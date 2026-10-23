@@ -107,8 +107,8 @@ automatic crash recovery touches only leases whose ID or holder string its
 own control record names.
 
 Oxide calls the library's `managed` entry points (`lease`, `release`,
-`recover`, `status`, `evict_idle_slot`, `init_budget_pool`,
-`init_volume_pool`, `flush_volume`). They behave as
+`recover`, `status`, `snapshot`, `measure`, `evict_idle_slot`,
+`init_budget_pool`, `init_volume_pool`, `flush_volume`). They behave as
 the functions below on an APFS pool and also open the budget-only
 `directory-budget-v1` pool ([workflow](workflow.md#directory-budget-v1-as-shipped))
 and the removable `apfs-volume-v1` pool ([workflow](workflow.md#removable-build-volume)),
@@ -262,7 +262,7 @@ defaults, which are unchanged. The callers:
 | The matching idle slot's own walk before reuse | Must be complete, or the lease refuses |
 | The whole-payload walk before a new slot, and again after eviction | Must be complete, or the lease refuses |
 | The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
-| `status`: the whole payload and each slot | Observational; reports coverage, causes and time |
+| `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
 
 A walk that reaches a bound, meets an unreadable entry, missing or unusable
 metadata or a mount boundary, or cannot open its root is incomplete. It
@@ -344,15 +344,74 @@ On a removable pool, one ordinary command paid several full walks, and a waiting
 - **Per-record checks:** under the same pool lock and in ledger order, it keeps status's cheap, non-recursive checks with the same errors, through one shared helper: `slot_path` refuses a zero slot ID (`unknown_accounting`), and a slot-root `symlink_metadata` error other than `NotFound` propagates (`io`). A record whose root is missing, held or idle, stays a member: no closure is inferred and no refusal is added. A symlinked root or partial accounting stays non-gating, as in status.
 - **Returns:** `store_id`, `backend`, `cap_bytes`, `reconciliation_blocked` and each slot's `slot_id`, `incarnation`, occupancy, `project`, `workspace`, `profile`, `holder` and `lease_id`, the same values status shows. The type has **no byte or coverage fields**, so a skipped walk cannot read as zero or complete. Selection, affinity, wait and recovery decisions, record-lock probes, process-group checks, retirement checks and admission-lock order are unchanged.
 
-**Full accounting stays** for explicit `oxide status` (`Store::report`, `slot_size` and the recursive reporting), `oxide init`/`new` readiness, which reads its figure and effective budget from its own completed full status, and every library admission, reuse, recycling and eviction walk, with unchanged bounds.
+**Full accounting stays** for `oxide status --measure` (oxide#128: the
+library's passive `measure`, the same payload and per-slot walks made without
+the pool lock or reconciliation), `oxide init`/`new` readiness, which reads its
+figure and effective budget from its own completed full status, and every
+library admission, reuse, recycling and eviction walk, with unchanged bounds.
+Default `oxide status` no longer walks, opens the pool lock or reconciles:
+it reads the [passive snapshot](#passive-snapshot-and-measurement-oxide128).
 
 **Result line.** It walks nothing. `managed::lease_measured` returns the grant and, only when the library's reuse walk took an idle slot, that walk's unique allocated bytes with the exact slot ID and incarnation. The line shows that figure with its provenance, `slot 5 was 7900 MiB when leased`; `new slot` after allocation or recycling; `slot size unknown` for a held same-holder replay, where `reused_slot` is true but nothing was measured. It then shows this command's soft budget and `pool total: see oxide status`. Nothing walks a slot after release, when another command may hold it.
 
 **Effect.** An ordinary reuse command walks only its target slot, the library's existing reuse walk. New-slot allocation keeps exactly its whole-payload walks before and after eviction. Waits and recovery walk nothing.
 
-**Observation hook.** Debug builds only, absent from release builds such as the installed `oxide`: `inventory::walk_observer` records the root of every `inventory_directory` walk, the one entry point of library accounting, `slot_size`, Cargo-home measurement and the stray check, on a per-thread recorder for tests and, when `OXIDE_TEST_WALK_LOG` names an absolute file, one line per walk. It changes no walk. Walk counts show routing only; they are not a resource gate.
+**Observation hook.** Debug builds only, absent from release builds such as the installed `oxide`: `inventory::walk_observer` records the root of every `inventory_directory` walk, the one entry point of library accounting, `status --measure`, Cargo-home measurement and the stray check, on a per-thread recorder for tests and, when `OXIDE_TEST_WALK_LOG` names an absolute file, one line per walk. It changes no walk. Walk counts show routing only; they are not a resource gate. The same debug-only hook can inject a scoped fixture fault for a proof: a one-shot `delay_before_read_dir` of 1..=65,000 ms (aggregate-bounded, marked fired before it sleeps and reported by a debug marker so a proof can prove activation). Injections are gated on the guard's own canonical `/private/tmp` scratch and evidence variables plus `OXIDE_PROOF_DEADLINE_NS`; a malformed, misapplied or out-of-scope injection installs nothing, and release builds have no hook.
 
-**Proof.** Standard tier. Library tests show that the view equals status's membership field for field with no walk while status still walks the payload and every slot; that reuse walks only its slot and returns that measurement, a held replay walks and measures nothing, and a new slot keeps its single admission walk; that a zero slot ID, a slot-root lookup error and a foreign pool entry refuse the view and status alike; and that a missing held root stays a member while partial accounting and a symlinked root stay non-gating and reuse still refuses incomplete accounting. The unreadable-walk and slot-root refusal cases inject `io::ErrorKind::PermissionDenied` at exact canonical-path `read_dir` and `slot_root` `symlink_metadata` calls with a current-test-thread `cfg(test)` guard and hit assertions. These cases preserve the library's gap and refusal mapping, but do not prove kernel permission enforcement or an operating-system `EACCES` response. Front-door recovery rules take the view's slot type unchanged. The native proof `effigy rust:front-door-accounting` covers, on one private pool with an idle slot of more than 200,000 entries: new-slot, reuse, status and readiness walks; a live-holder and killed-holder `recover-interrupted` refusal with no walk; a waiting build that walks nothing, then recovers, evicts the untrusted slot and builds cold; and new-slot admission with four whole-payload walks around eviction, hard links counted once. Removable selection is covered by the shared refusal tests only: no native session attaches a volume.
+**Proof.** Standard tier. Library tests show that the view equals status's membership field for field with no walk while `managed::status` still walks the payload and every slot; that reuse walks only its slot and returns that measurement, a held replay walks and measures nothing, and a new slot keeps its single admission walk; that a zero slot ID, a slot-root lookup error and a foreign pool entry refuse the view and status alike; and that a missing held root stays a member while partial accounting and a symlinked root stay non-gating and reuse still refuses incomplete accounting. The unreadable-walk and slot-root refusal cases inject `io::ErrorKind::PermissionDenied` at exact canonical-path `read_dir` and `slot_root` `symlink_metadata` calls with a current-test-thread `cfg(test)` guard and hit assertions. These cases preserve the library's gap and refusal mapping, but do not prove kernel permission enforcement or an operating-system `EACCES` response. Front-door recovery rules take the view's slot type unchanged. The native proof `effigy rust:front-door-accounting` covers, on one private pool with an idle slot of more than 200,000 entries: new-slot and reuse walks, a default `status` that walks nothing, `status --measure` and readiness walks; a live-holder and killed-holder `recover-interrupted` refusal with no walk; a waiting build that walks nothing, then recovers, evicts the untrusted slot and builds cold; and new-slot admission with four whole-payload walks around eviction, hard links counted once. Removable selection is covered by the shared refusal tests only: no native session attaches a volume.
+
+### Passive snapshot and measurement (oxide#128)
+
+Default `oxide status` must stay fast and read-only on a large pool, so it
+does not call `status`, `ledger_view` or `Store::open`, all of which take the
+pool lock and run recorded-deletion reconciliation. `managed::snapshot(pool)`
+is a separate read:
+
+- **Opening:** canonical owner-only pool root, the unchanged foreign-entry and
+  retired-image refusals, then config and ledger reads. It creates no lock,
+  takes no lock, waits for no writer and writes nothing, so a snapshot
+  returns while another command holds the pool lock.
+- **Validation shared with `Pool::open`:** backend shape, config/ledger
+  identity, the slot ceiling, and every record's ID, incarnation and recorded
+  directory. A directory pool's payload root must still be the real private
+  payload directory on the pool's device; a removable pool's recorded volume
+  is reported as recorded and never probed, so an absent volume still yields
+  its ledger.
+- **Torn reads:** each file is replaced atomically, so one snapshot may
+  straddle a concurrent replacement. A mismatched config/ledger pair is read
+  again once; a second mismatch refuses as `backing_mismatch`. It is never
+  repaired and never waits.
+- **Returns:** `store_id`, backend, recorded cap, the recorded payload root,
+  the recorded volume binding, ledger membership in ledger order, and the
+  slot IDs recorded `Evicting`. A pending deletion is reported as pending
+  reconciliation, distinct from idle and held; nothing infers writer closure
+  or current eligibility.
+
+`managed::measure(pool)` is the diagnostic measurement: the same recorded
+snapshot plus one whole-payload walk and one walk per slot, using the
+existing entry and depth bounds. The caller's remaining share of one
+cumulative command budget becomes a single deadline (clamped to the
+accounting bound) that every walk recomputes against, so the payload walk and
+all slot walks stay inside it rather than each starting a fresh bound; past
+the deadline a walk keeps a 1 ms bound and reports an elapsed-deadline gap. It
+takes no pool lock, creates none, reconciles nothing and writes nothing, so a
+recorded `Evicting` slot is walked as it stands and makes coverage unknown.
+After walking it re-reads the pair once; if any slot's ID, incarnation,
+directory or occupancy changed, coverage is unknown rather than pairing a
+walk with a different generation. Neither entry point persists anything.
+
+The front door records one diagnostic fact from the reuse walk an acquiring
+command already makes, in
+`<pool>/oxide-managed/status-observations.json` (schema
+`oxide.status-observations/1`, ≤256 KiB, 128 retained recent facts, each
+bound to store ID, slot ID, incarnation, exact recorded directory, wall-clock
+time, allocated bytes, source and measuring lease). The sidecar is an
+auxiliary diagnostic inside an already-tolerated directory: it bumps no core
+format, an older binary may ignore it, and a write failure changes no
+admission, ownership or exit status. A missing, unreadable, foreign, corrupt,
+unknown-version or mismatched sidecar reads as not measured, never as a
+fallback scan. Default status never creates or refreshes it and `--measure`
+never persists.
 
 ### Slot headroom and ranked idle replacement (oxide#118)
 

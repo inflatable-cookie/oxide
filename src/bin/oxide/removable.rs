@@ -776,8 +776,10 @@ pub fn select(internal: Store) -> Result<Selected, String> {
     }
 }
 
-/// The removable store if the registered volume is usable now.
-fn usable(internal: &Store, registration: &Registration) -> Result<Store, String> {
+/// The existing checks that decide whether a registered volume is usable for
+/// the next build. They probe the volume and run `diskutil`; `oxide status`
+/// runs them only in measured mode.
+fn verified(internal: &Store, registration: &Registration) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
         return Err("the removable backend is macOS-only".to_owned());
     }
@@ -800,11 +802,25 @@ fn usable(internal: &Store, registration: &Registration) -> Result<Store, String
             registration.reserve_bytes / MIB
         ));
     }
+    let _ = internal;
+    Ok(())
+}
+
+/// The removable store if the registered volume is usable now.
+fn usable(internal: &Store, registration: &Registration) -> Result<Store, String> {
+    verified(internal, registration)?;
     Store::open_removable(
         &internal.control().join(POOL_DIR),
         registration.mount_point.join(PAYLOAD_DIR),
         internal.max_active(),
     )
+}
+
+/// The recorded removable store if the volume is verified now, opened
+/// without the pool lock and without reconciling anything (oxide#128).
+fn usable_recorded(internal: &Store, registration: &Registration) -> Result<Store, String> {
+    verified(internal, registration)?;
+    Store::open_recorded_removable(&internal.control().join(POOL_DIR), internal.max_active())
 }
 
 /// Pair the internal store with a registered removable pool's state, so
@@ -834,19 +850,32 @@ pub struct RemovableStatus {
     /// Registration lines: the first is the pool's identity, the rest are
     /// indented details.
     pub lines: Vec<String>,
-    /// The opened store when the volume is usable for the next build, else
-    /// why not. Selection is the same check builds use.
-    pub selected: Result<Store, String>,
+    /// The record of the pool: its internal ledger and control state, opened
+    /// without the pool lock, reconciliation or a volume probe. In measured
+    /// mode the volume is verified first and the same recorded store is used
+    /// for the walks; `Err` is why it is not available.
+    pub recorded: Result<Store, String>,
+    /// Whether the registered mount point exists right now. Already-indented
+    /// observation only: it says nothing about write access, identity or
+    /// reserve.
+    pub present: bool,
+    /// The configured drive mode, from the registration.
+    pub mode: DriveMode,
+    /// The registered mount point.
+    pub mount_point: PathBuf,
     /// Its control directory, internal, readable while the volume is away.
     pub control: PathBuf,
 }
 
-/// The registration and selection of the removable pool, `None` when none
-/// is registered. Prints nothing.
-pub fn status(internal: &Store) -> Result<Option<RemovableStatus>, String> {
+/// The registration and recorded pool of the removable volume, `None` when
+/// none is registered. Prints nothing. A recorded status never probes the
+/// volume; a measured status verifies it exactly as a build would, then
+/// reads and walks it without reconciling.
+pub fn status(internal: &Store, measured: bool) -> Result<Option<RemovableStatus>, String> {
     let Some(registration) = registration(internal)? else {
         return Ok(None);
     };
+    let mode = registration.mode;
     let mut lines = vec![
         format!(
             "{} volume {} container {} (mode: {})",
@@ -873,8 +902,13 @@ pub fn status(internal: &Store) -> Result<Option<RemovableStatus>, String> {
         registration.reserve_bytes / MIB,
         registration.cap_bytes / MIB
     ));
-    let selected = usable(internal, &registration);
-    if selected.is_ok() {
+    let present = fs::symlink_metadata(&registration.mount_point).is_ok();
+    let recorded = if measured {
+        usable_recorded(internal, &registration)
+    } else {
+        Store::open_recorded_removable(&internal.control().join(POOL_DIR), internal.max_active())
+    };
+    if measured && recorded.is_ok() {
         let facts = volume::observe_path(&registration.mount_point).ok();
         let now = facts.map_or_else(
             || "unknown".to_owned(),
@@ -887,10 +921,15 @@ pub fn status(internal: &Store) -> Result<Option<RemovableStatus>, String> {
             },
         );
         lines.push(format!("  volume now: {now}"));
+    } else if !measured {
+        lines.push("  volume now: not checked by status; use `oxide status --measure`".to_owned());
     }
     Ok(Some(RemovableStatus {
         lines,
-        selected,
+        recorded,
+        present,
+        mode,
+        mount_point: registration.mount_point.clone(),
         control: internal
             .control()
             .join(POOL_DIR)

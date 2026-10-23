@@ -102,9 +102,21 @@ impl Measure {
     }
 }
 
+/// [`measure`] with a caller's remaining elapsed bound, clamped to the
+/// existing Cargo-home walk limits.
+pub fn measure_with(root: &Path, remaining_ms: u64) -> Result<Option<Measure>, String> {
+    let mut limits = LIMITS;
+    limits.max_elapsed_ms = remaining_ms.clamp(1, LIMITS.max_elapsed_ms);
+    measure_limited(root, limits)
+}
+
 /// Walk `root`, which must be a real directory: a symlink root refuses, so
 /// the walk never leaves the named tree.
 pub fn measure(root: &Path) -> Result<Option<Measure>, String> {
+    measure_limited(root, LIMITS)
+}
+
+fn measure_limited(root: &Path, limits: InventoryLimits) -> Result<Option<Measure>, String> {
     match std::fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
@@ -113,7 +125,7 @@ pub fn measure(root: &Path) -> Result<Option<Measure>, String> {
         }
         Ok(_) => {}
     }
-    let report = inventory_directory(root, LIMITS).map_err(|error| error.to_string())?;
+    let report = inventory_directory(root, limits).map_err(|error| error.to_string())?;
     Ok(Some(Measure {
         files: report.total.files,
         distinct: report.total.distinct_files,
@@ -130,8 +142,9 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
-/// `oxide status` lines for the Cargo home.
-pub fn report_status() {
+/// `oxide status` lines for the Cargo home. A recorded status resolves the
+/// path only; a measured status walks it inside the shared budget.
+pub fn report_status(measured: bool, remaining_ms: u64) {
     let home = match resolve() {
         Ok(home) => home,
         Err(error) => {
@@ -139,10 +152,17 @@ pub fn report_status() {
             return;
         }
     };
-    match measure(&home) {
-        Ok(Some(measure)) => println!("cargo home: {} {}", home.display(), measure.describe()),
-        Ok(None) => println!("cargo home: {} absent", home.display()),
-        Err(error) => println!("cargo home: {} not measured ({error})", home.display()),
+    if !measured {
+        println!(
+            "cargo home: {} not measured by status; use `oxide status --measure`",
+            home.display()
+        );
+    } else {
+        match measure_with(&home, remaining_ms) {
+            Ok(Some(measure)) => println!("cargo home: {} {}", home.display(), measure.describe()),
+            Ok(None) => println!("cargo home: {} absent", home.display()),
+            Err(error) => println!("cargo home: {} not measured ({error})", home.display()),
+        }
     }
     println!(
         "  Cargo cleans it itself only at the end of an online build or fetch, at most once a day; --offline, --frozen or net.offline, a held cache lock or an earlier failure skip it. `oxide clean --cargo-cache` asks for one pass"

@@ -10,7 +10,8 @@ entries. Cases, in order:
 - new slot: one whole-payload admission walk, summary "new slot";
 - ordinary reuse: exactly one walk, of the target slot, and the summary's
   provenance label "slot N was X MiB when leased";
-- `oxide status` and `oxide new` readiness keep their full walks;
+- default `oxide status` walks nothing (recorded facts only);
+- `oxide status --measure` and `oxide new` readiness keep their full walks;
 - a live holder: `pool recover-interrupted` refuses with no walk; its oxide
   killed while Cargo's group runs: the refusal names automatic recovery, a
   build in the same checkout waits with no walk, then recovers once the
@@ -272,18 +273,33 @@ def build(proof: Proof, cwd: str, label: str, expected_walks: list, extra: dict 
     return slot, warmth, tail, stderr
 
 
-def status(proof: Proof, cwd: str, label: str, slots: list) -> str:
+def recorded_status(proof: Proof, cwd: str, label: str) -> str:
+    """Default status reads recorded facts only: no walk, no reconcile."""
     code, stdout, stderr, walks, elapsed = proof.call(cwd, ["status"])
     if code:
-        fail(f"{label} status exit {code}: {stderr[-1200:]}")
+        fail(f"{label} recorded status exit {code}: {stderr[-1200:]}")
+    say(f"{label} recorded status in {elapsed:.1f} s: walks {walks}")
+    if walks:
+        fail(f"{label}: default status walked {walks}")
+    if "slot sizes: recorded observations only" not in stdout:
+        fail(f"{label}: default status did not report recorded sizes:\n{stdout}")
+    if "slot accounting walk: " in stdout:
+        fail(f"{label}: default status printed an accounting walk:\n{stdout}")
+    return stdout
+
+
+def status(proof: Proof, cwd: str, label: str, slots: list) -> str:
+    code, stdout, stderr, walks, elapsed = proof.call(cwd, ["status", "--measure"])
+    if code:
+        fail(f"{label} status --measure exit {code}: {stderr[-1200:]}")
     line = next((line for line in stdout.splitlines() if line.startswith("  slot accounting walk: ")), "")
     counted = re.search(r"complete, (\d+) entries", line)
-    say(f"{label} status in {elapsed:.1f} s: {line.strip()}; walks {walks}")
+    say(f"{label} status --measure in {elapsed:.1f} s: {line.strip()}; walks {walks}")
     if not counted or "accounting walk: partial" in stdout or "accounting walk: unknown" in stdout:
-        fail(f"{label}: status accounting is not complete:\n{stdout}")
+        fail(f"{label}: status --measure accounting is not complete:\n{stdout}")
     missing = [root for root in ["payload", *[f"slots/{slot}" for slot in slots]] if root not in walks]
     if walks[:1] != ["payload"] or missing:
-        fail(f"{label}: status did not walk the payload first and every slot: {walks}")
+        fail(f"{label}: status --measure did not walk the payload first and every slot: {walks}")
     return stdout
 
 
@@ -309,6 +325,7 @@ def prove_reuse(proof: Proof, app: str, big: str) -> tuple:
     after = proof.slots()[app_slot]
     if (after["id"], after["incarnation"]) != (generation["id"], generation["incarnation"]):
         fail(f"reuse changed the slot generation: {generation} -> {after}")
+    recorded_status(proof, app, "after reuse")
     status(proof, app, "after reuse", [app_slot, big_slot])
     return app_slot, big_slot
 

@@ -707,11 +707,10 @@ fn status_lines_for_current() -> Result<Vec<String>, String> {
     output_status_lines(&context)
 }
 
-/// Read-only owned-output lines for `oxide status`. Never creates a pool,
-/// directory or receipt.
-pub fn status_lines(workspace: &Path) -> Result<Vec<String>, String> {
-    let settings = store::settings()?;
-    let control = Store::open_existing_with(&settings)?.map(|store| store.control().to_path_buf());
+/// Read-only owned-output lines for `oxide status --measure`. The control
+/// directory comes from the recorded pool the command already read, so this
+/// opens no pool and never creates a pool, directory or receipt.
+pub fn status_lines_for(control: Option<PathBuf>, workspace: &Path) -> Result<Vec<String>, String> {
     output_status_lines(&Context::new(control, workspace.to_path_buf()))
 }
 

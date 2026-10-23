@@ -58,7 +58,8 @@ USAGE:
     oxide outputs plan|adopt|detach|status
                                          permanent drive: plan, explicitly convert or
                                          detach the owned <checkout>/target link
-    oxide status                         pool, slots, waits, stray output and Cargo home
+    oxide status                         recorded pool, slots and waits; no walk or reconcile
+    oxide status --measure               bounded payload, slot, checkout and Cargo-home walks
     oxide status --launch-check          macOS: time a new executable's first launch
     oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ...]
                                          macOS: register an APFS volume; mode defaults to ephemeral
@@ -858,34 +859,93 @@ fn print_summary(
     );
 }
 
-fn run_status(args: &[OsString]) -> Result<u8, String> {
-    match args {
-        [] => {}
-        [flag] if flag == "--launch-check" => return launch::run_check(),
-        _ => return Err("status takes no arguments except --launch-check".to_owned()),
+/// What one `oxide status` run asks for (oxide#128). `Recorded` is the
+/// default: recorded facts only, no walk, no lock and no reconciliation.
+/// `Measure` runs the existing bounded walks without reconciling or writing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusMode {
+    Recorded,
+    Measure,
+}
+
+impl StatusMode {
+    fn accounting(self) -> store::Accounting {
+        match self {
+            Self::Recorded => store::Accounting::Recorded,
+            Self::Measure => store::Accounting::Measured,
+        }
     }
+}
+
+/// One cumulative budget for every walk a measured status makes (payload,
+/// slots, checkout, Cargo home), so no combination of walks runs unbounded.
+struct MeasureBudget {
+    deadline: Instant,
+}
+
+/// The existing pool accounting deadline, shared by every measured walk.
+const MEASURE_BUDGET: Duration = Duration::from_secs(60);
+
+impl MeasureBudget {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + MEASURE_BUDGET,
+        }
+    }
+
+    /// Milliseconds left, at least one so every walk stays bounded but runs.
+    fn remaining_ms(&self) -> u64 {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
+    }
+}
+
+fn run_status(args: &[OsString]) -> Result<u8, String> {
+    let mode = match args {
+        [] => StatusMode::Recorded,
+        [flag] if flag == "--measure" => StatusMode::Measure,
+        [flag] if flag == "--launch-check" => return launch::run_check(),
+        _ => return Err("status takes no arguments except --measure or --launch-check".to_owned()),
+    };
     let settings = store::settings()?;
     print_settings(&settings);
     println!(
         "{}",
         wrapper::status_line(wrapper::Policy::from_env(), &wrapper::inherited(&[]))
     );
-    match Store::open_existing_with(&settings) {
-        Ok(None) => {
-            println!(
-                "  not created; the first building oxide command creates it ({}: {})",
-                Backend::DirectoryBudget.tag(),
-                Backend::DirectoryBudget.bound()
-            );
+    let mut budget = MeasureBudget::new();
+    let mut control = None;
+    match Store::open_recorded(&settings) {
+        Ok(None) => println!(
+            "  not created; the first building oxide command creates it ({}: {})",
+            Backend::DirectoryBudget.tag(),
+            Backend::DirectoryBudget.bound()
+        ),
+        Ok(Some(store)) => {
+            control = Some(store.control().to_path_buf());
+            print_pools(&store, mode, &mut budget)?;
         }
-        Ok(Some(store)) => print_pools(&store)?,
         Err(error) => println!("  cannot open: {error}"),
     }
     print_other_pools(&settings);
+    print_checkout(control, mode, &mut budget);
+    Ok(0)
+}
+
+/// The checkout-local lines. Recorded status runs no Cargo, no inventory and
+/// no repository discovery: it says so instead of measuring. Measured status
+/// locates the workspace once and walks it inside the shared budget.
+fn print_checkout(control: Option<PathBuf>, mode: StatusMode, budget: &mut MeasureBudget) {
+    if mode == StatusMode::Recorded {
+        println!("outputs: not measured by status; use `oxide status --measure`");
+        println!("stray Cargo output: not measured by status; use `oxide status --measure`");
+        cargo_home::report_status(false, budget.remaining_ms());
+        return;
+    }
     match identity::locate_workspace(CARGO, None) {
         Ok(workspace) => {
-            report_stray(&workspace);
-            match outputs::status_lines(&workspace) {
+            report_stray(&workspace, budget.remaining_ms());
+            match outputs::status_lines_for(control, &workspace) {
                 Ok(lines) => {
                     for line in lines {
                         println!("{line}");
@@ -896,27 +956,31 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         }
         Err(_) => println!("stray Cargo output: no Cargo workspace here"),
     }
-    cargo_home::report_status();
-    Ok(0)
+    cargo_home::report_status(true, budget.remaining_ms());
 }
 
 /// The pool selected for the next build first, then the other; the most
 /// recent recorded use across both; each pool's own slots under its header.
-/// Read-only: the same selection check builds use, no acquisition.
-fn print_pools(internal: &Store) -> Result<(), String> {
-    let removable = removable::status(internal)?;
-    let internal_report = internal.report()?;
-    let removable_report = match removable.as_ref().map(|status| &status.selected) {
-        Some(Ok(store)) => Some(store.report()?),
+/// A recorded status reads the ledger and control state without the pool
+/// lock and without reconciling anything; a measured status walks the
+/// payload and every slot once, under one cumulative budget.
+fn print_pools(
+    internal: &Store,
+    mode: StatusMode,
+    budget: &mut MeasureBudget,
+) -> Result<(), String> {
+    let measured = mode == StatusMode::Measure;
+    let removable = removable::status(internal, measured)?;
+    let removable_report = match removable.as_ref().map(|status| &status.recorded) {
+        Some(Ok(store)) => Some(store.report(mode.accounting(), budget.remaining_ms())?),
         _ => None,
     };
+    let internal_report = internal.report(mode.accounting(), budget.remaining_ms())?;
     let reason = removable
         .as_ref()
-        .and_then(|status| status.selected.as_ref().err());
-    println!(
-        "{}",
-        selection_line(removable.is_some(), reason.map(String::as_str))
-    );
+        .and_then(|status| status.recorded.as_ref().err())
+        .map(String::as_str);
+    println!("{}", selection_line(removable.as_ref(), reason, measured));
     let removable_use = match (&removable, &removable_report) {
         (None, _) => None,
         (Some(_), Some(report)) => Some(Ok(report.last_use.clone())),
@@ -928,38 +992,37 @@ fn print_pools(internal: &Store) -> Result<(), String> {
     }
     println!("{}", recent_use_line(&uses, process::now_ms()));
 
-    for section in sections(removable.is_some(), reason.map(String::as_str)) {
+    for section in sections(removable.as_ref(), reason, measured) {
         match section {
             Section::Internal(note) => {
                 let header = format!("internal pool: {}{note}", internal.pool.display());
-                print_pool(internal, &header, &[], &internal_report)?;
+                print_pool(internal, &header, &[], &internal_report, mode)?;
             }
             Section::NoRemovable => println!("removable pool: none registered"),
             Section::Removable => {
                 let (Some(status), Some(report)) = (&removable, &removable_report) else {
                     return Err("the removable pool was not opened".to_owned());
                 };
-                let Ok(store) = &status.selected else {
+                let Ok(store) = &status.recorded else {
                     return Err("the removable pool was not opened".to_owned());
                 };
-                let header = format!(
-                    "removable pool: {} (selected for the next build)",
-                    status.lines[0]
-                );
-                print_pool(store, &header, &status.lines[1..], report)?;
+                let header = format!("removable pool: {}", status.lines[0]);
+                print_pool(store, &header, &status.lines[1..], report, mode)?;
             }
             Section::RemovableUnread(reason) => {
                 let Some(status) = &removable else {
                     return Err("the removable pool is not registered".to_owned());
                 };
-                println!(
-                    "removable pool: {} (not used for the next build: {reason})",
-                    status.lines[0]
-                );
+                println!("removable pool: {}", status.lines[0]);
                 for line in &status.lines[1..] {
                     println!("{line}");
                 }
-                println!("  slots: not read while the volume is not usable (unknown, not empty)");
+                println!("  slots: not read ({reason})");
+                println!(
+                    "  recorded selection: {} at {}; status does not verify the volume",
+                    status.mode,
+                    status.mount_point.display()
+                );
                 match store::recorded_lost(&status.control) {
                     Ok(lost) => {
                         for (slot, checkout, what) in lost {
@@ -984,38 +1047,79 @@ enum Section {
     /// The internal pool, with its role note.
     Internal(&'static str),
     Removable,
-    /// Registered but not selected: its slots are not read.
+    /// Registered but its recorded pool could not be read.
     RemovableUnread(String),
     NoRemovable,
 }
 
 /// The pool selected for the next build comes first; each pool is one
-/// block holding only its own slots.
-fn sections(registered: bool, refused: Option<&str>) -> Vec<Section> {
-    const SELECTED: &str = " (selected for the next build)";
-    match (registered, refused) {
-        (false, _) => vec![Section::Internal(SELECTED), Section::NoRemovable],
-        (true, None) => vec![
-            Section::Removable,
-            Section::Internal(" (fallback while the removable volume is not usable)"),
-        ],
-        (true, Some(reason)) => vec![
-            Section::Internal(SELECTED),
-            Section::RemovableUnread(reason.to_owned()),
-        ],
+/// block holding only its own slots. A recorded status cannot verify the
+/// volume, so it only reports which pool the recording selects.
+fn sections(
+    removable: Option<&removable::RemovableStatus>,
+    reason: Option<&str>,
+    measured: bool,
+) -> Vec<Section> {
+    let Some(status) = removable else {
+        return vec![
+            Section::Internal(" (selected for the next build)"),
+            Section::NoRemovable,
+        ];
+    };
+    let selected = if measured {
+        reason.is_none()
+    } else {
+        status.present
+    };
+    let internal = if selected {
+        if status.present {
+            " (fallback while the removable volume is not usable)"
+        } else {
+            " (fallback while the removable volume is absent)"
+        }
+    } else {
+        " (selected for the next build)"
+    };
+    let removable_section = match &status.recorded {
+        Ok(_) => Section::Removable,
+        Err(error) => Section::RemovableUnread(error.clone()),
+    };
+    if selected {
+        vec![removable_section, Section::Internal(internal)]
+    } else {
+        vec![Section::Internal(internal), removable_section]
     }
 }
 
-/// Which pool the next build uses, from the same check builds make.
-fn selection_line(registered: bool, refused: Option<&str>) -> String {
-    match (registered, refused) {
-        (false, _) => {
-            "selected for the next build: internal pool (no removable volume registered)".to_owned()
-        }
-        (true, None) => "selected for the next build: removable pool".to_owned(),
-        (true, Some(reason)) => format!(
-            "selected for the next build: internal pool (removable volume not used: {reason})"
-        ),
+/// Which pool the next build uses. A measured status makes the same check
+/// builds make; a recorded status says what the registration records and
+/// whether the mount point is present, and never presents that as admission.
+fn selection_line(
+    removable: Option<&removable::RemovableStatus>,
+    reason: Option<&str>,
+    measured: bool,
+) -> String {
+    let Some(status) = removable else {
+        return "selected for the next build: internal pool (no removable volume registered)"
+            .to_owned();
+    };
+    let mount = status.mount_point.display();
+    if measured {
+        return match reason {
+            None => "selected for the next build: removable pool".to_owned(),
+            Some(reason) => format!(
+                "selected for the next build: internal pool (removable volume not used: {reason})"
+            ),
+        };
+    }
+    if status.present {
+        format!(
+            "recorded selection: removable pool (volume present at {mount}; status does not verify it, the next build does)"
+        )
+    } else {
+        format!(
+            "recorded selection: removable pool, but no volume is present at {mount}; the next build uses the internal pool until it returns"
+        )
     }
 }
 
@@ -1084,13 +1188,16 @@ fn recent_use_line(uses: &[(&str, Result<Option<store::LastUse>, String>)], now_
     }
 }
 
-/// Backend, use, slots and recoveries of one opened pool, under `header`.
+/// Backend, use, slots and recoveries of one recorded or measured pool,
+/// under `header`.
 fn print_pool(
     store: &Store,
     header: &str,
     details: &[String],
     report: &store::Report,
+    mode: StatusMode,
 ) -> Result<(), String> {
+    let measured = mode == StatusMode::Measure;
     println!("{header}");
     for line in details {
         println!("{line}");
@@ -1100,17 +1207,19 @@ fn print_pool(
         store.backend.tag(),
         store.backend.bound()
     );
+    let used = match &report.measured {
+        Some(pool) => slot_use(pool),
+        None => "slot allocation not measured".to_owned(),
+    };
     match store.backend {
         Backend::DirectoryBudget => {
-            let used = slot_use(&report.pool);
             let available = watchdog::available_bytes(&store.payload).map_or_else(
                 || "unknown".to_owned(),
                 |bytes| format!("{} MiB", bytes / MIB),
             );
             println!(
-                "  soft budget {} MB (checked at admission; a running build may grow past it), {used}, slot accounting {:?}",
-                store.budget(report.pool.cap_bytes) / 1_000_000,
-                report.pool.coverage
+                "  soft budget {} MB (checked at admission; a running build may grow past it), {used}",
+                store.budget(report.cap_bytes) / 1_000_000
             );
             let physical = store::statfs(&store.payload).and_then(|sample| {
                 let block = u64::try_from(sample.f_bsize).ok()?;
@@ -1127,7 +1236,14 @@ fn print_pool(
                 ),
                 None => println!("  filesystem: capacity unknown (no Oxide quota or hard ceiling)"),
             }
-            println!("  Time Machine: {}", backup_line(&store.pool));
+            println!(
+                "  Time Machine: {}",
+                if measured {
+                    backup_line(&store.pool)
+                } else {
+                    "not checked by status; use `oxide status --measure`".to_owned()
+                }
+            );
             println!("  Spotlight: {}", config::spotlight_advice(&store.pool));
             println!(
                 "  reserve watchdog: stops a build below {} GiB available ({} GiB reserve + {} GiB margin), best effort; pool filesystem available {available}",
@@ -1137,12 +1253,10 @@ fn print_pool(
             );
         }
         Backend::ApfsVolume => {
-            let used = slot_use(&report.pool);
             println!(
-                "  payload {}, admission cap {} MiB, {used}, slot accounting {:?}",
+                "  payload {} (recorded), admission cap {} MiB, {used}",
                 store.payload.display(),
-                report.pool.cap_bytes / MIB,
-                report.pool.coverage
+                report.cap_bytes / MIB
             );
             for flush in &report.flushes {
                 let outcome = match (flush.micros, &flush.error) {
@@ -1158,7 +1272,36 @@ fn print_pool(
             }
         }
     }
-    println!("  slot accounting walk: {}", report.pool.payload_accounting);
+    match &report.measured {
+        Some(pool) => {
+            println!("  slot accounting walk: {}", pool.payload_accounting);
+            if pool.coverage != pool.payload_accounting.coverage {
+                println!(
+                    "  pool coverage: {:?} (a recorded deletion is pending reconciliation or a slot walk was incomplete)",
+                    pool.coverage
+                );
+            }
+        }
+        None => println!(
+            "  slot sizes: recorded observations only; `oxide status --measure` walks the payload and every slot without reconciling"
+        ),
+    }
+    if !report.pending_reconciliation.is_empty() {
+        let pending: Vec<String> = report
+            .pending_reconciliation
+            .iter()
+            .map(|slot| format!("slot {slot}"))
+            .collect();
+        println!(
+            "  recorded deletions pending reconciliation: {} (left in place; status never reconciles or deletes)",
+            pending.join(", ")
+        );
+    }
+    if let Some(error) = &report.state_error {
+        println!(
+            "  control state: unknown ({error}); holders, waits, cleaning and flushes are not reported"
+        );
+    }
     println!(
         "  slots {}, waiting commands {}",
         report.slots.len(),
@@ -1184,52 +1327,58 @@ fn print_pool(
         println!("  cleaning {}", checkout.display());
     }
     for slot in &report.slots {
-        let state = match (slot.state, &slot.interrupted) {
-            (SlotOccupancy::Held, _) if slot.retired.is_some() => format!(
-                "retired and held, never reused ({})",
-                slot.retired.as_deref().unwrap_or_default()
-            ),
-            (SlotOccupancy::Held, Some(interrupted)) => {
-                let holder = interrupted
-                    .holder_pid
-                    .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
-                let path = match interrupted.path {
-                    store::Return::NeverStarted => {
-                        "Cargo never started; the next command recovers it".to_owned()
-                    }
-                    store::Return::GroupEmpty(group) => format!(
-                        "Cargo group {group}; recovered once the group is empty"
-                    ),
-                    store::Return::GroupUnrecorded => {
-                        "Cargo group not recorded; `oxide pool recover-interrupted <slot>` releases it"
-                            .to_owned()
-                    }
-                    store::Return::NotOwn => {
-                        "lease not provably this command's; `oxide pool recover-interrupted <slot>` releases it"
-                            .to_owned()
-                    }
-                };
-                let command = slot.holder.as_deref().unwrap_or("command");
-                format!("held by an interrupted {command} (oxide pid {holder}, {path})")
+        let state = if report.pending_reconciliation.contains(&slot.slot_id) {
+            "recorded deletion pending reconciliation (not idle or held)".to_owned()
+        } else {
+            match (slot.state, &slot.interrupted) {
+                (SlotOccupancy::Held, _) if slot.retired.is_some() => format!(
+                    "retired and held, never reused ({})",
+                    slot.retired.as_deref().unwrap_or_default()
+                ),
+                (SlotOccupancy::Held, Some(interrupted)) => {
+                    let holder = interrupted
+                        .holder_pid
+                        .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+                    let path = match interrupted.path {
+                        store::Return::NeverStarted => {
+                            "Cargo never started; the next command recovers it".to_owned()
+                        }
+                        store::Return::GroupEmpty(group) => {
+                            format!("Cargo group {group}; recovered once the group is empty")
+                        }
+                        store::Return::GroupUnrecorded => {
+                            "Cargo group not recorded; `oxide pool recover-interrupted <slot>` releases it"
+                                .to_owned()
+                        }
+                        store::Return::NotOwn => {
+                            "lease not provably this command's; `oxide pool recover-interrupted <slot>` releases it"
+                                .to_owned()
+                        }
+                    };
+                    let command = slot.holder.as_deref().unwrap_or("command");
+                    format!("held by an interrupted {command} (oxide pid {holder}, {path})")
+                }
+                (SlotOccupancy::Held, None) => match &slot.holder {
+                    Some(command) => format!("held by {command}"),
+                    None => "held".to_owned(),
+                },
+                _ => "idle".to_owned(),
             }
-            (SlotOccupancy::Held, None) => match &slot.holder {
-                Some(command) => format!("held by {command}"),
-                None => "held".to_owned(),
-            },
-            _ => "idle".to_owned(),
         };
         let owner = match (&slot.checkout, slot.managed) {
             (Some(checkout), _) => checkout.display().to_string(),
             (None, true) => "no checkout affinity".to_owned(),
             (None, false) => "not managed by oxide".to_owned(),
         };
-        let bytes = slot_size(&store.payload, &slot.slot_id, slot.dir.as_deref());
-        println!("{}", slot_line(slot, &state, &owner, &bytes));
+        println!("{}", slot_line(slot, &state, &owner));
         let diagnostic_scan = report
-            .pool
-            .slots
-            .iter()
-            .find(|pooled| pooled.slot_id == slot.slot_id)
+            .measured
+            .as_ref()
+            .and_then(|pool| {
+                pool.slots
+                    .iter()
+                    .find(|pooled| pooled.slot_id == slot.slot_id)
+            })
             .map(|pooled| &pooled.accounting)
             .filter(|scan| scan.coverage != AccountingCoverage::Complete || scan.vanished > 0);
         if let Some(scan) = diagnostic_scan {
@@ -1267,27 +1416,28 @@ fn print_pool(
 }
 
 /// One slot under its pool's header: ID, state, profile, project label,
-/// checkout, size and its place below the pool's `slots`.
-fn slot_line(slot: &store::SlotView, state: &str, owner: &str, bytes: &str) -> String {
+/// checkout, size and its recorded place below the pool's `slots`. The
+/// place is the ledger's recorded directory, so a nested layout is never
+/// confused with a sibling `slots/<id>` directory.
+fn slot_line(slot: &store::SlotView, state: &str, owner: &str) -> String {
     let place = slot.dir.as_deref().map_or_else(
         || format!("slots/{} (legacy path)", slot.slot_id),
         |dir| format!("slots/{dir}"),
     );
     format!(
-        "  slot {} {state} {} project {} {owner} {bytes}, {place}",
+        "  slot {} {state} {} project {} {owner} {}, {place}",
         slot.slot_id,
         slot.profile.as_deref().unwrap_or("-"),
-        slot.label.as_deref().unwrap_or("unknown")
+        slot.label.as_deref().unwrap_or("unknown"),
+        slot.size.describe()
     )
 }
 
-/// Slot allocation from the payload walk; an incomplete walk is a lower
-/// bound and says so.
+/// Slot allocation from the payload walk. The pool's own coverage is used, so
+/// a pending reconciliation or any incomplete slot walk makes the total a
+/// lower bound even when the payload walk itself completed.
 fn slot_use(pool: &PoolStatus) -> String {
-    match (
-        pool.payload_unique_allocated_bytes,
-        pool.payload_accounting.coverage,
-    ) {
+    match (pool.payload_unique_allocated_bytes, pool.coverage) {
         (Some(used), AccountingCoverage::Complete) => {
             format!("{} MiB allocated by slots", used / MIB)
         }
@@ -1296,42 +1446,10 @@ fn slot_use(pool: &PoolStatus) -> String {
     }
 }
 
-/// File names, distinct inodes and allocation counted once per inode for
-/// one slot. Reporting only: nothing inside a slot is ever deleted. The
-/// slot must resolve to itself under the canonical pool, so a link never
-/// leads the walk elsewhere.
-fn slot_size(payload: &Path, slot_id: &str, dir: Option<&str>) -> String {
-    if slot_id.is_empty() || !slot_id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return "size unknown".to_owned();
-    }
-    let slot = match dir {
-        None => payload.join("slots").join(slot_id),
-        Some(dir)
-            if dir.split('/').count() == 2
-                && !dir
-                    .split('/')
-                    .any(|part| part.is_empty() || part.starts_with('.')) =>
-        {
-            payload.join("slots").join(dir)
-        }
-        Some(_) => return "size unknown".to_owned(),
-    };
-    match std::fs::canonicalize(&slot) {
-        Ok(resolved) if resolved == slot => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "empty".to_owned(),
-        _ => return "size unknown (the slot path does not resolve to itself)".to_owned(),
-    }
-    match cargo_home::measure(&slot) {
-        Ok(Some(measure)) => measure.describe(),
-        Ok(None) => "empty".to_owned(),
-        Err(error) => format!("size unknown ({error})"),
-    }
-}
-
 /// Plain Cargo leaves `deps/` or `incremental/` in the checkout's `target/`;
 /// Oxide keeps intermediates in its slot. Finding none means none only for a
 /// verified Cargo release, whose layout was checked.
-fn report_stray(workspace: &Path) {
+fn report_stray(workspace: &Path, remaining_ms: u64) {
     let target = workspace.join("target");
     if !target.is_dir() {
         println!("stray Cargo output: none ({} absent)", target.display());
@@ -1341,7 +1459,7 @@ fn report_stray(workspace: &Path) {
         max_entries: 50_000,
         max_depth: 24,
         max_output_bytes: 4096,
-        max_elapsed_ms: 2_000,
+        max_elapsed_ms: remaining_ms.min(2_000),
     };
     match inventory_directory(&target, limits) {
         Ok(report) => {
@@ -1475,38 +1593,77 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::OsStr;
 
+    fn const_scan() -> oxide_storage::lease::AccountingScan {
+        oxide_storage::lease::AccountingScan {
+            coverage: AccountingCoverage::Complete,
+            gaps: Vec::new(),
+            vanished: 0,
+            entries_visited: 1,
+            elapsed_ms: 1,
+            max_entries: 2_000_000,
+            max_depth: 64,
+            max_elapsed_ms: 60_000,
+        }
+    }
+
+    fn removable_status(
+        recorded: Result<Store, String>,
+        present: bool,
+    ) -> removable::RemovableStatus {
+        removable::RemovableStatus {
+            lines: vec!["/Volumes/Drive volume U container C (mode: permanent)".to_owned()],
+            recorded,
+            present,
+            mode: removable::DriveMode::Permanent,
+            mount_point: PathBuf::from("/Volumes/Drive"),
+            control: PathBuf::from("/pool/oxide-managed/pool/oxide-managed"),
+        }
+    }
+
+    /// A recorded status says what the registration records; a measured one
+    /// makes the same selection check builds make.
     #[test]
     fn selected_pool_comes_first() {
+        let verified = removable_status(Err("not used".to_owned()), true);
         assert_eq!(
-            sections(true, None),
+            sections(Some(&verified), None, true),
             vec![
-                Section::Removable,
+                Section::RemovableUnread("not used".to_owned()),
                 Section::Internal(" (fallback while the removable volume is not usable)")
             ]
         );
+        let absent = removable_status(Err("recorded pool unreadable".to_owned()), false);
         assert_eq!(
-            sections(false, None),
+            sections(Some(&absent), Some("recorded pool unreadable"), false),
+            vec![
+                Section::Internal(" (selected for the next build)"),
+                Section::RemovableUnread("recorded pool unreadable".to_owned())
+            ]
+        );
+        assert_eq!(
+            sections(None, None, false),
             vec![
                 Section::Internal(" (selected for the next build)"),
                 Section::NoRemovable
             ]
         );
         assert_eq!(
-            sections(true, Some("volume not mounted")),
-            vec![
-                Section::Internal(" (selected for the next build)"),
-                Section::RemovableUnread("volume not mounted".to_owned())
-            ]
+            selection_line(None, None, false),
+            "selected for the next build: internal pool (no removable volume registered)"
         );
+        let present = removable_status(Err("not used".to_owned()), true);
         assert_eq!(
-            selection_line(true, None),
+            selection_line(Some(&present), None, true),
             "selected for the next build: removable pool"
         );
-        assert!(selection_line(true, Some("below reserve"))
+        assert!(selection_line(Some(&present), Some("below reserve"), true)
             .ends_with("(removable volume not used: below reserve)"));
-        assert!(
-            selection_line(false, None).contains("internal pool (no removable volume registered)")
-        );
+        // A recorded status never claims admission: it reports the recording
+        // and the mount point's presence.
+        assert!(selection_line(Some(&present), None, false)
+            .starts_with("recorded selection: removable pool (volume present at /Volumes/Drive"));
+        assert!(selection_line(Some(&absent), Some("not used"), false)
+            .contains("no volume is present at /Volumes/Drive"));
     }
 
     fn view(slot_id: &str, dir: Option<&str>, checkout: &str) -> store::SlotView {
@@ -1521,17 +1678,20 @@ mod tests {
             interrupted: None,
             retired: None,
             holder: None,
+            size: store::SlotSize::NotMeasured("not measured".to_owned()),
         }
     }
 
     /// Equal slot numbers in two pools stay distinct by label and place;
-    /// a legacy slot shows its checkout's name and legacy path.
+    /// a legacy slot shows its checkout's name and legacy path. A nested
+    /// recorded directory is always shown as recorded, never as a sibling
+    /// `slots/<id>`.
     #[test]
     fn slot_lines_name_project_and_place() {
         let internal = view("1", None, "/work/My App");
         let removable = view("1", Some("underlay-0a1b2c3d/quick-1"), "/work/underlay");
-        let internal_line = slot_line(&internal, "idle", "/work/My App", "empty");
-        let removable_line = slot_line(&removable, "idle", "/work/underlay", "empty");
+        let internal_line = slot_line(&internal, "idle", "/work/My App");
+        let removable_line = slot_line(&removable, "idle", "/work/underlay");
         assert!(
             internal_line.contains("project my-app ")
                 && internal_line.ends_with("slots/1 (legacy path)"),
@@ -1547,8 +1707,61 @@ mod tests {
             checkout: None,
             ..view("2", None, "/x")
         };
-        assert!(slot_line(&unknown, "idle", "no checkout affinity", "empty")
-            .contains("project unknown"));
+        assert!(slot_line(&unknown, "idle", "no checkout affinity").contains("project unknown"));
+        // A nested directory whose leaf carries the ID is never rendered as
+        // `slots/<id>`: the recorded directory is the path.
+        let nested = view("7", Some("oxide-aaaa/quick-7"), "/work/oxide");
+        let nested_line = slot_line(&nested, "idle", "/work/oxide");
+        assert!(
+            nested_line.ends_with("slots/oxide-aaaa/quick-7"),
+            "{nested_line}"
+        );
+        assert!(!nested_line.contains("slots/7 "), "{nested_line}");
+    }
+
+    /// A recorded size says it is recorded, with its age and source, and a
+    /// missing, unreadable or differently generated fact never claims a size.
+    #[test]
+    fn recorded_sizes_are_honest() {
+        use store::{ObservationSource, RecordedAge, SlotSize};
+        let recorded = SlotSize::Recorded {
+            allocated_bytes: 12 * 1024 * 1024,
+            age: RecordedAge::Ago(42),
+            source: ObservationSource::LeaseReuse,
+            lease_id: Some("v1.a.1.1.1".to_owned()),
+        };
+        let text = recorded.describe();
+        assert!(
+            text.contains("12 MiB") && text.contains("recorded 42s ago"),
+            "{text}"
+        );
+        assert!(
+            text.contains("measured by the reuse walk when leased")
+                && text.contains("may have changed since measurement"),
+            "{text}"
+        );
+        let skew = SlotSize::Recorded {
+            allocated_bytes: 0,
+            age: RecordedAge::ClockSkew,
+            source: ObservationSource::LeaseReuse,
+            lease_id: None,
+        };
+        assert!(
+            skew.describe().contains("age is unknown"),
+            "{}",
+            skew.describe()
+        );
+        let missing = SlotSize::NotMeasured(
+            "not measured (no recorded observation); use `oxide status --measure`".to_owned(),
+        );
+        assert!(missing.describe().contains("not measured"));
+        let measured = SlotSize::Measured {
+            logical: Some(2 * 1024 * 1024),
+            unique: Some(1024 * 1024),
+            scan: const_scan(),
+        };
+        assert!(measured.describe().contains("measured now"));
+        assert!(store::age_text(0) == "0s" && store::age_text(600) == "10m");
     }
 
     fn last(slot: &str, label: &str, at_ms: Option<u64>) -> store::LastUse {
