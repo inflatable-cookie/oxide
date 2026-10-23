@@ -226,6 +226,10 @@ enum ReceiptState {
     /// The selected root was deleted or resolved by an explicit operator
     /// prune; the receipt keeps the exact intent as evidence.
     Pruned,
+    /// An operator-listed receiptless legacy root of this checkout is being
+    /// pruned under the recorded intent (oxide#129). Every bind, adopt,
+    /// automatic adoption, detach, clean and replay refuses until it settles.
+    Pruning,
 }
 
 /// The checkout's owned-output receipt, keyed by canonical checkout.
@@ -440,6 +444,7 @@ impl Receipt {
             (ReceiptState::Committed, Some(_), None) => {}
             (ReceiptState::Detached, None, None) => {}
             (ReceiptState::Pruned, _, None) => {}
+            (ReceiptState::Pruning, None, None) if self.pruned.is_some() => {}
             (ReceiptState::Prepared, _, Some(prepared))
                 if prepared.generation == self.generation.saturating_add(1)
                     && prepared.generation > 0
@@ -562,6 +567,14 @@ impl Marker {
 
     pub(crate) fn kind(&self) -> RootKind {
         self.kind
+    }
+
+    pub(crate) fn checkout(&self) -> &Path {
+        &self.checkout
+    }
+
+    pub(crate) fn checkout_id(&self) -> &str {
+        &self.checkout_id
     }
 
     pub(crate) fn volume_uuid(&self) -> Option<&str> {
@@ -862,6 +875,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
             ReceiptState::Prepared => "prepared",
             ReceiptState::Detached => "detached",
             ReceiptState::Pruned => "pruned",
+            ReceiptState::Pruning => "pruning",
         });
     let next_generation = receipt
         .as_ref()
@@ -1056,6 +1070,9 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
                         )
                     })
                     .unwrap_or_else(|| "the recorded root was pruned".to_owned()),
+                ReceiptState::Pruning => {
+                    "a listed legacy root of this checkout is being pruned".to_owned()
+                }
                 ReceiptState::Prepared => format!(
                     "an interrupted transition to {} is pending",
                     receipt
@@ -1701,6 +1718,7 @@ fn bind_ephemeral(context: &Context, expected: Option<&Selected>) -> Result<Outc
     };
     match receipt.state {
         ReceiptState::Detached | ReceiptState::Pruned => Ok(Outcome::default()),
+        ReceiptState::Pruning => Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
         ReceiptState::Prepared => Err(
             "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
                 .to_owned(),
@@ -1760,6 +1778,7 @@ fn bind_under_binding(
 ) -> Bind {
     let generation = receipt.generation;
     let wanted = match receipt.state {
+        ReceiptState::Pruning => return Bind::Refuse("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
         ReceiptState::Detached | ReceiptState::Pruned => {
             return match expected {
                 Some(_) => Bind::Refuse(
@@ -3122,6 +3141,9 @@ fn crash_point(point: &str) -> Result<(), String> {
 
 /// Replay a prepared receipt: the exact new/old generations only.
 fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
+    if receipt.state == ReceiptState::Pruning {
+        return Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned());
+    }
     if receipt.state != ReceiptState::Prepared {
         return Ok(receipt);
     }
@@ -3426,6 +3448,14 @@ pub(crate) fn mark_pruned(
         }
         return Err("the receipt records a different prune intent".to_owned());
     }
+    if receipt.state == ReceiptState::Pruning
+        && receipt
+            .pruned
+            .as_ref()
+            .is_none_or(|record| record.intent != intent)
+    {
+        return Err("the pruning receipt records a different prune intent".to_owned());
+    }
     receipt.state = ReceiptState::Pruned;
     receipt.link_mut().selected = None;
     receipt.link_mut().prepared = None;
@@ -3436,6 +3466,89 @@ pub(crate) fn mark_pruned(
     });
     receipt.updated_ms = process::now_ms();
     write_receipt(control, &receipt)
+}
+
+/// Exclusively create the `pruning` receipt that protects an operator-listed
+/// receiptless legacy root before its prune intent is journaled (oxide#129).
+/// Under the internal publication lock: no receipt may exist, except this
+/// writer's own interrupted creation (a `pruning` receipt whose intent no
+/// registry journal records), which is rebound to the new intent. Any other
+/// existing receipt refuses. No adoption history is reconstructed.
+pub(crate) fn create_pruning_receipt(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    intent: &str,
+    journaled: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    let _guard = store::publication_guard(control)?;
+    let mut receipt = match read_receipt(control, checkout, checkout_id)? {
+        None => Receipt::first(checkout, checkout_id),
+        Some(existing)
+            if existing.state == ReceiptState::Pruning
+                && existing
+                    .pruned
+                    .as_ref()
+                    .is_some_and(|record| !journaled(&record.intent)) =>
+        {
+            existing
+        }
+        Some(_) => return Err(
+            "the checkout already has an owned-output receipt; a receiptless legacy root is kept"
+                .to_owned(),
+        ),
+    };
+    receipt.state = ReceiptState::Pruning;
+    receipt.link_mut().selected = None;
+    receipt.link_mut().prepared = None;
+    receipt.link_mut().reserved = None;
+    receipt.pruned = Some(PruneRecord {
+        intent: intent.to_owned(),
+        outcome: "pruning".to_owned(),
+        at_ms: process::now_ms(),
+    });
+    receipt.updated_ms = process::now_ms();
+    write_receipt(control, &receipt)
+}
+
+/// Remove this writer's own `pruning` receipt for exactly `intent`, when its
+/// journal was never published or was rolled back with no root effect.
+pub(crate) fn discard_pruning_receipt(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    intent: &str,
+) -> Result<bool, String> {
+    let _guard = store::publication_guard(control)?;
+    let Some(receipt) = read_receipt(control, checkout, checkout_id)? else {
+        return Ok(false);
+    };
+    if receipt.state != ReceiptState::Pruning
+        || receipt
+            .pruned
+            .as_ref()
+            .is_none_or(|record| record.intent != intent)
+    {
+        return Ok(false);
+    }
+    let path = receipt_path(control, checkout_id);
+    fs::remove_file(&path).map_err(|error| {
+        format!(
+            "cannot remove the pruning receipt {}: {error}",
+            path.display()
+        )
+    })?;
+    sync_directory(&control.join("outputs"))?;
+    Ok(true)
+}
+
+/// A marker read for prune discovery of a listed receiptless root.
+pub(crate) fn read_marker_for_prune(root: &Path) -> Result<Marker, String> {
+    read_marker(root)
+}
+
+pub(crate) fn receipt_is_pruning(receipt: &Receipt) -> bool {
+    receipt.state == ReceiptState::Pruning
 }
 
 fn read_marker(root: &Path) -> Result<Marker, String> {
@@ -3879,6 +3992,7 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
     };
     match receipt.state {
         ReceiptState::Detached | ReceiptState::Pruned => Ok(None),
+        ReceiptState::Pruning => Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
         ReceiptState::Prepared => Err(
             "clean refused: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before cleaning"
                 .to_owned(),

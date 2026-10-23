@@ -41,6 +41,12 @@ pub const RESOLUTION_VERSION: &str = "oxide.outputs.prune-resolution/1";
 
 const REGISTRY_FILE: &str = "registry.json";
 const OBSERVATIONS_FILE: &str = "prune-observations.json";
+/// The diagnostic tombstone ring (oxide#129): settled prune outcomes only,
+/// oldest first, compactable. Never a safety journal or a live cap.
+const TOMBSTONES_FILE: &str = "tombstones.json";
+const TOMBSTONES_VERSION: &str = "oxide.outputs.tombstones/1";
+const MAX_TOMBSTONES: usize = 16_384;
+const MAX_TOMBSTONE_BYTES: usize = 4 * 1024 * 1024;
 const QUARANTINE_PREFIX: &str = ".prune-";
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ROWS: usize = 4096;
@@ -264,6 +270,10 @@ struct Candidate {
     logical_bytes: u64,
     allocated_bytes: u64,
     accounting_complete: bool,
+    /// An operator-listed legacy root with no registry row and no receipt:
+    /// it is protected by an exclusive `pruning` receipt before its intent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    receiptless: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1980,11 +1990,33 @@ fn evaluate(
                     logical_bytes: logical,
                     allocated_bytes: allocated,
                     accounting_complete: complete,
+                    receiptless: false,
                 });
             }
             Ok(Some(reason)) | Err(reason) => out.kept = Some(reason),
         }
         evaluated.push(out);
+    }
+    // Operator-listed roots that no registry row names: only a receiptless
+    // legacy root with every other predicate positive can be a candidate.
+    if let Some(list) = list {
+        let mut extra = 0usize;
+        for root in &list.roots {
+            if registry.rows.iter().any(|row| &row.root == root) {
+                continue;
+            }
+            let mut entry = evaluate_receiptless(store, control, registry, root, false);
+            if entry.candidate.is_some() {
+                extra += 1;
+                if registry.rows.len() + extra > MAX_ROWS {
+                    entry.candidate = None;
+                    entry.kept = Some(
+                        "a temporary pruning row would exceed the registry row limit".to_owned(),
+                    );
+                }
+            }
+            evaluated.push(entry);
+        }
     }
     if let Some(reason) = snapshot_error {
         for entry in &mut evaluated {
@@ -3166,8 +3198,26 @@ fn prune_one_barrier(
     // gets one bounded reread; a second change keeps the root.
     let mut attempts = 0;
     loop {
-        let revision = recheck_candidate(store, control, candidate, list).map_err(Stop::Refuse)?;
-        if journal_intent(
+        let revision = if candidate.receiptless {
+            recheck_receiptless(store, control, candidate)
+        } else {
+            recheck_candidate(store, control, candidate, list)
+        }
+        .map_err(Stop::Refuse)?;
+        // A receiptless legacy root is protected by its exclusive `pruning`
+        // receipt before the intent exists; if the intent is not published
+        // the receipt is discarded again, with no output effect.
+        if candidate.receiptless {
+            outputs::create_pruning_receipt(
+                control,
+                &candidate.checkout,
+                &candidate.checkout_id,
+                &id,
+                &|intent| journaled(control, intent),
+            )
+            .map_err(Stop::Refuse)?;
+        }
+        let published = journal_intent(
             store,
             control,
             candidate,
@@ -3175,7 +3225,17 @@ fn prune_one_barrier(
             &id,
             &quarantine,
             revision,
-        )? {
+        );
+        if candidate.receiptless && matches!(published, Ok(false) | Err(Stop::Refuse(_))) {
+            outputs::discard_pruning_receipt(control, &candidate.checkout, &candidate.checkout_id, &id)
+                .map_err(|error| {
+                    Stop::Pending(format!(
+                        "the pruning receipt for {} could not be discarded after its intent was not published ({error})",
+                        candidate.checkout.display()
+                    ))
+                })?;
+        }
+        if published? {
             break;
         }
         attempts += 1;
@@ -3291,22 +3351,58 @@ fn journal_intent(
             "the registry became incomplete before the intent".to_owned(),
         ));
     }
-    let row = registry
-        .rows
-        .iter_mut()
-        .find(|row| {
-            row.checkout_id == candidate.checkout_id
-                && row.member == candidate.member
-                && row.root == candidate.root
-        })
-        .ok_or_else(|| Stop::Refuse("the registry row disappeared".to_owned()))?;
-    if !row.selected || row.pending || row.pruning.is_some() {
-        return Err(Stop::Refuse(
-            "the registry row is no longer an eligible selection".to_owned(),
-        ));
+    if candidate.receiptless {
+        // A temporary pruning row, within the live caps; never a selection.
+        if registry.rows.iter().any(|row| row.root == candidate.root) {
+            return Err(Stop::Refuse(
+                "a registry row now names the listed root".to_owned(),
+            ));
+        }
+        if registry.rows.len() >= MAX_ROWS {
+            return Err(Stop::Refuse(
+                "the registry row limit leaves no room for a temporary pruning row".to_owned(),
+            ));
+        }
+        registry.rows.push(Row {
+            checkout_id: candidate.checkout_id.clone(),
+            checkout: candidate.checkout.clone(),
+            checkout_volume_uuid: None,
+            receipt: candidate.receipt.clone(),
+            member: candidate.member.clone(),
+            root: candidate.root.clone(),
+            root_kind: candidate.root_kind,
+            volume_uuid: candidate.volume_uuid.clone(),
+            recipe: outputs::RECIPE_PUBLIC.to_owned(),
+            nonce: candidate.nonce.clone(),
+            generation: candidate.generation,
+            root_dev: Some(candidate.dev),
+            root_ino: Some(candidate.ino),
+            marker_digest: Some(candidate.marker_digest.clone()),
+            selected: false,
+            pending: false,
+            pruning: Some(id.to_owned()),
+            pruned_ms: None,
+            reservation: None,
+            cancelling: None,
+        });
+    } else {
+        let row = registry
+            .rows
+            .iter_mut()
+            .find(|row| {
+                row.checkout_id == candidate.checkout_id
+                    && row.member == candidate.member
+                    && row.root == candidate.root
+            })
+            .ok_or_else(|| Stop::Refuse("the registry row disappeared".to_owned()))?;
+        if !row.selected || row.pending || row.pruning.is_some() {
+            return Err(Stop::Refuse(
+                "the registry row is no longer an eligible selection".to_owned(),
+            ));
+        }
+        row.selected = false;
+        row.pruning = Some(id.to_owned());
     }
-    row.selected = false;
-    row.pruning = Some(id.to_owned());
     while registry.intents.len() >= MAX_INTENTS {
         let completed = registry
             .intents
@@ -3440,15 +3536,105 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
         id,
         outcome,
     )?;
+    {
+        let _guard = store::publication_guard(control)?;
+        let mut registry = ready_registry(control)?;
+        let Some(record) = registry
+            .intents
+            .iter()
+            .find(|record| record.id == id)
+            .cloned()
+        else {
+            return Err(format!("prune intent {id} disappeared"));
+        };
+        // Both terminal states are durable: the completed row and the settled
+        // intent leave the live registry in this one revision. Unsettled
+        // intents are never removed here.
+        registry.intents.retain(|record| record.id != id);
+        registry.rows.retain(|row| {
+            !(row.checkout_id == record.identity.checkout_id
+                && row.member == record.identity.member
+                && row.root == record.identity.root
+                && row.pruned_ms.is_some()
+                && !row.live())
+        });
+        registry.bump()?;
+        write_registry(control, &registry)?;
+    }
+    // Diagnostics only, best effort after the positive completion.
+    if let Err(reason) = append_tombstone(
+        control,
+        Tombstone {
+            intent: id.to_owned(),
+            checkout_id: intent.identity.checkout_id.clone(),
+            root: intent.identity.root.clone(),
+            nonce: intent.identity.nonce.clone(),
+            outcome: outcome.to_owned(),
+            at_ms: process::now_ms(),
+        },
+    ) {
+        eprintln!("oxide: the prune tombstone was not recorded ({reason}); diagnostics only");
+    }
+    Ok(())
+}
+
+/// One settled prune outcome kept for diagnostics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tombstone {
+    intent: String,
+    checkout_id: String,
+    root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce: Option<String>,
+    outcome: String,
+    at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tombstones {
+    version: String,
+    entries: Vec<Tombstone>,
+}
+
+/// Append to the bounded ring, compacting oldest first to 16,384 entries and
+/// 4 MiB. An unreadable or foreign ring is replaced: it is diagnostics, and
+/// no safety decision reads it.
+fn append_tombstone(control: &Path, entry: Tombstone) -> Result<(), String> {
     let _guard = store::publication_guard(control)?;
-    let mut registry = ready_registry(control)?;
-    let Some(record) = registry.intents.iter_mut().find(|record| record.id == id) else {
-        return Err(format!("prune intent {id} disappeared"));
-    };
-    record.receipt_settled = true;
-    record.updated_ms = process::now_ms();
-    registry.bump()?;
-    write_registry(control, &registry)
+    let path = registry_dir(control).join(TOMBSTONES_FILE);
+    let mut ring = read_bounded(&path, MAX_TOMBSTONE_BYTES, "tombstone ring")
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Tombstones>(&bytes).ok())
+        .filter(|ring| ring.version == TOMBSTONES_VERSION)
+        .unwrap_or(Tombstones {
+            version: TOMBSTONES_VERSION.to_owned(),
+            entries: Vec::new(),
+        });
+    ring.entries.push(entry);
+    compact_tombstones(&mut ring)?;
+    let bytes = serde_json::to_vec(&ring).map_err(|error| error.to_string())?;
+    let temp = registry_dir(control).join(format!(".tombstones.tmp-{}", std::process::id()));
+    write_private(&temp, &bytes)?;
+    fs::rename(&temp, &path)
+        .map_err(|error| format!("cannot publish the tombstone ring: {error}"))?;
+    sync_directory(&registry_dir(control))
+}
+
+fn compact_tombstones(ring: &mut Tombstones) -> Result<(), String> {
+    let excess = ring.entries.len().saturating_sub(MAX_TOMBSTONES);
+    ring.entries.drain(..excess);
+    while !ring.entries.is_empty()
+        && serde_json::to_vec(ring)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_TOMBSTONE_BYTES
+    {
+        let drop = (ring.entries.len() / 16).max(1);
+        ring.entries.drain(..drop);
+    }
+    Ok(())
 }
 
 fn checkout_absence_for_candidate(candidate: &Candidate, legacy: bool) -> Result<Absence, String> {
@@ -3554,6 +3740,7 @@ fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<Resum
                 logical_bytes: 0,
                 allocated_bytes: 0,
                 accounting_complete: false,
+                receiptless: false,
             };
             let session = match RootSession::open(&candidate) {
                 Ok(session) => session,
@@ -3607,21 +3794,269 @@ fn resume_quarantine(
 /// Remove an intent that provably had no filesystem effect and restore the
 /// row's selection, all in one durable revision.
 fn rollback_intent(_store: &Store, control: &Path, intent: &Intent) -> Result<(), String> {
-    let _guard = store::publication_guard(control)?;
-    let mut registry = ready_registry(control)?;
     let identity = intent.identity.clone();
-    registry.intents.retain(|record| record.id != intent.id);
-    if let Some(row) = registry.rows.iter_mut().find(|row| {
-        row.checkout_id == identity.checkout_id
-            && row.member == identity.member
-            && row.root == identity.root
-    }) {
-        row.selected = true;
-        row.pending = false;
-        row.pruning = None;
+    // A receiptless legacy root's intent is protected by this writer's own
+    // `pruning` receipt and a temporary row; both go, registry first, so the
+    // checkout stays refused until the journal is gone.
+    let receiptless =
+        outputs::read_receipt_for_prune(control, &identity.checkout, &identity.checkout_id)?
+            .is_some_and(|receipt| outputs::receipt_is_pruning(&receipt));
+    {
+        let _guard = store::publication_guard(control)?;
+        let mut registry = ready_registry(control)?;
+        registry.intents.retain(|record| record.id != intent.id);
+        let matches = |row: &Row| {
+            row.checkout_id == identity.checkout_id
+                && row.member == identity.member
+                && row.root == identity.root
+        };
+        if receiptless {
+            registry.rows.retain(|row| {
+                !(matches(row) && row.pruning.as_deref() == Some(intent.id.as_str()))
+            });
+        } else if let Some(row) = registry.rows.iter_mut().find(|row| matches(row)) {
+            row.selected = true;
+            row.pending = false;
+            row.pruning = None;
+        }
+        registry.bump()?;
+        write_registry(control, &registry)?;
     }
-    registry.bump()?;
-    write_registry(control, &registry)
+    if receiptless {
+        outputs::discard_pruning_receipt(
+            control,
+            &identity.checkout,
+            &identity.checkout_id,
+            &intent.id,
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether the registry journals `intent`.
+fn journaled(control: &Path, intent: &str) -> bool {
+    read_registry(control)
+        .ok()
+        .flatten()
+        .is_some_and(|registry| registry.intent(intent).is_some())
+}
+
+/// Writer closure for one checkout, outside or (with `under_barrier`) inside
+/// its clean barrier. `Some(reason)` keeps the root.
+fn custody_reason(
+    store: &Store,
+    control: &Path,
+    checkout: &Path,
+    under_barrier: bool,
+) -> Result<Option<String>, String> {
+    if under_barrier {
+        return Ok(custody_clear_under_barrier(store, control, checkout).err());
+    }
+    match store.checkout_custody(checkout, 0)? {
+        CheckoutCustody::Clear => {}
+        CheckoutCustody::Writers => {
+            return Ok(Some(
+                "an active writer still holds this checkout".to_owned(),
+            ))
+        }
+        CheckoutCustody::Unknown(reason) => {
+            return Ok(Some(format!("writer custody is unknown ({reason})")))
+        }
+    }
+    for pool_control in [control.to_path_buf(), removable::removable_control(control)] {
+        match store::active_holders(&pool_control, checkout) {
+            Ok(holders) => {
+                if let Some(holder) = holders.into_iter().next() {
+                    return Ok(Some(format!(
+                        "a recorded writer still holds this checkout ({holder})"
+                    )));
+                }
+            }
+            Err(reason) => return Ok(Some(format!("writer records are unreadable ({reason})"))),
+        }
+    }
+    Ok(None)
+}
+
+/// Evaluate one operator-listed root that no registry row names. Only a
+/// receiptless legacy root qualifies: a real directory directly inside the
+/// registered volume's `oxide-outputs`, a well-formed owner marker for that
+/// volume, no receipt for its checkout (or only this writer's own
+/// interrupted `pruning` creation), no journal or live reference for the
+/// checkout, the checkout's actual leaf absent, every writer closed and the
+/// root verified through the registered volume. Anything else keeps it.
+fn evaluate_receiptless(
+    store: &Store,
+    control: &Path,
+    registry: &Registry,
+    root: &Path,
+    under_barrier: bool,
+) -> Evaluated {
+    let mut row = Row {
+        checkout_id: String::new(),
+        checkout: PathBuf::new(),
+        checkout_volume_uuid: None,
+        receipt: PathBuf::new(),
+        member: outputs::MEMBER.to_owned(),
+        root: root.to_path_buf(),
+        root_kind: RootKind::External,
+        volume_uuid: None,
+        recipe: outputs::RECIPE_PUBLIC.to_owned(),
+        nonce: None,
+        generation: 0,
+        root_dev: None,
+        root_ino: None,
+        marker_digest: None,
+        selected: false,
+        pending: false,
+        pruning: None,
+        pruned_ms: None,
+        reservation: None,
+        cancelling: None,
+    };
+    let outcome = receiptless_candidate(store, control, registry, root, under_barrier, &mut row);
+    match outcome {
+        Ok(candidate) => Evaluated {
+            row,
+            candidate: Some(candidate),
+            kept: None,
+            legacy: true,
+        },
+        Err(reason) => Evaluated {
+            row,
+            candidate: None,
+            kept: Some(reason),
+            legacy: true,
+        },
+    }
+}
+
+fn receiptless_candidate(
+    store: &Store,
+    control: &Path,
+    registry: &Registry,
+    root: &Path,
+    under_barrier: bool,
+    row: &mut Row,
+) -> Result<Candidate, String> {
+    if !registry.complete {
+        return Err("the registry is sticky-incomplete, so prune keeps every root".to_owned());
+    }
+    let registration =
+        removable::read_registration(control)?.ok_or("no removable drive is registered")?;
+    if root.parent()
+        != Some(
+            registration
+                .mount_point
+                .join(outputs::EXTERNAL_DIR)
+                .as_path(),
+        )
+    {
+        return Err(
+            "the listed root is not directly inside the registered volume's oxide-outputs"
+                .to_owned(),
+        );
+    }
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("the listed root is not inspectable ({error})"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("the listed root is not a real directory".to_owned());
+    }
+    let marker = outputs::read_marker_for_prune(root)?;
+    if marker.kind() != RootKind::External
+        || marker.volume_uuid() != Some(registration.volume_uuid.as_str())
+    {
+        return Err("the listed root's marker is not for the registered volume".to_owned());
+    }
+    use std::os::unix::fs::MetadataExt;
+    row.checkout_id = marker.checkout_id().to_owned();
+    row.checkout = marker.checkout().to_path_buf();
+    if !hex64(&row.checkout_id) {
+        return Err("the listed root's marker names an unusable checkout identity".to_owned());
+    }
+    row.receipt = outputs::receipt_path_public(control, &row.checkout_id);
+    row.volume_uuid = Some(registration.volume_uuid.clone());
+    row.nonce = marker.nonce().map(str::to_owned);
+    row.generation = marker.generation();
+    row.root_dev = Some(metadata.dev());
+    row.root_ino = Some(metadata.ino());
+    row.marker_digest = Some(outputs::marker_digest(root)?);
+    if registry
+        .unfinished_intents()
+        .any(|intent| intent.identity.checkout_id == row.checkout_id)
+    {
+        return Err("the checkout has an unsettled prune intent".to_owned());
+    }
+    if registry
+        .live_rows()
+        .any(|other| other.checkout_id == row.checkout_id)
+    {
+        return Err("the checkout has a live registry reference".to_owned());
+    }
+    match outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id)? {
+        None => {}
+        Some(receipt) if outputs::receipt_is_pruning(&receipt) => {}
+        Some(_) => {
+            return Err(
+                "the checkout has an owned-output receipt; only receiptless listed roots are pruned this way"
+                    .to_owned(),
+            )
+        }
+    }
+    match checkout_absence(row, true)? {
+        Absence::Absent => {}
+        Absence::Present => return Err("the checkout is present, so its root is kept".to_owned()),
+        Absence::Unknown(reason) => return Err(format!("checkout absence is unknown ({reason})")),
+    }
+    if let Some(reason) = custody_reason(store, control, &row.checkout, under_barrier)? {
+        return Err(reason);
+    }
+    let facts = match observe_row_root(row)? {
+        RootState::Present(facts) => facts,
+        RootState::Absent => return Err("the listed root is already absent".to_owned()),
+        RootState::Unknown(reason) => return Err(reason),
+    };
+    let (logical, allocated, complete) = account_root(root);
+    Ok(Candidate {
+        checkout_id: row.checkout_id.clone(),
+        checkout: row.checkout.clone(),
+        receipt: row.receipt.clone(),
+        member: row.member.clone(),
+        root: row.root.clone(),
+        root_kind: RootKind::External,
+        volume_uuid: row.volume_uuid.clone(),
+        checkout_volume_uuid: None,
+        nonce: row.nonce.clone(),
+        generation: row.generation,
+        dev: facts.dev,
+        ino: facts.ino,
+        marker_digest: facts.marker_digest,
+        logical_bytes: logical,
+        allocated_bytes: allocated,
+        accounting_complete: complete,
+        receiptless: true,
+    })
+}
+
+/// The locked recheck for a receiptless candidate: the same evaluation under
+/// the checkout's barrier, with the root's identity unchanged.
+fn recheck_receiptless(
+    store: &Store,
+    control: &Path,
+    candidate: &Candidate,
+) -> Result<u64, String> {
+    let registry = ready_registry(control)?;
+    registry.validate()?;
+    let entry = evaluate_receiptless(store, control, &registry, &candidate.root, true);
+    let Some(current) = entry.candidate else {
+        return Err(entry
+            .kept
+            .unwrap_or_else(|| "the listed root is no longer eligible".to_owned()));
+    };
+    if !same_candidates(&[candidate], &[&current]) {
+        return Err("the listed root's identity changed".to_owned());
+    }
+    Ok(registry.revision)
 }
 
 fn stop_text(stop: Stop) -> String {
@@ -4362,6 +4797,7 @@ mod tests {
             logical_bytes: 0,
             allocated_bytes: 0,
             accounting_complete: true,
+            receiptless: false,
         };
         let first = candidate("/vol/oxide-outputs/a", &"b".repeat(32), 1);
         let second = candidate("/vol/oxide-outputs/a", &"d".repeat(32), 1);
@@ -4497,6 +4933,7 @@ mod tests {
             logical_bytes: 0,
             allocated_bytes: 0,
             accounting_complete: true,
+            receiptless: false,
         }
     }
 
