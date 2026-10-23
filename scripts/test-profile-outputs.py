@@ -2,11 +2,16 @@
 """Owned output links at profile directories (oxide#133): the fixed native
 matrix.
 
-The qualified shared supervisor owns the 420 s deadline (roughly 385 s of work
-after its 30 s shutdown margin), 512 MiB monitored scratch, continuous host
-reserve sampling, process census/closure and cleanup:
+The qualified shared supervisor owns the deadline, 512 MiB monitored scratch,
+continuous host reserve sampling, process census/closure and cleanup. The
+brief's scoped amendment (root owner, 2026-10-23T16:10Z, under the temporary
+Supervisor delegation) makes this selector/script/plan 600 s TOTAL instead of
+420; the old 420 publication at 030836f6 stays historical and unactivated. The
+helper's work cutoff is about 565 s (its 30 s reserve plus a 5 s refusal
+margin), inside which cleanup and image detach must finish. The published
+264-400 s work estimate is UNMEASURED, not an established fit:
 
-    python3 scripts/bounded-test.py --limit 420 --scratch-budget-mib 512 \\
+    python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 \\
         -- python3 scripts/test-profile-outputs.py
 
 This script is a whole fixed script with no supervision, clock, signal or
@@ -16,7 +21,7 @@ scratch of its own. Every write stays inside the supervisor-owned scratch
 APFS sparse image at a unique `/Volumes/<name>` and uses one private `HOME`,
 `CARGO_HOME`, directory pool and fixture tree per session.
 
-Staging (measured at author time, not a gate): two independent configs from
+Staging (an unmeasured estimate, not a gate): two independent configs from
 authenticated pinned source, this HEAD's candidate (~37-60 s) and base
 `4a70b83` (~37-60 s); the script discards each staging target after copying
 its binary into the owned `bin/` directory so both never exceed the allocation:
@@ -144,12 +149,16 @@ fn main() {
 def plan_only() -> int:
     print("profile-outputs proof allocation (unmeasured staging estimate)")
     print(f"  script          {os.path.abspath(__file__)}")
-    print(f"  supervisor      scripts/bounded-test.py --limit 420 --scratch-budget-mib 512")
-    print(f"  deadline        420 s total; helper work window ~385 s ({SHUTDOWN_MARGIN_S} s margin)")
-    print("  fit             UNMEASURED: no native, trial or setup-only run has been activated")
+    print("  supervisor      scripts/bounded-test.py --limit 600 --scratch-budget-mib 512")
+    print(f"  deadline        600 s total (scoped brief amendment); helper work cutoff ~565 s")
+    print("                  = 30 s helper reserve + 5 s refusal margin; cleanup/detach inside it")
+    print("  fit             UNMEASURED: 264-400 s estimated work; no native, trial or")
+    print("                  setup-only run has been activated, so the estimate is not a fit")
     print("  time estimate   two independent offline stagings 37-60 s each at Cargo's default")
-    print("                  parallelism, 20 s setup, 120-200 s cases, 30 s cleanup ->")
-    print("                  264-400 s estimated work; the 30 s margin leaves 385 s")
+    print("                  parallelism, 20 s setup, 120-200 s cases, 30 s cleanup")
+    print("  history         the 420 s publication at 030836f6 is historical and unactivated")
+    print("  amendment       GRANTED scoped bound: 600 s total (root owner 2026-10-23T16:10Z),")
+    print("                  512 MiB unchanged; no disk increase, runner change or native start")
     print("  disk            288 MiB staging peak, counted as ONE staging target at a time")
     print("                  (each is copied out and discarded before the next starts; two")
     print("                  live targets are NOT assumed), + 128 MiB image backing +")
