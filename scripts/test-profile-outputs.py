@@ -976,6 +976,33 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 creator cleared", creator_fixture)
     expect(code == 0, f"12: adopt after clearing the creator failed: {stderr}")
     expect_layout(creator_fixture, {"debug": f"link:{creator_root}"})
+    # A crash after the P4 commit keeps the committed real target and the
+    # cleanup journal; a replay finishes cleanup and never rolls back.
+    p4 = make_checkout(proof, "p4-cleanup")
+    auto_legacy(proof, p4)
+    env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": "migration-p4"}
+    code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 p4 crash", p4, env)
+    expect(code != 0, "12: the injected P4 stop did not stop adopt")
+    p4_receipt = perm.read_json(perm.receipt_path(pool, p4))
+    expect(p4_receipt["state"] == "committed", "12: P4 did not commit before cleanup")
+    expect(p4_receipt["layout"] == "profile", "12: P4 did not select the profile layout")
+    expect("transition" in p4_receipt, "12: the P4 cleanup journal was not retained")
+    expect(
+        not os.path.islink(os.path.join(p4, "target"))
+        and os.path.isdir(os.path.join(p4, "target")),
+        "12: P4 target is not a real directory",
+    )
+    expect_layout(p4, {"debug": f"link:{root_of(pool, p4)}"})
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 p4 replay", p4)
+    expect(code == 0, f"12: replaying the P4 cleanup failed: {stderr}")
+    finished = perm.read_json(perm.receipt_path(pool, p4))
+    expect("transition" not in finished, "12: the replay did not finish the cleanup journal")
+    expect_layout(p4, {"debug": f"link:{root_of(pool, p4)}"})
+    expect(
+        not os.path.exists(os.path.join(p4, ".target.oxide-old-3")),
+        "12: the target backup survived cleanup",
+    )
+
     # A committed migration is never rolled back.
     rollback = make_checkout(proof, "committed")
     auto_legacy(proof, rollback)
@@ -1252,6 +1279,7 @@ def run(proof: Proof, repo: str) -> None:
         any(candidate["root"] == gone_root for candidate in preview["candidates"]),
         f"20: the gone checkout's root is not a candidate: {preview['candidates']}",
     )
+
     # Another checkout's reference keeps the root: a peer reference for the
     # same root turns the candidate set empty (KEEP) while it is live.
     registry_path = os.path.join(pool, "oxide-managed", "outputs", "registry.json")
@@ -1314,6 +1342,7 @@ def run(proof: Proof, repo: str) -> None:
         not any(candidate["root"] == gone_root for candidate in kept_preview["candidates"]),
         f"20: another checkout's reference did not keep the root: {kept_preview['candidates']}",
     )
+
     expect(os.path.isdir(gone_root), "20: the peer-referenced root was removed")
     with open(registry_path, "wb") as handle:
         handle.write(registry_original)
@@ -1422,6 +1451,32 @@ def run(proof: Proof, repo: str) -> None:
     expect(settled["pruned"]["at_ms"] == fixed_ms, f"20: the terminal timestamp changed: {settled.get('pruned')}")
     expect(perm.sha256_file(perm.receipt_path(pool, gone)) == expected, "20: the replay rewrote the terminal image")
     expect(not os.path.exists(gone_root), "20: the root reappeared")
+    # An unrelated gone checkout is still an eligible candidate and is pruned
+    # independently, so the peer KEEP above is specific to the referenced root.
+    unrelated = make_checkout(proof, "gone-unrelated")
+    code, _, stderr = oxide(proof, ["build"], "20 unrelated build", unrelated)
+    expect(code == 0, f"20: unrelated build failed: {stderr}")
+    adopt(proof, unrelated, "20 unrelated adopt")
+    unrelated_root = root_of(pool, unrelated)
+    os.rename(unrelated, unrelated + "-moved")
+    code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 unrelated dry", group)
+    expect(code == 0, f"20: unrelated dry run failed: {stderr}")
+    unrelated_preview = json.loads(stdout)
+    expect(
+        any(candidate["root"] == unrelated_root for candidate in unrelated_preview["candidates"]),
+        f"20: the unrelated gone root is not an eligible candidate: {unrelated_preview['candidates']}",
+    )
+    unrelated_plan = os.path.join(proof.root, "prune-unrelated.json")
+    with open(unrelated_plan, "wb") as handle:
+        handle.write(stdout.encode())
+    code, _, stderr = oxide(
+        proof,
+        ["outputs", "prune", "--plan", unrelated_plan, "--plan-sha256", perm.sha256_file(unrelated_plan)],
+        "20 unrelated prune",
+        group,
+    )
+    expect(code == 0, f"20: the unrelated prune failed: {stderr}")
+    expect(not os.path.exists(unrelated_root), "20: the unrelated root was not pruned")
 
 
 

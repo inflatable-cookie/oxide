@@ -4644,7 +4644,13 @@ fn rollback_intent(_store: &Store, control: &Path, intent: &Intent) -> Result<()
                         .to_owned(),
                 );
             }
-            let live: Vec<&Row> = registry.rows.iter().filter(|row| matches(row)).collect();
+            // The group, not the representative member, is the transaction
+            // scope: every row of (checkout, root) is compared and restored.
+            let live: Vec<&Row> = registry
+                .rows
+                .iter()
+                .filter(|row| row.checkout_id == identity.checkout_id && row.root == identity.root)
+                .collect();
             if live.len() != intent.group.len() {
                 return Err(
                     "the root's registry references changed since the prune intent; the root is kept"
@@ -4671,11 +4677,11 @@ fn rollback_intent(_store: &Store, control: &Path, intent: &Intent) -> Result<()
                 }
             }
             for recorded in &intent.group {
-                if let Some(row) = registry
-                    .rows
-                    .iter_mut()
-                    .find(|row| matches(row) && row.member == recorded.member)
-                {
+                if let Some(row) = registry.rows.iter_mut().find(|row| {
+                    row.checkout_id == identity.checkout_id
+                        && row.root == identity.root
+                        && row.member == recorded.member
+                }) {
                     row.selected = recorded.selected;
                     row.pending = false;
                     row.pruning = None;
@@ -6025,6 +6031,143 @@ mod tests {
             ready_registry(&control).unwrap().intent(&id).unwrap().phase,
             IntentPhase::Renamed
         );
+    }
+
+    /// Two members of one root under the same checkout are ONE owner: the
+    /// intent marks and journals the complete group, and rollback restores
+    /// every row only while the pinned receipt preimage is unchanged.
+    #[test]
+    fn a_root_group_is_journaled_and_rolled_back_as_one_owner() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let rows = vec![debug.clone(), release.clone()];
+        let control = ready_control(&fixture, rows, Vec::new());
+        let receipt_path = outputs::receipt_path_public(&control, &debug.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        let selected = |member: &str| {
+            serde_json::json!({
+                "member": member,
+                "selected": {
+                    "kind": "external",
+                    "root": debug.root.to_string_lossy(),
+                    "volume_uuid": debug.volume_uuid,
+                    "nonce": debug.nonce,
+                    "generation": 1
+                }
+            })
+        };
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": "oxide.outputs.transition/3",
+                "checkout": debug.checkout.to_string_lossy(),
+                "checkout_id": debug.checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "layout": "profile",
+                "links": [selected("debug"), selected("release")],
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let candidate = candidate_of(&debug);
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let id = "a".repeat(32);
+        let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
+        let plan = "f".repeat(64);
+        let revision = ready_registry(&control).unwrap().revision;
+        match journal_intent(
+            &store,
+            &control,
+            &candidate,
+            &plan,
+            &id,
+            &quarantine,
+            revision,
+        ) {
+            Ok(true) => {}
+            Ok(false) => panic!("the group journal did not publish"),
+            Err(stop) => panic!("the group journal refused: {}", stop_text(stop)),
+        }
+        let journaled = ready_registry(&control).unwrap();
+        let intent = journaled.intent(&id).unwrap();
+        assert_eq!(
+            intent.group.len(),
+            2,
+            "the group did not record both members"
+        );
+        assert_eq!(
+            intent
+                .group
+                .iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            ["debug", "release"]
+        );
+        for row in journaled.rows.iter().filter(|row| row.root == debug.root) {
+            assert_eq!(
+                row.pruning.as_deref(),
+                Some(id.as_str()),
+                "{} was not marked",
+                row.member
+            );
+            assert!(!row.selected);
+        }
+        // Restoring the recorded preimage rolls back BOTH rows.
+        rollback_intent(&store, &control, intent).unwrap();
+        let rolled = ready_registry(&control).unwrap();
+        for row in rolled.rows.iter().filter(|row| row.root == debug.root) {
+            assert!(row.pruning.is_none(), "{} kept a pruning mark", row.member);
+            if row.member == "debug" {
+                assert!(row.selected);
+            }
+        }
+        // A changed receipt keeps the root: the second journal must roll back
+        // to an error, leaving both rows marked.
+        let revision = ready_registry(&control).unwrap().revision;
+        match journal_intent(
+            &store,
+            &control,
+            &candidate,
+            &plan,
+            &"b".repeat(32),
+            &quarantine,
+            revision,
+        ) {
+            Ok(true) => {}
+            Ok(false) => panic!("the second group journal did not publish"),
+            Err(stop) => panic!("the second group journal refused: {}", stop_text(stop)),
+        }
+        let mut changed = fs::read(&receipt_path).unwrap();
+        changed.push(b'\n');
+        fs::write(&receipt_path, &changed).unwrap();
+        let intent = ready_registry(&control)
+            .unwrap()
+            .intent(&"b".repeat(32))
+            .cloned()
+            .unwrap();
+        assert!(
+            rollback_intent(&store, &control, &intent).is_err(),
+            "rollback restored rows for a changed receipt"
+        );
+        let kept = ready_registry(&control).unwrap();
+        for row in kept.rows.iter().filter(|row| row.root == debug.root) {
+            assert_eq!(
+                row.pruning.as_deref(),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                "{} was restored",
+                row.member
+            );
+        }
     }
 
     /// A deleted or resolved intent whose checkout receipt has not committed
