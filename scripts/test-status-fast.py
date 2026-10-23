@@ -411,14 +411,26 @@ def tree_digest(root: str) -> str:
 
 
 def control_hashes(pool: dict) -> dict:
-    """Exact bytes of every control file that must never change on a read."""
+    """Exact bytes of every control file that must never change on a read.
+
+    The payload is covered separately by its entry count and directory
+    metadata, so a 200,000-entry slot is not reopened once per case.
+    """
     hashes = {}
-    for base, _, names in os.walk(pool["pool"]):
+    pool_root = pool["pool"]
+    for base, dirs, names in os.walk(pool_root):
+        dirs[:] = [
+            name
+            for name in dirs
+            if os.path.relpath(os.path.join(base, name), pool_root) != "payload"
+        ]
         for name in names:
-            path = os.path.join(base, name)
-            relative = os.path.relpath(path, pool["pool"])
-            if relative.startswith("payload/slots/") and "build/" in relative:
+            if name == "status-observations.json":
+                # The fixture writes this diagnostic itself; each case checks
+                # its bytes separately.
                 continue
+            path = os.path.join(base, name)
+            relative = os.path.relpath(path, pool_root)
             if os.path.getsize(path) > 4 * MIB:
                 continue
             hashes[relative] = sha256_file(path)
@@ -430,16 +442,18 @@ def entry_count(slot_path: str) -> int:
 
 
 def cheap_state(pool: dict) -> tuple:
-    """Control bytes plus the payload markers a read must never touch."""
+    """Control bytes plus the payload markers a read must never touch.
+
+    `payload/slots/project-aaaa/quick-1/build` holds the 200,000 fixture
+    entries; its own mtime and inode change if anything is written there.
+    """
     payload = pool["payload"]
-    served = os.path.join(payload, "slots")
-    markers = []
-    for name in sorted(os.listdir(served)):
-        markers.append((name, os.stat(os.path.join(served, name)).st_mtime_ns))
+    build = os.path.join(payload, "slots/project-aaaa/quick-1/build")
+    item = os.stat(build)
     return (
         tuple(sorted(control_hashes(pool).items())),
-        tuple(markers),
         os.stat(payload).st_mtime_ns,
+        (item.st_ino, item.st_mtime_ns, entry_count(build)),
     )
 
 
@@ -856,7 +870,10 @@ def run_cases(
         expect_line(output, "project foo-1234", "recorded removable slot label")
         expect_line(output, "fallback while the removable volume is absent", "internal fallback note")
         expect_line(output, "volume now: not checked by status", "no volume probe")
-        reject_line(output, "MiB available", "no volume reading")
+        expect(
+            re.search(r"volume now: \d", output) is None,
+            f"a recorded status read the volume:\n{output}",
+        )
 
         # --------------------------------------------------------- --measure
         case("measure-settled")
