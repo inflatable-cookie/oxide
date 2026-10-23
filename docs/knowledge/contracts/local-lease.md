@@ -389,9 +389,12 @@ is a separate read:
 
 `managed::measure(pool)` is the diagnostic measurement: the same recorded
 snapshot plus one whole-payload walk and one walk per slot, using the
-existing entry, depth and elapsed bounds (a caller may pass its remaining
-share of one cumulative budget, clamped to the accounting deadline). It takes
-no pool lock, creates none, reconciles nothing and writes nothing, so a
+existing entry and depth bounds. The caller's remaining share of one
+cumulative command budget becomes a single deadline (clamped to the
+accounting bound) that every walk recomputes against, so the payload walk and
+all slot walks stay inside it rather than each starting a fresh bound; past
+the deadline a walk keeps a 1 ms bound and reports an elapsed-deadline gap. It
+takes no pool lock, creates none, reconciles nothing and writes nothing, so a
 recorded `Evicting` slot is walked as it stands and makes coverage unknown.
 After walking it re-reads the pair once; if any slot's ID, incarnation,
 directory or occupancy changed, coverage is unknown rather than pairing a

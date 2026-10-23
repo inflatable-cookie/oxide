@@ -2678,3 +2678,37 @@ fn reuse_measurement_names_the_recorded_slot_directory() {
         "the measurement names the recorded directory"
     );
 }
+
+/// One measurement has one cumulative elapsed deadline: every walk
+/// recomputes what is left of it, so a pool cannot multiply the budget by
+/// its slot count and a slow first walk shortens the rest.
+#[test]
+fn measure_walks_share_one_cumulative_deadline() {
+    let fx = Fixture::new("measure-deadline");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 32 * 1024 * 1024).expect("init");
+    for index in 0..3 {
+        let project = fx.dir(&format!("project-{index}"));
+        let workspace = fx.dir(&format!("workspace-{index}"));
+        let leased = lease_injected(request(&pool, &project, &workspace, &format!("h{index}")))
+            .expect("lease");
+        release_injected(&pool, &leased.lease_id).expect("release");
+    }
+    // Wait well inside the bound before walking: a fresh per-walk bound would
+    // still report the full figure, while a shared deadline can only report
+    // what is left.
+    let bounds = super::pool::measure_after_delay_injected(&pool, 2_000, 300).expect("measure");
+    assert_eq!(bounds.len(), 4, "the payload and three slots are measured");
+    assert!(
+        bounds.iter().all(|bound| *bound < 2_000),
+        "a walk restarted the full bound instead of sharing the deadline: {bounds:?}"
+    );
+    assert!(
+        bounds.iter().all(|bound| *bound >= 1),
+        "every walk keeps a positive bound: {bounds:?}"
+    );
+    assert!(
+        bounds.windows(2).all(|pair| pair[0] >= pair[1]),
+        "the remaining bound must not grow between walks: {bounds:?}"
+    );
+}

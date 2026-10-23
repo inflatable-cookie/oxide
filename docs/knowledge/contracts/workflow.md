@@ -208,16 +208,19 @@ identity, ledger semantics, admission, eviction and recovery are unchanged.
   recorded slot directly under `slots` or under one owner-only project
   folder on the same device. Payload accounting allows two levels above the
   slots, so slot contents keep their depth allowance.
-- **Status.** The first lines say which pool the next build uses, from the
-  same selection check builds make, and the most recently used slot: its
-  pool, slot, project label, checkout and age. Each pool then has one
-  header, with the selected pool first and its own slots beneath it; equal
-  slot numbers in two pools never mix. Every slot line shows its project
-  label (the folder for a labelled slot, else the checkout directory name)
-  and its place, `slots/<dir>` or `slots/<id> (legacy path)`. A registered
-  removable pool that is not usable keeps its registration lines and the
-  reason, and its slots read `not read while the volume is not usable
-  (unknown, not empty)`.
+- **Status.** Default `oxide status` reports the recorded selection and the
+  most recently used slot: its pool, slot, project label, checkout and age.
+  The selection is what the registration and a cheap mount-point presence
+  check record (oxide#128), not the verified selection check a build makes;
+  `status --measure` runs that check and reports its reason. Each pool then
+  has one header, with the recorded selection first and its own slots beneath
+  it; equal slot numbers in two pools never mix. Every slot line shows its
+  project label (the folder for a labelled slot, else the checkout directory
+  name) and its place, `slots/<dir>` or `slots/<id> (legacy path)`. A
+  registered removable pool whose volume is absent or unreadable keeps its
+  registration lines, shows its recorded slots from the internal ledger
+  (unknown, not empty) and never probes the volume; `status --measure` adds
+  the verified reason.
 - **Most recent use.** Within one pool Oxide's use counter orders uses.
   Across pools it compares the wall-clock time recorded at each use since
   #104 (`last_used_ms` in the control state). A use recorded before then has
@@ -226,8 +229,8 @@ identity, ledger semantics, admission, eviction and recovery are unchanged.
   tied. For a removable pool that is not usable, status reads its internal
   control state only: the slot is `unknown` and the label is the checkout
   directory name. An unreadable state reports `unknown`, never "none".
-  Status still opens only what it did before; it acquires nothing and
-  changes no ledger.
+  Default status opens no pool lock, acquires nothing and changes no ledger;
+  it reads the recorded state without reconciling it.
 
 **Proof.** `effigy rust:oxide-pool-layout`
 (`scripts/test-oxide-pool-layout.py`) runs under the qualified shared proof
@@ -486,8 +489,8 @@ tested Cargo:
 
 - the two-worktree gate scenario;
 - effective build-dir: no intermediates in the checkout `target/`;
-- `none` from `oxide status` after Oxide alone, and stray output reported
-  after a plain `cargo check`;
+- `none` from `oxide status --measure` after Oxide alone, and stray output
+  reported after a plain `cargo check`;
 - the shipped decoder over every slot and plain-target `dep-*` file, with
   none refused;
 - a fallback phase on installed 1.94.1.
@@ -1888,11 +1891,14 @@ it never deletes there itself.
 
 - **Resolution.** As Cargo: `CARGO_HOME` when set and non-empty (relative
   to the current directory), else `$HOME/.cargo`. Both unset refuses.
-- **`status`.** One `cargo home:` line: allocation counted once per inode,
-  file names and distinct inodes, from one bounded walk (200,000 entries,
-  depth 64, 10 s; `partial` past a limit). The root must be a real directory;
-  symlinks are not followed and mounts are not crossed. A second line states
-  Cargo's skip conditions as facts. No last-cleanup time is shown: Cargo's
+- **`status`.** Default `oxide status` prints the `cargo home:` path and
+  says it is not measured; it walks nothing (oxide#128). `oxide status
+  --measure` adds the allocation, counted once per inode, with file names and
+  distinct inodes, from one bounded walk (200,000 entries, depth 64, 10 s,
+  cut to what is left of the one shared measurement budget; `partial` past a
+  limit). The root must be a real directory; symlinks are not followed and
+  mounts are not crossed. A second line states Cargo's skip conditions as
+  facts. No last-cleanup time is shown: Cargo's
   only record is also set when its database is created, and reading it
   means opening Cargo's internal database. No usage history is inferred.
 - **`oxide clean --cargo-cache`.** Takes no other arguments. Runs
@@ -2538,8 +2544,8 @@ Tom approved an early host trial on 2026-10-20. His `Builds` volume (`A6AC3ED7-3
 - **No stale-mount-point writes by Oxide.** Oxide creates slot directories with `mkdirat` relative to descriptors opened from the verified mount root, rechecking the binding (descriptor still the registered root, path still that root's device) before each creation and before removing a slot. Cargo itself writes through the slot path; while the volume is mounted that path is the volume. A mid-build removal is part 2.
 - **Flush on release.** Before a removable slot becomes idle (normal release, a refused shared slot handed back, an untrusted slot released for eviction, and crash recovery), Oxide calls `fsync_volume_np(fd, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)` on the verified mount-root descriptor, verifying the binding before and after. The summary line prints its cost; `status` lists recent flushes, including those made during crash recovery. The flush runs after positive writer closure and is a durability step, not a closure proof. A failed or unknown flush retires the slot: the record becomes `retired`, the lease stays held, the slot is never reused, recovered or deleted, and the build's own exit code is unchanged.
 - **Pools and limits.** Each pool keeps its own slots, records, origins and warmth; a lease belongs to the pool whose ledger granted it. The host-wide build limit counts active commands in both pools, reading the other pool's atomically replaced state without its lock, so two commands starting in different pools at the same instant may briefly exceed it by one. A checkout's clean barrier spans both pools: a removable slot attempt holds the internal pool's admission lock (internal first, then removable) and waits for a live internal clean of its checkout, and `oxide clean` (which marks under that lock) waits for the checkout's active removable commands. `oxide clean` drops slot affinity in the internal pool only.
-- **Status.** `status` prints the internal pool, the registration (volume and container UUIDs, configured mode, reserve, admission cap, capacity and quota at registration), the volume's current available/total space, which pool the next build would use and why, and the removable pool's slots, flushes and retired slots. The configured mode and the selected pool are separate facts.
-- **Selection cost.** With a registration, each leased command's selection runs three `diskutil` and three `plutil` calls; without one, none.
+- **Status.** Default `status` prints the internal pool, the registration (volume and container UUIDs, configured mode, reserve, admission cap, capacity and quota at registration), the recorded selection with the mount point's presence, and the removable pool's recorded slots, flushes and retired slots from its internal ledger. It does not open the volume, sample its space or run `diskutil` (oxide#128). `oxide status --measure` verifies the volume exactly as a build would, prints the current available/total space and names the reason when the removable pool is not used. The configured mode and the selected pool are separate facts.
+- **Selection cost.** With a registration, each leased command's selection runs three `diskutil` and three `plutil` calls; without one, none. `oxide status --measure` runs the same check once; default `status` never runs it.
 - **Platforms.** Off macOS, registration refuses and selection always falls back.
 
 Sources: `fstatfs(2)` / `sys/mount.h`; `getattrlist(2)` / `sys/attr.h` (`ATTR_VOL_UUID`); `faccessat(2)` with `AT_EACCESS` (volume writability only); `acl_get_fd_np(3)`, `acl_get_entry(3)`, `acl_free(3)` / `sys/acl.h`; `UF_HIDDEN` / `sys/stat.h`; `fsync_volume_np(3)` / `unistd.h` (macOS 10.8+: `SYNC_VOLUME_FULLSYNC` writes data and metadata to the disk hardware, `SYNC_VOLUME_WAIT` waits; returns a non-zero error code on failure); `diskutil(8)`. Observed on macOS 26.6: `fgetattrlist(ATTR_VOL_UUID)` on a non-root directory's descriptor answers the containing volume's UUID despite the man page's `EINVAL` rule, so the UUID is never treated as proof of a mount root.

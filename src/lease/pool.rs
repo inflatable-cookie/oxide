@@ -21,6 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Where a refused entry sits, for [`LeaseError::UnexpectedEntry`].
 const POOL_PLACE: &str = "pool directory";
@@ -243,6 +244,11 @@ pub(super) struct Pool {
     budget: u64,
     /// Bounds this open's accounting walks use.
     limits: InventoryLimits,
+    /// The shared deadline for every walk of one measurement, if any. Each
+    /// walk's remaining elapsed bound is recomputed from it, so the payload
+    /// and every slot walk draw on one cumulative budget instead of each
+    /// starting a fresh one.
+    deadline: Option<Instant>,
     reconciliation_blocked: bool,
 }
 
@@ -466,7 +472,9 @@ pub mod managed {
 
     /// [`measure`] with a caller's remaining elapsed bound, clamped to the
     /// existing accounting deadline. One `oxide status --measure` gives each
-    /// pool its share of one cumulative budget.
+    /// pool its share of one cumulative budget; inside a pool the payload and
+    /// every slot walk draw on that same deadline rather than each starting
+    /// a fresh bound.
     pub fn measure_within(pool: &Path, max_elapsed_ms: u64) -> Result<MeasuredPool, LeaseError> {
         measure_walks(pool, max_elapsed_ms)
     }
@@ -595,6 +603,27 @@ pub(super) fn measure_injected(pool: &Path) -> Result<super::MeasuredPool, Lease
     managed::measure(pool)
 }
 
+/// Test-only: open a passive measurement, wait, then walk, returning each
+/// scan's recorded elapsed bound so the shared deadline can be observed.
+#[cfg(test)]
+pub(super) fn measure_after_delay_injected(
+    pool: &Path,
+    bound_ms: u64,
+    delay_ms: u64,
+) -> Result<Vec<u64>, LeaseError> {
+    let opened = Pool::open_passive(pool, bound_ms)?;
+    std::thread::sleep(Duration::from_millis(delay_ms));
+    let status = opened.accounted()?;
+    let mut bounds = vec![status.payload_accounting.max_elapsed_ms];
+    bounds.extend(
+        status
+            .slots
+            .iter()
+            .map(|slot| slot.accounting.max_elapsed_ms),
+    );
+    Ok(bounds)
+}
+
 #[cfg(test)]
 pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
     let mut opened = Pool::open(pool)?;
@@ -647,6 +676,7 @@ impl Pool {
             budget: ledger.cap_bytes,
             ledger,
             limits: accounting_limits(),
+            deadline: None,
             reconciliation_blocked: false,
         };
         pool.reconcile_evicting()?;
@@ -668,8 +698,9 @@ impl Pool {
             VOLUME_BACKEND_APFS_V1 => open_volume_payload(&paths, &config)?,
             _ => return Err(LeaseError::BackingMismatch),
         };
+        let bound = max_elapsed_ms.clamp(1, ACCOUNTING_MAX_ELAPSED_MS);
         let mut limits = accounting_limits();
-        limits.max_elapsed_ms = max_elapsed_ms.clamp(1, ACCOUNTING_MAX_ELAPSED_MS);
+        limits.max_elapsed_ms = bound;
         let pending = ledger
             .slots
             .iter()
@@ -682,6 +713,7 @@ impl Pool {
             budget: ledger.cap_bytes,
             ledger,
             limits,
+            deadline: Some(Instant::now() + Duration::from_millis(bound)),
             // Coverage for a measurement made without reconciliation is
             // unknown while a recorded deletion is pending.
             reconciliation_blocked: pending,
@@ -1393,12 +1425,27 @@ impl Pool {
         remove_tree_owned(&slots_root, path)
     }
 
+    /// The bounds the next walk may use: this open's limits, with the
+    /// elapsed bound cut to what is left of the measurement's shared
+    /// deadline. A measurement's payload and every slot walk therefore share
+    /// one cumulative budget; past the deadline a walk keeps a 1 ms bound so
+    /// it still stops and reports an elapsed-deadline gap.
+    fn walk_limits(&self) -> InventoryLimits {
+        let mut limits = self.limits;
+        if let Some(deadline) = self.deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1);
+            limits.max_elapsed_ms = limits.max_elapsed_ms.min(left_ms);
+        }
+        limits
+    }
+
     /// The payload root's whole tree: `slots` and any tolerated Finder
     /// metadata beside it, one `(device, inode)` union. Two extra levels
     /// (`slots` and a project folder) keep slot contents at the depth bound
     /// they had under `slots`.
     fn payload_accounting(&self) -> Sizes {
-        inventory_sizes_with(self.backing.payload_root(), 2, self.limits)
+        inventory_sizes_with(self.backing.payload_root(), 2, self.walk_limits())
     }
 
     /// A slot's path and no-follow root metadata, `None` when missing. A
@@ -1418,25 +1465,19 @@ impl Pool {
     }
 
     fn slot_accounting(&self, id: u64) -> Result<Sizes, LeaseError> {
+        let limits = self.walk_limits();
         match self.slot_root(id)? {
             (_, None) => Ok(Sizes {
                 logical: Some(0),
                 unique: Some(0),
-                scan: scan_with(
-                    self.limits,
-                    AccountingCoverage::Complete,
-                    Vec::new(),
-                    0,
-                    0,
-                    0,
-                ),
+                scan: scan_with(limits, AccountingCoverage::Complete, Vec::new(), 0, 0, 0),
             }),
             (_, Some(metadata)) if metadata.file_type().is_symlink() => Ok(Sizes {
                 logical: None,
                 unique: None,
-                scan: root_failure_with(self.limits, AccountingGapKind::RootSymlink, 0),
+                scan: root_failure_with(limits, AccountingGapKind::RootSymlink, 0),
             }),
-            (path, Some(_)) => Ok(inventory_sizes_with(&path, 0, self.limits)),
+            (path, Some(_)) => Ok(inventory_sizes_with(&path, 0, limits)),
         }
     }
 }
@@ -1512,8 +1553,10 @@ fn snapshot_of(
     }
 }
 
-/// The walks of one passive measurement, sharing the caller's remaining
-/// elapsed bound. No lock, reconciliation, creation or write.
+/// The walks of one passive measurement. The caller's remaining elapsed
+/// bound becomes one deadline that the payload walk and every slot walk
+/// recompute against, so the whole measurement stays within it. No lock,
+/// reconciliation, creation or write.
 ///
 /// A bounded reread afterwards keeps the pairing honest: a concurrent grant,
 /// release or eviction between the read and the walks makes coverage unknown
