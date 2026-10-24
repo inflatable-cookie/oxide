@@ -1171,6 +1171,26 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
     the backing stays in the guard's OWN evidence for the custodian. Backing is
     removed only after a positive ordinary detach confirmation, never from a
     process census."""
+    if ATTACHMENT["uncertain"]:
+        # An earlier device operation's outcome is unknown: no further hdiutil/
+        # diskutil call, no unlink and no backing removal. Record the known
+        # facts and hand the retained backing to the evidence owner.
+        record = known_attachment_facts(proof, label, "unresolved: uncertain attachment state")
+        record["reason"] = ATTACHMENT["uncertain"]
+        record["device_operations_avoided"] = True
+        try:
+            write_attachment_facts("detach-unresolved.json", record)
+        except Exception as error:
+            print(
+                f"{label}: could not record the unresolved attachment facts ({error!r})",
+                file=sys.stderr,
+                flush=True,
+            )
+        fail(
+            f"{label}: a device operation's outcome is unknown, so this run performs no "
+            f"further detach; the mount and backing are retained"
+        )
+        return
     mount = proof.mount
     if not mount:
         return
@@ -1622,29 +1642,34 @@ PREMISE_GUARDS: dict = {}
 # may leave changed (which then skips every later step that needs them). Case
 # 11 is two blocks because its base-created fixture must exist before case 10's
 # warm check, so the step is the unit and the numbered case is the subject.
+SHARED_EVERY_STEP = ("volume", "registration", "pool")
 CASE_STEPS = [
-    # step, case, dependencies, needs, taints
-    ("11.1", "11", (), ("volume", "pool"), ("pool",)),
-    ("11.2", "11", ("11.1",), ("volume", "registration", "pool"), ("registration", "pool")),
-    ("01.1", "01", (), ("volume", "registration"), ("first", "pool")),
-    ("02.1", "02", ("01.1",), ("first", "volume"), ("first", "custody")),
-    ("03.1", "03", ("01.1",), ("first", "volume"), ("first",)),
-    ("04.1", "04", ("01.1",), ("first", "volume"), ("first",)),
-    ("05.1", "05", ("01.1",), ("first", "volume"), ("first",)),
-    ("06.1", "06", ("05.1",), ("first", "volume"), ("first",)),
-    ("07.1", "07", ("01.1",), ("first", "volume"), ("first",)),
-    ("08.1", "08", ("01.1",), ("first", "volume"), ("first",)),
-    ("09.1", "09", ("01.1",), ("first", "volume"), ("first",)),
-    ("10.1", "10", (), ("volume", "pool"), ("pool",)),
-    ("12.1", "12", ("01.1",), ("first", "volume", "pool"), ("pool", "first")),
-    ("13.1", "13", ("01.1",), ("first", "volume", "pool"), ("pool", "first", "custody")),
-    ("14.1", "14", ("01.1",), ("first", "volume"), ("volume", "registration", "first")),
-    ("15.1", "15", ("01.1",), ("first", "volume"), ("first", "pool")),
-    ("16.1", "16", ("01.1", "11.2"), ("first", "volume", "pool"), ("first", "pool", "custody")),
-    ("17.1", "17", ("07.1",), ("first", "volume"), ("first", "custody", "pool")),
-    ("18.1", "18", ("01.1",), ("first", "volume"), ("first", "pool")),
-    ("19.1", "19", ("11.2",), ("volume", "pool"), ("pool",)),
-    ("20.1", "20", ("01.1",), ("first", "volume", "pool"), ("pool", "custody")),
+    # step, case, dependencies, needs, taints. Every step runs `oxide` (or the
+    # staged base binary) against proof.env's SAME private pool and removable
+    # registration, so all of them require that pool and registration; only the
+    # premises a step really does not read are omitted. A failure taints the
+    # pool for every step that used it, conservatively.
+    ("11.1", "11", (), SHARED_EVERY_STEP, ("pool",)),
+    ("11.2", "11", ("11.1",), SHARED_EVERY_STEP, ("registration", "pool")),
+    ("01.1", "01", (), SHARED_EVERY_STEP, ("first", "pool")),
+    ("02.1", "02", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "custody", "pool")),
+    ("03.1", "03", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("04.1", "04", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("05.1", "05", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("06.1", "06", ("05.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("07.1", "07", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("08.1", "08", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("09.1", "09", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("10.1", "10", (), SHARED_EVERY_STEP, ("pool",)),
+    ("12.1", "12", ("01.1",), SHARED_EVERY_STEP + ("first",), ("pool", "first")),
+    ("13.1", "13", ("01.1",), SHARED_EVERY_STEP + ("first",), ("pool", "first", "custody")),
+    ("14.1", "14", ("01.1",), SHARED_EVERY_STEP + ("first",), ("volume", "registration", "first", "pool")),
+    ("15.1", "15", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("16.1", "16", ("01.1", "11.2"), SHARED_EVERY_STEP + ("first",), ("first", "pool", "custody")),
+    ("17.1", "17", ("07.1",), SHARED_EVERY_STEP + ("first",), ("first", "custody", "pool")),
+    ("18.1", "18", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
+    ("19.1", "19", ("11.2",), SHARED_EVERY_STEP, ("pool",)),
+    ("20.1", "20", ("01.1",), SHARED_EVERY_STEP + ("first",), ("pool", "custody")),
 ]
 CASE_STEP_DEPS = {step: deps for step, _, deps, _, _ in CASE_STEPS}
 CASE_STEP_NEEDS = {step: needs for step, _, _, needs, _ in CASE_STEPS}
@@ -1652,6 +1677,10 @@ CASE_STEP_TAINTS = {step: taints for step, _, _, _, taints in CASE_STEPS}
 CASE_STEP_CASE = {step: case for step, case, _, _, _ in CASE_STEPS}
 
 SHARED: dict = {}
+# The memory-only latch for a device operation whose outcome is unknown. It is
+# set BEFORE such an effect propagates, so closeout can keep the backing, the
+# facts and the evidence without attempting any further device operation.
+ATTACHMENT: dict = {"uncertain": None}
 
 
 def first_usable() -> tuple:
@@ -1788,11 +1817,18 @@ def diagnostic_record(proof, started_ms, primary, secondary) -> dict:
         case for case in CASE_IDS if case not in completed and case not in failed and case not in skipped
     ]
     first_oracle = DIAG.failures[0] if DIAG.failures else None
-    # A clean-looking outcome needs a COMPLETE, unaborted collection: any skip,
-    # abort or unexecuted case means the list is not complete.
+    # A cleanup/closeout failure that is not itself a recorded oracle failure
+    # (for example the ordinary detach) means the run did not close out, so the
+    # collection is NOT complete and this is not a clean diagnostic either.
+    closeout_failed = primary is not None and not any(
+        str(primary) == item["observed"] for item in DIAG.failures
+    )
+    collection_complete = (
+        DIAG.aborted is None and not DIAG.skips and not unexecuted and not closeout_failed
+    )
     outcome = (
         "no_oracle_failures"
-        if not DIAG.failures and not DIAG.skips and DIAG.aborted is None and not unexecuted
+        if not DIAG.failures and collection_complete
         else "failures_recorded"
     )
     return {
@@ -1833,7 +1869,8 @@ def diagnostic_record(proof, started_ms, primary, secondary) -> dict:
         "first_recorded_failure": dict(first_oracle) if first_oracle else None,
         "abort": dict(DIAG.aborted) if DIAG.aborted else None,
         "tainted_premises": dict(DIAG.tainted),
-        "collection_complete": DIAG.aborted is None and not DIAG.skips and not unexecuted,
+        "collection_complete": collection_complete,
+        "closeout_failed": closeout_failed,
         "secondary_errors": list(secondary),
         "custody": {
             "unclosed": sorted(getattr(proof, "unclosed", set())) if proof is not None else [],
@@ -1981,7 +2018,8 @@ def pure_diagnostic_controls() -> None:
         expect(DIAG.failures == [], f"an unsafe effect was recorded as an oracle failure: {DIAG.failures}")
         expect(not DIAG.enter("15.1"), "a case ran after an unsafe device effect")
         # 7. R3: a failed step taints exactly the shared premises it declares, so
-        #    its dependants skip while an unrelated safe step still runs.
+        #    every real step that uses the same pool/registration skips, while a
+        #    premise-free record-only step still runs.
         DIAG.reset()
         DIAG.mode = True
         PREMISE_GUARDS.clear()
@@ -1992,26 +2030,24 @@ def pure_diagnostic_controls() -> None:
             DIAG.tainted == {"registration": "11.2", "pool": "11.2"},
             f"11.2 tainted {DIAG.tainted}",
         )
-        expect(not DIAG.enter("16.1"), "a step ran on a pool a failure may have left changed")
-        expect(
-            any("pool" in reason for reason in DIAG.skips[-1]["reasons"]),
-            f"taint reason {DIAG.skips[-1]}",
-        )
-        expect(not DIAG.enter("19.1"), "a step ran on a pool a failure may have left changed")
-        # The registration taint skips any later step that declares it.
+        # Every later case runs `oxide` against the same private pool and the
+        # same registration, so a changed reserve or pool ledger skips them all.
+        for later in ("16.1", "19.1", "08.1", "03.1", "12.1", "20.1"):
+            expect(not DIAG.enter(later), f"{later} ran after the shared pool/registration was tainted")
+            reasons = "; ".join(DIAG.skips[-1]["reasons"])
+            expect(
+                "registration" in reasons or "pool" in reasons,
+                f"{later} skipped without naming the tainted shared premise: {reasons}",
+            )
         original_needs = dict(CASE_STEP_NEEDS)
         try:
-            CASE_STEP_NEEDS["08.1"] = ("first", "volume", "registration")
-            expect(not DIAG.enter("08.1"), "a step ran on a registration a failure may have left changed")
-            expect(
-                any("registration" in reason for reason in DIAG.skips[-1]["reasons"]),
-                f"taint reason {DIAG.skips[-1]}",
-            )
+            # A genuinely independent, record-only step (it needs no shared
+            # premise) still runs: bookkeeping is allowed, claimed coverage is not.
+            CASE_STEP_NEEDS["08.1"] = ()
+            expect(DIAG.enter("08.1"), "a premise-free record-only step was skipped by an unrelated taint")
         finally:
             CASE_STEP_NEEDS.clear()
             CASE_STEP_NEEDS.update(original_needs)
-        # An unrelated step that needs neither tainted premise still runs.
-        expect(DIAG.enter("08.1"), "an unrelated safe step was skipped by another case's taint")
         # A step that fails while the volume is KNOWN absent skips its dependants
         # honestly instead of reading the absence as a fresh failure...
         DIAG.reset()
@@ -2026,9 +2062,6 @@ def pure_diagnostic_controls() -> None:
             f"volume skip reason {DIAG.skips[-1]}",
         )
         # ...while an AMBIGUOUS mount state aborts instead of skipping.
-        class AmbiguousProof(FakeProof):
-            mount = "/definitely/not/a/mount"
-
         def ambiguous_volume() -> tuple:
             raise UnsafeEffect("the owned volume's state is unknown")
 
@@ -2091,6 +2124,90 @@ def pure_diagnostic_controls() -> None:
             "the diagnostic receipt claims a PASS",
         )
         expect(body["primary_failure"] == "02: first recorded fault", body["primary_failure"])
+        # 10b. C: an all-cases-complete run whose CLOSEOUT failed is not a clean
+        #      collection, even though it recorded no oracle failure.
+        DIAG.reset()
+        DIAG.mode = True
+        DIAG.done.extend(step for step, _, _, _, _ in CASE_STEPS)
+        record = diagnostic_record(
+            FakeProof(), 1234, "the ordinary detach failed: exit 2", ["ordinary detach failed: exit 2"]
+        )
+        expect(record["cases"]["completed"] == CASE_IDS, record["cases"]["completed"])
+        expect(record["collection_complete"] is False, "a failed closeout claimed a complete collection")
+        expect(record["closeout_failed"] is True, "a failed closeout was not recorded")
+        expect(record["outcome"] == "failures_recorded", record["outcome"])
+        expect(record["primary_failure"] == "the ordinary detach failed: exit 2", record["primary_failure"])
+        # 10c. A: the real diagnostic_main closeout path with the uncertain-detach
+        #      latch: no device operation is attempted after it, the retained
+        #      backing facts are written, and the original fault is preserved.
+        class DeviceProof(FakeProof):
+            def __init__(self) -> None:
+                super().__init__(mount="/fixture/owned/volume")
+                self.device_calls: list = []
+
+            def run(self, argv, **kwargs):
+                self.device_calls.append(list(argv))
+                raise AssertionError(f"a device command was attempted: {argv}")
+
+        device_proof = DeviceProof()
+        recorded: dict = {"receipts": [], "facts": [], "body_calls": 0}
+        originals = (
+            globals()["run"],
+            globals()["write_attachment_facts"],
+            globals()["write_diagnostic_receipt"],
+            dict(ATTACHMENT),
+        )
+
+        def fake_body(proof, repo):
+            recorded["body_calls"] += 1
+            # The ONE device attempt of the case: the ordinary detach, nonzero.
+            proof.device_calls.append(["/usr/bin/hdiutil", "detach", proof.mount])
+            ATTACHMENT["uncertain"] = "14: the ordinary detach exited 2, so the owned volume's state is unknown"
+            raise UnsafeEffect(ATTACHMENT["uncertain"])
+
+        def fake_facts(name, body):
+            recorded["facts"].append((name, body))
+
+        def fake_receipt(record):
+            recorded["receipts"].append(record)
+            return "/evidence/profile-outputs.diagnostic-mock.json"
+
+        try:
+            globals()["run"] = fake_body
+            globals()["write_attachment_facts"] = fake_facts
+            globals()["write_diagnostic_receipt"] = fake_receipt
+            ATTACHMENT["uncertain"] = None
+            try:
+                diagnostic_main(device_proof, "/repo")
+                expect(False, "the uncertain detach did not fail the diagnostic run")
+            except UnsafeEffect as error:
+                expect("detach exited 2" in str(error), f"the original fault changed: {error}")
+        finally:
+            (
+                globals()["run"],
+                globals()["write_attachment_facts"],
+                globals()["write_diagnostic_receipt"],
+                latch,
+            ) = originals
+            ATTACHMENT.clear()
+            ATTACHMENT.update(latch)
+        expect(recorded["body_calls"] == 1, recorded["body_calls"])
+        expect(
+            device_proof.device_calls == [["/usr/bin/hdiutil", "detach", "/fixture/owned/volume"]],
+            f"closeout retried or replaced the single device command: {device_proof.device_calls}",
+        )
+        expect(
+            [name for name, _ in recorded["facts"]] == ["detach-unresolved.json"],
+            f"closeout wrote {recorded['facts']}",
+        )
+        expect("device_operations_avoided" in recorded["facts"][0][1], recorded["facts"][0][1])
+        expect(len(recorded["receipts"]) == 1, "the diagnostic receipt was not attempted")
+        receipt = recorded["receipts"][0]
+        expect(receipt["abort"]["kind"] == "abort", receipt["abort"])
+        expect("detach exited 2" in receipt["abort"]["observed"], receipt["abort"]["observed"])
+        expect(receipt["collection_complete"] is False, "an aborted run claimed a complete collection")
+        expect(receipt["outcome"] == "failures_recorded", receipt["outcome"])
+        expect(receipt["qualified"] is False, receipt["qualified"])
         # 11. An oversized failure list is marked INCOMPLETE inside the bound,
         #     never silently truncated and never claimed complete.
         oversized = dict(record)
@@ -3149,6 +3266,10 @@ def run(proof: Proof, repo: str) -> None:
             write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, "14 volume away", "detaching"))
             detached = proof.run(["/usr/bin/hdiutil", "detach", proof.mount], timeout=60)
             if detached.returncode != 0:
+                ATTACHMENT["uncertain"] = (
+                    "14: the ordinary detach exited "
+                    f"{detached.returncode}, so the owned volume's state is unknown"
+                )
                 # R2: the device state after a nonzero detach is UNKNOWN. This is
                 # an effect boundary, so it aborts the whole diagnostic at once
                 # (never a recoverable oracle failure, never a later case against
@@ -4014,6 +4135,7 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
 
 
 def main() -> int:
+    ATTACHMENT["uncertain"] = None
     arguments = sys.argv[1:]
     if arguments == ["--plan"]:
         return plan_only()
