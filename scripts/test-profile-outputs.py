@@ -298,7 +298,7 @@ def plan_only() -> int:
     print("  diagnostic      ONE opt-in --diagnostic run records every oracle failure,")
     print("                  skips only unmet-dependency steps, still stops on any")
     print("                  safety failure, writes ONE distinct diagnostic receipt,")
-    print("                  and is never counted or accepted as a native PASS");
+    print("                  and is never counted or accepted as a native PASS")
     print("  cases")
     for case in CASES:
         print(f"    {case}")
