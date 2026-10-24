@@ -689,17 +689,28 @@ oxide run --execution-budget 120s
   held for owner activation: the declaration activates nothing. `--plan` is
   effect-free and prints the cases, phases, disk and child-lifetime
   allocation; an unrecognized argument refuses before any subprocess;
-  `--self-check` covers the argument boundary, allocation arithmetic, event
-  sequence oracle and descriptor oracles without staging. Every child timeout
-  is clipped to the guard's exported deadline minus the reserved cleanup
-  window, fixtures run from private checkouts with private
-  `HOME`/`CARGO_HOME`/`OXIDE_CONFIG`/`OXIDE_POOL`/temp, and the staged
-  candidate is this clean HEAD's debug `oxide` built offline with the pinned
-  toolchain into scratch-owned target and build directories. A run writes a
-  uniquely named bounded helper receipt beside the guard's own with the source
-  and candidate identities, reached/completed/failed/unexecuted cases and the
-  primary fault; that receipt never claims guard closure, which the
-  supervisor alone decides. The 300 s/512 MiB fit is unmeasured.
+  `--self-check` covers the pure boundaries; `--self-test` executes the
+  corrected case bodies and the whole-lifecycle fault paths against faked
+  process and filesystem seams (no child, image or pool), so a body that
+  stops asserting cannot pass it. Every child timeout is clipped to the
+  guard's exported deadline minus the reserved cleanup window; fixtures run
+  from private checkouts with private `HOME`/`CARGO_HOME`/`OXIDE_CONFIG`/
+  `OXIDE_POOL`/temp. Staging is this clean HEAD's debug `oxide`, built
+  offline with the pinned toolchain into scratch-owned target and build
+  directories; the copied candidate must hash-equal the staged binary and
+  then answer the built-in `__oxide-build-capabilities` probe (which reports
+  `test_controls`) before any private-home fixture exists. The cumulative
+  window's oracle is the launched program's own runtime after a ~3 s build
+  under one 5 s window (a reset window would give it ~5 s), not closeout
+  latency; the nested case has the outer command take the only slot first,
+  the inner call wait and end on its own 1 s admission budget with no build,
+  and the outer window stop the still-running tool. A run writes a uniquely
+  named bounded helper receipt beside the guard's own on every outcome,
+  including a staging, capability, assertion, interrupt or receipt-write
+  failure, with the primary fault, candidate identity when known, reached/
+  completed/failed/unexecuted cases and custody uncertainty; that receipt
+  never claims guard closure, which the supervisor alone decides. The
+  300 s/512 MiB fit is unmeasured.
 - **Locking.** A budgeted command waits for the admission, record and
   checkout-binding locks with the existing nonblocking primitive, polling
   against the remaining window in the unchanged order. Abandoning a wait
