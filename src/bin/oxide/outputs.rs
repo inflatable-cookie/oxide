@@ -4758,6 +4758,23 @@ fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Sele
     Ok(Some(wanted.with_nonce(nonce)))
 }
 
+/// P4 precondition, shared by the pre-lease reservation and binding: this
+/// checkout's committed receipt still places a member on an EXTERNAL root while
+/// this command's fresh selection is no longer external (the registered volume
+/// is away or became unusable). Such a command refuses at binding, so the
+/// pre-lease reservation must not durably reserve a future root for it: a
+/// refused command changes no authority.
+fn refuses_committed_external(receipt: &Receipt, wanted: &Selected) -> bool {
+    if wanted.kind == RootKind::External {
+        return false;
+    }
+    receipt
+        .links
+        .iter()
+        .filter_map(|placement| placement.selected.as_ref())
+        .any(|committed| committed.kind == RootKind::External)
+}
+
 /// Reserve the nonce of this command's future root before its slot is keyed
 /// (oxide#129). Runs after automatic adoption and before
 /// `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding
@@ -4807,6 +4824,13 @@ pub fn reserve(
         let Some(wanted) = desired_selection(&context, &receipt)? else {
             return Ok(());
         };
+        // oxide#133 case14: a command that a committed external member will
+        // make refuse must not reserve (or cancel) anything first. Reserving a
+        // root here used to rewrite the receipt — a real authority effect on a
+        // command that builds nothing.
+        if refuses_committed_external(&receipt, &wanted) {
+            return Ok(());
+        }
         if read_marker(&wanted.root).is_ok() {
             return Ok(());
         }
@@ -8768,6 +8792,122 @@ mod tests {
             Bind::Wait => panic!("a planner-derived refusal waited"),
         }
         assert_eq!(fs::read_link(&link).unwrap(), destination);
+    }
+
+    /// oxide#133 case14 CAUSAL regression. The diagnostic's case14 refused
+    /// with the right reason and then found the committed receipt bytes
+    /// changed. Traced through the production preflight: `reserve` runs before
+    /// the lease and, with the registered volume away, the fresh selection is
+    /// the local fallback root, so it durably reserved a nonce for a root this
+    /// command then never builds into and rewrote the receipt of a command that
+    /// builds nothing. The parent fails the first byte comparison below; the
+    /// refusal itself (and every authority field) must be unchanged.
+    #[test]
+    fn a_refusal_after_the_volume_is_away_reserves_nothing() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        register(&fixture, DriveMode::Permanent);
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.place_member("debug").selected = Some(external.clone());
+        write_receipt(&fixture.control, &receipt).unwrap();
+        fs::create_dir_all(member_destination(&external.root, "debug")).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: external.volume_uuid.clone(),
+            nonce: external.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let link = fixture.checkout.join("target/debug");
+        let destination = member_destination(&external.root, "debug");
+        symlink(&destination, &link).unwrap();
+        let declaration =
+            crate::layout::Declaration::new([crate::layout::Member::parse("debug").unwrap()])
+                .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.selected().map(Selected::kind),
+            Some(RootKind::Local),
+            "the production planner did not fall back to the local spec"
+        );
+        let receipt_file = receipt_path(&fixture.control, &context.checkout_id);
+        let before = fs::read(&receipt_file).unwrap();
+        let store = pool_store(&fixture.root.join("pool"));
+        // The production pre-lease step, before the slot key and the lease.
+        reserve(
+            &store,
+            Some(&fixture.control),
+            &fixture.checkout,
+            Some("the registered volume is away"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&receipt_file).unwrap(),
+            before,
+            "the pre-lease reservation rewrote the committed receipt of a refusing command"
+        );
+        // The command still refuses for the exact P4 reason with no effect.
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => {
+                assert!(
+                    reason.contains(
+                        "never moves an owned external output to another pool automatically"
+                    ),
+                    "{reason}"
+                );
+                assert!(reason.contains("nothing was built"), "{reason}");
+                assert!(
+                    reason.contains(&destination.display().to_string()),
+                    "{reason}"
+                );
+            }
+            Bind::Bound(_) => panic!("a fallback refusal relinked an external member"),
+            Bind::Wait => panic!("a fallback refusal waited"),
+        }
+        assert_eq!(
+            fs::read(&receipt_file).unwrap(),
+            before,
+            "the refusal changed the committed receipt"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), destination);
+        let recorded = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            recorded.reserved().is_none(),
+            "a refusing command left a root reservation behind"
+        );
+        assert_eq!(recorded.generation, 1, "the refusal moved the generation");
+        assert_eq!(recorded.selected_for("debug"), Some(&external));
     }
 
     #[test]
