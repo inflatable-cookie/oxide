@@ -808,6 +808,15 @@ def run(proof: Proof, repo: str) -> None:
     )
     marker_path = os.path.join(migrated_root, MARKER)
     root_ino = os.stat(migrated_root).st_ino
+    # A7: a tiny NONEMPTY sentinel in the root payload, plus the immutable
+    # marker facts, so the migration is shown to leave real bytes and inodes
+    # alone rather than only the entry names.
+    marker_before = perm.read_json(marker_path)
+    sentinel = os.path.join(migrated_root, "migration-sentinel")
+    with open(sentinel, "wb") as handle:
+        handle.write(b"migration sentinel bytes")
+    sentinel_ino = os.stat(sentinel).st_ino
+    expect(perm.read_bytes(sentinel) == b"migration sentinel bytes", "11: the sentinel was not written")
     payload = sorted(os.listdir(migrated_root))
     # Persist the exact bounded PRE-migration registry/receipt/marker bytes in
     # OWN evidence before the migration and its oracle.
@@ -855,6 +864,19 @@ def run(proof: Proof, repo: str) -> None:
     expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")
     nonce = upgraded["nonce"]
     expect(len(nonce) == 32, "11: migrated nonce is not 128-bit hex")
+    # A7: only version and nonce may change; owner, recipe, kind, volume and
+    # the ORIGINAL root-creation generation and timestamp are immutable.
+    for field in ("checkout", "checkout_id", "label", "recipe", "kind", "volume_uuid", "generation", "created_ms"):
+        expect(
+            upgraded.get(field) == marker_before.get(field),
+            f"11: the root/1 upgrade changed the immutable marker field {field!r}: "
+            f"{marker_before.get(field)!r} -> {upgraded.get(field)!r}",
+        )
+    expect(
+        os.stat(sentinel).st_ino == sentinel_ino
+        and perm.read_bytes(sentinel) == b"migration sentinel bytes",
+        "11: the migration changed the root payload sentinel",
+    )
     migrated_receipt = receipt(pool, migrated)
     expect({p["selected"]["nonce"] for p in migrated_receipt["links"] if p.get("selected")} == {nonce}, "11: members do not share the upgraded nonce")
     expect(os.stat(migrated_root).st_ino == root_ino, "11: the root inode changed")
