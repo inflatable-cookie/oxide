@@ -1332,10 +1332,22 @@ def run(proof: Proof, repo: str) -> None:
     finished = perm.read_json(perm.receipt_path(pool, p4))
     expect("transition" not in finished, "12: the replay did not finish the cleanup journal")
     expect_layout(p4, {"debug": f"link:{root_of(pool, p4)}"})
+    # The staging and backup leaves are derived from the journal's own
+    # generation (the committed receipt's), never a hardcoded one, and lexists
+    # is used so a dangling leftover link still counts as risen.
+    p4_generation = finished["generation"]
     expect(
-        not os.path.exists(os.path.join(p4, ".target.oxide-old-3")),
-        "12: the target backup survived cleanup",
+        isinstance(p4_generation, int) and p4_generation > 0,
+        f"12: the finished receipt carries no usable generation: {p4_generation!r}",
     )
+    for leaf in (
+        f".target.oxide-new-{p4_generation}",
+        f".target.oxide-old-{p4_generation}",
+    ):
+        expect(
+            not os.path.lexists(os.path.join(p4, leaf)),
+            f"12: {leaf} survived the finished cleanup",
+        )
 
     # A committed migration is never rolled back.
     rollback = make_checkout(proof, "committed")
