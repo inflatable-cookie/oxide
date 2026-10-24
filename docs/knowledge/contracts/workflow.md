@@ -700,9 +700,9 @@ oxide run --execution-budget 120s
   directories; the copied candidate must hash-equal the staged binary and
   then answer the built-in `__oxide-build-capabilities` probe (which reports
   `test_controls`) before any private-home fixture exists. The cumulative
-  window's oracle is the launched program's own runtime after a ~3 s build
-  under one 5 s window (a reset window would give it ~5 s), not closeout
-  latency; the nested case has the outer command take the only slot first,
+  window's oracle is the launched program's own heartbeat counter after a
+  ~3 s build under one 5 s window (about 10 beats; a reset window would give
+  it about 25), never the command's exit or closeout latency; the nested case has the outer command take the only slot first,
   the inner call wait and end on its own 1 s admission budget with no build,
   and the outer window stop the still-running tool. A run writes a uniquely
   named bounded helper receipt beside the guard's own on every outcome,
