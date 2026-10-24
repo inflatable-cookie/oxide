@@ -2720,21 +2720,10 @@ fn upgrade_marker(
                     &format!("the old marker backup is invalid: {error}"),
                 )
             })?;
-            let spec = spec_for(&migration.root);
-            let binding = match migration.root.kind {
-                RootKind::External => Some(binding_for(
-                    context,
-                    migration.root.volume_uuid.as_deref().unwrap_or_default(),
-                )?),
-                RootKind::Local => None,
-            };
-            create_marker(
-                context,
-                &spec,
-                before.generation,
-                binding.as_ref(),
-                migration.root.nonce(),
-            )?
+            // The successor carries the pinned marker's immutable fields
+            // exactly, including its ORIGINAL created_ms; only the version and
+            // the reserved nonce change.
+            publish_successor_marker(context, migration, &before)?
         }
     };
     if current.nonce() != migration.root.nonce() {
@@ -5439,6 +5428,80 @@ fn create_owned_directory(path: &Path) -> Result<(), String> {
     sync_directory(path.parent().unwrap_or(path))
 }
 
+/// P3: publish the root/2 successor from the PINNED old marker, changing ONLY
+/// the version and the reserved nonce. Every immutable field — checkout
+/// identity, label, recipe, kind, volume, the ORIGINAL root-creation
+/// generation and the original `created_ms` — is copied from the pinned root/1
+/// document. An existing root never goes through [`create_marker`], whose
+/// fresh-root path stamps a new `created_ms`.
+fn publish_successor_marker(
+    context: &Context,
+    migration: &Migration,
+    before: &Marker,
+) -> Result<Marker, String> {
+    // The only field the migration is allowed to change besides the version.
+    if before.nonce.is_some() {
+        return Err(pending_migration(
+            migration,
+            "the pinned old marker already carries a nonce",
+        ));
+    }
+    let nonce = migration
+        .root
+        .nonce()
+        .ok_or_else(|| pending_migration(migration, "the migration reserved no root nonce"))?;
+    let spec = spec_for(&migration.root);
+    let selected = spec
+        .selected(before.generation)
+        .with_nonce(Some(nonce.to_owned()));
+    // The root must be on the intended device before the successor is written.
+    let binding = match migration.root.kind {
+        RootKind::External => Some(binding_for(
+            context,
+            migration.root.volume_uuid.as_deref().unwrap_or_default(),
+        )?),
+        RootKind::Local => None,
+    };
+    validate_root_device(&context.workspace, &selected, binding.as_ref())?;
+    let successor = Marker {
+        version: MARKER_VERSION.to_owned(),
+        nonce: Some(nonce.to_owned()),
+        ..before.clone()
+    };
+    let path = spec.root().join(MARKER);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(pending_migration(
+                migration,
+                &format!("{} appeared before publication", path.display()),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(pending_migration(
+                migration,
+                &format!("cannot inspect {}: {error}", path.display()),
+            ))
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&successor)
+        .map_err(|error| format!("cannot encode the output root marker: {error}"))?;
+    if bytes.len() as u64 > MAX_MARKER_BYTES {
+        return Err("the output root marker exceeds its byte limit".to_owned());
+    }
+    let temp = spec
+        .root()
+        .join(format!(".{MARKER}.tmp-{}", std::process::id()));
+    let _ = fs::remove_file(&temp);
+    write_private(&temp, &bytes)?;
+    rename_no_replace(&temp, &path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("cannot publish the output root marker: {error}")
+    })?;
+    sync_directory(spec.root())?;
+    Ok(successor)
+}
+
 fn create_marker(
     context: &Context,
     spec: &RootSpec,
@@ -7488,6 +7551,15 @@ mod tests {
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
         make_root_one_marker(&fixture, &legacy);
+        // A DETERMINISTIC original creation timestamp, so a rewrite cannot pass
+        // by millisecond coincidence.
+        let mut pinned = read_marker(&root).unwrap();
+        pinned.created_ms = 1234;
+        fs::write(
+            root.join(MARKER),
+            serde_json::to_vec_pretty(&pinned).unwrap(),
+        )
+        .unwrap();
         let old_bytes = fs::read(root.join(MARKER)).unwrap();
         let old_digest = file_digest(&root.join(MARKER)).unwrap();
         // A pre-P4 rollback at the marker boundary restores the exact old
@@ -7526,6 +7598,29 @@ mod tests {
         assert_eq!(marker.nonce(), migrated.selected().unwrap().nonce());
         assert!(marker.nonce().is_some());
         assert_eq!(marker.generation, legacy_generation);
+        // The successor preserves EVERY immutable field of the pinned root/1
+        // marker, including its ORIGINAL creation timestamp: only the version
+        // and the reserved nonce may change.
+        let pinned: Marker = serde_json::from_slice(&old_bytes).unwrap();
+        assert_eq!(pinned.version, LEGACY_MARKER_VERSION);
+        assert!(pinned.nonce.is_none());
+        assert_eq!(pinned.created_ms, 1234, "the fixture pin was not applied");
+        assert_eq!(
+            marker.created_ms, pinned.created_ms,
+            "the root/1 upgrade rewrote created_ms"
+        );
+        assert_eq!(marker.checkout, pinned.checkout);
+        assert_eq!(marker.checkout_id, pinned.checkout_id);
+        assert_eq!(marker.label, pinned.label);
+        assert_eq!(marker.recipe, pinned.recipe);
+        assert_eq!(marker.kind, pinned.kind);
+        assert_eq!(marker.volume_uuid, pinned.volume_uuid);
+        assert_eq!(marker.checkout_volume_uuid, pinned.checkout_volume_uuid);
+        assert_eq!(marker.generation, pinned.generation);
+        assert_ne!(
+            marker.version, pinned.version,
+            "the successor is not the root/2 document"
+        );
         assert!(!root
             .join(format!("{MARKER}.oxide-old-{}", migrated.generation))
             .exists());

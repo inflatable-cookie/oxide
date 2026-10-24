@@ -3282,8 +3282,9 @@ stay real.
   classified, and each `<triple>` becomes a real ancestor directory in the new
   target holding only its own owned member links. The root/1 marker is
   exclusively renamed to a transaction backup and the root/2 successor is
-  published without replacement, preserving owner, recipe, kind, volume and
-  the original root-creation generation. P2 exclusively renames the old target
+  published without replacement, preserving owner, recipe, kind, volume,
+  the original root-creation generation and its original creation timestamp,
+  so only the marker version and the reserved nonce change. P2 exclusively renames the old target
   link to its recorded backup and P3 exclusively publishes the staging
   directory as the real target; only the staging INODE recorded at P1 is ever
   published, so a directory replaced in between with identically shaped links
