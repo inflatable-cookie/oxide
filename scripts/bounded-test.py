@@ -1034,9 +1034,12 @@ def tree_bytes(root):
     forms: depth, entries and bytes are unbounded by it, and this is not an
     atomic snapshot.
 
-    An entry that is gone is skipped exactly as before. Every other error
-    raises, so the sampler reports a measurement fault and never a smaller,
-    unbounded or partly counted total.
+    An entry that is gone is skipped exactly as before: at its stat, at the
+    final no-follow open of a directory, or at that directory's own read. Every
+    other error raises, so the sampler reports a measurement fault and never a
+    smaller, unbounded or partly counted total; in particular a name whose
+    observed kind or identity contradicts what the open finds is a fault, and
+    only `FileNotFoundError` is ever treated as a vanished entry.
     """
     limit = path_limit(root)
     total, seen = 0, set()
@@ -1080,7 +1083,13 @@ def tree_bytes(root):
                     else:
                         stack.append((names[0], (name,)))
             else:
-                inner = os.open(names[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                # The final component is opened no-follow too, and the same
+                # vanished tolerance the pathname read had applies: a directory
+                # that disappeared between its stat and this open is skipped.
+                try:
+                    inner = os.open(names[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
                 try:
                     children = os.listdir(inner)
                 except FileNotFoundError:

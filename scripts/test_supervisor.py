@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -1176,7 +1177,10 @@ def oracle_bytes(root, union=True):
             finally:
                 os.close(child)
 
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if isinstance(root, int):  # an already-open directory, however deep
+        fd = os.dup(root)
+    else:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         note(os.fstat(fd))
         walk(fd)
@@ -1233,6 +1237,89 @@ def long_fixture(base, referent):
             os.close(handle)
     return {"leaf": leaf_path, "link": link_path, "deepest": deepest,
             "anchor": anchor, "suffix": tuple(names[mark:])}
+
+
+def seam_fixture(base, referent):
+    """A nameable anchor holding one overlong regular file and one entry past
+    the limit, for the seam controls: that entry is a symlink to `referent`, so
+    a walk that follows it would count an outside tree."""
+    os.mkdir(base)
+    names, fds = [], []
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fds.append(fd)
+    try:
+        while len(os.fsencode(os.path.join(base, *names, NAME))) < LIMIT:
+            os.mkdir(NAME, dir_fd=fd)
+            child = os.open(NAME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            fds.append(child)
+            names.append(NAME)
+            fd = child
+        anchor = os.path.join(base, *names)
+        prefix = len(os.fsencode(anchor)) + 1
+        leaf, tail = "f" * (LIMIT - prefix + 1), "l" * (LIMIT - prefix + 1)
+        handle = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fd)
+        try:
+            os.write(handle, bytes(4096))
+        finally:
+            os.close(handle)
+        os.symlink(referent, tail, dir_fd=fd)
+    finally:
+        for handle in reversed(fds):
+            os.close(handle)
+    return {"anchor": anchor, "leaf": os.path.join(anchor, leaf),
+            "tail": tail, "link": os.path.join(anchor, tail)}
+
+
+class TraversalSeam:
+    """Test-only seams over `os.open`, `os.stat` and `os.close`, restored in
+    `finally`. The monitor has no test hook of its own: these wrap the real
+    calls, count their hits (so a seam that never fires fails its case), record
+    every name opened (so an outside traversal is visible) and track every
+    descriptor returned from an open against every close (so a leak is
+    visible)."""
+
+    def __init__(self, vanish_at_open=None, report_directory=None):
+        self.vanish_at_open = vanish_at_open  # answer ENOENT for this component
+        self.report_directory = report_directory  # report this component as a directory
+        self.hits = {"vanish": 0, "relabel": 0}
+        self.opened, self.live, self.saved = [], set(), None
+
+    def __enter__(self):
+        self.saved = (os.open, os.stat, os.close)
+        real_open, real_stat, real_close = self.saved
+
+        def open_(path, flags, mode=0o777, *, dir_fd=None):
+            self.opened.append((path, dir_fd))
+            if path == self.vanish_at_open:
+                self.hits["vanish"] += 1
+                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(path))
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            self.live.add(fd)
+            return fd
+
+        def stat_(path, *, dir_fd=None, follow_symlinks=True):
+            if path == self.report_directory:
+                self.hits["relabel"] += 1
+                meta = real_stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                # The entry's own identity, reported as a different kind: the
+                # contradiction the no-follow open has to refuse.
+                return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_dev=meta.st_dev,
+                                             st_ino=meta.st_ino, st_blocks=meta.st_blocks)
+            return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+        def close_(fd):
+            self.live.discard(fd)
+            return real_close(fd)
+
+        os.open, os.stat, os.close = open_, stat_, close_
+        return self
+
+    def __exit__(self, *_exception):
+        os.open, os.stat, os.close = self.saved
+        return False
+
+    def outside(self, marker="referent"):
+        return [call for call in self.opened if marker in str(call[0])]
 
 
 class PureTraversal(unittest.TestCase):
@@ -1308,6 +1395,77 @@ class PureTraversal(unittest.TestCase):
         (plain / "a" / "link").symlink_to(self.referent)
         os.link(str(plain / "a" / "b" / "file.bin"), str(plain / "a" / "twin.bin"))
         self.assertEqual(bounded.tree_bytes(str(plain)), oracle_bytes(str(plain)))
+
+    def test_a_directory_that_vanishes_at_its_final_open_is_skipped(self):
+        # The walk that counted everything, kept as this case's own control.
+        with TraversalSeam() as control:
+            self.assertEqual(bounded.tree_bytes(self.base), self.expected)
+        self.assertEqual(control.hits, {"vanish": 0, "relabel": 0})
+        self.assertEqual(control.live, set(), "a descriptor was left open")
+        # The branch under the anchor disappears between its no-follow stat
+        # and its no-follow open: the pathname read this replaces skipped that
+        # ENOENT, so the injection must too, and only that one.
+        branch = self.paths["suffix"][0]
+        branch_fd = bounded.open_relative(self.paths["anchor"], (branch,))
+        try:
+            branch_own = os.fstat(branch_fd).st_blocks * 512
+            children = oracle_bytes(branch_fd) - branch_own
+        finally:
+            os.close(branch_fd)
+        self.assertGreater(children, 0, "the vanishing branch has no children to lose")
+        with TraversalSeam(vanish_at_open=branch) as seam:
+            total = bounded.tree_bytes(self.base)
+        self.assertEqual(seam.hits["vanish"], 1)
+        self.assertEqual(total, self.expected - children)
+        self.assertEqual(seam.live, set(), "a descriptor was left open")
+        self.assertEqual(seam.outside(), [], "the walk left the fixture")
+        # The walk continued: both remaining overlong siblings are still in it.
+        anchor_fd = bounded.open_relative(self.paths["anchor"], ())
+        try:
+            leaf_fd = os.open(os.path.basename(self.paths["leaf"]), os.O_RDONLY, dir_fd=anchor_fd)
+            try:
+                leaf_blocks = os.fstat(leaf_fd).st_blocks * 512
+            finally:
+                os.close(leaf_fd)
+        finally:
+            os.close(anchor_fd)
+        pair_blocks = os.stat(os.path.join(self.base, "short")).st_blocks * 512
+        self.assertGreaterEqual(total, leaf_blocks + pair_blocks)
+
+    def test_a_directory_reported_where_a_symlink_sits_errors_without_following(self):
+        base = str(self.dir / "seam")
+        paths = seam_fixture(base, str(self.referent))
+        expected = oracle_bytes(base)  # the link itself, never the referent
+        self.assertLess(expected, (self.referent / "big.bin").stat().st_size)
+        with TraversalSeam() as control:  # uninjected: link counted, nothing followed
+            self.assertEqual(bounded.tree_bytes(base), expected)
+        self.assertEqual(control.hits, {"vanish": 0, "relabel": 0})
+        self.assertEqual(control.live, set(), "a descriptor was left open")
+        # The observed kind says directory while the entry at that name is a
+        # symlink: the no-follow open must refuse it, not read the referent.
+        with TraversalSeam(report_directory=paths["tail"]) as seam:
+            with self.assertRaises(OSError) as caught:
+                bounded.tree_bytes(base)
+        self.assertEqual(seam.hits["relabel"], 1)
+        self.assertIn(caught.exception.errno, (errno.ELOOP, errno.ENOTDIR),
+                      "a kind contradiction must fault, not become vanished")
+        self.assertNotEqual(caught.exception.errno, errno.ENOENT)
+        self.assertEqual(seam.live, set(), "a descriptor was left open")
+        self.assertEqual(seam.outside(), [], "the walk opened the referent")
+
+    def test_seams_whose_target_never_appears_change_nothing(self):
+        # A seam that never fires must not make its case pass by accident: the
+        # untouched walk still counts everything here, and the two injected
+        # cases above assert their own hit count.
+        base = str(self.dir / "seam")
+        seam_fixture(base, str(self.referent))
+        expected = oracle_bytes(base)
+        with TraversalSeam(vanish_at_open="never-this-component",
+                           report_directory="never-this-component") as seam:
+            self.assertEqual(bounded.tree_bytes(base), expected)
+        self.assertEqual(seam.hits, {"vanish": 0, "relabel": 0})
+        self.assertEqual(seam.live, set(), "a descriptor was left open")
+        self.assertGreater(len(seam.opened), 0, "the seam never observed an open")
 
 
 # Real cases --------------------------------------------------------------------
