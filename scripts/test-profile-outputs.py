@@ -1206,15 +1206,41 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
 
     # ----- case 03: test / bench / bench debug / doc mapping --------------
+    # A3: the mapping is proved by the PARSED slot identity, not by its exit
+    # code. Commands mapping to the same member must reuse that member's slot
+    # (warm, same id); a different member must key a different slot.
+    code, _, stderr = oxide(proof, ["build"], "03 debug build", first)
+    expect(code == 0, f"03: debug build failed: {stderr}")
+    debug_slot, debug_state = perm.slot_state(stderr)
+    expect("fallback" not in summary(stderr), f"03: external placement unexpectedly fell back: {summary(stderr)}")
     code, _, stderr = oxide(proof, ["test"], "03 test", first)
     expect(code == 0, f"03: test failed: {stderr}")
-    expect("fallback" not in summary(stderr), f"03: external placement unexpectedly fell back: {summary(stderr)}")
-    code, _, stderr = oxide(proof, ["bench"], "03 bench", first)
-    expect(code == 0, f"03: bench failed: {stderr}")
-    code, _, stderr = oxide(proof, ["bench", "--profile", "debug"], "03 bench debug", first)
-    expect(code == 0, f"03: bench debug failed: {stderr}")
+    test_slot, test_state = perm.slot_state(stderr)
+    expect(
+        test_slot == debug_slot and test_state == "warm",
+        f"03: test did not map to the debug member: {debug_slot} vs {test_slot} ({test_state})",
+    )
     code, _, stderr = oxide(proof, ["doc"], "03 doc", first)
     expect(code == 0, f"03: doc failed: {stderr}")
+    doc_slot, doc_state = perm.slot_state(stderr)
+    expect(
+        doc_slot == debug_slot,
+        f"03: doc did not map to a profile member key ({doc_slot} vs {debug_slot})",
+    )
+    code, _, stderr = oxide(proof, ["bench"], "03 bench", first)
+    expect(code == 0, f"03: bench failed: {stderr}")
+    release_slot, release_state = perm.slot_state(stderr)
+    expect(
+        release_slot != debug_slot and release_state == "cold",
+        f"03: plain bench did not map to the release member: {release_slot} ({release_state})",
+    )
+    code, _, stderr = oxide(proof, ["bench", "--profile", "debug"], "03 bench debug", first)
+    expect(code == 0, f"03: bench debug failed: {stderr}")
+    bench_debug_slot, bench_debug_state = perm.slot_state(stderr)
+    expect(
+        bench_debug_slot == debug_slot,
+        f"03: bench --profile debug did not map to the debug member: {bench_debug_slot} vs {debug_slot}",
+    )
     expect(os.path.isdir(os.path.join(first, "target", "doc")), "03: target/doc is missing")
     expect(not os.path.islink(os.path.join(first, "target", "doc")), "03: target/doc is a link")
     for member in ("debug", "release"):
