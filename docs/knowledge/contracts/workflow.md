@@ -2529,8 +2529,10 @@ oxide#102.
   (`getpwuid_r(geteuid())`), not the `HOME` variable. A test harness or
   wrapper that overrides `HOME` therefore still gets the machine's config,
   pool and Builds-drive registration; it cannot fall into a fresh private pool
-  by accident. Isolation is explicit: `OXIDE_POOL`, `OXIDE_CONFIG` and
-  absolute `XDG_*` values keep their precedence. A failed lookup, or an empty
+  by accident. Explicit settings keep their precedence: `OXIDE_POOL` selects
+  the pool, `OXIDE_CONFIG` the config file and absolute `XDG_*` values (Linux)
+  their roots; each replaces only what it names, so none alone is complete
+  isolation. A failed lookup, or an empty
   or relative passwd home, refuses as a missing home did; Oxide never falls
   back to `$HOME`. When `HOME` differs from the account home and neither the
   pool nor the config file is explicit, a leased command prints one notice and
@@ -2541,8 +2543,15 @@ oxide#102.
   alone honour two proof controls, which release and installed builds ignore:
   `OXIDE_TEST_HOME_FROM_ENV=1` restores `$HOME` as the home input (every proof
   script that sets a private `HOME` sets it), and `OXIDE_TEST_ACCOUNT_HOME`
-  stands in a controlled absolute account home, or `!unavailable` for an
-  injected lookup failure. `effigy rust:everyday-cli` proves the account
+  stands in a controlled account home (a canonical, real directory strictly
+  inside `OXIDE_TASK_SCRATCH_ROOT`; anything else refuses), or `!unavailable`
+  for an injected lookup failure. Setting both controls refuses. A proof
+  checks its staged artifact reports `test_controls: true` before any
+  storage-reading call. A release-profile artifact built with debug
+  assertions forced on would carry them, so the build-capabilities probe
+  reports `test_controls`, the installer refuses `true` or a missing answer,
+  and a build without the controls refuses (rather than ignores) either
+  variable. `effigy rust:everyday-cli` proves the account
   default, the notice, explicit `OXIDE_POOL` precedence and the refusal
   through the second control, with nothing created under the overridden
   `HOME`. `scripts/test-oxide-cli.py` (its active `clean-safety` and

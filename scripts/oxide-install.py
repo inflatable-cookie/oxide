@@ -227,6 +227,14 @@ def state_capabilities(built):
         if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
             raise Refusal(f"the built oxide reported no valid {name}")
         values[name] = value
+    # An artifact that honours the debug-only proof controls (OXIDE_TEST_*)
+    # could be steered off the account's pool; it is never installed.
+    controls = reported.get("test_controls") if isinstance(reported, dict) else None
+    if controls is not False:
+        raise Refusal(
+            "the built oxide reports proof controls compiled in (or no test_controls answer); "
+            "build a release artifact without debug assertions"
+        )
     return values
 
 

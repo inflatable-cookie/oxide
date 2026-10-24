@@ -126,7 +126,7 @@ class InstallerTests(unittest.TestCase):
         return stub
 
     def test_capability_probe_records_the_built_binary_numbers(self):
-        built = self.capability_binary('{"control_state_version": 2, "registration_version": 3}')
+        built = self.capability_binary('{"control_state_version": 2, "registration_version": 3, "test_controls": false}')
         self.assertEqual(
             installer.state_capabilities(built),
             {"control_state_version": 2, "registration_version": 3},
@@ -146,6 +146,15 @@ class InstallerTests(unittest.TestCase):
                 installer.state_capabilities(self.capability_binary(output))
         with self.assertRaises(installer.Refusal):
             installer.state_capabilities(self.capability_binary('{"control_state_version": 2, "registration_version": 2}', code=1))
+
+    def test_capability_probe_refuses_an_artifact_with_proof_controls(self):
+        for output in (
+            '{"control_state_version": 2, "registration_version": 2, "test_controls": true}',
+            '{"control_state_version": 2, "registration_version": 2}',
+            '{"control_state_version": 2, "registration_version": 2, "test_controls": "false"}',
+        ):
+            with self.assertRaises(installer.Refusal):
+                installer.state_capabilities(self.capability_binary(output))
 
     def test_a_build_is_stamped_with_the_pin_and_a_fresh_instance(self):
         pin, instance = "a" * 40, installer.new_instance()

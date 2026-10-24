@@ -92,12 +92,7 @@ pub fn account_home() -> Result<OsString, String> {
             if value == "!unavailable" {
                 return Err("the account home directory is unavailable (injected)".to_owned());
             }
-            if Path::new(&value).is_absolute() {
-                return Ok(value);
-            }
-            return Err(format!(
-                "{TEST_ACCOUNT_HOME} must be absolute or !unavailable"
-            ));
+            return controlled_account_home(&value);
         }
     }
     use std::ffi::CStr;
@@ -146,9 +141,64 @@ pub fn account_home() -> Result<OsString, String> {
     }
 }
 
+/// A proof's stand-in account home must be a real, canonical directory
+/// strictly inside the supervisor's `OXIDE_TASK_SCRATCH_ROOT`, so the control
+/// can never name the operator's home or escape through a link.
+fn controlled_account_home(value: &std::ffi::OsStr) -> Result<OsString, String> {
+    let refuse = |why: &str| Err(format!("{TEST_ACCOUNT_HOME} refused: {why}"));
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return refuse("not an absolute path");
+    }
+    let Some(scratch) = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT") else {
+        return refuse("OXIDE_TASK_SCRATCH_ROOT is unset");
+    };
+    let scratch = Path::new(&scratch);
+    let (Ok(canonical_scratch), Ok(canonical)) = (scratch.canonicalize(), path.canonicalize())
+    else {
+        return refuse("the path or the scratch root does not resolve");
+    };
+    if canonical != path || canonical_scratch != scratch {
+        return refuse("the path or the scratch root is not canonical");
+    }
+    if canonical == canonical_scratch || !canonical.starts_with(&canonical_scratch) {
+        return refuse("not strictly inside OXIDE_TASK_SCRATCH_ROOT");
+    }
+    if !canonical.is_dir() {
+        return refuse("not a directory");
+    }
+    Ok(canonical.into_os_string())
+}
+
 /// The home input and its source: the account home, or in a debug build
 /// `$HOME` when the proof control is exactly `1`.
 fn resolve_home(env_home: Option<OsString>) -> (Option<OsString>, HomeSource) {
+    // A proof control in a build without proof controls fails closed: the
+    // caller asked for isolation this artifact cannot give, so nothing may
+    // fall through to the account's real pool.
+    if !cfg!(debug_assertions) {
+        for name in [TEST_HOME_FROM_ENV, TEST_ACCOUNT_HOME] {
+            if std::env::var_os(name).is_some() {
+                return (
+                    None,
+                    HomeSource::Unavailable(format!(
+                        "{name} is set, but this build has no proof controls"
+                    )),
+                );
+            }
+        }
+    }
+    if cfg!(debug_assertions)
+        && std::env::var_os(TEST_HOME_FROM_ENV).is_some()
+        && std::env::var_os(TEST_ACCOUNT_HOME).is_some()
+    {
+        return (
+            None,
+            HomeSource::Unavailable(format!(
+                "{TEST_HOME_FROM_ENV} and {TEST_ACCOUNT_HOME} are both set; use one"
+            )),
+        );
+    }
     if cfg!(debug_assertions)
         && std::env::var_os(TEST_HOME_FROM_ENV).is_some_and(|value| value == "1")
     {
@@ -264,7 +314,7 @@ impl Facts {
             |value| Path::new(value).display().to_string(),
         );
         Some(format!(
-            "HOME is {shown}; Oxide's pool and config use the account home {} (set OXIDE_POOL or OXIDE_CONFIG to isolate)",
+            "HOME is {shown}; Oxide's pool and config use the account home {} (OXIDE_POOL selects another pool, OXIDE_CONFIG another config file)",
             Path::new(home).display()
         ))
     }

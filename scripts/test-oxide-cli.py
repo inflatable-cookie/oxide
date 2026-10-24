@@ -511,8 +511,14 @@ class Runner:
             "OXIDE_MAX_ACTIVE",
         ):
             env.pop(name, None)
+        # A private HOME through the proof control: no case reads or writes
+        # the operator's account config, state or pool.
+        self.home = os.path.join(parent, "home")
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
         env.update(
             {
+                "HOME": self.home,
+                "OXIDE_TEST_HOME_FROM_ENV": "1",
                 "OXIDE_POOL": self.pool,
                 "CARGO_HOME": self.cargo_home,
                 "PATH": self.bin + os.pathsep + env.get("PATH", ""),
@@ -3154,7 +3160,10 @@ def clean_safety_main() -> int:
     os.makedirs(build_home, mode=0o700)
     base["CARGO_HOME"] = os.path.realpath(build_home)
     real_env = {**base, "CARGO_NET_OFFLINE": "true"}
-    env = {**base, "PATH": bindir + os.pathsep + base.get("PATH", ""), "OXIDE_POOL": no_pool,
+    private_home = os.path.join(parent, "private-home")
+    os.makedirs(private_home, mode=0o700)
+    env = {**base, "HOME": private_home, "OXIDE_TEST_HOME_FROM_ENV": "1",
+           "PATH": bindir + os.pathsep + base.get("PATH", ""), "OXIDE_POOL": no_pool,
            "OXIDE_PROOF_CARGO_LOG": cargo_log, "OXIDE_PROOF_REAL_CARGO": real_cargo}
 
     def call(cwd: str, args: list, extra: dict | None = None, cargo_home: str | None = None):

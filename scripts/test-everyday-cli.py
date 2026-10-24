@@ -493,7 +493,13 @@ def account_home(proof: Proof, root: str) -> None:
     """The installed default: the pool and config follow the account home, not
     HOME. A controlled account home stands in for the real one, so nothing
     here can reach the operator's pool."""
-    account = os.path.join(root, "account-home")
+    # Handshake first: the staged artifact must report compiled proof controls
+    # before any storage-reading call relies on them.
+    for binary in (proof.binary, proof.stamped):
+        probe = subprocess.run([binary, "__oxide-build-capabilities"], capture_output=True, text=True, timeout=10)
+        expect(probe.returncode == 0 and json.loads(probe.stdout).get("test_controls") is True,
+               f"{binary} does not report compiled proof controls: {probe.stdout!r}")
+    account = os.path.realpath(os.path.join(root, "account-home"))
     harness = os.path.join(root, "harness-home")
     for path in (account, harness):
         os.makedirs(path, exist_ok=True)
@@ -511,6 +517,13 @@ def account_home(proof: Proof, root: str) -> None:
     code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_POOL": explicit}, timeout=60)
     case("an explicit OXIDE_POOL still wins and silences the notice", code == 0
          and f"pool: {explicit} (from OXIDE_POOL)" in out and "home: HOME is" not in out, out + err)
+    link = os.path.join(root, "account-link")
+    os.symlink(account, link)
+    for label, target in (("a symlinked account control", link), ("an account control outside scratch", "/Users")):
+        code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_TEST_ACCOUNT_HOME": target}, timeout=60)
+        case(f"{label} refuses", code != 0 and "OXIDE_TEST_ACCOUNT_HOME refused" in err, out + err)
+    code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_TEST_HOME_FROM_ENV": "1"}, timeout=60)
+    case("mixed proof controls refuse", code != 0 and "are both set" in err, out + err)
     code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_TEST_ACCOUNT_HOME": "!unavailable"}, timeout=60)
     case("an unavailable account home refuses instead of using HOME", code != 0
          and "the account home directory is unavailable" in err and harness not in out, out + err)
