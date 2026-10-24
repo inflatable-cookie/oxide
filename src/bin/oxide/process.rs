@@ -162,21 +162,27 @@ pub fn wait_leader(group: &mut Group) -> Result<ExitStatus, String> {
 
 /// [`wait_leader`] with a budget stop: `None` means the stop could not confirm
 /// group closure inside its finite closeout allowance.
+///
+/// Each iteration harvests the leader first, then forwards a caller signal,
+/// then evaluates the deadline. A child that already exited in this poll is a
+/// natural completion, so a due deadline must not latch a controlled stop over
+/// it (freeze A2 item 6). The deadline still applies to whatever the exit
+/// leaves behind in the group, which the closeout loops observe.
 pub fn wait_leader_budgeted(
     group: &mut Group,
     stop: &mut Stop,
 ) -> Result<Option<ExitStatus>, String> {
     loop {
-        forward_pending(group.id);
-        if stop.poll(group.id) {
-            return Ok(None);
-        }
         if let Some(status) = group
             .child
             .try_wait()
             .map_err(|error| format!("could not wait for Cargo: {error}"))?
         {
             return Ok(Some(status));
+        }
+        forward_pending(group.id);
+        if stop.poll(group.id) {
+            return Ok(None);
         }
         std::thread::sleep(POLL);
     }
@@ -190,16 +196,17 @@ pub fn wait_leader_watched(
     stop: &mut Stop,
 ) -> Result<Option<ExitStatus>, String> {
     loop {
-        forward_pending(group.id);
-        if stop.poll(group.id) {
-            return Ok(None);
-        }
+        // Same order as the unwatched wait: harvest, forward, then deadline.
         if let Some(status) = group
             .child
             .try_wait()
             .map_err(|error| format!("could not wait for Cargo: {error}"))?
         {
             return Ok(Some(status));
+        }
+        forward_pending(group.id);
+        if stop.poll(group.id) {
+            return Ok(None);
         }
         watchdog.poll(group.id);
         if watchdog.gave_up() {
@@ -337,5 +344,63 @@ pub fn exit_code(status: ExitStatus) -> u8 {
     match status.code() {
         Some(code) => u8::try_from(code).unwrap_or(1),
         None => signal_exit_code(status.signal().unwrap_or(0)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::{self, Options};
+
+    fn due_execution_clock() {
+        budget::clear();
+        budget::install(Options {
+            admission: None,
+            execution: Some(Duration::from_millis(1)),
+            events: None,
+        })
+        .expect("a budget clock");
+        budget::arm_execution(Instant::now(), budget::Phase::PrimaryCargo);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    #[test]
+    fn a_child_that_already_exited_wins_over_a_due_deadline() {
+        due_execution_clock();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut group = spawn_group(&mut command).expect("a child");
+        // Let the child exit so the harvest below is deterministic.
+        std::thread::sleep(Duration::from_millis(100));
+        let status = wait_leader_budgeted(&mut group, &mut Stop::new())
+            .expect("a status")
+            .expect("the natural exit must be returned, not a stop");
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(
+            budget::origin(),
+            None,
+            "a natural exit must not latch a stop"
+        );
+        budget::clear();
+    }
+
+    #[test]
+    fn a_live_child_is_stopped_when_the_deadline_is_due() {
+        due_execution_clock();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let mut group = spawn_group(&mut command).expect("a child");
+        let started = Instant::now();
+        let status = wait_leader_budgeted(&mut group, &mut Stop::new()).expect("a result");
+        // The stop is a trigger: the leader may be reaped as a signal status
+        // once TERM lands, and the closeout bound only matters if it survives.
+        assert_eq!(budget::origin(), Some(budget::Origin::Execution));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the deadline did not stop the child"
+        );
+        let _ = status;
+        let _ = group.child.wait();
+        budget::clear();
     }
 }

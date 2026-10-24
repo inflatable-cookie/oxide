@@ -1082,17 +1082,17 @@ fn collect_run(
     let mut status = None;
     let mut closed = false;
     while status.is_none() || !closed {
+        // Harvest the leader first (freeze A2 item 6): a natural exit in this
+        // poll is reported as itself, never as a controlled stop. A caller
+        // signal is forwarded next, and the deadline is evaluated last, so a
+        // still-running leader or an open drain can still be stopped.
+        if status.is_none() {
+            status = group
+                .child
+                .try_wait()
+                .map_err(|error| format!("could not wait for Cargo: {error}"))?;
+        }
         process::forward_pending(group.id);
-        if budget_stop.poll(group.id) {
-            // A stopped drain is reported as such, never as a settled stream.
-            return Ok((None, None, false));
-        }
-        if let Some(watchdog) = watchdog.as_deref_mut() {
-            watchdog.poll(group.id);
-            if status.is_none() && watchdog.gave_up() {
-                return Ok((None, None, false));
-            }
-        }
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => {
                 if invocation.json_messages {
@@ -1107,11 +1107,20 @@ fn collect_run(
             Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        if status.is_none() {
-            status = group
-                .child
-                .try_wait()
-                .map_err(|error| format!("could not wait for Cargo: {error}"))?;
+        if status.is_some() && closed {
+            // The child exited and its stream settled in the same iteration:
+            // nothing is left that a deadline could stop.
+            break;
+        }
+        if budget_stop.poll(group.id) {
+            // A stopped drain is reported as such, never as a settled stream.
+            return Ok((None, None, false));
+        }
+        if let Some(watchdog) = watchdog.as_deref_mut() {
+            watchdog.poll(group.id);
+            if status.is_none() && watchdog.gave_up() {
+                return Ok((None, None, false));
+            }
         }
     }
     // The reader reported end-of-file before the loop ended, so joining it is

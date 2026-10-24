@@ -1056,6 +1056,12 @@ fn group_empty(group: i32) -> bool {
     result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Test helper: forget the clock (tests in other modules use the same owner).
+#[cfg(test)]
+pub(crate) fn clear() {
+    STATE.with(|cell| *cell.borrow_mut() = None);
+}
+
 /// Test helper: the raw duplicate descriptor, for loss tests.
 #[cfg(test)]
 pub(crate) fn events_fd() -> Option<i32> {
@@ -1439,6 +1445,12 @@ mod tests {
                 libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
                 libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
             }
+        }
+        // SAFETY: close-on-exec on our own descriptors, so a child spawned by
+        // a concurrently running test cannot inherit either end of the pipe.
+        unsafe {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
         }
         use std::os::unix::io::FromRawFd;
         // SAFETY: both descriptors are owned by the returned files.
