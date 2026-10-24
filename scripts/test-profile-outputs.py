@@ -148,6 +148,14 @@ class OracleFailure(RuntimeError):
     unrecordable receipt all stay plain RuntimeError/OSError/etc."""
 
 
+class UnsafeEffect(OracleFailure):
+    """An attach, detach, device or writer operation whose EFFECT is unknown.
+
+    It always aborts the whole run — never recorded as a recoverable oracle
+    failure — because a later case must not run against an unknown device,
+    mount or writer state."""
+
+
 def fail(message: str) -> None:
     raise OracleFailure(message)
 
@@ -1593,6 +1601,8 @@ DIAGNOSTIC_RECEIPT_BYTES = 64 * 1024
 # The ONLY messages that turn an oracle failure into a safety abort. A
 # diagnostic may step over a wrong expectation; it may never step over the
 # deadline, an unrecordable receipt, unknown custody or an unsettled child.
+# Any operation whose EFFECT is unknown uses UnsafeEffect instead, which always
+# aborts regardless of its wording.
 DIAGNOSTIC_SAFETY_MARKERS = (
     "work deadline reached",
     "no kept evidence root",
@@ -1600,35 +1610,46 @@ DIAGNOSTIC_SAFETY_MARKERS = (
     "custody",
 )
 
-# Every case block of the fixed matrix, its own id and the steps it needs to
-# be complete before it can run. Case 11 is two blocks (its base-created
-# fixture must exist before case 10's warm check and its migration runs after),
-# so the unit is the step and the numbered case is the reported subject.
+# Shared premises: what a step may leave changed if it fails part-way, and what
+# it requires to be sound before it runs. `pool` and `custody` are taint-only
+# (there is no effect-free way to prove them restored); `first`, `volume` and
+# `registration` also carry a bounded guard.
+PREMISES = ("first", "volume", "registration", "pool", "custody")
+PREMISE_GUARDS: dict = {}
+
+# Every case block of the fixed matrix: its own id, the steps it needs COMPLETE
+# first, the shared premises it requires, and the premises a mid-step failure
+# may leave changed (which then skips every later step that needs them). Case
+# 11 is two blocks because its base-created fixture must exist before case 10's
+# warm check, so the step is the unit and the numbered case is the subject.
 CASE_STEPS = [
-    ("11.1", "11", ()),
-    ("11.2", "11", ("11.1",)),
-    ("01.1", "01", ()),
-    ("02.1", "02", ("01.1",)),
-    ("03.1", "03", ("01.1",)),
-    ("04.1", "04", ("01.1",)),
-    ("05.1", "05", ("01.1",)),
-    ("06.1", "06", ("05.1",)),
-    ("07.1", "07", ("01.1",)),
-    ("08.1", "08", ("01.1",)),
-    ("09.1", "09", ("01.1",)),
-    ("10.1", "10", ()),
-    ("12.1", "12", ("01.1",)),
-    ("13.1", "13", ("01.1",)),
-    ("14.1", "14", ("01.1",)),
-    ("15.1", "15", ("01.1",)),
-    ("16.1", "16", ("01.1", "11.2")),
-    ("17.1", "17", ("07.1",)),
-    ("18.1", "18", ("01.1",)),
-    ("19.1", "19", ("11.2",)),
-    ("20.1", "20", ("01.1",)),
+    # step, case, dependencies, needs, taints
+    ("11.1", "11", (), ("volume", "pool"), ("pool",)),
+    ("11.2", "11", ("11.1",), ("volume", "registration", "pool"), ("registration", "pool")),
+    ("01.1", "01", (), ("volume", "registration"), ("first", "pool")),
+    ("02.1", "02", ("01.1",), ("first", "volume"), ("first", "custody")),
+    ("03.1", "03", ("01.1",), ("first", "volume"), ("first",)),
+    ("04.1", "04", ("01.1",), ("first", "volume"), ("first",)),
+    ("05.1", "05", ("01.1",), ("first", "volume"), ("first",)),
+    ("06.1", "06", ("05.1",), ("first", "volume"), ("first",)),
+    ("07.1", "07", ("01.1",), ("first", "volume"), ("first",)),
+    ("08.1", "08", ("01.1",), ("first", "volume"), ("first",)),
+    ("09.1", "09", ("01.1",), ("first", "volume"), ("first",)),
+    ("10.1", "10", (), ("volume", "pool"), ("pool",)),
+    ("12.1", "12", ("01.1",), ("first", "volume", "pool"), ("pool", "first")),
+    ("13.1", "13", ("01.1",), ("first", "volume", "pool"), ("pool", "first", "custody")),
+    ("14.1", "14", ("01.1",), ("first", "volume"), ("volume", "registration", "first")),
+    ("15.1", "15", ("01.1",), ("first", "volume"), ("first", "pool")),
+    ("16.1", "16", ("01.1", "11.2"), ("first", "volume", "pool"), ("first", "pool", "custody")),
+    ("17.1", "17", ("07.1",), ("first", "volume"), ("first", "custody", "pool")),
+    ("18.1", "18", ("01.1",), ("first", "volume"), ("first", "pool")),
+    ("19.1", "19", ("11.2",), ("volume", "pool"), ("pool",)),
+    ("20.1", "20", ("01.1",), ("first", "volume", "pool"), ("pool", "custody")),
 ]
-CASE_STEP_DEPS = {step: deps for step, _, deps in CASE_STEPS}
-CASE_STEP_CASE = {step: case for step, case, _ in CASE_STEPS}
+CASE_STEP_DEPS = {step: deps for step, _, deps, _, _ in CASE_STEPS}
+CASE_STEP_NEEDS = {step: needs for step, _, _, needs, _ in CASE_STEPS}
+CASE_STEP_TAINTS = {step: taints for step, _, _, _, taints in CASE_STEPS}
+CASE_STEP_CASE = {step: case for step, case, _, _, _ in CASE_STEPS}
 
 SHARED: dict = {}
 
@@ -1661,9 +1682,11 @@ class Diagnostic:
         self.done: list = []
         self.failures: list = []
         self.skips: list = []
+        self.tainted: dict = {}
         self.aborted = None
 
     def enter(self, step: str, fixtures: tuple = ()) -> bool:
+        """Whether this step may run at all. Default mode always may."""
         if not self.mode:
             return True
         reasons = []
@@ -1673,11 +1696,23 @@ class Diagnostic:
             failed = next((item for item in self.failures if item["step"] == need), None)
             skipped = next((item for item in self.skips if item["step"] == need), None)
             if failed is not None:
-                reasons.append(f"{need} failed at its {failed['kind']} ({failed['observed'][:200]})")
+                reasons.append(f"{need} failed at its {failed['kind']}")
             elif skipped is not None:
                 reasons.append(f"{need} was skipped")
             else:
                 reasons.append(f"{need} did not complete")
+        for premise in CASE_STEP_NEEDS[step]:
+            if premise in self.tainted:
+                reasons.append(
+                    f"the shared {premise} premise may be left changed by {self.tainted[premise]}"
+                )
+                continue
+            guard = PREMISE_GUARDS.get(premise)
+            if guard is None:
+                continue
+            ok, reason = guard()
+            if not ok:
+                reasons.append(reason)
         for guard in fixtures:
             ok, reason = guard()
             if not ok:
@@ -1694,33 +1729,30 @@ class Diagnostic:
 
     @staticmethod
     def classify(error: BaseException) -> str:
+        # An unknown EFFECT is never recoverable, whatever its wording.
+        if isinstance(error, UnsafeEffect):
+            return "abort"
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             return "abort"
-        if isinstance(error, NameError):
-            return "dependency"
         if isinstance(error, OracleFailure):
             text = str(error)
             if any(marker in text for marker in DIAGNOSTIC_SAFETY_MARKERS):
                 return "abort"
             return "oracle"
+        # NameError/UnboundLocalError included: an unexpected name is a script
+        # defect or an unmodelled infrastructure failure, never proof that a
+        # declared prerequisite is missing (dependencies are declared above).
         return "abort"
 
     def failed_step(self, proof, step: str, error: BaseException) -> None:
         if not self.mode:
             raise error
-        kind = self.classify(error)
-        if kind == "dependency":
-            self.skips.append(
-                {
-                    "step": step,
-                    "case": CASE_STEP_CASE[step],
-                    "reasons": [f"a prerequisite fixture is missing: {error}"],
-                }
-            )
-            print(f"DIAGNOSTIC skip {step}: prerequisite fixture missing ({error})", flush=True)
-            return
+        # R1: custody is decided BEFORE any recoverable outcome is considered.
+        # An unsettled owned child or an unclosed writer means this run's
+        # effects are unknown, so no failure may be recorded and stepped over.
         unsettled = CUSTODY.pending(proof) if proof is not None else []
         unclosed = sorted(getattr(proof, "unclosed", set())) if proof is not None else []
+        kind = self.classify(error)
         record = {
             "step": step,
             "case": CASE_STEP_CASE[step],
@@ -1730,13 +1762,12 @@ class Diagnostic:
             "unclosed": unclosed,
         }
         if kind == "abort" or unsettled or unclosed:
-            # Safety failures stop the whole diagnostic: the guard/deadline,
-            # child closure, image/device/writer custody or the evidence path is
-            # no longer trustworthy, so no later case may run.
             self.aborted = record
             print(f"DIAGNOSTIC abort in {step}: {error}", flush=True)
             raise error
         self.failures.append(record)
+        for premise in CASE_STEP_TAINTS[step]:
+            self.tainted.setdefault(premise, step)
         print(f"DIAGNOSTIC failure in {step}: {error}", flush=True)
 
 
@@ -1749,13 +1780,16 @@ def diagnostic_record(proof, started_ms, primary, secondary) -> dict:
     completed = [
         case
         for case in CASE_IDS
-        if all(step in DIAG.done for step, known, _ in CASE_STEPS if known == case)
+        if all(step in DIAG.done for step, known, _, _, _ in CASE_STEPS if known == case)
     ]
     failed = sorted({item["case"] for item in DIAG.failures})
     skipped = sorted({item["case"] for item in DIAG.skips})
     unexecuted = [
         case for case in CASE_IDS if case not in completed and case not in failed and case not in skipped
     ]
+    first_oracle = DIAG.failures[0] if DIAG.failures else None
+    # A clean-looking outcome needs a COMPLETE, unaborted collection: any skip,
+    # abort or unexecuted case means the list is not complete.
     outcome = (
         "no_oracle_failures"
         if not DIAG.failures and not DIAG.skips and DIAG.aborted is None and not unexecuted
@@ -1793,7 +1827,13 @@ def diagnostic_record(proof, started_ms, primary, secondary) -> dict:
         },
         "failures": [dict(item) for item in DIAG.failures],
         "skips": [dict(item) for item in DIAG.skips],
+        # The FIRST recorded oracle failure is the primary fault even when a
+        # later abort or cleanup error ends the run; those stay secondary.
         "primary_failure": None if primary is None else str(primary)[-2000:],
+        "first_recorded_failure": dict(first_oracle) if first_oracle else None,
+        "abort": dict(DIAG.aborted) if DIAG.aborted else None,
+        "tainted_premises": dict(DIAG.tainted),
+        "collection_complete": DIAG.aborted is None and not DIAG.skips and not unexecuted,
         "secondary_errors": list(secondary),
         "custody": {
             "unclosed": sorted(getattr(proof, "unclosed", set())) if proof is not None else [],
@@ -1850,8 +1890,26 @@ def write_diagnostic_receipt(record: dict) -> str:
 
 def pure_diagnostic_controls() -> None:
     """Pure/mock controls for the diagnostic state machine. No child, image,
-    pool or fixture is touched; nothing is written."""
-    saved = (DIAG.mode, list(DIAG.done), list(DIAG.failures), list(DIAG.skips), DIAG.aborted)
+    pool or product fixture is touched; nothing is written."""
+    saved = (
+        DIAG.mode,
+        list(DIAG.done),
+        list(DIAG.failures),
+        list(DIAG.skips),
+        dict(DIAG.tainted),
+        DIAG.aborted,
+        dict(PREMISE_GUARDS),
+    )
+    passing = {premise: (lambda: (True, "")) for premise in ("first", "volume", "registration")}
+
+    class FakeProof:
+        """The minimum a safety decision reads: the runner's unclosed set and an
+        optional mount. Nothing here is a device or a child."""
+
+        def __init__(self, unclosed=(), mount=None) -> None:
+            self.unclosed = set(unclosed)
+            self.mount = mount
+
     try:
         # 1. Default mode stays fail-fast: the first oracle failure raises.
         DIAG.reset()
@@ -1864,59 +1922,163 @@ def pure_diagnostic_controls() -> None:
         # 2. Diagnostic mode records the failure and steps over it.
         DIAG.reset()
         DIAG.mode = True
-        DIAG.failed_step(None, "02.1", OracleFailure("02: observed A, expected B"))
+        DIAG.failed_step(FakeProof(), "02.1", OracleFailure("02: observed A, expected B"))
         expect(len(DIAG.failures) == 1, f"diagnostic did not record the failure: {DIAG.failures}")
         expect(DIAG.failures[0]["kind"] == "oracle", f"oracle failure classified {DIAG.failures[0]}")
         expect(DIAG.failures[0]["case"] == "02", f"failure case {DIAG.failures[0]}")
-        # 3. The first failure stays the primary/first recorded fault.
-        DIAG.failed_step(None, "03.1", OracleFailure("03: a later, unrelated failure"))
+        expect(DIAG.tainted.get("first") == "02.1", f"a failed step did not taint its premises: {DIAG.tainted}")
+        # 3. The first recorded failure stays first in the list.
+        DIAG.failed_step(FakeProof(), "03.1", OracleFailure("03: a later, unrelated failure"))
         expect(
             [item["step"] for item in DIAG.failures] == ["02.1", "03.1"],
             f"the recorded fault order changed: {DIAG.failures}",
         )
-        expect(DIAG.aborted is None, "a before-first diagnostic abort was recorded")
-        # 4. A step whose prerequisite failed is skipped, with the reason.
+        # 4. A declared dependency skip names the reason and records no failure.
+        DIAG.reset()
+        DIAG.mode = True
         expect(not DIAG.enter("16.1"), "a step entered although its prerequisite had not completed")
         expect(
-            DIAG.skips and "11.2 did not complete" in "; ".join(DIAG.skips[-1]["reasons"]),
+            "11.2 did not complete" in "; ".join(DIAG.skips[-1]["reasons"]),
             f"skip reasons {DIAG.skips}",
         )
-        expect(not DIAG.enter("06.1"), "a step entered after its prerequisite failed")
+        expect(DIAG.failures == [], "a dependency skip was recorded as an oracle failure")
+        # 5. R1: custody is decided BEFORE any recoverable outcome. An unresolved
+        #    owned child or an unclosed writer aborts even for a plain oracle and
+        #    even for a NameError, so a missing name can never bypass custody.
+        for error in (OracleFailure("05: a plain oracle failure"), NameError("first")):
+            DIAG.reset()
+            DIAG.mode = True
+            try:
+                DIAG.failed_step(FakeProof(unclosed={4242}), "05.1", error)
+                expect(False, f"an unclosed writer did not abort the diagnostic ({error!r})")
+            except BaseException as raised:
+                expect(raised is error, f"the abort re-raised {raised!r}, not the original {error!r}")
+            expect(DIAG.failures == [], f"a failure was recorded despite unclosed custody: {DIAG.failures}")
+            expect(DIAG.aborted and DIAG.aborted["unclosed"] == [4242], f"abort record {DIAG.aborted}")
+        # An unexpected NameError is an infrastructure abort even with clean
+        # custody: only a DECLARED dependency may skip a step.
+        DIAG.reset()
+        DIAG.mode = True
+        expect(DIAG.classify(NameError("first")) == "abort", "NameError was classified as a dependency")
+        expect(DIAG.classify(UnboundLocalError("x")) == "abort", "UnboundLocalError was classified as recoverable")
+        try:
+            DIAG.failed_step(FakeProof(), "06.1", NameError("first"))
+            expect(False, "a NameError was recorded as a recoverable oracle failure")
+        except NameError:
+            pass
+        expect(DIAG.failures == [], "a NameError was recorded as an oracle failure")
+        # 6. R2: an unknown device/writer EFFECT always aborts, whatever its
+        #    wording, and leaves no later case able to run.
+        DIAG.reset()
+        DIAG.mode = True
+        expect(DIAG.classify(UnsafeEffect("nothing else is spelled here")) == "abort", "UnsafeEffect was recoverable")
+        try:
+            DIAG.failed_step(FakeProof(), "14.1", UnsafeEffect("14: the detach exited 2, state unknown"))
+            expect(False, "a nonzero detach did not abort the diagnostic")
+        except UnsafeEffect:
+            pass
+        expect(DIAG.aborted and DIAG.aborted["kind"] == "abort", f"abort record {DIAG.aborted}")
+        expect(DIAG.failures == [], f"an unsafe effect was recorded as an oracle failure: {DIAG.failures}")
+        expect(not DIAG.enter("15.1"), "a case ran after an unsafe device effect")
+        # 7. R3: a failed step taints exactly the shared premises it declares, so
+        #    its dependants skip while an unrelated safe step still runs.
+        DIAG.reset()
+        DIAG.mode = True
+        PREMISE_GUARDS.clear()
+        PREMISE_GUARDS.update(passing)
+        DIAG.done.extend(["11.1", "01.1", "05.1", "07.1"])
+        DIAG.failed_step(FakeProof(), "11.2", OracleFailure("11: the low-reserve fallback assertion failed"))
         expect(
-            "05.1 did not complete" in "; ".join(DIAG.skips[-1]["reasons"]),
-            f"skip reasons {DIAG.skips[-1]}",
+            DIAG.tainted == {"registration": "11.2", "pool": "11.2"},
+            f"11.2 tainted {DIAG.tainted}",
         )
-        # 5. A tainted shared fixture skips dependent cases instead of faking it.
+        expect(not DIAG.enter("16.1"), "a step ran on a pool a failure may have left changed")
+        expect(
+            any("pool" in reason for reason in DIAG.skips[-1]["reasons"]),
+            f"taint reason {DIAG.skips[-1]}",
+        )
+        expect(not DIAG.enter("19.1"), "a step ran on a pool a failure may have left changed")
+        # The registration taint skips any later step that declares it.
+        original_needs = dict(CASE_STEP_NEEDS)
+        try:
+            CASE_STEP_NEEDS["08.1"] = ("first", "volume", "registration")
+            expect(not DIAG.enter("08.1"), "a step ran on a registration a failure may have left changed")
+            expect(
+                any("registration" in reason for reason in DIAG.skips[-1]["reasons"]),
+                f"taint reason {DIAG.skips[-1]}",
+            )
+        finally:
+            CASE_STEP_NEEDS.clear()
+            CASE_STEP_NEEDS.update(original_needs)
+        # An unrelated step that needs neither tainted premise still runs.
+        expect(DIAG.enter("08.1"), "an unrelated safe step was skipped by another case's taint")
+        # A step that fails while the volume is KNOWN absent skips its dependants
+        # honestly instead of reading the absence as a fresh failure...
+        DIAG.reset()
+        DIAG.mode = True
+        PREMISE_GUARDS.clear()
+        PREMISE_GUARDS.update(passing)
+        PREMISE_GUARDS["volume"] = lambda: (False, "the diagnostic left the owned volume detached")
+        DIAG.done.extend(["11.1", "11.2", "01.1"])
+        expect(not DIAG.enter("14.1"), "a step needing the volume ran while it is detached")
+        expect(
+            "left the owned volume detached" in "; ".join(DIAG.skips[-1]["reasons"]),
+            f"volume skip reason {DIAG.skips[-1]}",
+        )
+        # ...while an AMBIGUOUS mount state aborts instead of skipping.
+        class AmbiguousProof(FakeProof):
+            mount = "/definitely/not/a/mount"
+
+        def ambiguous_volume() -> tuple:
+            raise UnsafeEffect("the owned volume's state is unknown")
+
+        PREMISE_GUARDS["volume"] = ambiguous_volume
+        try:
+            DIAG.enter("14.1")
+            expect(False, "an ambiguous mount state did not abort")
+        except UnsafeEffect:
+            pass
+        expect(DIAG.failures == [], "an ambiguous mount state was recorded as an oracle failure")
+        # 8. A tainted shared fixture skips dependent cases instead of faking it.
         SHARED.pop("first", None)
         ok, reason = first_usable()
         expect(not ok and "never created" in reason, f"the missing fixture guard said {reason}")
-        # 6. Safety failures stop the whole diagnostic.
+        # 9. Other messages, exceptions and interruptions that must abort.
         for error, kind in (
             (OracleFailure("work deadline reached before the runner's shutdown margin"), "abort"),
             (OracleFailure("custody is unknown for pid 42"), "abort"),
             (RuntimeError("an infrastructure failure"), "abort"),
             (OSError("a disk error"), "abort"),
             (KeyboardInterrupt(), "abort"),
-            (NameError("first"), "dependency"),
+            (OracleFailure("02: a plain oracle message"), "oracle"),
         ):
             expect(DIAG.classify(error) == kind, f"{error!r} classified {DIAG.classify(error)}, not {kind}")
+        # 10. R4: the receipt keeps the FIRST recorded oracle as primary even when
+        #     a later abort ended the run, and never reads as a clean collection.
         DIAG.reset()
         DIAG.mode = True
-        try:
-            DIAG.failed_step(None, "04.1", OracleFailure("work deadline reached before the runner's shutdown margin"))
-            expect(False, "a safety failure did not stop the diagnostic")
-        except OracleFailure as error:
-            expect("work deadline" in str(error), f"safety abort message changed: {error}")
-        expect(DIAG.aborted and DIAG.aborted["kind"] == "abort", f"abort record {DIAG.aborted}")
-        expect(DIAG.failures == [], f"a safety abort was recorded as an oracle failure: {DIAG.failures}")
-        # 7. The diagnostic receipt is distinct, bounded and never a PASS claim.
-        DIAG.reset()
-        DIAG.mode = True
-        DIAG.failed_step(None, "02.1", OracleFailure("02: first recorded fault"))
-        record = diagnostic_record(None, 1234, None, ["a secondary error"])
+        DIAG.failed_step(FakeProof(), "02.1", OracleFailure("02: first recorded fault"))
+        DIAG.aborted = {
+            "step": "05.1",
+            "case": "05",
+            "kind": "abort",
+            "observed": "05: the run stopped later",
+            "unclosed": [],
+        }
+        record = diagnostic_record(
+            FakeProof(),
+            1234,
+            DIAG.failures[0]["observed"],
+            ["the run stopped after that failure: 05: the run stopped later", "a secondary error"],
+        )
         expect(record["version"] == "oxide.outputs.proof-diagnostic/1", record["version"])
         expect(record["mode"] == "diagnostic" and record["qualified"] is False, f"{record['mode']}/{record['qualified']}")
         expect(record["outcome"] == "failures_recorded", record["outcome"])
+        expect(record["primary_failure"] == "02: first recorded fault", record["primary_failure"])
+        expect(record["first_recorded_failure"]["step"] == "02.1", record["first_recorded_failure"])
+        expect(record["abort"]["step"] == "05.1", record["abort"])
+        expect(record["collection_complete"] is False, "an aborted collection claimed completeness")
+        expect(len(record["secondary_errors"]) == 2, record["secondary_errors"])
         expect("never a counted native PASS" in record["claims"], record["claims"])
         payload, incomplete = diagnostic_payload(record)
         expect(not incomplete and len(payload) <= DIAGNOSTIC_RECEIPT_BYTES, f"diagnostic payload {len(payload)} / {incomplete}")
@@ -1928,8 +2090,9 @@ def pure_diagnostic_controls() -> None:
             and body.get("mode") == "diagnostic",
             "the diagnostic receipt claims a PASS",
         )
-        # 8. An oversized failure list is marked INCOMPLETE inside the bound,
-        #    never silently truncated and never claimed complete.
+        expect(body["primary_failure"] == "02: first recorded fault", body["primary_failure"])
+        # 11. An oversized failure list is marked INCOMPLETE inside the bound,
+        #     never silently truncated and never claimed complete.
         oversized = dict(record)
         oversized["failures"] = [{"observed": "x" * 2000} for _ in range(60)]
         payload, incomplete = diagnostic_payload(oversized)
@@ -1939,8 +2102,11 @@ def pure_diagnostic_controls() -> None:
         expect(len(body["failures"]) + body["failures_omitted"] == 60, "the overflow record lost its count")
     finally:
         DIAG.reset()
-        DIAG.mode, done, failures, skips, aborted = saved
-        DIAG.done, DIAG.failures, DIAG.skips, DIAG.aborted = done, failures, skips, aborted
+        DIAG.mode, done, failures, skips, tainted, aborted, guards = saved
+        DIAG.done, DIAG.failures, DIAG.skips = done, failures, skips
+        DIAG.tainted, DIAG.aborted = tainted, aborted
+        PREMISE_GUARDS.clear()
+        PREMISE_GUARDS.update(guards)
 
 
 def run(proof: Proof, repo: str) -> None:
@@ -1984,6 +2150,30 @@ def run(proof: Proof, repo: str) -> None:
     # proof peaks at 6 concurrent Cargo jobs.
     proof.env["CARGO_BUILD_JOBS"] = str(FIXTURE_JOBS)
     register(proof, pool)
+
+    # R3: bounded, effect-free shared-premise guards. A premise a failed step may
+    # have changed is tracked as a taint by the diagnostic; these guards cover
+    # the two premises that also have a cheap positive observation, and an
+    # AMBIGUOUS mount state aborts instead of being read as a skip.
+    def volume_attached() -> tuple:
+        mount = getattr(proof, "mount", None)
+        if mount is None:
+            return False, "the diagnostic left the owned volume detached, so external-root steps cannot run"
+        if not os.path.isdir(mount):
+            raise UnsafeEffect(
+                f"the owned volume's state is unknown: its recorded mount point {mount!r} is not a directory"
+            )
+        return True, ""
+
+    def registration_intact() -> tuple:
+        path = perm.registration_path(pool)
+        if not os.path.exists(path):
+            return False, "the fixture removable registration is missing, so the recorded premise is not provable"
+        if getattr(proof, "mount", None) is None:
+            return False, "the fixture registration names a volume that is not attached"
+        return True, ""
+
+    PREMISE_GUARDS.update(volume=volume_attached, registration=registration_intact)
 
     # Case 10 (base half): a BASE-produced whole-target /2 state and warm slot
     # key prepared under the base-compatible registration before ANY candidate
@@ -2958,7 +3148,16 @@ def run(proof: Proof, repo: str) -> None:
             # and the detached state is recorded after it.
             write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, "14 volume away", "detaching"))
             detached = proof.run(["/usr/bin/hdiutil", "detach", proof.mount], timeout=60)
-            expect(detached.returncode == 0, "14: ordinary detach failed")
+            if detached.returncode != 0:
+                # R2: the device state after a nonzero detach is UNKNOWN. This is
+                # an effect boundary, so it aborts the whole diagnostic at once
+                # (never a recoverable oracle failure, never a later case against
+                # an unknown mount) and the backing stays retained.
+                raise UnsafeEffect(
+                    "14: the ordinary detach exited "
+                    f"{detached.returncode}, so the owned volume's state is unknown: "
+                    + detached.stderr.decode(errors="replace")[-500:]
+                )
             proof.mount = None
             write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, "14 volume away", "detached"))
             # The internal fallback slot meets an external owned link: the command
@@ -3758,12 +3957,12 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
     closure or qualified native evidence, even with zero oracle failures."""
     DIAG.reset()
     DIAG.mode = True
-    primary = None
+    raised = None
     secondary: list = []
     try:
         run(proof, repo)
     except BaseException as error:
-        primary = error
+        raised = error
         if DIAG.aborted is None:
             DIAG.aborted = {
                 "step": None,
@@ -3773,11 +3972,22 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
                 "unclosed": sorted(getattr(proof, "unclosed", set())),
             }
     try:
-        detach_owned_volume(proof, "failure" if primary is not None else "diagnostic")
+        detach_owned_volume(proof, "failure" if raised is not None else "diagnostic")
     except BaseException as error:
         secondary.append(f"ordinary detach failed: {error!r}")
-        if primary is None:
-            primary = error
+        if raised is None:
+            raised = error
+    # R4: the FIRST recorded oracle failure is the primary fault even when a
+    # later safety abort or cleanup error ended the run.
+    first_oracle = DIAG.failures[0] if DIAG.failures else None
+    if first_oracle is not None:
+        primary = first_oracle["observed"]
+        if raised is not None:
+            abort_text = str(raised)[-2000:]
+            if abort_text != primary:
+                secondary.append(f"the run stopped after that failure: {abort_text}")
+    else:
+        primary = None if raised is None else str(raised)[-2000:]
     record = diagnostic_record(proof, _CASE_PROGRESS["started_ms"], primary, secondary)
     try:
         path = write_diagnostic_receipt(record)
@@ -3789,8 +3999,8 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
             file=sys.stderr,
             flush=True,
         )
-        if primary is not None:
-            raise primary
+        if raised is not None:
+            raise raised
         raise
     print(
         f"profile-outputs diagnostic: {record['outcome']}; "
@@ -3798,8 +4008,8 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
         f"receipt {path}",
         flush=True,
     )
-    if primary is not None:
-        raise primary
+    if raised is not None:
+        raise raised
     return 0 if record["outcome"] == "no_oracle_failures" else 1
 
 
