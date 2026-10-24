@@ -1468,6 +1468,285 @@ class PureTraversal(unittest.TestCase):
         self.assertGreater(len(seam.opened), 0, "the seam never observed an open")
 
 
+# Default scratch parent (oxide#145) --------------------------------------------
+
+BOOT, DRIVE = 1000, 2000
+DRIVE_UUID = "a6ac3ed7-33ea-46b4-8082-7254cf291ed2"
+OTHER_UUID = "11111111-2222-3333-4444-555555555555"
+CONFIG = "/Users/owner/Library/Application Support/oxide/config/config.toml"
+
+
+class FakeProbe:
+    """Injected default-selection facts: no kernel read, no real lookup."""
+
+    def __init__(self, nodes, documents=None, uuids=None, home="/Users/owner", euid=501,
+                 realpaths=None):
+        self.nodes = dict(nodes)  # path -> (device, mode, uid)
+        self.documents = dict(documents or {})
+        self.uuids = dict(uuids or {})
+        self.home_dir = home
+        self.uid = euid
+        self.realpaths = dict(realpaths or {})
+
+    def _node(self, path):
+        try:
+            return self.nodes[path]
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+
+    def stat(self, path):
+        device, mode, uid = self._node(path)
+        return types.SimpleNamespace(st_dev=device, st_mode=mode, st_uid=uid, st_size=0)
+
+    def lstat(self, path):
+        return self.stat(path)
+
+    def realpath(self, path):
+        return self.realpaths.get(path, path)
+
+    def volume_uuid(self, path):
+        self._node(path)
+        return self.uuids.get(path)
+
+    def euid(self):
+        return self.uid
+
+    def home(self):
+        return self.home_dir
+
+    def read(self, path, limit):
+        if path not in self.documents:
+            self._node(path)
+        data = self.documents[path]
+        if len(data) > limit:
+            raise bounded.SelectionRefused(f"{path} is larger than {limit} bytes")
+        return data
+
+
+def registration_document(mount="/Volumes/Builds", uuid=DRIVE_UUID):
+    return json.dumps({"version": 2, "mount_point": mount, "volume_uuid": uuid,
+                       "container_uuid": OTHER_UUID, "reserve_bytes": 1024, "cap_bytes": 2048,
+                       "quota_bytes": None, "capacity_bytes": 4096, "registered_ms": 17,
+                       "mode": "permanent"}, indent=2).encode()
+
+
+def default_world(pool="/Users/owner/Dev/oxide", registration=True, config=True, drive=True,
+                  drive_device=DRIVE, drive_uuid=DRIVE_UUID, drive_mode=0o755, volumes_mode=0o755,
+                  pool_device=BOOT, documents=None):
+    """One fake machine: the boot volume, the drive and the pool's registration."""
+    nodes = {"/": (BOOT, stat.S_IFDIR | 0o755, 0),
+             "/Volumes": (BOOT, stat.S_IFDIR | volumes_mode, 0),
+             "/private/tmp": (BOOT, stat.S_IFDIR | 0o777, 0),
+             "/Users": (BOOT, stat.S_IFDIR | 0o755, 0),
+             "/Users/owner": (BOOT, stat.S_IFDIR | 0o700, 501),
+             "/Users/owner/Dev": (BOOT, stat.S_IFDIR | 0o755, 501),
+             "/Users/owner/Dev/oxide": (pool_device, stat.S_IFDIR | 0o700, 501),
+             pool: (pool_device, stat.S_IFDIR | 0o700, 501)}
+    uuids = {"/": OTHER_UUID, "/Volumes": OTHER_UUID}
+    if drive:
+        nodes["/Volumes/Builds"] = (drive_device, stat.S_IFDIR | drive_mode, 501)
+        uuids["/Volumes/Builds"] = drive_uuid
+    documents = dict(documents or {})
+    if config:
+        documents[CONFIG] = b'[pool]\npath = "~/Dev/oxide"\nbudget = "100GB"\n'
+    if registration:
+        documents[os.path.join(pool, "oxide-managed", "removable.json")] = registration_document()
+    return FakeProbe(nodes, documents, uuids)
+
+
+class PureDefaultScratch(unittest.TestCase):
+    """The default scratch parent: the selected volume when eligible, one
+    bounded warned fallback otherwise, and the caller's own contexts kept."""
+
+    def select(self, world, env=None):
+        return bounded.select_default_parent(dict(env or {}), world)
+
+    # Selected volume
+
+    def test_registered_drive_is_the_default(self):
+        facts = self.select(default_world())
+        self.assertEqual(facts["source"], "selected-volume")
+        self.assertEqual(facts["root_parent"], "/Volumes/Builds")
+        self.assertEqual(facts["mount"], "/Volumes/Builds")
+        self.assertEqual(facts["volume_uuid"], DRIVE_UUID)
+        self.assertEqual(facts["device"], DRIVE)
+        self.assertEqual(facts["pool"], "/Users/owner/Dev/oxide")
+        self.assertEqual(facts["pool_source"], "account config")
+        self.assertEqual(facts["registration"], "/Users/owner/Dev/oxide/oxide-managed/removable.json")
+        self.assertIsNone(facts["reason"])
+
+    def test_pool_on_the_drive_uses_its_mount_root(self):
+        world = default_world(pool="/Volumes/Builds/oxide-pool", registration=False, pool_device=DRIVE)
+        facts = self.select(world, {"OXIDE_POOL": "/Volumes/Builds/oxide-pool"})
+        self.assertEqual(facts["source"], "selected-volume")
+        self.assertEqual(facts["root_parent"], "/Volumes/Builds")
+        self.assertEqual(facts["registration"], None)
+        self.assertEqual(facts["pool_source"], "OXIDE_POOL")
+
+    def test_registration_beats_an_internal_pool(self):
+        facts = self.select(default_world(pool_device=BOOT))
+        self.assertEqual(facts["source"], "selected-volume")
+        self.assertEqual(facts["root_parent"], "/Volumes/Builds")
+
+    # Fallback with a bounded warning
+
+    def test_internal_pool_without_registration_falls_back(self):
+        facts = self.select(default_world(registration=False))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertEqual(facts["root_parent"], bounded.FALLBACK_PARENT)
+        self.assertIn("boot volume", facts["reason"])
+        warning = bounded.fallback_warning(facts)
+        self.assertLessEqual(len(warning.encode()), 512, "the warning is not bounded")
+        self.assertEqual(warning.count("\n"), 1, "the warning is more than one line")
+        self.assertIn(bounded.FALLBACK_PARENT, warning)
+        self.assertIn(facts["reason"][:40], warning)
+
+    def test_absent_drive_falls_back_without_creating_a_mount_path(self):
+        facts = self.select(default_world(drive=False))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("FileNotFoundError", facts["reason"])
+        self.assertIn("/Volumes/Builds", facts["reason"])
+        self.assertIsNone(facts["mount"])
+
+    def test_stale_mount_point_on_the_boot_volume_is_refused(self):
+        facts = self.select(default_world(drive_device=BOOT))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("boot volume", facts["reason"])
+
+    def test_a_different_volume_under_the_registered_name_is_refused(self):
+        facts = self.select(default_world(drive_uuid=OTHER_UUID))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn(DRIVE_UUID, facts["reason"])
+        self.assertIn(OTHER_UUID, facts["reason"])
+
+    def test_symlinked_mount_point_is_refused(self):
+        world = default_world()
+        world.nodes["/Volumes/Builds"] = (DRIVE, stat.S_IFLNK | 0o777, 501)
+        facts = self.select(world)
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("symlink", facts["reason"])
+
+    def test_uncanonical_mount_point_is_refused(self):
+        world = default_world()
+        world.realpaths["/Volumes/Builds"] = "/private/tmp/Builds"
+        facts = self.select(world)
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("not canonical", facts["reason"])
+
+    def test_unreadable_volume_identity_is_refused(self):
+        facts = self.select(default_world(drive_uuid=None))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("no readable UUID", facts["reason"])
+
+    def test_writable_mount_parent_is_refused(self):
+        facts = self.select(default_world(volumes_mode=0o777))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("mount parent", facts["reason"])
+
+    # Registration and config refusals
+
+    def test_unreadable_registration_falls_back(self):
+        for document, marks in ((b"{", "not JSON"), (b"[]", "not an object"),
+                                (json.dumps({"version": 2}).encode(), "no recorded mount point"),
+                                (b"x" * (64 * 1024 + 1), "larger than")):
+            with self.subTest(document=document[:16]):
+                world = default_world()
+                world.documents["/Users/owner/Dev/oxide/oxide-managed/removable.json"] = document
+                facts = self.select(world)
+                self.assertEqual(facts["source"], "fallback")
+                self.assertIn(marks, facts["reason"])
+
+    def test_config_pool_path_forms(self):
+        world = default_world(registration=False)
+        for text, expected in ((b'[other]\npath = "/nowhere"\n', "/Users/owner/Library/Caches/oxide/build-pool"),
+                               (b'[pool]\npath = \'~/Dev/oxide\'\n', "/Users/owner/Dev/oxide"),
+                               (b'# note\n[pool]\npath = "~/Dev/oxide"\n', "/Users/owner/Dev/oxide")):
+            with self.subTest(text=text):
+                world.documents[CONFIG] = text
+                facts = self.select(world)
+                self.assertEqual(facts["pool"], expected)
+        for text, marks in ((b'[pool]\npath = "~/Dev/oxi\\u0078de"\n', "unsupported escape"),
+                            (b'[pool]\npath = 12\n', "unsupported pool path value"),
+                            (b'[pool\npath = "~/Dev/oxide"\n', "unsupported table header"),
+                            (b'[pool]\npath = "~/a"\npath = "~/b"\n', "repeated pool path")):
+            with self.subTest(text=text):
+                world.documents[CONFIG] = text
+                facts = self.select(world)
+                self.assertEqual(facts["source"], "fallback")
+                self.assertIn(marks, facts["reason"])
+
+    def test_an_absent_config_uses_the_built_in_pool(self):
+        world = default_world(registration=False, config=False)
+        facts = self.select(world)
+        self.assertEqual(facts["pool"], "/Users/owner/Library/Caches/oxide/build-pool")
+        self.assertEqual(facts["pool_source"], "built-in default pool")
+        self.assertEqual(facts["source"], "fallback")  # that pool does not exist here
+
+    # Caller contexts keep their own contracts
+
+    def test_explicit_root_parent_and_adopted_scratch_are_not_defaults(self):
+        self.assertIsNone(bounded.parse(["command"])[1]["root_parent"])
+        self.assertEqual(bounded.parse(["--root-parent", "/x", "command"])[1]["root_parent"], "/x")
+        self.assertEqual(
+            bounded.parse(["--root-parent", "/x", "--evidence", "/e", "--limit", "40", "command"])[1],
+            {"limit": 40.0, "budget": bounded.SCRATCH_BUDGET, "evidence": "/e", "root_parent": "/x"})
+        self.assertIsNone(bounded.Custodian(["command"]).root_parent)
+
+    def test_bootstrap_still_exercises_the_default(self):
+        # The qualification must not mask default selection with --root-parent;
+        # it finds the candidate receipt through --evidence instead.
+        text = BOOTSTRAP.read_text()
+        self.assertNotIn('"--root-parent"', text)
+        self.assertIn('"--evidence"', text)
+
+    # The owned leaf
+
+    def leaf_world(self, **facts):
+        sandbox = Path(tempfile.mkdtemp(prefix="leaf.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        parent, leaf = str(sandbox), str(sandbox / "leaf")
+        mode = facts.get("mode", stat.S_IFDIR | 0o700)
+        nodes = {parent: (BOOT, stat.S_IFDIR | 0o700, 501),
+                 leaf: (facts.get("device", BOOT), mode, facts.get("uid", 501))}
+        probe = FakeProbe(nodes, euid=501, realpaths={leaf: facts.get("realpath", leaf)})
+
+        def make_dir(prefix, dir):
+            os.mkdir(leaf, 0o700)
+            return leaf
+
+        return parent, leaf, probe, make_dir
+
+    def test_owned_leaf_is_private_canonical_and_on_the_parent_device(self):
+        parent, leaf, probe, make_dir = self.leaf_world()
+        self.assertEqual(bounded.create_owned_root(parent, probe, make_dir), leaf)
+        self.assertTrue(os.path.isdir(leaf))
+        info = os.lstat(leaf)
+        self.assertEqual(info.st_uid, os.geteuid())
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+
+    def test_unusable_owned_leaf_is_refused_and_removed(self):
+        cases = {"not private": {"mode": stat.S_IFDIR | 0o755},
+                 "not private to this user": {"uid": 0},
+                 "not on the parent's device": {"device": DRIVE},
+                 "not canonical under": {"realpath": "/private/tmp/leaf"},
+                 "not a real directory": {"mode": stat.S_IFLNK | 0o777}}
+        for marks, facts in cases.items():
+            with self.subTest(marks):
+                parent, leaf, probe, make_dir = self.leaf_world(**facts)
+                with self.assertRaises(bounded.SelectionRefused) as caught:
+                    bounded.create_owned_root(parent, probe, make_dir)
+                self.assertIn(marks, str(caught.exception))
+                self.assertFalse(os.path.lexists(leaf), "the refused leaf was kept")
+
+    def test_a_symlinked_root_parent_is_refused(self):
+        parent, leaf, probe, make_dir = self.leaf_world()
+        probe.nodes[parent] = (BOOT, stat.S_IFLNK | 0o777, 501)
+        with self.assertRaises(bounded.SelectionRefused) as caught:
+            bounded.create_owned_root(parent, probe, make_dir)
+        self.assertIn("not a real directory", str(caught.exception))
+        self.assertFalse(os.path.lexists(leaf))
+
+
 # Real cases --------------------------------------------------------------------
 
 
@@ -1970,7 +2249,7 @@ def main():
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
-                                           PureTraversal))
+                                           PureTraversal, PureDefaultScratch))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

@@ -178,8 +178,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   controls exist only in debug builds; any other build refuses them.
 - **Temporary files off the internal drive:** temp files from builds, tests
   and native proofs go to the selected pool (the Builds drive when present),
-  not the internal SSD. Approved, not built. The
-  [scratch placement contract](contracts/workflow.md#temporary-scratch-placement-approved-not-implemented)
+  not the internal SSD. The proof and validation tooling default is in source
+  (oxide#145) and awaits independent review and requalification at the new
+  source; temp for product builds and tests is approved, not built. The
+  [scratch placement contract](contracts/workflow.md#temporary-scratch-placement)
   owns same-volume inherited-temp retention, fallback and supervisor
   requalification; external owners retain cleanup of their inherited paths.
 - **Leftover output roots** of checkouts that no longer exist are removed

@@ -16,14 +16,22 @@ stdout reader or slow read cannot extend the 300 s: at the deadline the
 worker is KILLed and the exit is 124 with whatever output was written.
 
 The worker runs the candidate with a 280 s limit and a 512 MiB monitored
-budget around `scripts/test_supervisor.py`, with the candidate's owned root
-inside this script's scratch. Nested case directories live in the
-candidate's evidence directory (OXIDE_PROOF_EVIDENCE), which the candidate's
-cleanup never removes. Pass requires: candidate exit 0, receipt phase
+budget around `scripts/test_supervisor.py`, with the candidate's own evidence
+directory inside this script's scratch (as `--evidence`, which selects no
+scratch parent) and **no** `--root-parent`, so the candidate's default
+scratch routing is what runs: the private area on the volume the machine's
+effect-free pool selection names. The bootstrap refuses before any effect
+when that selection does not resolve to an eligible non-boot volume, because
+a qualification that only exercised the `/private/tmp` fallback would not
+exercise the default. Nested case directories live in the candidate's
+evidence directory (OXIDE_PROOF_EVIDENCE), which the candidate's cleanup
+never removes. Pass requires: candidate exit 0, receipt phase
 `monitor_complete`, closure established with command status 0 and no fault,
-reserve sampling from before the gate with no gap over 1 s, the fixture
-writers counted, custody at every signal, every expected case passing, and
-every nested case directory still present after the candidate's cleanup.
+the default scratch on the selected volume with the selected volume's UUID
+and a reserve sampled on the scratch's own device, reserve sampling from
+before the gate with no gap over 1 s, the fixture writers counted, custody at
+every signal, every expected case passing, and every nested case directory
+still present after the candidate's cleanup.
 On overrun it TERMs, then KILLs, only its own unreaped candidate child.
 Nothing is ever deleted: nested UNCLOSED cases leave live fixture processes
 whose only bound is their fallback, which is not closure, so the whole
@@ -31,8 +39,8 @@ scratch base is kept and its path printed for the owner.
 """
 from __future__ import annotations
 
-import glob
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -48,7 +56,7 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 133
+EXPECTED_CASES = 152
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -61,7 +69,9 @@ LIMITATIONS = [
     "Cooperative session scope: a process that calls setsid is seen only if tracked as a member earlier or while it holds an output pipe; arbitrary same-user writers are outside the promise.",
     "Only the pinned leader's group and the pinned monitor are ever signalled; survivors in other groups end the run UNCLOSED with scratch kept, never signalled.",
     "The census treats every unvalidated process on the host as uncertain, including zombies of unrelated parents, so such a process present after the stop yields a false UNCLOSED (fails closed).",
-    "Host free space is a sampled abort threshold (0.25 s, 22 GiB = 20 GiB reserve + 2 GiB margin); no instantaneous guarantee. Owned bytes are walked every 2 s against a monitored budget, not a hard ceiling.",
+    "Host free space is a sampled abort threshold (0.25 s, 22 GiB = 20 GiB reserve + 2 GiB margin) read on the filesystem actually holding the scratch, so on the selected drive it is that volume's free space, not the internal disk's; no instantaneous guarantee. Owned bytes are walked every 2 s against a monitored budget, not a hard ceiling.",
+    "The default scratch parent is read passively from OXIDE_POOL, the user config file's [pool] path or the built-in pool, and the pool's removable registration, with one kernel volume-UUID read; that is not the product's verified build-time selection (no diskutil container/role check), the config reader understands only a simple [pool] path entry, and anything unreadable or unsupported falls back to /private/tmp with a warning. The bootstrap refuses to qualify on a fallback.",
+    "Scratch on the selected drive is created as a new private oxide-proof.* directory and is kept on a failed or unclosed run exactly like the /private/tmp default; the harness never removes any other directory on that volume.",
     "Deadlines are enforced by a single-threaded custodian on CLOCK_UPTIME_RAW with bounded calls; no hard real-time scheduling claim.",
     "macOS only (kqueue NOTE_EXIT, sysctl kinfo_proc at self-checked offsets); Linux is not qualified.",
     "Effigy admission waits happen before this script starts and are not inside its 300 s.",
@@ -155,7 +165,23 @@ def bounded(work, deadline_ns, finish_ns):
     return 124
 
 
-def check(receipt, results):
+def selection():
+    """The candidate's own default routing, resolved here before anything is
+    created: this bootstrap refuses rather than spend a native run that could
+    not exercise it."""
+    spec = importlib.util.spec_from_file_location("bounded_test", SOURCES["supervisor"])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.select_default_parent(os.environ)
+
+
+def registration(path):
+    """The recorded registration this bootstrap reads for itself (bounded)."""
+    with open(path, "rb") as handle:
+        return json.loads(handle.read(65536).decode("utf-8"))
+
+
+def check(receipt, results, expected):
     problems = []
     outcome = receipt.get("outcome") or {}
     if receipt.get("phase") != "monitor_complete: pending_custodian":
@@ -169,6 +195,7 @@ def check(receipt, results):
         problems.append("reserve sampling did not start before the gate opened")
     if reserve["max_gap_ns"] > NS:
         problems.append(f"reserve sample gap {reserve['max_gap_ns']} ns over 1 s")
+    problems += default_scratch(receipt, expected)
     owned = receipt["owned_bytes"]
     if owned["maximum"] is None or not 5 * MIB <= owned["maximum"] <= owned["budget"]:
         problems.append(f"owned-byte peak {owned['maximum']} does not show the fixture writers within budget")
@@ -182,6 +209,51 @@ def check(receipt, results):
     for case in results.get("cases", []):  # nested evidence survives the candidate's cleanup
         if "dir" in case and not os.path.exists(os.path.join(case["dir"], "evidence", "receipt.json")):
             problems.append(f"nested case evidence missing after cleanup: {case['case']} {case['dir']}")
+    return problems
+
+
+def default_scratch(receipt, expected):
+    """The changed default must have run on the selected volume: the
+    candidate's claim is cross-checked against this bootstrap's own facts
+    (the registration document, kernel devices and containment), not taken
+    on trust, and a run that fell back to /private/tmp fails."""
+    problems = []
+    facts = receipt.get("scratch_default") or {}
+    root = receipt.get("root") or ""
+    reserve = receipt.get("reserve") or {}
+    if facts.get("source") != "selected-volume":
+        return [f"the candidate default did not use the selected volume: {facts}"]
+    if expected.get("source") != "selected-volume":
+        return [f"this bootstrap could not resolve the selected volume: {expected}"]
+    if facts.get("root_parent") != expected.get("root_parent"):
+        problems.append(f"candidate default parent {facts.get('root_parent')} is not the selected volume"
+                        f" {expected.get('root_parent')}")
+    if not root.startswith(str(facts.get("root_parent")) + "/"):
+        problems.append(f"candidate root {root} is not directly under the selected volume")
+    try:
+        device = os.stat(root).st_dev
+        mount_device = os.stat(facts.get("root_parent")).st_dev
+        recorded = registration(facts.get("registration"))
+        pool = os.path.realpath(facts.get("pool"))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return problems + [f"independent default-scratch facts unavailable: {error!r}"]
+    if device == os.stat("/").st_dev:
+        problems.append("the candidate scratch is on the boot volume")
+    if device != mount_device:
+        problems.append(f"candidate scratch device {device} is not the selected volume's {mount_device}")
+    if facts.get("volume_uuid") != recorded.get("volume_uuid"):
+        problems.append(f"candidate volume UUID {facts.get('volume_uuid')} is not the recorded"
+                        f" {recorded.get('volume_uuid')}")
+    if facts.get("mount") != recorded.get("mount_point"):
+        problems.append(f"candidate mount {facts.get('mount')} is not the registered"
+                        f" {recorded.get('mount_point')}")
+    if root.startswith(pool + "/"):
+        problems.append(f"candidate scratch {root} is inside the pool payload {pool}")
+    if reserve.get("path") is None or reserve.get("device") != device:
+        problems.append(f"reserve is not sampled on the scratch's own device: {reserve.get('path')}"
+                        f" {reserve.get('device')} != {device}")
+    if not reserve.get("minimum"):
+        problems.append("no reserve minimum was recorded on the selected volume")
     return problems
 
 
@@ -208,13 +280,22 @@ def qualify():
     if initial < THRESHOLD:
         print("refused: host free space below 22 GiB", file=sys.stderr)
         return 2
+    expected = selection()
+    print(f"default scratch selection: {json.dumps(expected)}", flush=True)
+    if expected.get("source") != "selected-volume":
+        print(f"refused: the candidate default would fall back to {expected.get('root_parent')}"
+              f" ({expected.get('reason')}), so this qualification could not exercise the selected-volume"
+              " default; run it where the machine's passive pool selection names the registered drive"
+              " (account config or OXIDE_POOL). Nothing was created.", file=sys.stderr)
+        return 2
     base = os.path.realpath(tempfile.mkdtemp(prefix="oxide-supervisor-qualify.", dir="/private/tmp"))
     print(f"scratch base {base} (kept: never deleted by this bootstrap)", flush=True)
+    evidence = os.path.join(base, "evidence")
     env = {k: v for k, v in os.environ.items() if k not in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_SUPERVISOR_INJECT")}
     env["OXIDE_SUPERVISOR_CASES"] = os.path.join(base, "cases.json")
     candidate = subprocess.Popen(
         [sys.executable, SOURCES["supervisor"], "--limit", str(CANDIDATE_LIMIT), "--scratch-budget-mib", "512",
-         "--root-parent", base, "--", sys.executable, SOURCES["suite"]], env=env)
+         "--evidence", evidence, "--", sys.executable, SOURCES["suite"]], env=env)
     problems = []
     # Reaped only by `hold`, never by Popen, so the candidate stays pinned.
     status = hold(candidate.pid, DEADLINE - 15 * NS, forward)
@@ -234,12 +315,11 @@ def qualify():
         problems.append(f"final host free {final} below 22 GiB")
     receipt, results = {}, {}
     try:
-        [path] = glob.glob(os.path.join(base, "oxide-proof.*", "evidence", "receipt.json"))
-        with open(path) as handle:
+        with open(os.path.join(evidence, "receipt.json")) as handle:
             receipt = json.load(handle)
         with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
             results = json.load(handle)
-        problems += check(receipt, results)
+        problems += check(receipt, results, expected)
     except (OSError, ValueError, KeyError) as error:
         problems.append(f"missing or malformed candidate evidence: {error!r}")
     reserve, owned = receipt.get("reserve", {}), receipt.get("owned_bytes", {})
@@ -253,8 +333,11 @@ def qualify():
         "candidate_exit": code,
         "candidate_phase": receipt.get("phase"),
         "candidate_outcome": receipt.get("outcome"),
+        "default_scratch": {"expected": expected, "receipt": receipt.get("scratch_default"),
+                            "root": receipt.get("root")},
         "reserve": {"samples": reserve.get("samples"), "minimum_bytes": reserve.get("minimum"),
-                    "max_gap_ns": reserve.get("max_gap_ns")},
+                    "max_gap_ns": reserve.get("max_gap_ns"), "path": reserve.get("path"),
+                    "device": reserve.get("device")},
         "owned_bytes_peak": owned.get("maximum"),
         "candidate_signals": [r for r in receipt.get("custodian", []) if r["event"] == "signal"],
         "host_free_bytes": {"initial": initial, "final": final},

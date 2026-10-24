@@ -242,9 +242,13 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # (healthy reserve readings, fixed 300 s wall limit held by a minimal outer
 # actor) runs the candidate `bounded-test.py` around its synthetic suite:
 # pure fault injection first, then tiny real Python children and fixture
-# writers in owned scratch. Prints a receipt binding sources, platform, cases,
-# kept resources and limitations. Deletes nothing. 512 MiB monitored scratch.
-# Not a benchmark and not full QA.
+# writers in owned scratch. The candidate runs with no --root-parent, so its
+# default scratch routing runs on the volume the passive pool selection names;
+# the bootstrap refuses before any effect when that selection would fall back
+# to /private/tmp, and re-derives the volume, device and reserve sampling in
+# its pass check (oxide#145). Prints a receipt binding sources, platform,
+# cases, kept resources and limitations. Deletes nothing. 512 MiB monitored
+# scratch. Not a benchmark and not full QA.
 [tasks."proof:supervisor:qualify"]
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"

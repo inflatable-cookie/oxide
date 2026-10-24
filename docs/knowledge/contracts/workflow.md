@@ -1247,11 +1247,16 @@ identity lines.
   after the shared-budget correction). It is not a
   benchmark or an alias for full QA.
 
-### Temporary scratch placement (approved, not implemented)
+### Temporary scratch placement
+
+**Status.** The proof and validation tooling default is implemented in source
+(oxide#145) and awaits independent review plus requalification; the Oxide
+children rule remains approved and not built (queue #136). Neither is measured
+SSD-write savings.
 
 Tom, 2026-10-25: "Test and proof temp folders definitely should move to the
 drive." This is direction for two separate Oxide facilities; it is not current
-behaviour or measured SSD-write savings. Effigy owns its own test/run temp
+behaviour. Effigy owns its own test/run temp
 placement and retention; Oxide changes no consumer or daemon configuration.
 
 - **Oxide children.** The selected pool's actual volume decides temp placement
@@ -1268,16 +1273,34 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   the selected volume use owned temp too. Absent drive selection falls back
   internally without recreating a mount point. Bounded escaped summary/status
   labels distinguish `temp: inherited <path>` and `temp: oxide <path>`.
-- **Proof and validation tooling.** The shared supervisor's default root parent
-  and documented validation scratch move to a private scratch area on the
-  selected pool's volume, outside its managed payload. Reserve sampling uses
-  the volume actually holding scratch. `/private/tmp` is the warned fallback.
-  Explicit parent/adopted scratch, canonical paths, monitored reserve/budget,
-  custody, retained evidence and closure semantics remain intact. The current
-  qualified supervisor is unchanged; its old hash's qualification does not
-  automatically qualify a changed default. The new source must pass independent
-  review and `proof:supervisor:qualify` on the new default, with actual default
-  selection exercised rather than masked by a root-parent override.
+- **Proof and validation tooling (oxide#145, source only).** With no caller
+  scratch or root parent, `scripts/bounded-test.py` creates its owned root in a
+  private area on the volume the effect-free pool selection names:
+  - the recorded removable selection when the pool's `removable.json` names a
+    mount point that is a canonical real directory directly under a
+    root-owned, non-writable `/Volumes`, on a device that is not the boot
+    volume, whose kernel `ATTR_VOL_UUID` equals the registered volume UUID;
+  - otherwise the configured pool's own volume (mount root of `OXIDE_POOL`,
+    the user config file's `[pool] path` with `~` as the account home, or the
+    built-in pool), again only when it is not the boot volume.
+  The owned leaf is one `oxide-proof.*` directory created privately (0700,
+  this user, canonical, same device as the mount) directly on that volume,
+  outside `oxide-pool` and `oxide-outputs` payload. Absent, unreadable,
+  malformed, symlinked, wrong-device or otherwise unsafe selection falls back
+  to `/private/tmp` with one bounded warning and never manufactures a mount
+  path or an internal shadow. Reserve sampling reads the filesystem actually
+  holding the scratch, with the existing thresholds, cadence and staleness;
+  the receipt records the selection source, the actual root and the reserve
+  path and device. Explicit `--root-parent` and adopted
+  `OXIDE_TASK_SCRATCH_ROOT` keep their ownership, retention and refusal
+  contracts: this changes the default, not caller ownership. This is not the
+  product's verified build-time selection (no container/role check), and the
+  narrow config reader understands only a simple `[pool] path` entry.
+
+The previously qualified supervisor hash stays qualified only at its old
+bytes. This source has no native run: it needs independent review and
+`proof:supervisor:qualify` at the exact head, with the default selection
+actually exercised rather than masked by a root-parent override.
 
 The implementation briefs and separate native activations live in Queue. No
 runtime scratch or host setting changes follow from this knowledge record.
@@ -1532,12 +1555,18 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - Output persists up to 8 MiB per stream in the evidence directory, is
     forwarded up to 32 MiB, and the rest is counted and discarded.
 - **Scratch.** Without a caller's `OXIDE_TASK_SCRATCH_ROOT`, it owns
-  `<root-parent>/oxide-proof.*/{scratch,evidence}` (default
-  `/private/tmp`). It passes `scratch` as `OXIDE_TASK_SCRATCH_ROOT`,
-  `TMPDIR`, `TMP` and `TEMP`, and counts the whole root, evidence included.
-  A caller's root is adopted and never removed; evidence goes in a
-  `supervisor-evidence.*` directory inside it. Evidence directories are kept
-  for review.
+  `<root-parent>/oxide-proof.*/{scratch,evidence}`. The default root parent is
+  the private selected-volume area described under
+  [temporary scratch placement](#temporary-scratch-placement): the volume the
+  effect-free pool selection names, never the boot volume, with the warned
+  `/private/tmp` fallback; `--root-parent` overrides it with unchanged caller
+  semantics. It passes `scratch` as `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`
+  and `TEMP`, and counts the whole root, evidence included. A caller's root is
+  adopted and never removed; evidence goes in a `supervisor-evidence.*`
+  directory inside it. Evidence directories are kept for review. Reserve
+  sampling reads the filesystem holding the scratch in every case, and the
+  receipt records `scratch_default` (source, pool, registration, mount, volume
+  UUID, device) with the reserve path and device.
 - **Owned bytes.** The monitored count is `st_blocks * 512` for every
   distinct (device, inode) under the root, with no symlink followed, taken
   every 2 s. `PC_PATH_MAX` is only the choice between two lookup forms: a
@@ -1589,8 +1618,20 @@ fallback expiry is not closure. The scratch base is therefore kept, and its
 path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
-`scripts/test_supervisor.py`. The suite runs in order:
-- 97 pure cases: guard thresholds, staleness and errors, a future-stamped
+`scripts/test_supervisor.py` with **no** `--root-parent`: the candidate's own
+default scratch routing runs, and its receipt is found through an explicit
+`--evidence` directory inside the bootstrap's `/private/tmp` base (evidence
+selects no scratch parent). The bootstrap resolves the same passive selection
+first and, if it is the `/private/tmp` fallback, refuses before creating
+anything (exit 2) instead of spending a native run that could not exercise the
+default. Its pass check then re-derives, independently of the candidate's
+claim: the receipt's `scratch_default` is the selected volume, the owned root
+lies directly on it, that volume is not the boot volume, its device and
+`ATTR_VOL_UUID` are the scratch's own and the registration's, the root is
+outside the pool payload, and the reserve was sampled on the scratch's device
+with a recorded minimum. A fallback run fails the qualification. The suite
+runs in order:
+- 116 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1643,6 +1684,16 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   nothing opened outside the fixture; a directory reported where a symlink
   sits faults (`ELOOP`/`ENOTDIR`, never `ENOENT`) with the referent never
   opened; and seams whose target never appears change nothing;
+- the default scratch parent with injected facts only: a registered drive, a
+  configured pool on the drive, `OXIDE_POOL` precedence, an internal pool
+  without a registration, an absent mount point, a stale mount point on the
+  boot volume, a different volume under the registered name, a symlinked and
+  an uncanonical mount, an unreadable volume UUID, a writable `/Volumes`, an
+  unreadable or malformed registration, the narrow config path forms and the
+  built-in pool, the bounded single-line fallback warning, `--root-parent`
+  and adopted scratch keeping their own contracts, that the qualification
+  bootstrap still passes no `--root-parent`, and the owned leaf's privacy,
+  ownership, device and canonical refusals with the refused leaf removed;
 - writers before and after a simulated staging step;
 - 36 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
@@ -1694,10 +1745,11 @@ expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
 - established closure with status 0;
+- the default scratch on the selected volume, as above;
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 133 cases;
+- all 152 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
