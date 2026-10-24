@@ -6723,6 +6723,101 @@ mod tests {
         assert!(verified_group(&empty, &candidate_of(&debug)).is_err());
     }
 
+    /// P2: a group whose recorded HISTORY no longer matches the registry (a
+    /// missing or extra row) keeps the root: the rollback refuses instead of
+    /// restoring part of it.
+    #[test]
+    fn a_rollback_refuses_a_group_whose_history_changed() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let id = "c".repeat(32);
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: id.clone(),
+            identity: RootIdentity {
+                checkout_id: debug.checkout_id.clone(),
+                checkout: debug.checkout.clone(),
+                receipt: debug.receipt.clone(),
+                member: debug.member.clone(),
+                root: debug.root.clone(),
+                root_kind: debug.root_kind,
+                volume_uuid: debug.volume_uuid.clone(),
+                nonce: debug.nonce.clone(),
+                generation: debug.generation,
+                dev: debug.root_dev.unwrap_or(1),
+                ino: debug.root_ino.unwrap_or(2),
+                marker_digest: debug.marker_digest.clone().unwrap_or_default(),
+            },
+            phase: IntentPhase::Intent,
+            quarantine: fixture.root.join("quarantine"),
+            preview_sha256: "f".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+            was_selected: true,
+            prior_receipt_sha: String::new(),
+            group: vec![
+                GroupRow {
+                    member: "debug".to_owned(),
+                    generation: debug.generation,
+                    nonce: debug.nonce.clone(),
+                    root_dev: debug.root_dev,
+                    root_ino: debug.root_ino,
+                    marker_digest: debug.marker_digest.clone(),
+                    selected: true,
+                },
+                GroupRow {
+                    member: "release".to_owned(),
+                    generation: release.generation,
+                    nonce: release.nonce.clone(),
+                    root_dev: release.root_dev,
+                    root_ino: release.root_ino,
+                    marker_digest: release.marker_digest.clone(),
+                    selected: false,
+                },
+            ],
+            expected_terminal_sha: None,
+            terminal_ms: None,
+        };
+        // The registry keeps the group marked by this intent, but the recorded
+        // HISTORY row `release` has disappeared.
+        let control = ready_control(
+            &fixture,
+            vec![debug.clone(), release.clone()],
+            vec![intent.clone()],
+        );
+        let mut registry = ready_registry(&control).unwrap();
+        for row in registry.rows.iter_mut() {
+            row.selected = false;
+            row.pruning = Some(id.clone());
+        }
+        registry.rows.retain(|row| row.member != "release");
+        registry.bump().unwrap();
+        write_registry(&control, &registry).unwrap();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let refused = rollback_intent(&store, &control, &intent).unwrap_err();
+        assert!(
+            refused.contains("changed since the prune intent"),
+            "{refused}"
+        );
+        let kept = ready_registry(&control).unwrap();
+        let row = kept
+            .rows
+            .iter()
+            .find(|row| row.member == "debug")
+            .expect("the remaining row disappeared");
+        assert_eq!(
+            row.pruning.as_deref(),
+            Some(id.as_str()),
+            "the rollback restored a row for an incomplete group"
+        );
+    }
+
     /// P2: pruning a RELEASED root never rewrites the checkout's receipt. When
     /// the receipt currently selects a different root, that selection and the
     /// exact receipt bytes survive while the released root's whole group is
