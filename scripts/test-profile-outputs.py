@@ -1382,9 +1382,35 @@ def run(proof: Proof, repo: str) -> None:
     expect(detached.returncode == 0, "14: ordinary detach failed")
     proof.mount = None
     # The internal fallback slot meets an external owned link: the command
-    # refuses rather than writing to an unsupervised drive.
+    # refuses rather than writing to an unsupervised drive. The oracle is exact
+    # (exit 1, both the slot reason and the refusal reason, the affected member
+    # and its paths) and the recorded authority is compared byte for byte: the
+    # fixture directory is named "fallback", so a bare substring would prove
+    # nothing.
+    before_fallback = perm.read_bytes(receipt_file(pool, fallback))
     code, _, stderr = oxide(proof, ["build"], "14 fallback refusal", fallback)
-    expect(code != 0 and "fallback" in stderr.lower(), f"14: fallback build was not refused: {stderr}")
+    expect(code == 1, f"14: the fallback build did not refuse with exit 1: {code}: {stderr}")
+    expect(
+        "fell back to the internal pool" in stderr,
+        f"14: the refusal did not report the internal-pool fallback: {stderr}",
+    )
+    expect("nothing was built" in stderr, f"14: the refusal did not report that nothing was built: {stderr}")
+    expect(
+        member_destination(external, "debug") in stderr,
+        f"14: the refusal did not name the external member it keeps: {stderr}",
+    )
+    expect(
+        member_link(fallback, "debug") in stderr,
+        f"14: the refusal did not name the affected member link: {stderr}",
+    )
+    expect(
+        "never moves an owned external output to another pool automatically" in stderr,
+        f"14: the refusal did not state that it will not move the root automatically: {stderr}",
+    )
+    expect(
+        perm.read_bytes(receipt_file(pool, fallback)) == before_fallback,
+        "14: the fallback refusal changed the recorded authority",
+    )
     expect(
         os.readlink(member_link(fallback, "debug")) == member_destination(external, "debug"),
         "14: the refusal changed the member link",
@@ -1518,17 +1544,47 @@ def run(proof: Proof, repo: str) -> None:
     adopt(proof, malformed, "17 adopt")
     code, _, stderr = oxide(proof, ["exec", "--output", "../escape", "--", script], "17 malformed member", malformed)
     expect(code != 0 and "not an output member" in stderr, f"17: a traversing member was accepted: {stderr}")
+    # A foreign member link refuses before Cargo. The oracle is exact: exit 1,
+    # the affected member path, Oxide's own label for an entry it does not own
+    # and its never-follow policy. The former oracle was `A and B or C`, so a
+    # bare "foreign" substring passed even when nothing was named. No authority
+    # changes: the receipt bytes and the link itself are compared.
+    referent = os.path.join(malformed, "foreign-referent")
+    os.makedirs(referent)
+    with open(os.path.join(referent, "keep"), "wb") as handle:
+        handle.write(b"referent")
     foreign = os.path.join(malformed, "target", "release")
     os.remove(foreign) if os.path.islink(foreign) else None
-    os.symlink("/tmp", foreign)
+    os.symlink(referent, foreign)
+    before_receipt = perm.read_bytes(receipt_file(pool, malformed))
     # The command must declare the affected member: a debug build never touches
     # release, so `build --release` is the refusal that proves it.
     code, _, stderr = oxide(proof, ["build", "--release"], "17 foreign release link", malformed)
-    expect(code != 0, f"17: a foreign release link was followed: {stderr}")
-    expect(foreign in stderr and "not a link" in stderr or "foreign" in stderr.lower(), f"17: the refusal did not name the affected release member: {stderr}")
+    expect(code == 1, f"17: a foreign release link did not refuse with exit 1: {code}: {stderr}")
+    expect(foreign in stderr, f"17: the refusal did not name the affected release member: {stderr}")
+    expect(
+        "a symlink or file Oxide does not own" in stderr,
+        f"17: the refusal did not label the entry as unowned: {stderr}",
+    )
+    expect(
+        "never follows or replaces it" in stderr
+        or "never followed, adopted or replaced" in stderr,
+        f"17: the refusal did not state the never-follow policy: {stderr}",
+    )
+    expect(
+        perm.read_bytes(receipt_file(pool, malformed)) == before_receipt,
+        "17: the foreign-link refusal changed the recorded authority",
+    )
+    expect(
+        os.readlink(foreign) == referent
+        and perm.read_bytes(os.path.join(referent, "keep")) == b"referent",
+        "17: the refused command followed or replaced the foreign link",
+    )
     code, _, stderr = oxide(proof, ["build"], "17 debug still usable", malformed)
     expect(code == 0, f"17: the unaffected debug member stopped building: {stderr}")
     os.remove(foreign)
+    os.remove(os.path.join(referent, "keep"))
+    os.rmdir(referent)
     # Actual unknown custody: a retired record whose writers were never
     # positively closed must make adopt refuse with every byte unchanged.
     custody = make_checkout(proof, "unknown-custody")

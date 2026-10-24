@@ -4059,8 +4059,21 @@ fn bind_profile(
                             .to_string()
                     },
                 );
+                // Name the fallback reason too when this command's own
+                // intermediate slot came from the internal pool, so the
+                // refusal states both why the slot is internal and why the
+                // member is not moved there.
+                let fallback = context
+                    .pool_fallback
+                    .as_deref()
+                    .map(|reason| {
+                        format!(
+                            "; this command's intermediate slot fell back to the internal pool ({reason})"
+                        )
+                    })
+                    .unwrap_or_default();
                 return Bind::Refuse(format!(
-                    "outputs: {} keeps the external member root {} from this checkout's committed receipt, but this command would place it at {now}; Oxide never moves an owned external output to another pool automatically, so nothing was built. Restore the drive, or run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                    "outputs: {} keeps the external member root {} from this checkout's committed receipt, but this command would place it at {now}{fallback}; Oxide never moves an owned external output to another pool automatically, so nothing was built. Restore the drive, or run `oxide outputs adopt` to recheck this checkout's owned outputs",
                     link.display(),
                     member_destination(&committed.root, &planned.member).display()
                 ));
@@ -7893,6 +7906,34 @@ mod tests {
             recorded
         );
         assert!(!fixture.checkout.join(".oxide-outputs").exists());
+        // When this command's own intermediate slot came from the internal
+        // pool, the refusal names that reason too (the proof's absence oracle)
+        // and still changes nothing.
+        let fallback = fixture
+            .context()
+            .with_pool_fallback(Some("the volume is absent"));
+        match bind_profile(&fallback, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => {
+                assert!(
+                    reason.contains("fell back to the internal pool (the volume is absent)"),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains(
+                        "never moves an owned external output to another pool automatically"
+                    ),
+                    "{reason}"
+                );
+                assert!(reason.contains("nothing was built"), "{reason}");
+            }
+            Bind::Bound(_) => panic!("a fallback relinked an external member to the internal pool"),
+            Bind::Wait => panic!("a fallback external-to-local refusal waited"),
+        }
+        assert_eq!(fs::read_link(&link).unwrap(), destination);
+        assert_eq!(
+            fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap(),
+            recorded
+        );
     }
 
     #[test]
