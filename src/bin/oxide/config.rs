@@ -1489,11 +1489,11 @@ mod tests {
         fs::create_dir_all(&dir).expect("scratch");
         let config = dir.join("config.toml");
         fs::write(&config, "[pool]\npath = \"~/file-pool\"\n").expect("config");
-        let mut facts = facts(true);
-        facts.home_source = HomeSource::Account;
-        facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
-        facts.oxide_config = Some(config.into_os_string());
-        let file = settings(&facts).expect("settings");
+        let mut mac = facts(true);
+        mac.home_source = HomeSource::Account;
+        mac.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        mac.oxide_config = Some(config.into_os_string());
+        let file = settings(&mac).expect("settings");
         assert_eq!(file.pool, Path::new("/home/user/file-pool"));
         assert_eq!(file.home_notice, None, "the config file chose the pool");
 
