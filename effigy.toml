@@ -162,6 +162,27 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-status-fast.py"
 
+# Child temporary files on the selected pool (oxide#136), one fixed script and
+# the whole command of the qualified shared proof supervisor: 300 s, 512 MiB
+# monitored scratch, an ELEVATED trigger (owned-scratch deletion, writer
+# closure, removable writes). Stages this HEAD's debug `oxide` offline with
+# 1.97.1 and proves on tiny std-only fixtures that an inherited `TMPDIR` is
+# kept only when it is a writable directory on the selected pool's device,
+# that absent/unwritable/other-device/symlink-escaping values are replaced by
+# one short owned directory inside the held slot, that the aliases follow the
+# chosen value, that the owned directory is accounted once while held and
+# removed at release, that a crash with a surviving writer keeps it and the
+# positive dead-group recovery deletes the slot whole, that a foreign or
+# linked scratch position is kept and reported, and that one owned 128 MiB
+# scratch APFS image puts the child's temporary files on the image with an
+# internal fallback after an ordinary detach and no stale mount point. It
+# reports the longest injected path in bytes and characters against the
+# 91-byte socket bound. No live pool, registered drive, install or consumer is
+# touched. Not a benchmark and not an alias for full QA.
+[tasks."rust:pool-temp-scratch"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
+
 # Final outputs on the permanent drive (oxide#117), under the qualified
 # shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored scratch,
 # ordinary detach). Stages this HEAD's debug `oxide` offline with 1.97.1 and

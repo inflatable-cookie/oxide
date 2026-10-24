@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""Focused native proof for child temporary files on the selected pool (oxide#136).
+
+One fixed script under the qualified shared supervisor (`bounded-test.py
+--limit 300 --scratch-budget-mib 512`), and the whole command of that
+supervisor: the supervisor owns the absolute deadline, the 20 GiB reserve
+watchdog, the monitored scratch and cleanup, and closure; this script keeps no
+clock, sampler or session of its own. The brief's tier is ELEVATED (it deletes
+owned scratch, decides writer closure and writes to an owned removable fixture
+volume).
+
+It stages this clean HEAD's debug `oxide` with plain Cargo and the pinned
+1.97.1, offline, into its own scratch target, copies the binary out and
+deletes the target before the fixtures. Every fixture is a tiny std-only
+crate: a build script, a test and a `run` program report `std::env::temp_dir()`
+and the three alias variables, and write a marker into that directory.
+
+Cases (each one is a real child, nothing is simulated):
+
+1. premise and oracle sweep: the observation method is proved against plain
+   `cargo` first (its build script reports the inherited directory), then
+   `oxide --version`, an unknown subcommand pass-through and `oxide run` are
+   shown to leave no scratch behind; the script's own `TMPDIR` is not inside
+   the fixture pool (a void premise fails).
+2. same-device inherited `TMPDIR` kept: the child reports it, no Oxide
+   directory is created, and a planted file inside it is untouched after the
+   command.
+3. absent, unwritable and symlink-escaping inherited directories are replaced
+   by one owned directory; a file and a relative path are replaced too.
+4. aliases: `TMPDIR`, `TMP` and `TEMP` all follow the chosen value, not the
+   caller's other values.
+5. the owned directory is observed on the selected pool while a gated writer
+   holds it; `status --measure` counts it once with a hard-linked pair; the
+   writer's marker is inside it.
+6. normal release removes it; `status --measure` then reports the slot without
+   it.
+7. a crash with a surviving writer group keeps the directory and the slot; the
+   positive dead-group recovery deletes the slot whole and the next command
+   reuses the pool.
+8. a foreign entry and a link in the scratch position are refused and kept,
+   never followed or deleted; the child keeps the machine default then.
+9. one owned 128 MiB scratch APFS image registered as the removable pool: the
+   child's temporary files land on the image, the inherited `/private/tmp`
+   (another device) is replaced, release removes the directory, and after an
+   ordinary detach the internal pool's own scratch is used with no stale
+   `/Volumes/<name>` directory created. With an inherited same-device
+   `TMPDIR`, the fallback keeps it and creates nothing.
+10. the longest injected path is reported in bytes and characters against the
+    91-byte socket bound.
+
+`--plan` prints the allocation and cases and touches nothing. No live pool,
+registered drive, install receipt, host setting or consumer is touched; the
+fixture image is created, attached and ordinarily detached inside the
+supervisor's scratch.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Optional
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUILDER = "1.97.1"
+# macOS `sun_path`, including the NUL, less `/` and an eleven-byte socket name.
+SOCKET_PATH_BOUND = 91
+MIB = 1024 * 1024
+IMAGE_MIB = 128
+SHUTDOWN_MARGIN_S = 30
+CASES: list[str] = []
+STARTED = time.perf_counter()
+
+
+def plan() -> None:
+    print(
+        """pool-temp-scratch proof, planned allocation (unmeasured):
+  supervisor: bounded-test.py --limit 300 --scratch-budget-mib 512
+  work stops before the supervisor's 30 s shutdown margin
+  staging: plain Cargo, pinned 1.97.1, offline, 1 job, target deleted after
+  fixtures: one private HOME, CARGO_HOME, OXIDE_POOL and tiny std-only crates
+  removable: one owned 128 MiB APFS scratch image at a unique /Volumes/<name>,
+             ordinary detach only, never a real drive
+  cases:"""
+    )
+    for index, name in enumerate(CASE_NAMES, start=1):
+        print(f"    {index}. {name}")
+    print("  writes only inside OXIDE_TASK_SCRATCH_ROOT; no live pool is touched")
+
+
+CASE_NAMES = [
+    "premise and oracle sweep",
+    "same-device inherited TMPDIR kept",
+    "absent, unwritable and symlink-escaping TMPDIR replaced",
+    "aliases follow the chosen value",
+    "owned scratch observed while held, hard link counted once",
+    "normal release removes the owned scratch",
+    "crash with a surviving group keeps it; recovery deletes the slot whole",
+    "foreign and linked scratch position refused and kept",
+    "removable image and absent-volume internal fallback",
+    "longest injected path against the socket bound",
+]
+
+
+def fail(message: str) -> None:
+    print(f"pool-temp-scratch proof failed: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def expect(condition: bool, message: str) -> None:
+    if not condition:
+        fail(message)
+
+
+def say(message: str) -> None:
+    print(f"[{time.perf_counter() - STARTED:7.1f}s] {message}", flush=True)
+
+
+def case(name: str) -> None:
+    CASES.append(name)
+    say(f"case {name}")
+
+
+def work_left() -> float:
+    deadline = int(os.environ["OXIDE_PROOF_DEADLINE_NS"])
+    left = (
+        deadline - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+    ) / 1e9 - SHUTDOWN_MARGIN_S
+    if left <= 5:
+        fail("work deadline reached before the supervisor's shutdown margin")
+    return left
+
+
+def scratch_root() -> str:
+    root = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+    expect(bool(root), "OXIDE_TASK_SCRATCH_ROOT is required")
+    return os.path.realpath(root)
+
+
+def private_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def write_private(path: str, data: str, mode: int = 0o600) -> None:
+    private_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(data)
+    os.chmod(path, mode)
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def children_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def stage_subject(root: str) -> str:
+    """Stage this HEAD's debug `oxide` offline, then delete the target."""
+    stage = os.path.join(root, "stage")
+    log = os.path.join(root, "stage.log")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_"))
+        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+    }
+    env.update(
+        {
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "RUSTC_WRAPPER": "",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+            "CARGO_TARGET_DIR": os.path.join(stage, "target"),
+            "CARGO_BUILD_BUILD_DIR": os.path.join(stage, "build"),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_DEV_OPT_LEVEL": "s",
+            "CARGO_PROFILE_DEV_CODEGEN_UNITS": "1",
+            "CARGO_PROFILE_DEV_PANIC": "abort",
+            "CARGO_INCREMENTAL": "0",
+            "RUSTFLAGS": "-C strip=symbols",
+        }
+    )
+    with open(log, "w", encoding="utf-8") as handle:
+        build = subprocess.run(
+            ["cargo", "build", "-j", "1", "--locked", "--offline", "--bin", "oxide"],
+            cwd=REPO,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            timeout=work_left(),
+        )
+    if build.returncode:
+        with open(log, encoding="utf-8") as handle:
+            fail(f"staging exit {build.returncode}: {handle.read()[-2000:]}")
+    built = os.path.join(stage, "target", "debug", "oxide")
+    expect(os.path.isfile(built), f"staging produced no binary at {built}")
+    subject = os.path.join(root, "subject-oxide")
+    shutil.copy2(built, subject)
+    os.chmod(subject, 0o755)
+    shutil.rmtree(stage, ignore_errors=True)
+    os.unlink(log)
+    return subject
+
+
+# ---------------------------------------------------------------------------
+# Fixtures: a tiny std-only crate whose child processes report their temp dir.
+
+BUILD_SCRIPT = r'''
+use std::io::Write;
+
+fn main() {
+    let dir = std::env::temp_dir();
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        println!(
+            "cargo:warning=OXIDE-TEMP {name}={}",
+            std::env::var(name).unwrap_or_else(|_| "<unset>".to_owned())
+        );
+    }
+    println!("cargo:warning=OXIDE-TEMP dir={}", dir.display());
+    if let Ok(gate) = std::env::var("FIXTURE_HOLD") {
+        // A gated writer: it announces itself, writes into the temporary
+        // directory and waits for the release file the proof creates.
+        let marker = dir.join("held-marker");
+        let mut file = std::fs::File::create(&marker).expect("marker");
+        file.write_all(&vec![b'x'; 1 << 20]).expect("write");
+        drop(file);
+        std::os::unix::fs::symlink("held-marker", dir.join("held-link")).expect("link");
+        let clobber = dir.join("clobber");
+        let _ = std::fs::hard_link(dir.join("held-marker"), &clobber);
+        println!("cargo:warning=OXIDE-TEMP holding");
+        while !std::path::Path::new(&gate).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        println!("cargo:warning=OXIDE-TEMP released");
+    }
+}
+'''
+
+MAIN_RS = r'''
+fn main() {
+    println!("OXIDE-TEMP run={}", std::env::temp_dir().display());
+    let _ = std::fs::write(std::env::temp_dir().join("run-marker"), b"run");
+}
+'''
+
+TEST_RS = r'''
+#[test]
+fn reports_the_child_temporary_directory() {
+    println!("OXIDE-TEMP test={}", std::env::temp_dir().display());
+    let dir = std::env::temp_dir();
+    std::fs::write(dir.join("test-marker"), b"test").expect("marker");
+}
+'''
+
+MANIFEST = """[package]
+name = "tempcheck"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+"""
+
+
+def make_fixture(root: str, name: str) -> str:
+    crate = private_dir(os.path.join(root, name))
+    write_private(os.path.join(crate, "Cargo.toml"), MANIFEST)
+    write_private(os.path.join(crate, "build.rs"), BUILD_SCRIPT)
+    write_private(os.path.join(crate, "src", "main.rs"), MAIN_RS)
+    write_private(os.path.join(crate, "src", "lib.rs"), "")
+    write_private(os.path.join(crate, "tests", "temp.rs"), TEST_RS)
+    return crate
+
+
+class World:
+    """The private account, pool, Cargo home and checkout of one proof run."""
+
+    def __init__(self, root: str, subject: str) -> None:
+        self.root = root
+        self.subject = subject
+        self.home = private_dir(os.path.join(root, "home"))
+        self.cargo_home = private_dir(os.path.join(root, "cargo-home"))
+        self.pool = private_dir(os.path.join(root, "pool"))
+        self.scratch = private_dir(os.path.join(root, "fixture-scratch"))
+        self.base = {
+            "PATH": os.environ["PATH"],
+            "HOME": self.home,
+            "CARGO_HOME": self.cargo_home,
+            "CARGO_NET_OFFLINE": "true",
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "TMPDIR": self.scratch,
+            "TMP": self.scratch,
+            "TEMP": self.scratch,
+            "OXIDE_POOL": self.pool,
+            "OXIDE_POOL_CAP": "64MiB",
+        }
+
+    def env(self, **overrides: Optional[str]) -> dict:
+        env = dict(self.base)
+        for key, value in overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+        return env
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        cwd: str,
+        env: dict,
+        timeout: Optional[float] = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess:
+        left = work_left()
+        result = subprocess.run(
+            [self.subject, *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=min(left, timeout or left),
+        )
+        if check and result.returncode != 0:
+            fail(
+                f"`oxide {' '.join(args)}` exit {result.returncode}: "
+                f"{result.stderr[-2000:]}"
+            )
+        return result
+
+    def slot_roots(self) -> list[str]:
+        slots = os.path.join(self.pool, "payload", "slots")
+        if not os.path.isdir(slots):
+            return []
+        found = []
+        for root, dirs, _ in os.walk(slots):
+            if os.path.basename(root) == "build":
+                dirs[:] = []
+                found.append(os.path.dirname(root))
+        return found
+
+    def scratch_dirs(self) -> list[str]:
+        return [os.path.join(slot, "scratch") for slot in self.slot_roots()]
+
+    def slot_bytes(self) -> int:
+        return sum(children_bytes(slot) for slot in self.slot_roots())
+
+
+def reported(stderr: str, kind: str) -> str:
+    marker = f"OXIDE-TEMP {kind}="
+    for line in stderr.splitlines():
+        if marker in line:
+            return line.split(marker, 1)[1].strip()
+    fail(f"no {kind} observation in the child output: {stderr[-2000:]}")
+
+
+def reported_aliases(stderr: str) -> dict:
+    return {
+        name: reported(stderr, name) for name in ("TMPDIR", "TMP", "TEMP")
+    }
+
+
+# ---------------------------------------------------------------------------
+
+
+def held_by_pool(world: World, path: str) -> None:
+    real = os.path.realpath(path)
+    pool = os.path.realpath(world.pool)
+    expect(real.startswith(pool + os.sep), f"{real} is not inside the pool {pool}")
+
+
+def premise_sweep(world: World, crate: str) -> None:
+    case(CASE_NAMES[0])
+    # The script's own TMPDIR is the fixture scratch, never inside the pool:
+    # otherwise every later "kept" assertion would be a void premise.
+    expect(
+        not os.path.realpath(world.scratch).startswith(
+            os.path.realpath(world.pool) + os.sep
+        ),
+        "the fixture scratch is inside the pool, so the premise is void",
+    )
+    version = world.run(["--version"], cwd=crate, env=world.env())
+    expect(
+        "oxide" in version.stdout + version.stderr,
+        f"`oxide --version` printed no identity: {version.stdout}{version.stderr}",
+    )
+    # Oracle: plain Cargo's build script reports the inherited directory, so
+    # the observation method really sees the child environment.
+    plain_env = world.env()
+    plain_env.pop("OXIDE_POOL", None)
+    plain = subprocess.run(
+        ["cargo", "check", "--offline", "--locked"],
+        cwd=crate,
+        env=plain_env,
+        capture_output=True,
+        text=True,
+        timeout=work_left(),
+    )
+    expect(
+        plain.returncode == 0,
+        f"plain cargo premise failed: {plain.stderr[-2000:]}",
+    )
+    expect(
+        reported(plain.stderr, "dir") == os.path.realpath(world.scratch)
+        or reported(plain.stderr, "dir").rstrip("/")
+        == os.path.realpath(world.scratch),
+        f"plain cargo did not report the inherited TMPDIR: {plain.stderr[-1000:]}",
+    )
+    # Effect-free commands allocate nothing.
+    before = len(world.slot_roots())
+    world.run(["metadata", "--format-version", "1"], cwd=crate, env=world.env())
+    world.run(["fmt", "--", "--check"], cwd=crate, env=world.env(), check=False)
+    expect(
+        len(world.slot_roots()) == before,
+        "an effect-free command created a slot",
+    )
+
+
+def inherited_kept(world: World, crate: str) -> None:
+    case(CASE_NAMES[1])
+    inherited = private_dir(os.path.join(world.pool, "inherited-tmp"))
+    keep = os.path.join(inherited, "effigy-evidence")
+    write_private(keep, "retained")
+    env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
+    result = world.run(["check"], cwd=crate, env=env)
+    expect(
+        reported(result.stderr, "dir") in (inherited, inherited + "/"),
+        f"the child did not keep the inherited directory: {result.stderr[-1500:]}",
+    )
+    expect(
+        not any(os.path.exists(path) for path in world.scratch_dirs()),
+        "Oxide created its own directory although the inherited one was kept",
+    )
+    expect(
+        open(keep, encoding="utf-8").read() == "retained",
+        "the inherited directory's content changed",
+    )
+    expect(
+        "temp: inherited" in result.stderr,
+        f"the summary did not name the inherited directory: {result.stderr[-1000:]}",
+    )
+    summary = [
+        line for line in result.stderr.splitlines() if "temp: inherited" in line
+    ][-1]
+    expect(
+        len(summary.encode()) < 4096 and "\n" not in summary,
+        "the temp fragment is not one bounded line",
+    )
+
+
+def replaced(world: World, crate: str) -> None:
+    case(CASE_NAMES[2])
+    missing = os.path.join(world.pool, "missing-tmp")
+    closed = private_dir(os.path.join(world.pool, "closed-tmp"))
+    os.chmod(closed, 0o500)
+    file_path = os.path.join(world.pool, "not-a-dir")
+    write_private(file_path, "file")
+    escape = os.path.join(world.root, "escape-link")
+    if os.path.lexists(escape):
+        os.unlink(escape)
+    os.symlink(os.path.join(world.root, "absent-target"), escape)
+    try:
+        for label, value in (
+            ("absent", missing),
+            ("file", file_path),
+            ("relative", "relative/tmp"),
+            ("escaping link", escape),
+        ):
+            result = world.run(["check"], cwd=crate, env=world.env(TMPDIR=value))
+            observed = reported(result.stderr, "dir")
+            held_by_pool(world, observed)
+            expect(
+                os.path.basename(observed.rstrip("/")) == "scratch",
+                f"{label}: the child did not use the owned scratch: {observed}",
+            )
+            expect(
+                "temp: oxide" in result.stderr,
+                f"{label}: the summary did not name the owned scratch",
+            )
+            expect(
+                not os.path.exists(observed),
+                f"{label}: the owned directory survived a healthy release",
+            )
+    finally:
+        os.chmod(closed, 0o700)
+
+
+def aliases(world: World, crate: str) -> None:
+    case(CASE_NAMES[3])
+    inherited = private_dir(os.path.join(world.pool, "alias-tmp"))
+    env = world.env(
+        TMPDIR=inherited,
+        TMP=os.path.join(world.root, "elsewhere-tmp"),
+        TEMP=os.path.join(world.root, "third-tmp"),
+    )
+    result = world.run(["check"], cwd=crate, env=env)
+    names = reported_aliases(result.stderr)
+    expect(
+        names["TMPDIR"] == names["TMP"] == names["TEMP"],
+        f"the aliases did not follow one chosen value: {names}",
+    )
+    expect(
+        names["TMPDIR"].rstrip("/") == inherited,
+        f"the aliases did not follow the inherited TMPDIR: {names}",
+    )
+
+
+def accounting(world: World, crate: str) -> None:
+    case(CASE_NAMES[4])
+    gate = os.path.join(world.root, "release")
+    if os.path.exists(gate):
+        os.unlink(gate)
+    env = world.env(TMPDIR=None, TMP=None, TEMP=None, FIXTURE_HOLD=gate)
+    child = subprocess.Popen(
+        [world.subject, "check"],
+        cwd=crate,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        expect(child.stderr is not None, "no stderr pipe")
+        holding = False
+        lines: list[str] = []
+        deadline = time.monotonic() + min(work_left(), 120)
+        while time.monotonic() < deadline:
+            line = child.stderr.readline()
+            if not line:
+                break
+            lines.append(line)
+            if "OXIDE-TEMP holding" in line:
+                holding = True
+                break
+        expect(holding, "the gated writer never reported holding the slot")
+        observed = reported("".join(lines), "dir")
+        held_by_pool(world, observed)
+        expect(
+            os.path.basename(observed.rstrip("/")) == "scratch",
+            f"the unset TMPDIR did not become the owned scratch: {observed}",
+        )
+        scratch = observed.rstrip("/")
+        expect(os.path.isdir(scratch), "the owned directory is not a directory")
+        expect(
+            os.path.isfile(os.path.join(scratch, "held-marker")),
+            "the writer's marker is not inside the owned directory",
+        )
+        # `status --measure` observes the same bytes without reconciling.
+        measure_env = self_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+        measured = world.run(
+            ["status", "--measure"], cwd=crate, env=measure_env, check=False
+        )
+        expect(
+            measured.returncode == 0,
+            f"status --measure failed: {measured.stderr[-1500:]}",
+        )
+        expect(
+            "temp: oxide" in measured.stdout,
+            f"measured status did not name the pool scratch: {measured.stdout[-1500:]}",
+        )
+        held_bytes = children_bytes(scratch)
+        expect(held_bytes >= MIB, "the writer's 1 MiB marker is missing")
+        # A hard-linked pair counts once: 1 MiB written, 1 MiB counted.
+        slot_bytes = world.slot_bytes()
+        expect(
+            slot_bytes < held_bytes + 8 * MIB,
+            f"a hard-linked pair was counted twice ({slot_bytes} bytes for {held_bytes})",
+        )
+    finally:
+        write_private(gate, "")
+        try:
+            child.wait(timeout=min(work_left(), 60))
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=10)
+    expect(
+        child.returncode == 0,
+        f"the released command failed with {child.returncode}",
+    )
+    expect(
+        not os.path.exists(scratch),
+        "normal release did not remove the owned directory",
+    )
+
+
+def crash_and_recovery(world: World, crate: str) -> None:
+    case(CASE_NAMES[6])
+    gate = os.path.join(world.root, "crash-release")
+    if os.path.exists(gate):
+        os.unlink(gate)
+    env = world.env(TMPDIR=None, TMP=None, TEMP=None, FIXTURE_HOLD=gate)
+    child = subprocess.Popen(
+        [world.subject, "check"],
+        cwd=crate,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    scratch = ""
+    try:
+        expect(child.stderr is not None, "no stderr pipe")
+        lines: list[str] = []
+        deadline = time.monotonic() + min(work_left(), 120)
+        while time.monotonic() < deadline:
+            line = child.stderr.readline()
+            if not line:
+                break
+            lines.append(line)
+            if "OXIDE-TEMP holding" in line:
+                break
+        scratch = reported("".join(lines), "dir").rstrip("/")
+        held_by_pool(world, scratch)
+        expect(os.path.isdir(scratch), "no owned directory while holding")
+        slot = os.path.dirname(scratch)
+        # Kill only Oxide itself: the writer group survives, so closure is
+        # unknown and the slot with its scratch must stay.
+        child.kill()
+        child.wait(timeout=min(work_left(), 30))
+        expect(
+            os.path.isdir(scratch),
+            "the owned directory was removed while its writer survived",
+        )
+        expect(os.path.isdir(slot), "the held slot was deleted")
+        # Positive closure: release the writer and let the group end.
+        write_private(gate, "")
+        deadline = time.monotonic() + min(work_left(), 120)
+        while time.monotonic() < deadline and os.path.isdir(scratch):
+            time.sleep(0.2)
+        recovered = world.run(
+            ["check"], cwd=crate, env=world.env(TMPDIR=None, TMP=None, TEMP=None)
+        )
+        expect(
+            "OXIDE-TEMP dir=" in recovered.stderr,
+            f"the recovering command produced no observation: {recovered.stderr[-1500:]}",
+        )
+        expect(
+            not os.path.isdir(slot),
+            "the interrupted slot was not deleted whole after closure",
+        )
+        expect(
+            not os.path.exists(scratch),
+            "the owned directory survived the recovered slot",
+        )
+    finally:
+        write_private(gate, "")
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+def foreign(world: World, crate: str) -> None:
+    case(CASE_NAMES[7])
+    outside = private_dir(os.path.join(world.root, "outside"))
+    keep = os.path.join(outside, "keep")
+    write_private(keep, "foreign")
+    result = world.run(
+        ["check"], cwd=crate, env=world.env(TMPDIR=None, TMP=None, TEMP=None)
+    )
+    held_by_pool(world, reported(result.stderr, "dir"))
+    slot = world.slot_roots()[0]
+    scratch = os.path.join(slot, "scratch")
+    # Plant a link in the owned position: the next command must neither
+    # follow it nor delete it, and the child keeps the machine default.
+    os.symlink(outside, scratch)
+    try:
+        replaced_run = world.run(
+            ["check"],
+            cwd=crate,
+            env=world.env(TMPDIR=None, TMP=None, TEMP=None),
+            check=False,
+        )
+        observed = reported(replaced_run.stderr, "dir")
+        expect(
+            os.path.realpath(observed) != os.path.realpath(outside),
+            "Oxide followed a link in the owned position",
+        )
+        expect(
+            "WARNING" in replaced_run.stderr,
+            f"the refused link was not reported: {replaced_run.stderr[-1500:]}",
+        )
+        expect(os.path.islink(scratch), "the foreign link was removed")
+        expect(
+            open(keep, encoding="utf-8").read() == "foreign",
+            "the foreign target changed",
+        )
+    finally:
+        if os.path.islink(scratch):
+            os.unlink(scratch)
+
+
+def removable(world: World, crate: str) -> None:
+    case(CASE_NAMES[8])
+    if sys.platform != "darwin":
+        say("not macOS: no removable fixture, the internal pool stands")
+        return
+    image = os.path.join(world.root, "dragontail.sparseimage")
+    created = subprocess.run(
+        [
+            "hdiutil",
+            "create",
+            "-size",
+            f"{IMAGE_MIB}m",
+            "-fs",
+            "APFS",
+            "-volname",
+            "oxide-temp-proof",
+            "-type",
+            "SPARSE",
+            "-quiet",
+            image,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=work_left(),
+    )
+    expect(created.returncode == 0, f"image creation failed: {created.stderr}")
+    attached = subprocess.run(
+        ["hdiutil", "attach", "-nobrowse", "-noautoopen", image],
+        capture_output=True,
+        text=True,
+        timeout=work_left(),
+    )
+    expect(attached.returncode == 0, f"image attach failed: {attached.stderr}")
+    mount = ""
+    try:
+        for line in attached.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1].startswith("/Volumes/"):
+                mount = parts[-1]
+        expect(bool(mount), f"no mount point in {attached.stdout!r}")
+        world.run(
+            [
+                "pool",
+                "register-removable",
+                mount,
+                "--reserve",
+                "16MiB",
+                "--cap",
+                "64MiB",
+            ],
+            cwd=crate,
+            env=world.env(),
+        )
+        result = world.run(["check"], cwd=crate, env=world.env())
+        observed = reported(result.stderr, "dir")
+        expect(
+            os.path.realpath(observed).startswith(
+                os.path.realpath(os.path.join(mount, "oxide-pool")) + os.sep
+            ),
+            f"the removable build's temporary files are not on the image: {observed}",
+        )
+        expect(
+            os.path.realpath(observed).startswith(os.path.realpath(mount) + os.sep),
+            f"the inherited /private/tmp was not replaced: {observed}",
+        )
+        expect(
+            "temp: oxide" in result.stderr,
+            "the removable build did not report the owned scratch",
+        )
+        expect(
+            not os.path.exists(observed.rstrip("/")),
+            "the removable build's owned directory survived release",
+        )
+        # Ordinary detach, then the internal fallback: no inherited TMPDIR, so
+        # the internal pool's own scratch is used and no stale mount point is
+        # created.
+        detached = subprocess.run(
+            ["hdiutil", "detach", mount], capture_output=True, text=True
+        )
+        expect(
+            detached.returncode == 0, f"ordinary detach failed: {detached.stderr}"
+        )
+        expect(not os.path.exists(mount), f"the mount point {mount} was recreated")
+        fallback = world.run(
+            ["check"],
+            cwd=crate,
+            env=world.env(
+                TMPDIR=None,
+                TMP=None,
+                TEMP=None,
+                OXIDE_POOL=os.path.join(world.root, "internal-pool"),
+                OXIDE_POOL_CAP="64MiB",
+            ),
+        )
+        observed = reported(fallback.stderr, "dir")
+        expect(
+            os.path.realpath(observed).startswith(
+                os.path.realpath(os.path.join(world.root, "internal-pool")) + os.sep
+            ),
+            f"the fallback did not use the internal pool's scratch: {observed}",
+        )
+        expect(not os.path.exists(mount), f"the fallback recreated {mount}")
+        # With a same-device inherited TMPDIR the fallback keeps it and
+        # creates nothing.
+        inherited = private_dir(os.path.join(world.root, "internal-pool", "keep-tmp"))
+        kept = world.run(
+            ["check"],
+            cwd=crate,
+            env=world.env(
+                TMPDIR=inherited,
+                TMP=None,
+                TEMP=None,
+                OXIDE_POOL=os.path.join(world.root, "internal-pool"),
+                OXIDE_POOL_CAP="64MiB",
+            ),
+        )
+        expect(
+            reported(kept.stderr, "dir").rstrip("/") == inherited,
+            f"the fallback did not keep the same-device inherited directory: {kept.stderr[-1500:]}",
+        )
+        slots = os.path.join(world.root, "internal-pool", "payload", "slots")
+        for root, _, _ in os.walk(slots):
+            expect(
+                not os.path.exists(os.path.join(root, "scratch")),
+                "the fallback created an owned directory it did not need",
+            )
+    finally:
+        if mount and os.path.ismount(mount):
+            subprocess.run(["hdiutil", "detach", mount], capture_output=True)
+        if os.path.exists(image):
+            os.unlink(image)
+
+
+def path_bound(world: World, crate: str) -> None:
+    case(CASE_NAMES[9])
+    env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+    result = world.run(["check"], cwd=crate, env=env)
+    observed = reported(result.stderr, "dir").rstrip("/")
+    held_by_pool(world, observed)
+    leaf = os.path.basename(observed)
+    raw = observed.encode()
+    say(
+        f"longest injected internal path: {raw!r} = {len(raw)} bytes, "
+        f"{len(observed)} characters, leaf {leaf!r}"
+    )
+    expect(
+        len(raw) <= SOCKET_PATH_BOUND,
+        f"the injected path is {len(raw)} bytes, over the {SOCKET_PATH_BOUND}-byte bound",
+    )
+    # A guard against a silently longer derivation: the observation must be
+    # the documented `<slot>/scratch` shape.
+    expect(leaf == "scratch", f"the injected path does not end in scratch: {observed}")
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == "--plan":
+        plan()
+        return 0
+    if argv:
+        fail(f"unknown argument {argv[0]!r}; use --plan")
+    root = scratch_root()
+    world_root = private_dir(os.path.join(root, "pool-temp"))
+    say(f"scratch root {root}")
+    subject = stage_subject(world_root)
+    say(f"staged {subject} sha256={sha256_file(subject)}")
+    world = World(world_root, subject)
+    crate = make_fixture(world_root, "tempcheck")
+    premise_sweep(world, crate)
+    inherited_kept(world, crate)
+    replaced(world, crate)
+    aliases(world, crate)
+    accounting(world, crate)
+    case(CASE_NAMES[5])
+    expect(
+        not any(os.path.exists(path) for path in world.scratch_dirs()),
+        "the released slot kept an owned directory",
+    )
+    crash_and_recovery(world, crate)
+    foreign(world, crate)
+    removable(world, crate)
+    path_bound(world, crate)
+    print(
+        f"pool-temp-scratch proof passed: {len(CASES)} cases, "
+        f"{time.perf_counter() - STARTED:.1f}s"
+    )
+    for name in CASES:
+        print(f"  pass {name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

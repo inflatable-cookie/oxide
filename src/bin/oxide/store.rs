@@ -532,6 +532,13 @@ pub struct Lease {
     pub slot_id: String,
     pub reused: bool,
     pub build_dir: PathBuf,
+    /// The pool's recorded store identity and this slot's incarnation: the
+    /// durable binding of anything the command owns inside the slot.
+    pub store_id: String,
+    pub incarnation: String,
+    /// The command's owned child temporary directory (oxide#136), removed at
+    /// release after positive writer closure.
+    pub scratch: Option<crate::child_temp::Owned>,
     /// The slot's history for the freshness gate.
     pub prior: Prior,
     /// Checkout whose idle slot this command took; restored if the gate
@@ -550,6 +557,11 @@ impl Lease {
     /// every other command in the same checkout.
     pub fn record_id(&self) -> u64 {
         self.record
+    }
+
+    /// The library's lease identity, recorded in its ledger for this grant.
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
     }
 }
 
@@ -1609,6 +1621,7 @@ impl Store {
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission = self.admission()?;
+        self.discard_scratch(&held);
         if !self.flush_before_idle(&held.slot_id, held.record)? {
             return Ok(());
         }
@@ -1631,6 +1644,7 @@ impl Store {
     /// release it and give it back, origin unchanged.
     pub fn unshare(&self, held: Lease) -> Result<(), String> {
         let _admission = self.admission()?;
+        self.discard_scratch(&held);
         if !self.flush_before_idle(&held.slot_id, held.record)? {
             return Ok(());
         }
@@ -1648,6 +1662,19 @@ impl Store {
             self.write_origin(held.record, state.records[index].last_used, origin)?;
         }
         self.save(&state)
+    }
+
+    /// Remove the command's owned child temporary directory (oxide#136)
+    /// before the slot can go idle. The caller has already seen its own
+    /// process group empty; a failure is reported and never fails an
+    /// otherwise successful command, and the slot's own accounting and
+    /// deletion are unchanged, so a kept leftover is never counted twice.
+    fn discard_scratch(&self, held: &Lease) {
+        if let Some(scratch) = held.scratch.as_ref() {
+            if let Some(warning) = crate::child_temp::discard(scratch) {
+                eprintln!("oxide: WARNING: {warning}; the slot's own deletion still reconciles it");
+            }
+        }
     }
 
     /// A removable-volume slot is flushed to the device before it can go
@@ -3050,6 +3077,9 @@ impl Store {
             slot_id: grant.slot_id,
             reused: grant.reused_slot,
             build_dir: grant.env.cargo_build_build_dir,
+            store_id: grant.store_id,
+            incarnation: grant.incarnation,
+            scratch: None,
             prior,
             shared_from,
             measured,

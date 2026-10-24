@@ -851,6 +851,91 @@ explicit `recover` unless they adopt it.
   admission; `oxide clean --cargo-cache` asks
   Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
 
+### Child temporary files (oxide#136)
+
+Implemented. It owns where a leased command's children put temporary files;
+it is not final output, final-output placement or a claim of saved writes.
+
+- **One rule.** Before any writer starts, a leased command decides once for
+  its whole child tree. An inherited `TMPDIR` is kept for every child when it
+  canonically resolves to an existing directory that this user can write and
+  that is on the **same device** as the selected pool's payload root;
+  otherwise the command gets one Oxide-owned directory, `<slot>/scratch`,
+  inside the held slot. `TMPDIR`, `TMP` and `TEMP` are set to the chosen
+  value on every child Oxide launches for the command — Cargo, `oxide exec`'s
+  tool, and the owned program after a converted checkout's `run` — so test
+  binaries, build scripts, `run` programs and tools' own Cargo calls inherit
+  it. The choice is made after the lease and before the spawn, so the child
+  environment never influences workspace classification.
+- **An inherited directory is never Oxide's.** Oxide creates nothing inside
+  it, writes no management data into it and never removes or cleans it; the
+  owning tool keeps its own retention rules (an Effigy per-run scratch root
+  stays Effigy's). Only `TMP`, `TEMP` and a replaced `TMPDIR` are published on
+  the child's environment, so the caller's own environment is unchanged.
+- **The owned directory is bound and short.** Its ownership marker records
+  the pool's store identity, the slot and its incarnation (the lease that
+  created it is recorded too), is written before any writer starts, and
+  decides every later deletion: a leftover bound to the same incarnation is
+  reconciled by the next lease of that slot, and anything else — another
+  incarnation, a missing or unreadable marker, a link, another owner or
+  device — is reported and kept, never deleted. The directory is created
+  `0700`, refuses to follow a link, and lives inside the slot, so the
+  existing whole-payload accounting counts it exactly once (hard links
+  included), whole-slot eviction and crash recovery delete it with the slot
+  they already own, and a held, lost or quarantined slot keeps it.
+- **Lifecycle.** It is removed at release, after the command has seen its own
+  process group empty and before the slot can go idle. A removable slot is
+  flushed after that removal. An `oxide exec` tool, a kept rustc wrapper or an
+  interrupted command obeys the existing custody rules unchanged; a crash
+  leaves the directory with the held slot. `run` on a non-converted checkout
+  releases the slot before executing the program, so that program keeps the
+  machine's own temporary directory.
+- **Effect-free commands create nothing.** Plain passthrough, `--version`,
+  probes and `status` never lease, so they never create a scratch directory.
+  The freshness gate's `cargo metadata` and lockfile calls also run before the
+  choice and keep the inherited environment.
+- **Length is a limit, not a preference.** Unix-domain sockets need a short
+  path. The injected path is the held slot plus `scratch`; a path over 91
+  bytes (macOS `sun_path` is 104 bytes including the NUL, less `/` and an
+  eleven-byte socket name; Linux allows 108) is reported with its measured
+  byte count and **not** used, and the command runs with the machine default
+  rather than Oxide claiming the pool holds its temporary files. No alias,
+  symlink or settings change shortens a configured pool path.
+- **Visibility.** A leased command's summary ends with the bounded, escaped
+  fragment `temp: inherited <path>` or `temp: oxide <path>`. `status
+  --measure` names the choice the next leased command would make on the
+  pool it verifies; recorded `status` states the rule and never opens the
+  volume to answer it (oxide#128). An unusable choice prints one warning and
+  no summary fragment; the command itself is not failed for an environmental
+  temporary directory.
+- **Scope.** This is not a general temporary-file redirection: it applies only
+  to children Oxide launches for leased commands. CI, Effigy's own run
+  scratch, Queue worktrees, container scratch, `$HOME` and host or global
+  settings are untouched, and the Windows/other-platform default is not
+  guessed.
+
+**Proof.** `effigy rust:pool-temp-scratch` is one fixed script,
+`scripts/test-pool-temp-scratch.py`, and the whole command of the qualified
+shared proof supervisor (`bounded-test.py --limit 300
+--scratch-budget-mib 512`; an ELEVATED trigger: it deletes owned scratch,
+decides writer closure and writes to an owned removable fixture volume). It
+stages this clean HEAD's debug `oxide` offline with 1.97.1 and covers, on tiny
+fixtures with a private `HOME`, `CARGO_HOME` and directory pool: the
+same-device inherited `TMPDIR` kept with no Oxide directory created and the
+inherited content untouched; an inherited directory on another device,
+absent, unwritable and symlink-escaping replaced by one owned directory;
+aliases following the chosen value; the owned directory observed on the
+selected pool while a writer holds it, counted once with a hard link; normal
+release removing it; an injected crash while the writer group survives
+keeping it, and positive dead-group recovery removing the slot whole and
+permitting reuse; a foreign or other-incarnation entry kept and reported;
+and one owned 128 MiB scratch APFS image used as the removable pool, where a
+build's temporary files land on the image, then an ordinary detach selects the
+internal pool's scratch with no stale `/Volumes/<name>` directory written.
+It never touches a live pool or the registered drive, and it is not a
+benchmark or an alias for full QA. Its native author and reviewer sessions
+are separately root-activated; no run has happened yet.
+
 ## Execution location
 
 Every command becomes a request handed to an executor:

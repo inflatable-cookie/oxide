@@ -176,9 +176,15 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   drive from the account home, not `$HOME`, so a harness that overrides
   HOME still uses them; private pools need an explicit setting. Its proof
   controls exist only in debug builds; any other build refuses them.
-- **Temporary files off the internal drive:** temp files from builds, tests
-  and native proofs go to the selected pool (the Builds drive when present),
-  not the internal SSD. Approved, not built.
+- **Temporary files off the internal drive:** a leased command's children
+  (tests, run programs, build scripts, `oxide exec` tools) put temporary
+  files on the selected pool. An inherited `TMPDIR` is kept only when it is a
+  writable directory on the pool's own device; otherwise Oxide owns one
+  short per-command directory inside the slot, removed at release after
+  writer closure
+  ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It
+  covers child launches only: CI, Effigy's own run scratch, Queue worktrees
+  and host settings stay as they are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
@@ -192,7 +198,6 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Approved, not built:**
   - cold-slot seeding from matching units, conservative first, with
     one-use temp workspaces handled as seeded, first-evicted slots;
-  - per-slot test scratch;
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
 
