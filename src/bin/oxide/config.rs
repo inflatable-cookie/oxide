@@ -197,7 +197,7 @@ fn proof_controls(
 
 /// The qualified shared supervisor's own layout: a canonical
 /// `OXIDE_TASK_SCRATCH_ROOT` at `<root>/scratch` and `OXIDE_PROOF_EVIDENCE`
-/// at `<root>/evidence` under one `oxide-proof.*` root, plus a numeric
+/// at `<root>/evidence` under one `oxide-proof.*` root, plus a `u64`
 /// `OXIDE_PROOF_DEADLINE_NS`. The account control works only inside it.
 fn supervisor_scratch(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     let refuse = |why: &str| Err(format!("{TEST_ACCOUNT_HOME} refused: {why}"));
@@ -224,8 +224,11 @@ fn supervisor_scratch(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf,
         return refuse("OXIDE_PROOF_EVIDENCE is not the supervisor's sibling evidence directory");
     }
     let deadline = var("OXIDE_PROOF_DEADLINE_NS").unwrap_or_default();
-    let deadline = deadline.to_string_lossy();
-    if deadline.is_empty() || !deadline.bytes().all(|byte| byte.is_ascii_digit()) {
+    if deadline
+        .to_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .is_none()
+    {
         return refuse("OXIDE_PROOF_DEADLINE_NS is not the supervisor's deadline");
     }
     Ok(scratch)
@@ -417,27 +420,41 @@ impl Facts {
     }
 
     /// One stderr line when `$HOME` differs from the account home and the
-    /// pool or config came from that home, naming each with its provenance.
-    fn home_notice(&self, pool: &Path, pool_source: Source, file: &ConfigFile) -> Option<String> {
-        if !self.home_differs()
-            || (pool_source == Source::Environment("OXIDE_POOL") && file.explicit)
-        {
+    /// pool is the built-in default under that home; `None` when an explicit
+    /// override (`OXIDE_POOL`, a config-file path or an honoured XDG cache
+    /// root) chose the pool.
+    fn home_notice(&self, pool: &Path, pool_source: Source) -> Option<String> {
+        if !self.home_differs() || pool_source != Source::Default || !self.cache_from_home() {
             return None;
         }
         Some(format!(
-            "HOME is {}, but Oxide uses the account home {}: pool {} (from {}), config {} ({}); set OXIDE_POOL or OXIDE_CONFIG to choose others",
+            "HOME is {}; using the account pool at {} (account home {}); set OXIDE_POOL to isolate",
             self.env_home_shown(),
-            self.home.as_deref().map_or_else(|| "none".to_owned(), shown),
             shown(pool.as_os_str()),
-            pool_source.describe(),
-            shown(file.path.as_os_str()),
-            if file.explicit { "selected by OXIDE_CONFIG" } else { "platform location" },
+            self.home
+                .as_deref()
+                .map_or_else(|| "none".to_owned(), shown),
         ))
     }
 
     /// One platform-native root under the `oxide` leaf. Only this root's
     /// platform fact is read; Oxide's file names stay beneath it.
     fn storage_root(&self, kind: RootKind) -> Result<PathBuf, String> {
+        self.root_from(kind, false)
+    }
+
+    /// Whether the cache root, and so the default pool, is the one the home
+    /// alone gives: no honoured XDG override chose it.
+    fn cache_from_home(&self) -> bool {
+        matches!(
+            (self.root_from(RootKind::Cache, false), self.root_from(RootKind::Cache, true)),
+            (Ok(actual), Ok(from_home)) if actual == from_home
+        )
+    }
+
+    /// One root from the process or injected facts, or with `home_only` from
+    /// the home alone.
+    fn root_from(&self, kind: RootKind, home_only: bool) -> Result<PathBuf, String> {
         self.check_controls()?;
         let fact = match kind {
             RootKind::Config => PlatformDirectoryFact::Config,
@@ -445,26 +462,30 @@ impl Facts {
             RootKind::State => PlatformDirectoryFact::State,
             _ => return Err(format!("{kind:?} is not an Oxide storage root")),
         };
-        let facts = match &self.directories {
+        let macos = match &self.directories {
             // Longhorn also has a Windows policy; Oxide keeps to the two
             // platforms it resolved before.
             Directories::Process if !cfg!(any(target_os = "macos", target_os = "linux")) => {
                 return Err("no Oxide storage-root policy for this platform".to_owned());
             }
+            Directories::Process => cfg!(target_os = "macos"),
+            Directories::Injected(_) => self.macos,
+        };
+        let platform = if macos {
+            TargetPlatform::MacOs
+        } else {
+            TargetPlatform::Linux
+        };
+        let facts = match &self.directories {
+            _ if home_only => {
+                let home = self.home.as_ref().map(PathBuf::from);
+                let environment = PlatformEnvironment::default().with_home_dir(home);
+                native_platform_directory_fact_from(platform, fact, &environment)
+            }
             Directories::Process => {
-                let platform = if cfg!(target_os = "macos") {
-                    TargetPlatform::MacOs
-                } else {
-                    TargetPlatform::Linux
-                };
                 native_platform_directory_fact_from(platform, fact, &self.process_environment(fact))
             }
             Directories::Injected(environment) => {
-                let platform = if self.macos {
-                    TargetPlatform::MacOs
-                } else {
-                    TargetPlatform::Linux
-                };
                 native_platform_directory_fact_from(platform, fact, environment)
             }
         };
@@ -602,8 +623,8 @@ pub struct Settings {
     pub file: ConfigFile,
     /// Which home Oxide used and why, for `status`.
     pub home_line: String,
-    /// Set when `$HOME` differs from the account home and the pool or the
-    /// config file came from that home.
+    /// Set when `$HOME` differs from the account home and the pool is the
+    /// built-in default under that home.
     pub home_notice: Option<String>,
 }
 
@@ -694,7 +715,7 @@ pub fn settings(facts: &Facts) -> Result<Settings, String> {
     };
     let active_build_limit = resolve_active_build_limit(facts, section.max_active, &file.path)?;
     let ignored_legacy_config = ignored_legacy_config(facts);
-    let home_notice = facts.home_notice(&pool, pool_source, &file);
+    let home_notice = facts.home_notice(&pool, pool_source);
     Ok(Settings {
         pool,
         pool_source,
@@ -1326,6 +1347,8 @@ mod tests {
                 ("OXIDE_PROOF_EVIDENCE", scratch.to_str().expect("utf-8")),
                 ("OXIDE_PROOF_EVIDENCE", ""),
                 ("OXIDE_PROOF_DEADLINE_NS", "soon"),
+                ("OXIDE_PROOF_DEADLINE_NS", "-1"),
+                ("OXIDE_PROOF_DEADLINE_NS", "18446744073709551616"),
                 ("OXIDE_PROOF_DEADLINE_NS", ""),
                 ("OXIDE_TASK_SCRATCH_ROOT", stand_in_text),
             ] {
@@ -1393,44 +1416,35 @@ mod tests {
     }
 
     #[test]
-    fn a_differing_home_is_noticed_with_the_pool_and_config_provenance() {
+    fn a_differing_home_is_noticed_only_for_the_default_pool_under_it() {
         let mut facts = facts(true);
         facts.home_source = HomeSource::Account;
         facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
         let default = settings(&facts).expect("settings resolve");
-        let notice = default.home_notice.expect("a differing HOME is noticed");
-        assert!(
-            notice.starts_with(
-                "HOME is /private/tmp/harness-home, but Oxide uses the account home /home/user"
-            ),
-            "{notice}"
+        assert_eq!(
+            default.home_notice.as_deref(),
+            Some("HOME is /private/tmp/harness-home; using the account pool at /home/user/Library/Caches/oxide/build-pool (account home /home/user); set OXIDE_POOL to isolate")
         );
-        assert!(notice.contains("(from built-in default)"), "{notice}");
-        assert!(notice.contains("(platform location)"), "{notice}");
         assert_eq!(
             default.home_line,
             "account home /home/user (passwd entry); HOME is /private/tmp/harness-home"
         );
 
-        facts.oxide_pool = Some(OsString::from("/private/tmp/explicit-pool"));
-        let pool_only = settings(&facts).expect("settings resolve");
-        let notice = pool_only
-            .home_notice
-            .expect("the config still comes from the account home");
+        facts.oxide_config = Some(OsString::from("/private/tmp/absent-config.toml"));
         assert!(
-            notice.contains("/private/tmp/explicit-pool (from OXIDE_POOL)"),
-            "{notice}"
+            settings(&facts).expect("settings").home_notice.is_some(),
+            "an explicit config without a pool path leaves the default pool"
         );
-
-        facts.oxide_config = Some(OsString::from("/private/tmp/explicit-config.toml"));
-        assert_eq!(
-            settings(&facts).expect("settings").home_notice,
-            None,
-            "both explicit is quiet"
-        );
-
-        facts.oxide_pool = None;
         facts.oxide_config = None;
+
+        facts.oxide_pool = Some(OsString::from("/private/tmp/explicit-pool"));
+        let explicit = settings(&facts).expect("settings resolve");
+        assert_eq!(explicit.home_notice, None, "OXIDE_POOL chose the pool");
+        assert!(explicit
+            .home_line
+            .ends_with("; HOME is /private/tmp/harness-home"));
+        facts.oxide_pool = None;
+
         facts.env_home = Some(OsString::from("/home/user"));
         let matching = settings(&facts).expect("settings resolve");
         assert_eq!(matching.home_notice, None, "a matching HOME is quiet");
@@ -1441,7 +1455,7 @@ mod tests {
             .expect("settings")
             .home_notice
             .expect("unset HOME differs");
-        assert!(unset.starts_with("HOME is unset,"), "{unset}");
+        assert!(unset.starts_with("HOME is unset;"), "{unset}");
 
         facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
         facts.home_source = HomeSource::TestAccount;
@@ -1463,6 +1477,38 @@ mod tests {
         assert_eq!(
             environment.home_line,
             format!("HOME /home/user (proof control {TEST_HOME_FROM_ENV})")
+        );
+    }
+
+    #[test]
+    fn a_config_file_pool_or_honoured_xdg_cache_root_is_not_noticed() {
+        let dir = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("config-notice-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch");
+        let config = dir.join("config.toml");
+        fs::write(&config, "[pool]\npath = \"~/file-pool\"\n").expect("config");
+        let mut facts = facts(true);
+        facts.home_source = HomeSource::Account;
+        facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        facts.oxide_config = Some(config.into_os_string());
+        let file = settings(&facts).expect("settings");
+        assert_eq!(file.pool, Path::new("/home/user/file-pool"));
+        assert_eq!(file.home_notice, None, "the config file chose the pool");
+
+        let mut linux = facts(false);
+        linux.home_source = HomeSource::Account;
+        linux.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        assert!(settings(&linux).expect("settings").home_notice.is_some());
+        environment(&mut linux, |environment| {
+            environment.with_xdg_cache_home(Some(PathBuf::from("/srv/cache")))
+        });
+        let xdg = settings(&linux).expect("settings");
+        assert_eq!(xdg.pool, Path::new("/srv/cache/oxide/build-pool"));
+        assert_eq!(
+            xdg.home_notice, None,
+            "an honoured XDG cache root chose the pool"
         );
     }
 

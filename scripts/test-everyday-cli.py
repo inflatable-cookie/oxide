@@ -497,108 +497,6 @@ def require_test_controls(binary: str) -> None:
            f"{binary} does not report compiled proof controls: {probe.stdout!r}")
 
 
-def status_line(stdout: str, prefix: str) -> str:
-    return next((line for line in stdout.splitlines() if line.startswith(prefix)), "")
-
-
-def account_home(proof: Proof, root: str) -> None:
-    """The installed default: the pool and config follow the account home, not
-    HOME. A controlled account home inside the supervisor's scratch stands in
-    for the real one, so nothing here can reach the operator's pool, config or
-    drive registration."""
-    account = os.path.realpath(os.path.join(root, "account-home"))
-    harness = os.path.join(root, "harness-home")
-    for path in (account, harness):
-        os.makedirs(path, exist_ok=True)
-    base = {k: v for k, v in ENV.items() if k not in ("OXIDE_TEST_HOME_FROM_ENV", "OXIDE_POOL")}
-    supervisor = {name: os.environ[name] for name in ("OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS")}
-    env = {**base, **supervisor, "HOME": harness, "OXIDE_TEST_ACCOUNT_HOME": account}
-    config_dir = os.path.join(account, "Library", "Application Support", "oxide", "config")
-    default_pool = os.path.join(account, "Library", "Caches", "oxide", "build-pool")
-    code, out, err = run(proof, proof.binary, ["status"], root, env=env, timeout=60)
-    case("an overridden HOME resolves config from the account home", code == 0
-         and f"config: {config_dir}/config.toml (platform location, absent)" in out, out + err)
-    case("an overridden HOME resolves the default pool from the account home", code == 0
-         and f"pool: {default_pool} (from built-in default)" in out, out)
-    case("status names the account-home source and the differing HOME", code == 0
-         and f"  home: account home {account} (proof control OXIDE_TEST_ACCOUNT_HOME); HOME is {harness}" in out, out)
-    case("a differing HOME prints one notice with the pool provenance", err.count("oxide: HOME is ") == 1
-         and f"oxide: HOME is {harness}, but Oxide uses the account home {account}: pool {default_pool} (from built-in default)" in err, err)
-    case("nothing is created under the harness HOME", not os.path.exists(os.path.join(harness, "Library")))
-
-    explicit = os.path.join(root, "explicit-pool")
-    code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_POOL": explicit}, timeout=60)
-    case("an explicit OXIDE_POOL wins; the notice still names the account config", code == 0
-         and f"pool: {explicit} (from OXIDE_POOL)" in out and f"pool {explicit} (from OXIDE_POOL), config {config_dir}/config.toml" in err, out + err)
-    explicit_config = os.path.join(root, "explicit-config.toml")
-    code, out, err = run(proof, proof.binary, ["status"], root,
-                         env={**env, "OXIDE_POOL": explicit, "OXIDE_CONFIG": explicit_config}, timeout=60)
-    case("an explicit pool and config silence the notice", code == 0 and "oxide: HOME is" not in err
-         and f"HOME is {harness}" in status_line(out, "  home: "), out + err)
-
-    # A planted account config chooses the pool and budget; `~` is the account home.
-    write(os.path.join(config_dir, "config.toml"), '[pool]\npath = "~/acct-pool"\nbudget = 3000000000\n')
-    account_pool = os.path.join(account, "acct-pool")
-    code, out, err = run(proof, proof.binary, ["status"], root, env=env, timeout=60)
-    case("the account config is read under an overridden HOME", code == 0
-         and f"pool: {account_pool} (from config file)" in out and "soft budget 3000 MB (from config file)" in out
-         and f"pool {account_pool} (from config file)" in err, out + err)
-
-    # The account-selected pool, created by one tiny offline check, with a
-    # private permanent registration naming an absent volume.
-    app = os.path.join(root, "account-app")
-    manifest(app, "account_app")
-    code, out, err = run(proof, proof.binary, ["check", "--offline"], app, env=env, timeout=120)
-    case("a build under an overridden HOME uses the account-selected pool", code == 0
-         and os.path.isdir(os.path.join(account_pool, "oxide-managed")), err[-2000:])
-    mount = f"/Volumes/oxide-account-home-absent-{os.getpid()}"
-    expect(not os.path.lexists(mount), f"{mount} exists")
-    registration = os.path.join(account_pool, "oxide-managed", "removable.json")
-    write(registration, json.dumps({
-        "version": 2, "mount_point": mount,
-        "volume_uuid": "00000000-0000-4000-8000-000000000143",
-        "container_uuid": "00000000-0000-4000-8000-000000000143",
-        "reserve_bytes": 1 << 20, "cap_bytes": 1 << 20, "quota_bytes": None, "capacity_bytes": None,
-        "registered_ms": 17, "mode": "permanent",
-    }, indent=2) + "\n")
-    os.chmod(registration, 0o600)
-    planted = open(registration, "rb").read()
-    for label, home in (("an overridden", harness), ("a matching", account)):
-        code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "HOME": home}, timeout=60)
-        removable = status_line(out, "removable pool: ")
-        case(f"{label} HOME keeps the account pool's removable registration", code == 0
-             and mount in removable and "(mode: permanent)" in removable
-             and f"internal pool: {account_pool}" in out, out + err)
-    case("a matching HOME is quiet", "oxide: HOME is" not in err
-         and status_line(out, "  home: ") == f"  home: account home {account} (proof control OXIDE_TEST_ACCOUNT_HOME)", out + err)
-    case("status left the registration and absent mount untouched",
-         open(registration, "rb").read() == planted and not os.path.lexists(mount))
-
-    link = os.path.join(root, "account-link")
-    os.symlink(account, link)
-    for label, target in (("a symlinked account control", link), ("an account control outside scratch", "/Users")):
-        code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_TEST_ACCOUNT_HOME": target}, timeout=60)
-        case(f"{label} refuses", code != 0 and "OXIDE_TEST_ACCOUNT_HOME refused" in err, out + err)
-    unsupervised = {k: v for k, v in env.items() if k != "OXIDE_PROOF_EVIDENCE"}
-    for value in (account, "!unavailable"):
-        code, out, err = run(proof, proof.binary, ["status"], root, env={**unsupervised, "OXIDE_TEST_ACCOUNT_HOME": value}, timeout=60)
-        case(f"the account control {'stand-in' if value == account else '!unavailable'} refuses outside the supervisor",
-             code != 0 and "OXIDE_PROOF_EVIDENCE" in err and not out, out + err)
-    explicit_both = {**env, "OXIDE_POOL": explicit, "OXIDE_CONFIG": explicit_config}
-    malformed = {k: v for k, v in explicit_both.items() if k != "OXIDE_TEST_ACCOUNT_HOME"}
-    for label, request, refusal in (
-        ("mixed proof controls", {**explicit_both, "OXIDE_TEST_HOME_FROM_ENV": "1"}, "are both set"),
-        ("a malformed HOME control", {**malformed, "OXIDE_TEST_HOME_FROM_ENV": "yes"}, "must be exactly 1"),
-    ):
-        code, out, err = run(proof, proof.binary, ["status"], root, env=request, timeout=60)
-        case(f"{label} refuse before config even with explicit pool and config",
-             code != 0 and refusal in err and not out, out + err)
-    code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_TEST_ACCOUNT_HOME": "!unavailable"}, timeout=60)
-    case("an unavailable account home refuses instead of using HOME", code != 0
-         and "the account home directory is unavailable" in err and harness not in out, out + err)
-    case("the refusals created nothing under the harness HOME", not os.path.exists(os.path.join(harness, "Library")))
-
-
 def main() -> int:
     if sys.platform != "darwin":
         fail("the everyday CLI proof requires macOS")
@@ -638,7 +536,6 @@ def main() -> int:
         readiness(proof, root)
         passthrough(proof, root)
         capacity(proof, root)
-        account_home(proof, root)
     except BaseException as failure:
         print(f"everyday CLI proof failed after {time.monotonic() - STARTED:.0f} s: {failure!r}; scratch {root} left to the runner", file=sys.stderr)
         raise

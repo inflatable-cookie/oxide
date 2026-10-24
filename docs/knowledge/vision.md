@@ -162,7 +162,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides
-  HOME still uses them; private pools need an explicit setting.
+  HOME still uses them; private pools need an explicit setting. Its proof
+  controls exist only in debug builds; any other build refuses them.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per

@@ -501,11 +501,13 @@ def build_binaries(extra: tuple = (), env: dict | None = None) -> dict:
 def scrubbed(environ) -> dict:
     """The inherited environment without anything that selects Oxide's
     config, pool, proof controls or XDG roots, so fixture overrides are the
-    only storage inputs. Rustup keeps the invoking account's toolchains and
-    never installs one."""
+    only storage inputs. Rustup keeps the invoking default (its RUSTUP_HOME,
+    else the invoking HOME's .rustup, read before any fixture replaces HOME)
+    and never installs a toolchain."""
     env = {name: value for name, value in environ.items()
            if name not in ("OXIDE_CONFIG", "OXIDE_POOL") and not name.startswith(("OXIDE_TEST_", "XDG_"))}
-    env["RUSTUP_HOME"] = environ.get("RUSTUP_HOME") or os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".rustup")
+    invoking_home = environ.get("HOME") or pwd.getpwuid(os.geteuid()).pw_dir
+    env["RUSTUP_HOME"] = environ.get("RUSTUP_HOME") or os.path.join(invoking_home, ".rustup")
     env["RUSTUP_AUTO_INSTALL"] = "0"
     return env
 
