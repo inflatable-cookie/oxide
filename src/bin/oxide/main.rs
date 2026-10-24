@@ -353,18 +353,36 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // may re-arm it (oxide#140).
     let exec = invocation.command == "exec";
     process::install_signal_handlers()?;
-    if let Some(code) = pick_run_target(&mut invocation)? {
+    // A preparation step stopped by the admission window is the admission
+    // deadline (124), never an internal error: the window is what refused it.
+    macro_rules! prep {
+        ($value:expr) => {
+            match $value {
+                Ok(value) => value,
+                Err(error) => {
+                    if budget::admission_expired() {
+                        return Ok(stop_for_admission());
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    }
+    if let Some(code) = prep!(pick_run_target(&mut invocation)) {
         return Ok(code);
     }
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
-    let internal = Store::open_or_create()?;
+    let internal = prep!(Store::open_or_create());
     let output_control = internal.control().to_path_buf();
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
-    let checkout = identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())?;
+    let checkout = prep!(identity::locate_workspace(
+        CARGO,
+        invocation.manifest_path.as_deref()
+    ));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -376,7 +394,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // The intermediate pool is selected first: outputs select the external
     // root only when this command's slot comes from the removable pool, whose
     // watchdog supervises the drive's removal.
-    let selected = removable::select(internal)?;
+    let selected = prep!(removable::select(internal));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -390,7 +408,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // A fresh checkout on the selected permanent drive converts its target
     // before the destination is planned and keyed (oxide#121). Its barrier is
     // released before this command takes a slot.
-    outputs::auto_adopt(&selected.store, &checkout, &selected)?;
+    prep!(outputs::auto_adopt(&selected.store, &checkout, &selected));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -398,25 +416,28 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
     // released again before this command waits for a slot.
-    outputs::reserve(
+    prep!(outputs::reserve(
         &store,
         Some(&output_control),
         &checkout,
         pool_fallback.as_deref(),
-    )?;
+    ));
     test_pause("reserved");
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
-    let planned =
-        outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
+    let planned = prep!(outputs::planned_destination(
+        Some(&output_control),
+        &checkout,
+        pool_fallback.as_deref()
+    ));
     let destination = outputs::destination_facts(planned.as_ref());
-    let key = SlotKey::resolve_in(
+    let key = prep!(SlotKey::resolve_in(
         &checkout,
         invocation.profile.recipe_key(),
         invocation.target.as_deref(),
         &destination,
-    )?;
+    ));
     test_pause_with("keyed", &destination);
     if budget::admission_expired() {
         return Ok(stop_for_admission());
@@ -478,6 +499,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         Err(reason) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
+            if budget::admission_expired() {
+                return Ok(stop_for_admission());
+            }
             return Err(reason);
         }
     };
@@ -530,6 +554,11 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         let origin = held.prior.unchanged();
         store.release(held, origin)?;
         return Ok(stop_for_admission());
+    }
+    if let Some(delay) = budget::spawn_delay() {
+        // Debug proof control: hold the last admission check open so the
+        // deadline can pass before the launch attempt (the in-flight case).
+        std::thread::sleep(delay);
     }
     let started_group = store
         .mark_spawning(&held)

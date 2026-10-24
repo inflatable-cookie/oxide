@@ -666,6 +666,17 @@ oxide run --execution-budget 120s
   inheritance yet. In-kernel filesystem, flush and lock sections, eviction
   walks, standard-stream I/O, scheduling and a `setsid` escapee remain
   cooperative limits; budgets do not make them preemptible.
+- **Independently optional axes.** An admission-only command still emits the
+  start record (with a null execution axis) and, if its child starts after the
+  admission deadline, stops at once and exits 124; a preparation step that the
+  window stops is the admission deadline, never an internal error.
+- **Debug proof controls.** Two debug-only variables exist for the fixed
+  proof and are absent from release builds, which refuse either variable when
+  present: `OXIDE_TEST_CLOSURE_STUCK` reports the owned group as unconfirmed
+  so the held-custody path is exercisable, and `OXIDE_TEST_SPAWN_DELAY_MS`
+  holds the window between the last admission check and the launch so a late
+  start is observable. Neither changes a product decision outside a debug
+  build.
 - **Locking.** A budgeted command waits for the admission, record and
   checkout-binding locks with the existing nonblocking primitive, polling
   against the remaining window in the unchanged order. Abandoning a wait

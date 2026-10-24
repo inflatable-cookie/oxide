@@ -283,8 +283,10 @@ struct Admission {
 
 struct LiveExecution {
     started: Instant,
-    /// The stop trigger: `now` for a late start, else the armed deadline.
-    stop: Instant,
+    /// The stop trigger: `now` for a late start, the armed deadline for an
+    /// execution budget, and `None` for an admission-only command that started
+    /// inside its window (it has no execution window at all).
+    stop: Option<Instant>,
 }
 
 struct State {
@@ -299,6 +301,8 @@ struct State {
     late: bool,
     /// The budget stop has been handed to the wait loops once.
     stop_requested: bool,
+    /// The observed start has been recorded once.
+    armed: bool,
     events: Option<Events>,
     events_lost: bool,
     note_printed: bool,
@@ -334,6 +338,7 @@ pub fn install(options: Options) -> Result<(), String> {
             origin: None,
             late: false,
             stop_requested: false,
+            armed: false,
             events,
             events_lost: false,
             note_printed: false,
@@ -381,28 +386,33 @@ pub fn clamp(limit: Duration) -> Duration {
     }
 }
 
-/// Arm the execution window once, at the observed child start. A start after
-/// the admission deadline is recorded as late and stops immediately: the
-/// command never receives a fresh usable interval.
+/// Record the one observed child start. This runs for every budgeted command,
+/// including an admission-only one: the start is what the typed event reports,
+/// and a late start stops immediately even when no execution budget exists.
+/// Nothing here is ever re-armed.
 pub fn arm_execution(started: Instant, phase: Phase) {
     with(|state| {
         let Some(state) = state else { return };
-        if state.execution.is_some() || state.origin.is_some() {
+        if state.armed {
             return;
         }
-        let Some(limit) = state.options.execution else {
-            return;
-        };
+        state.armed = true;
         let late = state
             .admission
             .as_ref()
             .is_some_and(|admission| started >= admission.expires);
         state.late = late;
-        let expires = started + limit;
-        state.execution = Some(LiveExecution {
-            started,
-            stop: if late { Instant::now() } else { expires },
-        });
+        let stop = match state.options.execution {
+            Some(limit) => Some(if late {
+                Instant::now()
+            } else {
+                started + limit
+            }),
+            // A late start with no execution axis is still a stop: the
+            // admission window had already closed.
+            None => late.then(Instant::now),
+        };
+        state.execution = Some(LiveExecution { started, stop });
         if late {
             state.origin = Some(Origin::Admission);
         }
@@ -412,7 +422,14 @@ pub fn arm_execution(started: Instant, phase: Phase) {
                 .checked_duration_since(admission.expires)
                 .map(millis)
         });
-        events_started(state, phase, late, admission_limit, limit, overshoot);
+        events_started(
+            state,
+            phase,
+            late,
+            admission_limit,
+            state.options.execution,
+            overshoot,
+        );
     });
 }
 
@@ -421,11 +438,14 @@ fn events_started(
     phase: Phase,
     late: bool,
     admission_limit: Option<Duration>,
-    execution_limit: Duration,
+    execution_limit: Option<Duration>,
     overshoot_ms: Option<u64>,
 ) {
-    let execution_started = Some(0_u64);
+    if state.events_lost {
+        return;
+    }
     let seq = next_seq(state);
+    let execution_started = execution_limit.map(|_| 0_u64);
     let record = format!(
         "{{\"v\":1,\"invocation\":\"{}\",\"seq\":{},\"event\":\"admitted_child_started\",\"phase\":\"{}\",\"spawn\":true,\"spawn_late\":{},\"admission_expired_before_start\":{},\"admission_ms\":{},\"execution_ms\":{},\"admission_elapsed_ms\":{},\"execution_started_ms\":{},\"admission_overshoot_ms\":{}}}",
         state.invocation,
@@ -434,7 +454,7 @@ fn events_started(
         late,
         late,
         optional(admission_limit.map(millis)),
-        millis(execution_limit),
+        optional(execution_limit.map(millis)),
         millis(state.started.elapsed()),
         optional(execution_started),
         optional(overshoot_ms),
@@ -458,6 +478,11 @@ fn optional(value: Option<u64>) -> String {
 }
 
 fn emit(state: &mut State, record: &str) {
+    if state.events_lost {
+        // Sticky: once the stream is lost nothing more is written, so a later
+        // terminal record can never land after a lost earlier one.
+        return;
+    }
     let lost_before = state.events_lost;
     let lost = match state.events.as_mut() {
         Some(events) => !events.write(record),
@@ -481,7 +506,8 @@ pub fn take_execution_stop() -> Option<Origin> {
             return None;
         }
         let live = state.execution.as_ref()?;
-        if Instant::now() < live.stop {
+        let stop = live.stop?;
+        if Instant::now() < stop {
             return None;
         }
         state.stop_requested = true;
@@ -519,6 +545,9 @@ pub fn origin() -> Option<Origin> {
 pub fn program_started() {
     with(|state| {
         let Some(state) = state else { return };
+        if state.events_lost {
+            return;
+        }
         let seq = next_seq(state);
         let admission_limit = state.admission.as_ref().map(|entry| entry.limit);
         let execution_limit = state.options.execution.map(millis);
@@ -552,6 +581,9 @@ pub fn finished(
 ) {
     with(|state| {
         let Some(state) = state else { return };
+        if state.events_lost {
+            return;
+        }
         let signal = child.and_then(|status| status.signal());
         let code = child.and_then(|status| status.code());
         let seq = next_seq(state);
@@ -597,20 +629,41 @@ pub fn closure_stuck() -> bool {
     }
 }
 
+/// The debug-only proof control for the in-flight spawn window: a delay placed
+/// after the last admission check and before the launch, so the proof can force
+/// an observable late start. Release builds have no hook.
+pub const SPAWN_DELAY_HOOK: &str = "OXIDE_TEST_SPAWN_DELAY_MS";
+
+/// Milliseconds to wait just before the launch attempt (debug builds only).
+pub fn spawn_delay() -> Option<Duration> {
+    #[cfg(debug_assertions)]
+    {
+        let value = std::env::var_os(SPAWN_DELAY_HOOK)?;
+        let millis = value.to_str()?.parse::<u64>().ok()?;
+        Some(Duration::from_millis(millis))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 /// A build without the debug hook refuses the variable whenever it is present,
 /// rather than silently ignoring a proof control.
 pub fn refuse_absent_test_hook() -> Result<(), String> {
     #[cfg(debug_assertions)]
     {
-        let _ = CLOSURE_HOOK;
+        let _ = (CLOSURE_HOOK, SPAWN_DELAY_HOOK);
         Ok(())
     }
     #[cfg(not(debug_assertions))]
     {
-        if std::env::var_os(CLOSURE_HOOK).is_some() {
-            return Err(format!(
-                "{CLOSURE_HOOK} is a debug-only proof control; this build has no such hook"
-            ));
+        for hook in [CLOSURE_HOOK, SPAWN_DELAY_HOOK] {
+            if std::env::var_os(hook).is_some() {
+                return Err(format!(
+                    "{hook} is a debug-only proof control; this build has no such hook"
+                ));
+            }
         }
         Ok(())
     }
@@ -1015,6 +1068,26 @@ pub(crate) fn events_lost() -> bool {
     with(|state| state.is_some_and(|state| state.events_lost))
 }
 
+/// Test helper: the current sequence number.
+#[cfg(test)]
+pub(crate) fn events_seq() -> u64 {
+    with(|state| {
+        state
+            .and_then(|state| state.events.as_ref().map(|events| events.seq))
+            .unwrap_or(0)
+    })
+}
+
+/// Test helper: mark the stream lost, as a failed write would.
+#[cfg(test)]
+pub(crate) fn force_loss() {
+    with(|state| {
+        if let Some(state) = state {
+            state.events_lost = true;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1255,6 +1328,73 @@ mod tests {
         reset();
         assert!(!closure_stuck());
         assert!(refuse_absent_test_hook().is_ok());
+    }
+
+    #[test]
+    fn an_admission_only_late_start_still_requests_its_stop() {
+        reset();
+        guard(Options {
+            admission: Some(Duration::from_millis(1)),
+            execution: None,
+            events: None,
+        });
+        std::thread::sleep(Duration::from_millis(5));
+        arm_execution(Instant::now(), Phase::ExecTool);
+        assert!(late_start());
+        assert_eq!(origin(), Some(Origin::Admission));
+        assert_eq!(take_execution_stop(), Some(Origin::Admission));
+        assert_eq!(take_execution_stop(), None);
+        assert_eq!(exit_code(0), 124);
+        reset();
+    }
+
+    #[test]
+    fn an_admission_only_start_emits_the_started_record_with_a_null_axis() {
+        let (mut reader, writer) = pipe(true);
+        reset();
+        guard(Options {
+            admission: Some(Duration::from_secs(30)),
+            execution: None,
+            events: Some(writer.as_raw_fd()),
+        });
+        arm_execution(Instant::now(), Phase::ExecTool);
+        let records = drain_records(&mut reader);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let started = &records[0];
+        assert_eq!(started["admission_ms"], 30_000);
+        assert_eq!(started["execution_ms"], serde_json::Value::Null);
+        assert_eq!(started["execution_started_ms"], serde_json::Value::Null);
+        assert_eq!(started["spawn_late"], false);
+        // No execution axis means no execution stop can fire.
+        assert_eq!(take_execution_stop(), None);
+        reset();
+    }
+
+    #[test]
+    fn a_lost_stream_never_writes_again_or_advances_its_sequence() {
+        reset();
+        guard(Options {
+            admission: Some(Duration::from_secs(1)),
+            execution: Some(Duration::from_secs(1)),
+            events: None,
+        });
+        force_loss();
+        let before = events_seq();
+        arm_execution(Instant::now(), Phase::PrimaryCargo);
+        finished(
+            Outcome::ChildExit,
+            None,
+            None,
+            Drain::Complete,
+            Lease::Released,
+            0,
+        );
+        assert_eq!(
+            events_seq(),
+            before,
+            "a suppressed record must not advance seq"
+        );
+        reset();
     }
 
     #[test]

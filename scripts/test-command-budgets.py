@@ -18,9 +18,12 @@ Cases and oracles (see docs/knowledge/contracts/workflow.md#command-time-budgets
   4 an execution deadline stops a slow child
   5 precedence: caller signal, a genuine 124/125 child, TERM then KILL
   6 a bounded `run` uses one cumulative build+program window
-  7 the event channel matrix (type, access, flag, full, broken, gap)
-  8 no settings or ledger mutation
-  9 unbudgeted commands keep their old behaviour
+  7 the event channel matrix (type, access, flag, full, broken, gap, sticky loss)
+  8 an admission-only start (nullable execution axis) and a stopped
+    preparation child reported as the admission deadline
+  9 a late start forced through the debug spawn-delay control
+ 10 no settings or ledger mutation
+ 11 unbudgeted commands keep their old behaviour
 """
 
 import json
@@ -475,7 +478,40 @@ def case_events(root):
         fail(f"a broken event reader changed the outcome: {process.returncode} {stderr[-500:]}")
     if stderr.count("event channel became unusable") > 1:
         fail("the loss note was printed more than once")
-    print("ok events: type/access/flag refusals, broken reader survives", flush=True)
+    # Sticky loss: when the stream is full before the command starts, nothing
+    # is ever written, and a later terminal record cannot appear.
+    read_fd, write_fd = event_reader()
+    filler = b"x" * 4096
+    while True:
+        try:
+            os.write(write_fd, filler)
+        except BlockingIOError:
+            break
+    result = subprocess.run(
+        [str(BINARY), "exec", "--execution-budget", "10s", "--budget-events", str(write_fd), "--", str(tool)],
+        env=env,
+        pass_fds=(write_fd,),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    os.close(write_fd)
+    drained = b""
+    while True:
+        try:
+            chunk = os.read(read_fd, 65536)
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        drained += chunk
+    os.close(read_fd)
+    if result.returncode != EXIT_OK:
+        fail(f"a full event pipe changed the command outcome: {result.returncode}")
+    if b'"event"' in drained:
+        fail("a record was written after the stream was lost")
+    print("ok events: type/access/flag refusals, broken reader survives, sticky loss", flush=True)
 
 
 def state_shape(control):
@@ -488,6 +524,126 @@ def state_shape(control):
     except (OSError, json.JSONDecodeError):
         return "unreadable"
     return sorted(document) if isinstance(document, dict) else "not-an-object"
+
+
+def case_admission_only_and_preparation_stop(root):
+    """An admission-only start is typed, and a stopped preparation child is 124."""
+    env = base_env(root, "admission-only")
+    tool = root / "admission-only.sh"
+    write_executable(tool, "#!/bin/sh\nexit 0\n")
+    read_fd, write_fd = event_reader()
+    with os.fdopen(read_fd, "r") as reader:
+        result = subprocess.run(
+            [
+                str(BINARY),
+                "exec",
+                "--admission-budget",
+                "30s",
+                "--budget-events",
+                str(write_fd),
+                "--",
+                str(tool),
+            ],
+            env=env,
+            pass_fds=(write_fd,),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        os.close(write_fd)
+        raw = reader.read()
+    if result.returncode != EXIT_OK:
+        fail(f"the admission-only command exited {result.returncode}: {result.stderr[-800:]}")
+    started = (records(raw) or [{}])[0]
+    if started.get("admission_ms") != 30_000 or started.get("execution_ms") is not None:
+        fail(f"the admission-only started record is wrong: {started}")
+    if started.get("execution_started_ms") is not None:
+        fail(f"an admission-only start claimed an execution clock: {started}")
+    if started.get("spawn_late") is not False:
+        fail(f"an admission-only fast start was reported late: {started}")
+    print("ok admission-only: started record with a null execution axis", flush=True)
+
+    # A preparation child that outlives a tiny admission window is the
+    # admission deadline, never an internal error: the fake cargo below sleeps
+    # inside `cargo locate-project`, so the bounded helper stops it.
+    real_cargo = shutil.which("cargo")
+    if not real_cargo:
+        fail("the proof needs the real cargo on PATH for the fake")
+    fake = root / "fakebin"
+    fake.mkdir(exist_ok=True)
+    write_executable(
+        fake / "cargo",
+        f"#!/bin/sh\ncase \" $* \" in *locate-project*) sleep 5 ;; esac\nexec {real_cargo} \"$@\"\n",
+    )
+    slow_env = dict(env)
+    slow_env["PATH"] = f"{fake}:{env['PATH']}"
+    marker = root / "prep.started"
+    prep_tool = root / "prep.sh"
+    write_executable(prep_tool, f"#!/bin/sh\ntouch {marker}\n")
+    result = run(
+        [str(BINARY), "exec", "--admission-budget", "1ms", "--", str(prep_tool)],
+        slow_env,
+        timeout=60,
+    )
+    if result.returncode != ADMISSION_EXIT:
+        fail(f"a stopped preparation child exited {result.returncode}, wanted {ADMISSION_EXIT}")
+    if marker.exists():
+        fail("a stopped preparation child still started the primary program")
+    print("ok preparation stop: exit 124, no primary child", flush=True)
+
+
+def case_late_start(root):
+    """A start after the admission deadline is reported and stopped at once."""
+    env = base_env(root, "late", OXIDE_TEST_SPAWN_DELAY_MS="3000")
+    tool = root / "late.sh"
+    write_executable(tool, "#!/bin/sh\nexec sleep 60\n")
+    read_fd, write_fd = event_reader()
+    with os.fdopen(read_fd, "r") as reader:
+        result = subprocess.run(
+            [
+                str(BINARY),
+                "exec",
+                "--admission-budget",
+                "2s",
+                "--execution-budget",
+                "60s",
+                "--budget-events",
+                str(write_fd),
+                "--",
+                str(tool),
+            ],
+            env=env,
+            pass_fds=(write_fd,),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        os.close(write_fd)
+        raw = reader.read()
+    if result.returncode != ADMISSION_EXIT:
+        fail(f"the late start exited {result.returncode}, wanted {ADMISSION_EXIT}")
+    if "admission budget" not in result.stderr:
+        fail(f"the late start did not name the admission budget: {result.stderr[-800:]}")
+    parsed = records(raw) or []
+    started = [entry for entry in parsed if entry.get("event") == "admitted_child_started"]
+    if not started:
+        fail(f"the late start emitted no started record: {parsed}")
+    record = started[0]
+    if record.get("spawn") is not True or record.get("spawn_late") is not True:
+        fail(f"the late start was not reported truthfully: {record}")
+    if record.get("admission_expired_before_start") is not True:
+        fail(f"the late start did not report the expired window: {record}")
+    if not isinstance(record.get("admission_overshoot_ms"), int):
+        fail(f"the late start reported no overshoot: {record}")
+    if record.get("execution_started_ms") is not None and record.get("execution_ms") is None:
+        fail(f"a late start claimed an execution clock without one: {record}")
+    # The group was stopped and released: the next command gets the slot.
+    follow = run([str(BINARY), "exec", "--", str(root / "admission-only.sh")], env, timeout=90)
+    if follow.returncode != EXIT_OK:
+        fail(f"the slot was not released after a late start: {follow.returncode}")
+    print("ok late start: spawn_late, admission overshoot, stopped and released", flush=True)
 
 
 def state_keys(pool):
@@ -645,6 +801,8 @@ def main():
     case_precedence(work)
     case_cumulative_run(work)
     case_events(work)
+    case_admission_only_and_preparation_stop(work)
+    case_late_start(work)
     case_nested(work)
     case_unknown_closure(work)
     case_no_mutation(work)
