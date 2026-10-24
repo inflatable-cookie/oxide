@@ -234,6 +234,25 @@ the operating rules.
   closure, and removable media: adds an independent reviewer native session.
 - **Bounds:** wall-clock time and scratch budget. Resource figures are
   reported, not gated.
+- **Proof authoring guidance** (product architect, 2026-10-24): briefs that
+  author or correct a native proof script, its fixtures or its oracles declare
+  **HIGH** complexity. Queue still selects the models. Before a counted native,
+  the author runs the script's safe opt-in diagnostic keep-going mode as an
+  uncounted collection run, using an existing mode or adding one for a new
+  script. Where no safe diagnostic exists, use a documented source
+  premise/oracle sweep against current shipped behaviour instead. Check the
+  executable case bodies, not only their plan text: automatic adoption,
+  private-HOME controls, Cargo's external-subcommand argv and command-prefix
+  parsing are examples of premises that have caused false failures.
+  - Record diagnostic failures and dependent or tainted skips honestly;
+    unknown device/writer effects, infrastructure faults and uncertain custody
+    still abort. Keep the default counted path fail-fast and preserve the
+    qualified guard and cleanup bounds.
+  - The collection receipt is diagnostic only, never a counted PASS or closure
+    claim. It still needs its own scoped activation, exact source/input pins,
+    supported route, time and scratch bounds. This guidance grants no native
+    start, extra diagnostic allowance or clock reset. The counted run exercises
+    an already-swept script.
 - **Mechanical native-evidence gates** (Supervisor, 2026-10-23): every Oxide
   brief requiring counted native evidence encodes it in Queue before
   promotion. Use `reviewVerdicts: true` with a `reviewPassGate` subject such
