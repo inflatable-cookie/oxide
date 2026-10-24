@@ -2599,7 +2599,10 @@ oxide#102.
   with artifacts recorded as staged and resources known at failure; it never
   claims closure. `--plan` allocations are planning figures, unmeasured.
   `dogfood:scripts:test` covers the custody decisions with a fake `hdiutil`.
-  Each native run needs a separate owner activation; none has run.
+  One native run passed at `05fd297` (2026-10-24: 41/41 cases in 56 s,
+  66.9 MiB peak owned, supervisor closed with no fault), accepted by Tom
+  in place of the separate author and reviewer runs; a further run needs
+  its own owner activation.
   **Proof.** Unit tests pin literal former paths for both platforms
   (Unicode and spaces), demanded and unused relative XDG, overrides without
   `HOME` and missing facts with injected facts; they do not prove native
