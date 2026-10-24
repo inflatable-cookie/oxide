@@ -1164,6 +1164,33 @@ def pure_attachment_facts_control() -> None:
     print("pure attachment-facts control: ok (synthetic filesystem, no subprocess)", flush=True)
 
 
+def detach_owned_image(proof: Proof, label: str):
+    """The ONE risky ordinary detach of the fixture volume.
+
+    The uncertainty intention is set BEFORE the device call, so a runner that
+    raises (timeout, interruption, OS error) - and may therefore have killed and
+    reaped its direct child, discarding the unclosed entry - still leaves the
+    latch in force: closeout then performs no further device operation and keeps
+    the backing. The latch is cleared only after a positive successful result.
+    """
+    ATTACHMENT["uncertain"] = (
+        f"{label}: the ordinary detach was attempted and its outcome is not yet known"
+    )
+    detached = proof.run(["/usr/bin/hdiutil", "detach", proof.mount], timeout=60)
+    if detached.returncode != 0:
+        ATTACHMENT["uncertain"] = (
+            f"{label}: the ordinary detach exited {detached.returncode}, "
+            "so the owned volume's state is unknown"
+        )
+        raise UnsafeEffect(
+            f"{label}: the ordinary detach exited {detached.returncode}, so the owned "
+            "volume's state is unknown: "
+            + detached.stderr.decode(errors="replace")[-500:]
+        )
+    ATTACHMENT["uncertain"] = None
+    return detached
+
+
 def detach_owned_volume(proof: Proof, label: str) -> None:
     """Ordinary detach of the proof-owned mount, used on success AND after a
     failure once direct child outcomes are known. A failed or unresolved
@@ -1189,6 +1216,28 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
         fail(
             f"{label}: a device operation's outcome is unknown, so this run performs no "
             f"further detach; the mount and backing are retained"
+        )
+        return
+    if DIAG.mode and ATTACHMENT["writers_uncertain"]:
+        # A reaped direct child is NOT proof that its writers closed. After an
+        # infrastructure/safety abort this run cannot prove closure, so it
+        # retains the mount, the backing and the recorded facts without any
+        # device operation.
+        record = known_attachment_facts(proof, label, "unresolved: writer closure not provable")
+        record["reason"] = ATTACHMENT["writers_uncertain"]
+        record["reaping_is_not_closure"] = True
+        record["device_operations_avoided"] = True
+        try:
+            write_attachment_facts("detach-unresolved.json", record)
+        except Exception as error:
+            print(
+                f"{label}: could not record the unresolved writer facts ({error!r})",
+                file=sys.stderr,
+                flush=True,
+            )
+        fail(
+            f"{label}: the run stopped with an infrastructure abort, so its writer closure "
+            f"cannot be read from reaped direct children; the mount and backing are retained"
         )
         return
     mount = proof.mount
@@ -1680,7 +1729,7 @@ SHARED: dict = {}
 # The memory-only latch for a device operation whose outcome is unknown. It is
 # set BEFORE such an effect propagates, so closeout can keep the backing, the
 # facts and the evidence without attempting any further device operation.
-ATTACHMENT: dict = {"uncertain": None}
+ATTACHMENT: dict = {"uncertain": None, "writers_uncertain": None}
 
 
 def first_usable() -> tuple:
@@ -2137,77 +2186,158 @@ def pure_diagnostic_controls() -> None:
         expect(record["closeout_failed"] is True, "a failed closeout was not recorded")
         expect(record["outcome"] == "failures_recorded", record["outcome"])
         expect(record["primary_failure"] == "the ordinary detach failed: exit 2", record["primary_failure"])
-        # 10c. A: the real diagnostic_main closeout path with the uncertain-detach
-        #      latch: no device operation is attempted after it, the retained
-        #      backing facts are written, and the original fault is preserved.
+        # 10c. A: the REAL case14 device boundary (detach_owned_image) through the
+        #      REAL diagnostic_main closeout, with a runner that RAISES instead of
+        #      returning nonzero. The latch is set before the call, so an
+        #      exceptional outcome can never let closeout retry the device.
         class DeviceProof(FakeProof):
+            def __init__(self, error) -> None:
+                super().__init__(mount="/fixture/owned/volume")
+                self.error = error
+                self.device_calls: list = []
+
+            def run(self, argv, **kwargs):
+                self.device_calls.append(list(argv))
+                raise self.error
+
+        def mock_closeout(device_proof):
+            recorded = {"receipts": [], "facts": [], "body_calls": 0, "raised": None}
+            originals = (
+                globals()["run"],
+                globals()["write_attachment_facts"],
+                globals()["write_diagnostic_receipt"],
+                dict(ATTACHMENT),
+            )
+
+            def fake_body(proof, repo):
+                recorded["body_calls"] += 1
+                return detach_owned_image(proof, "14 volume away")
+
+            def fake_facts(name, body):
+                recorded["facts"].append((name, body))
+
+            def fake_receipt(record):
+                recorded["receipts"].append(record)
+                return "/evidence/profile-outputs.diagnostic-mock.json"
+
+            try:
+                globals()["run"] = fake_body
+                globals()["write_attachment_facts"] = fake_facts
+                globals()["write_diagnostic_receipt"] = fake_receipt
+                ATTACHMENT.update({"uncertain": None, "writers_uncertain": None})
+                try:
+                    diagnostic_main(device_proof, "/repo")
+                except BaseException as error:
+                    recorded["raised"] = error
+            finally:
+                (
+                    globals()["run"],
+                    globals()["write_attachment_facts"],
+                    globals()["write_diagnostic_receipt"],
+                    latch,
+                ) = originals
+                ATTACHMENT.clear()
+                ATTACHMENT.update(latch)
+            return recorded
+
+        for error in (
+            perm.subprocess.TimeoutExpired(["/usr/bin/hdiutil", "detach"], 60),
+            KeyboardInterrupt(),
+            OSError("the device call failed before it could report"),
+        ):
+            recorded = mock_closeout(DeviceProof(error))
+            expect(recorded["body_calls"] == 1, recorded["body_calls"])
+            expect(
+                recorded["raised"] is error,
+                f"the original exceptional fault was replaced: {recorded['raised']!r}",
+            )
+            expect(
+                recorded["facts"] and recorded["facts"][0][0] == "detach-unresolved.json",
+                f"closeout wrote {recorded['facts']}",
+            )
+            expect(
+                recorded["facts"][0][1].get("device_operations_avoided") is True,
+                recorded["facts"][0][1],
+            )
+            expect(len(recorded["receipts"]) == 1, "the diagnostic receipt was not attempted")
+            receipt = recorded["receipts"][0]
+            expect(receipt["abort"]["kind"] == "abort", receipt["abort"])
+            expect(receipt["collection_complete"] is False, receipt["collection_complete"])
+            expect(receipt["qualified"] is False, receipt["qualified"])
+        # Exactly ONE device attempt per exceptional run, and never a closeout
+        # device call.
+        for error in (
+            perm.subprocess.TimeoutExpired(["/usr/bin/hdiutil", "detach"], 60),
+            KeyboardInterrupt(),
+        ):
+            device_proof = DeviceProof(error)
+            mock_closeout(device_proof)
+            expect(
+                device_proof.device_calls
+                == [["/usr/bin/hdiutil", "detach", "/fixture/owned/volume"]],
+                f"closeout retried or replaced the single device command: {device_proof.device_calls}",
+            )
+        # 10d. An infrastructure abort with a CLEARED direct-child set must not be
+        #      read as writer closure: closeout keeps mount and backing with no
+        #      device operation at all.
+        class AbortProof(FakeProof):
             def __init__(self) -> None:
                 super().__init__(mount="/fixture/owned/volume")
                 self.device_calls: list = []
 
             def run(self, argv, **kwargs):
                 self.device_calls.append(list(argv))
-                raise AssertionError(f"a device command was attempted: {argv}")
+                raise AssertionError(f"closeout attempted a device command: {argv}")
 
-        device_proof = DeviceProof()
-        recorded: dict = {"receipts": [], "facts": [], "body_calls": 0}
-        originals = (
+        abort_proof = AbortProof()
+        abort_recorded = {"receipts": [], "facts": []}
+        abort_originals = (
             globals()["run"],
             globals()["write_attachment_facts"],
             globals()["write_diagnostic_receipt"],
             dict(ATTACHMENT),
         )
 
-        def fake_body(proof, repo):
-            recorded["body_calls"] += 1
-            # The ONE device attempt of the case: the ordinary detach, nonzero.
-            proof.device_calls.append(["/usr/bin/hdiutil", "detach", proof.mount])
-            ATTACHMENT["uncertain"] = "14: the ordinary detach exited 2, so the owned volume's state is unknown"
-            raise UnsafeEffect(ATTACHMENT["uncertain"])
+        def fake_abort_body(proof, repo):
+            raise UnsafeEffect("05: writer custody is unknown")
 
-        def fake_facts(name, body):
-            recorded["facts"].append((name, body))
+        def fake_abort_facts(name, body):
+            abort_recorded["facts"].append((name, body))
 
-        def fake_receipt(record):
-            recorded["receipts"].append(record)
+        def fake_abort_receipt(record):
+            abort_recorded["receipts"].append(record)
             return "/evidence/profile-outputs.diagnostic-mock.json"
 
         try:
-            globals()["run"] = fake_body
-            globals()["write_attachment_facts"] = fake_facts
-            globals()["write_diagnostic_receipt"] = fake_receipt
-            ATTACHMENT["uncertain"] = None
+            globals()["run"] = fake_abort_body
+            globals()["write_attachment_facts"] = fake_abort_facts
+            globals()["write_diagnostic_receipt"] = fake_abort_receipt
+            ATTACHMENT.update({"uncertain": None, "writers_uncertain": None})
             try:
-                diagnostic_main(device_proof, "/repo")
-                expect(False, "the uncertain detach did not fail the diagnostic run")
-            except UnsafeEffect as error:
-                expect("detach exited 2" in str(error), f"the original fault changed: {error}")
+                diagnostic_main(abort_proof, "/repo")
+                expect(False, "an infrastructure abort did not fail the diagnostic run")
+            except UnsafeEffect:
+                pass
         finally:
             (
                 globals()["run"],
                 globals()["write_attachment_facts"],
                 globals()["write_diagnostic_receipt"],
                 latch,
-            ) = originals
+            ) = abort_originals
             ATTACHMENT.clear()
             ATTACHMENT.update(latch)
-        expect(recorded["body_calls"] == 1, recorded["body_calls"])
+        expect(abort_proof.unclosed == set(), "the mock must start with no unclosed child")
+        expect(abort_proof.device_calls == [], f"closeout detached with unproven closure: {abort_proof.device_calls}")
         expect(
-            device_proof.device_calls == [["/usr/bin/hdiutil", "detach", "/fixture/owned/volume"]],
-            f"closeout retried or replaced the single device command: {device_proof.device_calls}",
+            abort_recorded["facts"] and abort_recorded["facts"][0][1].get("reaping_is_not_closure") is True,
+            f"closeout wrote {abort_recorded['facts']}",
         )
+        expect(len(abort_recorded["receipts"]) == 1, "the diagnostic receipt was not attempted")
         expect(
-            [name for name, _ in recorded["facts"]] == ["detach-unresolved.json"],
-            f"closeout wrote {recorded['facts']}",
+            abort_recorded["receipts"][0]["abort"]["kind"] == "abort",
+            abort_recorded["receipts"][0]["abort"],
         )
-        expect("device_operations_avoided" in recorded["facts"][0][1], recorded["facts"][0][1])
-        expect(len(recorded["receipts"]) == 1, "the diagnostic receipt was not attempted")
-        receipt = recorded["receipts"][0]
-        expect(receipt["abort"]["kind"] == "abort", receipt["abort"])
-        expect("detach exited 2" in receipt["abort"]["observed"], receipt["abort"]["observed"])
-        expect(receipt["collection_complete"] is False, "an aborted run claimed a complete collection")
-        expect(receipt["outcome"] == "failures_recorded", receipt["outcome"])
-        expect(receipt["qualified"] is False, receipt["qualified"])
         # 11. An oversized failure list is marked INCOMPLETE inside the bound,
         #     never silently truncated and never claimed complete.
         oversized = dict(record)
@@ -3264,21 +3394,10 @@ def run(proof: Proof, repo: str) -> None:
             # A10: the custody facts are persisted BEFORE this risky ordinary detach,
             # and the detached state is recorded after it.
             write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, "14 volume away", "detaching"))
-            detached = proof.run(["/usr/bin/hdiutil", "detach", proof.mount], timeout=60)
-            if detached.returncode != 0:
-                ATTACHMENT["uncertain"] = (
-                    "14: the ordinary detach exited "
-                    f"{detached.returncode}, so the owned volume's state is unknown"
-                )
-                # R2: the device state after a nonzero detach is UNKNOWN. This is
-                # an effect boundary, so it aborts the whole diagnostic at once
-                # (never a recoverable oracle failure, never a later case against
-                # an unknown mount) and the backing stays retained.
-                raise UnsafeEffect(
-                    "14: the ordinary detach exited "
-                    f"{detached.returncode}, so the owned volume's state is unknown: "
-                    + detached.stderr.decode(errors="replace")[-500:]
-                )
+            # The boundary latches its uncertainty BEFORE the device call (see
+            # detach_owned_image): an exceptional runner outcome cannot leave
+            # closeout free to retry the detach.
+            detach_owned_image(proof, "14 volume away")
             proof.mount = None
             write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, "14 volume away", "detached"))
             # The internal fallback slot meets an external owned link: the command
@@ -3325,8 +3444,14 @@ def run(proof: Proof, repo: str) -> None:
                 not os.path.exists(external),
                 "14: the external root is reachable while its volume is unmounted",
             )
+            # The reattach is the same kind of effect boundary: latch first, and
+            # clear only after a positive usable mount.
+            ATTACHMENT["uncertain"] = (
+                "14: the fixture image was re-attached and its result is not yet known"
+            )
             remount = attach_owned_image(proof, "fallback return attach")
             expect(remount is not None, "14: cannot re-attach the image")
+            ATTACHMENT["uncertain"] = None
             adopt(proof, fallback, "14 return adopt")
             expect_layout(fallback, {"debug": f"link:{external}", "release": f"link:{external}"})
             expect(os.path.isdir(external), "14: the external root did not return with its volume")
@@ -4092,6 +4217,15 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
                 "observed": str(error)[-2000:],
                 "unclosed": sorted(getattr(proof, "unclosed", set())),
             }
+        if DIAG.classify(error) != "oracle":
+            # An infrastructure/safety abort may have killed and reaped a direct
+            # child, which removes it from proof.unclosed without proving that
+            # its writers closed. Record that uncertainty so closeout keeps the
+            # mount and backing instead of inferring closure.
+            ATTACHMENT["writers_uncertain"] = (
+                "the diagnostic stopped with an infrastructure/abort error, so writer "
+                "closure cannot be read from reaped direct children"
+            )
     try:
         detach_owned_volume(proof, "failure" if raised is not None else "diagnostic")
     except BaseException as error:
@@ -4136,6 +4270,7 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
 
 def main() -> int:
     ATTACHMENT["uncertain"] = None
+    ATTACHMENT["writers_uncertain"] = None
     arguments = sys.argv[1:]
     if arguments == ["--plan"]:
         return plan_only()
