@@ -644,10 +644,13 @@ oxide run --execution-budget 120s
   `spawn` fails, so a child that starts after the admission deadline is
   reported truthfully as `spawn_late`, latches the admission origin and is
   stopped on the first wait iteration. It never receives a usable execution
-  window. Each wait iteration harvests the child first, then forwards a caller
-  signal, then evaluates the deadline, so a child that exited naturally in the
-  same poll is reported as that exit rather than as a controlled stop; the
-  deadline still applies to whatever the exit leaves in the group.
+  window. Each wait iteration harvests the child, forwards a caller signal,
+  then evaluates the deadline, so a child that exited naturally in the same
+  poll is reported as that exit rather than as a controlled stop; for `run`,
+  the bounded line-read slice is followed by a fresh harvest before the
+  deadline is evaluated, so a build whose output settles inside that slice
+  also keeps its natural status. The deadline still applies to whatever the
+  exit leaves in the group.
 - **Events.** `--budget-events <fd>` takes an existing, already-nonblocking,
   writable pipe write end (descriptor 3–1023). Oxide validates the type,
   access mode and flag without changing shared descriptor flags, takes a

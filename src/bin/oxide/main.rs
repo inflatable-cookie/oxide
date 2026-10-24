@@ -1082,17 +1082,13 @@ fn collect_run(
     let mut status = None;
     let mut closed = false;
     while status.is_none() || !closed {
-        // Harvest the leader first (freeze A2 item 6): a natural exit in this
-        // poll is reported as itself, never as a controlled stop. A caller
-        // signal is forwarded next, and the deadline is evaluated last, so a
-        // still-running leader or an open drain can still be stopped.
-        if status.is_none() {
-            status = group
-                .child
-                .try_wait()
-                .map_err(|error| format!("could not wait for Cargo: {error}"))?;
-        }
-        process::forward_pending(group.id);
+        // Freeze A2 item 6 order, with the drain slice first: the line read is
+        // the only wait here, and the leader is harvested immediately after it
+        // and before any latch decision. A child that exited during the slice
+        // is this iteration's natural outcome, never a controlled stop. Once
+        // the child is reaped and its stream settled, the loop ends before the
+        // deadline is even looked at; a still-running leader or an open drain
+        // can still be stopped.
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => {
                 if invocation.json_messages {
@@ -1107,9 +1103,16 @@ fn collect_run(
             Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+        if status.is_none() {
+            status = group
+                .child
+                .try_wait()
+                .map_err(|error| format!("could not wait for Cargo: {error}"))?;
+        }
+        process::forward_pending(group.id);
         if status.is_some() && closed {
-            // The child exited and its stream settled in the same iteration:
-            // nothing is left that a deadline could stop.
+            // The child exited and its stream settled in this iteration:
+            // nothing is left that a deadline could stop or a signal could end.
             break;
         }
         if budget_stop.poll(group.id) {
@@ -2268,5 +2271,54 @@ mod tests {
                 assert_eq!(profile.get(name), set(value).as_ref(), "{name}");
             }
         }
+    }
+
+    fn budget_invocation() -> Invocation {
+        Invocation {
+            command: "run".to_owned(),
+            profile: Profile::Quick,
+            cargo_args: Vec::new(),
+            program_args: Vec::new(),
+            json_messages: false,
+            manifest_path: None,
+            target: None,
+            tool: Vec::new(),
+            budget: budget::Options::default(),
+            package: None,
+        }
+    }
+
+    #[test]
+    fn collect_run_reports_a_natural_exit_that_lands_inside_the_drain_slice() {
+        budget::clear();
+        budget::install(budget::Options {
+            admission: None,
+            execution: Some(Duration::from_millis(1)),
+            events: None,
+        })
+        .expect("a budget clock");
+        budget::arm_execution(Instant::now(), budget::Phase::PrimaryCargo);
+        std::thread::sleep(Duration::from_millis(10));
+        // The deadline is already due when the drain starts. The child exits
+        // during the first bounded line-read slice, so only a harvest taken
+        // after that slice (and before any latch) can see the natural exit.
+        // Under an overloaded machine the child may not have exited by then;
+        // the product is then entitled to stop it, so the regression asserts
+        // the invariant exactly where it is observable: a natural exit status
+        // observed with a settled stream must not carry a latched deadline.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]).stdout(Stdio::piped());
+        let mut group = process::start_group(&mut command).expect("a child");
+        let mut stop = process::Stop::new();
+        let (status, _target, drained) =
+            collect_run(&mut group, &budget_invocation(), None, &mut stop).expect("a result");
+        if status.and_then(|status| status.code()) == Some(0) && drained {
+            assert_eq!(
+                budget::origin(),
+                None,
+                "a natural exit observed after the slice must not become a 125 stop"
+            );
+        }
+        budget::clear();
     }
 }
