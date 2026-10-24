@@ -213,6 +213,10 @@ fails, Oxide reports that the wait duration is unavailable.
   a missing `Cargo.lock` and similar routes; it reports `ran`,
   `skipped` or `failed`. Do not delete files in the Cargo home or a slot by
   hand.
+- Oxide finds its config, pool and Builds drive from your account's home
+  directory, not `HOME`, so a temporary `HOME` still uses the shared pool
+  (with a one-line notice). To isolate on purpose, set `OXIDE_POOL` or
+  `OXIDE_CONFIG`.
 - `OXIDE_POOL_CAP` sets the cap only when a pool is first created.
 - Use `oxide clean`, never plain `cargo clean`. `oxide clean` waits for active
   commands in this checkout, removes its private output and slot affinity, and

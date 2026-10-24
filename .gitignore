@@ -1,2 +1,3 @@
 /target
 /.oxide-outputs/
+__pycache__/
