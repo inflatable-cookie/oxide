@@ -181,6 +181,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
+  - the machine pool and drive resolved from the account, not `$HOME`, so a
+    harness that overrides HOME cannot bypass them; isolation is explicit;
   - cold-slot seeding from matching units, conservative first, with
     one-use temp workspaces handled as seeded, first-evicted slots;
   - per-slot test scratch;
