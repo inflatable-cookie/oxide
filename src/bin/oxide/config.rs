@@ -454,7 +454,7 @@ impl Facts {
         ]
         .into_iter()
         .map(Path::new)
-        .find(|probe| self.home.as_deref() != Some(probe.as_os_str()))
+        .find(|probe| self.home.as_deref().map(Path::new) != Some(*probe))
         .unwrap_or(Path::new("/"));
         matches!(
             (self.root_from(RootKind::Cache, None), self.root_from(RootKind::Cache, Some(probe))),
@@ -1520,16 +1520,21 @@ mod tests {
             environment.with_xdg_cache_home(Some(PathBuf::from("/home/user/.cache")))
         });
         let same = settings(&linux).expect("settings");
-        let mut probe_home = at_home(false, Some("/oxide-home-provenance-probe-a"));
-        probe_home.home_source = HomeSource::Account;
-        probe_home.env_home = Some(OsString::from("/private/tmp/harness-home"));
-        assert!(
-            settings(&probe_home)
-                .expect("settings")
-                .home_notice
-                .is_some(),
-            "a home equal to the first probe still moves the root"
-        );
+        for captured in [
+            "/oxide-home-provenance-probe-a",
+            "/oxide-home-provenance-probe-a/",
+        ] {
+            let mut probe_home = at_home(false, Some(captured));
+            probe_home.home_source = HomeSource::Account;
+            probe_home.env_home = Some(OsString::from("/private/tmp/harness-home"));
+            assert!(
+                settings(&probe_home)
+                    .expect("settings")
+                    .home_notice
+                    .is_some(),
+                "a home equivalent to the first probe ({captured}) still moves the root"
+            );
+        }
         assert_eq!(same.pool, Path::new("/home/user/.cache/oxide/build-pool"));
         assert_eq!(
             same.home_notice, None,
