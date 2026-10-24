@@ -2056,6 +2056,19 @@ def run(proof: Proof, repo: str) -> None:
     # ----- case 05: an unknown target refuses only when linked ------------
     case_reached("05")
     unknown = make_checkout(proof, "unknown-target")
+    # A11 / case05 cause: the "unlinked" premise must be POSITIVE. Automatic
+    # first conversion (oxide#121, outputs::auto_adopts) adopts a checkout
+    # whose target is positively ABSENT under a usable permanent registration,
+    # and it keeps that conversion even when Cargo then rejects the JSON spec
+    # below. A real target directory is not eligible, so this checkout stays
+    # unconverted and the absent-receipt oracle actually says something about
+    # the unlinked path instead of about a conversion the product was right to
+    # make.
+    os.makedirs(os.path.join(unknown, "target"))
+    expect(
+        not os.path.exists(receipt_file(pool, unknown)),
+        "05: the unlinked unknown-target fixture already has an output receipt",
+    )
     code, _, stderr = oxide(proof, ["build", "--target", "targets/spec.json"], "05 unlinked", unknown)
     expect("not a plain triple" not in stderr, f"05: unlinked checkout refused a JSON target: {stderr}")
     expect(
