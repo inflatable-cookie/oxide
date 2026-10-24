@@ -227,8 +227,9 @@ def stage_subject(root: str) -> str:
     os.chmod(subject, 0o755)
     shutil.rmtree(stage)
     os.unlink(log)
-    # The installer's hidden probe must report this build's own versions; a
-    # future bump then fails this proof loudly instead of mis-testing it.
+    # The installer's hidden probe must report this build's own versions and
+    # its compiled proof controls (debug staging); a future bump then fails
+    # this proof loudly instead of mis-testing it.
     probe = subprocess.run(
         [subject, CAPABILITIES_PROBE],
         capture_output=True,
@@ -237,7 +238,8 @@ def stage_subject(root: str) -> str:
     )
     expect(probe.returncode == 0, f"capability probe exit {probe.returncode}: {probe.stderr!r}")
     expect(
-        json.loads(probe.stdout) == {"control_state_version": STATE_VERSION, "registration_version": REGISTRATION_VERSION},
+        json.loads(probe.stdout)
+        == {"control_state_version": STATE_VERSION, "registration_version": REGISTRATION_VERSION, "test_controls": True},
         f"capability probe {probe.stdout!r} disagrees with this proof's versions",
     )
     return subject

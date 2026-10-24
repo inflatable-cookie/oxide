@@ -1592,9 +1592,7 @@ fn print_settings(settings: &config::Settings) {
         },
         if file.present { "" } else { ", absent" }
     );
-    if let Some(notice) = &settings.home_notice {
-        println!("  home: {notice}");
-    }
+    println!("  home: {}", settings.home_line);
     if let Some(ignored) = &settings.ignored_legacy_config {
         println!(
             "  ignored: {} exists but is never read on macOS; move its settings to the file above",

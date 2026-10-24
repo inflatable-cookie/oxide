@@ -2534,29 +2534,47 @@ oxide#102.
   their roots; each replaces only what it names, so none alone is complete
   isolation. A failed lookup, or an empty
   or relative passwd home, refuses as a missing home did; Oxide never falls
-  back to `$HOME`. When `HOME` differs from the account home and neither the
-  pool nor the config file is explicit, a leased command prints one notice and
-  `status` shows it on a `home:` line. Cargo's own `CARGO_HOME` default still
-  follows `$HOME`. Explicit pool and config settings choose the pool and
-  config file; `status` still reads the account's state root (known pools,
-  the legacy default pool and previous registrations), read-only. Debug builds
-  alone honour two proof controls, which release and installed builds ignore:
-  `OXIDE_TEST_HOME_FROM_ENV=1` restores `$HOME` as the home input (every proof
-  script that sets a private `HOME` sets it), and `OXIDE_TEST_ACCOUNT_HOME`
-  stands in a controlled account home (a canonical, real directory strictly
-  inside `OXIDE_TASK_SCRATCH_ROOT`; anything else refuses), or `!unavailable`
-  for an injected lookup failure. Setting both controls refuses. A proof
-  checks its staged artifact reports `test_controls: true` before any
-  storage-reading call. A release-profile artifact built with debug
-  assertions forced on would carry them, so the build-capabilities probe
-  reports `test_controls`, the installer refuses `true` or a missing answer,
-  and a build without the controls refuses (rather than ignores) either
-  variable. `effigy rust:everyday-cli` proves the account
-  default, the notice, explicit `OXIDE_POOL` precedence and the refusal
-  through the second control, with nothing created under the overridden
-  `HOME`. `scripts/test-oxide-cli.py` (its active `clean-safety` and
-  `launch-check` modes) already ran under the operator's real `HOME`, so its
-  resolution is unchanged.
+  back to `$HOME`; the lookup runs once per invocation and its failure
+  surfaces only where a home is needed. `status` always prints a `home:` line
+  naming the home and its source (passwd entry, proof control or
+  unavailable) and, when it differs, `HOME`. When `HOME` differs from the
+  account home and the pool or the config file came from that home, a leased
+  command or `status` prints one stderr notice naming the pool and config
+  with their provenance; explicit `OXIDE_POOL` and `OXIDE_CONFIG` together
+  silence it. Paths in both lines are escaped and bounded. Cargo's own
+  `CARGO_HOME` default still follows `$HOME`. Explicit pool and config
+  settings choose the pool and config file; `status` still reads the
+  account's state root (known pools, the legacy default pool and previous
+  registrations), read-only.
+- **Proof controls for the home.** Debug builds alone honour two controls:
+  `OXIDE_TEST_HOME_FROM_ENV`, which must be exactly `1`, restores `$HOME` as
+  the home input (every proof script that sets a private `HOME` sets it), and
+  `OXIDE_TEST_ACCOUNT_HOME` stands in a controlled account home or, as
+  `!unavailable`, an injected lookup failure. The account control works only
+  inside the qualified supervisor's own layout: a canonical
+  `OXIDE_TASK_SCRATCH_ROOT` at `<oxide-proof.*>/scratch`, `OXIDE_PROOF_EVIDENCE`
+  at its sibling `evidence` and a numeric `OXIDE_PROOF_DEADLINE_NS`; the
+  stand-in must be a canonical, real directory strictly inside that scratch.
+  An adopted scratch root does not qualify. A malformed value, both controls
+  together or either control in a build without them refuses before any
+  configuration is read, explicit `OXIDE_POOL` and `OXIDE_CONFIG` included;
+  release and installed builds refuse rather than ignore them. The
+  build-capabilities probe reports `test_controls`, the installer refuses
+  `true` or a missing answer, and each proof stager that relies on the
+  controls checks `test_controls: true` before any case runs
+  (`test-everyday-cli.py`, `test-oxide-cli.py`'s debug stager and
+  `test-installed-handoff.py`'s, which `test-outputs-prune.py` reuses); other
+  debug stagers rely on the fail-closed refusal. `scripts/test-oxide-cli.py`
+  gives its runner and `clean-safety` a private `HOME` with the first control,
+  removes inherited `OXIDE_CONFIG`, `OXIDE_POOL`, `OXIDE_TEST_*` and `XDG_*`,
+  keeps the invoking `RUSTUP_HOME` and sets `RUSTUP_AUTO_INSTALL=0`.
+  `effigy rust:everyday-cli` proves, through the account control, the
+  account default with its `home:` line and notice, a planted account config
+  choosing pool and budget, a planted permanent registration in the
+  account-selected pool staying selected under a changed and a matching
+  `HOME`, explicit `OXIDE_POOL` and `OXIDE_CONFIG` precedence, the
+  supervisor-context, malformed, mixed and `!unavailable` refusals, and
+  nothing created under the overridden `HOME`.
   **Proof.** Unit tests pin literal former paths for both platforms
   (Unicode and spaces), demanded and unused relative XDG, overrides without
   `HOME` and missing facts with injected facts; they do not prove native
