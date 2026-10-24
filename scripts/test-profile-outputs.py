@@ -1399,6 +1399,92 @@ def member_payload_state(root: str, member: str) -> tuple:
     return ("dir", info.st_dev, info.st_ino, tuple(entries), newest)
 
 
+ASSERTION_RECEIPT_BYTES = 64 * 1024
+CASE_IDS = [f"{index:02d}" for index in range(1, 21)]
+_CASE_PROGRESS = {"reached": [], "started_ms": None}
+
+
+def case_reached(case_id: str) -> None:
+    """Record that one fixed case block has started, in execution order."""
+    reached = _CASE_PROGRESS["reached"]
+    if case_id not in reached:
+        reached.append(case_id)
+    if _CASE_PROGRESS["started_ms"] is None:
+        _CASE_PROGRESS["started_ms"] = time.time_ns() // 1_000_000
+
+
+def write_assertion_receipt(outcome: str, failure) -> str:
+    """Write ONE uniquely named bounded assertion/source receipt beside the
+    guard receipt in the runner's kept evidence root.
+
+    It records only what this script itself knows: the source/script/helper
+    hashes it ran, the cases it actually reached, and the primary failure. It
+    makes NO closure, census, gate or native-PASS claim, and it never
+    reconstructs an earlier run. Exclusive creation, at most 64 KiB."""
+    evidence = evidence_root()
+    expect(
+        bool(evidence) and os.path.isdir(evidence),
+        f"no kept evidence root for the assertion receipt: {evidence!r}",
+    )
+    reached = list(_CASE_PROGRESS["reached"])
+    if outcome == "pass":
+        # The case blocks run in the script's own order, which is not the plan
+        # order (the base-created migration controls come first), so the fixed
+        # set is compared as a set and the execution order is kept in the
+        # record exactly as it happened.
+        expect(
+            sorted(reached) == CASE_IDS,
+            f"the proof finished without running every fixed case: reached {reached}",
+        )
+        completed, failed_in, unexecuted = reached, None, []
+    else:
+        # Conservative on failure: the last reached case is reported as
+        # started-but-unconfirmed, never as completed.
+        completed = reached[:-1]
+        failed_in = reached[-1] if reached else None
+        unexecuted = [case for case in CASE_IDS if case not in reached]
+    record = {
+        "version": "oxide.outputs.proof-assertions/1",
+        "outcome": outcome,
+        "primary_failure": None if failure is None else str(failure)[-2000:],
+        "started_ms": _CASE_PROGRESS["started_ms"],
+        "finished_ms": time.time_ns() // 1_000_000,
+        "source": os.environ.get("OXIDE_PROFILE_HEAD", "unbound"),
+        "script": {
+            "path": "scripts/test-profile-outputs.py",
+            "sha256": perm.sha256_file(os.path.abspath(__file__)),
+        },
+        "helpers": {
+            "scripts/test-oxide-pool-layout.py": perm.sha256_file(
+                os.path.join(HERE, "test-oxide-pool-layout.py")
+            ),
+            "scripts/test-permanent-outputs.py": perm.sha256_file(
+                os.path.join(HERE, "test-permanent-outputs.py")
+            ),
+        },
+        "cases": {
+            "total": len(CASE_IDS),
+            "reached": reached,
+            "completed": completed,
+            "failed_in": failed_in,
+            "unexecuted": unexecuted,
+        },
+        "claims": "this script's own case progress and source hashes only; no closure, census, gate or native PASS claim",
+    }
+    payload = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode()
+    if len(payload) > ASSERTION_RECEIPT_BYTES:
+        raise RuntimeError(
+            f"the assertion receipt would exceed {ASSERTION_RECEIPT_BYTES} bytes"
+        )
+    name = f"profile-outputs.assertions-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.json"
+    path = os.path.join(evidence, name)
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write(payload.decode())
+        handle.flush()
+        os.fsync(handle.fileno())
+    return path
+
+
 def selected_backend_slots(proof: Proof, pool: str, label: str) -> str:
     """The ACTUAL selected removable backend's slot root, derived from the
     fixture registration rather than an assumed path: the registered volume's
@@ -1531,6 +1617,7 @@ def run(proof: Proof, repo: str) -> None:
     base_receipt_bytes = perm.read_bytes(perm.receipt_path(pool, legacy))
     base_link_text = link_at(os.path.join(legacy, "target"))
     # ----- case 11: explicit migration of a base-created checkout ---------
+    case_reached("11")
     # The base binary can create its committed whole-target /2 state only
     # before any candidate command runs in this pool, so this base state is
     # prepared under the SAME base-compatible registration as case 10's, and
@@ -1767,6 +1854,7 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(top, {"debug": f"link:{root_of(pool, top)}"})
 
     # ----- case 01: a real target with a debug member link -----------------
+    case_reached("01")
     first = make_checkout(proof, "first")
     # A real EMPTY target selects the explicit profile adopt: an absent target
     # would let the automatic whole-target first conversion run, and building
@@ -1819,6 +1907,7 @@ def run(proof: Proof, repo: str) -> None:
     )
 
     # ----- case 02: a member mutation waits for a gated writer ------------
+    case_reached("02")
     gate = os.path.join(proof.root, "gate2")
     os.makedirs(gate)
     env = {**proof.env, "OXIDE_PROFILE_GATE": gate}
@@ -1840,6 +1929,7 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
 
     # ----- case 03: test / bench / bench debug / doc mapping --------------
+    case_reached("03")
     # A3: the mapping is decided by MEMBER-identifying product facts -- the
     # member set the product reports and the member payload it actually writes
     # -- never by an exit code, and never by cross-recipe slot equality. A
@@ -1941,10 +2031,20 @@ def run(proof: Proof, repo: str) -> None:
     expect(not os.path.islink(os.path.join(first, "target", "doc")), "03: target/doc is a link")
     for member in ("debug", "release"):
         expect_layout(first, {member: f"link:{root}"})
-    # test and doc ran through the debug member; bench through release.
-    expect(os.path.exists(os.path.join(root, "release", "deps")), "03: no release member payload")
+    # Cargo's intermediates live in the leased slot's profile build directory
+    # (for example <slot>/quick-6/build/release/deps), never in
+    # oxide-outputs/<root>/<member>, so no deps path is asserted here. The
+    # member mapping is proved above by the product's member report, the payload
+    # facts and the untouched-opposite-member controls; all this adds is that
+    # the release member payload root is a real directory once plain bench has
+    # written it.
+    expect(
+        os.path.isdir(os.path.join(root, "release")),
+        "03: the release member payload root is not a real directory",
+    )
 
     # ----- case 04: a host --target member --------------------------------
+    case_reached("04")
     host = proof.run(["rustc", "-vV"], cwd=first, env=proof.env, timeout=30).stdout.decode()
     triple = next(line.split(": ", 1)[1] for line in host.splitlines() if line.startswith("host: "))
     code, _, stderr = oxide(proof, ["build", "--target", triple], "04 host target", first)
@@ -1954,6 +2054,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(f"{triple}/debug" in {entry["member"] for entry in report["members"]}, "04: plan misses the triple member")
 
     # ----- case 05: an unknown target refuses only when linked ------------
+    case_reached("05")
     unknown = make_checkout(proof, "unknown-target")
     code, _, stderr = oxide(proof, ["build", "--target", "targets/spec.json"], "05 unlinked", unknown)
     expect("not a plain triple" not in stderr, f"05: unlinked checkout refused a JSON target: {stderr}")
@@ -2008,6 +2109,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(code != 0 and "not a command whose profile outputs Oxide models" in stderr, f"05: linked external command was not refused: {stderr}")
     expect(not os.path.exists(external_marker), "05: the external tool ran in a linked checkout")
     # ----- case 06: opaque custom-profile refusal -------------------------
+    case_reached("06")
     code, _, stderr = oxide(proof, ["build", "--profile", "custom"], "06 modelled custom", first)
     expect(code != 0 and "not an Oxide profile" in stderr, f"06: modelled custom profile was not refused: {stderr}")
     # Case 05's unlinked run wrote the marker; clear it first so this absence
@@ -2050,6 +2152,7 @@ def run(proof: Proof, repo: str) -> None:
     )
 
     # ----- case 07: exec declarations -------------------------------------
+    case_reached("07")
     script = os.path.join(first, "declared.sh")
     exec_argv = os.path.join(proof.root, "exec-argv")
     with open(script, "w", encoding="utf-8") as handle:
@@ -2094,6 +2197,7 @@ def run(proof: Proof, repo: str) -> None:
     )
 
     # ----- case 08: real nonempty kept, empty converted -------------------
+    case_reached("08")
     mixed = make_checkout(proof, "mixed")
     # A real NONEMPTY release member must be kept; debug is absent, so the
     # explicit adopt links it. No build runs before adoption: a pre-build would
@@ -2136,12 +2240,14 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(other, {"debug": f"link:{root_of(pool, other)}", "release": f"link:{root_of(pool, other)}"})
 
     # ----- case 09: container-style preflight sees a real target ----------
+    case_reached("09")
     expect(is_real_dir(os.path.join(first, "target")), "09: target is not a real directory for a container preflight")
     env = {**proof.env, "CARGO_TARGET_DIR": os.path.join(first, "target")}
     result = proof.run(["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=first, env=env, timeout=60)
     expect(result.returncode == 0, "09: metadata through the real target failed")
 
     # ----- case 10: legacy whole-target state stays unchanged under state 4 ---
+    case_reached("10")
     # The pool now carries the successor fence (case 11); the base-produced /2
     # checkout must still build warm with the same slot, key, receipt and link.
     expect(fence_in(pool) == STATE4_FENCE, f"10: the pool is not state 4: {fence_in(pool)}")
@@ -2155,6 +2261,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the legacy receipt was rewritten")
 
     # ----- case 12: P0-P4 replay, races and exact rollback ----------------
+    case_reached("12")
     # A crash at every pre-commit phase replays to the committed profile
     # layout; a rollback at the staged and marker boundaries restores the
     # exact published /2 state.
@@ -2330,6 +2437,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(receipt(pool, rollback)["version"] == "oxide.outputs.transition/3", "12: committed migration changed format")
 
     # ----- case 13: an active writer blocks migration ---------------------
+    case_reached("13")
     blocked = make_checkout(proof, "blocked")
     auto_legacy(proof, blocked)
     gate = os.path.join(proof.root, "gate13")
@@ -2355,6 +2463,7 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(blocked, {"debug": f"link:{root_of(pool, blocked)}"})
 
     # ----- case 14: per-member fallback and return ------------------------
+    case_reached("14")
     fallback = make_checkout(proof, "fallback")
     code, _, _ = oxide(proof, ["build"], "14 prebuild", fallback)
     expect(code == 0, "14: prebuild failed")
@@ -2428,6 +2537,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(volume.get("VolumeUUID") == registration["volume_uuid"], "14: the mounted volume UUID changed")
 
     # ----- case 15: detach and re-adopt ----------------------------------
+    case_reached("15")
     code, _, stderr = oxide(proof, ["outputs", "detach"], "15 detach", first)
     expect(code == 0, f"15: detach failed: {stderr}")
     expect_layout(first, {"debug": "real", "release": "real"})
@@ -2450,6 +2560,7 @@ def run(proof: Proof, repo: str) -> None:
     )
 
     # ----- case 16: whole and selected clean keep links and markers -------
+    case_reached("16")
     # The known fixture top-level file is a foreign entry for a whole clean:
     # prove the refusal names it, then remove it and prove clean succeeds.
     top_control = os.path.join(top, "target", "oxide-proof-top-level-control")
@@ -2559,6 +2670,7 @@ def run(proof: Proof, repo: str) -> None:
         handle.write(b"release")
 
     # ----- case 17: refusals ---------------------------------------------
+    case_reached("17")
     malformed = make_checkout(proof, "malformed")
     code, _, _ = oxide(proof, ["build"], "17 prebuild", malformed)
     adopt(proof, malformed, "17 adopt")
@@ -2634,6 +2746,7 @@ def run(proof: Proof, repo: str) -> None:
     os.chmod(state_path, 0o600)
 
     # ----- case 18: real and linked placements key different cold slots ----
+    case_reached("18")
     # A real NONEMPTY debug directory is kept real, so the first keyed build
     # uses real:debug. The operator then removes that real directory (Oxide
     # never moves it) and adopts again: the same member becomes a link, so the
@@ -2700,6 +2813,7 @@ def run(proof: Proof, repo: str) -> None:
     )
 
     # ----- case 19: the staged state-3 binary refuses state 4 -------------
+    case_reached("19")
     snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
     receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
     slots_dir = selected_backend_slots(proof, pool, "19")
@@ -2745,6 +2859,7 @@ def run(proof: Proof, repo: str) -> None:
         )
 
     # ----- case 20: root-group prune keeps another checkout's reference ---
+    case_reached("20")
     group = make_checkout(proof, "group")
     code, _, _ = oxide(proof, ["build"], "20 prebuild", group)
     adopt(proof, group, "20 adopt")
@@ -3147,14 +3262,29 @@ def main() -> int:
     proof = Proof(root)
     try:
         run(proof, repo)
-    except BaseException:
+    except BaseException as error:
         try:
             detach_owned_volume(proof, "failure")
-        except BaseException as error:
-            print(f"ordinary detach after failure also failed: {error!r}", file=sys.stderr)
+        except BaseException as detach_error:
+            print(
+                f"ordinary detach after failure also failed: {detach_error!r}",
+                file=sys.stderr,
+            )
+        try:
+            write_assertion_receipt("fail", error)
+        except BaseException as receipt_error:
+            # A secondary failure never hides or replaces the primary one.
+            print(
+                f"the assertion receipt could not be written ({receipt_error!r}); "
+                "the primary failure above stands",
+                file=sys.stderr,
+                flush=True,
+            )
         raise
     detach_owned_volume(proof, "success")
-    print("profile-outputs proof: 20 cases held", flush=True)
+    # On success a missing or failed assertion receipt FAILS the proof.
+    receipt = write_assertion_receipt("pass", None)
+    print(f"profile-outputs proof: 20 cases held; assertion receipt {receipt}", flush=True)
     return 0
 
 
