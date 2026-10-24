@@ -333,6 +333,7 @@ class Fixture:
     def env(self, binary: str) -> dict:
         return {
             "HOME": self.home,
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "OXIDE_POOL": self.pool,
             "CARGO_HOME": self.cargo_home,
             "PATH": ":".join(

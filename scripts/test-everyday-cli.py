@@ -122,6 +122,7 @@ def environment(root: str) -> dict:
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.path.join(root, "home"),
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
         "CARGO_HOME": os.path.join(root, "cargo-home"),
         "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", os.path.join(real_home, ".rustup")),
         "RUSTUP_TOOLCHAIN": BUILDER,
@@ -278,7 +279,7 @@ def provenance(proof: Proof, stamp: tuple, unstamped: str, root: str) -> None:
     home, destination, receipt_path = install(stamp, proof.stamped, root)
     fake = fake_cargo(proof, "provenance")
     log = os.path.join(work, "cargo.log")
-    env = {**ENV, "HOME": home, "PATH": fake + os.pathsep + ENV["PATH"], "FAKE_CARGO_LOG": log}
+    env = {**ENV, "OXIDE_TEST_HOME_FROM_ENV": "1", "HOME": home, "PATH": fake + os.pathsep + ENV["PATH"], "FAKE_CARGO_LOG": log}
     code, out, _ = run(proof, destination, ["--version"], work, env)
     receipt_digest = digest(receipt_path)
     pin, instance = stamp

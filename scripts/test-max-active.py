@@ -168,6 +168,7 @@ def clear_owned_environment() -> dict[str, str]:
     env.update(
         {
             "HOME": home,
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "CARGO_HOME": cargo_home,
             "RUSTUP_HOME": real_rustup,
             "RUSTUP_TOOLCHAIN": BUILDER,

@@ -162,6 +162,7 @@ def private_environment(proof: Proof) -> dict:
     env.update(
         {
             "HOME": os.path.join(proof.root, "home"),
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "CARGO_HOME": os.path.join(proof.root, "cargo-home"),
             "RUSTUP_HOME": rustup,
             "OXIDE_POOL": os.path.join(proof.root, "pool"),

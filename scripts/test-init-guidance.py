@@ -99,6 +99,7 @@ def environment(root: str) -> dict:
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.path.join(root, "home"),
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
         "CARGO_HOME": os.path.join(root, "cargo-home"),
         "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", os.path.join(real_home, ".rustup")),
         "RUSTUP_TOOLCHAIN": BUILDER,

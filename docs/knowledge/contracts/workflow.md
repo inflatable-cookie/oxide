@@ -2523,6 +2523,22 @@ oxide#102.
   adopted.
   Oxide keeps its own file names beneath the roots and its own TOML parsing
   and overrides; it uses no Longhorn config store or layout digest.
+- **The home is the account's, not `$HOME`.** Every home-derived input
+  above (the storage roots, `~` in config paths and the ignored macOS legacy
+  config) uses the account's passwd home directory
+  (`getpwuid_r(geteuid())`), not the `HOME` variable. A test harness or
+  wrapper that overrides `HOME` therefore still gets the machine's config,
+  pool and Builds-drive registration; it cannot fall into a fresh private pool
+  by accident. Isolation is explicit: `OXIDE_POOL`, `OXIDE_CONFIG` and
+  absolute `XDG_*` values keep their precedence. A failed lookup, or an empty
+  or relative passwd home, refuses as a missing home did; Oxide never falls
+  back to `$HOME`. When `HOME` differs from the account home and neither the
+  pool nor the config file is explicit, a leased command prints one notice and
+  `status` shows it on a `home:` line. Cargo's own `CARGO_HOME` default still
+  follows `$HOME`. Debug builds alone honour `OXIDE_TEST_HOME_FROM_ENV=1`,
+  which restores `$HOME` as the home input for Oxide's proof scripts; release
+  and installed builds ignore it. Every proof script that sets a private
+  `HOME` sets it.
   **Proof.** Unit tests pin literal former paths for both platforms
   (Unicode and spaces), demanded and unused relative XDG, overrides without
   `HOME` and missing facts with injected facts; they do not prove native

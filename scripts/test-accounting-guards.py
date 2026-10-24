@@ -416,6 +416,7 @@ def fixture_env(root: str, pool: str) -> dict:
     home = private_dir(os.path.join(root, "home"))
     env = {
         "HOME": home,
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
         "TMPDIR": root,
         "TMP": root,
         "TEMP": root,

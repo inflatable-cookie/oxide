@@ -1258,7 +1258,14 @@ pub fn parse_cap(value: &str, _backend: Backend) -> Result<u64, String> {
 /// The effective settings: environment, then config file, then defaults.
 pub fn settings() -> Result<Settings, String> {
     refuse_retired_backend_request()?;
-    config::settings(&Facts::from_env())
+    let settings = config::settings(&Facts::from_env())?;
+    static NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(notice) = &settings.home_notice {
+        if !NOTICED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("oxide: {notice}");
+        }
+    }
+    Ok(settings)
 }
 
 /// The soft budget for the next admission. Debug builds accept

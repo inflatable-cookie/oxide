@@ -15,9 +15,9 @@
 //! directory variable.
 
 use longhorn_storage_layout::{
-    native_platform_directory_fact, native_platform_directory_fact_from, resolve_storage_root,
-    PlatformDirectoryFact, PlatformEnvironment, RootKind, StorageIdentity, StorageLayoutError,
-    StorageLayoutRequest, TargetPlatform,
+    native_platform_directory_fact_from, resolve_storage_root, PlatformDirectoryFact,
+    PlatformEnvironment, RootKind, StorageIdentity, StorageLayoutError, StorageLayoutRequest,
+    TargetPlatform,
 };
 use serde::Deserialize;
 use std::ffi::OsString;
@@ -45,14 +45,101 @@ const MAX_KNOWN_POOLS_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub macos: bool,
-    /// For `~` in config paths and the ignored macOS legacy config.
+    /// The home every Oxide storage root, `~` in config paths and the ignored
+    /// macOS legacy config derive from: the account's home directory, never
+    /// `$HOME` (a harness that overrides HOME still gets the machine pool).
     pub home: Option<OsString>,
+    /// `$HOME` as the process saw it, only for the status notice.
+    pub env_home: Option<OsString>,
+    /// Why `home` holds what it does.
+    pub home_source: HomeSource,
     pub directories: Directories,
     pub oxide_config: Option<OsString>,
     pub oxide_pool: Option<OsString>,
     pub oxide_pool_cap: Option<OsString>,
     pub oxide_max_active: Option<OsString>,
     pub physical_cores: PhysicalCoreCount,
+}
+
+/// Where the home fact came from.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum HomeSource {
+    /// Injected by a unit test.
+    #[default]
+    Injected,
+    /// The account's passwd entry (`getpwuid_r(geteuid())`).
+    Account,
+    /// `$HOME`, through the debug-build-only proof control.
+    TestEnvironment,
+    /// The account lookup failed; nothing derives from a home.
+    Unavailable(String),
+}
+
+/// The debug-build-only proof control that restores `$HOME` as the home
+/// input. Release builds never read it.
+pub const TEST_HOME_FROM_ENV: &str = "OXIDE_TEST_HOME_FROM_ENV";
+
+/// The account's home directory from its passwd entry: absolute, non-empty,
+/// or an error. Never `$HOME`.
+pub fn account_home() -> Result<OsString, String> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let uid = unsafe { libc::geteuid() };
+    let mut size = 1024usize;
+    loop {
+        let mut buffer = vec![0 as libc::c_char; size];
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer refers to live, correctly sized storage owned here.
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE && size < 1 << 20 {
+            size *= 4;
+            continue;
+        }
+        if code != 0 {
+            return Err(format!(
+                "the account home directory is unavailable (getpwuid_r: {})",
+                std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        if result.is_null() || entry.pw_dir.is_null() {
+            return Err(format!(
+                "the account home directory is unavailable (no passwd entry for uid {uid})"
+            ));
+        }
+        // SAFETY: getpwuid_r succeeded, so pw_dir is a NUL-terminated string in `buffer`.
+        let bytes = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes();
+        let home = std::ffi::OsStr::from_bytes(bytes).to_owned();
+        if bytes.is_empty() || !Path::new(&home).is_absolute() {
+            return Err(
+                "the account home directory is unavailable (empty or relative passwd home)"
+                    .to_owned(),
+            );
+        }
+        return Ok(home);
+    }
+}
+
+/// The home input and its source: the account home, or in a debug build
+/// `$HOME` when the proof control is exactly `1`.
+fn resolve_home(env_home: Option<OsString>) -> (Option<OsString>, HomeSource) {
+    if cfg!(debug_assertions)
+        && std::env::var_os(TEST_HOME_FROM_ENV).is_some_and(|value| value == "1")
+    {
+        return (env_home, HomeSource::TestEnvironment);
+    }
+    match account_home() {
+        Ok(home) => (Some(home), HomeSource::Account),
+        Err(error) => (None, HomeSource::Unavailable(error)),
+    }
 }
 
 /// Where platform directory facts come from.
@@ -106,9 +193,13 @@ impl ActiveBuildLimit {
 impl Facts {
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+        let env_home = var("HOME");
+        let (home, home_source) = resolve_home(env_home.clone());
         Self {
             macos: cfg!(target_os = "macos"),
-            home: var("HOME"),
+            home,
+            env_home,
+            home_source,
             directories: Directories::Process,
             oxide_config: var("OXIDE_CONFIG"),
             oxide_pool: var("OXIDE_POOL"),
@@ -123,12 +214,41 @@ impl Facts {
             .home
             .as_ref()
             .map(PathBuf::from)
-            .ok_or("HOME is unset; set OXIDE_CONFIG and OXIDE_POOL explicitly")?;
+            .ok_or_else(|| self.missing_home())?;
         if home.is_absolute() {
             Ok(home)
         } else {
-            Err("HOME is not an absolute path".to_owned())
+            Err("the home directory is not an absolute path".to_owned())
         }
+    }
+
+    fn missing_home(&self) -> String {
+        match &self.home_source {
+            HomeSource::Unavailable(reason) => {
+                format!("{reason}; set OXIDE_CONFIG and OXIDE_POOL explicitly")
+            }
+            _ => "HOME is unset; set OXIDE_CONFIG and OXIDE_POOL explicitly".to_owned(),
+        }
+    }
+
+    /// A one-line notice when `$HOME` differs from the account home the pool
+    /// and config were resolved from, or `None`.
+    pub fn home_notice(&self) -> Option<String> {
+        if self.home_source != HomeSource::Account {
+            return None;
+        }
+        let (home, env_home) = (self.home.as_ref()?, self.env_home.as_ref());
+        if env_home.is_some_and(|env_home| env_home == home) {
+            return None;
+        }
+        let shown = env_home.map_or_else(
+            || "unset".to_owned(),
+            |value| Path::new(value).display().to_string(),
+        );
+        Some(format!(
+            "HOME is {shown}; Oxide's pool and config use the account home {} (set OXIDE_POOL or OXIDE_CONFIG to isolate)",
+            Path::new(home).display()
+        ))
     }
 
     /// One platform-native root under the `oxide` leaf. Only this root's
@@ -147,7 +267,12 @@ impl Facts {
                 return Err("no Oxide storage-root policy for this platform".to_owned());
             }
             Directories::Process => {
-                native_platform_directory_fact(fact).map_err(|error| error.to_string())?
+                let platform = if cfg!(target_os = "macos") {
+                    TargetPlatform::MacOs
+                } else {
+                    TargetPlatform::Linux
+                };
+                native_platform_directory_fact_from(platform, fact, &self.process_environment(fact))
             }
             Directories::Injected(environment) => {
                 let platform = if self.macos {
@@ -162,11 +287,38 @@ impl Facts {
         match resolve_storage_root(&StorageLayoutRequest::new(identity, facts), kind) {
             Ok(Some(root)) => Ok(root.path().to_path_buf()),
             Ok(None) => Err(format!("no {kind:?} root resolved")),
-            Err(StorageLayoutError::MissingPlatformFact { .. }) => Err(
-                "HOME is unset or not an absolute path; set OXIDE_CONFIG and OXIDE_POOL explicitly"
+            Err(StorageLayoutError::MissingPlatformFact { .. }) => Err(match &self.home_source {
+                HomeSource::Unavailable(reason) => {
+                    format!("{reason}; set OXIDE_CONFIG and OXIDE_POOL explicitly")
+                }
+                _ => "HOME is unset or not an absolute path; set OXIDE_CONFIG and OXIDE_POOL explicitly"
                     .to_owned(),
-            ),
+            }),
             Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The one fact's inputs: the resolved home in place of `$HOME`, and on
+    /// Linux the XDG variable for that fact, read from the process as Longhorn
+    /// would.
+    fn process_environment(&self, fact: PlatformDirectoryFact) -> PlatformEnvironment {
+        let home = self.home.as_ref().map(PathBuf::from);
+        let variable = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        let environment = PlatformEnvironment::default().with_home_dir(home);
+        if cfg!(target_os = "macos") {
+            return environment;
+        }
+        match fact {
+            PlatformDirectoryFact::Config => {
+                environment.with_xdg_config_home(variable("XDG_CONFIG_HOME"))
+            }
+            PlatformDirectoryFact::Cache => {
+                environment.with_xdg_cache_home(variable("XDG_CACHE_HOME"))
+            }
+            PlatformDirectoryFact::State => {
+                environment.with_xdg_state_home(variable("XDG_STATE_HOME"))
+            }
+            _ => environment,
         }
     }
 
@@ -237,6 +389,9 @@ pub struct Settings {
     pub active_build_limit: ActiveBuildLimit,
     pub ignored_legacy_config: Option<PathBuf>,
     pub file: ConfigFile,
+    /// Set when `$HOME` differs from the account home and neither the pool
+    /// nor the config file was chosen explicitly.
+    pub home_notice: Option<String>,
 }
 
 /// The config file the platform selects, or `OXIDE_CONFIG`.
@@ -331,6 +486,11 @@ pub fn settings(facts: &Facts) -> Result<Settings, String> {
         budget_source,
         active_build_limit,
         ignored_legacy_config,
+        home_notice: if pool_source == Source::Environment("OXIDE_POOL") || file.explicit {
+            None
+        } else {
+            facts.home_notice()
+        },
         file,
     })
 }
@@ -835,6 +995,63 @@ mod tests {
 
     fn facts(macos: bool) -> Facts {
         at_home(macos, Some("/home/user"))
+    }
+
+    #[test]
+    fn the_account_home_is_absolute_and_never_read_from_home() {
+        let home = account_home().expect("the test account has a passwd home");
+        assert!(Path::new(&home).is_absolute(), "{home:?}");
+    }
+
+    #[test]
+    fn a_differing_home_variable_is_noticed_only_for_the_account_source() {
+        let mut facts = facts(true);
+        facts.home_source = HomeSource::Account;
+        facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        let notice = facts.home_notice().expect("a differing HOME is noticed");
+        assert!(notice.contains("/private/tmp/harness-home"), "{notice}");
+        assert!(notice.contains("account home /home/user"), "{notice}");
+        assert!(notice.contains("OXIDE_POOL"), "{notice}");
+
+        facts.env_home = Some(OsString::from("/home/user"));
+        assert_eq!(facts.home_notice(), None, "a matching HOME is quiet");
+
+        facts.env_home = None;
+        assert!(facts
+            .home_notice()
+            .is_some_and(|notice| notice.contains("HOME is unset")));
+
+        facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        facts.home_source = HomeSource::TestEnvironment;
+        assert_eq!(facts.home_notice(), None, "the proof control is quiet");
+    }
+
+    #[test]
+    fn an_explicit_pool_or_config_suppresses_the_home_notice() {
+        let mut facts = facts(true);
+        facts.home_source = HomeSource::Account;
+        facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        facts.oxide_pool = Some(OsString::from("/private/tmp/explicit-pool"));
+        let explicit = settings(&facts).expect("settings resolve");
+        assert_eq!(explicit.home_notice, None);
+
+        facts.oxide_pool = None;
+        let default = settings(&facts).expect("settings resolve");
+        assert!(
+            default.home_notice.is_some(),
+            "the default pool from a differing HOME is noticed"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_account_home_refuses_and_names_the_lookup() {
+        let mut facts = at_home(true, None);
+        facts.home_source = HomeSource::Unavailable(
+            "the account home directory is unavailable (no passwd entry for uid 1)".to_owned(),
+        );
+        let error = facts.home().expect_err("no home");
+        assert!(error.contains("no passwd entry"), "{error}");
+        assert!(error.contains("OXIDE_POOL"), "{error}");
     }
 
     /// `home` feeds both `~` expansion and the injected directory snapshot.
