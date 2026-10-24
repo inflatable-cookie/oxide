@@ -1503,6 +1503,27 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   A caller's root is adopted and never removed; evidence goes in a
   `supervisor-evidence.*` directory inside it. Evidence directories are kept
   for review.
+- **Owned bytes.** The monitored count is `st_blocks * 512` for every
+  distinct (device, inode) under the root, with no symlink followed, taken
+  every 2 s. `PC_PATH_MAX` is only the choice between two lookup forms: a
+  path name at or past the platform limit, which no absolute-path call can
+  open, is reached from its nearest nameable directory one short
+  `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` component at a time, so an owned fixture
+  at the limit is counted instead of faulting the reading (oxide#142; without
+  it ordinary full-suite sampling faulted with `ENAMETOOLONG` while the #141
+  `PATH_MAX` fixture existed, which is the fault the #133 fault run records;
+  no #133 proof credit or acceptance follows). No frame keeps a descriptor
+  between iterations, so descriptor use stays constant whatever the depth or
+  path length. The root itself must still be nameable, a per-filesystem limit
+  below the platform's still faults, and a substituted symlink at an anchor is
+  an error rather than a walk into another tree: only `FileNotFoundError` is
+  ever a vanished entry, so a kind or identity contradiction (`ENOTDIR`,
+  `ELOOP`, `EACCES`) still faults. A vanished entry — at its stat, at a
+  relative directory's final no-follow open, or at that directory's read — is
+  still skipped, and every other error is a measurement fault, never a smaller,
+  partial or zero total. The cadence, staleness bound, monitored budget and
+  no-follow rule are unchanged; this is a non-atomic observation and claims no
+  completeness for a name the platform cannot form.
 - **Scope.** Cooperative session only. A `setsid` escape is seen only if
   already tracked as a member or while it holds an output pipe. Arbitrary
   same-user writers are outside the promise. The reserve check is a sampled
@@ -1534,7 +1555,7 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 88 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 97 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1572,10 +1593,27 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   final-live/non-`ESRCH`/non-`ESRCH`-errno/replacement never terminal,
   all-actually-performed-read tracking without short-circuit, tracked
   member forcing uncertainty on unaccountable counts, tracked recompute,
-  combined witness budget keeping the count);
+  combined witness budget keeping the count); owned-byte traversal of owned
+  fixtures that live at and past the platform limit (a regular file one byte
+  past it counted, the limit shown to be a byte rather than a character
+  rule, a directory past it read, a hard-link pair counted once with the
+  union's saving measured against a no-union total, a symlink that names a
+  directory never followed, an unreadable such directory raising instead of
+  reporting less, a missing root counting nothing, and an ordinary tree
+  matching an independent descriptor-relative oracle); three synthetic-FS
+  controls over test-only seams that wrap `os.open`/`os.stat`/`os.close`
+  (never a monitor hook) and count their own hits, so a seam that does not
+  fire fails: a directory that vanishes at its final no-follow open is
+  skipped with the rest of the walk counted, no descriptor left open and
+  nothing opened outside the fixture; a directory reported where a symlink
+  sits faults (`ELOOP`/`ENOTDIR`, never `ENOENT`) with the referent never
+  opened; and seams whose target never appears change nothing;
 - writers before and after a simulated staging step;
-- 35 real cases with tiny Python fixtures and injected faults:
+- 36 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
+  - a case directory that already holds the owned long-path fixture: the
+    first scratch reading counts it, closure holds and the command runs (before
+    oxide#142 that reading faulted `ENAMETOOLONG` and nothing launched);
   - a held direct-fork zombie child witnessed as the exact (PID, start)
     terminal nonwriter with `CLOSED` status 0 and no fault, reaped only
     in `finally`; a live owned child with an explicitly injected session
@@ -1624,7 +1662,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 123 cases;
+- all 133 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
