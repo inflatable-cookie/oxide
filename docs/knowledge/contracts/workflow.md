@@ -3146,7 +3146,10 @@ stay real.
   volume that became unusable after the slot was keyed) refuses before Cargo
   too, with or without a fallback slot and whatever the live link looks like:
   an owned external member is never moved to another pool automatically, and
-  only an explicit adopt changes where a member is placed. An explicit adopt
+  only an explicit adopt changes where a member is placed. That holds for a
+  plan the production planner derived itself, which falls back to the local
+  spec when the registered volume cannot be verified, not only for a plan
+  supplied to binding. An explicit adopt
   compares the live link with the desired destination (relinking under custody
   on a fallback or redock rather than trusting an old receipt match). A profile
   clean is validated before the legacy whole-target pre-gate, plans each
@@ -3155,7 +3158,11 @@ stay real.
   clean keeps the target directory itself, every owned member link and every
   real ancestor directory that holds a nested link (a `<triple>` directory),
   and removes the payload around them; keeping a kept directory never skips
-  the walk inside it. An owned member root holds payload, not a target root:
+  the walk inside it. A retained triple directory is itself a classification
+  boundary: the entries beside its owned member link are held to the same
+  foreign-entry policy, and the refusal names each of them relative to the
+  target (`<triple>/<name>`), so nothing below a kept ancestor is deleted
+  unexamined. An owned member root holds payload, not a target root:
   its `deps`, `incremental`, `build`, `.fingerprint`, `examples` and artifact
   files of any name are Cargo's, while an unknown directory or a symlink in it
   is still foreign and refuses. Prune eligibility and candidate construction
@@ -3242,8 +3249,13 @@ stay real.
   link to its recorded backup and P3 exclusively publishes the staging
   directory as the real target; only the staging INODE recorded at P1 is ever
   published, so a directory replaced in between with identically shaped links
-  is refused, and a creator of `target` is preserved and leaves the
-  transaction pending. P4 verifies the final real directory and exact
+  is refused or left pending, and a creator of `target` is preserved and leaves
+  the transaction pending. The COMMIT is reachable only through that same
+  staged inode and requires the pinned pre-P4 backup of the old whole-target
+  link (and, for a root/1 upgrade, the pinned old-marker backup) to still be
+  present with its recorded inode and bytes; a lookalike target directory, a
+  missing or substituted backup leaves the transaction pending instead of
+  committing. P4 verifies the final real directory and exact
   member link set and commits the receipt, root/2 nonce and outputs-3 member
   references — the COMMIT point, never rolled back. Journaled backups are
   removed only under their pinned identities before the journal is dropped.

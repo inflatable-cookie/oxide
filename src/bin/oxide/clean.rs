@@ -306,8 +306,8 @@ fn plan(
             dir: true,
         });
     }
-    let mut stack = vec![(target.to_path_buf(), 0_usize)];
-    while let Some((dir, depth)) = stack.pop() {
+    let mut stack = vec![(target.to_path_buf(), 0_usize, true)];
+    while let Some((dir, depth, classify)) = stack.pop() {
         let entries = std::fs::read_dir(&dir).map_err(|error| {
             format!(
                 "cannot read {}: {error}; the plan would be incomplete",
@@ -344,7 +344,7 @@ fn plan(
                             path.display()
                         ));
                     }
-                    stack.push((path, depth + 1));
+                    stack.push((path, depth + 1, true));
                 }
                 continue;
             }
@@ -354,8 +354,11 @@ fn plan(
                 plan.preserved.push(path);
                 continue;
             }
-            if depth == 0 && !cargo_owned(&path, &entry.file_name(), &metadata, payload) {
-                plan.foreign.push(entry.file_name());
+            if classify && !cargo_owned(&path, &entry.file_name(), &metadata, payload) {
+                // The name is relative to the target root, so an entry below a
+                // retained ancestor is named unambiguously in the refusal.
+                let relative = path.strip_prefix(target).unwrap_or(&path).to_path_buf();
+                plan.foreign.push(relative.into_os_string());
             }
             if plan.entries.len() > MAX_ENTRIES {
                 return Err(format!(
@@ -376,7 +379,7 @@ fn plan(
                     path: path.clone(),
                     dir: true,
                 });
-                stack.push((path, depth + 1));
+                stack.push((path, depth + 1, false));
             } else {
                 plan.files += 1;
                 plan.bytes += metadata.len();
@@ -403,7 +406,7 @@ fn names(names: &[OsString]) -> String {
 /// The refusal both the dry run and a real clean give for foreign entries.
 fn refuse_foreign(target: &Path, plan: &Plan) -> String {
     format!(
-        "clean refused: {} holds {} top-level entr{} Cargo does not create: {}. Move {} out of the target, or pass --include-foreign to remove {} too (`oxide clean --dry-run --include-foreign` lists every path)",
+        "clean refused: {} holds {} entr{} Cargo does not create: {}. Move {} out of the target, or pass --include-foreign to remove {} too (`oxide clean --dry-run --include-foreign` lists every path)",
         target.display(),
         plan.foreign.len(),
         if plan.foreign.len() == 1 { "y" } else { "ies" },
@@ -956,7 +959,7 @@ mod tests {
         );
         let refusal = refuse_foreign(&target, &mixed);
         assert!(
-            refusal.contains("5 top-level entries") && refusal.contains("handover"),
+            refusal.contains("5 entries") && refusal.contains("handover"),
             "{refusal}"
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -1177,6 +1180,72 @@ mod tests {
         assert!(target.join("aarch64-apple-darwin/debug").is_symlink());
         assert!(!target.join("tmp").exists());
         assert!(!target.join("CACHEDIR.TAG").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// oxide#133 P1, ROOT check: descending a retained real triple directory
+    /// must not quietly accept the entries BESIDE the owned member link. An
+    /// unknown directory, an unknown file and a generic symlink there are
+    /// foreign, so an ordinary clean refuses before any effect instead of
+    /// deleting them because they sit below a kept ancestor.
+    #[test]
+    fn a_foreign_entry_beside_a_retained_triple_link_is_refused() {
+        let root = scratch("profile-foreign");
+        let target = root.join("target");
+        let owned = root.join("owned");
+        profile_payload(&owned.join("debug"));
+        let triple = target.join("aarch64-apple-darwin");
+        std::fs::create_dir_all(triple.join("tmp")).unwrap();
+        symlink(&owned.join("debug"), triple.join("debug")).unwrap();
+        let preserve = vec![target.clone(), triple.clone(), triple.join("debug")];
+        // Only the retained link and real Cargo payload: nothing foreign.
+        let clean = plan(&target, None, false, &preserve, false)
+            .unwrap()
+            .unwrap();
+        assert!(clean.foreign.is_empty(), "{:?}", clean.foreign);
+        // One of each kind beside the retained link.
+        std::fs::create_dir_all(triple.join("handover")).unwrap();
+        std::fs::write(triple.join("handover/tool"), "keep").unwrap();
+        std::fs::write(triple.join("notes.txt"), "").unwrap();
+        symlink(&root, triple.join("link")).unwrap();
+        let mixed = plan(&target, None, false, &preserve, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mixed.foreign,
+            os(&[
+                "aarch64-apple-darwin/handover",
+                "aarch64-apple-darwin/link",
+                "aarch64-apple-darwin/notes.txt",
+            ])
+        );
+        // An ordinary clean refuses with every affected path named, and the
+        // plan that would have removed them is never returned.
+        let refused = checked_plan(&target, None, false, false, &preserve, false).unwrap_err();
+        assert!(refused.contains("3 entries"), "{refused}");
+        assert!(
+            refused.contains("aarch64-apple-darwin/handover"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("aarch64-apple-darwin/notes.txt"),
+            "{refused}"
+        );
+        assert!(refused.contains("--include-foreign"), "{refused}");
+        // With --include-foreign the same entries ARE planned for removal, so
+        // the refusal above is the real gate and not an empty plan.
+        let included = checked_plan(&target, None, true, false, &preserve, false)
+            .unwrap()
+            .unwrap();
+        for name in ["handover", "link", "notes.txt"] {
+            assert!(
+                included
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == triple.join(name)),
+                "{name}"
+            );
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

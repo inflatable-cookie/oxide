@@ -2114,6 +2114,41 @@ fn verify_stage_identity(dir: &Path, migration: &Migration) -> Result<(), String
     Ok(())
 }
 
+/// P3: the required pre-P4 backup of the old whole-target link. It must be the
+/// exact link the journal pinned at P0 — same inode and same text — at its
+/// recorded backup path. A missing, foreign or substituted link is never
+/// accepted as the pinned original.
+fn verify_target_backup(migration: &Migration) -> Result<(), String> {
+    let meta = fs::symlink_metadata(&migration.backup).map_err(|error| {
+        pending_migration(
+            migration,
+            &format!("the recorded target backup is missing ({error})"),
+        )
+    })?;
+    if !meta.file_type().is_symlink()
+        || meta.dev() != migration.link_dev
+        || meta.ino() != migration.link_ino
+    {
+        return Err(pending_migration(
+            migration,
+            "the target backup is not the pinned old link",
+        ));
+    }
+    let text = fs::read_link(&migration.backup).map_err(|error| {
+        pending_migration(
+            migration,
+            &format!("cannot read the target backup: {error}"),
+        )
+    })?;
+    if text != migration.link_text {
+        return Err(pending_migration(
+            migration,
+            "the target backup link text changed",
+        ));
+    }
+    Ok(())
+}
+
 /// Verify the live member link set of one real profile directory: exactly the
 /// journal's sorted members, each a symlink into the journal's root. A
 /// `<triple>/<profile>` member lives one level down in its own real triple
@@ -2596,7 +2631,21 @@ fn upgrade_marker(
             // published: the exact pinned backup is the only acceptable
             // reason for a missing marker.
             match fs::symlink_metadata(&backup) {
-                Ok(meta) if meta.dev() == pin.dev && meta.ino() == pin.ino => {}
+                Ok(meta) if meta.dev() == pin.dev && meta.ino() == pin.ino => {
+                    // The pinned inode must still carry the pinned bytes.
+                    let digest = file_digest(&backup).map_err(|error| {
+                        pending_migration(
+                            migration,
+                            &format!("cannot digest the old marker backup: {error}"),
+                        )
+                    })?;
+                    if digest != pin.sha256 {
+                        return Err(pending_migration(
+                            migration,
+                            "the old marker backup bytes changed",
+                        ));
+                    }
+                }
                 _ => {
                     return Err(pending_migration(
                         migration,
@@ -2668,7 +2717,16 @@ fn upgrade_marker(
 fn back_up_target(migration: &Migration) -> Result<MigrationPhase, String> {
     match fs::symlink_metadata(&migration.backup) {
         Ok(_) => {
-            // Already renamed by an earlier attempt.
+            // An earlier attempt renamed it. Only the exact pinned old link at
+            // the recorded backup path may stand in, and the live target must
+            // not have reappeared beside it.
+            verify_target_backup(migration)?;
+            if fs::symlink_metadata(&migration.link).is_ok() {
+                return Err(pending_migration(
+                    migration,
+                    "the target reappeared beside its recorded backup",
+                ));
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let link_meta = fs::symlink_metadata(&migration.link).map_err(|error| {
@@ -2717,8 +2775,10 @@ fn swap_in_staging(migration: &Migration) -> Result<MigrationPhase, String> {
     match fs::symlink_metadata(&migration.link) {
         Ok(_) => {
             // A creator (or an earlier replay) is at the target. It is only
-            // acceptable when it is exactly the staged member set.
-            if verify_member_links(&migration.link, migration).is_ok()
+            // acceptable when it is EXACTLY this transaction's staged inode
+            // with the staged member set, and the staging path is gone.
+            if verify_stage_identity(&migration.link, migration).is_ok()
+                && verify_member_links(&migration.link, migration).is_ok()
                 && fs::symlink_metadata(&migration.stage).is_err()
             {
                 return Ok(MigrationPhase::Swapped);
@@ -2762,7 +2822,38 @@ fn commit_migration(
     receipt: Receipt,
     migration: &Migration,
 ) -> Result<Receipt, String> {
+    // P3: the COMMIT is reachable only through this transaction's own staged
+    // inode, with the pinned pre-P4 backup of the old link still in place. A
+    // lookalike target directory or a lost/substituted backup leaves the
+    // migration pending instead of committing.
+    verify_stage_identity(&migration.link, migration)?;
+    verify_target_backup(migration)?;
     verify_migrated_target(&migration.link, migration)?;
+    // P3: while a rollback is still possible, a root/1 upgrade must keep the
+    // exact old marker it pinned.
+    if let Some(pin) = migration.marker_pin.as_ref() {
+        let backup = migration.marker_backup.as_ref().ok_or_else(|| {
+            pending_migration(migration, "the migration lost its old-marker backup record")
+        })?;
+        let meta = fs::symlink_metadata(backup).map_err(|error| {
+            pending_migration(
+                migration,
+                &format!("the recorded old-marker backup is missing ({error})"),
+            )
+        })?;
+        let digest = file_digest(backup).map_err(|error| {
+            pending_migration(
+                migration,
+                &format!("cannot digest the old-marker backup: {error}"),
+            )
+        })?;
+        if meta.dev() != pin.dev || meta.ino() != pin.ino || digest != pin.sha256 {
+            return Err(pending_migration(
+                migration,
+                "the old-marker backup is not the pinned marker",
+            ));
+        }
+    }
     let marker = read_marker(&migration.root.root)?;
     check_marker(&marker, &context.workspace, &context.checkout_id)?;
     if marker.nonce() != migration.root.nonce() {
@@ -7518,6 +7609,124 @@ mod tests {
         fs::remove_dir_all(&replaced).unwrap();
     }
 
+    /// P3: a lookalike REAL directory at the target, holding the staged member
+    /// links but a different inode, is never accepted as the already-swapped
+    /// staging directory. Without the recorded staging identity this shape
+    /// alone would be taken as a completed swap.
+    #[test]
+    fn a_lookalike_target_is_not_accepted_as_the_staged_directory() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        std::env::set_var(CRASH_ENVIRONMENT, "migration-staged");
+        let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
+        std::env::remove_var(CRASH_ENVIRONMENT);
+        assert!(stopped.is_err(), "the injected stop did not stop");
+        let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        let journal = stored.transition.clone().unwrap();
+        assert_eq!(journal.phase, MigrationPhase::Staged);
+        // P2 really moves the old link aside, then a lookalike directory takes
+        // the target and the staging path is emptied: the occupied-target
+        // branch must still refuse it.
+        back_up_target(&journal).unwrap();
+        fs::create_dir(&journal.link).unwrap();
+        fs::set_permissions(&journal.link, fs::Permissions::from_mode(0o755)).unwrap();
+        for member in &journal.members {
+            symlink(
+                member_destination(&journal.root.root, member),
+                journal.link.join(member),
+            )
+            .unwrap();
+        }
+        fs::remove_dir_all(&journal.stage).unwrap();
+        let refused = swap_in_staging(&journal).unwrap_err();
+        assert!(refused.contains("cannot proceed"), "{refused}");
+        // The lookalike is neither replaced nor removed.
+        assert!(fs::symlink_metadata(&journal.link).unwrap().is_dir());
+    }
+
+    /// P3: the commit point requires the pinned pre-P4 backup of the old link.
+    /// A backup that disappeared or was substituted leaves the migration
+    /// pending instead of committing on the target's shape alone.
+    #[test]
+    fn a_missing_or_substituted_target_backup_blocks_commit() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        for substitute in [false, true] {
+            let (fixture, legacy) = legacy_checkout();
+            let context = fixture.context();
+            std::env::set_var(CRASH_ENVIRONMENT, "migration-swapped");
+            let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
+            std::env::remove_var(CRASH_ENVIRONMENT);
+            assert!(stopped.is_err(), "the injected stop did not stop");
+            let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            let journal = stored.transition.clone().unwrap();
+            assert_eq!(journal.phase, MigrationPhase::Swapped);
+            fs::remove_file(&journal.backup).unwrap();
+            if substitute {
+                // A different inode with the same text is still not the pinned
+                // original.
+                symlink(&journal.link_text, &journal.backup).unwrap();
+                assert_eq!(fs::read_link(&journal.backup).unwrap(), journal.link_text);
+            }
+            let refused = match replay_migration(&context, &fixture.control, stored) {
+                Ok(_) => panic!("a migration committed without its pinned target backup"),
+                Err(reason) => reason,
+            };
+            assert!(refused.contains("cannot proceed"), "{refused}");
+            let kept = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                kept.state,
+                ReceiptState::Prepared,
+                "the commit was not blocked"
+            );
+            assert!(kept.transition.is_some(), "the pending journal was dropped");
+        }
+    }
+
+    /// P3: a root/1 upgrade whose pinned old-marker backup disappeared cannot
+    /// reach the commit point, because a rollback must stay possible until P4.
+    #[test]
+    fn a_missing_marker_backup_blocks_commit() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        make_root_one_marker(&fixture, &legacy);
+        std::env::set_var(CRASH_ENVIRONMENT, "migration-marker");
+        let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
+        std::env::remove_var(CRASH_ENVIRONMENT);
+        assert!(stopped.is_err(), "the injected stop did not stop");
+        let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        let journal = stored.transition.clone().unwrap();
+        assert_eq!(journal.phase, MigrationPhase::MarkerUpgraded);
+        let backup = journal
+            .marker_backup
+            .clone()
+            .expect("no recorded marker backup");
+        fs::remove_file(&backup).unwrap();
+        let refused = match replay_migration(&context, &fixture.control, stored) {
+            Ok(_) => panic!("a root/1 upgrade committed without its pinned marker backup"),
+            Err(reason) => reason,
+        };
+        assert!(refused.contains("cannot proceed"), "{refused}");
+        let kept = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.state,
+            ReceiptState::Prepared,
+            "the commit was not blocked"
+        );
+        assert!(kept.transition.is_some(), "the pending journal was dropped");
+    }
+
     #[test]
     fn a_migration_waits_for_a_creator_of_the_target() {
         let (fixture, legacy) = legacy_checkout();
@@ -8038,6 +8247,92 @@ mod tests {
             fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap(),
             recorded
         );
+    }
+
+    /// P4, ROOT check: the same refusal through the PRODUCTION planning path.
+    /// The fixture registers a permanent drive whose volume cannot be verified,
+    /// so `planned_destination` itself stops selecting the committed external
+    /// root and returns a local plan; binding that derived plan must still
+    /// refuse before Cargo. The manual `Plan` in the regression above is a
+    /// binding-only control, not this one.
+    #[test]
+    fn a_planner_derived_local_plan_refuses_a_committed_external_member() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        register(&fixture, DriveMode::Permanent);
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.place_member("debug").selected = Some(external.clone());
+        write_receipt(&fixture.control, &receipt).unwrap();
+        // A real external root carrying this checkout's marker and member
+        // directory, with the live owned link into it.
+        fs::create_dir_all(member_destination(&external.root, "debug")).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: external.volume_uuid.clone(),
+            nonce: external.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let link = fixture.checkout.join("target/debug");
+        let destination = member_destination(&external.root, "debug");
+        symlink(&destination, &link).unwrap();
+        let declaration =
+            crate::layout::Declaration::new([crate::layout::Member::parse("debug").unwrap()])
+                .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.selected().map(Selected::kind),
+            Some(RootKind::Local),
+            "the production planner did not fall back to the local spec"
+        );
+        let store = pool_store(&fixture.root.join("pool"));
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => {
+                assert!(
+                    reason.contains(
+                        "never moves an owned external output to another pool automatically"
+                    ),
+                    "{reason}"
+                );
+                assert!(reason.contains("nothing was built"), "{reason}");
+                assert!(
+                    reason.contains(&destination.display().to_string()),
+                    "{reason}"
+                );
+            }
+            Bind::Bound(_) => panic!("a planner-derived local plan relinked an external member"),
+            Bind::Wait => panic!("a planner-derived refusal waited"),
+        }
+        assert_eq!(fs::read_link(&link).unwrap(), destination);
     }
 
     #[test]
