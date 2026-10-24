@@ -3261,7 +3261,11 @@ stay real.
   removed only under their pinned identities before the journal is dropped.
   Replay advances only exact recorded identities, including a crash before a
   phase record; ambiguous identity, a foreign creator, a lost volume, a
-  missing required backup or an unrecognised phase stays pending. A pre-P4
+  missing required backup or an unrecognised phase stays pending. For a root/1
+  upgrade the pinned old-marker backup must be POSITIVELY present under the
+  recorded root with its exact inode and bytes before any pre-P4 target rename
+  or staging publication, not merely recorded as a pathname, and a replaced
+  backup with the same bytes but a new inode is refused. A pre-P4
   rollback restores the exact old marker from its pinned backup, the old
   target link and the published /2 receipt, and retires the reserved nonce;
   every rollback effect verifies the recorded parent first and removes only

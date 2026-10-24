@@ -958,15 +958,29 @@ class _FakeCustodyProof:
     deadline hit), which is exactly the situation in which a failure record
     must still be written from already-known facts."""
 
-    def __init__(self, mount: str, failure: str = "query refused") -> None:
+    def __init__(
+        self, mount: str, failure: str = "query refused", detach_returncode=None
+    ) -> None:
         self.mount = mount
         self.unclosed = set()
         self.failure = failure
+        self.detach_returncode = detach_returncode
         self.calls = []
 
     def run(self, args, **_kwargs):
         self.calls.append(list(args))
+        if self.detach_returncode is not None and "detach" in args:
+            return _FakeDetachResult(self.detach_returncode)
         raise RuntimeError(self.failure)
+
+
+class _FakeDetachResult:
+    """A refused ordinary detach: no subprocess, a real return code."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+        self.stdout = b""
+        self.stderr = b"detach refused by the mock"
 
 
 def pure_attachment_facts_control() -> None:
@@ -1066,6 +1080,32 @@ def pure_attachment_facts_control() -> None:
                 f"the unresolved record is not honest about the mount: {record}",
             )
             expect(os.path.isfile(backing), "the backing was deleted after a failed detach")
+            # A REFUSED ordinary detach: the record must be a FILE under the
+            # evidence root (never the directory, never os.devnull), written from
+            # known facts before any further query, with the backing retained.
+            refused_detach = _FakeCustodyProof(mount, detach_returncode=1)
+            try:
+                detach_owned_volume(refused_detach, "mock detach refused")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a refused detach reported success")
+            failure_record = os.path.join(root, "detach-failure.json")
+            expect(
+                os.path.isfile(failure_record),
+                "a refused detach wrote no failure record file",
+            )
+            with open(failure_record, encoding="utf-8") as handle:
+                record = json.load(handle)
+            expect(
+                record.get("mount") == mount and record.get("detach_exit") == 1,
+                f"the failure record is not honest about the mount or exit: {record}",
+            )
+            expect(
+                os.path.isfile(os.path.join(root, "detach-details-unavailable.json")),
+                "a refused post-failure detail query was not recorded",
+            )
+            expect(os.path.isfile(backing), "the backing was deleted after a refused detach")
         finally:
             if real_evidence is None:
                 os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
@@ -1115,44 +1155,69 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
         return
     expect(os.path.lexists(mount), f"{label}: the owned mount {mount} vanished before ordinary detach")
     # Persist the last-known facts BEFORE the risky calls, so an interruption
-    # (including a timeout) still leaves custody facts in evidence.
-    write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, label, "detaching"))
+    # (including a timeout) still leaves custody facts in evidence. A write that
+    # itself fails is an explicit failure and the mount is never touched.
+    try:
+        write_attachment_facts(
+            "attachment-facts.json", known_attachment_facts(proof, label, "detaching")
+        )
+    except Exception as error:
+        fail(
+            f"{label}: cannot record the attachment facts before detaching ({error!r}); "
+            f"the mount {mount} and any backing are retained"
+        )
+        return
     try:
         result = proof.run(["/usr/bin/hdiutil", "detach", mount], timeout=60)
     except Exception as error:  # a timeout or a harness fault is unresolved custody
         record = known_attachment_facts(proof, label, "unresolved: detach did not complete")
         record["reason"] = f"detach raised {error!r}"
-        write_attachment_facts("detach-unresolved.json", record)
+        try:
+            write_attachment_facts("detach-unresolved.json", record)
+        except Exception as write_error:
+            fail(
+                f"{label}: the unresolved-custody record could not be written ({write_error!r}); "
+                f"the mount {mount} and any backing are retained"
+            )
+            return
         fail(f"{label}: ordinary detach of {mount} did not complete ({error!r}); the backing is retained in the guard evidence")
         return
     if result.returncode != 0:
-        details = {}
-        try:
-            info = proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30)
-            if info.returncode == 0:
-                plist = perm.plistlib.loads(info.stdout)
-                details = {
-                    "device": plist.get("DeviceIdentifier"),
-                    "volume_uuid": plist.get("VolumeUUID"),
-                    "owners": plist.get("Owners"),
-                    "mount_point": plist.get("MountPoint"),
-                }
-        except Exception as error:
-            details = {"unavailable": repr(error)}
-        record = detach_failure_record(
-            label,
-            mount,
-            result.returncode,
-            result.stderr.decode(errors="replace"),
-            backing,
-            os.path.exists(backing),
-            details,
+        # A10: the failure record is written FIRST, from last-known facts only.
+        # Nothing here needs a subprocess, and the record is a FILE under the
+        # evidence root (never the directory itself, never os.devnull).
+        record = dict(
+            detach_failure_record(
+                label,
+                mount,
+                result.returncode,
+                result.stderr.decode(errors="replace"),
+                backing,
+                os.path.exists(backing),
+                dict(getattr(proof, "_attachment_details", {}) or {}),
+            )
         )
-        evidence = evidence_root()
-        with open(os.path.join(evidence or os.devnull), "w", encoding="utf-8") as handle:
-            json.dump(record, handle, indent=2)
-            handle.write("\n")
-        write_attachment_facts("detach-unresolved.json", known_attachment_facts(proof, label, "unresolved: detach failed"))
+        record["known"] = known_attachment_facts(proof, label, "unresolved: detach failed")
+        try:
+            write_attachment_facts("detach-failure.json", record)
+            write_attachment_facts(
+                "detach-unresolved.json",
+                known_attachment_facts(proof, label, "unresolved: detach failed"),
+            )
+        except Exception as error:
+            fail(
+                f"{label}: ordinary detach of {mount} failed and the custody record could not be "
+                f"written ({error!r}); the backing is retained in the guard evidence"
+            )
+            return
+        # A refused detail query is recorded separately and can never be the
+        # reason the failure above went unrecorded.
+        details = refresh_attachment_details(proof)
+        if "unavailable" in details:
+            write_attachment_facts(
+                "detach-details-unavailable.json",
+                {"label": label, "error": details["unavailable"]},
+            )
         fail(f"{label}: ordinary detach of {mount} failed; the backing is retained in the guard evidence")
         return
     proof.mount = None

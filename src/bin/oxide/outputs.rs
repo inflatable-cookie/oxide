@@ -2149,6 +2149,45 @@ fn verify_target_backup(migration: &Migration) -> Result<(), String> {
     Ok(())
 }
 
+/// P3: while a rollback is still possible, a root/1 upgrade's pinned old-marker
+/// backup must be POSITIVELY present under the recorded root with its exact
+/// inode and bytes. A journaled pathname is not proof that a required rollback
+/// backup survives, and this is checked before any pre-P4 target rename or
+/// staging publication.
+fn verify_marker_backup(migration: &Migration) -> Result<(), String> {
+    let Some(pin) = migration.marker_pin.as_ref() else {
+        return Ok(());
+    };
+    let backup = migration.marker_backup.as_ref().ok_or_else(|| {
+        pending_migration(migration, "the migration lost its old-marker backup record")
+    })?;
+    if backup.parent() != Some(migration.root.root.as_path()) {
+        return Err(pending_migration(
+            migration,
+            "the old-marker backup is not under the recorded root",
+        ));
+    }
+    let meta = fs::symlink_metadata(backup).map_err(|error| {
+        pending_migration(
+            migration,
+            &format!("the recorded old-marker backup is missing ({error})"),
+        )
+    })?;
+    let digest = file_digest(backup).map_err(|error| {
+        pending_migration(
+            migration,
+            &format!("cannot digest the old-marker backup: {error}"),
+        )
+    })?;
+    if meta.dev() != pin.dev || meta.ino() != pin.ino || digest != pin.sha256 {
+        return Err(pending_migration(
+            migration,
+            "the old-marker backup is not the pinned marker",
+        ));
+    }
+    Ok(())
+}
+
 /// Verify the live member link set of one real profile directory: exactly the
 /// journal's sorted members, each a symlink into the journal's root. A
 /// `<triple>/<profile>` member lives one level down in its own real triple
@@ -2583,12 +2622,13 @@ fn upgrade_marker(
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if migration.marker_backup.as_deref() != Some(backup.as_path()) {
-                        return Err(pending_migration(
-                            migration,
-                            "the successor marker is live and the old marker is gone",
-                        ));
-                    }
+                    // A journaled pathname is NOT proof that the required
+                    // rollback backup survives: the successor is live and the
+                    // pinned old marker is positively gone.
+                    return Err(pending_migration(
+                        migration,
+                        "the successor marker is live and the pinned old-marker backup is gone",
+                    ));
                 }
                 Err(error) => {
                     return Err(pending_migration(
@@ -2715,6 +2755,9 @@ fn upgrade_marker(
 
 /// P2: exclusively rename the old whole-target link to its backup.
 fn back_up_target(migration: &Migration) -> Result<MigrationPhase, String> {
+    // P3: no pre-P4 target rename happens until the pinned old-marker backup is
+    // positively present with its recorded identity.
+    verify_marker_backup(migration)?;
     match fs::symlink_metadata(&migration.backup) {
         Ok(_) => {
             // An earlier attempt renamed it. Only the exact pinned old link at
@@ -2772,6 +2815,9 @@ fn back_up_target(migration: &Migration) -> Result<MigrationPhase, String> {
 /// P3: exclusively rename the staging directory onto `target`. A creator that
 /// appeared in between is preserved and leaves the migration pending.
 fn swap_in_staging(migration: &Migration) -> Result<MigrationPhase, String> {
+    // P3: no staging publication happens until the pinned old-marker backup is
+    // positively present with its recorded identity.
+    verify_marker_backup(migration)?;
     match fs::symlink_metadata(&migration.link) {
         Ok(_) => {
             // A creator (or an earlier replay) is at the target. It is only
@@ -2831,29 +2877,7 @@ fn commit_migration(
     verify_migrated_target(&migration.link, migration)?;
     // P3: while a rollback is still possible, a root/1 upgrade must keep the
     // exact old marker it pinned.
-    if let Some(pin) = migration.marker_pin.as_ref() {
-        let backup = migration.marker_backup.as_ref().ok_or_else(|| {
-            pending_migration(migration, "the migration lost its old-marker backup record")
-        })?;
-        let meta = fs::symlink_metadata(backup).map_err(|error| {
-            pending_migration(
-                migration,
-                &format!("the recorded old-marker backup is missing ({error})"),
-            )
-        })?;
-        let digest = file_digest(backup).map_err(|error| {
-            pending_migration(
-                migration,
-                &format!("cannot digest the old-marker backup: {error}"),
-            )
-        })?;
-        if meta.dev() != pin.dev || meta.ino() != pin.ino || digest != pin.sha256 {
-            return Err(pending_migration(
-                migration,
-                "the old-marker backup is not the pinned marker",
-            ));
-        }
-    }
+    verify_marker_backup(migration)?;
     let marker = read_marker(&migration.root.root)?;
     check_marker(&marker, &context.workspace, &context.checkout_id)?;
     if marker.nonce() != migration.root.nonce() {
@@ -7694,6 +7718,76 @@ mod tests {
     #[test]
     fn a_missing_marker_backup_blocks_commit() {
         let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        for stolen in [false, true] {
+            let (fixture, legacy) = legacy_checkout();
+            let context = fixture.context();
+            make_root_one_marker(&fixture, &legacy);
+            std::env::set_var(CRASH_ENVIRONMENT, "migration-marker");
+            let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
+            std::env::remove_var(CRASH_ENVIRONMENT);
+            assert!(stopped.is_err(), "the injected stop did not stop");
+            let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            let journal = stored.transition.clone().unwrap();
+            assert_eq!(journal.phase, MigrationPhase::MarkerUpgraded);
+            let backup = journal
+                .marker_backup
+                .clone()
+                .expect("no recorded marker backup");
+            // The pre-replay state that must survive untouched.
+            let link_meta = fs::symlink_metadata(&journal.link).unwrap();
+            let link_text = fs::read_link(&journal.link).unwrap();
+            let staging = fs::symlink_metadata(&journal.stage).unwrap();
+            if stolen {
+                // STOLEN: moved away, so the recorded path is gone.
+                fs::rename(&backup, backup.with_extension("stolen")).unwrap();
+            } else {
+                fs::remove_file(&backup).unwrap();
+            }
+            let refused = match replay_migration(&context, &fixture.control, stored) {
+                Ok(_) => panic!("a root/1 upgrade proceeded without its pinned marker backup"),
+                Err(reason) => reason,
+            };
+            assert!(refused.contains("cannot proceed"), "{refused}");
+            // No pre-P4 effect happened: the old target link keeps its text and
+            // inode (it was neither renamed nor swapped), the staging directory
+            // keeps its inode, and the journal phase is still MarkerUpgraded.
+            let after = fs::symlink_metadata(&journal.link).unwrap();
+            assert_eq!(
+                fs::read_link(&journal.link).unwrap(),
+                link_text,
+                "{refused}"
+            );
+            assert_eq!(after.ino(), link_meta.ino(), "{refused}");
+            assert!(!after.file_type().is_dir(), "the target was swapped anyway");
+            let staging_after = fs::symlink_metadata(&journal.stage).unwrap();
+            assert_eq!(staging_after.ino(), staging.ino(), "staging changed");
+            assert!(
+                fs::symlink_metadata(&journal.backup).is_err(),
+                "the target link was backed up anyway"
+            );
+            let kept = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                kept.state,
+                ReceiptState::Prepared,
+                "the operation was not kept pending"
+            );
+            assert_eq!(
+                kept.transition.as_ref().map(|journal| journal.phase),
+                Some(MigrationPhase::MarkerUpgraded),
+                "the journal phase advanced"
+            );
+        }
+    }
+
+    /// P3: an identical-looking REPLACEMENT backup (same bytes, new inode) is not
+    /// the pinned marker and cannot unlock the pre-P4 target effects.
+    #[test]
+    fn a_replaced_marker_backup_blocks_the_pre_p4_effects() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         make_root_one_marker(&fixture, &legacy);
@@ -7705,26 +7799,31 @@ mod tests {
             .unwrap()
             .unwrap();
         let journal = stored.transition.clone().unwrap();
-        assert_eq!(journal.phase, MigrationPhase::MarkerUpgraded);
         let backup = journal
             .marker_backup
             .clone()
             .expect("no recorded marker backup");
+        let bytes = fs::read(&backup).unwrap();
         fs::remove_file(&backup).unwrap();
+        fs::write(&backup, &bytes).unwrap();
+        let link_meta = fs::symlink_metadata(&journal.link).unwrap();
         let refused = match replay_migration(&context, &fixture.control, stored) {
-            Ok(_) => panic!("a root/1 upgrade committed without its pinned marker backup"),
+            Ok(_) => panic!("a replaced marker backup unlocked the migration"),
             Err(reason) => reason,
         };
-        assert!(refused.contains("cannot proceed"), "{refused}");
-        let kept = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            kept.state,
-            ReceiptState::Prepared,
-            "the commit was not blocked"
+        assert!(
+            refused.contains("not the pinned marker"),
+            "the refusal did not name the replaced backup: {refused}"
         );
-        assert!(kept.transition.is_some(), "the pending journal was dropped");
+        assert_eq!(
+            fs::symlink_metadata(&journal.link).unwrap().ino(),
+            link_meta.ino(),
+            "the target was renamed anyway"
+        );
+        assert!(
+            fs::symlink_metadata(&journal.backup).is_err(),
+            "the target link was backed up anyway"
+        );
     }
 
     #[test]
