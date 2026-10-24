@@ -640,7 +640,17 @@ def validate_migrated_registry(rows: list, root: str, nonce: str, volume_uuid, g
         if row.get("pruning") or row.get("reservation") or row.get("cancelling")
     ]
     expect({row.get("member") for row in selected} == {"debug", "release"}, f"11: selected profile rows are {selected}")
+    # A7: exactly ONE selected row per expected member. A set comparison above
+    # cannot see a duplicated row, so the sorted member list is compared too.
+    expect(
+        sorted(row.get("member") for row in selected) == ["debug", "release"],
+        f"11: selected profile rows are not exactly one debug and one release: {selected}",
+    )
     expect({row.get("member") for row in pending} == set(), f"11: pending registry references remain: {pending}")
+    expect(
+        [row.get("member") for row in pending] == [],
+        f"11: duplicate pending registry references remain: {pending}",
+    )
     expect({row.get("member") for row in live_other} == set(), f"11: live pruning/reservation rows remain: {live_other}")
     for row in selected:
         expect(row.get("nonce") == nonce, f"11: selected {row.get('member')} row does not carry the upgraded nonce: {row}")
@@ -670,6 +680,10 @@ def pure_registry_controls() -> None:
         ([good[0], good[1], {**good[2], "selected": True}], "extra live legacy member"),
         ([good[0], good[1], {**good[2], "pending": True}], "pending legacy member"),
         ([good[0], good[1], good[2], {**good[0], "member": "x86_64-unknown-linux-gnu/debug"}], "extra live profile member"),
+        # A7: a duplicated selected row keeps the member SET identical, so only
+        # an explicit per-row count rejects it.
+        ([good[0], good[0], good[1], good[2]], "duplicated selected profile row"),
+        ([good[0], good[1], {**good[2], "selected": False, "pending": True}, {**good[2], "pending": True}], "duplicated pending history row"),
     ):
         try:
             validate_migrated_registry(broken, "/r", "a" * 32, "11111111-2222-3333-4444-555555555555", 1)
@@ -767,6 +781,11 @@ def run(proof: Proof, repo: str) -> None:
     result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
     expect(result.returncode == 0, f"10: base build failed: {result.stderr.decode(errors='replace')[-2000:]}")
     base_slot, _ = perm.slot_state(result.stderr.decode(errors="replace"))
+    # A7: keep the EXACT base receipt bytes and link facts, so the candidate's
+    # no-mutation claim is a byte comparison rather than a version/member spot
+    # check.
+    base_receipt_bytes = perm.read_bytes(perm.receipt_path(pool, legacy))
+    base_link_text = link_at(os.path.join(legacy, "target"))
     # ----- case 11: explicit migration of a base-created checkout ---------
     # The base binary can create its committed whole-target /2 state only
     # before any candidate command runs in this pool, so this base state is
@@ -815,6 +834,14 @@ def run(proof: Proof, repo: str) -> None:
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
     base_links = item(pool, legacy, "links")
     expect(base_links[0]["member"] == "target", "10: the base placement changed")
+    expect(
+        perm.read_bytes(perm.receipt_path(pool, legacy)) == base_receipt_bytes,
+        "10: the candidate rewrote the base receipt bytes",
+    )
+    expect(
+        link_at(os.path.join(legacy, "target")) == base_link_text,
+        "10: the candidate changed the base link text",
+    )
     expect(
         "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
         f"10: the candidate did not print the one adopt notice: {stderr}",
@@ -1085,29 +1112,43 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build", "--target", "targets/spec.json"], "05 linked", unknown)
     expect(code != 0 and "not a plain triple" in stderr, f"05: linked unknown target was not refused: {stderr}")
     expect_layout(unknown, {"debug": f"link:{root_of(pool, unknown)}"})
-    # An external subcommand has opaque output directories: it refuses in the
-    # linked checkout and is not silently treated as the dev profile.
+    # An external subcommand has opaque output directories. A2: the positive
+    # control comes FIRST and is established on a checkout that is positively
+    # unconverted (a real empty target prevents automatic whole-target
+    # adoption), so the later absence really is the linked refusal. The
+    # recording tool is installed under BOTH names a Cargo external subcommand
+    # can be looked up as, and it records its exact argv.
     fake_bin = os.path.join(proof.root, "fake-bin")
     os.makedirs(fake_bin, exist_ok=True)
     external_marker = os.path.join(proof.root, "external-tool-ran")
-    fake = os.path.join(fake_bin, "nextest")
-    with open(fake, "w", encoding="utf-8") as handle:
-        handle.write(
-            "#!/bin/sh\nprintf 'ran %s' \"$*\" > \"$OXIDE_FAKE_EXTERNAL_MARKER\"\nexit 0\n"
-        )
-    os.chmod(fake, 0o755)
+    fake_body = "#!/bin/sh\nprintf '%s' \"$*\" > \"$OXIDE_FAKE_EXTERNAL_MARKER\"\nexit 0\n"
+    for name in ("nextest", "cargo-nextest"):
+        fake = os.path.join(fake_bin, name)
+        with open(fake, "w", encoding="utf-8") as handle:
+            handle.write(fake_body)
+        os.chmod(fake, 0o755)
     fake_env = {
         **proof.env,
         "PATH": fake_bin + os.pathsep + proof.env.get("PATH", ""),
         "OXIDE_FAKE_EXTERNAL_MARKER": external_marker,
     }
+    plain = make_checkout(proof, "unlinked-external")
+    os.makedirs(os.path.join(plain, "target"))
+    code, _, stderr = perm.oxide_env(proof, ["nextest", "run", "--help"], "05 unlinked external", plain, fake_env)
+    expect(code == 0, f"05: the positive fake external tool did not run in an unlinked checkout: {stderr}")
+    expect(
+        perm.read_bytes(external_marker) == b"run --help",
+        f"05: the unlinked external tool's argv changed: {perm.read_bytes(external_marker)!r}",
+    )
+    expect(
+        not os.path.exists(receipt_file(pool, plain)),
+        "05: the unconverted external control wrote an output receipt",
+    )
+    os.remove(external_marker)
+    # Now the linked checkout: the same installed tool must not run at all.
     code, _, stderr = perm.oxide_env(proof, ["nextest", "run"], "05 linked external", unknown, fake_env)
     expect(code != 0 and "not a command whose profile outputs Oxide models" in stderr, f"05: linked external command was not refused: {stderr}")
     expect(not os.path.exists(external_marker), "05: the external tool ran in a linked checkout")
-    plain = make_checkout(proof, "unlinked-external")
-    code, _, stderr = perm.oxide_env(proof, ["nextest", "run"], "05 unlinked external", plain, fake_env)
-    expect(code == 0, f"05: the positive fake external tool did not run in an unlinked checkout: {stderr}")
-    expect(os.path.isfile(external_marker), "05: the positive fake external tool did not record its run")
     # ----- case 06: opaque custom-profile refusal -------------------------
     code, _, stderr = oxide(proof, ["build", "--profile", "custom"], "06 modelled custom", first)
     expect(code != 0 and "not an Oxide profile" in stderr, f"06: modelled custom profile was not refused: {stderr}")
@@ -1142,8 +1183,26 @@ def run(proof: Proof, repo: str) -> None:
     )
     code, _, stderr = oxide(proof, ["exec", "--output", "custom", "--", script], "07 custom exec", first)
     expect(code != 0 and "not an output member" in stderr, f"07: custom declaration was accepted: {stderr}")
-    code, _, stderr = oxide(proof, ["exec", "--output", "debug", "--output", "release", "--", script], "07 complete exec", first)
+    # A3: the complete declaration must run with the tool's environment and
+    # produce FRESH exact argv. The recording tool ends with `exit 0`, so an
+    # exit code alone could be an unconditional success after a failed
+    # redirection; the recorded argv file is therefore removed first and then
+    # required to exist with exactly the expected bytes.
+    if os.path.exists(exec_argv):
+        os.remove(exec_argv)
+    code, _, stderr = perm.oxide_env(
+        proof,
+        ["exec", "--output", "debug", "--output", "release", "--", script, "gamma"],
+        "07 complete exec",
+        first,
+        exec_env,
+    )
     expect(code == 0, f"07: complete declaration failed: {stderr}")
+    expect(
+        os.path.isfile(exec_argv) and perm.read_bytes(exec_argv) == b"gamma",
+        f"07: the complete declaration did not run the tool with its own argv: "
+        f"{perm.read_bytes(exec_argv) if os.path.isfile(exec_argv) else 'no recorded argv'}",
+    )
 
     # ----- case 08: real nonempty kept, empty converted -------------------
     mixed = make_checkout(proof, "mixed")
@@ -1643,6 +1702,10 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build"], "18 real build again", cold)
     expect(code == 0, f"18: second real-member build failed: {stderr}")
     expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
+    # A8: the real placement's slot is read from the parsed summary, and the
+    # repeat is required to be WARM in that exact slot - not a substring test.
+    real_slot, real_state = perm.slot_state(stderr)
+    expect(real_state == "warm", f"18: the real placement's repeat was not warm: {summary(stderr)}")
     slots_dir = os.path.join(pool, "payload", "slots")
     slots_before = sorted(os.listdir(slots_dir))
     shutil.rmtree(os.path.join(cold, "target", "debug"))
@@ -1650,7 +1713,15 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(cold, {"debug": f"link:{cold_root}", "release": f"link:{cold_root}"})
     code, _, stderr = oxide(proof, ["build"], "18 linked debug", cold)
     expect(code == 0, f"18: linked build failed: {stderr}")
-    expect("cold" in summary(stderr), f"18: linked placement reused the real placement's slot: {summary(stderr)}")
+    linked_slot, linked_state = perm.slot_state(stderr)
+    expect(
+        linked_state == "cold",
+        f"18: the linked placement reused the real placement's slot: {summary(stderr)}",
+    )
+    expect(
+        linked_slot != real_slot,
+        f"18: the placement change reused slot {real_slot} ({real_state}); a distinct key needs its own slot",
+    )
     slots_after = sorted(os.listdir(slots_dir))
     expect(
         set(slots_before).issubset(set(slots_after)),
