@@ -481,8 +481,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // own device is kept for every child; otherwise the command gets one
     // Oxide-owned directory inside the held slot. The choice is made before
     // any writer starts and published through the shared child environment.
-    let slot_dir = held.build_dir.parent().map(std::path::Path::to_path_buf);
-    let chosen_temp = match slot_dir.as_deref() {
+    // The slot directory is the build directory's parent; a command whose
+    // children can be given neither a qualified inherited directory nor an
+    // owned one refuses here, before any writer starts, instead of leaving
+    // them on the machine default this decision rejected.
+    let chosen_temp = match held.build_dir.parent() {
         Some(slot_dir) => child_temp::choose(
             std::env::var_os("TMPDIR"),
             &store.payload,
@@ -494,11 +497,16 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
                 lease_id: held.lease_id().to_owned(),
             },
         ),
-        None => child_temp::Chosen::Unavailable("the held slot path has no directory".to_owned()),
+        None => Err("the held slot path has no directory".to_owned()),
     };
-    if let Some(warning) = chosen_temp.warning() {
-        eprintln!("oxide: WARNING: {warning}");
-    }
+    let chosen_temp = match chosen_temp {
+        Ok(chosen) => chosen,
+        Err(reason) => {
+            let origin = held.prior.unchanged();
+            store.release(held, origin)?;
+            return Err(reason);
+        }
+    };
     chosen_temp.apply(&mut cargo);
     // The owned directory is a lease property: release removes it after
     // positive writer closure, and a crash keeps it with the held slot.
@@ -588,15 +596,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let measured = held.measured.clone();
-    let mut notes = [
-        gate.describe(),
-        wrapper_note,
-        output_note,
-        chosen_temp.note(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let mut notes = [gate.describe(), wrapper_note, output_note]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    notes.push(chosen_temp.note());
     if selection_mode == Some(removable::DriveMode::Permanent) {
         if let Some(reason) = fallback_reason.as_deref() {
             notes.push(format!(
@@ -646,6 +650,19 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             &chosen_temp,
         );
     }
+    // An unconverted `run` releases its lease and then replaces this process
+    // with the program, which is still an Oxide-launched child. It gets the
+    // same chosen temporary directory: an inherited one outlives the lease,
+    // and an owned one still has a live writer (the program), so it is kept
+    // rather than removed here. A later lease of this slot incarnation
+    // reconciles it, and whole-slot eviction removes it with the slot.
+    let program_temp = run
+        && stopped.is_none()
+        && matches!(&outcome, Ok((Some(status), Some(Ok(_)))) if status.success());
+    let kept_scratch = program_temp && chosen_temp.owned().is_some();
+    if kept_scratch {
+        held.scratch = None;
+    }
     store.release(held, origin)?;
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
@@ -681,13 +698,21 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     if !run || !status.success() {
         return Ok(process::exit_code(status));
     }
+    if kept_scratch {
+        eprintln!(
+            "oxide: the run program keeps this command's temporary directory; the next command in this slot reconciles it"
+        );
+    }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
-            // Lease released: the program runs from the private target dir.
-            let error = Command::new(&program)
+            // Lease released: the program runs from the private target dir,
+            // with the same chosen temporary directory as Cargo had.
+            let mut command = Command::new(&program);
+            command
                 .args(&invocation.program_args)
-                .env("CARGO_MANIFEST_DIR", manifest_dir)
-                .exec();
+                .env("CARGO_MANIFEST_DIR", manifest_dir);
+            chosen_temp.apply(&mut command);
+            let error = command.exec();
             Err(format!("could not execute {}: {error}", program.display()))
         }
         Err(message) => {

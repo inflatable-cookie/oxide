@@ -18,34 +18,44 @@ and the three alias variables, and write a marker into that directory.
 Cases (each one is a real child, nothing is simulated):
 
 1. premise and oracle sweep: the observation method is proved against plain
-   `cargo` first (its build script reports the inherited directory), then
-   `oxide --version`, an unknown subcommand pass-through and `oxide run` are
-   shown to leave no scratch behind; the script's own `TMPDIR` is not inside
-   the fixture pool (a void premise fails).
-2. same-device inherited `TMPDIR` kept: the child reports it, no Oxide
-   directory is created, and a planted file inside it is untouched after the
-   command.
-3. absent, unwritable and symlink-escaping inherited directories are replaced
-   by one owned directory; a file and a relative path are replaced too.
-4. aliases: `TMPDIR`, `TMP` and `TEMP` all follow the chosen value, not the
-   caller's other values.
-5. the owned directory is observed on the selected pool while a gated writer
-   holds it; `status --measure` counts it once with a hard-linked pair; the
-   writer's marker is inside it.
-6. normal release removes it; `status --measure` then reports the slot without
-   it.
-7. a crash with a surviving writer group keeps the directory and the slot; the
+   `cargo` first, then `oxide --version` and an effect-free pass-through are
+   shown to allocate nothing; the script's own `TMPDIR` is not inside the
+   fixture pool (a void premise fails).
+2. same-volume inherited `TMPDIR` kept: the child reports the canonical
+   directory, no Oxide directory is created, and a planted file inside it is
+   untouched after the command.
+3. absent, file, relative, unwritable, other-device and symlink-escaping
+   inherited directories are replaced by one owned directory.
+4. an existing **relative** `TMPDIR` resolves against the parent's working
+   directory and reaches the child as the canonical absolute path, so a child
+   that changes directory still uses the qualified directory; a relative
+   value that does not resolve is replaced.
+5. aliases: `TMPDIR`, `TMP` and `TEMP` all follow the chosen value, never the
+   caller's conflicting values.
+6. the owned directory is observed on the selected pool while a gated writer
+   holds it; `status --measure` counts a hard-linked pair once (asserted
+   against the measured slot figure, not a vacuous bound); the writer's marker
+   is inside it.
+7. normal release removes it; the released slot keeps none.
+8. a crash with a surviving writer group keeps the directory and the slot; the
    positive dead-group recovery deletes the slot whole and the next command
    reuses the pool.
-8. a foreign entry and a link in the scratch position are refused and kept,
-   never followed or deleted; the child keeps the machine default then.
-9. one owned 128 MiB scratch APFS image registered as the removable pool: the
-   child's temporary files land on the image, the inherited `/private/tmp`
-   (another device) is replaced, release removes the directory, and after an
-   ordinary detach the internal pool's own scratch is used with no stale
-   `/Volumes/<name>` directory created. With an inherited same-device
-   `TMPDIR`, the fallback keeps it and creates nothing.
-10. the longest injected path is reported in bytes and characters against the
+9. `oxide test`, `oxide exec -- <tool>` and `oxide run` children each observe
+   the chosen directory: a test binary asserts the prefix it was given, the
+   fake exec tool records `$TMPDIR`, and the run program reports and writes
+   into it. An owned directory a released `run` program is still using is kept
+   until the next command in that slot incarnation reconciles it.
+10. a foreign entry and a link in the scratch position refuse the command
+    without following, deleting or spawning anything, and the entry is kept;
+    an over-bound derived path refuses the command rather than leaving the
+    child on the machine default.
+11. one owned 128 MiB scratch APFS image registered as the removable pool: the
+    child's temporary files land on the image, the inherited `/private/tmp`
+    (another device) is replaced, release removes the directory, and after an
+    ordinary detach the internal pool's own scratch is used with no stale
+    `/Volumes/<name>` directory created. With an inherited same-device
+    `TMPDIR`, the fallback keeps it and creates nothing.
+12. the longest injected path is reported in bytes and characters against the
     91-byte socket bound.
 
 `--plan` prints the allocation and cases and touches nothing. No live pool,
@@ -57,10 +67,9 @@ supervisor's scratch.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
+import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -95,13 +104,15 @@ def plan() -> None:
 
 CASE_NAMES = [
     "premise and oracle sweep",
-    "same-device inherited TMPDIR kept",
-    "absent, unwritable and symlink-escaping TMPDIR replaced",
+    "same-volume inherited TMPDIR kept canonically",
+    "unusable inherited TMPDIR replaced",
+    "existing relative TMPDIR resolved canonically",
     "aliases follow the chosen value",
     "owned scratch observed while held, hard link counted once",
     "normal release removes the owned scratch",
     "crash with a surviving group keeps it; recovery deletes the slot whole",
-    "foreign and linked scratch position refused and kept",
+    "test, exec and run children observe the chosen directory",
+    "foreign, linked and over-bound positions refuse",
     "removable image and absent-volume internal fallback",
     "longest injected path against the socket bound",
 ]
@@ -266,9 +277,17 @@ fn main() {
 TEST_RS = r'''
 #[test]
 fn reports_the_child_temporary_directory() {
-    println!("OXIDE-TEMP test={}", std::env::temp_dir().display());
     let dir = std::env::temp_dir();
+    println!("OXIDE-TEMP test={}", dir.display());
     std::fs::write(dir.join("test-marker"), b"test").expect("marker");
+    if let Ok(prefix) = std::env::var("TEMP_EXPECT_PREFIX") {
+        assert!(
+            dir.starts_with(&prefix),
+            "the test binary's temporary directory {} is not under {}",
+            dir.display(),
+            prefix
+        );
+    }
 }
 '''
 
@@ -437,16 +456,38 @@ def premise_sweep(world: World, crate: str) -> None:
     )
 
 
+def canonical(path: str) -> str:
+    return os.path.realpath(path)
+
+
+def slot_id_of(slot: str) -> str:
+    return os.path.basename(slot).rsplit("-", 1)[-1]
+
+
+def measured_slot_bytes(text: str, slot_id: str) -> int:
+    """The measured allocated figure for one slot, from `status --measure`."""
+    for line in text.splitlines():
+        if not re.match(rf"\s+slot {re.escape(slot_id)} ", line):
+            continue
+        match = re.search(r"([0-9]+) (KiB|MiB) allocated", line)
+        expect(match is not None, f"no measured figure in {line!r}")
+        value = int(match.group(1))
+        return value * (1024 if match.group(2) == "KiB" else 1024 * 1024)
+    fail(f"no measured line for slot {slot_id} in the status output")
+
+
 def inherited_kept(world: World, crate: str) -> None:
     case(CASE_NAMES[1])
     inherited = private_dir(os.path.join(world.pool, "inherited-tmp"))
     keep = os.path.join(inherited, "effigy-evidence")
     write_private(keep, "retained")
-    env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
-    result = world.run(["check"], cwd=crate, env=env)
+    result = world.run(
+        ["check"], cwd=crate, env=world.env(TMPDIR=inherited, TMP=None, TEMP=None)
+    )
+    observed = reported(result.stderr, "dir")
     expect(
-        reported(result.stderr, "dir") in (inherited, inherited + "/"),
-        f"the child did not keep the inherited directory: {result.stderr[-1500:]}",
+        observed.rstrip("/") == canonical(inherited),
+        f"the child did not keep the canonical inherited directory: {observed}",
     )
     expect(
         not any(os.path.exists(path) for path in world.scratch_dirs()),
@@ -460,12 +501,14 @@ def inherited_kept(world: World, crate: str) -> None:
         "temp: inherited" in result.stderr,
         f"the summary did not name the inherited directory: {result.stderr[-1000:]}",
     )
-    summary = [
-        line for line in result.stderr.splitlines() if "temp: inherited" in line
-    ][-1]
+    summary = [line for line in result.stderr.splitlines() if "temp: inherited" in line][-1]
     expect(
-        len(summary.encode()) < 4096 and "\n" not in summary,
+        len(summary.encode()) < 4096,
         "the temp fragment is not one bounded line",
+    )
+    expect(
+        canonical(inherited) in summary,
+        f"the summary did not name the canonical directory: {summary}",
     )
 
 
@@ -485,7 +528,9 @@ def replaced(world: World, crate: str) -> None:
             ("absent", missing),
             ("file", file_path),
             ("relative", "relative/tmp"),
-            ("escaping link", escape),
+            ("unwritable", closed),
+            ("symlink escape", escape),
+            ("other device", world.scratch),
         ):
             result = world.run(["check"], cwd=crate, env=world.env(TMPDIR=value))
             observed = reported(result.stderr, "dir")
@@ -499,15 +544,63 @@ def replaced(world: World, crate: str) -> None:
                 f"{label}: the summary did not name the owned scratch",
             )
             expect(
-                not os.path.exists(observed),
+                not os.path.exists(observed.rstrip("/")),
                 f"{label}: the owned directory survived a healthy release",
             )
+        # The unwritable inherited directory itself is never removed.
+        expect(os.path.isdir(closed), "Oxide removed an inherited directory")
     finally:
         os.chmod(closed, 0o700)
 
 
-def aliases(world: World, crate: str) -> None:
+def relative_inherited(world: World, crate: str) -> None:
     case(CASE_NAMES[3])
+    relative = private_dir(os.path.join(crate, "rel-tmp"))
+    keep = os.path.join(relative, "keep")
+    write_private(keep, "relative")
+    # The parent's working directory is the crate, so `rel-tmp` names the
+    # fixture directory. A child that changed directory would resolve the raw
+    # text somewhere else; the canonical absolute path cannot.
+    result = world.run(
+        ["check"], cwd=crate, env=world.env(TMPDIR="rel-tmp", TMP=None, TEMP=None)
+    )
+    observed = reported(result.stderr, "dir")
+    expect(
+        os.path.isabs(observed),
+        f"the child was given a relative path: {observed}",
+    )
+    expect(
+        observed.rstrip("/") == canonical(relative),
+        f"the relative TMPDIR was not resolved canonically: {observed}",
+    )
+    expect(
+        open(keep, encoding="utf-8").read() == "relative",
+        "the relative inherited directory's content changed",
+    )
+    expect(
+        not any(os.path.exists(path) for path in world.scratch_dirs()),
+        "Oxide created its own directory for a relative inherited value",
+    )
+    expect(
+        "temp: inherited" in result.stderr,
+        "the summary did not name the relative inherited directory",
+    )
+    # A relative value that does not resolve anywhere is replaced.
+    replaced_run = world.run(
+        ["check"],
+        cwd=crate,
+        env=world.env(TMPDIR="missing-rel", TMP=None, TEMP=None),
+    )
+    observed = reported(replaced_run.stderr, "dir")
+    held_by_pool(world, observed)
+    expect(
+        os.path.basename(observed.rstrip("/")) == "scratch",
+        f"an unresolved relative value was not replaced: {observed}",
+    )
+
+
+def aliases(world: World, crate: str) -> None:
+    case(CASE_NAMES[4])
     inherited = private_dir(os.path.join(world.pool, "alias-tmp"))
     env = world.env(
         TMPDIR=inherited,
@@ -521,13 +614,29 @@ def aliases(world: World, crate: str) -> None:
         f"the aliases did not follow one chosen value: {names}",
     )
     expect(
-        names["TMPDIR"].rstrip("/") == inherited,
+        names["TMPDIR"].rstrip("/") == canonical(inherited),
         f"the aliases did not follow the inherited TMPDIR: {names}",
     )
+    # The same, in the owned branch.
+    owned = world.run(
+        ["check"],
+        cwd=crate,
+        env=world.env(
+            TMPDIR=None,
+            TMP=os.path.join(world.root, "elsewhere-tmp"),
+            TEMP=os.path.join(world.root, "third-tmp"),
+        ),
+    )
+    names = reported_aliases(owned.stderr)
+    expect(
+        names["TMPDIR"] == names["TMP"] == names["TEMP"],
+        f"the aliases did not follow the owned directory: {names}",
+    )
+    held_by_pool(world, names["TMPDIR"])
 
 
 def accounting(world: World, crate: str) -> None:
-    case(CASE_NAMES[4])
+    case(CASE_NAMES[5])
     gate = os.path.join(world.root, "release")
     if os.path.exists(gate):
         os.unlink(gate)
@@ -540,6 +649,7 @@ def accounting(world: World, crate: str) -> None:
         stderr=subprocess.PIPE,
         text=True,
     )
+    scratch = ""
     try:
         expect(child.stderr is not None, "no stderr pipe")
         holding = False
@@ -556,20 +666,24 @@ def accounting(world: World, crate: str) -> None:
         expect(holding, "the gated writer never reported holding the slot")
         observed = reported("".join(lines), "dir")
         held_by_pool(world, observed)
+        scratch = observed.rstrip("/")
         expect(
-            os.path.basename(observed.rstrip("/")) == "scratch",
+            os.path.basename(scratch) == "scratch",
             f"the unset TMPDIR did not become the owned scratch: {observed}",
         )
-        scratch = observed.rstrip("/")
-        expect(os.path.isdir(scratch), "the owned directory is not a directory")
         expect(
             os.path.isfile(os.path.join(scratch, "held-marker")),
             "the writer's marker is not inside the owned directory",
         )
-        # `status --measure` observes the same bytes without reconciling.
-        measure_env = self_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+        # 16 MiB of unique data plus a hard link to one 8 MiB file: a walk
+        # that counted the link twice would measure at least 24 MiB.
+        for name in ("first", "second"):
+            with open(os.path.join(scratch, name), "wb") as handle:
+                handle.write(b"x" * (8 * MIB))
+        os.link(os.path.join(scratch, "first"), os.path.join(scratch, "first-link"))
+        slot = os.path.dirname(scratch)
         measured = world.run(
-            ["status", "--measure"], cwd=crate, env=measure_env, check=False
+            ["status", "--measure"], cwd=crate, env=world.env(), check=False
         )
         expect(
             measured.returncode == 0,
@@ -579,13 +693,24 @@ def accounting(world: World, crate: str) -> None:
             "temp: oxide" in measured.stdout,
             f"measured status did not name the pool scratch: {measured.stdout[-1500:]}",
         )
-        held_bytes = children_bytes(scratch)
-        expect(held_bytes >= MIB, "the writer's 1 MiB marker is missing")
-        # A hard-linked pair counts once: 1 MiB written, 1 MiB counted.
-        slot_bytes = world.slot_bytes()
+        figure = measured_slot_bytes(measured.stdout, slot_id_of(slot))
+        say(f"measured slot {slot_id_of(slot)}: {figure} bytes for 16 MiB unique")
         expect(
-            slot_bytes < held_bytes + 8 * MIB,
-            f"a hard-linked pair was counted twice ({slot_bytes} bytes for {held_bytes})",
+            figure >= 16 * MIB,
+            f"the measured figure {figure} is below the 16 MiB written",
+        )
+        expect(
+            figure < 24 * MIB,
+            f"the hard-linked pair was counted twice ({figure} bytes for 16 MiB unique)",
+        )
+        expect(
+            not os.path.exists(os.path.join(scratch, "first-link")) is False,
+            "the hard link is missing",
+        )
+        # The measured status reconciled nothing.
+        expect(
+            os.path.isfile(os.path.join(scratch, "held-marker")),
+            "status --measure removed the held scratch",
         )
     finally:
         write_private(gate, "")
@@ -605,7 +730,7 @@ def accounting(world: World, crate: str) -> None:
 
 
 def crash_and_recovery(world: World, crate: str) -> None:
-    case(CASE_NAMES[6])
+    case(CASE_NAMES[7])
     gate = os.path.join(world.root, "crash-release")
     if os.path.exists(gate):
         os.unlink(gate)
@@ -620,6 +745,7 @@ def crash_and_recovery(world: World, crate: str) -> None:
         start_new_session=True,
     )
     scratch = ""
+    slot = ""
     try:
         expect(child.stderr is not None, "no stderr pipe")
         lines: list[str] = []
@@ -671,35 +797,93 @@ def crash_and_recovery(world: World, crate: str) -> None:
             child.wait(timeout=10)
 
 
-def foreign(world: World, crate: str) -> None:
-    case(CASE_NAMES[7])
+def spawns(world: World, crate: str) -> None:
+    case(CASE_NAMES[8])
+    # An inherited directory reaches every child.
+    inherited = private_dir(os.path.join(world.pool, "spawn-tmp"))
+    env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
+    tested = world.run(["test"], cwd=crate, env=dict(env, TEMP_EXPECT_PREFIX=inherited))
+    expect(
+        "test result: ok" in tested.stderr,
+        f"oxide test did not pass: {tested.stderr[-1500:]}",
+    )
+    tool = world.run(
+        ["exec", "--", "/bin/sh", "-c", 'printf "%s\\n%s\\n%s" "$TMPDIR" "$TMP" "$TEMP"'],
+        cwd=crate,
+        env=env,
+    )
+    lines = [line.strip() for line in tool.stdout.splitlines() if line.strip()]
+    expect(
+        {line.rstrip("/") for line in lines} == {canonical(inherited)},
+        f"the exec tool did not inherit the chosen directory: {lines}",
+    )
+    ran = world.run(["run"], cwd=crate, env=env)
+    expect(
+        reported(ran.stdout, "run").rstrip("/") == canonical(inherited),
+        f"the run program did not inherit the chosen directory: {ran.stdout[-1000:]}",
+    )
+    # The owned branch reaches the same children, and a released run program
+    # keeps its directory until the next command reconciles it.
+    owned_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+    prefix = os.path.join(os.path.realpath(world.pool), "payload")
+    world.run(["test"], cwd=crate, env=dict(owned_env, TEMP_EXPECT_PREFIX=prefix))
+    tool = world.run(
+        ["exec", "--", "/bin/sh", "-c", 'printf "%s" "$TMPDIR"'],
+        cwd=crate,
+        env=owned_env,
+    )
+    held_by_pool(world, tool.stdout.strip())
+    ran = world.run(["run"], cwd=crate, env=owned_env)
+    observed = reported(ran.stdout, "run").rstrip("/")
+    held_by_pool(world, observed)
+    expect(
+        os.path.isdir(observed),
+        "the run program's owned directory was removed before it ran",
+    )
+    expect(
+        os.path.isfile(os.path.join(observed, "run-marker")),
+        "the run program did not write into its owned directory",
+    )
+    expect(
+        "keeps this command's temporary directory" in ran.stderr,
+        f"the kept directory was not reported: {ran.stderr[-1000:]}",
+    )
+    # The next command in that slot incarnation reconciles it.
+    world.run(["check"], cwd=crate, env=owned_env)
+    expect(
+        not os.path.exists(observed),
+        "the released run program's directory was not reconciled",
+    )
+
+
+def refusals(world: World, crate: str) -> None:
+    case(CASE_NAMES[9])
     outside = private_dir(os.path.join(world.root, "outside"))
     keep = os.path.join(outside, "keep")
     write_private(keep, "foreign")
-    result = world.run(
-        ["check"], cwd=crate, env=world.env(TMPDIR=None, TMP=None, TEMP=None)
-    )
-    held_by_pool(world, reported(result.stderr, "dir"))
+    world.run(["check"], cwd=crate, env=world.env(TMPDIR=None, TMP=None, TEMP=None))
     slot = world.slot_roots()[0]
     scratch = os.path.join(slot, "scratch")
-    # Plant a link in the owned position: the next command must neither
-    # follow it nor delete it, and the child keeps the machine default.
+    # A link in the owned position: refuse, never follow, keep the target.
     os.symlink(outside, scratch)
     try:
-        replaced_run = world.run(
+        refused = world.run(
             ["check"],
             cwd=crate,
             env=world.env(TMPDIR=None, TMP=None, TEMP=None),
             check=False,
         )
-        observed = reported(replaced_run.stderr, "dir")
         expect(
-            os.path.realpath(observed) != os.path.realpath(outside),
-            "Oxide followed a link in the owned position",
+            refused.returncode != 0,
+            "Oxide accepted a link in the owned position",
         )
         expect(
-            "WARNING" in replaced_run.stderr,
-            f"the refused link was not reported: {replaced_run.stderr[-1500:]}",
+            "real directory" in refused.stderr,
+            f"the linked position was not named: {refused.stderr[-1500:]}",
+        )
+        expect(
+            "OXIDE-TEMP dir=" not in refused.stderr,
+            "a child ran with an unqualified temporary directory",
         )
         expect(os.path.islink(scratch), "the foreign link was removed")
         expect(
@@ -709,10 +893,57 @@ def foreign(world: World, crate: str) -> None:
     finally:
         if os.path.islink(scratch):
             os.unlink(scratch)
+    # A foreign directory in the owned position: refuse and keep it.
+    private_dir(scratch)
+    write_private(os.path.join(scratch, "not-ours"), "keep")
+    refused = world.run(
+        ["check"],
+        cwd=crate,
+        env=world.env(TMPDIR=None, TMP=None, TEMP=None),
+        check=False,
+    )
+    expect(refused.returncode != 0, "Oxide accepted a foreign scratch directory")
+    expect(
+        "marker" in refused.stderr,
+        f"the missing ownership marker was not named: {refused.stderr[-1500:]}",
+    )
+    expect(
+        "OXIDE-TEMP dir=" not in refused.stderr,
+        "a child ran with an unqualified temporary directory",
+    )
+    expect(
+        open(os.path.join(scratch, "not-ours"), encoding="utf-8").read() == "keep",
+        "the foreign entry was changed",
+    )
+    shutil.rmtree(scratch)
+    # An over-bound derived path refuses instead of leaving the child on the
+    # machine default.
+    long_pool = private_dir(os.path.join(world.root, "nested" * 8, "pool"))
+    refused = world.run(
+        ["check"],
+        cwd=crate,
+        env=world.env(
+            TMPDIR=None,
+            TMP=None,
+            TEMP=None,
+            OXIDE_POOL=long_pool,
+            OXIDE_POOL_CAP="64MiB",
+        ),
+        check=False,
+    )
+    expect(refused.returncode != 0, "Oxide accepted an over-bound scratch path")
+    expect(
+        "Unix-socket bound" in refused.stderr,
+        f"the over-bound path was not named: {refused.stderr[-1500:]}",
+    )
+    expect(
+        "OXIDE-TEMP dir=" not in refused.stderr,
+        "a child ran with an unqualified temporary directory",
+    )
 
 
 def removable(world: World, crate: str) -> None:
-    case(CASE_NAMES[8])
+    case(CASE_NAMES[10])
     if sys.platform != "darwin":
         say("not macOS: no removable fixture, the internal pool stands")
         return
@@ -764,6 +995,9 @@ def removable(world: World, crate: str) -> None:
             cwd=crate,
             env=world.env(),
         )
+        # The inherited fixture scratch is on another device, so the
+        # removable build's children must get the owned directory on the
+        # image instead.
         result = world.run(["check"], cwd=crate, env=world.env())
         observed = reported(result.stderr, "dir")
         expect(
@@ -774,7 +1008,7 @@ def removable(world: World, crate: str) -> None:
         )
         expect(
             os.path.realpath(observed).startswith(os.path.realpath(mount) + os.sep),
-            f"the inherited /private/tmp was not replaced: {observed}",
+            f"the inherited other-device directory was not replaced: {observed}",
         )
         expect(
             "temp: oxide" in result.stderr,
@@ -794,6 +1028,7 @@ def removable(world: World, crate: str) -> None:
             detached.returncode == 0, f"ordinary detach failed: {detached.stderr}"
         )
         expect(not os.path.exists(mount), f"the mount point {mount} was recreated")
+        internal = os.path.join(world.root, "internal-pool")
         fallback = world.run(
             ["check"],
             cwd=crate,
@@ -801,21 +1036,21 @@ def removable(world: World, crate: str) -> None:
                 TMPDIR=None,
                 TMP=None,
                 TEMP=None,
-                OXIDE_POOL=os.path.join(world.root, "internal-pool"),
+                OXIDE_POOL=internal,
                 OXIDE_POOL_CAP="64MiB",
             ),
         )
         observed = reported(fallback.stderr, "dir")
         expect(
             os.path.realpath(observed).startswith(
-                os.path.realpath(os.path.join(world.root, "internal-pool")) + os.sep
+                os.path.realpath(os.path.join(internal, "payload")) + os.sep
             ),
             f"the fallback did not use the internal pool's scratch: {observed}",
         )
         expect(not os.path.exists(mount), f"the fallback recreated {mount}")
         # With a same-device inherited TMPDIR the fallback keeps it and
         # creates nothing.
-        inherited = private_dir(os.path.join(world.root, "internal-pool", "keep-tmp"))
+        inherited = private_dir(os.path.join(internal, "keep-tmp"))
         kept = world.run(
             ["check"],
             cwd=crate,
@@ -823,15 +1058,15 @@ def removable(world: World, crate: str) -> None:
                 TMPDIR=inherited,
                 TMP=None,
                 TEMP=None,
-                OXIDE_POOL=os.path.join(world.root, "internal-pool"),
+                OXIDE_POOL=internal,
                 OXIDE_POOL_CAP="64MiB",
             ),
         )
         expect(
-            reported(kept.stderr, "dir").rstrip("/") == inherited,
+            reported(kept.stderr, "dir").rstrip("/") == canonical(inherited),
             f"the fallback did not keep the same-device inherited directory: {kept.stderr[-1500:]}",
         )
-        slots = os.path.join(world.root, "internal-pool", "payload", "slots")
+        slots = os.path.join(internal, "payload", "slots")
         for root, _, _ in os.walk(slots):
             expect(
                 not os.path.exists(os.path.join(root, "scratch")),
@@ -845,7 +1080,7 @@ def removable(world: World, crate: str) -> None:
 
 
 def path_bound(world: World, crate: str) -> None:
-    case(CASE_NAMES[9])
+    case(CASE_NAMES[11])
     env = world.env(TMPDIR=None, TMP=None, TEMP=None)
     result = world.run(["check"], cwd=crate, env=env)
     observed = reported(result.stderr, "dir").rstrip("/")
@@ -881,15 +1116,17 @@ def main(argv: list[str]) -> int:
     premise_sweep(world, crate)
     inherited_kept(world, crate)
     replaced(world, crate)
+    relative_inherited(world, crate)
     aliases(world, crate)
     accounting(world, crate)
-    case(CASE_NAMES[5])
+    case(CASE_NAMES[6])
     expect(
         not any(os.path.exists(path) for path in world.scratch_dirs()),
-        "the released slot kept an owned directory",
+        "a released slot kept an owned directory",
     )
     crash_and_recovery(world, crate)
-    foreign(world, crate)
+    spawns(world, crate)
+    refusals(world, crate)
     removable(world, crate)
     path_bound(world, crate)
     print(

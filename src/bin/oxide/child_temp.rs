@@ -5,17 +5,21 @@
 //!
 //! - an inherited `TMPDIR` that canonically resolves to an existing,
 //!   user-writable directory on the same device as the selected pool is
-//!   retained for every child, and nothing of Oxide's is created or cleaned;
+//!   retained for every child as that **canonical** directory, and nothing of
+//!   Oxide's is created or cleaned;
 //! - otherwise the command gets one Oxide-owned directory inside the held
 //!   slot (`<slot>/scratch`), created and removed under the exclusive lease,
-//!   after positive writer closure.
+//!   after positive writer closure. If that directory cannot be prepared the
+//!   command refuses before spawning: it never falls back to the machine
+//!   default this decision rejected.
 //!
-//! `TMPDIR`, `TMP` and `TEMP` are set to the chosen value on every child
+//! `TMPDIR`, `TMP` and `TEMP` are all set to the chosen value on every child
 //! Oxide launches for a leased command, so descendants (test and `run`
-//! programs, build scripts, tools under `oxide exec`) inherit it. Oxide never
-//! writes management data into, or removes, an inherited directory: it is not
-//! Oxide's, and the owning tool keeps its own retention rules. Effect-free
-//! commands (plain passthrough, probes, `status`) create nothing.
+//! programs, build scripts, tools under `oxide exec`) inherit it and no
+//! conflicting alias survives. Oxide never writes management data into, or
+//! removes, an inherited directory: it is not Oxide's, and the owning tool
+//! keeps its own retention rules. Effect-free commands (plain passthrough,
+//! probes, `status`) create nothing.
 //!
 //! The owned directory is bound to pool identity, slot and incarnation by a
 //! marker file written before any writer starts, so a later lease of the same
@@ -34,6 +38,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::PathBuf;
 
 /// The Oxide-owned directory inside the held slot.
 const SCRATCH_NAME: &str = "scratch";
@@ -69,7 +74,7 @@ impl Identity {
 /// One owned per-command temporary directory.
 #[derive(Clone, Debug)]
 pub(crate) struct Owned {
-    path: std::path::PathBuf,
+    path: PathBuf,
     /// The device the directory was created on; removal refuses another.
     dev: u64,
     identity: Identity,
@@ -82,32 +87,32 @@ impl Owned {
     }
 }
 
-/// What a leased command's children get.
+/// What a leased command's children get. Either answer is published on all
+/// three alias variables, so a child can never inherit a value this decision
+/// rejected.
 #[derive(Clone, Debug)]
 pub(crate) enum Chosen {
-    /// Retained inherited `TMPDIR`, byte for byte. Oxide owns nothing.
-    Inherited(OsString),
+    /// Retained inherited directory, resolved canonically: children always
+    /// get the one directory this decision qualified, never the raw text
+    /// (which a child could resolve against a different working directory).
+    /// Oxide owns nothing in it.
+    Inherited(PathBuf),
     /// Oxide's own per-command directory inside the held slot.
     Oxide(Owned),
-    /// Neither was usable; children keep this machine's default. The reason
-    /// was already reported; the command is not failed for it.
-    Unavailable(String),
 }
 
 impl Chosen {
-    /// The bounded, escaped summary and status fragment, or nothing when the
-    /// contract could not be applied.
-    pub(crate) fn note(&self) -> Option<String> {
+    /// The bounded, escaped summary and status fragment.
+    pub(crate) fn note(&self) -> String {
         match self {
-            Self::Inherited(value) => Some(format!(
+            Self::Inherited(path) => format!(
                 "temp: inherited {}",
-                wrapper::shown(&value.to_string_lossy())
-            )),
-            Self::Oxide(owned) => Some(format!(
+                wrapper::shown(&path.to_string_lossy())
+            ),
+            Self::Oxide(owned) => format!(
                 "temp: oxide {}",
                 wrapper::shown(&owned.path.to_string_lossy())
-            )),
-            Self::Unavailable(_) => None,
+            ),
         }
     }
 
@@ -115,43 +120,37 @@ impl Chosen {
     pub(crate) fn owned(&self) -> Option<Owned> {
         match self {
             Self::Oxide(owned) => Some(owned.clone()),
-            Self::Inherited(_) | Self::Unavailable(_) => None,
+            Self::Inherited(_) => None,
         }
     }
 
-    /// Publish the choice on one child's environment.
+    /// Publish the choice on one child's environment: `TMPDIR`, `TMP` and
+    /// `TEMP` all name the chosen directory, so a conflicting alias never
+    /// survives to the child.
     pub(crate) fn apply(&self, command: &mut std::process::Command) {
         let value: &OsStr = match self {
-            Self::Inherited(value) => value.as_os_str(),
+            Self::Inherited(path) => path.as_os_str(),
             Self::Oxide(owned) => owned.path.as_os_str(),
-            Self::Unavailable(_) => return,
         };
         for name in VARIABLES {
             command.env(name, value);
         }
     }
-
-    /// The one-line warning for an unusable choice, printed once per command.
-    pub(crate) fn warning(&self) -> Option<String> {
-        match self {
-            Self::Unavailable(reason) => Some(format!(
-                "{reason}; child temporary files keep this machine's default"
-            )),
-            Self::Inherited(_) | Self::Oxide(_) => None,
-        }
-    }
 }
 
-/// Choose the child temporary directory for one leased command.
+/// Choose the child temporary directory for one leased command, or refuse.
 ///
 /// `inherited` is the caller's `TMPDIR`, `pool` the selected pool's payload
-/// root (its device is the pool's) and `slot` the held slot directory.
+/// root (its device is the pool's) and `slot` the held slot directory. There
+/// is no third answer on purpose: a command whose children can be given
+/// neither qualified directory refuses before it spawns, rather than quietly
+/// leaving them on the machine default this decision rejected.
 pub(crate) fn choose(
     inherited: Option<OsString>,
     pool: &std::path::Path,
     slot: &std::path::Path,
     identity: Identity,
-) -> Chosen {
+) -> Result<Chosen, String> {
     choose_with(inherited, pool, slot, identity, MAX_SCRATCH_PATH_BYTES)
 }
 
@@ -164,44 +163,31 @@ pub(crate) fn choose_with(
     slot: &std::path::Path,
     identity: Identity,
     bound: usize,
-) -> Chosen {
-    let pool_dev = match fs::metadata(pool) {
-        Ok(meta) => meta.dev(),
-        Err(error) => {
-            return Chosen::Unavailable(format!(
-                "cannot read the selected pool {}: {error}",
-                pool.display()
-            ))
-        }
-    };
+) -> Result<Chosen, String> {
+    let pool_dev = fs::metadata(pool)
+        .map_err(|error| format!("cannot read the selected pool {}: {error}", pool.display()))?
+        .dev();
     if let Some(value) = inherited {
-        if inheritable(&value, pool_dev) {
-            return Chosen::Inherited(value);
+        if let Some(canonical) = inheritable(&value, pool_dev) {
+            return Ok(Chosen::Inherited(canonical));
         }
     }
-    match prepare(slot, pool_dev, &identity, bound) {
-        Ok(owned) => Chosen::Oxide(owned),
-        Err(reason) => Chosen::Unavailable(reason),
-    }
+    prepare(slot, pool_dev, &identity, bound).map(Chosen::Oxide)
 }
 
-/// Whether an inherited `TMPDIR` is kept: it must canonically resolve to an
-/// existing directory that this user can write and that lives on the pool's
-/// own device. No prefix comparison, no mount mutation.
-pub(crate) fn inheritable(value: &OsStr, pool_dev: u64) -> bool {
+/// The inherited directory to keep, resolved canonically, when it is an
+/// existing directory this user can write on the pool's own device. The
+/// canonical form is what children are given, so a relative or symlinked
+/// `TMPDIR` can never be re-resolved against a child's own working
+/// directory. No prefix comparison, no mount mutation.
+pub(crate) fn inheritable(value: &OsStr, pool_dev: u64) -> Option<PathBuf> {
     if value.is_empty() {
-        return false;
+        return None;
     }
-    let Ok(canonical) = fs::canonicalize(value) else {
-        return false;
-    };
-    let Ok(meta) = fs::metadata(&canonical) else {
-        return false;
-    };
-    meta.is_dir() && meta.dev() == pool_dev && writable(&canonical)
+    let canonical = fs::canonicalize(value).ok()?;
+    let meta = fs::metadata(&canonical).ok()?;
+    (meta.is_dir() && meta.dev() == pool_dev && writable(&canonical)).then_some(canonical)
 }
-
-/// Effective-user write access, without touching anything.
 fn writable(path: &std::path::Path) -> bool {
     let Ok(text) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
@@ -323,11 +309,8 @@ fn prepare(
 /// Remove one owned directory after positive writer closure. Returns a
 /// warning instead of failing the command; the slot's own accounting and
 /// deletion are unchanged, so a kept leftover is never counted twice.
-pub(crate) fn discard(owned: &Owned) -> Option<String> {
-    match remove(&owned.path, owned.dev, &owned.identity) {
-        Ok(()) => None,
-        Err(reason) => Some(reason),
-    }
+pub(crate) fn discard(owned: &Owned) -> Result<(), String> {
+    remove(&owned.path, owned.dev, &owned.identity)
 }
 
 /// Remove this command's scratch, refusing anything that is no longer the
@@ -497,10 +480,10 @@ fn effective_uid() -> u32 {
 /// The status line for the selected pool's device, without creating
 /// anything: the decision `choose` would make for a leased command there.
 pub(crate) fn describe(inherited: Option<&OsStr>, pool_dev: u64) -> String {
-    match inherited.filter(|value| inheritable(value, pool_dev)) {
-        Some(value) => format!(
+    match inherited.and_then(|value| inheritable(value, pool_dev)) {
+        Some(path) => format!(
             "temp: inherited {}",
-            wrapper::shown(&value.to_string_lossy())
+            wrapper::shown(&path.to_string_lossy())
         ),
         None => "temp: oxide (per leased command, inside the selected pool's slot)".to_owned(),
     }
@@ -551,15 +534,34 @@ mod tests {
     }
 
     /// The plan under test with a fixture-safe path bound: the ambient
-    /// temporary root is long, and these cases are about ownership and
-    /// lifecycle, not the length limit.
-    fn choose(
+    /// temporary root is long, and these cases are about routing, ownership
+    /// and lifecycle, not the length limit.
+    fn try_pick(
+        inherited: Option<OsString>,
+        pool: &std::path::Path,
+        slot: &std::path::Path,
+        identity: Identity,
+    ) -> Result<Chosen, String> {
+        choose_with(inherited, pool, slot, identity, 4096)
+    }
+
+    fn pick(
         inherited: Option<OsString>,
         pool: &std::path::Path,
         slot: &std::path::Path,
         identity: Identity,
     ) -> Chosen {
-        choose_with(inherited, pool, slot, identity, 4096)
+        try_pick(inherited, pool, slot, identity).expect("the plan under test")
+    }
+
+    /// The plan under test at the product's own path bound.
+    fn pick_bounded(
+        inherited: Option<OsString>,
+        pool: &std::path::Path,
+        slot: &std::path::Path,
+        identity: Identity,
+    ) -> Result<Chosen, String> {
+        choose_with(inherited, pool, slot, identity, MAX_SCRATCH_PATH_BYTES)
     }
 
     fn identity(incarnation: &str, lease: &str) -> Identity {
@@ -575,12 +577,25 @@ mod tests {
         fs::metadata(path).expect("metadata").dev()
     }
 
+    fn envs(command: &std::process::Command) -> Vec<(String, String)> {
+        command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.unwrap_or_default().to_string_lossy().into_owned(),
+                )
+            })
+            .filter(|(name, _)| VARIABLES.contains(&name.as_str()))
+            .collect()
+    }
+
     #[test]
-    fn an_unset_or_unusable_tmpdir_gets_one_owned_directory_in_the_slot() {
+    fn an_unset_tmpdir_gets_one_owned_directory_and_overrides_the_aliases() {
         let fixture = Fixture::new("owned");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
-        let chosen = choose(None, &pool, &slot, identity("1", "lease-a"));
+        let chosen = pick(None, &pool, &slot, identity("1", "lease-a"));
         let owned = chosen.owned().expect("owned directory");
         assert_eq!(owned.path(), slot.join("scratch"));
         assert!(owned.path().is_dir());
@@ -589,141 +604,177 @@ mod tests {
             0o700
         );
         assert_eq!(
-            chosen.note().as_deref(),
-            Some(format!("temp: oxide {}", owned.path().display()).as_str())
+            chosen.note(),
+            format!("temp: oxide {}", owned.path().display())
         );
         let mut command = std::process::Command::new("true");
+        command.env("TMP", "/elsewhere").env("TEMP", "/third");
         chosen.apply(&mut command);
-        let envs: std::collections::HashMap<_, _> = command
-            .get_envs()
-            .map(|(name, value)| {
-                (
-                    name.to_string_lossy().into_owned(),
-                    value.expect("set").to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
+        let seen = envs(&command);
         for name in VARIABLES {
-            assert_eq!(envs.get(name), Some(&owned.path().display().to_string()));
+            assert_eq!(
+                seen.iter()
+                    .find(|(found, _)| found == name)
+                    .map(|(_, value)| value.as_str()),
+                Some(owned.path().to_string_lossy().as_ref()),
+                "{name} does not name the owned directory"
+            );
         }
     }
 
     #[test]
-    fn an_inherited_tmpdir_on_the_pool_device_is_retained_and_never_owned() {
+    fn an_inherited_directory_on_the_pool_device_is_kept_canonically() {
         let fixture = Fixture::new("inherited");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
         let inherited = pool.join("effigy-run");
         fs::create_dir_all(&inherited).expect("inherited");
-        let value = inherited.clone().into_os_string();
-        let chosen = choose(Some(value.clone()), &pool, &slot, identity("1", "lease-a"));
-        match &chosen {
-            Chosen::Inherited(retained) => assert_eq!(retained, &value),
-            other => panic!("expected the inherited directory, got {other:?}"),
-        }
-        assert!(chosen.owned().is_none());
-        // Nothing was created inside the slot and nothing inside the
-        // inherited directory.
-        assert!(!slot.join(SCRATCH_NAME).exists());
-        assert_eq!(fs::read_dir(&inherited).expect("read").count(), 0);
-        assert!(chosen
-            .note()
-            .as_deref()
-            .is_some_and(|note| note.starts_with("temp: inherited ")));
-        // Aliases follow the chosen value, not their own.
-        let mut command = std::process::Command::new("true");
-        command.env("TMP", "/somewhere/else");
-        chosen.apply(&mut command);
-        let tmp = command
-            .get_envs()
-            .find(|(name, _)| *name == "TMP")
-            .and_then(|(_, value)| value)
-            .map(|value| value.to_owned());
-        assert_eq!(tmp, Some(value));
-    }
-
-    #[test]
-    fn a_tmpdir_on_another_device_missing_or_unwritable_is_replaced() {
-        let fixture = Fixture::new("replaced");
-        let pool = fixture.pool();
-        let slot = fixture.slot(&pool);
-        let other = std::env::temp_dir();
-        // The test scratch root and the pool are normally on one device; an
-        // absent path and an explicit empty value are refused regardless.
-        assert!(!inheritable(OsStr::new(""), device(&pool)));
-        assert!(!inheritable(
-            &pool.join("missing").into_os_string(),
-            device(&pool)
-        ));
-        assert!(!inheritable(OsStr::new("relative/tmp"), device(&pool)));
-        let replaced = choose(
-            Some(pool.join("missing").into_os_string()),
+        fs::write(inherited.join("evidence"), b"retained").expect("evidence");
+        let chosen = pick(
+            Some(inherited.clone().into_os_string()),
             &pool,
             &slot,
             identity("1", "lease-a"),
         );
-        assert!(replaced.owned().is_some());
-        if device(&other) != device(&pool) {
-            assert!(!inheritable(other.as_os_str(), device(&pool)));
-            let other_device = choose(
-                Some(other.clone().into_os_string()),
-                &pool,
-                &slot,
-                identity("1", "lease-a"),
-            );
-            assert!(other_device.owned().is_some());
+        match &chosen {
+            Chosen::Inherited(path) => {
+                assert_eq!(path, &fs::canonicalize(&inherited).expect("canonical"))
+            }
+            other => panic!("expected the inherited directory, got {other:?}"),
         }
-        let unreadable = fixture.0.join("closed");
-        fs::create_dir_all(&unreadable).expect("closed");
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o500)).expect("chmod");
-        let unwritable = inheritable(unreadable.as_os_str(), device(&pool));
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).expect("chmod");
-        assert!(
-            !unwritable,
-            "a directory this user cannot write is replaced"
+        assert!(chosen.owned().is_none());
+        assert!(!slot.join(SCRATCH_NAME).exists());
+        assert_eq!(
+            fs::read_dir(&inherited).expect("read").count(),
+            1,
+            "Oxide wrote into the inherited directory"
         );
+        assert!(chosen.note().starts_with("temp: inherited "));
+        // Aliases follow the chosen value, whatever the caller set.
+        let mut command = std::process::Command::new("true");
+        command.env("TMP", "/somewhere/else");
+        chosen.apply(&mut command);
+        let seen = envs(&command);
+        for name in VARIABLES {
+            assert_eq!(
+                seen.iter()
+                    .find(|(found, _)| found == name)
+                    .map(|(_, value)| value.as_str()),
+                Some(inherited.to_string_lossy().as_ref()),
+                "{name} does not follow the kept directory"
+            );
+        }
     }
 
     #[test]
-    fn a_symlink_escape_is_replaced_but_a_same_device_target_is_kept() {
-        let fixture = Fixture::new("symlink");
+    fn a_symlinked_inherited_value_publishes_the_canonical_directory() {
+        // A `TMPDIR` a child could re-resolve — here through a link, in the
+        // proof through a relative path — must reach children as the one
+        // canonical directory this decision qualified.
+        let fixture = Fixture::new("canonical");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
         let real = pool.join("real-tmp");
         fs::create_dir_all(&real).expect("real");
         let link = fixture.0.join("link");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
-        assert!(inheritable(link.as_os_str(), device(&pool)));
-        let escaped = fixture.0.join("escaped");
-        std::os::unix::fs::symlink(pool.join("absent"), &escaped).expect("symlink");
-        assert!(!inheritable(escaped.as_os_str(), device(&pool)));
-        let chosen = choose(
-            Some(escaped.into_os_string()),
+        assert_eq!(
+            inheritable(link.as_os_str(), device(&pool)),
+            Some(fs::canonicalize(&real).expect("canonical"))
+        );
+        let chosen = pick(
+            Some(link.clone().into_os_string()),
             &pool,
             &slot,
             identity("1", "lease-a"),
         );
-        assert!(chosen.owned().is_some());
+        match &chosen {
+            Chosen::Inherited(path) => {
+                assert_eq!(path, &fs::canonicalize(&real).expect("canonical"));
+                assert_ne!(path, &link, "the raw link text reached the child");
+            }
+            other => panic!("expected the inherited directory, got {other:?}"),
+        }
     }
 
     #[test]
-    fn an_inherited_directory_is_never_written_or_cleaned_by_oxide() {
-        let fixture = Fixture::new("untouched");
+    fn a_rejected_inherited_value_is_replaced_by_the_owned_directory() {
+        let fixture = Fixture::new("replaced");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
-        let inherited = pool.join("effigy-run");
-        fs::create_dir_all(&inherited).expect("inherited");
-        let keep = inherited.join("payload");
-        fs::write(&keep, b"evidence").expect("payload");
-        let chosen = choose(
-            Some(inherited.clone().into_os_string()),
-            &pool,
-            &slot,
-            identity("1", "lease-a"),
+        let other = std::env::temp_dir();
+        assert_eq!(inheritable(OsStr::new(""), device(&pool)), None);
+        assert_eq!(
+            inheritable(&pool.join("missing").into_os_string(), device(&pool)),
+            None
         );
-        assert!(matches!(chosen, Chosen::Inherited(_)));
-        assert_eq!(fs::read(&keep).expect("read"), b"evidence");
-        assert_eq!(fs::read_dir(&inherited).expect("read").count(), 1);
+        assert_eq!(inheritable(OsStr::new("relative/tmp"), device(&pool)), None);
+        let file = pool.join("not-a-dir");
+        fs::write(&file, b"file").expect("file");
+        assert_eq!(inheritable(file.as_os_str(), device(&pool)), None);
+        let closed = fixture.0.join("closed");
+        fs::create_dir_all(&closed).expect("closed");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o500)).expect("chmod");
+        let unwritable = inheritable(closed.as_os_str(), device(&pool));
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert_eq!(
+            unwritable, None,
+            "a directory this user cannot write is replaced"
+        );
+        let escaped = fixture.0.join("escaped");
+        std::os::unix::fs::symlink(pool.join("absent"), &escaped).expect("symlink");
+        assert_eq!(inheritable(escaped.as_os_str(), device(&pool)), None);
+        for value in [
+            pool.join("missing").into_os_string(),
+            OsString::from("relative/tmp"),
+            file.clone().into_os_string(),
+            escaped.into_os_string(),
+        ] {
+            let chosen = pick(Some(value), &pool, &slot, identity("1", "lease-a"));
+            assert!(chosen.owned().is_some(), "not replaced: {chosen:?}");
+        }
+        if device(&other) != device(&pool) {
+            assert_eq!(inheritable(other.as_os_str(), device(&pool)), None);
+        }
+    }
+
+    #[test]
+    fn an_unpreparable_owned_directory_refuses_instead_of_leaving_the_default() {
+        let fixture = Fixture::new("refuse");
+        let pool = fixture.pool();
+        let slot = fixture.slot(&pool);
+        // A path over the socket bound.
+        let long = pool.join("slots").join("x".repeat(40)).join("quick-1");
+        fs::create_dir_all(long.join("build")).expect("slot");
+        match pick_bounded(None, &pool, &long, identity("1", "lease-a")) {
+            Err(reason) => {
+                assert!(reason.contains("Unix-socket bound"), "{reason}");
+                assert!(reason.contains("bytes"), "{reason}");
+            }
+            Ok(other) => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!long.join(SCRATCH_NAME).exists());
+        // A foreign entry and a link in the owned position.
+        let scratch = slot.join(SCRATCH_NAME);
+        fs::create_dir_all(&scratch).expect("scratch");
+        fs::write(scratch.join("not-ours"), b"keep").expect("foreign");
+        match try_pick(None, &pool, &slot, identity("1", "lease-a")) {
+            Err(reason) => assert!(reason.contains("marker"), "{reason}"),
+            Ok(other) => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(fs::read(scratch.join("not-ours")).expect("read"), b"keep");
+        fs::remove_dir_all(&scratch).expect("cleanup");
+
+        let elsewhere = fixture.0.join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let keep = elsewhere.join("keep");
+        fs::write(&keep, b"keep").expect("keep");
+        std::os::unix::fs::symlink(&elsewhere, &scratch).expect("symlink");
+        match try_pick(None, &pool, &slot, identity("1", "lease-a")) {
+            Err(reason) => assert!(reason.contains("real directory"), "{reason}"),
+            Ok(other) => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(fs::read(&keep).expect("read"), b"keep");
     }
 
     #[test]
@@ -731,7 +782,7 @@ mod tests {
         let fixture = Fixture::new("marker");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
-        let chosen = choose(None, &pool, &slot, identity("7", "lease-a"));
+        let chosen = pick(None, &pool, &slot, identity("7", "lease-a"));
         let owned = chosen.owned().expect("owned");
         let text = fs::read_to_string(owned.path().join(OWNER_NAME)).expect("marker");
         let parsed = parse_owner(&text).expect("parse");
@@ -754,22 +805,19 @@ mod tests {
         let fixture = Fixture::new("reconcile");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
-        let first = choose(None, &pool, &slot, identity("1", "lease-a"));
-        let owned = first.owned().expect("owned");
+        let owned = pick(None, &pool, &slot, identity("1", "lease-a"))
+            .owned()
+            .expect("owned");
         fs::write(owned.path().join("leftover"), b"x").expect("leftover");
-        // The lease that created it may remove it; ownership binds to the
-        // slot and incarnation, not to one lease ID.
+        // Ownership binds to the slot and incarnation, not to one lease ID.
         assert!(remove(owned.path(), owned.dev, &identity("1", "lease-b")).is_ok());
         assert!(!owned.path().exists());
 
-        // A second command of the same incarnation creates its own.
-        let again = choose(None, &pool, &slot, identity("1", "lease-b"));
-        let owned = match &again {
-            Chosen::Oxide(owned) => owned.clone(),
-            other => panic!("expected a fresh owned directory, got {other:?}"),
-        };
+        let owned = pick(None, &pool, &slot, identity("1", "lease-b"))
+            .owned()
+            .expect("owned");
         fs::write(owned.path().join("leftover"), b"x").expect("leftover");
-        assert!(discard(&owned).is_none());
+        assert!(discard(&owned).is_ok());
         assert!(!owned.path().exists());
 
         // A leftover bound to another incarnation is refused, not deleted.
@@ -781,129 +829,78 @@ mod tests {
             owner_text(&identity("2", "lease-c")).as_bytes(),
         )
         .expect("marker");
-        match choose(None, &pool, &slot, identity("3", "lease-d")) {
-            Chosen::Unavailable(reason) => {
-                assert!(reason.contains("another slot incarnation"), "{reason}")
-            }
-            other => panic!("expected a refusal, got {other:?}"),
+        match try_pick(None, &pool, &slot, identity("3", "lease-d")) {
+            Err(reason) => assert!(reason.contains("another slot incarnation"), "{reason}"),
+            Ok(other) => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(fs::read(scratch.join("leftover")).expect("read"), b"keep");
 
         // The incarnation that owns it reconciles it as its own.
-        let owned = match choose(None, &pool, &slot, identity("2", "lease-e")) {
-            Chosen::Oxide(owned) => owned,
+        let owned = match try_pick(None, &pool, &slot, identity("2", "lease-e")) {
+            Ok(Chosen::Oxide(owned)) => owned,
             other => panic!("expected reconciliation by the owning incarnation, got {other:?}"),
         };
         assert!(!owned.path().join("leftover").exists());
-        assert!(discard(&owned).is_none());
+        assert!(discard(&owned).is_ok());
         assert!(!owned.path().exists());
     }
 
     #[test]
-    fn a_foreign_entry_in_the_scratch_position_is_kept() {
-        let fixture = Fixture::new("foreign");
-        let pool = fixture.pool();
-        let slot = fixture.slot(&pool);
-        let scratch = slot.join(SCRATCH_NAME);
-        fs::create_dir_all(&scratch).expect("scratch");
-        fs::write(scratch.join("not-ours"), b"keep").expect("foreign");
-        let chosen = choose(None, &pool, &slot, identity("1", "lease-a"));
-        match chosen {
-            Chosen::Unavailable(reason) => {
-                assert!(reason.contains("marker"), "{reason}")
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-        assert_eq!(fs::read(scratch.join("not-ours")).expect("read"), b"keep");
-
-        // A link where the directory belongs is refused, never followed.
-        let fixture = Fixture::new("linked");
-        let pool = fixture.pool();
-        let slot = fixture.slot(&pool);
-        let elsewhere = pool.join("elsewhere");
-        fs::create_dir_all(&elsewhere).expect("elsewhere");
-        fs::write(elsewhere.join("keep"), b"keep").expect("keep");
-        std::os::unix::fs::symlink(&elsewhere, slot.join(SCRATCH_NAME)).expect("symlink");
-        let chosen = choose(None, &pool, &slot, identity("1", "lease-a"));
-        assert!(matches!(chosen, Chosen::Unavailable(_)));
-        assert_eq!(fs::read(elsewhere.join("keep")).expect("read"), b"keep");
-    }
-
-    #[test]
-    fn a_path_over_the_socket_bound_is_reported_not_used() {
-        let fixture = Fixture::new("long");
-        let pool = fixture.pool();
-        let slot = pool.join("slots").join("x".repeat(40)).join("quick-1");
-        fs::create_dir_all(slot.join("build")).expect("slot");
-        let chosen = choose_with(
-            None,
-            &pool,
-            &slot,
-            identity("1", "lease-a"),
-            MAX_SCRATCH_PATH_BYTES,
-        );
-        match chosen {
-            Chosen::Unavailable(ref reason) => {
-                assert!(reason.contains("Unix-socket bound"), "{reason}");
-                assert!(reason.contains("bytes"), "{reason}");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-        assert!(!slot.join(SCRATCH_NAME).exists());
-        assert!(chosen.note().is_none());
-        assert!(chosen
-            .warning()
-            .is_some_and(|text| text.contains("default")));
-    }
-
-    #[test]
-    fn removal_refuses_a_device_that_does_not_match_the_recorded_one() {
+    fn removal_refuses_a_device_or_incarnation_that_does_not_match() {
         let fixture = Fixture::new("device");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
-        let chosen = choose(None, &pool, &slot, identity("1", "lease-a"));
-        let owned = chosen.owned().expect("owned");
-        let wrong = owned.dev.wrapping_add(1);
-        let reason = remove(owned.path(), wrong, &identity("1", "lease-a")).expect_err("refuse");
+        let owned = pick(None, &pool, &slot, identity("1", "lease-a"))
+            .owned()
+            .expect("owned");
+        let wrong_device = owned.dev.wrapping_add(1);
+        let reason = remove(owned.path(), wrong_device, &identity("1", "lease-a"))
+            .expect_err("refuse another device");
         assert!(reason.contains("not on the pool's device"), "{reason}");
+        let reason = remove(owned.path(), owned.dev, &identity("2", "lease-a"))
+            .expect_err("refuse another incarnation");
+        assert!(reason.contains("another slot incarnation"), "{reason}");
         assert!(owned.path().exists());
-        assert!(discard(&owned).is_none());
+        assert!(discard(&owned).is_ok());
         assert!(!owned.path().exists());
     }
 
     #[test]
-    fn a_hard_linked_file_is_removed_once() {
+    fn a_hard_linked_pair_is_removed_once_and_a_link_is_never_followed() {
         let fixture = Fixture::new("hardlink");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
-        let chosen = choose(None, &pool, &slot, identity("1", "lease-a"));
-        let owned = chosen.owned().expect("owned");
+        let owned = pick(None, &pool, &slot, identity("1", "lease-a"))
+            .owned()
+            .expect("owned");
         let first = owned.path().join("a");
         fs::write(&first, b"x").expect("write");
         fs::hard_link(&first, owned.path().join("b")).expect("hard link");
-        assert!(discard(&owned).is_none());
+        let outside = fixture.0.join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        let target = outside.join("keep");
+        fs::write(&target, b"keep").expect("keep");
+        std::os::unix::fs::symlink(&target, owned.path().join("escape")).expect("symlink");
+        assert!(discard(&owned).is_ok());
         assert!(!owned.path().exists());
+        assert_eq!(fs::read(&target).expect("read"), b"keep");
     }
 
     #[test]
-    fn a_slot_on_another_device_or_a_link_is_refused() {
+    fn a_slot_that_is_a_link_or_on_another_device_is_refused() {
         let fixture = Fixture::new("slot");
         let pool = fixture.pool();
         let slot = fixture.slot(&pool);
         let link = fixture.0.join("slot-link");
         std::os::unix::fs::symlink(&slot, &link).expect("symlink");
-        let chosen = choose(None, &pool, &link, identity("1", "lease-a"));
-        match chosen {
-            Chosen::Unavailable(reason) => {
-                assert!(reason.contains("not a real directory"), "{reason}")
-            }
-            other => panic!("expected a refusal, got {other:?}"),
+        match try_pick(None, &pool, &link, identity("1", "lease-a")) {
+            Err(reason) => assert!(reason.contains("not a real directory"), "{reason}"),
+            Ok(other) => panic!("expected a refusal, got {other:?}"),
         }
         let elsewhere = pool.parent().expect("parent").join("other-slot");
         fs::create_dir_all(&elsewhere).expect("other slot");
-        let chosen = choose(None, &pool, &elsewhere, identity("1", "lease-a"));
         if device(&elsewhere) != device(&pool) {
-            assert!(matches!(chosen, Chosen::Unavailable(_)));
+            assert!(try_pick(None, &pool, &elsewhere, identity("1", "lease-a")).is_err());
         }
     }
 
@@ -915,7 +912,10 @@ mod tests {
         fs::create_dir_all(&inherited).expect("inherited");
         assert_eq!(
             describe(Some(inherited.as_os_str()), device(&pool)),
-            format!("temp: inherited {}", inherited.display())
+            format!(
+                "temp: inherited {}",
+                fs::canonicalize(&inherited).expect("canonical").display()
+            )
         );
         assert_eq!(fs::read_dir(&inherited).expect("read").count(), 0);
         assert!(describe(None, device(&pool)).starts_with("temp: oxide"));
@@ -924,19 +924,8 @@ mod tests {
 
     #[test]
     fn the_note_is_one_escaped_bounded_line() {
-        let fixture = Fixture::new("note");
-        let pool = fixture.pool();
-        let slot = fixture.slot(&pool);
-        let chosen = choose(
-            Some(OsString::from("/tmp/with\nnewline")),
-            &pool,
-            &slot,
-            identity("1", "lease-a"),
-        );
-        // Not on the pool device (and not a directory), so it is replaced.
-        assert!(chosen.owned().is_some());
-        let owned = Chosen::Inherited(OsString::from("/some/very/long/\npath"));
-        let note = owned.note().expect("note");
+        let chosen = Chosen::Inherited(PathBuf::from("/some/very/long/\npath"));
+        let note = chosen.note();
         assert!(!note.contains('\n'), "{note}");
         assert!(note.starts_with("temp: inherited /some/very/long/\\npath"));
     }

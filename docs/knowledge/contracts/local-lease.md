@@ -276,11 +276,13 @@ reconciled only for the recorded evicting slot path.
 unique-allocated `(device, inode)` union counts it once with the rest of the
 slot, its capacity walk covers it, and whole-slot eviction, crash recovery
 and lost-volume retirement remove or keep it with the slot they already own.
-Its own ownership marker (pool store identity, slot, incarnation) decides the
-one earlier removal, at release after positive writer closure; an entry that
-marker does not claim is kept and reported, never deleted. An inherited
-`TMPDIR` is outside Oxide's ownership entirely: it is neither accounted as
-the pool's nor removed.
+Its own ownership marker (pool store identity, slot, incarnation) decides
+every earlier removal: at release after positive writer closure, and — for a
+released `run` program that keeps its directory — at the next lease of the
+same incarnation. An entry that marker does not claim is kept and reported,
+never deleted, and a removal that cannot be completed keeps the slot held
+rather than marking it idle. An inherited `TMPDIR` is outside Oxide's
+ownership entirely: it is neither accounted as the pool's nor removed.
 
 **Accounting walks (oxide#108).** Every pool accounting walk uses the same
 pool-specific bounds: 2,000,000 entries, depth 64 below the walked root and a

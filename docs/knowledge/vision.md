@@ -178,10 +178,11 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   controls exist only in debug builds; any other build refuses them.
 - **Temporary files off the internal drive:** a leased command's children
   (tests, run programs, build scripts, `oxide exec` tools) put temporary
-  files on the selected pool. An inherited `TMPDIR` is kept only when it is a
-  writable directory on the pool's own device; otherwise Oxide owns one
-  short per-command directory inside the slot, removed at release after
-  writer closure
+  files on the selected pool. An inherited `TMPDIR` is kept, as its canonical
+  directory, only when it is a writable directory on the pool's own device;
+  otherwise Oxide owns one short per-command directory inside the slot,
+  removed at release after writer closure (a released `run` program's own
+  directory is reconciled by the next command)
   ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It
   covers child launches only: CI, Effigy's own run scratch, Queue worktrees
   and host settings stay as they are.

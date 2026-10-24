@@ -1621,8 +1621,7 @@ impl Store {
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission = self.admission()?;
-        self.discard_scratch(&held);
-        if !self.flush_before_idle(&held.slot_id, held.record)? {
+        if !self.discard_scratch(&held) || !self.flush_before_idle(&held.slot_id, held.record)? {
             return Ok(());
         }
         release(&self.pool, &held.lease_id)
@@ -1644,8 +1643,7 @@ impl Store {
     /// release it and give it back, origin unchanged.
     pub fn unshare(&self, held: Lease) -> Result<(), String> {
         let _admission = self.admission()?;
-        self.discard_scratch(&held);
-        if !self.flush_before_idle(&held.slot_id, held.record)? {
+        if !self.discard_scratch(&held) || !self.flush_before_idle(&held.slot_id, held.record)? {
             return Ok(());
         }
         release(&self.pool, &held.lease_id)
@@ -1669,10 +1667,22 @@ impl Store {
     /// process group empty; a failure is reported and never fails an
     /// otherwise successful command, and the slot's own accounting and
     /// deletion are unchanged, so a kept leftover is never counted twice.
-    fn discard_scratch(&self, held: &Lease) {
-        if let Some(scratch) = held.scratch.as_ref() {
-            if let Some(warning) = crate::child_temp::discard(scratch) {
-                eprintln!("oxide: WARNING: {warning}; the slot's own deletion still reconciles it");
+    /// `false` means the owned directory could not be removed (another
+    /// incarnation's, a foreign entry, an unreadable tree): the slot is not
+    /// marked idle then, exactly as for an unconfirmed group closure, and a
+    /// later command recovers it once its closure and ownership rules pass.
+    fn discard_scratch(&self, held: &Lease) -> bool {
+        let Some(scratch) = held.scratch.as_ref() else {
+            return true;
+        };
+        match crate::child_temp::discard(scratch) {
+            Ok(()) => true,
+            Err(reason) => {
+                eprintln!(
+                    "oxide: {reason}; slot {} stays held, and a later oxide command recovers it once its closure and ownership rules pass",
+                    held.slot_id
+                );
+                false
             }
         }
     }
