@@ -156,19 +156,21 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   with a loud warning when a build falls back to the internal pool.
   `oxide pool describe --json` reports it to other tools.
 - **Final outputs** stay checkout-local by default. Permanent drive mode adds
-  one per-checkout owned `target` link: a fresh checkout with no `target`
-  gets it on its first build, others by explicit adoption. It never moves
-  existing output, and ephemeral mode is unchanged
+  owned output links: a fresh checkout with no `target` gets its first
+  conversion on build, others by explicit adoption. Existing whole-target
+  links migrate only by explicit adoption. It never moves existing output,
+  and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
-- **Owned links at profile directories** (approved v1 direction): a converted
+- **Owned links at profile directories** (v1, operator accepted): a converted
   checkout keeps `target` itself a real directory and owns only the positively
   identified members `debug`, `release`, `<triple>/debug` and
   `<triple>/release`, so tools that mount `target` keep working. An existing
   whole-target link moves only through an explicit `oxide outputs adopt` under
   a durable journal, a real nonempty profile directory is never moved or
   converted, and an undeclared opaque tool refuses instead of guessing. The
-  published default is still the whole-target layout described above; the
-  profile layout's contract, formats and limits are owned by the
+  profile layout is implemented with a known fail-safe detach refusal for
+  host-triple member links and incomplete native coverage. The as-is acceptance,
+  contract, formats and evidence limits are owned by the
   [workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides

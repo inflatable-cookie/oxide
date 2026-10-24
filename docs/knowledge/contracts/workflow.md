@@ -3252,6 +3252,13 @@ become owned links. Cargo's top-level files (`CACHEDIR.TAG`,
 `.rustc_info.json`), `target/tmp` and tool directories such as `target/doc`
 stay real.
 
+**Known detach limitation.** `oxide outputs detach` currently refuses safely
+when an owned host-triple member such as `target/aarch64-apple-darwin/debug`
+is present: it classifies that nested link as foreign and leaves it untouched.
+Detach on non-target checkouts remains as before. Target-member detach and the
+remaining native cases need the separately scoped correction; do not remove
+links or weaken ownership checks to work around this refusal.
+
 - **Members and destinations.** A converted checkout's `target` is real and
   each linked member selects its own approved subpath beneath the shared root
   (`R/debug`, `R/release`, `R/<triple>/debug`, `R/<triple>/release`); the root
@@ -3515,10 +3522,33 @@ a benign ordinary target-root file on its own checkout makes the top-level
 preservation control nonvacuous (a clean of that checkout must refuse the file
 as foreign and succeed after its removal), a real peer checkout receipt for the
 same root proves another reference keeps it, and `CACHEDIR.TAG`/`.rustc_info.json`
-are asserted real only when present. It has NOT
-run: the
-author and reviewer natives are separately counted owner activations, and this
-task's merge hold requires their exact-head receipts.
+are asserted real only when present.
+
+**Evidence and acceptance limits, 2026-10-24.** Tom explicitly accepted source
+`a5020b5d93e3c6d658d2660ab9c0fcb8a7fa641f` as-is after the ninth counted native
+failed; this is operator acceptance, not a native or independent review PASS.
+Independent exact-head source/fit reviews passed. The two author runs and all
+nine counted native attempts remain FAIL with zero PASS; the single uncounted
+diagnostic is spent and is not qualification evidence. Counted attempt 9 ran
+the default proof under guard `961164e7` with the explicit direct physical-host
+exception and quiet-host waiver. It completed 14 distinct cases (11 and 01–14,
+with 11 counted once), then failed case 15 when detach rejected the host-triple
+member link. Cases 16–20 remain unexecuted. The guard reported closed, status 1,
+no fault or deadline, certain empty census, and 97.8 MiB monitored whole-root
+peak within 512 MiB; raw EPERM signal results remain in its receipt. Closure
+does not turn the assertion failure into a PASS. The helper and guard receipts
+are distinct. Tom's final acceptance supersedes the earlier conditional
+full-matrix requirement; it does not report that condition fulfilled. No further
+native is authorized for this accepted task. The target-member detach follow-up
+starts from that failure packet and must exercise cases 15–20, without inheriting
+a proof allowance or claiming they already passed. Historical UNCLOSED runs and
+retained unknown backing stay separate from this closed failure.
+
+The script also has an explicitly opt-in `--diagnostic` collection mode. It
+records recoverable oracle failures and skips dependent or tainted premises,
+while unknown device/writer effects and infrastructure errors abort. Its bounded
+receipt is marked diagnostic and unqualified; it never supplies counted PASS
+or closure credit. The default counted mode remains fail-fast.
 
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
 `scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same
