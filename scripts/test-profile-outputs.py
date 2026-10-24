@@ -568,6 +568,31 @@ def pure_detach_record_control() -> None:
     print("pure detach-failure record control: ok", flush=True)
 
 
+def pure_slot_state_control() -> None:
+    """No-subprocess control for the parsed slot summary (A11). The slot id and
+    the cold/warm state come from the summary LINE, so a path or directory name
+    containing "cold", "warm", "fallback" or "foreign" can never stand in for
+    the state, and a line without a slot is a failure rather than a default."""
+    slot, state = perm.slot_state(
+        "oxide: quick profile, build strategy, slot abc123 cold, 0.6s, new slot, pool total: see oxide status"
+    )
+    expect((slot, state) == ("abc123", "cold"), f"the parsed slot/state changed: {(slot, state)}")
+    slot, state = perm.slot_state(
+        "oxide: quick profile, build strategy, slot zz9 warm, 0.2s, slot zz9 was 1 MiB when leased"
+    )
+    expect((slot, state) == ("zz9", "warm"), f"the parsed warm slot changed: {(slot, state)}")
+    for bad, why in (
+        ("oxide: quick profile built into /tmp/cold-warm/fallback/foreign, 0.6s", "path words only"),
+        ("oxide: quick profile, build strategy, slot abc123, 0.6s", "no state"),
+    ):
+        try:
+            perm.slot_state(bad)
+        except Exception:
+            continue
+        raise AssertionError(f"the slot summary parsed a {why} line")
+    print("pure slot-state control: ok", flush=True)
+
+
 def pure_attachment_facts_control() -> None:
     """No-subprocess control for A10 custody facts: they are written into the
     evidence root, replaced atomically, leave no temporary file behind, and
@@ -862,6 +887,7 @@ def run(proof: Proof, repo: str) -> None:
     pure_registry_controls()
     pure_detach_record_control()
     pure_attachment_facts_control()
+    pure_slot_state_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -2348,6 +2374,7 @@ def main() -> int:
         pure_registry_controls()
         pure_detach_record_control()
         pure_attachment_facts_control()
+        pure_slot_state_control()
         return 0
     if arguments:
         print(USAGE, file=sys.stderr)
