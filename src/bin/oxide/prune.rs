@@ -3903,7 +3903,6 @@ fn verified_group(registry: &Registry, candidate: &Candidate) -> Result<Vec<Grou
     if rows.is_empty() {
         return Err("no registry row references the candidate root".to_owned());
     }
-    let first = rows[0];
     for row in &rows {
         if row.pending
             || row.pruning.is_some()
@@ -3915,23 +3914,50 @@ fn verified_group(registry: &Registry, candidate: &Candidate) -> Result<Vec<Grou
                 row.member
             ));
         }
-        if row.nonce != first.nonce
-            || row.generation != first.generation
-            || row.root_dev != first.root_dev
-            || row.root_ino != first.root_ino
-            || row.marker_digest != first.marker_digest
-            || row.root_kind != first.root_kind
-            || row.volume_uuid != first.volume_uuid
+        // A historical row keeps its OWN recorded facts. Only a row that is
+        // currently selected is part of the checkout's current authority and
+        // therefore has to agree with the root's live identity; requiring
+        // every historical row to match the representative would reject a
+        // legitimate inactive legacy `target` row (no nonce, old digest).
+        if row.nonce.as_deref().is_some_and(|nonce| !is_nonce(nonce))
+            || row
+                .marker_digest
+                .as_deref()
+                .is_some_and(|digest| !hex64(digest))
         {
-            return Err("the root's registry references disagree about its identity".to_owned());
+            return Err(format!(
+                "the registry reference {} carries an unusable recorded identity",
+                row.member
+            ));
         }
     }
-    if first.nonce != candidate.nonce
-        || first.root_dev != Some(candidate.dev)
-        || first.root_ino != Some(candidate.ino)
-        || first.marker_digest.as_deref() != Some(candidate.marker_digest.as_str())
-    {
-        return Err("the root's registry identity changed since the plan".to_owned());
+    // The CURRENT authority is the selected subset. A released or detached
+    // root legitimately has none: its complete group is valid history, and
+    // physical identity is still proven by the observation behind `candidate`.
+    let current: Vec<&Row> = rows.iter().copied().filter(|row| row.selected).collect();
+    if let Some(first) = current.first() {
+        for row in &current {
+            if row.nonce != first.nonce
+                || row.generation != first.generation
+                || row.root_dev != first.root_dev
+                || row.root_ino != first.root_ino
+                || row.marker_digest != first.marker_digest
+                || row.root_kind != first.root_kind
+                || row.volume_uuid != first.volume_uuid
+            {
+                return Err(
+                    "the root's currently selected registry references disagree about its identity"
+                        .to_owned(),
+                );
+            }
+        }
+        if first.nonce != candidate.nonce
+            || first.root_dev != Some(candidate.dev)
+            || first.root_ino != Some(candidate.ino)
+            || first.marker_digest.as_deref() != Some(candidate.marker_digest.as_str())
+        {
+            return Err("the root's registry identity changed since the plan".to_owned());
+        }
     }
     Ok(rows
         .iter()
@@ -3971,30 +3997,64 @@ fn verify_group_receipt(
     if receipt.prepared_ref().is_some() {
         return Err("the checkout receipt has a pending transition".to_owned());
     }
-    let mut receipt_members: Vec<&str> = receipt
+    // Normalize the receipt's current placements and hand them to the pure
+    // comparison. Only the CURRENTLY SELECTED part of the group is the
+    // checkout's current authority; registry-only inactive history is never
+    // invented into the receipt and is not required to appear there.
+    let current: Vec<(String, PathBuf, u64, Option<String>)> = receipt
         .links()
         .iter()
-        .filter(|placement| {
-            placement
-                .selected_ref()
-                .is_some_and(|selected| selected.root() == root)
+        .filter_map(|placement| {
+            placement.selected_ref().map(|selected| {
+                (
+                    placement.member().to_owned(),
+                    selected.root().to_path_buf(),
+                    selected.generation(),
+                    selected.nonce().map(str::to_owned),
+                )
+            })
         })
-        .map(outputs::LinkPlacement::member)
+        .collect();
+    selected_group_mismatch(&current, root, group)
+}
+
+/// The exact rule between a receipt's current references and the recorded
+/// group: the receipt's current members for THIS root must be exactly the
+/// group's SELECTED members, each with the recorded generation and nonce.
+///
+/// Historical rows (an inactive legacy `target`, or any released member) keep
+/// their own recorded facts and are intentionally absent from this comparison,
+/// and a group with no selected row requires the receipt to select nothing for
+/// this root. Kept separate from the receipt type so the rule is unit-tested
+/// without a receipt fixture.
+fn selected_group_mismatch(
+    current: &[(String, PathBuf, u64, Option<String>)],
+    root: &Path,
+    group: &[GroupRow],
+) -> Result<(), String> {
+    let mut receipt_members: Vec<&str> = current
+        .iter()
+        .filter(|(_, receipt_root, _, _)| receipt_root == root)
+        .map(|(member, _, _, _)| member.as_str())
         .collect();
     receipt_members.sort_unstable();
-    let mut group_members: Vec<&str> = group.iter().map(|row| row.member.as_str()).collect();
+    let selected: Vec<&GroupRow> = group.iter().filter(|row| row.selected).collect();
+    let mut group_members: Vec<&str> = selected.iter().map(|row| row.member.as_str()).collect();
     group_members.sort_unstable();
     if receipt_members != group_members {
-        return Err("the checkout receipt's references do not match the recorded group".to_owned());
+        return Err(
+            "the checkout receipt's current references do not match the selected part of the recorded group"
+                .to_owned(),
+        );
     }
-    for row in group {
-        let selected = receipt
-            .selected_for(&row.member)
-            .ok_or_else(|| "the receipt lost a group member".to_owned())?;
-        if selected.root() != root
-            || selected.generation() != row.generation
-            || selected.nonce() != row.nonce.as_deref()
-        {
+    for row in selected {
+        let Some((_, _, generation, nonce)) = current
+            .iter()
+            .find(|(member, receipt_root, _, _)| member == &row.member && receipt_root == root)
+        else {
+            return Err("the receipt lost a selected group member".to_owned());
+        };
+        if *generation != row.generation || nonce.as_deref() != row.nonce.as_deref() {
             return Err(format!(
                 "the receipt's reference for {} disagrees with the recorded group",
                 row.member
@@ -6162,7 +6222,11 @@ mod tests {
                 "generation": 1,
                 "state": "committed",
                 "layout": "profile",
-                "links": [selected("debug"), selected("release")],
+                // `release` is INACTIVE history for this root in the registry
+                // (selected = false), so the receipt's current references are
+                // exactly `debug`. P2 requires that exact agreement; the group
+                // still holds both rows and the rollback restores each role.
+                "links": [selected("debug")],
                 "updated_ms": 1
             }))
             .unwrap(),
@@ -6575,6 +6639,173 @@ mod tests {
         )
         .unwrap());
         assert!(!outputs::receipt_path_public(&control, &second.checkout_id).exists());
+    }
+
+    /// P2: registry-only inactive history stays in the COMPLETE group and is
+    /// never required to agree with the root's current identity. Only the
+    /// currently selected rows are the checkout's current authority.
+    #[test]
+    fn a_group_keeps_inactive_history_beside_current_members() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        // An inactive legacy `target` row preserved as history: no nonce, no
+        // recorded device/ino/marker digest, and not selected.
+        let mut history = debug.clone();
+        history.member = outputs::MEMBER.to_owned();
+        history.nonce = None;
+        history.root_dev = None;
+        history.root_ino = None;
+        history.marker_digest = None;
+        history.selected = false;
+        history.generation = 1;
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 7,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug.clone(), release.clone(), history.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let candidate = candidate_of(&debug);
+        let group = verified_group(&registry, &candidate).unwrap();
+        assert_eq!(
+            group
+                .iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            vec!["debug", "release", "target"]
+        );
+        // Each row keeps its OWN recorded facts and prior role.
+        let target = group.iter().find(|row| row.member == "target").unwrap();
+        assert!(!target.selected, "history must stay unselected");
+        assert_eq!(target.nonce, None, "history keeps its absent nonce");
+        assert_eq!(target.marker_digest, None);
+        assert_eq!(target.root_dev, None);
+        assert!(group.iter().filter(|row| row.selected).count() == 2);
+    }
+
+    /// P2: a complete group with ZERO selected rows is valid history for the
+    /// existing released/Detached-root eligibility. It is not a missing group.
+    #[test]
+    fn a_zero_selected_group_is_valid_history() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        debug.selected = false;
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 8,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug.clone(), release.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let group = verified_group(&registry, &candidate_of(&debug)).unwrap();
+        assert_eq!(group.len(), 2);
+        assert!(group.iter().all(|row| !row.selected));
+        // A group that is empty is still a refusal: zero SELECTED is not zero
+        // recorded rows.
+        let empty = Registry {
+            rows: Vec::new(),
+            ..registry
+        };
+        assert!(verified_group(&empty, &candidate_of(&debug)).is_err());
+    }
+
+    /// P2: the receipt's current references are compared with the SELECTED part
+    /// of the group only. Inactive history is never required in the receipt,
+    /// and a receipt that selects a historical member is a contradiction.
+    #[test]
+    fn the_receipt_is_compared_with_the_selected_part_of_the_group() {
+        let root = PathBuf::from("/volumes/owned/root");
+        let group = vec![
+            GroupRow {
+                member: "debug".to_owned(),
+                generation: 3,
+                nonce: Some("b".repeat(32)),
+                root_dev: Some(1),
+                root_ino: Some(2),
+                marker_digest: Some("c".repeat(64)),
+                selected: true,
+            },
+            GroupRow {
+                member: "release".to_owned(),
+                generation: 3,
+                nonce: Some("b".repeat(32)),
+                root_dev: Some(1),
+                root_ino: Some(2),
+                marker_digest: Some("c".repeat(64)),
+                selected: true,
+            },
+            GroupRow {
+                member: "target".to_owned(),
+                generation: 1,
+                nonce: None,
+                root_dev: None,
+                root_ino: None,
+                marker_digest: None,
+                selected: false,
+            },
+        ];
+        let current = vec![
+            ("debug".to_owned(), root.clone(), 3u64, Some("b".repeat(32))),
+            (
+                "release".to_owned(),
+                root.clone(),
+                3u64,
+                Some("b".repeat(32)),
+            ),
+        ];
+        // Exactly the two selected members: history is absent and that is fine.
+        selected_group_mismatch(&current, &root, &group).unwrap();
+        // A historical member appearing as current is a contradiction.
+        let mut with_history = current.clone();
+        with_history.push(("target".to_owned(), root.clone(), 1, None));
+        let refused = selected_group_mismatch(&with_history, &root, &group).unwrap_err();
+        assert!(
+            refused.contains("do not match the selected part"),
+            "{refused}"
+        );
+        // A missing selected member is a contradiction.
+        let missing = vec![current[0].clone()];
+        assert!(selected_group_mismatch(&missing, &root, &group).is_err());
+        // A changed generation or nonce is a contradiction.
+        let mut changed = current.clone();
+        changed[1].2 = 4;
+        assert!(selected_group_mismatch(&changed, &root, &group).is_err());
+        let mut renamed = current.clone();
+        renamed[0].3 = Some("d".repeat(32));
+        assert!(selected_group_mismatch(&renamed, &root, &group).is_err());
+        // Another root's placement never counts as this root's authority.
+        let elsewhere = vec![(
+            "debug".to_owned(),
+            PathBuf::from("/volumes/other/root"),
+            3u64,
+            Some("b".repeat(32)),
+        )];
+        assert!(selected_group_mismatch(&elsewhere, &root, &group).is_err());
+        // A ZERO-selected group requires the receipt to select nothing here.
+        let detached: Vec<GroupRow> = group
+            .iter()
+            .cloned()
+            .map(|row| GroupRow {
+                selected: false,
+                ..row
+            })
+            .collect();
+        selected_group_mismatch(&[], &root, &detached).unwrap();
+        assert!(selected_group_mismatch(&current, &root, &detached).is_err());
     }
 
     #[test]

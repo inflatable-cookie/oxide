@@ -3293,9 +3293,21 @@ stay real.
   flags). Replay verifies that exact group and the receipt BEFORE recomputing
   each row's selection; a missing, corrupt or changed receipt, a missing or
   extra row, a contradictory identity or a pending reference keeps the root
-  (pending/KEEP). The receipt's terminal image digest and its FIXED timestamp
-  are durable before publication, and a replay accepts only the recorded
-  preimage or that exact image. `RootIdentity.member` is only the first sorted
+  (pending/KEEP). The group is stored COMPLETE, never filtered to selected
+  rows: the SELECTED subset is the checkout's current authority and must match
+  the receipt's current placements for this root exactly (member, generation,
+  nonce), while registry-only inactive history — for example a legacy `target`
+  row kept after an explicit migration, with no nonce or an older marker digest
+  — is separately pinned evidence that keeps its own recorded facts and prior
+  role. History is never required to appear in the receipt, never invalidates
+  the upgraded current members and never grants deletion authority. A complete
+  group with ZERO selected rows is valid history for the existing
+  released/Detached-root eligibility (an empty selected subset is not an empty
+  group), and pruning a released root while the receipt currently selects a
+  different root preserves that root and the receipt bytes unchanged. A
+  rollback restores EACH row's own prior selection flag. The receipt's terminal
+  image digest and its FIXED timestamp are durable before publication, and a
+  replay accepts only the recorded preimage or that exact image. `RootIdentity.member` is only the first sorted
   representative, never the transaction scope. A whole clean plans the
   checkout target with every owned member link preserved and each owned member
   root's payload with its marker kept, never follows a generic link, and
@@ -3319,7 +3331,11 @@ and a case-11 registry predicate that separates the selected profile group from
 retained legacy history (a history row without a nonce is non-selected history,
 never a live reference), a real `run` control that executes the artifact of its
 own linked member, and a specific other-owner KEEP reason in the peer-receipt
-oracle: one private session per side with one owned
+oracle; the fixture's own registry/receipt pairs agree member-for-member with
+that rule; and a failure-custody control that settles only the gated children
+this script created, through the existing bounded helpers, and keeps anything
+unestablished unclosed and detach-blocking: one private session per side with
+one owned
 128 MiB scratch APFS image, a private `HOME`, `CARGO_HOME` and directory pool,
 a separately staged base `4a70b83` binary and this HEAD's candidate staged
 offline with 1.97.1 from authenticated pinned source, with asserted distinct

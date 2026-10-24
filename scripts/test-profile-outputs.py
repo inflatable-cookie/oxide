@@ -493,6 +493,83 @@ def write_attachment_facts(name: str, record: dict, evidence: str | None = None)
     return path
 
 
+class ChildCustody:
+    """Script-local ownership of the gated children and gates THIS proof
+    created, so a failure path can settle exactly them through the existing
+    perm.stop_gate/perm.finish_child helpers within the supervisor's existing
+    deadline. It is not a clock, signal controller, census or second harness:
+    children it does not own are never touched, and anything it cannot settle
+    stays in proof.unclosed and keeps blocking detach."""
+
+    def __init__(self) -> None:
+        self._children = {}
+        self._finished = set()
+
+    def track(self, child, gate: str | None, label: str) -> None:
+        self._children[child.pid] = (child, gate, label)
+
+    def finished(self, child) -> None:
+        self._finished.add(child.pid)
+        self._children.pop(child.pid, None)
+
+    def pending(self, proof: Proof) -> list:
+        unclosed = set(getattr(proof, "unclosed", set()))
+        return [pid for pid in sorted(unclosed) if pid in self._children and pid not in self._finished]
+
+    def not_owned(self, proof: Proof) -> list:
+        return [
+            pid
+            for pid in sorted(getattr(proof, "unclosed", set()))
+            if pid not in self._children
+        ]
+
+    def settle(self, proof: Proof, label: str, finish=None, remaining=None) -> dict:
+        """Release this script's gates and finish its own children, bounded by
+        the existing deadline. A child that ALREADY finished keeps its own
+        recorded status and is never signalled or re-run as new work."""
+        finish = finish or perm.finish_child
+        remaining = remaining or perm.work_left
+        record = {"settled": [], "unresolved": [], "not_owned": self.not_owned(proof)}
+        for pid in self.pending(proof):
+            child, gate, child_label = self._children[pid]
+            if child.poll() is not None:
+                # It exited without a recorded helper outcome. Nothing is
+                # signalled or re-run as new work, and its status is kept in the
+                # record, but closure is NOT claimed from a poll: it stays
+                # unclosed and keeps blocking detach.
+                record["unresolved"].append(
+                    {
+                        "pid": pid,
+                        "label": child_label,
+                        "reason": "exited without a recorded helper outcome; left unclosed",
+                        "observed_exit": child.returncode,
+                    }
+                )
+                continue
+            try:
+                left = remaining()
+            except Exception as error:
+                record["unresolved"].append({"pid": pid, "label": child_label, "reason": f"no bounded time left ({error})"})
+                break
+            if left <= 0:
+                record["unresolved"].append({"pid": pid, "label": child_label, "reason": "no bounded time left"})
+                break
+            try:
+                if gate:
+                    perm.stop_gate(gate, os.path.join(gate, "release"))
+                code, _, _ = finish(proof, child, f"{label}: {child_label}")
+            except Exception as error:
+                record["unresolved"].append({"pid": pid, "label": child_label, "reason": repr(error)})
+                continue
+            self.finished(child)
+            record["settled"].append({"pid": pid, "exit": code, "label": child_label})
+        record["still_unclosed"] = sorted(getattr(proof, "unclosed", set()))
+        return record
+
+
+CUSTODY = ChildCustody()
+
+
 def known_attachment_facts(proof: Proof, label: str, state: str) -> dict:
     """Source-KNOWN custody facts with NO subprocess.
 
@@ -728,6 +805,127 @@ def pure_reserve_stop_control() -> None:
     print("pure reserve-stop control: ok", flush=True)
 
 
+class _FakeCustodyChild:
+    """A child stand-in: no process, no subprocess, no signal."""
+
+    def __init__(self, pid: int, returncode=None) -> None:
+        self.pid = pid
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
+class _FakeUnclosedProof:
+    def __init__(self, pids) -> None:
+        self.unclosed = set(pids)
+        self.mount = None
+
+
+def pure_child_custody_control() -> None:
+    """Synthetic, no-subprocess controls for the A10 child custody bookkeeping.
+
+    They prove: an owned gated child is released and finished through the
+    injected existing-helper seam; a child that exited without a helper outcome
+    is never signalled or re-run and stays unclosed; a failing finish keeps it
+    unclosed; exhausted remaining time settles nothing; a child this proof does
+    not own is never touched; and an unwritable evidence root is an explicit
+    failure rather than a silent success."""
+    # 1. An owned gated child is released and finished.
+    with tempfile.TemporaryDirectory() as root:
+        gate = os.path.join(root, "gate")
+        os.makedirs(gate)
+        proof = _FakeUnclosedProof({101})
+        custody = ChildCustody()
+        child = _FakeCustodyChild(101)
+        custody.track(child, gate, "gated case")
+        calls = []
+
+        def finish(fake_proof, fake_child, label):
+            calls.append((fake_child.pid, label))
+            fake_proof.unclosed.discard(fake_child.pid)
+            return 0, "ok", ""
+
+        record = custody.settle(proof, "mock failure", finish=finish, remaining=lambda: 60.0)
+        expect(calls == [(101, "mock failure: gated case")], f"the child was not finished through the helper seam: {calls}")
+        expect(os.path.isfile(os.path.join(gate, "release")), "the owned gate was not released")
+        expect(record["settled"] and record["settled"][0]["exit"] == 0, f"the settled record is wrong: {record}")
+        expect(record["still_unclosed"] == [], f"the settled child is still unclosed: {record}")
+        expect(record["not_owned"] == [], f"an owned child was reported as foreign: {record}")
+
+    # 2. A child that exited without a helper outcome is not touched.
+    proof = _FakeUnclosedProof({202})
+    custody = ChildCustody()
+    custody.track(_FakeCustodyChild(202, returncode=7), None, "exited early")
+    calls = []
+    record = custody.settle(
+        proof, "mock", finish=lambda *a: calls.append(a) or (0, "", ""), remaining=lambda: 60.0
+    )
+    expect(calls == [], "an already-exited child was finished as new work")
+    expect(record["settled"] == [], f"an unestablished exit was reported settled: {record}")
+    expect(202 in record["still_unclosed"], f"poll was treated as closure: {record}")
+    expect(record["unresolved"] and record["unresolved"][0]["observed_exit"] == 7, f"the observed exit was lost: {record}")
+
+    # 3. A failing finish keeps the child unclosed and does not claim closure.
+    proof = _FakeUnclosedProof({303})
+    custody = ChildCustody()
+    custody.track(_FakeCustodyChild(303), None, "finish fails")
+    record = custody.settle(
+        proof,
+        "mock",
+        finish=lambda *a: (_ for _ in ()).throw(RuntimeError("finish refused")),
+        remaining=lambda: 60.0,
+    )
+    expect(record["settled"] == [], f"a failed finish was reported settled: {record}")
+    expect(303 in record["still_unclosed"], f"a failed finish dropped the child: {record}")
+
+    # 4. Exhausted remaining time settles nothing and does not signal.
+    proof = _FakeUnclosedProof({404})
+    custody = ChildCustody()
+    custody.track(_FakeCustodyChild(404), None, "no time")
+    calls = []
+    record = custody.settle(
+        proof, "mock", finish=lambda *a: calls.append(a) or (0, "", ""), remaining=lambda: 0
+    )
+    expect(calls == [], "a child was finished after the bounded time ran out")
+    expect(
+        record["unresolved"] and "no bounded time left" in record["unresolved"][0]["reason"],
+        f"the exhausted-time record is wrong: {record}",
+    )
+    # A raising remaining-time probe is the same outcome, never a hang.
+    record = custody.settle(
+        proof,
+        "mock",
+        finish=lambda *a: calls.append(a) or (0, "", ""),
+        remaining=lambda: (_ for _ in ()).throw(RuntimeError("deadline reached")),
+    )
+    expect(not record["settled"] and calls == [], f"a raising time probe settled work: {record}")
+
+    # 5. A child this proof does not own is never touched.
+    proof = _FakeUnclosedProof({505})
+    custody = ChildCustody()
+    calls = []
+    record = custody.settle(
+        proof, "mock", finish=lambda *a: calls.append(a) or (0, "", ""), remaining=lambda: 60.0
+    )
+    expect(calls == [], "an unowned child was finished")
+    expect(record["not_owned"] == [505], f"an unowned child was not reported: {record}")
+    expect(record["still_unclosed"] == [505], f"an unowned child was dropped: {record}")
+
+    # 6. An unwritable evidence root is an explicit failure, not a success.
+    with tempfile.TemporaryDirectory() as root:
+        blocked = os.path.join(root, "not-a-directory")
+        with open(blocked, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        try:
+            write_attachment_facts("attachment-facts.json", {"state": "x"}, evidence=blocked)
+        except Exception:
+            pass
+        else:
+            raise AssertionError("a custody record was reported written into an unwritable root")
+    print("pure child-custody control: ok (synthetic, no subprocess)", flush=True)
+
+
 def pure_slot_state_control() -> None:
     """No-subprocess control for the parsed slot summary (A11). The slot id and
     the cold/warm state come from the summary LINE, so a path or directory name
@@ -897,8 +1095,21 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
     # outcome is not known, so the mount is kept and reported instead.
     unclosed = sorted(getattr(proof, "unclosed", set()))
     if unclosed:
+        # A10: first settle only THIS script's own gated children through the
+        # existing helpers, within the existing deadline, and persist that.
+        custody = CUSTODY.settle(proof, label)
+        write_attachment_facts(
+            "detach-custody.json",
+            {
+                **known_attachment_facts(proof, label, "settling owned children"),
+                "custody": custody,
+            },
+        )
+        unclosed = sorted(getattr(proof, "unclosed", set()))
+    if unclosed:
         record = known_attachment_facts(proof, label, "unresolved: unclosed children")
         record["reason"] = "refused to detach while child custody is unknown"
+        record["not_owned"] = CUSTODY.not_owned(proof)
         write_attachment_facts("detach-unresolved.json", record)
         fail(f"{label}: refusing ordinary detach while {len(unclosed)} child(ren) are unclosed; the mount and backing are retained")
         return
@@ -1153,6 +1364,7 @@ def run(proof: Proof, repo: str) -> None:
     pure_attachment_facts_control()
     pure_slot_state_control()
     pure_reserve_stop_control()
+    pure_child_custody_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -1502,14 +1714,18 @@ def run(proof: Proof, repo: str) -> None:
     os.makedirs(gate)
     env = {**proof.env, "OXIDE_PROFILE_GATE": gate}
     child = perm.start_child(proof, [proof.binary, "build"], first, env)
+    CUSTODY.track(child, gate, "02 gated build")
     wait_started(gate, "02 gated build start")
     before = custody_snapshot(pool, first)
     second = perm.start_child(proof, [proof.binary, "outputs", "adopt"], first, proof.env)
+    CUSTODY.track(second, None, "02 waited adopt")
     observed_wait(second, before, pool, first, "02")
     perm.stop_gate(gate, os.path.join(gate, "release"))
     code, _, _ = perm.finish_child(proof, child, "02 gated build")
+    CUSTODY.finished(child)
     expect(code == 0, f"02: gated build exited {code}")
     code, _, _ = perm.finish_child(proof, second, "02 waited adopt")
+    CUSTODY.finished(second)
     expect(code == 0, "02: the waiting adopt failed")
     expect(custody_snapshot(pool, first) == before, "02: the waited adopt changed authority")
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
@@ -1948,9 +2164,11 @@ def run(proof: Proof, repo: str) -> None:
     gate = os.path.join(proof.root, "gate13")
     os.makedirs(gate)
     child = perm.start_child(proof, [proof.binary, "build"], blocked, {**proof.env, "OXIDE_PROFILE_GATE": gate})
+    CUSTODY.track(child, gate, "13 gated writer")
     wait_started(gate, "13 writer start")
     before = custody_snapshot(pool, blocked)
     waiter = perm.start_child(proof, [proof.binary, "outputs", "adopt"], blocked, proof.env)
+    CUSTODY.track(waiter, None, "13 waiting adopt")
     observed_wait(waiter, before, pool, blocked, "13")
     expect(
         os.path.islink(os.path.join(blocked, "target")),
@@ -1958,8 +2176,10 @@ def run(proof: Proof, repo: str) -> None:
     )
     perm.stop_gate(gate, os.path.join(gate, "release"))
     code, _, _ = perm.finish_child(proof, child, "13 writer")
+    CUSTODY.finished(child)
     expect(code == 0, f"13: the gated writer exited {code}")
     code, _, _ = perm.finish_child(proof, waiter, "13 waiting adopt")
+    CUSTODY.finished(waiter)
     expect(code == 0, "13: the waiting adopt failed")
     expect_layout(blocked, {"debug": f"link:{root_of(pool, blocked)}"})
 
@@ -2133,10 +2353,12 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
     seeded_receipt = perm.read_bytes(receipt_file(dirpool, seeded))
     child = perm.start_child(proof, [proof.binary, "clean", "-p", "profileapp"], seeded, env)
+    CUSTODY.track(child, gate, "16 watched clean")
     perm.wait_for(os.path.join(gate, "started"), "16 watched clean writer start")
     with open(readings, "w", encoding="utf-8") as handle:
         handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
     code, _, stderr = perm.finish_child(proof, child, "16 watched clean")
+    CUSTODY.finished(child)
     # A11: the stop is judged by the source-defined report, not by a word
     # match. watchdog.rs::report emits the injected reason, the reading and
     # trigger, a concrete Cargo group, the sampled minimum, the overshoot and
@@ -2730,6 +2952,7 @@ def main() -> int:
         pure_attachment_facts_control()
         pure_slot_state_control()
         pure_reserve_stop_control()
+        pure_child_custody_control()
         return 0
     if arguments:
         print(USAGE, file=sys.stderr)
