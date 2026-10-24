@@ -168,9 +168,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   whole-target link moves only through an explicit `oxide outputs adopt` under
   a durable journal, a real nonempty profile directory is never moved or
   converted, and an undeclared opaque tool refuses instead of guessing. The
-  profile layout is implemented with a known fail-safe detach refusal for
-  host-triple member links and incomplete native coverage. The as-is acceptance,
-  contract, formats and evidence limits are owned by the
+  profile layout is implemented; `oxide outputs detach` recognises the host
+  triple and every other supported member link by its approved destination
+  and this checkout's root marker, so a `<triple>/debug` member no longer
+  refuses a safe detach, while an unowned, wrong-destination, dangling or
+  malformed link still refuses with nothing changed. Corrected native
+  coverage of detach, clean and prune is still unactivated. The as-is
+  acceptance, contract, formats and evidence limits are owned by the
   [workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides

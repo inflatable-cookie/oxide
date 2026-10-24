@@ -3469,15 +3469,38 @@ def run(proof: Proof, repo: str) -> None:
         try:
             # ----- case 15: detach and re-adopt ----------------------------------
             case_reached("15")
+            # Case 04's real `--target <host triple>` build left an owned
+            # `target/<triple>/debug` link beside the adopted pair. The
+            # accepted run refused this very detach as foreign (oxide#144);
+            # name the pre-state first so the assertion below is not vacuous.
+            host = proof.run(["rustc", "-vV"], cwd=first, env=proof.env, timeout=30).stdout.decode()
+            triple = next(line.split(": ", 1)[1] for line in host.splitlines() if line.startswith("host: "))
+            expect_layout(
+                first,
+                {
+                    "debug": f"link:{root_of(pool, first)}",
+                    "release": f"link:{root_of(pool, first)}",
+                    f"{triple}/debug": f"link:{root_of(pool, first)}",
+                },
+            )
             code, _, stderr = oxide(proof, ["outputs", "detach"], "15 detach", first)
             expect(code == 0, f"15: detach failed: {stderr}")
-            expect_layout(first, {"debug": "real", "release": "real"})
+            # Every recognised member link — the host-triple one included —
+            # becomes a real empty directory, and no root is deleted.
+            expect_layout(first, {"debug": "real", "release": "real", f"{triple}/debug": "real"})
             expect(receipt(pool, first)["state"] == "detached", "15: receipt not detached")
             expect(os.path.isdir(root), "15: a root was deleted by detach")
             adopt(proof, first, "15 readopt")
-            expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
-            host = proof.run(["rustc", "-vV"], cwd=first, env=proof.env, timeout=30).stdout.decode()
-            triple = next(line.split(": ", 1)[1] for line in host.splitlines() if line.startswith("host: "))
+            # Re-adoption restores every placement the detached receipt kept,
+            # so the host-triple member is a link again as well (oxide#144).
+            expect_layout(
+                first,
+                {
+                    "debug": f"link:{root_of(pool, first)}",
+                    "release": f"link:{root_of(pool, first)}",
+                    f"{triple}/debug": f"link:{root_of(pool, first)}",
+                },
+            )
             code, _, stderr = oxide(proof, ["build", "--target", triple], "15 triple build", first)
             expect(code == 0, f"15: host-triple build failed: {stderr}")
             expect_layout(first, {f"{triple}/debug": f"link:{root_of(pool, first)}"})

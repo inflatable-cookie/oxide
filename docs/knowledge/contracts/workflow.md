@@ -3252,12 +3252,30 @@ become owned links. Cargo's top-level files (`CACHEDIR.TAG`,
 `.rustc_info.json`), `target/tmp` and tool directories such as `target/doc`
 stay real.
 
-**Known detach limitation.** `oxide outputs detach` currently refuses safely
-when an owned host-triple member such as `target/aarch64-apple-darwin/debug`
-is present: it classifies that nested link as foreign and leaves it untouched.
-Detach on non-target checkouts remains as before. Target-member detach and the
-remaining native cases need the separately scoped correction; do not remove
-links or weaken ownership checks to work around this refusal.
+**Detach and target-member links (oxide#144).** `oxide outputs detach`
+recognises the host-triple and every other supported member link
+(`debug`, `release`, `<triple>/debug`, `<triple>/release`): it removes each
+link whose destination is exactly that member's approved subpath beneath the
+root its placement selects, and restores a real empty directory there. The
+member suffix alone never grants ownership. A destination is classified by the
+shape of its link text — the plain `<root>/<profile>` and the nested
+`<root>/<triple>/<profile>` forms are both considered, most specific first —
+and only a candidate root that is a real directory carrying this checkout's
+owner marker makes the link owned. A wrong destination, an unmarked or
+another checkout's root, a missing destination (dangling) and a relative or
+otherwise malformed link text all keep the previous fail-safe refusal, with
+the link, every other member and the receipt bytes unchanged; there is no
+link traversal, no arbitrary removal and no force mode. A profile receipt
+places its members independently, so an unselected member is a real local
+directory (or one left unselected by a detach that a later adoption converts
+again); the detach keeps every placement as re-adoption authority, and
+re-adopting after a multi-member detach — including the host-triple member —
+is the same journaled per-member transition as any other adoption. **Evidence
+limit:** this correction and its unit counterexamples are source-reviewed;
+the corrected cases15–20 native run is not activated. The accepted
+oxide#133 run's cases 01–14 stand, its case 15 refused safely (the
+host-triple limitation above), cases 16–20 did not execute, and no
+diagnostic run or full-20 PASS exists.
 
 - **Members and destinations.** A converted checkout's `target` is real and
   each linked member selects its own approved subpath beneath the shared root
@@ -3360,8 +3378,12 @@ links or weaken ownership checks to work around this refusal.
   host `debug`/`release` pair (and every member the receipt already places)
   into one root under the member ignore check, keeps a real nonempty member
   with a notice, is idempotent, and refuses a legacy whole-target link
-  untouched. `oxide outputs detach` restores real empty member directories,
-  keeps every root and marker, and leaves the receipt detached.
+  untouched. `oxide outputs detach` restores real empty member directories for
+  every owned member link — the plain `debug`/`release` pair and each
+  `<triple>/debug` or `<triple>/release` member alike — keeps every root,
+  marker and payload byte, and leaves the receipt detached with its placements
+  as re-adoption authority; an unowned member link refuses the whole detach
+  before any link is touched.
 - **Explicit migration and marker upgrade.** `oxide outputs adopt` on a
   committed whole-target receipt is the only path that rewrites a legacy
   placement. It is macOS-only (Linux remains compile-only), runs under the
@@ -3544,6 +3566,30 @@ starts from that failure packet and must exercise cases 15–20, without inherit
 a proof allowance or claiming they already passed. Historical UNCLOSED runs and
 retained unknown backing stay separate from this closed failure.
 
+**Source correction, oxide#144.** Two shipped defects were found behind that
+case-15 refusal and corrected in the source phase only (native cases 15–20
+remain unactivated for this task). First, the one `target`-relative ownership
+classifier derived a member link's candidate root from only the shallow
+`<root>/<profile>` shape, so a real `target/<triple>/debug` link — created
+correctly by a host `--target` build — was reported foreign and detached
+refused it. Ownership now considers both the `<root>/<profile>` and
+`<root>/<triple>/<profile>` shapes, most specific first, and still requires
+this checkout's marker at the candidate root (a wrong destination, an unmarked
+or another checkout's root, a missing destination or a malformed relative link
+all keep the fail-safe refusal with nothing changed). Second, re-adoption after
+a multi-member detach could not write its per-member write-ahead receipt: the
+receipt consistency rule demanded every profile placement be selected, while a
+detach deliberately leaves them all unselected. A profile receipt now requires
+at least one selected placement and allows the others unselected (a real local
+member, or one awaiting re-adoption); a whole-target receipt keeps the strict
+rule. The fixed proof's case-15 oracles were strengthened, not weakened: they
+now assert the pre-detach state (the host-triple link created by case 04's real
+build), that the first detach converts it to a real directory, and that
+re-adoption restores it — the exact accepted failure point. A pure/static
+premise sweep maps each case-15 to case-20 premise (and the private-`HOME`,
+automatic-adoption and Cargo-argv premises) to shipped source at this head; no
+diagnostic or native run was made.
+
 The script also has an explicitly opt-in `--diagnostic` collection mode. It
 records recoverable oracle failures and skips dependent or tainted premises,
 while unknown device/writer effects and infrastructure errors abort. Its bounded
@@ -3661,7 +3707,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 - **Nonces and keys.** Every root creation or recreation draws a fresh random 128-bit lowercase-hex nonce. The output destination key includes the nonce, root, volume UUID and recipe; legacy `outputs-1` keys stay distinct and no recreated root claims a warm legacy root. An existing root keeps its marker's nonce.
 - **Registry and overflow.** Rows are keyed by checkout, placement member and root; revision advances before every changed receipt, selection or root effect, and the registry is read as one bounded whole snapshot (8192 files, 64 MiB, 10 s). The live registry is capped at 4096 rows and 4 MiB. Before a cap-exceeding unindexed selection the registry records sticky incompleteness durably; that write failing refuses adoption before its effect, and prune then keeps every root with an explicit reason. The incomplete flag is never cleared by this tranche.
 - **Status.** Default `oxide status` reads only the bounded recorded `outputs/prune-observations.json` (`oxide.outputs.prune-observations/1`, at most 256 KiB and 512 roots) in the pool section. It performs no root walk, replay, lock or reconciliation. Coverage, source and time are explicit; a partial observation never becomes a global orphan total. `--measure` does not scan output roots for prune.
-- **Nonce reservation.** A building command reserves its future root's nonce after automatic adoption and before `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding lock (released before the slot wait) and the internal publication lock: the receipt's `target` placement records `reserved` (transaction ID, fresh random nonce, root, kind, volume UUID, generation) and the registry a pending row with the same transaction and nonce, in one write-ahead publication. An existing root keys its marker nonce; a future root keys only its reserved nonce, never a missing root's old one. Starters for the identical future root share one uncancelled reservation; the commit that creates the root consumes it. Binding validates the exact surviving reservation (receipt, keyed nonce, registry row with no cancellation) before Cargo and refuses a cancelled, replaced or absent one with no automatic retry. `oxide outputs cancel-reservation` (and `detach`, and a starter that needs a different future root) cancels only under the checkout's binding with every writer clear, the reserved root absent and no prune intent: the registry first records the cancellation (authority invalidated, revision advanced), then the receipt commits without it, then the abandoned row is removed; an interrupted cancellation is finished only for its exact recorded transaction. A cancelled nonce is never reused. `oxide outputs plan` stays read-only. The pre-lease reservation applies binding's P4 precondition exactly, so a command that binding will refuse for it changes no authority — no `reserved` field, no generation, no updated timestamp, no link text (oxide#133 case14). That precondition is per REQUESTED member and only for a profile-layout receipt: a requested member whose committed placement is external while this command's fresh selection is not. A member the receipt does not place, a whole-target receipt, and any command whose fresh selection is still external keep their reservation — a whole-target local fallback and a new member beside a committed external sibling both need it for `reservation_matches`. Every other refusal (an unmodelled command, an empty `exec` declaration) still decides after the reservation.
+- **Nonce reservation.** A building command reserves its future root's nonce after automatic adoption and before `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding lock (released before the slot wait) and the internal publication lock: the receipt's `target` placement records `reserved` (transaction ID, fresh random nonce, root, kind, volume UUID, generation) and the registry a pending row with the same transaction and nonce, in one write-ahead publication. An existing root keys its marker nonce; a future root keys only its reserved nonce, never a missing root's old one. Starters for the identical future root share one uncancelled reservation; the commit that creates the root consumes it. Binding validates the exact surviving reservation (receipt, keyed nonce, registry row with no cancellation) before Cargo and refuses a cancelled, replaced or absent one with no automatic retry. `oxide outputs cancel-reservation` (and `detach`, and a starter that needs a different future root) cancels only under the checkout's binding with every writer clear, the reserved root absent and no prune intent: the registry first records the cancellation (authority invalidated, revision advanced), then the receipt commits without it, then the abandoned row is removed; an interrupted cancellation is finished only for its exact recorded transaction. A cancelled nonce is never reused. `oxide outputs plan` stays read-only. The pre-lease reservation applies binding's P4 precondition exactly, so a command that binding will refuse for it changes no authority — no `reserved` field, no generation, no updated timestamp, no link text (oxide#133 case14). That precondition is per REQUESTED member and only for a profile-layout receipt: a requested member whose committed placement is external while this command's fresh selection is not. A member the receipt does not place, a whole-target receipt, and any command whose fresh selection is still external keep their reservation — a whole-target local fallback and a new member beside a committed external sibling both need it for `reservation_matches`. The ordering nit closed by oxide#133 is recorded here: in a profile checkout a command name whose profile outputs Oxide does not model is refused in the declaration step, BEFORE `reserve`, so it publishes no reservation at all. The remaining deferred nit is narrower: an `exec` that declares no member is still refused by `planned_destination`, i.e. after the reservation, and moving that refusal ahead of `reserve` (so it too changes nothing) is not part of oxide#144.
 - **Overflow.** When a reservation would exceed the live row cap, the registry durably records sticky incompleteness and the reservation is retried once with an explicit overflow tag (registry identity, transaction, nonce, revision as provenance) and no registry row. Binding validates that exact tag against the same sticky-incomplete registry and the overflow cancellation journal; an unrelated revision advance never refuses it. Prune keeps the whole batch while the registry is incomplete, and the flag is never cleared by this tranche.
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.
 - **Tombstones.** After a positive completion (both the registry terminal state and the receipt's terminal state committed), the completed row and the settled intent leave the live registry in one revision, and a diagnostic entry is appended best effort to `outputs/tombstones.json` (`oxide.outputs.tombstones/1`, at most 16,384 entries and 4 MiB, oldest compacted first). The ring is never a safety journal or a live cap; unfinished intents and reservations stay in the registry and are never compacted. A recreated root always gets a fresh nonce.
