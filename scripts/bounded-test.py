@@ -16,7 +16,11 @@ Implements docs/knowledge/contracts/proof-supervisor-correction.md (revision
   kinfo_proc check, path resolution, scratch and evidence creation) inside
   the custodian's setup deadline: the receipt phases, output draining,
   reserve and scratch sampling (each reading carries its completion stamp),
-  the session census and cleanup. It reports over a control pipe.
+  the session census and cleanup. It reports over a control pipe. Its
+  owned-byte walk counts `st_blocks * 512` per distinct (device, inode) and
+  never follows a symlink; an entry whose absolute path name is at or past
+  the platform limit is reached from its nearest nameable directory by one
+  short descriptor-relative component at a time (oxide#142).
 - The leader (second child) calls setsid, acknowledges, and execs the command
   only after the custodian holds its NOTE_EXIT detector and opens the gate.
 
@@ -984,24 +988,110 @@ def exit_code(deadline_hit, fault, closed, status):
 # Monitor -------------------------------------------------------------------------
 
 
+PATH_LIMIT_FALLBACK = 1024  # a smaller limit than the platform's only costs descriptor walks
+
+
+def path_limit(root):
+    """Byte length of the longest absolute path name, its terminating NUL
+    included, that this platform can open below `root`; a name shorter than
+    this is nameable by path. An unavailable answer takes the conservative
+    smaller limit: descriptor-relative opens work at any length."""
+    try:
+        value = os.pathconf(root, "PC_PATH_MAX")
+    except (OSError, ValueError):
+        value = 0
+    return value if isinstance(value, int) and value > 0 else PATH_LIMIT_FALLBACK
+
+
+def open_relative(anchor, names):
+    """Open the directory `anchor` and then each of the short component
+    `names` below it, closing every descriptor as it is replaced. No symlink
+    is followed at any step, so a substitution is an error, not a walk into
+    another tree. `names` is empty for the anchor itself."""
+    fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name in names:
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def tree_bytes(root):
-    total, seen, stack = 0, set(), [root]
+    """Allocated bytes under `root`: `st_blocks * 512` for every distinct
+    (device, inode), with no symlink followed.
+
+    A path name at or past the platform limit cannot be opened by absolute
+    path at all, so a frame below the deepest nameable directory is reached
+    from that directory one short descriptor-relative component at a time.
+    No frame keeps a descriptor between iterations: the walk opens one
+    directory, reads its names, closes it and moves on, so descriptor use
+    stays constant whatever the depth or path length and every error closes
+    what it opened. `PC_PATH_MAX` is only the choice between the two lookup
+    forms: depth, entries and bytes are unbounded by it, and this is not an
+    atomic snapshot.
+
+    An entry that is gone is skipped exactly as before. Every other error
+    raises, so the sampler reports a measurement fault and never a smaller,
+    unbounded or partly counted total.
+    """
+    limit = path_limit(root)
+    total, seen = 0, set()
+    stack = [(None, (root,))]  # (nameable anchor, (absolute path,)) or (anchor, components)
     while stack:
-        path = stack.pop()
+        anchor, names = stack.pop()
+        fd = None
         try:
-            meta = os.lstat(path)
-        except FileNotFoundError:
-            continue
-        if (meta.st_dev, meta.st_ino) in seen:
-            continue
-        seen.add((meta.st_dev, meta.st_ino))
-        total += meta.st_blocks * 512
-        if stat.S_ISDIR(meta.st_mode):
-            try:
-                with os.scandir(path) as entries:
-                    stack.extend(entry.path for entry in entries)
-            except FileNotFoundError:
+            if anchor is None:
+                try:
+                    meta = os.lstat(names[0])
+                except FileNotFoundError:
+                    continue
+            else:
+                # One short component at a time from the nearest nameable
+                # directory: the accumulated absolute name is never looked up.
+                try:
+                    fd = open_relative(anchor, names[:-1])
+                except FileNotFoundError:
+                    continue  # the entry's own ancestor went away: still skipped
+                try:
+                    meta = os.stat(names[-1], dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+            identity = (meta.st_dev, meta.st_ino)
+            if identity in seen:
                 continue
+            seen.add(identity)
+            total += meta.st_blocks * 512
+            if not stat.S_ISDIR(meta.st_mode):
+                continue
+            if anchor is None:
+                try:
+                    children = os.listdir(names[0])
+                except FileNotFoundError:
+                    continue
+                prefix = len(os.fsencode(names[0])) + 1  # bytes, not characters
+                for name in children:
+                    if prefix + len(os.fsencode(name)) < limit:
+                        stack.append((None, (os.path.join(names[0], name),)))
+                    else:
+                        stack.append((names[0], (name,)))
+            else:
+                inner = os.open(names[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    children = os.listdir(inner)
+                except FileNotFoundError:
+                    continue
+                finally:
+                    os.close(inner)
+                for name in children:  # already past the limit: stays relative
+                    stack.append((anchor, names + (name,)))
+        finally:
+            if fd is not None:
+                os.close(fd)
     return total
 
 

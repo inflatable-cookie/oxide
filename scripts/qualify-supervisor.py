@@ -48,7 +48,7 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 123
+EXPECTED_CASES = 130
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -68,6 +68,7 @@ LIMITATIONS = [
     "Nested candidate sessions are outside the outer session; their UNCLOSED cases are settled by no guardian. Their resources are kept in the outer evidence directory and the scratch base is never deleted; their fixture processes end only at the finite fallback, which is not closure.",
     "The outer actor KILLs only its pinned worker at the deadline; a candidate still running then is bounded by its own 280 s limit, not by the actor.",
     "Synthetic fixtures model Cargo's setpgid groups; no real Cargo build or live application ran.",
+    "Owned bytes are a non-atomic best-effort walk: an entry past the platform path limit is reached one descriptor-relative component at a time from its nearest nameable directory, and any error other than a vanished entry is a measurement fault, never a smaller total.",
 ]
 
 

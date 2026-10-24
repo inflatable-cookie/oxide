@@ -3,10 +3,11 @@
 
 Runs inside the candidate supervisor's own session under
 `proof:supervisor:qualify`. Pure cases (run first) drive the guard,
-precedence, census and control-protocol logic with fake inputs: nothing is
-spawned. Real cases run `bounded-test.py` as a separate process around tiny
-Python fixtures, with test-only injected faults (OXIDE_SUPERVISOR_INJECT) and
-injected readings; the disk is never filled.
+precedence, census, control-protocol and owned-byte traversal logic with fake
+inputs or with owned fixtures: nothing is spawned. Real cases run
+`bounded-test.py` as a separate process around tiny Python fixtures, with
+test-only injected faults (OXIDE_SUPERVISOR_INJECT) and injected readings; the
+disk is never filled.
 
 Every fixture process first resets and unblocks SIGALRM and arms an interval
 timer to FIXTURE_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline in the
@@ -24,7 +25,9 @@ import errno
 import importlib.util
 import json
 import os
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1137,6 +1140,176 @@ class PureProtocol(unittest.TestCase):
         self.assertEqual([r["held_unreaped"] for r in records], [False, False])
 
 
+# Owned-byte traversal (oxide#142) ----------------------------------------------
+
+try:
+    LIMIT = os.pathconf(str(SCRATCH), "PC_PATH_MAX")  # bytes, stated independently of the walk
+except (OSError, ValueError):
+    LIMIT = 1024
+NAME = "\u00e9" * 20  # 20 characters, 40 bytes: the byte and character rules differ
+
+
+def oracle_bytes(root, union=True):
+    """Independent descriptor-relative total: `st_blocks * 512` per distinct
+    (device, inode) under `root`, with no symlink followed. `union=False`
+    counts every name instead, so a hard-link case can show what union removed."""
+    seen, total = set(), 0
+
+    def note(meta):
+        nonlocal total
+        if union:
+            identity = (meta.st_dev, meta.st_ino)
+            if identity in seen:
+                return False
+            seen.add(identity)
+        total += meta.st_blocks * 512
+        return True
+
+    def walk(fd):
+        for name in os.listdir(fd):
+            meta = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if not note(meta) or not stat.S_ISDIR(meta.st_mode):
+                continue
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                walk(child)
+            finally:
+                os.close(child)
+
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        note(os.fstat(fd))
+        walk(fd)
+    finally:
+        os.close(fd)
+    return total
+
+
+def long_fixture(base, referent):
+    """Create owned paths at and past `LIMIT` using only short
+    descriptor-relative names, exactly as the #141 product fixture does: a
+    regular file one byte past the limit, a hard-link pair, and a directory
+    that is itself unnameable holding a file and a symlink to `referent`,
+    which names a directory outside the fixture. Returns the absolute names
+    that no path lookup can reach."""
+    os.mkdir(base)
+    names, fds = [], []
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fds.append(fd)
+
+    def descend():
+        nonlocal fd
+        os.mkdir(NAME, dir_fd=fd)
+        child = os.open(NAME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        fds.append(child)
+        names.append(NAME)
+        fd = child
+
+    def create(where, name, size):
+        handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=where)
+        try:
+            os.write(handle, bytes(size))
+        finally:
+            os.close(handle)
+
+    try:
+        while len(os.fsencode(os.path.join(base, *names, NAME))) < LIMIT:
+            descend()  # every level stays nameable by path
+        prefix = len(os.fsencode(os.path.join(base, *names))) + 1
+        leaf, link = "f" * (LIMIT - prefix + 1), "h" * (LIMIT - prefix + 1)
+        leaf_path = os.path.join(base, *names, leaf)  # one byte past the limit
+        create(fd, leaf, 4096)
+        create(fds[0], "short", 8192)  # nameable by path, at the fixture base
+        os.link("short", link, src_dir_fd=fds[0], dst_dir_fd=fd)
+        link_path = os.path.join(base, *names, link)
+        anchor, mark = os.path.join(base, *names), len(names)  # still nameable
+        while len(os.fsencode(os.path.join(base, *names))) < LIMIT + 64:
+            descend()  # the directory itself is past the limit now
+        deepest = os.path.join(base, *names)
+        create(fd, "i" * 40, 2048)
+        os.symlink(referent, "s" * 40, dir_fd=fd)
+    finally:
+        for handle in reversed(fds):
+            os.close(handle)
+    return {"leaf": leaf_path, "link": link_path, "deepest": deepest,
+            "anchor": anchor, "suffix": tuple(names[mark:])}
+
+
+class PureTraversal(unittest.TestCase):
+    """The monitor's owned-byte walk over owned paths whose absolute name
+    cannot exist (oxide#142). It spawns nothing: the fixture lives under the
+    suite's scratch and is removed by descriptor-relative names."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="tree.", dir=str(SCRATCH)))
+        self.referent = self.dir / "referent"
+        self.referent.mkdir()
+        (self.referent / "big.bin").write_bytes(bytes(1024 * 1024))
+        self.base = str(self.dir / "fixture")
+        self.paths = long_fixture(self.base, str(self.referent))
+        self.expected = oracle_bytes(self.base)
+
+    def tearDown(self):
+        shutil.rmtree(str(self.dir), ignore_errors=True)
+
+    def test_a_path_past_the_limit_is_counted(self):
+        with self.assertRaises(OSError) as caught:
+            os.lstat(self.paths["leaf"])
+        self.assertEqual(caught.exception.errno, errno.ENAMETOOLONG)
+        # A byte length, not a character length: this name is past the limit in
+        # bytes and well short of it in characters, so a character rule would
+        # have looked it up by path and failed on it.
+        self.assertGreaterEqual(len(os.fsencode(self.paths["leaf"])), LIMIT)
+        self.assertLess(len(self.paths["leaf"]), LIMIT)
+        self.assertEqual(bounded.tree_bytes(self.base), self.expected)
+        self.assertGreaterEqual(self.expected, 4096)  # the overlong file is in it
+
+    def test_a_directory_past_the_limit_is_read_and_a_hard_link_counted_once(self):
+        with self.assertRaises(OSError) as caught:
+            os.scandir(self.paths["deepest"]).close()
+        self.assertEqual(caught.exception.errno, errno.ENAMETOOLONG)
+        self.assertEqual(bounded.tree_bytes(self.base), self.expected)
+        # The pair joins a nameable name to one past the limit, so the union,
+        # not the path, is what keeps its inode in the total once.
+        with self.assertRaises(OSError) as caught:
+            os.lstat(self.paths["link"])
+        self.assertEqual(caught.exception.errno, errno.ENAMETOOLONG)
+        shared = os.stat(os.path.join(self.base, "short")).st_blocks * 512
+        self.assertNotEqual(shared, 0)
+        self.assertEqual(oracle_bytes(self.base, union=False) - self.expected, shared)
+
+    def test_a_symlink_past_the_limit_is_never_followed(self):
+        # The entry's name would be a directory if the referent were followed:
+        # the walk counts the link itself and never opens another tree.
+        referent = (self.referent / "big.bin").stat()
+        self.assertLess(self.expected, referent.st_size, "the fixture is smaller than the referent")
+        self.assertEqual(bounded.tree_bytes(self.base), self.expected)
+
+    def test_an_unreadable_overlong_directory_is_a_measurement_fault(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permission bits")
+        fd = bounded.open_relative(self.paths["anchor"], self.paths["suffix"])
+        self.addCleanup(os.close, fd)
+        os.fchmod(fd, 0o000)
+        self.addCleanup(os.fchmod, fd, 0o700)
+        with self.assertRaises(OSError) as caught:
+            bounded.tree_bytes(self.base)
+        self.assertIn(caught.exception.errno, (errno.EACCES, errno.EPERM))
+        os.fchmod(fd, 0o700)  # a fault is never a smaller total, and never a stuck fixture
+        self.assertEqual(bounded.tree_bytes(self.base), self.expected)
+
+    def test_a_missing_root_counts_nothing(self):
+        self.assertEqual(bounded.tree_bytes(str(self.dir / "absent")), 0)
+
+    def test_an_ordinary_tree_still_matches_the_descriptor_oracle(self):
+        plain = self.dir / "plain"
+        (plain / "a" / "b").mkdir(parents=True)
+        (plain / "a" / "b" / "file.bin").write_bytes(bytes(4096))
+        (plain / "a" / "link").symlink_to(self.referent)
+        os.link(str(plain / "a" / "b" / "file.bin"), str(plain / "a" / "twin.bin"))
+        self.assertEqual(bounded.tree_bytes(str(plain)), oracle_bytes(str(plain)))
+
+
 # Real cases --------------------------------------------------------------------
 
 
@@ -1231,6 +1404,27 @@ class Real(unittest.TestCase):
         roots = list(self.dir.glob("oxide-proof.*"))
         self.assertEqual(len(roots), 1)
         self.assertFalse((roots[0] / "scratch").exists())
+        self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def test_owned_paths_past_the_limit_are_counted_from_the_first_reading(self):
+        # The case directory is the monitored root, so a path at and past the
+        # platform limit exists before the first scratch reading. Before
+        # oxide#142 that reading faulted with ENAMETOOLONG, so the run ended
+        # below the launch gate and this command never ran.
+        referent = Path(tempfile.mkdtemp(prefix="referent.", dir=str(SCRATCH)))
+        self.addCleanup(shutil.rmtree, str(referent), True)
+        (referent / "big.bin").write_bytes(bytes(1024 * 1024))
+        fixture_root = str(self.dir / "fixture")
+        long_fixture(fixture_root, str(referent / "big.bin"))
+        self.addCleanup(shutil.rmtree, fixture_root, True)
+        expected = oracle_bytes(fixture_root)
+        self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertTrue((self.dir / "ran").exists(), "the command ran")
+        self.assertGreaterEqual(self.receipt["owned_bytes"]["samples"], 1)
+        self.assertGreaterEqual(self.receipt["owned_bytes"]["maximum"], expected,
+                                "the overlong fixture was never counted")
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
 
     def test_nonzero_exit(self):
@@ -1617,7 +1811,8 @@ def main():
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
-                                           PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol))
+                                           PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
+                                           PureTraversal))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer
