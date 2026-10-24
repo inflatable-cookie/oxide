@@ -141,6 +141,7 @@ image custody: backing file and custody.json under OXIDE_PROOF_EVIDENCE/owned-im
 cleanup: after any fault, ordinary detach only, bounded by the guard's stop (deadline less {STOP_RESERVE_S} s, less {CLEANUP_SAFETY_S} s safety), not the {SHUTDOWN_MARGIN_S} s work margin; the first fault stays primary; closure is the guard's census alone
 fixtures: private CARGO_HOME, stand-in account home and harness HOME inside the supervisor scratch; nothing outside it except the one image mount; RUSTFLAGS fixed and CARGO_ENCODED_RUSTFLAGS removed for staging and fixtures
 evidence: one uniquely named helper receipt beside the supervisor's own; closure and cleanup are the supervisor's
+samples: script-scratch phase samples cover only this run's scratch directory (not evidence, image backing or staging peaks between samples); the guard's continuous whole-root receipt is the budget authority
 """
 
 STARTED = time.monotonic()
@@ -205,8 +206,8 @@ class Session:
         PHASES.append({
             "phase": label,
             "seconds": round(time.monotonic() - STARTED, 1),
-            "peak_owned_bytes": self.proof.peak,
-            "host_free_min_bytes": self.proof.low,
+            "script_scratch_peak_bytes_at_phase_samples": self.proof.peak,
+            "host_free_min_bytes_at_samples": self.proof.low,
         })
 
     def run(self, command: list, cwd: str, env: dict, timeout: float = 120) -> tuple:
@@ -496,6 +497,16 @@ class Custody:
         os.makedirs(directory, exist_ok=True)
         self.record("planned")
 
+    def retain(self, reason: str) -> None:
+        """Latch `retained` in memory first, then try to persist it; a failed
+        write never replaces the caller's fault and never re-opens custody."""
+        self.facts["state"] = "retained"
+        self.facts["reason"] = reason
+        try:
+            self.record("retained", reason=reason)
+        except BaseException as error:
+            self.facts["write_error"] = f"{type(error).__name__}"
+
     def record(self, state: str, **facts) -> None:
         self.facts.update(facts)
         self.facts["state"] = state
@@ -540,38 +551,72 @@ def detach_image(custody: Custody, run, deadline_ns: int, writers_unknown: bool,
     """Ordinary detach of every mount this run recorded, then removal of the
     backing image, only on positive answers. Unknown writers, too little time
     before the guard's stop, a failed or timed-out detach or a mount still
-    present keep the image and record why. Never forced; the guard's census
-    alone decides closure."""
+    present keep the image and record why. Any other exception, including an
+    interruption or a failed evidence write, latches `retained` in memory
+    before it propagates, so no later call touches the device or the backing.
+    Never forced; the guard's census alone decides closure."""
     state = custody.facts["state"]
     if state in ("planned", "create-requested", "image-created", "image-removed"):
         return True  # nothing was attached; an unattached backing file stays in evidence
     if state == "retained":
         return False  # an earlier attempt already decided to keep it; no retry
-    if state in ("attach-requested", "attach-unknown") or writers_unknown:
-        custody.record("retained", reason="device or writer custody unknown; no detach attempted")
+    try:
+        return _detach(custody, run, deadline_ns, writers_unknown, clock, mounted)
+    except BaseException as error:
+        if custody.facts["state"] != "image-removed":
+            custody.retain(f"detach interrupted by {type(error).__name__}; no further device action")
+        raise
+
+
+def _detach(custody: Custody, run, deadline_ns: int, writers_unknown: bool, clock, mounted) -> bool:
+    state = custody.facts["state"]
+    if state in ("attach-requested", "attach-unknown", "detach-requested", "detached") or writers_unknown:
+        custody.retain("device or writer custody unknown; no detach attempted")
         return False
     if state == "attach-mismatch" and not custody.facts["mounts"]:
-        custody.record("retained", reason="attach reported no mount; a device may be attached unmounted")
+        custody.retain("attach reported no mount; a device may be attached unmounted")
         return False
     for mount in custody.facts["mounts"]:
         left = (deadline_ns - clock()) / NS
         if left < 3:
-            custody.record("retained", reason=f"{left:.1f} s left before the guard's stop; no detach attempted")
+            custody.retain(f"{left:.1f} s left before the guard's stop; no detach attempted")
             return False
         custody.record("detach-requested", detaching=mount)
         try:
             code, _, err = run(["/usr/bin/hdiutil", "detach", mount], left - 1)
         except subprocess.TimeoutExpired:
-            custody.record("retained", reason=f"ordinary detach of {mount} timed out")
+            custody.retain(f"ordinary detach of {mount} timed out")
             return False
-        if code != 0 or mounted(mount):
-            custody.record("retained", reason=f"ordinary detach of {mount} exit {code}; mount present {mounted(mount)}",
-                           stderr=err[-2000:])
+        present = mounted(mount)
+        if code != 0 or present:
+            custody.facts["stderr"] = err[-2000:]
+            custody.retain(f"ordinary detach of {mount} exit {code}; mount present {present}")
             return False
         custody.record("detached", detached=mount)
     os.unlink(custody.image)
     custody.record("image-removed")
     return True
+
+
+def closeout_after_failure(failure: BaseException, custody, writers_unknown: bool, body: dict, evidence: str,
+                           detach=None, write_receipt=None) -> str:
+    """After the first fault: bounded ordinary cleanup, then the helper
+    receipt. A cleanup or record failure is noted beside the first fault and
+    never replaces it or skips the receipt."""
+    detach = detach or (lambda: detach_image(custody, bounded_run, cleanup_deadline_ns(), writers_unknown))
+    write_receipt = write_receipt or receipt
+    cleanup = "no owned image"
+    if custody is not None:
+        try:
+            detach()
+        except BaseException as error:
+            body["cleanup_error"] = f"{type(error).__name__}: {error}"[:2000]
+        cleanup = custody.facts
+    body.update({"result": f"failed: {failure!r}"[:4000], "image": cleanup, "writers_unknown": writers_unknown})
+    try:
+        return write_receipt(evidence, body)
+    except BaseException as error:
+        return f"not written ({type(error).__name__}: {error})"
 
 
 def receipt(evidence: str, body: dict) -> str:
@@ -633,7 +678,9 @@ def main() -> int:
             "tiny fixtures; not a benchmark, real-drive or real-account qualification",
             "the normal artifact is the release profile at opt-level 1, not the installer's opt-level 3",
             "the stand-in replaces the passwd lookup; the real lookup is covered by unit tests only",
-            "phase figures are samples at phase boundaries; the guard's continuous receipt has the actual peak",
+            "script-scratch phase samples measure only this run's scratch directory at phase boundaries; they exclude "
+            "the evidence directory (image backing, custody, receipts) and staging peaks between samples; the guard's "
+            "continuous whole-root receipt is the budget authority",
             "children_max_single_rss_bytes is the largest single child, not an aggregate demand",
         ],
     }
@@ -642,7 +689,7 @@ def main() -> int:
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)
         return {
             "script_seconds": round(time.monotonic() - STARTED, 1),
-            "peak_owned_bytes_at_phase_samples": session.proof.peak,
+            "script_scratch_peak_bytes_at_phase_samples": session.proof.peak,
             "host_free_min_bytes_at_samples": session.proof.low,
             "children_max_single_rss_bytes": usage.ru_maxrss,
             "children_cpu_seconds": round(usage.ru_utime + usage.ru_stime, 1),
@@ -696,21 +743,13 @@ def main() -> int:
         session.phase("unavailable")
     except BaseException as failure:
         # The first fault stays primary; cleanup only records what it did.
-        cleanup = "no owned image"
-        if session.custody is not None:
-            try:
-                detach_image(session.custody, bounded_run, cleanup_deadline_ns(),
-                             session.writers_unknown or bool(session.proof.unclosed))
-            except BaseException as error:
-                session.custody.record("retained", reason=f"cleanup raised {type(error).__name__}")
-            cleanup = session.custody.facts
-        body.update({"result": f"failed: {failure!r}", "cases": CASES, "phases": PHASES, "image": cleanup,
-                     "resources": resources(), "unclosed_children": sorted(session.proof.unclosed),
-                     "writers_unknown": session.writers_unknown})
         try:
-            written = receipt(evidence, body)
+            body.update({"cases": CASES, "phases": PHASES, "resources": resources(),
+                         "unclosed_children": sorted(session.proof.unclosed)})
         except BaseException as error:
-            written = f"not written ({error!r})"
+            body["resources_error"] = type(error).__name__
+        written = closeout_after_failure(failure, session.custody,
+                                         session.writers_unknown or bool(session.proof.unclosed), body, evidence)
         print(f"account-home proof failed; receipt {written}; scratch {root} left to the supervisor", file=sys.stderr)
         raise
     body.update({

@@ -322,6 +322,68 @@ class AccountHomeCustodyTests(unittest.TestCase):
         finally:
             del os.environ["OXIDE_PROOF_DEADLINE_NS"]
 
+    def test_an_interrupted_or_failing_detach_latches_retained_with_one_attempt(self):
+        for raised in (KeyboardInterrupt(), OSError("runner failed")):
+            self.custody.record("attached", mounts=[self.MOUNT])
+            self.calls.clear()
+            with self.assertRaises(type(raised)):
+                account_home.detach_image(self.custody, self.runner([raised]), 10**12, False,
+                                          clock=lambda: 0, mounted=lambda path: False)
+            self.assertEqual(self.custody.facts["state"], "retained")
+            self.assertFalse(account_home.detach_image(self.custody, self.runner([]), 10**12, False,
+                                                       clock=lambda: 0, mounted=lambda path: False))
+            self.assertEqual([call[0] for call in self.calls], ["detach"])
+            self.assertTrue(Path(self.custody.image).exists())
+
+    def test_a_failing_confirmation_or_evidence_write_latches_retained(self):
+        self.custody.record("attached", mounts=[self.MOUNT])
+
+        def confirm(path):
+            raise OSError("statfs failed")
+        with self.assertRaises(OSError):
+            account_home.detach_image(self.custody, self.runner([(0, b"", "")]), 10**12, False,
+                                      clock=lambda: 0, mounted=confirm)
+        self.assertEqual(self.custody.facts["state"], "retained")
+        self.assertTrue(Path(self.custody.image).exists())
+
+        self.custody.record("attached", mounts=[self.MOUNT])
+        self.calls.clear()
+        original = self.custody.record
+
+        def broken(state, **facts):
+            raise OSError("evidence write failed")
+        self.custody.record = broken
+        try:
+            with self.assertRaises(OSError):
+                account_home.detach_image(self.custody, self.runner([(0, b"", "")]), 10**12, False,
+                                          clock=lambda: 0, mounted=lambda path: False)
+        finally:
+            self.custody.record = original
+        self.assertEqual(self.custody.facts["state"], "retained")
+        self.assertEqual(self.custody.facts["write_error"], "OSError")
+        self.assertEqual(self.calls, [], "no device action after the intention could not be recorded")
+        self.assertTrue(Path(self.custody.image).exists())
+
+    def test_the_first_fault_survives_cleanup_and_record_failures(self):
+        evidence = Path(tempfile.mkdtemp(dir=SCRATCH))
+        primary = RuntimeError("case 07 failed")
+        self.custody.record("attached", mounts=[self.MOUNT])
+
+        def cleanup():
+            self.custody.record = lambda state, **facts: (_ for _ in ()).throw(OSError("evidence write failed"))
+            raise KeyboardInterrupt()
+        body = {}
+        written = account_home.closeout_after_failure(primary, self.custody, False, body, str(evidence), detach=cleanup)
+        receipt = json.loads(Path(written).read_text())
+        self.assertIn("case 07 failed", receipt["result"])
+        self.assertIn("KeyboardInterrupt", receipt["cleanup_error"])
+        self.assertTrue(Path(self.custody.image).exists())
+
+        def no_receipt(directory, body):
+            raise OSError("evidence full")
+        self.assertTrue(account_home.closeout_after_failure(primary, None, False, {}, str(evidence),
+                                                            write_receipt=no_receipt).startswith("not written (OSError"))
+
     def test_the_custody_record_stays_bounded(self):
         self.custody.record("attached", stderr="x" * 200_000)
         self.assertLessEqual((self.directory / "custody.json").stat().st_size, account_home.CUSTODY_MAX_BYTES)
