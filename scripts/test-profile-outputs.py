@@ -2,14 +2,17 @@
 """Owned output links at profile directories (oxide#133): the fixed native
 matrix.
 
-The qualified shared supervisor owns the deadline, 512 MiB monitored scratch,
-continuous host reserve sampling, process census/closure and cleanup. The
+The qualified shared supervisor (`scripts/bounded-test.py`, SHA-256
+`961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052`, the
+merged oxide#142 monitor qualified at main `791f552`) owns the deadline,
+512 MiB monitored scratch, continuous host reserve sampling, process
+census/closure and cleanup. The
 brief's scoped amendment (root owner, 2026-10-23T16:10Z, under the temporary
 Supervisor delegation) makes this selector/script/plan 600 s TOTAL instead of
 420; the old 420 publication at 030836f6 stays historical and unactivated. The
 helper's work cutoff is about 565 s (its 30 s reserve plus a 5 s refusal
 margin), inside which cleanup and image detach must finish. The published
-300-450 s work estimate is UNMEASURED, not an established fit:
+360-540 s work estimate is UNMEASURED, not an established fit:
 
     python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 \\
         -- python3 scripts/test-profile-outputs.py
@@ -61,8 +64,8 @@ base `4a70b83` (~45-80 s at 6 jobs); each target is copied out and discarded
 before the next staging starts, so only one staging target exists at a time.
 The script discards each staging target after copying
 its binary into the owned `bin/` directory so both never exceed the allocation:
-288 MiB staging peak + 128 MiB image backing + 32 MiB fixtures + 32 MiB
-evidence + 32 MiB margin = 512 MiB monitored.
+288 MiB staging peak + 128 MiB image backing + 48 MiB fixtures + 32 MiB
+evidence + 16 MiB margin = 512 MiB monitored.
 
 The 20 cases (see `--plan`):
 

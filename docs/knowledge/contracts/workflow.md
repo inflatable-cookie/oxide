@@ -3383,7 +3383,10 @@ a separately staged base `4a70b83` binary and this HEAD's candidate staged
 offline with 1.97.1 from authenticated pinned source, with asserted distinct
 binary hashes and state-3/state-4 capability probes. It runs under the
 qualified shared supervisor (`scripts/bounded-test.py`, SHA-256
-`d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e`) as
+`961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052`, the
+oxide#142 monitor qualified at main `791f552`; this proof was bound to its
+predecessor `d89115f1…` before that qualification and those runs stay
+historical) as
 `bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3
 scripts/test-profile-outputs.py`; the script prints its own phase allocation
 and assertions with `--plan`. The root owner's scoped amendment
@@ -3391,9 +3394,10 @@ and assertions with `--plan`. The root owner's scoped amendment
 publication at 030836f6 is historical and unactivated), with a helper work
 cutoff of about 565 s (its 30 s reserve plus a 5 s refusal margin) inside which
 cleanup and image detach must finish; scratch stays 512 MiB and no runner or
-split-proof change is granted. The published 300-450 s work estimate remains
+split-proof change is granted. The published 360-540 s work estimate remains
 UNMEASURED, not an established fit, and independent source-fit may still
-refuse it. CPU controls support a 6 CPU / 8 GiB planning request: the two
+refuse it. Its static disk allocation is 288 MiB staging peak + 128 MiB image
+backing + 48 MiB fixtures + 32 MiB evidence + 16 MiB margin = 512 MiB. CPU controls support a 6 CPU / 8 GiB planning request: the two
 independent stagings are sequential and each is explicitly bounded to 6 Cargo
 jobs, fixture Cargo children are bounded to 2 jobs with at most two gated
 writers overlapping, and the shared staging helper takes that bound explicitly
