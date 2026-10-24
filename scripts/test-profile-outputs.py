@@ -790,6 +790,24 @@ def pure_registry_controls() -> None:
     print("pure registry controls: ok", flush=True)
 
 
+def selected_backend_slots(proof: Proof, pool: str, label: str) -> str:
+    """The ACTUAL selected removable backend's slot root, derived from the
+    fixture registration rather than an assumed path: the registered volume's
+    payload directory (`removable::PAYLOAD_DIR` = "oxide-pool") holds the pool's
+    `SLOTS_NAME` ("slots") directory. A8: slot no-effect controls must watch
+    this tree, not the unused internal payload tree."""
+    registration = perm.read_json(perm.registration_path(pool))
+    mount = registration.get("mount_point")
+    expect(bool(mount), f"{label}: the registration names no mount point")
+    expect(
+        proof.mount is not None and os.path.realpath(mount) == os.path.realpath(proof.mount),
+        f"{label}: the registered mount {mount} is not the attached volume {proof.mount}",
+    )
+    slots = os.path.join(mount, "oxide-pool", "slots")
+    expect(os.path.isdir(slots), f"{label}: the selected backend slot root {slots} is missing")
+    return slots
+
+
 def custody_snapshot(pool: str, checkout: str) -> dict:
     """Bounded observable state of one checkout's output authority: receipt
     bytes, member link texts, the root marker's bytes, the checkout's own
@@ -1906,8 +1924,16 @@ def run(proof: Proof, repo: str) -> None:
     # repeat is required to be WARM in that exact slot - not a substring test.
     real_slot, real_state = perm.slot_state(stderr)
     expect(real_state == "warm", f"18: the real placement's repeat was not warm: {summary(stderr)}")
-    slots_dir = os.path.join(pool, "payload", "slots")
+    # A8: the selected removable backend's own slot root, plus the internal
+    # pool's authority for a no-effect comparison.
+    slots_dir = selected_backend_slots(proof, pool, "18")
     slots_before = sorted(os.listdir(slots_dir))
+    internal_slots = os.path.join(pool, "payload", "slots")
+    internal_before = sorted(os.listdir(internal_slots)) if os.path.isdir(internal_slots) else []
+    expect(
+        real_slot in slots_before,
+        f"18: the real placement's slot {real_slot} is not in the selected backend tree {slots_dir}",
+    )
     shutil.rmtree(os.path.join(cold, "target", "debug"))
     adopt(proof, cold, "18 relink")
     expect_layout(cold, {"debug": f"link:{cold_root}", "release": f"link:{cold_root}"})
@@ -1927,6 +1953,15 @@ def run(proof: Proof, repo: str) -> None:
         set(slots_before).issubset(set(slots_after)),
         f"18: the real placement's slot was evicted instead of remaining available: {slots_before} -> {slots_after}",
     )
+    expect(
+        real_slot in slots_after,
+        f"18: the real placement's slot {real_slot} left the selected backend tree",
+    )
+    if os.path.isdir(internal_slots):
+        expect(
+            sorted(os.listdir(internal_slots)) == internal_before,
+            "18: the internal pool's slot authority changed during external builds",
+        )
     facts_linked = perm.plan(proof, cold, "18 linked plan")["members"]
     expect(
         facts_real != facts_linked,
@@ -1936,8 +1971,10 @@ def run(proof: Proof, repo: str) -> None:
     # ----- case 19: the staged state-3 binary refuses state 4 -------------
     snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
     receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
-    slots_dir = os.path.join(pool, "payload", "slots")
+    slots_dir = selected_backend_slots(proof, pool, "19")
     slots_before = sorted(os.listdir(slots_dir))
+    internal_slots = os.path.join(pool, "payload", "slots")
+    internal_before = sorted(os.listdir(internal_slots)) if os.path.isdir(internal_slots) else []
     # Working base control immediately before the refusal: the same base
     # binary serves a fresh private pool normally.
     control = proof.run([base, "--version"], cwd=migrated, env=proof.env, timeout=60)
@@ -1968,8 +2005,13 @@ def run(proof: Proof, repo: str) -> None:
     expect(perm.sha256_file(perm.receipt_path(pool, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
     expect(
         sorted(os.listdir(slots_dir)) == slots_before,
-        "19: the refused state-3 run created or changed a slot",
+        "19: the refused state-3 run created or changed a slot in the selected backend",
     )
+    if os.path.isdir(internal_slots):
+        expect(
+            sorted(os.listdir(internal_slots)) == internal_before,
+            "19: the refused state-3 run changed the internal pool authority",
+        )
 
     # ----- case 20: root-group prune keeps another checkout's reference ---
     group = make_checkout(proof, "group")
@@ -2092,6 +2134,22 @@ def run(proof: Proof, repo: str) -> None:
     with open(rollback_plan, "wb") as handle:
         handle.write(stdout.encode())
     rollback_sha = perm.sha256_file(rollback_plan)
+    # A9: the source seam is prune.rs CRASH_ENVIRONMENT=OXIDE_TEST_PRUNE_CRASH,
+    # fired AFTER the durable journal publication and BEFORE quarantine, and a
+    # Pending stop exits 3. Require the exact exit, the named diagnostic and a
+    # real durable intent that pins the complete recorded group and the actual
+    # receipt preimage: a generic nonzero (for example a pre-intent refusal)
+    # must not pass.
+    intent_receipt_path = perm.receipt_path(pool, gone)
+    intent_preimage = perm.sha256_file(intent_receipt_path)
+    registry_path = os.path.join(pool, "oxide-managed", "outputs", "registry.json")
+    gone_id = perm.hashlib.sha256(gone.encode()).hexdigest()
+    group_rows_before = sorted(
+        row.get("member")
+        for row in perm.read_json(registry_path).get("rows", [])
+        if row.get("checkout_id") == gone_id and row.get("root") == gone_root
+    )
+    expect(bool(group_rows_before), "20: the gone checkout has no recorded group rows to inject against")
     env = {**proof.env, "OXIDE_TEST_PRUNE_CRASH": "intent"}
     code, _, stderr = perm.oxide_env(
         proof,
@@ -2100,8 +2158,44 @@ def run(proof: Proof, repo: str) -> None:
         group,
         env,
     )
-    expect(code != 0, "20: the injected intent stop did not stop the prune")
+    expect(code == 3, f"20: the injected intent stop exited {code}, not 3: {stderr}")
+    expect(
+        "prune: injected stop at intent" in stderr
+        and "OXIDE_TEST_PRUNE_CRASH=intent" in stderr
+        and "the intent stays pending" in stderr,
+        f"20: the injected intent diagnostic changed: {stderr}",
+    )
     expect(os.path.isdir(gone_root), "20: the intent crash removed the root")
+    expect(
+        perm.sha256_file(intent_receipt_path) == intent_preimage,
+        "20: the intent stop changed the receipt preimage",
+    )
+    intent = next(
+        (entry for entry in perm.read_json(registry_path).get("intents", []) if entry["identity"]["root"] == gone_root),
+        None,
+    )
+    expect(intent is not None, "20: the injected intent stop published no durable intent")
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    if evidence:
+        with open(os.path.join(evidence, "case20-intent-registry.json"), "wb") as handle:
+            handle.write(perm.read_bytes(registry_path))
+    expect(
+        intent.get("prior_receipt_sha") == intent_preimage,
+        f"20: the intent does not pin the receipt preimage: {intent.get('prior_receipt_sha')} vs {intent_preimage}",
+    )
+    injected_group = [row.get("member") for row in (intent.get("group") or [])]
+    expect(
+        sorted(injected_group) == sorted(set(injected_group)),
+        f"20: the injected intent group holds duplicate members: {injected_group}",
+    )
+    expect(
+        sorted(injected_group) == group_rows_before,
+        f"20: the injected intent group is not the COMPLETE recorded group: {sorted(injected_group)} vs {group_rows_before}",
+    )
+    expect(
+        intent.get("receipt_settled") is False,
+        "20: the injected intent was already settled at the stop",
+    )
     receipt_path = perm.receipt_path(pool, gone)
     original_receipt = perm.read_bytes(receipt_path)
     with open(receipt_path, "wb") as handle:
@@ -2168,6 +2262,11 @@ def run(proof: Proof, repo: str) -> None:
         env,
     )
     expect(code != 0, "20: the injected terminal-image stop did not stop the prune")
+    expect(
+        "prune: injected stop at terminal-image" in stderr
+        and "OXIDE_TEST_PRUNE_CRASH=terminal-image" in stderr,
+        f"20: the terminal-image diagnostic changed: {stderr}",
+    )
     registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
     intent = next((entry for entry in registry.get("intents", []) if entry["identity"]["root"] == gone_root), None)
     expect(intent is not None, "20: the terminal crash lost its intent")
@@ -2205,9 +2304,24 @@ def run(proof: Proof, repo: str) -> None:
     code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 unrelated dry", group)
     expect(code == 0, f"20: unrelated dry run failed: {stderr}")
     unrelated_preview = json.loads(stdout)
+    candidate_roots = [candidate["root"] for candidate in unrelated_preview["candidates"]]
     expect(
-        any(candidate["root"] == unrelated_root for candidate in unrelated_preview["candidates"]),
-        f"20: the unrelated gone root is not an eligible candidate: {unrelated_preview['candidates']}",
+        unrelated_root in candidate_roots,
+        f"20: the unrelated gone root is not an eligible candidate: {candidate_roots}",
+    )
+    # Specificity in the SAME preview: the eligible deletion names the gone
+    # root and the live checkout's root is never a candidate.
+    expect(
+        group_root not in candidate_roots,
+        f"20: the live checkout's root is a candidate beside the eligible one: {candidate_roots}",
+    )
+    # A9 honest limitation, not silently dropped: a peer receipt that keeps its
+    # root is asserted KEEP in its own preview earlier, but a single preview
+    # showing peer KEEP and this eligible deletion simultaneously is still
+    # missing; the peer receipt is removed before this run.
+    expect(
+        not os.path.exists(peer_receipt_path),
+        "20: the peer receipt is supposed to be gone before the unrelated preview",
     )
     unrelated_plan = os.path.join(proof.root, "prune-unrelated.json")
     with open(unrelated_plan, "wb") as handle:
