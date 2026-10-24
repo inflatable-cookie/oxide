@@ -2535,10 +2535,19 @@ oxide#102.
   back to `$HOME`. When `HOME` differs from the account home and neither the
   pool nor the config file is explicit, a leased command prints one notice and
   `status` shows it on a `home:` line. Cargo's own `CARGO_HOME` default still
-  follows `$HOME`. Debug builds alone honour `OXIDE_TEST_HOME_FROM_ENV=1`,
-  which restores `$HOME` as the home input for Oxide's proof scripts; release
-  and installed builds ignore it. Every proof script that sets a private
-  `HOME` sets it.
+  follows `$HOME`. Explicit pool and config settings choose the pool and
+  config file; `status` still reads the account's state root (known pools,
+  the legacy default pool and previous registrations), read-only. Debug builds
+  alone honour two proof controls, which release and installed builds ignore:
+  `OXIDE_TEST_HOME_FROM_ENV=1` restores `$HOME` as the home input (every proof
+  script that sets a private `HOME` sets it), and `OXIDE_TEST_ACCOUNT_HOME`
+  stands in a controlled absolute account home, or `!unavailable` for an
+  injected lookup failure. `effigy rust:everyday-cli` proves the account
+  default, the notice, explicit `OXIDE_POOL` precedence and the refusal
+  through the second control, with nothing created under the overridden
+  `HOME`. `scripts/test-oxide-cli.py` (its active `clean-safety` and
+  `launch-check` modes) already ran under the operator's real `HOME`, so its
+  resolution is unchanged.
   **Proof.** Unit tests pin literal former paths for both platforms
   (Unicode and spaces), demanded and unused relative XDG, overrides without
   `HOME` and missing facts with injected facts; they do not prove native

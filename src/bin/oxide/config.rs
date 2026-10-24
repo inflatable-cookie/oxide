@@ -78,10 +78,28 @@ pub enum HomeSource {
 /// The debug-build-only proof control that restores `$HOME` as the home
 /// input. Release builds never read it.
 pub const TEST_HOME_FROM_ENV: &str = "OXIDE_TEST_HOME_FROM_ENV";
+/// The debug-build-only proof control that replaces the passwd lookup with a
+/// controlled account home, or `!unavailable` for an injected failure.
+pub const TEST_ACCOUNT_HOME: &str = "OXIDE_TEST_ACCOUNT_HOME";
 
 /// The account's home directory from its passwd entry: absolute, non-empty,
 /// or an error. Never `$HOME`.
 pub fn account_home() -> Result<OsString, String> {
+    // Debug builds only: a proof can stand in a controlled account home, or
+    // an exact `!unavailable` lookup failure, without touching the real one.
+    if cfg!(debug_assertions) {
+        if let Some(value) = std::env::var_os(TEST_ACCOUNT_HOME) {
+            if value == "!unavailable" {
+                return Err("the account home directory is unavailable (injected)".to_owned());
+            }
+            if Path::new(&value).is_absolute() {
+                return Ok(value);
+            }
+            return Err(format!(
+                "{TEST_ACCOUNT_HOME} must be absolute or !unavailable"
+            ));
+        }
+    }
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
     let uid = unsafe { libc::geteuid() };

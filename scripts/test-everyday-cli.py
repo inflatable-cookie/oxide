@@ -489,6 +489,34 @@ def capacity(proof: Proof, root: str) -> None:
     )
 
 
+def account_home(proof: Proof, root: str) -> None:
+    """The installed default: the pool and config follow the account home, not
+    HOME. A controlled account home stands in for the real one, so nothing
+    here can reach the operator's pool."""
+    account = os.path.join(root, "account-home")
+    harness = os.path.join(root, "harness-home")
+    for path in (account, harness):
+        os.makedirs(path, exist_ok=True)
+    base = {k: v for k, v in ENV.items() if k not in ("OXIDE_TEST_HOME_FROM_ENV", "OXIDE_POOL")}
+    env = {**base, "HOME": harness, "OXIDE_TEST_ACCOUNT_HOME": account}
+    code, out, err = run(proof, proof.binary, ["status"], root, env=env, timeout=60)
+    case("an overridden HOME resolves config from the account home", code == 0
+         and f"config: {account}/Library/Application Support/oxide/config/config.toml" in out, out + err)
+    case("an overridden HOME resolves the default pool from the account home", code == 0
+         and f"pool: {account}/Library/Caches/oxide/build-pool" in out, out)
+    case("a differing HOME prints the account-home notice", code == 0
+         and f"home: HOME is {harness}; Oxide's pool and config use the account home {account}" in out, out)
+    case("nothing is created under the harness HOME", not os.path.exists(os.path.join(harness, "Library")))
+    explicit = os.path.join(root, "explicit-pool")
+    code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_POOL": explicit}, timeout=60)
+    case("an explicit OXIDE_POOL still wins and silences the notice", code == 0
+         and f"pool: {explicit} (from OXIDE_POOL)" in out and "home: HOME is" not in out, out + err)
+    code, out, err = run(proof, proof.binary, ["status"], root, env={**env, "OXIDE_TEST_ACCOUNT_HOME": "!unavailable"}, timeout=60)
+    case("an unavailable account home refuses instead of using HOME", code != 0
+         and "the account home directory is unavailable" in err and harness not in out, out + err)
+    case("the refusal created nothing under the harness HOME", not os.path.exists(os.path.join(harness, "Library")))
+
+
 def main() -> int:
     if sys.platform != "darwin":
         fail("the everyday CLI proof requires macOS")
@@ -526,6 +554,7 @@ def main() -> int:
         readiness(proof, root)
         passthrough(proof, root)
         capacity(proof, root)
+        account_home(proof, root)
     except BaseException as failure:
         print(f"everyday CLI proof failed after {time.monotonic() - STARTED:.0f} s: {failure!r}; scratch {root} left to the runner", file=sys.stderr)
         raise
