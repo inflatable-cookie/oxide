@@ -181,6 +181,24 @@ def timeout(phase_seconds: float) -> float:
     return clip(phase_seconds, work_left())
 
 
+def remaining_quiet() -> float:
+    """Seconds of guard work left, without raising: custody steps use this.
+
+    A release or closeout must never call `fail()` (which itself releases owned
+    children) or it could replace the primary fault with a recursive one.
+    """
+    guard = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
+    if not guard:
+        return 0.0
+    left = (int(guard) - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9 - SHUTDOWN_MARGIN_S
+    return max(0.0, left)
+
+
+def custody_bound() -> float:
+    """A short, clipped wait for releasing one owned direct child."""
+    return min(2.0, max(0.2, remaining_quiet()))
+
+
 def parse_arguments(argv: list[str]) -> tuple[str, str | None]:
     """Fail-closed argument boundary: at most one known mode, no effects."""
     if not argv:
@@ -265,11 +283,12 @@ def plan_document() -> dict:
             {"name": "admission-expiry-no-start", "oracle": "held slot + 1s admission: exit 124, no primary marker, no started record, finished(admission_deadline), contender ticket gone"},
             {"name": "contention-longer-than-execution", "oracle": "held slot released after ~3s + 60s admission/2s execution: starts after release, exit 0, execution_elapsed <=2s though wall >=3s"},
             {"name": "execution-deadline", "oracle": "60s sleeper + 1s execution: exit 125, finished(execution_deadline), budget named, group settled, slot reusable"},
+            {"name": "precedence-child-124", "oracle": "child exits 124 itself under a 60s budget: child_exit 124, no budget line, no latched origin"},
             {"name": "precedence-caller-signal", "oracle": "SIGTERM before expiry: 143, released, no deadline origin"},
             {"name": "precedence-child-125", "oracle": "child exits 125 itself under a 60s budget: child_exit, no budget line"},
             {"name": "precedence-term-trap", "oracle": "TERM-trapping child under 1s: trap marker present, exit 125, finished(execution_deadline)"},
-            {"name": "cumulative-run-window", "oracle": "1s build.rs + 60s program, 12s execution on a budget-only pool: exit 125 in run_program with 8s<=elapsed<12.8s (a reset window would take at least 13s)"},
-            {"name": "nested-outer-window", "oracle": "outer exec takes the only slot, its tool starts an inner oxide that waits; the outer window stops the tool group, the inner ends on its own admission budget, no build appears"},
+            {"name": "cumulative-run-window", "oracle": "3s build.rs + 60s program under one 5s execution window on a budget-only pool: exit 125 in run_program and the launched program ran 0.5s<=t<3.5s after the build hand-off (a reset window would let it run ~5s); closeout latency is not asserted"},
+            {"name": "nested-outer-window", "oracle": "the outer exec starts first and takes the only slot; its tool starts an inner oxide that waits and ends on its own 1s admission budget with no build; the tool keeps running so the outer 2s window (not a natural exit) stops it: exit 125 with a typed exec_tool start and execution_deadline"},
             {"name": "events-matrix", "oracle": "regular file, read end and blocking pipe refuse before any effect; full pipe yields no typed record; contiguous sequence on a healthy stream"},
             {"name": "events-broken-reader", "oracle": "read end closed before start: exit 0, parent survives, one loss note, no typed record"},
             {"name": "unknown-closure-held", "oracle": "debug closure hook + 1s execution: exit 1, finished(unconfirmed_closure), drain not complete, lease held, status shows the held slot"},
@@ -367,18 +386,22 @@ def git(*args: str) -> str:
 
 
 def release(process: subprocess.Popen) -> None:
-    """End one owned direct child: terminate, bounded wait, then kill."""
+    """Best-effort custody for one owned direct child, with clipped waits.
+
+    It never waits past the guard's remaining window and never claims that a
+    descendant closed. An unresolved child is reported as unknown custody.
+    """
     if process.poll() is not None:
         return
     try:
         process.terminate()
-        process.wait(timeout=5)
+        process.wait(timeout=custody_bound())
     except (subprocess.TimeoutExpired, OSError):
         try:
             process.kill()
-            process.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+            process.wait(timeout=custody_bound())
+        except (subprocess.TimeoutExpired, OSError) as error:
+            say(f"custody: owned pid {process.pid} did not settle ({error}); closure is unknown")
 
 
 def start(argv: list[str], *, cwd: str, env: dict, **kwargs) -> subprocess.Popen:
@@ -412,8 +435,12 @@ def run(
     try:
         stdout, stderr = process.communicate(timeout=timeout(phase_seconds))
     except subprocess.TimeoutExpired:
-        release(process)
-        stdout, stderr = process.communicate()
+        process.kill()
+        try:
+            stdout, stderr = process.communicate(timeout=min(5.0, max(0.2, remaining_quiet())))
+        except subprocess.TimeoutExpired:
+            say(f"custody: owned pid {process.pid} outlived its clipped timeout; output is unknown")
+            stdout, stderr = "", ""
         fail(f"{argv[0]} exceeded its clipped timeout of {clip(phase_seconds, work_left()):.0f}s")
     result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
     result.elapsed = time.monotonic() - started
@@ -490,6 +517,18 @@ def create_crate(root: str, label: str) -> str:
     )
     write_private(os.path.join(crate, "src", "lib.rs"), "pub fn fixture() -> u8 { 1 }\n")
     return crate
+
+
+def close_holder(process: subprocess.Popen, release_file: str) -> None:
+    """Ask a holder to end through its own release file, then bound the wait."""
+    try:
+        write_private(release_file, "done\n")
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=min(5.0, max(0.2, remaining_quiet())))
+    except subprocess.TimeoutExpired:
+        release(process)
 
 
 def hold_slot(
@@ -620,7 +659,7 @@ def case_fast_start_axes(root: str, subject: str) -> None:
     ):
         read_fd, write_fd = event_pipe()
         try:
-            result = run(
+            answer = run(
                 [subject, "exec", *budgets, "--budget-events", str(write_fd), "--", tool],
                 cwd=crate,
                 env=env,
@@ -631,7 +670,7 @@ def case_fast_start_axes(root: str, subject: str) -> None:
         finally:
             os.close(write_fd)
             os.close(read_fd)
-        expect(result.returncode == 0, f"{label}: exit {result.returncode}: {result.stderr[-800:]}")
+        expect(answer.returncode == 0, f"{label}: exit {answer.returncode}: {answer.stderr[-800:]}")
         records = finish_events(result, raw)
         ok, detail = sequence_oracle(records)
         expect(ok, f"{label}: {detail}")
@@ -645,7 +684,7 @@ def case_fast_start_axes(root: str, subject: str) -> None:
         recorded = terminal(records)
         expect(recorded["outcome"] == "child_exit", f"{label}: outcome {recorded['outcome']}")
         expect(recorded["exit_code"] == 0, f"{label}: terminal exit {recorded['exit_code']}")
-        expect("budget" not in result.stderr.lower(), f"{label}: printed a budget line")
+        expect("budget" not in answer.stderr.lower(), f"{label}: printed a budget line")
     result("fast-start-axes", True, "both/execution-only/admission-only axes, nullable fields and sequence")
 
 
@@ -655,7 +694,7 @@ def case_spawn_failure(root: str, subject: str) -> None:
     crate = create_crate(root, "spawn-failure")
     read_fd, write_fd = event_pipe()
     try:
-        result = run(
+        answer = run(
             [subject, "exec", "--execution-budget", "5s", "--budget-events", str(write_fd), "--", os.path.join(root, "absent")],
             cwd=crate,
             env=env,
@@ -666,7 +705,7 @@ def case_spawn_failure(root: str, subject: str) -> None:
     finally:
         os.close(write_fd)
         os.close(read_fd)
-    expect(result.returncode == 127, f"a missing program exited {result.returncode}, wanted 127")
+    expect(answer.returncode == 127, f"a missing program exited {answer.returncode}, wanted 127")
     records = finish_events(result, raw)
     expect(not started_records(records), "a spawn failure emitted a started record")
     recorded = terminal(records)
@@ -687,7 +726,7 @@ def case_admission_expiry(root: str, subject: str) -> None:
     tickets_before = ticket_count(env)
     read_fd, write_fd = event_pipe()
     try:
-        result = run(
+        answer = run(
             [subject, "exec", "--admission-budget", "1s", "--budget-events", str(write_fd), "--", tool],
             cwd=crate,
             env=env,
@@ -698,10 +737,10 @@ def case_admission_expiry(root: str, subject: str) -> None:
     finally:
         os.close(write_fd)
         os.close(read_fd)
-        release(holder)
-    expect(result.returncode == ADMISSION_EXIT, f"admission expiry exited {result.returncode}")
+        close_holder(holder, _release_file)
+    expect(answer.returncode == ADMISSION_EXIT, f"admission expiry exited {answer.returncode}")
     expect(not os.path.exists(marker), "an admission-expired command started its child")
-    expect("admission budget" in result.stderr, f"the stop did not name the admission budget: {result.stderr[-600:]}")
+    expect("admission budget" in answer.stderr, f"the stop did not name the admission budget: {answer.stderr[-600:]}")
     records = finish_events(result, raw)
     expect(not started_records(records), "an admission-expired command emitted a started record")
     expect(terminal(records)["outcome"] == "admission_deadline", "the terminal outcome is not admission_deadline")
@@ -748,7 +787,7 @@ def case_contention(root: str, subject: str) -> None:
         release(process)
         fail("the contender did not finish inside its clipped timeout")
     finally:
-        release(holder)
+        close_holder(holder, release_file)
     expect(process.returncode == 0, f"the contender exited {process.returncode}: {stderr[-800:]}")
     expect(waited >= 2.5, f"the contender only waited {waited:.1f}s, not longer than its 2s execution window")
     expect(elapsed <= 6.0, f"the contender took {elapsed:.1f}s after release; execution elapsed must fit its own window")
@@ -764,7 +803,7 @@ def case_execution_deadline(root: str, subject: str) -> None:
     write_executable(tool, "#!/bin/sh\nexec sleep 60\n")
     read_fd, write_fd = event_pipe()
     try:
-        result = run(
+        answer = run(
             [subject, "exec", "--execution-budget", "1s", "--budget-events", str(write_fd), "--", tool],
             cwd=crate,
             env=env,
@@ -775,9 +814,9 @@ def case_execution_deadline(root: str, subject: str) -> None:
     finally:
         os.close(write_fd)
         os.close(read_fd)
-    expect(result.returncode == EXECUTION_EXIT, f"the deadline exited {result.returncode}")
-    expect("execution budget" in result.stderr, f"the stop did not name the execution budget: {result.stderr[-600:]}")
-    expect(result.elapsed <= 1 + 15, f"the stop took {result.elapsed:.1f}s past the finite closeout bound")
+    expect(answer.returncode == EXECUTION_EXIT, f"the deadline exited {answer.returncode}")
+    expect("execution budget" in answer.stderr, f"the stop did not name the execution budget: {answer.stderr[-600:]}")
+    expect(answer.elapsed <= 1 + 15, f"the stop took {answer.elapsed:.1f}s past the finite closeout bound")
     records = finish_events(result, raw)
     recorded = terminal(records)
     expect(recorded["outcome"] == "execution_deadline", f"outcome {recorded['outcome']}")
@@ -792,6 +831,29 @@ def case_execution_deadline(root: str, subject: str) -> None:
 def case_precedence(root: str, subject: str) -> None:
     env = fixture_env(root, "precedence")
     crate = create_crate(root, "precedence")
+    case("precedence-child-124")
+    self124 = os.path.join(root, "self124.sh")
+    write_executable(self124, "#!/bin/sh\nexit 124\n")
+    read_fd, write_fd = event_pipe()
+    try:
+        answer = run(
+            [subject, "exec", "--execution-budget", "60s", "--budget-events", str(write_fd), "--", self124],
+            cwd=crate,
+            env=env,
+            phase_seconds=30,
+            pass_fds=(write_fd,),
+        )
+        raw = drain(read_fd)
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+    expect(answer.returncode == 124, f"a genuine child 124 exited {answer.returncode}")
+    expect("budget" not in answer.stderr.lower(), "a genuine child 124 printed a budget line")
+    recorded = terminal(finish_events(answer, raw))
+    expect(recorded["outcome"] == "child_exit", f"a genuine 124 was typed {recorded['outcome']}")
+    expect(recorded["stop_origin"] is None, f"a genuine 124 latched {recorded['stop_origin']}")
+    result("precedence-child-124", True, "child_exit 124 without a budget line or latched origin")
+
     case("precedence-child-125")
     self125 = os.path.join(root, "self125.sh")
     write_executable(self125, "#!/bin/sh\nexit 125\n")
@@ -1199,7 +1261,16 @@ def stage_subject(scratch: str) -> str:
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_"))
-        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "OXIDE_CONFIG", "OXIDE_POOL")
+        and key
+        not in (
+            "CARGO",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "OXIDE_CONFIG",
+            "OXIDE_POOL",
+        )
     }
     env.update(
         {
@@ -1234,6 +1305,27 @@ def stage_subject(scratch: str) -> str:
     subject = os.path.join(scratch, "subject-oxide")
     shutil.copy2(built, subject)
     os.chmod(subject, 0o755)
+    # The copied candidate must be byte-identical before the staging targets go.
+    expect(
+        sha256_file(subject) == sha256_file(built),
+        "the copied candidate does not match the staged binary",
+    )
+    # Debug-control capability identity, checked statically: only a
+    # debug_assertions build carries the closure hook name, so a release build
+    # would be refused here instead of silently mis-running the proof.
+    with open(subject, "rb") as handle:
+        image = handle.read()
+    expect(
+        b"OXIDE_TEST_CLOSURE_STUCK" in image,
+        "the staged candidate has no debug closure-control capability",
+    )
+    expect(
+        b"OXIDE_TEST_SPAWN_DELAY_MS" in image,
+        "the staged candidate has no debug spawn-delay capability",
+    )
+    say(
+        "staged candidate capabilities: debug closure hook and spawn-delay hook present"
+    )
     # Only the positively owned staging directories are removed.
     shutil.rmtree(os.path.join(stage, "target"), ignore_errors=True)
     shutil.rmtree(os.path.join(stage, "build"), ignore_errors=True)
@@ -1273,6 +1365,47 @@ def write_receipt(receipt: dict, scratch: str) -> str:
     return path
 
 
+def receipt_document(
+    commit: str, tree: str, digest: str, runner_sha: str, fault: str | None
+) -> dict:
+    return {
+        "task": "oxide#140",
+        "kind": "command-budgets helper receipt",
+        "selector": SELECTOR,
+        "identity": stage_identity(commit, tree, digest, sha256_file(SCRIPT)),
+        "command": COMMAND,
+        "reached": [entry["case"] for entry in RESULTS],
+        "completed": [entry["case"] for entry in RESULTS if entry["result"] == "pass"],
+        "failed": [entry for entry in RESULTS if entry["result"] != "pass"],
+        "unexecuted": sorted(
+            set(case["name"] for case in plan_document()["cases"])
+            - set(entry["case"] for entry in RESULTS)
+        ),
+        "cases": RESULTS,
+        "primary_fault": fault,
+        "allocation": phase_allocation(),
+        "limits": {
+            "wall_limit_s": WALL_LIMIT_S,
+            "scratch_budget_mib": SCRATCH_BUDGET_MIB,
+            "shutdown_margin_s": SHUTDOWN_MARGIN_S,
+            "timing": "unmeasured",
+        },
+        "children": {
+            "tracked": len(OWNED),
+            "release": "release files, then terminate() and clipped kill() on exact owned PIDs",
+            "sessions": "no new session or process group; no census or broad signals",
+            "closure": "direct leader reaping is not descendant closure; the guard decides closure",
+        },
+        "guard_sha256": runner_sha,
+        "authority": "This helper receipt records only the script's own case oracles and its "
+        "own primary fault. The guard's own receipt, the actual caller exit and the "
+        "session closure remain separately authoritative and are not determined here.",
+        "live_pool": False,
+        "mounted_volume": False,
+        "result": "pass" if fault is None else "fail",
+    }
+
+
 def run_proof(scratch: str, commit: str, tree: str, runner_sha: str) -> None:
     global SUBJECT
     SUBJECT = stage_subject(scratch)
@@ -1296,47 +1429,26 @@ def run_proof(scratch: str, commit: str, tree: str, runner_sha: str) -> None:
         case_no_mutation,
         case_unbudgeted,
     ]
-    for entry in cases:
-        entry(root, SUBJECT)
-        work_left()
-    say(f"cases run: {', '.join(CASES)}")
-    receipt = {
-        "task": "oxide#140",
-        "kind": "command-budgets helper receipt",
-        "selector": SELECTOR,
-        "identity": stage_identity(commit, tree, digest, sha256_file(SCRIPT)),
-        "command": COMMAND,
-        "reached": [entry["case"] for entry in RESULTS],
-        "completed": [entry["case"] for entry in RESULTS if entry["result"] == "pass"],
-        "failed": [entry for entry in RESULTS if entry["result"] != "pass"],
-        "unexecuted": sorted(
-            set(case["name"] for case in plan_document()["cases"])
-            - set(entry["case"] for entry in RESULTS)
-        ),
-        "cases": RESULTS,
-        "allocation": phase_allocation(),
-        "limits": {
-            "wall_limit_s": WALL_LIMIT_S,
-            "scratch_budget_mib": SCRATCH_BUDGET_MIB,
-            "shutdown_margin_s": SHUTDOWN_MARGIN_S,
-            "timing": "unmeasured",
-        },
-        "children": {
-            "tracked": len(OWNED),
-            "release": "release files, then terminate() and bounded kill() on exact owned PIDs",
-            "sessions": "no new session or process group; no census or broad signals",
-        },
-        "guard_sha256": runner_sha,
-        "authority": "This helper receipt records only the script's own case oracles. "
-        "The guard's own receipt, the actual caller exit and the session closure "
-        "remain separately authoritative and are not determined here.",
-        "live_pool": False,
-        "mounted_volume": False,
-        "result": "pass" if all(entry["result"] == "pass" for entry in RESULTS) else "fail",
-    }
-    path = write_receipt(receipt, scratch)
-    say(f"helper receipt {path}")
-    print(json.dumps(receipt, indent=2, sort_keys=True), flush=True)
+    fault = None
+    try:
+        for entry in cases:
+            entry(root, SUBJECT)
+            work_left()
+        say(f"cases run: {', '.join(CASES)}")
+    except SystemExit as stop:
+        fault = f"case stop with status {stop.code}"
+        raise
+    except Exception as error:  # noqa: BLE001 - the receipt must record any fault
+        fault = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        # The receipt is written on every path, including a case failure, so
+        # the primary fault and the reached set survive.
+        receipt = receipt_document(commit, tree, digest, runner_sha, fault)
+        path = write_receipt(receipt, scratch)
+        say(f"helper receipt {path} (result {receipt['result']})")
+        if fault is None:
+            print(json.dumps(receipt, indent=2, sort_keys=True), flush=True)
 
 
 SUBJECT = ""
@@ -1360,7 +1472,7 @@ def self_check() -> None:
     expect(plan["limits"]["shutdown_margin_s"] == 30, "the shutdown margin changed")
     expect(plan["limits"]["allocation_fits"] is True, "the phase allocation does not fit 300 s")
     expect(allocation_fits(), "the phase allocation must fit the wall limit")
-    expect(len(plan["cases"]) == 17, "the plan case count changed")
+    expect(len(plan["cases"]) == 18, "the plan case count changed")
     expect("unmeasured" in json.dumps(plan["limits"]), "the plan must not claim measured timing")
     expect(plan["children"]["sessions"].startswith("no new session"), "sessions must stay uncreated")
     expect(plan["provenance"]["private_home"].startswith("OXIDE_TEST_HOME_FROM_ENV=1"), "the private home control changed")
@@ -1386,6 +1498,20 @@ def self_check() -> None:
     expect(descriptor_refusal("regular file") == "not a pipe", "regular-file oracle changed")
     expect(descriptor_refusal("read end") == "not writable", "read-end oracle changed")
     expect(descriptor_refusal("blocking pipe") == "not nonblocking", "blocking-pipe oracle changed")
+    # Apparatus invariants added after the independent review.
+    names = [entry["name"] for entry in plan["cases"]]
+    expect("precedence-child-124" in names, "the genuine-124 control is missing")
+    cumulative = [entry for entry in plan["cases"] if entry["name"] == "cumulative-run-window"][0]
+    expect("reset" in cumulative["oracle"], "the cumulative oracle must falsify a clock reset")
+    expect("closeout latency is not asserted" in cumulative["oracle"], "the cumulative oracle must not gate closeout latency")
+    nested = [entry for entry in plan["cases"] if entry["name"] == "nested-outer-window"][0]
+    expect("outer 2s window" in nested["oracle"], "the nested oracle must attribute the stop to the outer window")
+    expect(remaining_quiet() >= 0.0, "the quiet remaining clock must not raise")
+    expect(custody_bound() >= 0.2, "the custody bound must stay positive")
+    receipt = receipt_document("c" * 40, "t" * 40, "d" * 64, "s" * 64, None)
+    expect(receipt["primary_fault"] is None and receipt["result"] == "pass", "a clean receipt changed")
+    failed = receipt_document("c" * 40, "t" * 40, "d" * 64, "s" * 64, "boom")
+    expect(failed["primary_fault"] == "boom" and failed["result"] == "fail", "a failed receipt lost its fault")
     # Receipt identity shape.
     identity = stage_identity("c" * 40, "t" * 40, "d" * 64, "s" * 64)
     expect(set(identity) == {"source_commit", "source_tree", "binary_sha256", "script_sha256", "supervisor_sha256", "toolchain"}, "the receipt identity changed")
