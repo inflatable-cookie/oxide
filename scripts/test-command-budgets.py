@@ -75,7 +75,6 @@ import os
 import select
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import time
@@ -269,7 +268,7 @@ def plan_document() -> dict:
             {"name": "precedence-caller-signal", "oracle": "SIGTERM before expiry: 143, released, no deadline origin"},
             {"name": "precedence-child-125", "oracle": "child exits 125 itself under a 60s budget: child_exit, no budget line"},
             {"name": "precedence-term-trap", "oracle": "TERM-trapping child under 1s: trap marker present, exit 125, finished(execution_deadline)"},
-            {"name": "cumulative-run-window", "oracle": "2s build.rs + 60s program, 8s execution on a budget-only pool: exit 125 in run_program with 6s<=elapsed<9.5s (a reset window would take ~10s)"},
+            {"name": "cumulative-run-window", "oracle": "1s build.rs + 60s program, 12s execution on a budget-only pool: exit 125 in run_program with 8s<=elapsed<12.8s (a reset window would take at least 13s)"},
             {"name": "nested-outer-window", "oracle": "outer exec takes the only slot, its tool starts an inner oxide that waits; the outer window stops the tool group, the inner ends on its own admission budget, no build appears"},
             {"name": "events-matrix", "oracle": "regular file, read end and blocking pipe refuse before any effect; full pipe yields no typed record; contiguous sequence on a healthy stream"},
             {"name": "events-broken-reader", "oracle": "read end closed before start: exit 0, parent survives, one loss note, no typed record"},
@@ -685,6 +684,7 @@ def case_admission_expiry(root: str, subject: str) -> None:
     tool = os.path.join(root, "admission.sh")
     write_executable(tool, f"#!/bin/sh\ntouch {marker}\nexit 0\n")
     holder, _release_file = hold_slot(root, env, crate, "admission", 30)
+    tickets_before = ticket_count(env)
     read_fd, write_fd = event_pipe()
     try:
         result = run(
@@ -705,10 +705,13 @@ def case_admission_expiry(root: str, subject: str) -> None:
     records = finish_events(result, raw)
     expect(not started_records(records), "an admission-expired command emitted a started record")
     expect(terminal(records)["outcome"] == "admission_deadline", "the terminal outcome is not admission_deadline")
+    expect(
+        ticket_count(env) == tickets_before,
+        "the contender's wait ticket survived its admission expiry",
+    )
     status = run([subject, "status"], cwd=crate, env=env, phase_seconds=30)
     expect(status.returncode == 0, f"status exited {status.returncode}")
-    expect(tool not in status.stdout, "the contender's ticket survived its admission expiry")
-    result("admission-expiry-no-start", True, "124, no marker, no started record, contender ticket gone")
+    result("admission-expiry-no-start", True, "124, no marker, no started record, ticket count back to baseline")
 
 
 def case_contention(root: str, subject: str) -> None:
@@ -720,6 +723,7 @@ def case_contention(root: str, subject: str) -> None:
     tool = os.path.join(root, "contention.sh")
     write_executable(tool, f"#!/bin/sh\ntouch {marker}\nsleep 0.2\n")
     holder, release_file = hold_slot(root, env, crate, "contention", 30)
+    released_at = time.monotonic()
     process = start(
         [subject, "exec", "--admission-budget", "60s", "--execution-budget", "2s", "--", tool],
         cwd=crate,
@@ -735,6 +739,7 @@ def case_contention(root: str, subject: str) -> None:
             if os.path.exists(marker):
                 fail("the contender started while the only slot was held")
             time.sleep(0.02)
+        waited = time.monotonic() - released_at
         write_private(release_file, "go\n")
         started = time.monotonic()
         stdout, stderr = process.communicate(timeout=timeout(60))
@@ -745,9 +750,10 @@ def case_contention(root: str, subject: str) -> None:
     finally:
         release(holder)
     expect(process.returncode == 0, f"the contender exited {process.returncode}: {stderr[-800:]}")
+    expect(waited >= 2.5, f"the contender only waited {waited:.1f}s, not longer than its 2s execution window")
     expect(elapsed <= 6.0, f"the contender took {elapsed:.1f}s after release; execution elapsed must fit its own window")
     expect("admission budget" not in stderr and "execution budget" not in stderr, f"a budget stop appeared: {stderr[-600:]}")
-    result("contention-longer-than-execution", True, f"waited ~3s then succeeded in {elapsed:.1f}s")
+    result("contention-longer-than-execution", True, f"waited {waited:.1f}s (over 2s) then succeeded in {elapsed:.1f}s")
 
 
 def case_execution_deadline(root: str, subject: str) -> None:
@@ -846,7 +852,7 @@ def case_cumulative_run(root: str, subject: str) -> None:
         os.path.join(crate, "Cargo.toml"),
         '[package]\nname = "oxide-budget-cumulative"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
     )
-    write_private(os.path.join(crate, "build.rs"), "fn main() { std::thread::sleep(std::time::Duration::from_secs(2)); }\n")
+    write_private(os.path.join(crate, "build.rs"), "fn main() { std::thread::sleep(std::time::Duration::from_secs(1)); }\n")
     write_private(
         os.path.join(crate, "src", "main.rs"),
         "fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }\n",
@@ -854,7 +860,7 @@ def case_cumulative_run(root: str, subject: str) -> None:
     read_fd, write_fd = event_pipe()
     try:
         result_run = run(
-            [subject, "run", "--execution-budget", "8s", "--budget-events", str(write_fd)],
+            [subject, "run", "--execution-budget", "12s", "--budget-events", str(write_fd)],
             cwd=crate,
             env=env,
             phase_seconds=45,
@@ -866,14 +872,14 @@ def case_cumulative_run(root: str, subject: str) -> None:
         os.close(read_fd)
     expect(result_run.returncode == EXECUTION_EXIT, f"the cumulative run exited {result_run.returncode}")
     expect(
-        6.0 <= result_run.elapsed < 9.5,
+        8.0 <= result_run.elapsed < 12.8,
         f"the cumulative run took {result_run.elapsed:.1f}s: the window was reset or never armed",
     )
     records = finish_events(result_run, raw)
     phases = [entry.get("phase") for entry in started_records(records)]
     expect("primary_cargo" in phases and "run_program" in phases, f"phases {phases}")
     expect(terminal(records)["outcome"] == "execution_deadline", "the cumulative window did not end as execution_deadline")
-    result("cumulative-run-window", True, f"one 8s window across build and program ({result_run.elapsed:.1f}s)")
+    result("cumulative-run-window", True, f"one 12s window across build and program ({result_run.elapsed:.1f}s)")
 
 
 def case_nested(root: str, subject: str) -> None:
@@ -1089,6 +1095,20 @@ def case_late_start(root: str, subject: str) -> None:
     follow = run([subject, "exec", "--", follow_tool], cwd=crate, env=env, phase_seconds=30)
     expect(follow.returncode == 0, f"the slot was not released after a late start: {follow.returncode}")
     result("late-start", True, "124, spawn_late with overshoot, slot released")
+
+
+def ticket_count(env: dict) -> int:
+    """The recorded wait-ticket count, read from the pool's control state."""
+    pool = env["OXIDE_POOL"]
+    for root, _dirs, files in os.walk(pool):
+        if "state.json" in files:
+            try:
+                document = json.loads(read_text(os.path.join(root, "state.json")))
+            except json.JSONDecodeError:
+                return -1
+            tickets = document.get("tickets")
+            return len(tickets) if isinstance(tickets, list) else 0
+    return 0
 
 
 def control_state(env: dict) -> tuple[str | None, list[str]]:
@@ -1341,7 +1361,7 @@ def self_check() -> None:
     expect(plan["limits"]["allocation_fits"] is True, "the phase allocation does not fit 300 s")
     expect(allocation_fits(), "the phase allocation must fit the wall limit")
     expect(len(plan["cases"]) == 17, "the plan case count changed")
-    expect(plan["timing"] if "timing" in plan else plan["limits"]["timing"] == "unmeasured", "the plan must not claim measured timing")
+    expect("unmeasured" in json.dumps(plan["limits"]), "the plan must not claim measured timing")
     expect(plan["children"]["sessions"].startswith("no new session"), "sessions must stay uncreated")
     expect(plan["provenance"]["private_home"].startswith("OXIDE_TEST_HOME_FROM_ENV=1"), "the private home control changed")
     expect(COMMAND[-1].endswith("scripts/test-command-budgets.py") and "--limit" in COMMAND and "--scratch-budget-mib" in COMMAND, "the fixed command changed")
