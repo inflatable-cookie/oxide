@@ -3594,7 +3594,11 @@ The script also has an explicitly opt-in `--diagnostic` collection mode. It
 records recoverable oracle failures and skips dependent or tainted premises,
 while unknown device/writer effects and infrastructure errors abort. Its bounded
 receipt is marked diagnostic and unqualified; it never supplies counted PASS
-or closure credit. The default counted mode remains fail-fast.
+or closure credit. The default counted mode remains fail-fast. The mode is
+routed by its own heavy selector, `effigy rust:profile-outputs:diagnostic`
+(the counted command below with `--diagnostic` appended), so the counted
+selector keeps its unchanged fail-fast command; both share the same
+supervisor, limit, scratch bound and activation holds.
 
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
 `scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same

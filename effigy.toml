@@ -103,6 +103,18 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
 
+# The SAME fixed 20-case proof in its own opt-in diagnostic collection mode
+# (`--diagnostic`, decision 1e4feb57): recoverable oracle failures are recorded
+# and dependent/tainted steps skipped, while the deadline, custody, unsettled
+# children and unrecordable evidence still abort. It exists so the pre-counted
+# diagnostic can be routed through a selector instead of passing arguments to
+# the counted one; the counted selector above stays byte-for-byte its own
+# fail-fast command. Its receipt is marked diagnostic and never claims PASS,
+# closure or counted credit, and it needs its own owner activation.
+[tasks."rust:profile-outputs:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --diagnostic"
+
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the
 # debug-only walk hook, status/refusal diagnostics, whole-slot eviction and
