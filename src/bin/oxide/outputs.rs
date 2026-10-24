@@ -2737,6 +2737,10 @@ fn swap_in_staging(migration: &Migration) -> Result<MigrationPhase, String> {
         }
     }
     verify_member_links(&migration.stage, migration)?;
+    // P3: publish only the staging inode the journal recorded at P1. A
+    // directory that was replaced but holds identically shaped links is not
+    // this transaction's staging directory.
+    verify_stage_identity(&migration.stage, migration)?;
     rename_no_replace(&migration.stage, &migration.link).map_err(|error| {
         format!(
             "cannot publish the migrated target {}: {error}; the old link is kept at its backup",
@@ -2934,12 +2938,30 @@ fn rollback_migration(
     if migration.phase == MigrationPhase::Committed {
         return Err("a committed layout migration is never rolled back".to_owned());
     }
-    // 1. If the staging directory was swapped in, remove exactly it.
+    // P3: no rollback effect happens before the recorded parent is verified,
+    // so nothing is removed or renamed beneath a directory this transaction
+    // did not pin.
+    let parent = migration
+        .link
+        .parent()
+        .ok_or("the migration journal names no parent")?;
+    let parent_meta = fs::symlink_metadata(parent)
+        .map_err(|error| format!("cannot inspect {}: {error}", parent.display()))?;
+    if parent_meta.dev() != migration.parent_dev || parent_meta.ino() != migration.parent_ino {
+        return Err(pending_migration(
+            migration,
+            "the parent directory changed identity",
+        ));
+    }
+    // 1. If the staging directory was swapped in, remove exactly it: only the
+    // inode this transaction created and staged is ever removed here.
     match fs::symlink_metadata(&migration.link) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
                 // The old link is still (or again) in place.
-            } else if verify_member_links(&migration.link, migration).is_ok() {
+            } else if verify_stage_identity(&migration.link, migration).is_ok()
+                && verify_member_links(&migration.link, migration).is_ok()
+            {
                 for member in &migration.members {
                     let link = migration.link.join(member);
                     fs::remove_file(&link).map_err(|error| {
@@ -7440,6 +7462,60 @@ mod tests {
                 "{boundary}: the target backup was kept"
             );
         }
+    }
+
+    /// P3: only the staging inode recorded at P1 is ever published as the real
+    /// target. A directory that replaced the staging directory but holds
+    /// identically shaped links is refused, and the transaction stays pending
+    /// rather than being committed.
+    #[test]
+    fn a_replaced_staging_directory_is_never_swapped_in() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        std::env::set_var(CRASH_ENVIRONMENT, "migration-staged");
+        let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
+        std::env::remove_var(CRASH_ENVIRONMENT);
+        assert!(stopped.is_err(), "the injected stop did not stop");
+        let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        let journal = stored.transition.clone().unwrap();
+        assert_eq!(journal.phase, MigrationPhase::Staged);
+        assert!(journal.stage_dev.is_some() && journal.stage_ino.is_some());
+        // Replace the staging DIRECTORY: same links, different inode.
+        let replaced = journal.stage.with_extension("replaced");
+        fs::rename(&journal.stage, &replaced).unwrap();
+        fs::create_dir(&journal.stage).unwrap();
+        fs::set_permissions(&journal.stage, fs::Permissions::from_mode(0o755)).unwrap();
+        for member in &journal.members {
+            symlink(
+                member_destination(&journal.root.root, member),
+                journal.stage.join(member),
+            )
+            .unwrap();
+        }
+        let refused = match replay_migration(&context, &fixture.control, stored) {
+            Ok(_) => panic!("a replaced staging directory was published as the target"),
+            Err(reason) => reason,
+        };
+        assert!(refused.contains("cannot proceed"), "{refused}");
+        // Pending, never committed: the old link is at its backup, the target
+        // was not published and the journal is kept.
+        let target = context.link();
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "a replaced staging directory became the target"
+        );
+        let backup = fs::symlink_metadata(&journal.backup).unwrap();
+        assert!(backup.file_type().is_symlink());
+        assert_eq!(fs::read_link(&journal.backup).unwrap(), journal.link_text);
+        let kept = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(kept.transition.is_some(), "the pending journal was dropped");
+        assert_eq!(kept.state, ReceiptState::Prepared);
+        fs::remove_dir_all(&replaced).unwrap();
     }
 
     #[test]

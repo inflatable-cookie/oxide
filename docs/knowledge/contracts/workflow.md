@@ -3240,8 +3240,10 @@ stay real.
   published without replacement, preserving owner, recipe, kind, volume and
   the original root-creation generation. P2 exclusively renames the old target
   link to its recorded backup and P3 exclusively publishes the staging
-  directory as the real target; a creator of `target` is preserved and leaves
-  the transaction pending. P4 verifies the final real directory and exact
+  directory as the real target; only the staging INODE recorded at P1 is ever
+  published, so a directory replaced in between with identically shaped links
+  is refused, and a creator of `target` is preserved and leaves the
+  transaction pending. P4 verifies the final real directory and exact
   member link set and commits the receipt, root/2 nonce and outputs-3 member
   references — the COMMIT point, never rolled back. Journaled backups are
   removed only under their pinned identities before the journal is dropped.
@@ -3250,7 +3252,8 @@ stay real.
   missing required backup or an unrecognised phase stays pending. A pre-P4
   rollback restores the exact old marker from its pinned backup, the old
   target link and the published /2 receipt, and retires the reserved nonce;
-  the debug-only `OXIDE_TEST_MIGRATION_ROLLBACK` hook and
+  every rollback effect verifies the recorded parent first and removes only
+  the transaction's own staged inode. The debug-only `OXIDE_TEST_MIGRATION_ROLLBACK` hook and
   `OXIDE_TEST_OUTPUTS_CRASH=migration-<phase>` crashes exist only in debug
   builds.
 - **Formats and upgrade.** State version 4 carries the successor fence
