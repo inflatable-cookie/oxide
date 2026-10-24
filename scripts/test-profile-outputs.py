@@ -1358,6 +1358,47 @@ def pure_registry_controls() -> None:
     print("pure registry controls: ok", flush=True)
 
 
+def summary_members(stderr: str) -> set:
+    """The owned member links the PRODUCT reports for this command.
+
+    `oxide` prints one summary line ending in
+    "... through profile member links (<m1>, <m2>)", which names exactly the
+    members this command placed outputs for. This is the member-identifying
+    product fact; a leased slot id is a key of (recipe, layout, member) and is
+    never member identity on its own."""
+    line = summary(stderr)
+    match = re.search(r"profile member links \(([^)]*)\)", line)
+    if match is None:
+        return set()
+    return {part.strip() for part in match.group(1).split(",") if part.strip()}
+
+
+def summary_recipe(stderr: str) -> str:
+    """The recipe label the PRODUCT reports: quick, debug or release."""
+    line = summary(stderr)
+    match = re.search(r"oxide: (quick|debug|release) profile,", line)
+    expect(match is not None, f"no recipe label in the summary: {line}")
+    return match.group(1)
+
+
+def member_payload_state(root: str, member: str) -> tuple:
+    """A bounded identity of ONE member payload, to prove a command wrote (or
+    did not write) that member: absent, or the directory identity plus a capped
+    listing and its newest entry mtime. Never walks the payload."""
+    path = os.path.join(root, member)
+    if not os.path.isdir(path):
+        return ("absent",)
+    info = os.stat(path)
+    entries = sorted(os.listdir(path))[:64]
+    newest = 0
+    for name in entries:
+        try:
+            newest = max(newest, os.stat(os.path.join(path, name)).st_mtime_ns)
+        except OSError:
+            continue
+    return ("dir", info.st_dev, info.st_ino, tuple(entries), newest)
+
+
 def selected_backend_slots(proof: Proof, pool: str, label: str) -> str:
     """The ACTUAL selected removable backend's slot root, derived from the
     fixture registration rather than an assumed path: the registered volume's
@@ -1799,40 +1840,102 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
 
     # ----- case 03: test / bench / bench debug / doc mapping --------------
-    # A3: the mapping is proved by the PARSED slot identity, not by its exit
-    # code. Commands mapping to the same member must reuse that member's slot
-    # (warm, same id); a different member must key a different slot.
+    # A3: the mapping is decided by MEMBER-identifying product facts -- the
+    # member set the product reports and the member payload it actually writes
+    # -- never by an exit code, and never by cross-recipe slot equality. A
+    # leased slot id keys (recipe, layout, member), so two commands can map to
+    # the SAME member and legitimately lease DIFFERENT slots when their recipe
+    # differs (oxide#068/#106). Recipe equality is asserted separately as its
+    # own fact; it is not used as member evidence.
     code, _, stderr = oxide(proof, ["build"], "03 debug build", first)
     expect(code == 0, f"03: debug build failed: {stderr}")
+    expect(
+        summary_members(stderr) == {"debug"},
+        f"03: build did not report the debug member: {summary(stderr)}",
+    )
+    expect(
+        summary_recipe(stderr) == "quick",
+        f"03: build did not use the quick recipe: {summary(stderr)}",
+    )
     debug_slot, debug_state = perm.slot_state(stderr)
     expect("fallback" not in summary(stderr), f"03: external placement unexpectedly fell back: {summary(stderr)}")
+    # test and doc share the build's recipe AND member, so the exact keyed slot
+    # must be reused warm: a genuinely valid same-recipe identity check.
     code, _, stderr = oxide(proof, ["test"], "03 test", first)
     expect(code == 0, f"03: test failed: {stderr}")
+    expect(
+        summary_members(stderr) == {"debug"},
+        f"03: test did not report the debug member: {summary(stderr)}",
+    )
+    expect(
+        summary_recipe(stderr) == "quick",
+        f"03: test did not use the quick recipe: {summary(stderr)}",
+    )
     test_slot, test_state = perm.slot_state(stderr)
     expect(
         test_slot == debug_slot and test_state == "warm",
-        f"03: test did not map to the debug member: {debug_slot} vs {test_slot} ({test_state})",
+        f"03: test did not reuse the debug member's quick slot: {debug_slot} vs {test_slot} ({test_state})",
     )
     code, _, stderr = oxide(proof, ["doc"], "03 doc", first)
     expect(code == 0, f"03: doc failed: {stderr}")
-    doc_slot, doc_state = perm.slot_state(stderr)
+    expect(
+        summary_members(stderr) == {"debug"},
+        f"03: doc did not report the debug member: {summary(stderr)}",
+    )
+    expect(
+        summary_recipe(stderr) == "quick",
+        f"03: doc did not use the quick recipe: {summary(stderr)}",
+    )
+    doc_slot, _ = perm.slot_state(stderr)
     expect(
         doc_slot == debug_slot,
-        f"03: doc did not map to a profile member key ({doc_slot} vs {debug_slot})",
+        f"03: doc did not reuse the debug member's quick slot ({doc_slot} vs {debug_slot})",
     )
+    # Plain bench maps to the RELEASE member: it must report release, key its
+    # own slot, write the release payload, and leave the debug payload alone.
+    debug_payload_before = member_payload_state(root, "debug")
     code, _, stderr = oxide(proof, ["bench"], "03 bench", first)
     expect(code == 0, f"03: bench failed: {stderr}")
+    expect(
+        summary_members(stderr) == {"release"},
+        f"03: plain bench did not report the release member: {summary(stderr)}",
+    )
     release_slot, release_state = perm.slot_state(stderr)
     expect(
         release_slot != debug_slot and release_state == "cold",
-        f"03: plain bench did not map to the release member: {release_slot} ({release_state})",
+        f"03: plain bench did not key its own release slot: {release_slot} ({release_state}) vs {debug_slot}",
     )
+    expect(
+        member_payload_state(root, "release") != ("absent",),
+        "03: plain bench wrote no release member payload",
+    )
+    expect(
+        member_payload_state(root, "debug") == debug_payload_before,
+        "03: plain bench touched the debug member payload",
+    )
+    # `bench --profile debug` maps to the DEBUG member with the DEBUG recipe.
+    # Its recipe differs from the plain build's, so a different slot id is
+    # legitimate and is NOT evidence of a wrong mapping; the member set is, and
+    # the release member must stay untouched.
+    release_payload_before = member_payload_state(root, "release")
     code, _, stderr = oxide(proof, ["bench", "--profile", "debug"], "03 bench debug", first)
     expect(code == 0, f"03: bench debug failed: {stderr}")
+    expect(
+        summary_members(stderr) == {"debug"},
+        f"03: bench --profile debug did not map to the debug member: {summary(stderr)}",
+    )
+    expect(
+        summary_recipe(stderr) == "debug",
+        f"03: bench --profile debug did not use the debug recipe: {summary(stderr)}",
+    )
     bench_debug_slot, bench_debug_state = perm.slot_state(stderr)
     expect(
-        bench_debug_slot == debug_slot,
-        f"03: bench --profile debug did not map to the debug member: {bench_debug_slot} vs {debug_slot}",
+        bench_debug_slot != release_slot,
+        f"03: bench --profile debug reused the release member's slot {release_slot} ({bench_debug_state})",
+    )
+    expect(
+        member_payload_state(root, "release") == release_payload_before,
+        "03: bench --profile debug touched the release member payload",
     )
     expect(os.path.isdir(os.path.join(first, "target", "doc")), "03: target/doc is missing")
     expect(not os.path.islink(os.path.join(first, "target", "doc")), "03: target/doc is a link")
