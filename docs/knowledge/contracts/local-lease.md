@@ -286,6 +286,24 @@ defaults, which are unchanged. The callers:
 | The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
 
+**Removable-volume fallback (2026-10-25 hotfix, Tom's ruling).** A
+removable `apfs-volume-v1` payload walks for at most 5 s before a new slot
+or a count replacement (`VOLUME_WALK_MS`). If that walk is incomplete and
+its only gaps are `elapsed_deadline` or `entry_limit`, the open caches that
+result. Admission then uses the volume's own used bytes (capacity less
+available, from the verified binding), which include everything else on the
+volume and so never undercount. Under the budget it admits and the command
+prints one warning naming the entries walked and the used and budget bytes.
+Over the budget it evicts least-recently-used idle whole slots one at a
+time, re-reading the volume after each, at most 8 times, then refuses with
+the original scan. Count replacements (the per-project and pool slot caps)
+proceed on the same bound-only result. Any other gap (unreadable, missing
+or unusable metadata, mount boundary, depth limit, root problems) still
+refuses, and the internal `directory-budget-v1` pool keeps every gate in
+the table above unchanged. Reason: a 127-slot USB pool could not be walked
+within 60 s, so every new-slot admission refused. Faster recorded
+accounting is the planned replacement.
+
 **How one walk reads (oxide#141).** The walk itself is unchanged in scope,
 bounds, policy and refusal classes. Each enumerated regular file or directory
 is read immediately from the live directory entry the walk holds, when its
