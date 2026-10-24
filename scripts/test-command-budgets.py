@@ -69,6 +69,7 @@ Frozen acceptance map (frozen A2 section 10, committee-corrected)
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -256,6 +257,31 @@ def budget_prefix_ok(argv: list[str]) -> bool:
     return True if saw_budget or not any(flag in argv for flag in BUDGET_FLAGS) else False
 
 
+def body_signature_drift(path: str) -> list[tuple[int, str]]:
+    """Keywords a case body passes to `run` that its real signature lacks.
+
+    This is the body-versus-API check: a mock with a permissive signature can
+    hide such a mismatch from a runtime test, but the real call would fail.
+    """
+    import inspect as _inspect
+
+    declared = set(_inspect.signature(run).parameters)
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    drift: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("case_"):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            if not isinstance(call.func, ast.Name) or call.func.id != "run":
+                continue
+            for keyword in call.keywords:
+                if keyword.arg is not None and keyword.arg not in declared:
+                    drift.append((call.lineno, keyword.arg))
+    return drift
+
+
 def parse_arguments(argv: list[str]) -> tuple[str, str | None]:
     """Fail-closed argument boundary: at most one known mode, no effects."""
     if not argv:
@@ -349,7 +375,7 @@ def plan_document() -> dict:
             {"name": "precedence-caller-signal", "oracle": "SIGTERM before expiry: 143, released, no deadline origin"},
             {"name": "precedence-child-125", "oracle": "child exits 125 itself under a 60s budget: child_exit, no budget line"},
             {"name": "precedence-term-trap", "oracle": "TERM-trapping child under 1s: trap marker present, exit 125, finished(execution_deadline)"},
-            {"name": "cumulative-run-window", "oracle": "3s build.rs + 60s program under one 5s execution window on a budget-only pool: exit 125 in run_program and the launched program ran 0.5s<=t<3.5s after the build hand-off (a reset window would let it run ~5s); closeout latency is not asserted"},
+            {"name": "cumulative-run-window", "oracle": "3s build.rs then a 60s program under one 5s execution window on a budget-only pool: exit 125 in run_program, execution stop origin, and the launched program wrote 2..20 heartbeats of its own 200ms counter (~10 in the remaining window; a reset window would write ~25); the candidate exit and closeout latency are not asserted"},
             {"name": "nested-outer-window", "oracle": "the outer exec starts first and takes the only slot; its tool starts an inner oxide that waits and ends on its own 1s admission budget with no build; the tool keeps running so the outer 2s window (not a natural exit) stops it: exit 125 with a typed exec_tool start and execution_deadline"},
             {"name": "events-matrix", "oracle": "regular file, read end and blocking pipe refuse before any effect; full pipe yields no typed record; contiguous sequence on a healthy stream"},
             {"name": "events-broken-reader", "oracle": "read end closed before start: exit 0, parent survives, one loss note, no typed record"},
@@ -483,8 +509,16 @@ def run(
     phase_seconds: float,
     pass_fds: tuple[int, ...] = (),
     stdin=None,
+    stdout=None,
+    stderr=None,
 ) -> subprocess.CompletedProcess:
-    """Run one owned direct child with the guard-clipped timeout."""
+    """Run one owned direct child with the guard-clipped timeout.
+
+    `stdout`/`stderr` are the real API for a case that must send a stream to a
+    file (the cumulative case polls nothing, but keeps the candidate's stderr
+    out of a pipe); when omitted both are captured. A redirected stream is not
+    captured, so the completed process reports `None` for it.
+    """
     started = time.monotonic()
     process = start(
         argv,
@@ -492,8 +526,8 @@ def run(
         env=env,
         pass_fds=pass_fds,
         stdin=subprocess.DEVNULL if stdin is None else stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE if stdout is None else stdout,
+        stderr=subprocess.PIPE if stderr is None else stderr,
         text=True,
     )
     try:
@@ -1680,7 +1714,7 @@ def self_check() -> None:
     expect("precedence-child-124" in names, "the genuine-124 control is missing")
     cumulative = [entry for entry in plan["cases"] if entry["name"] == "cumulative-run-window"][0]
     expect("reset" in cumulative["oracle"], "the cumulative oracle must falsify a clock reset")
-    expect("closeout latency is not asserted" in cumulative["oracle"], "the cumulative oracle must not gate closeout latency")
+    expect("not asserted" in cumulative["oracle"], "the cumulative oracle must not gate closeout latency")
     nested = [entry for entry in plan["cases"] if entry["name"] == "nested-outer-window"][0]
     expect("outer 2s window" in nested["oracle"], "the nested oracle must attribute the stop to the outer window")
     expect(remaining_quiet() >= 0.0, "the quiet remaining clock must not raise")
@@ -1836,6 +1870,23 @@ def self_test() -> None:
             return Holder()
 
         return fake_start
+
+    # ---- the real helper signature is the contract every case call meets ----
+    import inspect
+
+    contract = load()
+    parameters = set(inspect.signature(contract.run).parameters)
+    expect({"stdout", "stderr"} <= parameters, "run() must expose its output streams")
+    expect(contract.body_signature_drift(SCRIPT) == [], "a case passes a keyword run() does not accept")
+    contract.run.__defaults__  # noqa: B018 - the signature above is the check
+    mutated = os.path.join(scratch, "mutated-proof.py")
+    original = open(SCRIPT, encoding="utf-8").read()
+    with open(mutated, "w", encoding="utf-8") as handle:
+        handle.write(original.replace("stderr=stderr_file,", "stderr_file=stderr_file,", 1))
+    expect(
+        bool(contract.body_signature_drift(mutated)),
+        "the drift sweep missed an undeclared output-stream keyword",
+    )
 
     # ---- fast start: three axes pass; a nulled axis must fail ----
     module = load()
