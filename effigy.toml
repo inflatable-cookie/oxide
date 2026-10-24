@@ -34,14 +34,6 @@ minimum_effigy_version = "0.14.0"
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
 "rust:storage-inventory-cli" = "python3 scripts/test-storage-inventory-cli.py"
-# Opt-in command admission/execution budgets (oxide#140). Source only until
-# its owner activation: one fixed script under the qualified shared proof
-# supervisor, 300 s and 512 MiB monitored scratch, private directory pools,
-# no image or mount. It stages this HEAD's debug oxide offline with 1.97.1 and
-# proves the frozen budget semantics (contention longer than the execution
-# window, admission expiry, cumulative bounded run, precedence, event channel
-# refusals and loss, no persisted mutation).
-"rust:command-budgets" = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"
 "build-context:comparison:test" = "python3 scripts/test_build_context_comparison.py"
 "docs:check" = [
   "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",
@@ -517,3 +509,26 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:slot-headroom"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
+
+# Opt-in command admission/execution budgets (oxide#140): one fixed proof
+# script and the whole command of the qualified shared supervisor under heavy
+# admission (300 s absolute, 512 MiB monitored scratch including staging). It
+# stages this HEAD's debug oxide with plain Cargo offline and 1.97.1 into
+# scratch-owned target/build directories, then runs private-HOME/CARGO_HOME/
+# config/pool fixtures from tiny private checkouts: independently optional
+# axes and nullable typed fields, admission expiry with no primary child and
+# its ticket gone, contention longer than the execution window, a slow-child
+# execution stop, signal/genuine-124/125/TERM-trap precedence, one cumulative
+# build+program window that would fail a reset implementation, a nested call
+# that waits inside the outer window, the event-channel matrix with sticky
+# loss, deterministic unknown-closure custody through the debug hook, a
+# stopped preparation child reported as 124, a late start reported and
+# stopped, no mutation of settings or persisted fields, and unchanged
+# unbudgeted behaviour. `--plan` is effect-free, an unknown argument refuses
+# before any subprocess, `--self-check` covers the pure apparatus, and a pass
+# writes a uniquely named bounded helper receipt beside the guard's own; that
+# receipt never claims guard closure. Fit is unmeasured; HELD for owner
+# activation — this declaration activates nothing.
+[tasks."rust:command-budgets"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"

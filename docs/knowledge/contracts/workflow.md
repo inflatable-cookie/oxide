@@ -683,6 +683,23 @@ oxide run --execution-budget 120s
   holds the window between the last admission check and the launch so a late
   start is observable. Neither changes a product decision outside a debug
   build.
+- **Proof apparatus.** `scripts/test-command-budgets.py` is the fixed proof
+  and the whole command of the qualified shared supervisor under heavy
+  admission (`bounded-test.py --limit 300 --scratch-budget-mib 512`). It is
+  held for owner activation: the declaration activates nothing. `--plan` is
+  effect-free and prints the cases, phases, disk and child-lifetime
+  allocation; an unrecognized argument refuses before any subprocess;
+  `--self-check` covers the argument boundary, allocation arithmetic, event
+  sequence oracle and descriptor oracles without staging. Every child timeout
+  is clipped to the guard's exported deadline minus the reserved cleanup
+  window, fixtures run from private checkouts with private
+  `HOME`/`CARGO_HOME`/`OXIDE_CONFIG`/`OXIDE_POOL`/temp, and the staged
+  candidate is this clean HEAD's debug `oxide` built offline with the pinned
+  toolchain into scratch-owned target and build directories. A run writes a
+  uniquely named bounded helper receipt beside the guard's own with the source
+  and candidate identities, reached/completed/failed/unexecuted cases and the
+  primary fault; that receipt never claims guard closure, which the
+  supervisor alone decides. The 300 s/512 MiB fit is unmeasured.
 - **Locking.** A budgeted command waits for the admission, record and
   checkout-binding locks with the existing nonblocking primitive, polling
   against the remaining window in the unchanged order. Abandoning a wait
