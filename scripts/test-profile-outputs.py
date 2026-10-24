@@ -206,7 +206,7 @@ def plan_only() -> int:
     print("  supervisor      scripts/bounded-test.py --limit 600 --scratch-budget-mib 512")
     print(f"  deadline        600 s total (scoped brief amendment); helper work cutoff ~565 s")
     print("                  = 30 s helper reserve + 5 s refusal margin; cleanup/detach inside it")
-    print("  fit             UNMEASURED: 300-450 s estimated work inside the ~565 s cutoff;")
+    print("  fit             UNMEASURED: 360-540 s estimated work inside the ~565 s cutoff;")
     print("                  no native, trial or setup-only run has been activated, so the")
     print("                  estimate is not an established fit")
     print("  cpu             planning request 6 CPU / 8 GiB: two SEQUENTIAL stagings at")
@@ -214,14 +214,20 @@ def plan_only() -> int:
     print("                  most two gated writers (2 x 2 = 4); peak 6 Cargo jobs")
     print("  time estimate   two sequential 6-job stagings ~45-80 s each, 25 s setup,")
     print("                  150-240 s cases (base control, p0/parent races, unknown")
-    print("                  custody, prune oracles), 30 s cleanup -> 300-450 s estimated work")
+    print("                  custody, prune oracles), plus the controls added in this phase:")
+    print("                  a seeded directory-budget adopt+build for the watched clean,")
+    print("                  three extra fixture builds/adopts (mixed run, second eligible")
+    print("                  gone root, cleared-target parent-ignore), settled-background")
+    print("                  waits and additional dry runs (~60-90 s), 30 s cleanup")
+    print("                  -> 360-540 s estimated work; UNMEASURED, not a fit claim")
     print("  history         the 420 s publication at 030836f6 is historical and unactivated")
     print("  amendment       GRANTED scoped bound: 600 s total (root owner 2026-10-23T16:10Z),")
     print("                  512 MiB unchanged; no disk increase, runner change or native start")
     print("  disk            288 MiB staging peak, counted as ONE staging target at a time")
     print("                  (each is copied out and discarded before the next starts; two")
     print("                  live targets are NOT assumed), + 128 MiB image backing +")
-    print("                  32 MiB fixtures + 32 MiB evidence + 32 MiB margin = 512 MiB")
+    print("                  48 MiB fixtures (three added tiny checkouts) + 32 MiB")
+    print("                  evidence + 16 MiB margin = 512 MiB")
     print("                  real target occupancy: one tiny locked checkout per case,")
     print("                  a few MiB each, inside the fixtures allowance")
     print(f"  staging         candidate {os.environ.get('OXIDE_PROFILE_HEAD', 'this HEAD')} and base {BASE}")
@@ -2146,6 +2152,48 @@ def run(proof: Proof, repo: str) -> None:
     expect(
         "another checkout's live reference" in kept_reason,
         f"20: the peer KEEP did not carry the other-owner reason: {kept_preview.get('kept')}",
+    )
+    # A9: ONE preview must show the peer-referenced root KEPT, a SECOND
+    # DISTINCT eligible gone root as a candidate, and the live checkout's root
+    # kept. The peer reference is synthetic injected authority (a crafted
+    # committed receipt plus matching registry rows), not a bind-produced
+    # receipt; the second eligible root is real fixture state with its own
+    # identity, so neither control can stand in for the other.
+    extra = make_checkout(proof, "root-group-extra-gone")
+    code, _, stderr = oxide(proof, ["build"], "20 extra build", extra)
+    expect(code == 0, f"20: the second eligible gone checkout failed to build: {stderr}")
+    adopt(proof, extra, "20 extra adopt")
+    extra_root = root_of(pool, extra)
+    expect(
+        len({extra_root, gone_root, group_root}) == 3,
+        f"20: the simultaneous control reuses a root: {extra_root}, {gone_root}, {group_root}",
+    )
+    os.rename(extra, extra + "-moved")
+    peer_receipt_bytes = perm.read_bytes(peer_receipt_path)
+    code, stdout, stderr = oxide(
+        proof, ["outputs", "prune", "--dry-run"], "20 peer keep and candidate", group
+    )
+    expect(code == 0, f"20: the simultaneous dry run failed: {stderr}")
+    simultaneous = json.loads(stdout)
+    candidate_roots = [candidate["root"] for candidate in simultaneous["candidates"]]
+    kept_roots = [entry.get("root") for entry in simultaneous.get("kept", [])]
+    expect(
+        gone_root in kept_roots,
+        f"20: the peer-referenced root is not KEEP in the simultaneous preview: {kept_roots}",
+    )
+    expect(
+        extra_root in candidate_roots,
+        f"20: the second eligible gone root is not a candidate: {candidate_roots}",
+    )
+    expect(
+        group_root not in candidate_roots,
+        f"20: the live checkout's root became a candidate: {candidate_roots}",
+    )
+    expect(os.path.isdir(gone_root), "20: the simultaneous preview removed the peer-referenced root")
+    expect(os.path.isdir(extra_root), "20: the simultaneous preview removed the eligible root")
+    expect(
+        perm.read_bytes(peer_receipt_path) == peer_receipt_bytes,
+        "20: the simultaneous preview rewrote the peer receipt",
     )
     with open(registry_path, "wb") as handle:
         handle.write(registry_original)
