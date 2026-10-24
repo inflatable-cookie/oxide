@@ -4758,21 +4758,33 @@ fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Sele
     Ok(Some(wanted.with_nonce(nonce)))
 }
 
-/// P4 precondition, shared by the pre-lease reservation and binding: this
-/// checkout's committed receipt still places a member on an EXTERNAL root while
-/// this command's fresh selection is no longer external (the registered volume
-/// is away or became unusable). Such a command refuses at binding, so the
-/// pre-lease reservation must not durably reserve a future root for it: a
-/// refused command changes no authority.
-fn refuses_committed_external(receipt: &Receipt, wanted: &Selected) -> bool {
-    if wanted.kind == RootKind::External {
+/// The EXACT P4 precondition binding enforces, evaluated before the lease.
+///
+/// `bind_profile` refuses per REQUESTED member: that member's committed
+/// placement is on an EXTERNAL root while this command's fresh selection for it
+/// is not external (the registered volume is away or became unusable). Only a
+/// profile receipt carries that per-member rule — a whole-target receipt never
+/// refuses this way, and its future local root needs its reservation so
+/// `reservation_matches` can accept it — so the layout is part of the
+/// condition. A member with no committed placement (a new or nested member)
+/// does not trigger the refusal either, and keeps its reservation.
+///
+/// Returns true only when binding will refuse because of this condition, so the
+/// pre-lease reservation can leave the receipt untouched.
+fn refuses_committed_external(
+    receipt: &Receipt,
+    wanted: &Selected,
+    declaration: &crate::layout::Declaration,
+) -> bool {
+    if receipt.layout() != LayoutKind::Profile || wanted.kind == RootKind::External {
         return false;
     }
-    receipt
-        .links
-        .iter()
-        .filter_map(|placement| placement.selected.as_ref())
-        .any(|committed| committed.kind == RootKind::External)
+    declaration.members().iter().any(|member| {
+        receipt
+            .placement(member.name())
+            .and_then(|placement| placement.selected.as_ref())
+            .is_some_and(|committed| committed.kind == RootKind::External)
+    })
 }
 
 /// Reserve the nonce of this command's future root before its slot is keyed
@@ -4787,6 +4799,7 @@ pub fn reserve(
     store: &Store,
     control: Option<&Path>,
     checkout: &Path,
+    declaration: &crate::layout::Declaration,
     pool_fallback: Option<&str>,
 ) -> Result<(), String> {
     let Some(control) = control else {
@@ -4824,11 +4837,13 @@ pub fn reserve(
         let Some(wanted) = desired_selection(&context, &receipt)? else {
             return Ok(());
         };
-        // oxide#133 case14: a command that a committed external member will
-        // make refuse must not reserve (or cancel) anything first. Reserving a
-        // root here used to rewrite the receipt — a real authority effect on a
-        // command that builds nothing.
-        if refuses_committed_external(&receipt, &wanted) {
+        // oxide#133 case14: a command that binding will refuse because of a
+        // committed external member must not reserve (or cancel) anything
+        // first. Reserving a root here used to rewrite the receipt — a real
+        // authority effect on a command that builds nothing. The condition is
+        // binding's own P4 precondition, per requested member and profile
+        // layout only, so every command binding accepts still reserves.
+        if refuses_committed_external(&receipt, &wanted, declaration) {
             return Ok(());
         }
         if read_marker(&wanted.root).is_ok() {
@@ -8846,6 +8861,18 @@ mod tests {
         let declaration =
             crate::layout::Declaration::new([crate::layout::Member::parse("debug").unwrap()])
                 .unwrap();
+        let receipt_file = receipt_path(&fixture.control, &context.checkout_id);
+        let before = fs::read(&receipt_file).unwrap();
+        let store = pool_store(&fixture.root.join("pool"));
+        // Production order: the pre-lease reservation, then the plan, then bind.
+        reserve(
+            &store,
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            Some("the registered volume is away"),
+        )
+        .unwrap();
         let plan = planned_destination(
             Some(&fixture.control),
             &fixture.checkout,
@@ -8859,17 +8886,6 @@ mod tests {
             Some(RootKind::Local),
             "the production planner did not fall back to the local spec"
         );
-        let receipt_file = receipt_path(&fixture.control, &context.checkout_id);
-        let before = fs::read(&receipt_file).unwrap();
-        let store = pool_store(&fixture.root.join("pool"));
-        // The production pre-lease step, before the slot key and the lease.
-        reserve(
-            &store,
-            Some(&fixture.control),
-            &fixture.checkout,
-            Some("the registered volume is away"),
-        )
-        .unwrap();
         assert_eq!(
             fs::read(&receipt_file).unwrap(),
             before,
@@ -8908,6 +8924,209 @@ mod tests {
         );
         assert_eq!(recorded.generation, 1, "the refusal moved the generation");
         assert_eq!(recorded.selected_for("debug"), Some(&external));
+    }
+
+    /// oxide#133 review finding (b): the pre-lease predicate must use binding's
+    /// REQUESTED member set, not any committed external placement. In a profile
+    /// checkout whose `debug` stays on an external root, a command that requests
+    /// only a NEW nested member is not refused by binding's P4 rule, so its
+    /// local future root keeps its reservation and the transition proceeds. The
+    /// checkout-wide predicate skipped that reservation and left
+    /// `reservation_matches` refusing.
+    #[test]
+    fn a_new_member_beside_a_committed_external_member_keeps_its_reservation() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        register(&fixture, DriveMode::Permanent);
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.place_member("debug").selected = Some(external.clone());
+        write_receipt(&fixture.control, &receipt).unwrap();
+        fs::create_dir_all(member_destination(&external.root, "debug")).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: external.volume_uuid.clone(),
+            nonce: external.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let debug_link = fixture.checkout.join("target/debug");
+        symlink(member_destination(&external.root, "debug"), &debug_link).unwrap();
+        let nested = "x86_64-unknown-linux-gnu/debug";
+        let declaration =
+            crate::layout::Declaration::new([crate::layout::Member::parse(nested).unwrap()])
+                .unwrap();
+        let store = pool_store(&fixture.root.join("pool"));
+        // Production order: reservation, then plan, then bind.
+        reserve(
+            &store,
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            Some("the registered volume is away"),
+        )
+        .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.selected().map(Selected::kind),
+            Some(RootKind::Local),
+            "the production planner did not fall back to the local spec"
+        );
+        let reserved = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        let reservation = reserved
+            .reserved()
+            .expect("a requested new member lost its required reservation");
+        assert_eq!(
+            Some(reservation.kind),
+            plan.selected().map(Selected::kind),
+            "the reservation is not for the planned local root"
+        );
+        assert_eq!(
+            Some(reservation.nonce.as_str()),
+            plan.selected().and_then(Selected::nonce),
+            "the reservation does not carry the keyed nonce"
+        );
+        // The exact gate binding applies to a MISSING member link
+        // (`member_root_authority`): the committed sibling's external placement
+        // must not block the new member's local reservation. On the parent this
+        // is the refusal ("reservation was cancelled or replaced") that the
+        // checkout-wide predicate caused.
+        let wanted = plan.selected().unwrap();
+        assert!(
+            !refuses_committed_external(&reserved, wanted, &declaration),
+            "the pre-lease predicate still claims this accepted command will refuse"
+        );
+        reservation_matches(&context, &reserved, wanted)
+            .expect("the new member's local reservation is not usable at binding");
+        assert_eq!(
+            fs::read_link(&debug_link).unwrap(),
+            member_destination(&external.root, "debug"),
+            "the committed external member link moved"
+        );
+    }
+
+    /// oxide#133 review finding (a): a whole-target receipt never refuses through
+    /// binding's per-member P4 rule, so its local fallback root keeps the
+    /// reservation `bind_under_binding` requires. The checkout-wide predicate
+    /// skipped it and left the #117 first local fallback refusing.
+    #[test]
+    fn a_whole_target_local_fallback_keeps_its_reservation() {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        register(&fixture, DriveMode::Permanent);
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        let mut receipt = Receipt::first(&fixture.checkout, &context.checkout_id);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.link_mut().selected = Some(external.clone());
+        write_receipt(&fixture.control, &receipt).unwrap();
+        fs::create_dir_all(&external.root).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: external.volume_uuid.clone(),
+            nonce: external.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        let legacy_link = fixture.checkout.join("target");
+        symlink(&external.root, &legacy_link).unwrap();
+        let declaration =
+            crate::layout::Declaration::new([crate::layout::Member::parse("debug").unwrap()])
+                .unwrap();
+        let store = pool_store(&fixture.root.join("pool"));
+        // Production order: reservation, then plan, then bind.
+        reserve(
+            &store,
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            Some("the registered volume is away"),
+        )
+        .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            plan.whole_target,
+            "the legacy checkout planned a profile layout"
+        );
+        assert_eq!(
+            plan.selected().map(Selected::kind),
+            Some(RootKind::Local),
+            "the production planner did not fall back to the local spec"
+        );
+        let reserved = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            reserved.reserved().is_some_and(
+                |reservation| Some(reservation.kind) == plan.selected().map(Selected::kind)
+            ),
+            "a whole-target local fallback lost its required reservation"
+        );
+        match bind_under_binding(&context, &store, 0, &reserved, Some(&plan)) {
+            Bind::Bound(outcome) => {
+                assert_eq!(
+                    outcome.root.as_deref(),
+                    Some(fixture.local().root()),
+                    "the whole-target fallback did not bind the local root"
+                );
+            }
+            Bind::Refuse(reason) => panic!("the whole-target local fallback refused: {reason}"),
+            Bind::Wait => panic!("the whole-target local fallback waited"),
+        }
     }
 
     #[test]

@@ -325,16 +325,10 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // released before this command takes a slot.
     outputs::auto_adopt(&selected.store, &checkout, &selected)?;
     let store = selected.store;
-    // A future owned root gets its durable random nonce reserved before the
-    // destination is planned and keyed (oxide#129); the binding lock is
-    // released again before this command waits for a slot.
-    outputs::reserve(
-        &store,
-        Some(&output_control),
-        &checkout,
-        pool_fallback.as_deref(),
-    )?;
-    test_pause("reserved");
+    // The declaration is pure parsing and is computed BEFORE the reservation:
+    // the pre-lease reservation needs the same requested member set binding
+    // will use, and a command this checkout refuses on layout or an unmodelled
+    // command name now refuses before any authority write (oxide#133).
     let declaration = if invocation.command == "exec" {
         // The caller's declaration is the complete set of the tool's profile
         // outputs; an opaque tool that declares none is refused in a profile
@@ -367,6 +361,17 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             }
         }
     };
+    // A future owned root gets its durable random nonce reserved before the
+    // destination is planned and keyed (oxide#129); the binding lock is
+    // released again before this command waits for a slot.
+    outputs::reserve(
+        &store,
+        Some(&output_control),
+        &checkout,
+        &declaration,
+        pool_fallback.as_deref(),
+    )?;
+    test_pause("reserved");
     let planned = outputs::planned_destination(
         Some(&output_control),
         &checkout,
