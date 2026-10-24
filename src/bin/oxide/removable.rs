@@ -437,9 +437,9 @@ fn refuse_roles(roles: &[&str]) -> Result<(), String> {
 
 /// `diskutil <args>` as JSON, via `plutil`. Bounded output.
 fn plist(args: &[&str]) -> Result<serde_json::Value, String> {
-    let output = Command::new("/usr/sbin/diskutil")
-        .args(args)
-        .output()
+    let mut diskutil = Command::new("/usr/sbin/diskutil");
+    diskutil.args(args);
+    let output = crate::budget::output(&mut diskutil)
         .map_err(|error| format!("cannot run diskutil: {error}"))?;
     if !output.status.success() || output.stdout.len() > MAX_PLIST_BYTES {
         return Err(format!(
@@ -448,21 +448,10 @@ fn plist(args: &[&str]) -> Result<serde_json::Value, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut convert = Command::new("/usr/bin/plutil")
-        .args(["-convert", "json", "-o", "-", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
+    let mut convert = Command::new("/usr/bin/plutil");
+    convert.args(["-convert", "json", "-o", "-", "-"]);
+    let json = crate::budget::output_with_stdin(&mut convert, output.stdout)
         .map_err(|error| format!("cannot run plutil: {error}"))?;
-    convert
-        .stdin
-        .take()
-        .ok_or("plutil stdin")?
-        .write_all(&output.stdout)
-        .map_err(|error| format!("cannot feed plutil: {error}"))?;
-    let json = convert
-        .wait_with_output()
-        .map_err(|error| format!("plutil failed: {error}"))?;
     if !json.status.success() || json.stdout.len() > MAX_PLIST_BYTES {
         return Err("plutil could not convert diskutil's output".to_owned());
     }

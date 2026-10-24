@@ -34,6 +34,14 @@ minimum_effigy_version = "0.14.0"
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
 "rust:storage-inventory-cli" = "python3 scripts/test-storage-inventory-cli.py"
+# Opt-in command admission/execution budgets (oxide#140). Source only until
+# its owner activation: one fixed script under the qualified shared proof
+# supervisor, 300 s and 512 MiB monitored scratch, private directory pools,
+# no image or mount. It stages this HEAD's debug oxide offline with 1.97.1 and
+# proves the frozen budget semantics (contention longer than the execution
+# window, admission expiry, cumulative bounded run, precedence, event channel
+# refusals and loss, no persisted mutation).
+"rust:command-budgets" = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"
 "build-context:comparison:test" = "python3 scripts/test_build_context_comparison.py"
 "docs:check" = [
   "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",

@@ -3872,7 +3872,7 @@ fn git_probe(
             let _ = stdin.write_all(&input);
         });
     }
-    let deadline = Instant::now() + GIT_PROBE_TIME;
+    let deadline = Instant::now() + crate::budget::clamp(GIT_PROBE_TIME);
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
@@ -3923,11 +3923,12 @@ fn git_would_track(checkout: &Path, relative: &str) -> Result<bool, String> {
             Some(0) => Ok(false),
             Some(1) => Ok(true),
             _ => {
-                let probe = Command::new("git")
+                let mut probe_command = Command::new("git");
+                probe_command
                     .arg("-C")
                     .arg(checkout)
-                    .args(["rev-parse", "--is-inside-work-tree"])
-                    .output();
+                    .args(["rev-parse", "--is-inside-work-tree"]);
+                let probe = crate::budget::output(&mut probe_command);
                 match probe {
                     Ok(probe)
                         if probe.status.success()

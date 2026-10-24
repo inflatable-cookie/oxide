@@ -417,10 +417,9 @@ fn version_command() -> Command {
 /// The first `cargo -V` line of the command's own Cargo when it is a
 /// [verified release](VERIFIED_CARGO); otherwise why not.
 pub(crate) fn verified_cargo() -> Result<String, String> {
-    let output = version_command()
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+    let mut command = version_command();
+    command.stdin(Stdio::null()).stderr(Stdio::null());
+    let output = crate::budget::output(&mut command)
         .map_err(|error| format!("could not start Cargo: {error}"))?;
     let version = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -494,7 +493,7 @@ impl Git {
             waited: Duration::ZERO,
             bytes: 0,
             call_time: GIT_CALL_TIME,
-            total_time: GIT_TOTAL_TIME,
+            total_time: crate::budget::clamp(GIT_TOTAL_TIME),
             settle_time: GIT_SETTLE_TIME,
         }
     }
@@ -1521,7 +1520,7 @@ pub(crate) fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOu
     let stderr = child.stderr.take().ok_or("Cargo stderr was not captured")?;
     let out = std::thread::spawn(move || read_capped(stdout, stdout_cap));
     let err = std::thread::spawn(move || read_capped(stderr, MAX_METADATA_ERROR_BYTES));
-    let deadline = Instant::now() + METADATA_TIME;
+    let deadline = Instant::now() + crate::budget::clamp(METADATA_TIME);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),

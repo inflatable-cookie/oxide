@@ -70,7 +70,11 @@ pub fn hidden() -> Option<u8> {
 
 /// The front-door check. `None` means "continue as this binary normally
 /// would"; `Some(code)` is a finished invocation.
-pub fn preflight() -> Option<u8> {
+/// The one pre-effect hand-off. A budgeted command refuses instead of
+/// handing off: a successor process would restart both clocks, and deadline
+/// inheritance across an exec is not part of this feature. An unbudgeted
+/// command hands off exactly as before.
+pub fn preflight(budgeted: bool) -> Option<u8> {
     let control = match Store::existing_control() {
         Ok(Some(control)) => control,
         // No pool or no recognizable control directory: nothing to compare.
@@ -80,6 +84,9 @@ pub fn preflight() -> Option<u8> {
     let observed = observe(&control);
     if !observed.any() {
         return None;
+    }
+    if budgeted {
+        return Some(refuse());
     }
     let Some(inputs) = Inputs::from_environment() else {
         return Some(refuse());
