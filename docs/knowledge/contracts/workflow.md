@@ -3151,7 +3151,15 @@ stay real.
   on a fallback or redock rather than trusting an old receipt match). A profile
   clean is validated before the legacy whole-target pre-gate, plans each
   member destination once, and preserves links, root markers and unrelated
-  payloads. Prune eligibility and candidate construction are per
+  payloads. In the profile layout `<checkout>/target` is REAL, so a whole
+  clean keeps the target directory itself, every owned member link and every
+  real ancestor directory that holds a nested link (a `<triple>` directory),
+  and removes the payload around them; keeping a kept directory never skips
+  the walk inside it. An owned member root holds payload, not a target root:
+  its `deps`, `incremental`, `build`, `.fingerprint`, `examples` and artifact
+  files of any name are Cargo's, while an unknown directory or a symlink in it
+  is still foreign and refuses. Prune eligibility and candidate construction
+  are per
   `(checkout, root)` with a first-sorted representative: a root under one
   checkout is ONE owner, so its own sibling members never keep each other,
   while a reference from a different checkout does keep the root. A dangling

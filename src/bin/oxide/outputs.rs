@@ -6643,6 +6643,34 @@ impl CleanPlacement {
         &self.members
     }
 
+    /// Every path a whole clean must keep, or nothing when this is not a
+    /// profile placement. In the profile layout `target` is a REAL directory,
+    /// so it is kept as well as each owned member link and each real ancestor
+    /// directory between the target and a nested link (a triple directory).
+    /// Keeping a directory never stops the walk inside it.
+    pub fn preserved(&self) -> Vec<PathBuf> {
+        if self.members.is_empty() {
+            return Vec::new();
+        }
+        let mut paths = vec![self.target.clone()];
+        for (link, _) in &self.members {
+            if !paths.iter().any(|known| known == link) {
+                paths.push(link.clone());
+            }
+            let mut ancestor = link.parent();
+            while let Some(directory) = ancestor {
+                if directory == self.target.as_path() || !directory.starts_with(&self.target) {
+                    break;
+                }
+                if !paths.iter().any(|known| known == directory) {
+                    paths.push(directory.to_path_buf());
+                }
+                ancestor = directory.parent();
+            }
+        }
+        paths
+    }
+
     /// What the clean keeps, for its report; empty for an ephemeral checkout.
     pub fn preserved_note(&self) -> Option<String> {
         if !self.members.is_empty() {
