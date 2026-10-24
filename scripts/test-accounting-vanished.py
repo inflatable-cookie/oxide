@@ -151,6 +151,7 @@ def base_env(scratch: str, pool: str, cap: str = "8MiB") -> dict[str, str]:
     env.update(
         {
             "HOME": os.path.join(scratch, "home"),
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "XDG_CONFIG_HOME": os.path.join(scratch, "xdg-config"),
             "CARGO_HOME": os.path.join(scratch, "cargo-home"),
             "RUSTUP_HOME": os.environ.get(
@@ -304,6 +305,7 @@ def stage_oxide(scratch: str) -> str:
     env["CARGO_BUILD_BUILD_DIR"] = target
     env["CARGO_HOME"] = cargo_home
     env["HOME"] = os.path.join(scratch, "home")
+    env["OXIDE_TEST_HOME_FROM_ENV"] = "1"
     env["XDG_CONFIG_HOME"] = os.path.join(scratch, "xdg-config")
     env["RUSTUP_HOME"] = os.environ.get(
         "RUSTUP_HOME", os.path.expanduser("~/.rustup")

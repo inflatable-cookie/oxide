@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Synthetic fixtures for the dogfood installer.
+"""Synthetic fixtures for the dogfood installer and the account-home proof's
+image custody (oxide#143).
 
 The shared session supervisor (`bounded-test.py`) has its own suite,
 `test_supervisor.py`, run by `proof:supervisor:qualify`.
@@ -35,6 +36,7 @@ def load(name):
 
 
 installer = load("oxide-install")
+account_home = load("test-account-home")
 
 
 def sha256(data):
@@ -126,7 +128,7 @@ class InstallerTests(unittest.TestCase):
         return stub
 
     def test_capability_probe_records_the_built_binary_numbers(self):
-        built = self.capability_binary('{"control_state_version": 2, "registration_version": 3}')
+        built = self.capability_binary('{"control_state_version": 2, "registration_version": 3, "test_controls": false}')
         self.assertEqual(
             installer.state_capabilities(built),
             {"control_state_version": 2, "registration_version": 3},
@@ -146,6 +148,15 @@ class InstallerTests(unittest.TestCase):
                 installer.state_capabilities(self.capability_binary(output))
         with self.assertRaises(installer.Refusal):
             installer.state_capabilities(self.capability_binary('{"control_state_version": 2, "registration_version": 2}', code=1))
+
+    def test_capability_probe_refuses_an_artifact_with_proof_controls(self):
+        for output in (
+            '{"control_state_version": 2, "registration_version": 2, "test_controls": true}',
+            '{"control_state_version": 2, "registration_version": 2}',
+            '{"control_state_version": 2, "registration_version": 2, "test_controls": "false"}',
+        ):
+            with self.assertRaises(installer.Refusal):
+                installer.state_capabilities(self.capability_binary(output))
 
     def test_a_build_is_stamped_with_the_pin_and_a_fresh_instance(self):
         pin, instance = "a" * 40, installer.new_instance()
@@ -208,6 +219,175 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaises(installer.Refusal):
             installer.preflight(True)
 
+
+
+class AccountHomeCustodyTests(unittest.TestCase):
+    """The account-home proof's image custody and cleanup decisions with a
+    fake hdiutil, clock and mount table: nothing is created or mounted."""
+
+    MOUNT = "/Volumes/OxAhsynthetic"
+    PLIST = (b'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>system-entities</key><array>'
+             b'<dict><key>dev-entry</key><string>/dev/disk9s1</string><key>mount-point</key>'
+             b'<string>/Volumes/OxAhsynthetic</string></dict></array></dict></plist>')
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(dir=SCRATCH)) / "owned-image"
+        self.custody = account_home.Custody(str(self.directory), self.MOUNT)
+        Path(self.custody.image).write_bytes(b"backing")
+        self.custody.record("image-created")
+        self.calls = []
+
+    def runner(self, answers):
+        def run(command, timeout):
+            self.calls.append((command[1], timeout))
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        return run
+
+    def persisted(self):
+        return json.loads((self.directory / "custody.json").read_text())
+
+    def attached(self):
+        mount = account_home.attach_image(self.custody, self.runner([(0, self.PLIST, "")]), 30)
+        self.assertEqual(mount, self.MOUNT)
+        self.assertEqual(self.persisted()["state"], "attached")
+
+    def test_custody_is_persisted_before_the_attach_runs(self):
+        def run(command, timeout):
+            self.assertEqual(self.persisted()["state"], "attach-requested")
+            return 0, self.PLIST, ""
+        account_home.attach_image(self.custody, run, 30)
+
+    def test_attach_failures_keep_custody_and_the_image(self):
+        for answer, state in ((account_home.subprocess.TimeoutExpired("hdiutil", 30), "attach-unknown"),
+                              ((1, b"not a plist", "boom"), "attach-unknown"),
+                              ((1, b'<?xml version="1.0"?><plist version="1.0"><dict><key>system-entities</key><array/></dict></plist>', "x"),
+                               "attach-mismatch")):
+            self.custody.record("image-created", mounts=[])
+            with self.assertRaises(RuntimeError):
+                account_home.attach_image(self.custody, self.runner([answer]), 30)
+            self.assertEqual(self.persisted()["state"], state)
+            self.assertFalse(account_home.detach_image(self.custody, self.runner([]), 10**12, False,
+                                                       clock=lambda: 0, mounted=lambda path: False))
+            self.assertEqual(self.persisted()["state"], "retained")
+            self.assertTrue(Path(self.custody.image).exists())
+        self.assertEqual([call[0] for call in self.calls], ["attach", "attach", "attach"])
+
+    def test_a_mismatched_mount_is_recorded_and_detached_ordinarily(self):
+        other = self.PLIST.replace(b"OxAhsynthetic", b"OxAhsynthetic 1")
+        with self.assertRaises(RuntimeError):
+            account_home.attach_image(self.custody, self.runner([(0, other, "")]), 30)
+        self.assertEqual(self.persisted()["mounts"], [self.MOUNT + " 1"])
+        self.assertTrue(account_home.detach_image(self.custody, self.runner([(0, b"", "")]), 10**12, False,
+                                                  clock=lambda: 0, mounted=lambda path: False))
+        self.assertEqual(self.calls[-1][0], "detach")
+        self.assertEqual(self.persisted()["state"], "image-removed")
+        self.assertFalse(Path(self.custody.image).exists())
+
+    def test_unknown_writers_or_too_little_time_keep_the_image_without_detach(self):
+        self.attached()
+        self.assertFalse(account_home.detach_image(self.custody, self.runner([]), 10**12, True,
+                                                   clock=lambda: 0, mounted=lambda path: True))
+        self.assertIn("writer custody unknown", self.persisted()["reason"])
+        self.custody.record("attached")
+        deadline = 2 * account_home.NS
+        self.assertFalse(account_home.detach_image(self.custody, self.runner([]), deadline, False,
+                                                   clock=lambda: 0, mounted=lambda path: True))
+        self.assertIn("before the guard's stop", self.persisted()["reason"])
+        self.assertEqual([call[0] for call in self.calls], ["attach"])
+        self.assertTrue(Path(self.custody.image).exists())
+
+    def test_a_failed_timed_out_or_lingering_detach_keeps_the_image_and_never_retries(self):
+        for answer, present in (((1, b"", "busy"), True), (account_home.subprocess.TimeoutExpired("hdiutil", 5), True),
+                                ((0, b"", ""), True)):
+            self.custody.record("attached", mounts=[self.MOUNT])
+            self.assertFalse(account_home.detach_image(self.custody, self.runner([answer]), 10**12, False,
+                                                       clock=lambda: 0, mounted=lambda path: present))
+            self.assertEqual(self.persisted()["state"], "retained")
+            self.assertFalse(account_home.detach_image(self.custody, self.runner([]), 10**12, False,
+                                                       clock=lambda: 0, mounted=lambda path: False))
+            self.assertTrue(Path(self.custody.image).exists())
+
+    def test_detach_is_bounded_by_the_guard_stop_not_the_work_margin(self):
+        self.attached()
+        deadline = 9 * account_home.NS
+        self.assertTrue(account_home.detach_image(self.custody, self.runner([(0, b"", "")]), deadline, False,
+                                                  clock=lambda: 0, mounted=lambda path: False))
+        self.assertEqual(self.calls[-1], ("detach", 8.0))
+        os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(100 * account_home.NS)
+        try:
+            self.assertEqual(account_home.cleanup_deadline_ns(), 79 * account_home.NS)
+        finally:
+            del os.environ["OXIDE_PROOF_DEADLINE_NS"]
+
+    def test_an_interrupted_or_failing_detach_latches_retained_with_one_attempt(self):
+        for raised in (KeyboardInterrupt(), OSError("runner failed")):
+            self.custody.record("attached", mounts=[self.MOUNT])
+            self.calls.clear()
+            with self.assertRaises(type(raised)):
+                account_home.detach_image(self.custody, self.runner([raised]), 10**12, False,
+                                          clock=lambda: 0, mounted=lambda path: False)
+            self.assertEqual(self.custody.facts["state"], "retained")
+            self.assertFalse(account_home.detach_image(self.custody, self.runner([]), 10**12, False,
+                                                       clock=lambda: 0, mounted=lambda path: False))
+            self.assertEqual([call[0] for call in self.calls], ["detach"])
+            self.assertTrue(Path(self.custody.image).exists())
+
+    def test_a_failing_confirmation_or_evidence_write_latches_retained(self):
+        self.custody.record("attached", mounts=[self.MOUNT])
+
+        def confirm(path):
+            raise OSError("statfs failed")
+        with self.assertRaises(OSError):
+            account_home.detach_image(self.custody, self.runner([(0, b"", "")]), 10**12, False,
+                                      clock=lambda: 0, mounted=confirm)
+        self.assertEqual(self.custody.facts["state"], "retained")
+        self.assertTrue(Path(self.custody.image).exists())
+
+        self.custody.record("attached", mounts=[self.MOUNT])
+        self.calls.clear()
+        original = self.custody.record
+
+        def broken(state, **facts):
+            raise OSError("evidence write failed")
+        self.custody.record = broken
+        try:
+            with self.assertRaises(OSError):
+                account_home.detach_image(self.custody, self.runner([(0, b"", "")]), 10**12, False,
+                                          clock=lambda: 0, mounted=lambda path: False)
+        finally:
+            self.custody.record = original
+        self.assertEqual(self.custody.facts["state"], "retained")
+        self.assertEqual(self.custody.facts["write_error"], "OSError")
+        self.assertEqual(self.calls, [], "no device action after the intention could not be recorded")
+        self.assertTrue(Path(self.custody.image).exists())
+
+    def test_the_first_fault_survives_cleanup_and_record_failures(self):
+        evidence = Path(tempfile.mkdtemp(dir=SCRATCH))
+        primary = RuntimeError("case 07 failed")
+        self.custody.record("attached", mounts=[self.MOUNT])
+
+        def cleanup():
+            self.custody.record = lambda state, **facts: (_ for _ in ()).throw(OSError("evidence write failed"))
+            raise KeyboardInterrupt()
+        body = {}
+        written = account_home.closeout_after_failure(primary, self.custody, False, body, str(evidence), detach=cleanup)
+        receipt = json.loads(Path(written).read_text())
+        self.assertIn("case 07 failed", receipt["result"])
+        self.assertIn("KeyboardInterrupt", receipt["cleanup_error"])
+        self.assertTrue(Path(self.custody.image).exists())
+
+        def no_receipt(directory, body):
+            raise OSError("evidence full")
+        self.assertTrue(account_home.closeout_after_failure(primary, None, False, {}, str(evidence),
+                                                            write_receipt=no_receipt).startswith("not written (OSError"))
+
+    def test_the_custody_record_stays_bounded(self):
+        self.custody.record("attached", stderr="x" * 200_000)
+        self.assertLessEqual((self.directory / "custody.json").stat().st_size, account_home.CUSTODY_MAX_BYTES)
+        self.assertTrue(self.persisted()["truncated"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

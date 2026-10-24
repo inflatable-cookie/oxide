@@ -520,6 +520,17 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-everyday-cli.py"
 
+# Account-home proof (oxide#143): under the qualified shared proof supervisor,
+# stages a controlled debug and a normal release `oxide` in sequence, checks
+# the installer's capability decision and the normal artifact's control
+# refusals, then proves the account default, a removable registration in the
+# account-selected pool on one owned scratch image, overrides, lazy facts and
+# control refusals through a stand-in account home. `--plan` alone touches
+# nothing. Not a benchmark and not an alias for full QA.
+[tasks."rust:account-home"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-account-home.py"
+
 [tasks."rust:freshness-submodules"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"

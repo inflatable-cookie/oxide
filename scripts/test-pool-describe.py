@@ -191,6 +191,7 @@ class Proof:
         env["PATH"] = PATH_BASE
         if case is not None:
             env["HOME"] = str(case / "home")
+            env["OXIDE_TEST_HOME_FROM_ENV"] = "1"
             env["OXIDE_POOL"] = str(case / "pool")
         if extra:
             env.update(extra)

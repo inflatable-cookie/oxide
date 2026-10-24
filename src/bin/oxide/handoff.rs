@@ -59,8 +59,11 @@ pub fn hidden() -> Option<u8> {
         eprintln!("oxide: {CAPABILITIES_PROBE} takes no arguments");
         return Some(2);
     }
+    // `test_controls`: whether this artifact honours the debug-only proof
+    // controls (`OXIDE_TEST_*`). The installer refuses an artifact that does.
     println!(
-        "{{\"control_state_version\":{STATE_VERSION},\"registration_version\":{REGISTRATION_VERSION}}}"
+        "{{\"control_state_version\":{STATE_VERSION},\"registration_version\":{REGISTRATION_VERSION},\"test_controls\":{}}}",
+        cfg!(debug_assertions)
     );
     Some(0)
 }

@@ -884,6 +884,94 @@ fn ensure_member_directory(root: &Path, member: &str) -> Result<PathBuf, String>
     Ok(destination)
 }
 
+/// Create the real ancestor directories a nested profile member needs inside
+/// the checkout's own `target` (`target/<triple>` for `<triple>/debug`). The
+/// target root stays a real directory, so a member link at a second component
+/// is published only after that ancestor exists as a real directory: a
+/// symlink, a file or any other entry there is refused, never followed or
+/// replaced, and nothing outside the checkout's target is created.
+fn ensure_member_ancestors(context: &Context, link: &Path) -> Result<(), String> {
+    let target = context.link();
+    // The legacy whole-target placement IS the target directory, and a
+    // one-component profile member sits directly in it: neither needs an
+    // ancestor.
+    if link == target.as_path() {
+        return Ok(());
+    }
+    let Some(parent) = link.parent() else {
+        return Ok(());
+    };
+    if parent == target.as_path() {
+        return Ok(());
+    }
+    let relative = parent.strip_prefix(&target).map_err(|_| {
+        format!(
+            "{} is not beneath the checkout's target directory {}",
+            link.display(),
+            target.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(&target).map_err(|error| {
+        format!(
+            "cannot inspect {}: {error}; a profile member is placed only inside a real target directory",
+            target.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} is not a real directory; a profile member is placed only inside one",
+            target.display()
+        ));
+    }
+    let mut current = target.clone();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not a real directory; Oxide never follows or replaces it",
+                    current.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {
+                        fs::set_permissions(&current, fs::Permissions::from_mode(0o755)).map_err(
+                            |error| {
+                                format!(
+                                    "cannot set permissions on the member directory {}: {error}",
+                                    current.display()
+                                )
+                            },
+                        )?;
+                        sync_directory(&target)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                            format!("cannot inspect {}: {error}", current.display())
+                        })?;
+                        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                            return Err(format!(
+                                "{} is not a real directory; Oxide never follows or replaces it",
+                                current.display()
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot create the member directory {}: {error}",
+                            current.display()
+                        ))
+                    }
+                }
+            }
+            Err(error) => return Err(format!("cannot inspect {}: {error}", current.display())),
+        }
+    }
+    Ok(())
+}
+
 /// The real destination one member's link selects: the approved distinct
 /// subpath beneath the shared root (`R/debug`, `R/release`,
 /// `R/<triple>/debug`, ...). Only the legacy whole-target placement, member
@@ -4228,7 +4316,7 @@ fn bind_profile(
                 owned_root.get_or_insert_with(|| wanted.root.clone());
             }
             (Some(wanted), TargetState::Missing) => {
-                if let Err(reason) = reservation_matches(context, receipt, wanted) {
+                if let Err(reason) = member_root_authority(context, receipt, wanted) {
                     return Bind::Refuse(reason);
                 }
                 needed.push((planned.member.clone(), wanted.clone()));
@@ -4344,6 +4432,40 @@ fn bind_profile(
         }
     }
     Bind::Bound(outcome)
+}
+
+/// The authority a MISSING member link is created under. A member that joins a
+/// root this checkout already owns is placed by the receipt itself: the commit
+/// of that root's first member consumed the reservation, so adding a later
+/// member (a host `--target` triple after `debug`, say) must not demand one.
+/// The keyed root must still be exactly a root the receipt currently selects
+/// and pass the full marker/kind/volume/generation/device check. Only a root
+/// that does not exist yet binds the durable reservation its slot was keyed
+/// with.
+fn member_root_authority(
+    context: &Context,
+    receipt: &Receipt,
+    wanted: &Selected,
+) -> Result<(), String> {
+    let committed = receipt
+        .links
+        .iter()
+        .filter_map(|placement| placement.selected.as_ref())
+        .any(|selected| {
+            selected.root == wanted.root
+                && selected.kind == wanted.kind
+                && selected.volume_uuid == wanted.volume_uuid
+                && selected.nonce() == wanted.nonce()
+        });
+    if committed {
+        return check_bound_root(context, receipt.generation, wanted).map_err(|reason| {
+            format!(
+                "outputs: this command's new profile member joins the committed root {} but {reason}; nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                wanted.root.display()
+            )
+        });
+    }
+    reservation_matches(context, receipt, wanted)
 }
 
 /// The keyed future root's reservation must survive exactly: the receipt's
@@ -5661,10 +5783,17 @@ fn transition_at(
     }
     // A newly created root gets a fresh random nonce; an existing root keeps
     // the nonce in its marker. A missing root is never re-created with the
-    // receipt's old nonce (oxide#129).
-    let existing_nonce = read_marker(spec.root())
-        .ok()
-        .and_then(|marker| marker.nonce);
+    // receipt's old nonce (oxide#129). A selection keys the root's OWN
+    // immutable creation generation, which is the placement generation only
+    // for the transition that creates the root; a member joining an existing
+    // root must not claim a newer one.
+    let existing_marker = read_marker(spec.root()).ok();
+    let existing_nonce = existing_marker
+        .as_ref()
+        .and_then(|marker| marker.nonce.clone());
+    let root_generation = existing_marker
+        .as_ref()
+        .map_or(generation, |marker| marker.generation);
     // A future root takes the nonce reserved for exactly it, after the
     // reservation is validated against the registry (or its overflow tag);
     // only an explicit adoption without a keyed slot draws a fresh one.
@@ -5683,7 +5812,7 @@ fn transition_at(
             None => Some(crate::prune::fresh_nonce()?),
         },
     };
-    let to = spec.selected(generation).with_nonce(nonce);
+    let to = spec.selected(root_generation).with_nonce(nonce);
     // Write-ahead: prepared first, then the destination root, then the
     // sibling link, then the rename, then the committed receipt.
     let mut writing = receipt.clone();
@@ -5699,6 +5828,7 @@ fn transition_at(
 
     ensure_root_with(context, spec, generation, to.nonce())?;
     ensure_member_directory(&to.root, member)?;
+    ensure_member_ancestors(context, &link)?;
     let sibling = sibling_link(&link, generation);
     match fs::symlink_metadata(&sibling) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -5798,9 +5928,11 @@ fn finish_commit(
         prepared.to.nonce(),
     )?;
     ensure_member_directory(&prepared.to.root, &member)?;
+    // The committed selection carries the root's own creation generation, not
+    // the placement revision that committed it.
     let selected = prepared
         .to
-        .at(prepared.generation)
+        .at(marker.generation)
         .with_nonce(marker.nonce.clone());
     let mut committed = receipt.clone();
     committed.state = ReceiptState::Committed;
@@ -8441,6 +8573,115 @@ mod tests {
             fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap(),
             recorded
         );
+    }
+
+    /// oxide#133 case 04 product regression. A member that JOINS a root this
+    /// checkout already owns needs no fresh reservation: the commit of that
+    /// root's first member consumed it. Demanding one made every later member
+    /// of the same root -- a host `--target` triple after `debug`/`release` --
+    /// refuse with "that reservation was cancelled or replaced", so the parent
+    /// of this fix fails and this test distinguishes it from the correct
+    /// behaviour instead of accepting any nonzero exit.
+    #[test]
+    fn a_new_member_joins_an_existing_owned_root_without_a_fresh_reservation() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let store = pool_store(&fixture.root.join("pool"));
+        // Committed debug + release on one owned root, exactly as a first
+        // conversion leaves them: no reservation survives that commit.
+        let mut receipt = profile_receipt(&fixture);
+        receipt.reserved = None;
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let selected = receipt.selected().cloned().unwrap();
+        let root = selected.root.clone();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::Local,
+            volume_uuid: None,
+            nonce: selected.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        for member in ["debug", "release"] {
+            fs::create_dir_all(member_destination(&root, member)).unwrap();
+            symlink(
+                member_destination(&root, member),
+                fixture.checkout.join("target").join(member),
+            )
+            .unwrap();
+        }
+        // The production planner keys the new triple member on the SAME owned
+        // root, its existing nonce and the root's own generation.
+        let triple_member = "aarch64-apple-darwin/debug";
+        let declaration =
+            crate::layout::Declaration::new([crate::layout::Member::parse(triple_member).unwrap()])
+                .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let wanted = plan.selected().cloned().unwrap();
+        assert_eq!(
+            wanted.root, root,
+            "the planner did not reuse the owned root"
+        );
+        assert_eq!(
+            wanted.nonce(),
+            selected.nonce(),
+            "the planner did not reuse the root nonce"
+        );
+        assert_eq!(wanted.generation, 1, "the planner moved the generation");
+        let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Bound(outcome) => outcome,
+            Bind::Refuse(reason) => panic!("a new member of an owned root was refused: {reason}"),
+            Bind::Wait => panic!("a new member of an owned root waited"),
+        };
+        assert_eq!(outcome.root, Some(root.clone()));
+        let note = outcome.note.unwrap_or_default();
+        assert!(note.contains(triple_member), "{note}");
+        assert!(note.contains("profile member links"), "{note}");
+        // The new link names its own member destination under the shared root,
+        // and the two committed links are untouched.
+        assert_eq!(
+            fs::read_link(fixture.checkout.join("target").join(triple_member)).unwrap(),
+            member_destination(&root, triple_member)
+        );
+        for member in ["debug", "release"] {
+            assert_eq!(
+                fs::read_link(fixture.checkout.join("target").join(member)).unwrap(),
+                member_destination(&root, member)
+            );
+        }
+        // The receipt now places all three members on that one root and nonce.
+        let committed = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        let mut members: Vec<&str> = Vec::new();
+        for member in ["debug", "release", triple_member] {
+            let placed = committed
+                .selected_for(member)
+                .unwrap_or_else(|| panic!("the receipt lost {member}"));
+            assert_eq!(placed.root, root, "{member}");
+            assert_eq!(placed.nonce(), selected.nonce(), "{member}");
+            members.push(member);
+        }
+        assert_eq!(committed.links.len(), 3, "{members:?}");
     }
 
     /// P4, ROOT check: the same refusal through the PRODUCTION planning path.

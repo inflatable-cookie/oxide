@@ -170,6 +170,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   published default is still the whole-target layout described above; the
   profile layout's contract, formats and limits are owned by the
   [workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133).
+- **Machine pool from the account:** Oxide resolves its config, pool and
+  drive from the account home, not `$HOME`, so a harness that overrides
+  HOME still uses them; private pools need an explicit setting. Its proof
+  controls exist only in debug builds; any other build refuses them.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
@@ -181,8 +185,6 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - the machine pool and drive resolved from the account, not `$HOME`, so a
-    harness that overrides HOME cannot bypass them; isolation is explicit;
   - cold-slot seeding from matching units, conservative first, with
     one-use temp workspaces handled as seeded, first-evicted slots;
   - per-slot test scratch;

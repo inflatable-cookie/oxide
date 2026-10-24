@@ -395,6 +395,7 @@ def proof_env(pool: str, home: str, cargo_home: str) -> dict:
             "OXIDE_POOL": pool,
             "OXIDE_POOL_CAP": "64MiB",
             "HOME": home,
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "CARGO_HOME": cargo_home,
             "RUSTUP_HOME": real_rustup,
             "RUSTUP_TOOLCHAIN": BUILDER,
