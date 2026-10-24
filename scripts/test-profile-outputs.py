@@ -132,8 +132,9 @@ STAGE_JOBS = 6
 FIXTURE_JOBS = 2
 # The private image is 128 MiB. Every normal registration reserves well below
 # that geometry (16 MiB) with a 64 MiB admission cap, so the volume is really
-# selected; one SEPARATE deliberate low-reserve control registers another pool
-# above the image's free space to prove the honest internal fallback.
+# selected; one SEPARATE deliberate low-reserve control temporarily raises THIS
+# registration's recorded reserve above the image's free space and restores the
+# exact recorded bytes afterwards, proving the honest internal fallback.
 IMAGE_RESERVE = "16MiB"
 LOW_RESERVE_MIB = 200
 SHUTDOWN_MARGIN_S = 30
@@ -472,14 +473,19 @@ def owned_image_dir() -> str:
     return directory
 
 
-def write_attachment_facts(name: str, record: dict) -> None:
+def evidence_root() -> str:
+    """The runner's evidence root, or "" when this script is not under it."""
+    return os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+
+
+def write_attachment_facts(name: str, record: dict, evidence: str | None = None) -> str | None:
     """Persist bounded attachment custody in the guard's OWN evidence root,
     before or after a risky operation, so an interrupted run still leaves the
     last known mount/device/UUID/image facts for the custodian."""
-    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
-    if not evidence:
+    root = evidence_root() if evidence is None else evidence
+    if not root:
         return None
-    path = os.path.join(evidence, name)
+    path = os.path.join(root, name)
     with open(path + ".new", "w", encoding="utf-8") as handle:
         json.dump(record, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -487,16 +493,55 @@ def write_attachment_facts(name: str, record: dict) -> None:
     return path
 
 
-def attachment_facts(proof: Proof, label: str, state: str) -> dict:
-    """Bounded last-known attachment facts for one owned mount."""
+def known_attachment_facts(proof: Proof, label: str, state: str) -> dict:
+    """Source-KNOWN custody facts with NO subprocess.
+
+    Everything here is already in hand (the proof's mount, the owned backing
+    path, the unclosed-child set and the last cached query). Nothing is
+    queried, so a failure handler can always persist this record even when
+    diskutil would hang, time out or fail."""
     mount = proof.mount
-    directory = owned_image_dir()
-    backing = os.path.join(directory, "volume.sparseimage")
+    # A record must be writable even when the owned paths cannot be derived:
+    # unknown stays honestly unknown instead of raising inside a failure path.
+    try:
+        directory = owned_image_dir()
+        backing = os.path.join(directory, "volume.sparseimage")
+        backing_present = os.path.exists(backing)
+    except Exception:
+        directory = ""
+        backing = ""
+        backing_present = False
+    cached = getattr(proof, "_attachment_details", None)
+    return {
+        "label": label,
+        "state": state,
+        "mount": mount,
+        "image": backing or None,
+        "image_dir": directory or None,
+        "backing_present": backing_present,
+        "owned": True,
+        "unclosed_children": sorted(getattr(proof, "unclosed", set())),
+        "details": dict(cached) if cached else {
+            "device": None,
+            "volume_uuid": None,
+            "owners": None,
+            "mount_point": mount,
+        },
+        "details_known": bool(cached) or mount is None,
+    }
+
+
+def refresh_attachment_details(proof: Proof) -> dict:
+    """Bounded read-only diskutil query, cached as the last-known facts.
+
+    Never raises and never blocks a record: a refusing, failing, timing-out or
+    unparseable query is itself recorded as unavailable."""
+    mount = proof.mount
     details = {}
     if mount:
-        info = proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30)
-        if info.returncode == 0:
-            try:
+        try:
+            info = proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30)
+            if info.returncode == 0:
                 plist = perm.plistlib.loads(info.stdout)
                 details = {
                     "device": plist.get("DeviceIdentifier"),
@@ -504,19 +549,15 @@ def attachment_facts(proof: Proof, label: str, state: str) -> dict:
                     "owners": plist.get("Owners"),
                     "mount_point": plist.get("MountPoint"),
                 }
-            except Exception:
-                details = {"plist": "unreadable"}
-    return {
-        "label": label,
-        "state": state,
-        "mount": mount,
-        "image": backing,
-        "image_dir": directory,
-        "backing_present": os.path.exists(backing),
-        "owned": True,
-        "unclosed_children": sorted(getattr(proof, "unclosed", set())),
-        "details": details,
-    }
+            else:
+                details = {"unavailable": f"diskutil exited {info.returncode}"}
+        except Exception as error:
+            details = {"unavailable": repr(error)}
+    try:
+        proof._attachment_details = details
+    except Exception:
+        pass
+    return details
 
 
 def attach_owned_image(
@@ -534,7 +575,8 @@ def attach_owned_image(
         image_name=image_name,
     )
     owners_honored(proof, mount, label)
-    write_attachment_facts("attachment-facts.json", attachment_facts(proof, label, "attached"))
+    refresh_attachment_details(proof)
+    write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, label, "attached"))
     return mount
 
 
@@ -711,28 +753,131 @@ def pure_slot_state_control() -> None:
     print("pure slot-state control: ok", flush=True)
 
 
+class _FakeCustodyProof:
+    """Synthetic stand-in for the custody paths: it NEVER spawns a subprocess.
+
+    `run` raises whatever failure the case wants to model (query refused,
+    deadline hit), which is exactly the situation in which a failure record
+    must still be written from already-known facts."""
+
+    def __init__(self, mount: str, failure: str = "query refused") -> None:
+        self.mount = mount
+        self.unclosed = set()
+        self.failure = failure
+        self.calls = []
+
+    def run(self, args, **_kwargs):
+        self.calls.append(list(args))
+        raise RuntimeError(self.failure)
+
+
 def pure_attachment_facts_control() -> None:
-    """No-subprocess control for A10 custody facts: they are written into the
-    evidence root, replaced atomically, leave no temporary file behind, and
-    are skipped entirely when no evidence root is configured."""
-    written = write_attachment_facts("attachment-unset.json", {"state": "never"})
-    expect(written is None, "the attachment facts were written without an evidence root")
+    """Synthetic-filesystem, no-subprocess control for the A10 custody facts.
+
+    It writes only into its OWN temporary directories, never into the runner's
+    evidence root: the writer takes an explicit evidence seam, and where the
+    control does exercise the environment it SAVES and RESTORES whatever the
+    runner set (a sentinel is checked byte-for-byte afterwards)."""
+    real_evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
     with tempfile.TemporaryDirectory() as root:
+        # 1. Explicit seam: no environment needed at all.
+        path = write_attachment_facts("attachment-facts.json", {"state": "attached"}, evidence=root)
+        expect(path == os.path.join(root, "attachment-facts.json"), f"the explicit seam wrote {path}")
+        write_attachment_facts("attachment-facts.json", {"state": "detached"}, evidence=root)
+        with open(os.path.join(root, "attachment-facts.json"), encoding="utf-8") as handle:
+            record = json.load(handle)
+        expect(record.get("state") == "detached", f"the facts were not replaced atomically: {record}")
+        expect(
+            not os.path.exists(os.path.join(root, "attachment-facts.json.new")),
+            "a temporary attachment-facts file was left behind",
+        )
+        # 2. Absent evidence root: skipped, and no file appears anywhere.
+        expect(
+            write_attachment_facts("attachment-unset.json", {"state": "never"}, evidence="") is None,
+            "the writer wrote without an evidence root",
+        )
+        expect(
+            not os.path.exists(os.path.join(root, "attachment-unset.json")),
+            "the writer wrote into a directory it was not given",
+        )
+        # 3. Environment seam with a SENTINEL: the runner's value is preserved
+        #    exactly and nothing is written into the runner's real root.
         os.environ["OXIDE_PROOF_EVIDENCE"] = root
         try:
-            write_attachment_facts("attachment-facts.json", {"state": "attached", "mount": "/Volumes/x", "unclosed_children": []})
-            write_attachment_facts("attachment-facts.json", {"state": "detached", "mount": "/Volumes/x", "unclosed_children": []})
-            with open(os.path.join(root, "attachment-facts.json"), encoding="utf-8") as handle:
-                record = json.load(handle)
-            expect(record.get("state") == "detached", f"the attachment facts were not replaced: {record}")
-            expect(record.get("mount") == "/Volumes/x", f"the attachment facts lost the mount: {record}")
+            write_attachment_facts("attachment-env.json", {"state": "attached"})
             expect(
-                not os.path.exists(os.path.join(root, "attachment-facts.json.new")),
-                "a temporary attachment-facts file was left behind",
+                os.path.isfile(os.path.join(root, "attachment-env.json")),
+                "the environment seam did not write into the temporary root",
             )
         finally:
-            os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
-    print("pure attachment-facts control: ok", flush=True)
+            if real_evidence is None:
+                os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+            else:
+                os.environ["OXIDE_PROOF_EVIDENCE"] = real_evidence
+        expect(
+            os.environ.get("OXIDE_PROOF_EVIDENCE") == real_evidence,
+            "the control did not restore the runner's evidence value exactly",
+        )
+        if real_evidence:
+            expect(
+                not os.path.exists(os.path.join(real_evidence, "attachment-unset.json")),
+                "the control wrote a probe file into the runner's real evidence root",
+            )
+        # 4. Failure paths use KNOWN facts only: no subprocess, nothing lost.
+        mount = os.path.join(root, "mock-mount")
+        os.makedirs(mount)
+        os.makedirs(os.path.join(root, "owned-image"), exist_ok=True)
+        backing = os.path.join(root, "owned-image", "volume.sparseimage")
+        with open(backing, "wb") as handle:
+            handle.write(b"owned backing")
+        # owned_image_dir() reads the evidence root, so the synthetic custody
+        # section runs with the TEMPORARY root (restored in the finally below).
+        real_scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+        os.environ["OXIDE_PROOF_EVIDENCE"] = root
+        os.environ["OXIDE_TASK_SCRATCH_ROOT"] = root
+        fake = _FakeCustodyProof(mount)
+        facts = known_attachment_facts(fake, "mock", "detaching")
+        expect(fake.calls == [], f"the known-facts record spawned a query: {fake.calls}")
+        expect(facts["mount"] == mount and facts["owned"] is True, f"the known facts lost the mount: {facts}")
+        expect(
+            facts["details"]["device"] is None and facts["details_known"] is False,
+            f"unknown device facts were invented: {facts['details']}",
+        )
+        # A failing observation is recorded as unavailable, never raised.
+        os.environ["OXIDE_PROOF_EVIDENCE"] = root
+        try:
+            refreshed = refresh_attachment_details(fake)
+            expect("unavailable" in refreshed, f"a failed query was not recorded as unavailable: {refreshed}")
+            expect(
+                known_attachment_facts(fake, "mock", "attached")["details_known"] is True,
+                "the cached last-known facts were not retained",
+            )
+            expect(os.path.isfile(backing), "the backing disappeared before the detach attempt")
+            try:
+                detach_owned_volume(fake, "mock detach timeout")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a timed-out detach reported success")
+            unresolved = os.path.join(root, "detach-unresolved.json")
+            expect(os.path.isfile(unresolved), "a timed-out detach left no unresolved-custody record")
+            with open(unresolved, encoding="utf-8") as handle:
+                record = json.load(handle)
+            expect(
+                "unresolved" in record.get("state", "") and record.get("mount") == mount,
+                f"the unresolved record is not honest about the mount: {record}",
+            )
+            expect(os.path.isfile(backing), "the backing was deleted after a failed detach")
+        finally:
+            if real_evidence is None:
+                os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+            else:
+                os.environ["OXIDE_PROOF_EVIDENCE"] = real_evidence
+            if real_scratch is None:
+                os.environ.pop("OXIDE_TASK_SCRATCH_ROOT", None)
+            else:
+                os.environ["OXIDE_TASK_SCRATCH_ROOT"] = real_scratch
+    print("pure attachment-facts control: ok (synthetic filesystem, no subprocess)", flush=True)
 
 
 def detach_owned_volume(proof: Proof, label: str) -> None:
@@ -752,7 +897,7 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
     # outcome is not known, so the mount is kept and reported instead.
     unclosed = sorted(getattr(proof, "unclosed", set()))
     if unclosed:
-        record = attachment_facts(proof, label, "unresolved: unclosed children")
+        record = known_attachment_facts(proof, label, "unresolved: unclosed children")
         record["reason"] = "refused to detach while child custody is unknown"
         write_attachment_facts("detach-unresolved.json", record)
         fail(f"{label}: refusing ordinary detach while {len(unclosed)} child(ren) are unclosed; the mount and backing are retained")
@@ -760,11 +905,11 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
     expect(os.path.lexists(mount), f"{label}: the owned mount {mount} vanished before ordinary detach")
     # Persist the last-known facts BEFORE the risky calls, so an interruption
     # (including a timeout) still leaves custody facts in evidence.
-    write_attachment_facts("attachment-facts.json", attachment_facts(proof, label, "detaching"))
+    write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, label, "detaching"))
     try:
         result = proof.run(["/usr/bin/hdiutil", "detach", mount], timeout=60)
     except Exception as error:  # a timeout or a harness fault is unresolved custody
-        record = attachment_facts(proof, label, "unresolved: detach did not complete")
+        record = known_attachment_facts(proof, label, "unresolved: detach did not complete")
         record["reason"] = f"detach raised {error!r}"
         write_attachment_facts("detach-unresolved.json", record)
         fail(f"{label}: ordinary detach of {mount} did not complete ({error!r}); the backing is retained in the guard evidence")
@@ -792,15 +937,15 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
             os.path.exists(backing),
             details,
         )
-        evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
-        with open(os.path.join(evidence, "detach-failure.json"), "w", encoding="utf-8") as handle:
+        evidence = evidence_root()
+        with open(os.path.join(evidence or os.devnull), "w", encoding="utf-8") as handle:
             json.dump(record, handle, indent=2)
             handle.write("\n")
-        write_attachment_facts("detach-unresolved.json", attachment_facts(proof, label, "unresolved: detach failed"))
+        write_attachment_facts("detach-unresolved.json", known_attachment_facts(proof, label, "unresolved: detach failed"))
         fail(f"{label}: ordinary detach of {mount} failed; the backing is retained in the guard evidence")
         return
     proof.mount = None
-    write_attachment_facts("attachment-facts.json", attachment_facts(proof, label, "detached"))
+    write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, label, "detached"))
     if os.path.exists(backing):
         os.remove(backing)
     try:
@@ -841,7 +986,8 @@ def auto_legacy(proof: Proof, checkout: str) -> None:
 
 def base_legacy(proof: Proof, base: str, pool: str, checkout: str) -> None:
     """Create a whole-target /2 state with the STAGED BASE binary (never the
-    candidate), in a pool that has not published the successor fence."""
+    candidate) in the one private pool BEFORE any candidate publishes the
+    successor fence there."""
     env = {**proof.env, "OXIDE_POOL": pool}
     result = proof.run([base, "outputs", "adopt"], cwd=checkout, env=env, timeout=90)
     stdout, stderr = result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace")
@@ -1827,9 +1973,13 @@ def run(proof: Proof, repo: str) -> None:
     # The volume goes away: the next command's intermediate slot falls back to
     # the internal pool while its member link selects the external root, so it
     # refuses instead of writing through an unsupervised drive.
+    # A10: the custody facts are persisted BEFORE this risky ordinary detach,
+    # and the detached state is recorded after it.
+    write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, "14 volume away", "detaching"))
     detached = proof.run(["/usr/bin/hdiutil", "detach", proof.mount], timeout=60)
     expect(detached.returncode == 0, "14: ordinary detach failed")
     proof.mount = None
+    write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, "14 volume away", "detached"))
     # The internal fallback slot meets an external owned link: the command
     # refuses rather than writing to an unsupervised drive. The oracle is exact
     # (exit 1, both the slot reason and the refusal reason, the affected member
@@ -2244,9 +2394,9 @@ def run(proof: Proof, repo: str) -> None:
     peer_receipt_path = receipt_file(pool, peer)
     rows = [row for row in registry["rows"] if row["checkout_id"] == gone_id]
     expect(bool(rows), "20: the gone checkout has no registry reference")
-    # A real, valid peer receipt for the same root (not a synthetic row and
-    # not a missing receipt): the peer checkout exists, its committed receipt
-    # selects the gone root with the identical recorded identity.
+    # SYNTHETIC INJECTED AUTHORITY: a crafted committed peer receipt plus
+    # matching registry rows (not a bind-produced receipt and not a missing
+    # receipt) selects the gone root with the identical recorded identity.
     peer_receipt = {
         "version": "oxide.outputs.transition/2",
         "checkout": peer,
@@ -2567,7 +2717,7 @@ def run(proof: Proof, repo: str) -> None:
 
 
 
-USAGE = "usage: test-profile-outputs.py [--plan|--self-check]\n--plan prints the fixed allocation and cases; --self-check runs the pure\npredicates only (registry, detach record, attachment facts, slot state,\nreserve-stop report). Neither has filesystem effects."
+USAGE = "usage: test-profile-outputs.py [--plan|--self-check]\n--plan prints the fixed allocation and cases; --self-check runs the pure\npredicates only (registry, detach record, attachment facts, slot state,\nreserve-stop report). --plan has no filesystem effects; --self-check only uses\nits own temporary directory and never the runner's evidence root."
 
 
 def main() -> int:
