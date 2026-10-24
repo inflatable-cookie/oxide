@@ -2575,8 +2575,11 @@ oxide#102.
   **Account-home proof.** `effigy rust:account-home` (oxide#143) is one fixed
   script under the qualified shared supervisor (300 s, 512 MiB monitored
   scratch; `--plan` prints phases, budgets and limits with no effect). It
-  stages a controlled debug artifact and a normal release artifact in
-  sequence with one Cargo job, each target deleted after its copy; the
+  stages a controlled debug artifact and a normal release artifact
+  (opt-level 1) in sequence with a fixed eight Cargo jobs, one Cargo call at
+  a time with fixtures included (planning demand 8 CPUs and 6 GiB,
+  unmeasured; `RUSTFLAGS` fixed and `CARGO_ENCODED_RUSTFLAGS` removed), each
+  target deleted after its copy; the
   installer's capability check refuses the first and accepts the second, and
   the normal artifact refuses each control before configuration. Through the
   account control it proves the account default under a differing `HOME`
@@ -2587,9 +2590,16 @@ oxide#102.
   matching `HOME`, `OXIDE_POOL` isolation, ordinary detach, a planted account
   config choosing pool and budget without a notice, lazy needed facts with an
   unavailable account home, and the malformed, mixed, unsupervised,
-  symlinked, outside and relative refusals. It writes a uniquely named helper
-  receipt that never claims closure. Each native run needs a separate owner
-  activation; none has run.
+  symlinked, outside and relative refusals. The image backing and its
+  custody record live under the never-cleaned evidence directory, written
+  before each effect; the backing is removed only after a positive ordinary
+  detach, and unknown attach answers or writers, a failed detach or too
+  little time keep it. Cleanup after a fault is bounded by the supervisor's
+  stop point, not the work margin. It writes a uniquely named helper receipt
+  with artifacts recorded as staged and resources known at failure; it never
+  claims closure. `--plan` allocations are planning figures, unmeasured.
+  `dogfood:scripts:test` covers the custody decisions with a fake `hdiutil`.
+  Each native run needs a separate owner activation; none has run.
   **Proof.** Unit tests pin literal former paths for both platforms
   (Unicode and spaces), demanded and unused relative XDG, overrides without
   `HOME` and missing facts with injected facts; they do not prove native

@@ -440,21 +440,23 @@ impl Facts {
     /// One platform-native root under the `oxide` leaf. Only this root's
     /// platform fact is read; Oxide's file names stay beneath it.
     fn storage_root(&self, kind: RootKind) -> Result<PathBuf, String> {
-        self.root_from(kind, false)
+        self.root_from(kind, None)
     }
 
-    /// Whether the cache root, and so the default pool, is the one the home
-    /// alone gives: no honoured XDG override chose it.
+    /// Whether the home chose the cache root, and so the default pool: the
+    /// root moves when only the home input changes. An honoured XDG cache
+    /// root does not, even when it names the home's default path.
     fn cache_from_home(&self) -> bool {
+        let probe = Path::new("/oxide-home-provenance-probe");
         matches!(
-            (self.root_from(RootKind::Cache, false), self.root_from(RootKind::Cache, true)),
-            (Ok(actual), Ok(from_home)) if actual == from_home
+            (self.root_from(RootKind::Cache, None), self.root_from(RootKind::Cache, Some(probe))),
+            (Ok(actual), Ok(moved)) if actual != moved
         )
     }
 
-    /// One root from the process or injected facts, or with `home_only` from
-    /// the home alone.
-    fn root_from(&self, kind: RootKind, home_only: bool) -> Result<PathBuf, String> {
+    /// One root from the process or injected facts, with the home input
+    /// replaced by `home` when given. The resolver reads no files.
+    fn root_from(&self, kind: RootKind, home: Option<&Path>) -> Result<PathBuf, String> {
         self.check_controls()?;
         let fact = match kind {
             RootKind::Config => PlatformDirectoryFact::Config,
@@ -476,19 +478,15 @@ impl Facts {
         } else {
             TargetPlatform::Linux
         };
-        let facts = match &self.directories {
-            _ if home_only => {
-                let home = self.home.as_ref().map(PathBuf::from);
-                let environment = PlatformEnvironment::default().with_home_dir(home);
-                native_platform_directory_fact_from(platform, fact, &environment)
-            }
-            Directories::Process => {
-                native_platform_directory_fact_from(platform, fact, &self.process_environment(fact))
-            }
-            Directories::Injected(environment) => {
-                native_platform_directory_fact_from(platform, fact, environment)
-            }
+        let environment = match &self.directories {
+            Directories::Process => self.process_environment(fact),
+            Directories::Injected(environment) => environment.clone(),
         };
+        let environment = match home {
+            Some(home) => environment.with_home_dir(Some(home.to_path_buf())),
+            None => environment,
+        };
+        let facts = native_platform_directory_fact_from(platform, fact, &environment);
         let identity = StorageIdentity::new("oxide").map_err(|error| error.to_string())?;
         match resolve_storage_root(&StorageLayoutRequest::new(identity, facts), kind) {
             Ok(Some(root)) => Ok(root.path().to_path_buf()),
@@ -1509,6 +1507,15 @@ mod tests {
         assert_eq!(
             xdg.home_notice, None,
             "an honoured XDG cache root chose the pool"
+        );
+        environment(&mut linux, |environment| {
+            environment.with_xdg_cache_home(Some(PathBuf::from("/home/user/.cache")))
+        });
+        let same = settings(&linux).expect("settings");
+        assert_eq!(same.pool, Path::new("/home/user/.cache/oxide/build-pool"));
+        assert_eq!(
+            same.home_notice, None,
+            "an XDG cache root naming the home default still chose the pool"
         );
     }
 

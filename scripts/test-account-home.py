@@ -41,9 +41,13 @@ account config choosing pool and budget without a notice; lazy needed facts
 with an unavailable account home; and the malformed, mixed, unsupervised,
 symlinked, outside and relative control refusals.
 
-A uniquely named helper receipt in the evidence directory records sources,
-artifacts, cases, phases, resources and image custody; it never claims
-closure, which is the supervisor's. Not a benchmark, real-drive or
+The image backing and its custody record live under the never-cleaned
+evidence directory; custody is written before each effect and the backing is
+removed only after a positive ordinary detach. Cleanup after a fault is
+bounded by the guard's own stop point, not the work margin. A uniquely named
+helper receipt records sources, artifacts as each is staged, cases, phase
+samples, resources and image custody; it never claims closure, which is the
+supervisor's census alone. Not a benchmark, real-drive or
 real-account qualification, or full QA.
 """
 
@@ -82,6 +86,13 @@ JOBS = "8"
 MEMORY_GIB = 6
 LIMIT_S = 300
 WORK_SECONDS = 270
+NS = 1_000_000_000
+# bounded-test.py stops the leader at its deadline less STOP_RESERVE_S; work
+# ends SHUTDOWN_MARGIN_S before the deadline, so cleanup has the gap between.
+STOP_RESERVE_S = 20
+SHUTDOWN_MARGIN_S = 30
+CLEANUP_SAFETY_S = 1
+CUSTODY_MAX_BYTES = 64 * 1024
 # (phase, allocated seconds, allocated peak owned MiB at that phase). Owned
 # bytes count the supervisor scratch: staged trees, copied binaries, the
 # sparse image backing file, fixtures and evidence.
@@ -126,7 +137,9 @@ phases:
   removable         one owned 128 MiB sparse APFS image at a unique /Volumes name, owners enabled, registered (reserve 16 MiB, cap 64 MiB) under the account pool; builds select it under a differing and a matching HOME; OXIDE_POOL isolates; ordinary detach; status after detach
   account-config    planted config.toml chooses pool and budget with no notice
   unavailable       !unavailable refuses where a home is needed and succeeds with explicit pool and config
-fixtures: private CARGO_HOME, stand-in account home and harness HOME inside the supervisor scratch; nothing outside it except the one image mount
+image custody: backing file and custody.json under OXIDE_PROOF_EVIDENCE/owned-image (never cleaned by the guard, inside its monitored root); custody persisted before create, attach and detach; the backing is removed only after a positive ordinary detach; an unknown attach answer, unknown writers, a failed or timed-out detach or too little time keep it
+cleanup: after any fault, ordinary detach only, bounded by the guard's stop (deadline less {STOP_RESERVE_S} s, less {CLEANUP_SAFETY_S} s safety), not the {SHUTDOWN_MARGIN_S} s work margin; the first fault stays primary; closure is the guard's census alone
+fixtures: private CARGO_HOME, stand-in account home and harness HOME inside the supervisor scratch; nothing outside it except the one image mount; RUSTFLAGS fixed and CARGO_ENCODED_RUSTFLAGS removed for staging and fixtures
 evidence: one uniquely named helper receipt beside the supervisor's own; closure and cleanup are the supervisor's
 """
 
@@ -184,6 +197,8 @@ class Session:
         self.layout = layout
         self.proof = layout.Proof(root)
         self.root = root
+        self.writers_unknown = False
+        self.custody = None
 
     def phase(self, label: str) -> None:
         self.proof.phase(label)
@@ -195,7 +210,12 @@ class Session:
         })
 
     def run(self, command: list, cwd: str, env: dict, timeout: float = 120) -> tuple:
-        result = self.proof.run(command, cwd=cwd, env=env, timeout=timeout)
+        try:
+            result = self.proof.run(command, cwd=cwd, env=env, timeout=timeout)
+        except BaseException:
+            # A timed-out or killed child: its writers are not known closed.
+            self.writers_unknown = True
+            raise
         out = result.stdout.decode(errors="replace")
         err = result.stderr.decode(errors="replace")
         print(f"----- {' '.join(command[1:3])} (exit {result.returncode}) -----\n{out}{err}", flush=True)
@@ -211,8 +231,8 @@ def stage(session: Session, label: str, release: bool) -> str:
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "CARGO_PROFILE_", "SCCACHE_", "OXIDE_TEST_"))
-        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "OXIDE_POOL", "OXIDE_CONFIG")
+        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_ENCODED_", "SCCACHE_", "OXIDE_"))
+        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "RUSTDOCFLAGS")
     }
     env.update({
         "RUSTUP_TOOLCHAIN": BUILDER,
@@ -257,8 +277,10 @@ def fixture_env(root: str) -> dict:
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("SCCACHE_", "OXIDE_", "XDG_", "CARGO_BUILD_", "CARGO_TARGET_", "CARGO_PROFILE_", "GIT_"))
-        and key not in ("CARGO", "RUSTC", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "HOME")
+        if not key.startswith(("SCCACHE_", "OXIDE_", "XDG_", "CARGO_BUILD_", "CARGO_TARGET_", "CARGO_PROFILE_",
+                               "CARGO_ENCODED_", "GIT_"))
+        and key not in ("CARGO", "RUSTC", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "HOME",
+                        "RUSTFLAGS", "RUSTDOCFLAGS")
     }
     scratch = os.environ["OXIDE_TASK_SCRATCH_ROOT"]
     cargo_home = os.path.join(root, "cargo-home")
@@ -363,22 +385,20 @@ def account_default(session: Session, controlled: str, account_env: dict, accoun
     return app, pool
 
 
-def removable(session: Session, controlled: str, account_env: dict, account: str, harness: str, app: str, pool: str) -> dict:
+def removable(session: Session, controlled: str, account_env: dict, account: str, harness: str, app: str, pool: str) -> None:
     root = session.root
     name = "OxAh" + secrets.token_hex(4)
     mount = f"/Volumes/{name}"
     expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
-    image = os.path.join(root, "volume.sparseimage")
-    custody = {"image": image, "mount": mount, "attached": False, "detached": False}
+    custody = Custody(os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "owned-image"), mount)
+    session.custody = custody
+    custody.record("create-requested")
     code, _, err = session.run(["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name,
-                                "-type", "SPARSE", image], root, os.environ.copy(), timeout=60)
+                                "-type", "SPARSE", custody.image], root, os.environ.copy(), timeout=60)
     expect(code == 0, f"image creation failed: {err}")
-    result = session.proof.run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist", image], cwd=root, env=os.environ.copy(), timeout=60)
-    expect(result.returncode == 0, f"attach failed; attachment unresolved, evidence kept: {result.stderr!r}")
-    mounts = [entity["mount-point"] for entity in plistlib.loads(result.stdout)["system-entities"] if entity.get("mount-point")]
-    expect(mounts == [mount], f"scratch volume mounted at {mounts}, not {mount}")
-    session.proof.mount = mount
-    custody["attached"] = True
+    custody.record("image-created")
+    attached = attach_image(custody, bounded_run, min(60, session.layout.work_left()))
+    expect(attached == mount, f"attached {attached}, not {mount}")
     info = session.proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], cwd=root, env=os.environ.copy(), timeout=30)
     expect(info.returncode == 0, f"diskutil info failed: {info.stderr!r}")
     case("the owned image has owners enabled", plistlib.loads(info.stdout).get("GlobalPermissionsEnabled") is True)
@@ -406,16 +426,16 @@ def removable(session: Session, controlled: str, account_env: dict, account: str
          and os.path.isdir(os.path.join(isolated, "oxide-managed")), err)
     session.phase("removable selected")
 
-    session.proof.detach()
-    custody["detached"] = not os.path.ismount(mount)
-    case("ordinary detach of the owned image", custody["detached"])
+    detached = detach_image(custody, bounded_run, cleanup_deadline_ns(),
+                            session.writers_unknown or bool(session.proof.unclosed))
+    case("ordinary detach of the owned image, then its backing removed", detached
+         and not os.path.ismount(mount) and not os.path.lexists(custody.image), repr(custody.facts))
     code, out, err = session.run([controlled, "status"], app, account_env, timeout=60)
     case("after detach the account registration remains and the internal pool is next", code == 0
          and line_with(out, "removable pool: ").startswith(f"removable pool: {mount} volume ")
          and line_with(out, "recorded selection: ").startswith(f"recorded selection: removable pool, but no volume is present at {mount};"),
          out + err)
     case("nothing was created under the harness HOME after the drive cases", tree(harness) == [], repr(tree(harness)))
-    return custody
 
 
 def account_config(session: Session, controlled: str, account_env: dict, account: str) -> None:
@@ -442,6 +462,116 @@ def unavailable(session: Session, controlled: str, base: dict, harness: str) -> 
          and line_with(out, "  home: ").startswith("  home: unavailable (the account home directory is unavailable (injected))"),
          out + err)
     case("the unavailable cases created nothing under the harness HOME", tree(harness) == [], repr(tree(harness)))
+
+
+def now_ns() -> int:
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+
+
+def cleanup_deadline_ns() -> int:
+    """The guard's own stop point (its exported absolute deadline less its
+    stop reserve) less a small safety: cleanup never relies on the 30 s work
+    margin and never runs past the guard's stop."""
+    return int(os.environ["OXIDE_PROOF_DEADLINE_NS"]) - (STOP_RESERVE_S + CLEANUP_SAFETY_S) * NS
+
+
+def bounded_run(command: list, timeout: float) -> tuple:
+    """One direct child in the supervisor's session, bounded by `timeout`.
+    A timeout kills and reaps that child and is reported, not hidden."""
+    result = subprocess.run(command, capture_output=True, timeout=timeout)
+    return result.returncode, result.stdout, result.stderr.decode(errors="replace")
+
+
+class Custody:
+    """The owned image's custody, persisted under the never-cleaned evidence
+    directory before every effect, so a SIGKILL or an unexpected attach
+    answer still leaves the intention and the last known facts behind."""
+
+    def __init__(self, directory: str, mount: str):
+        self.directory = directory
+        self.path = os.path.join(directory, "custody.json")
+        self.image = os.path.join(directory, "volume.sparseimage")
+        self.facts = {"image": self.image, "expected_mount": mount, "mounts": [], "state": "planned",
+                      "history": []}
+        os.makedirs(directory, exist_ok=True)
+        self.record("planned")
+
+    def record(self, state: str, **facts) -> None:
+        self.facts.update(facts)
+        self.facts["state"] = state
+        self.facts["history"] = (self.facts["history"] + [f"{state} at {now_ns()}"])[-32:]
+        text = json.dumps(self.facts, indent=2, sort_keys=True) + "\n"
+        if len(text.encode()) > CUSTODY_MAX_BYTES:
+            text = json.dumps({"state": state, "image": self.image, "mounts": self.facts["mounts"],
+                               "truncated": True}) + "\n"
+        temporary = self.path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, self.path)
+
+
+def attach_image(custody: Custody, run, timeout: float) -> str:
+    """Attach the owned image. Every answer short of exactly the expected
+    mount keeps custody facts and the image; a reported mount is recorded so
+    cleanup can detach what this run owns."""
+    custody.record("attach-requested")
+    try:
+        code, out, err = run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist", custody.image], timeout)
+    except subprocess.TimeoutExpired:
+        custody.record("attach-unknown", reason="attach timed out; device custody unknown")
+        raise RuntimeError("attach timed out; image and custody kept")
+    try:
+        entities = plistlib.loads(out)["system-entities"]
+        mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
+        devices = [entity.get("dev-entry") for entity in entities if entity.get("dev-entry")]
+    except Exception as error:
+        custody.record("attach-unknown", reason=f"attach exit {code}; unreadable answer ({type(error).__name__})",
+                       stderr=err[-2000:])
+        raise RuntimeError("attach answer unreadable; image and custody kept")
+    custody.record("attached" if code == 0 and mounts == [custody.facts["expected_mount"]] else "attach-mismatch",
+                   mounts=mounts, devices=devices, attach_exit=code, stderr=err[-2000:])
+    if custody.facts["state"] != "attached":
+        raise RuntimeError(f"attach exit {code} mounted {mounts}, not {custody.facts['expected_mount']}; custody kept")
+    return mounts[0]
+
+
+def detach_image(custody: Custody, run, deadline_ns: int, writers_unknown: bool,
+                 clock=now_ns, mounted=os.path.ismount) -> bool:
+    """Ordinary detach of every mount this run recorded, then removal of the
+    backing image, only on positive answers. Unknown writers, too little time
+    before the guard's stop, a failed or timed-out detach or a mount still
+    present keep the image and record why. Never forced; the guard's census
+    alone decides closure."""
+    state = custody.facts["state"]
+    if state in ("planned", "create-requested", "image-created", "image-removed"):
+        return True  # nothing was attached; an unattached backing file stays in evidence
+    if state == "retained":
+        return False  # an earlier attempt already decided to keep it; no retry
+    if state in ("attach-requested", "attach-unknown") or writers_unknown:
+        custody.record("retained", reason="device or writer custody unknown; no detach attempted")
+        return False
+    if state == "attach-mismatch" and not custody.facts["mounts"]:
+        custody.record("retained", reason="attach reported no mount; a device may be attached unmounted")
+        return False
+    for mount in custody.facts["mounts"]:
+        left = (deadline_ns - clock()) / NS
+        if left < 3:
+            custody.record("retained", reason=f"{left:.1f} s left before the guard's stop; no detach attempted")
+            return False
+        custody.record("detach-requested", detaching=mount)
+        try:
+            code, _, err = run(["/usr/bin/hdiutil", "detach", mount], left - 1)
+        except subprocess.TimeoutExpired:
+            custody.record("retained", reason=f"ordinary detach of {mount} timed out")
+            return False
+        if code != 0 or mounted(mount):
+            custody.record("retained", reason=f"ordinary detach of {mount} exit {code}; mount present {mounted(mount)}",
+                           stderr=err[-2000:])
+            return False
+        custody.record("detached", detached=mount)
+    os.unlink(custody.image)
+    custody.record("image-removed")
+    return True
 
 
 def receipt(evidence: str, body: dict) -> str:
@@ -478,9 +608,13 @@ def main() -> int:
         expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
     layout = load("pool_layout", "test-oxide-pool-layout.py")
     installer = load("oxide_install", "oxide-install.py")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True, text=True, timeout=30).stdout.strip()
-    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True, text=True, timeout=30).stdout.strip()
-    expect(len(head) == 40 and not dirty, f"candidate checkout {head!r} is not a clean commit: {dirty}")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True, text=True, timeout=30)
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True, text=True, timeout=30)
+    expect(head.returncode == 0 and not head.stderr and len(head.stdout.strip()) == 40,
+           f"git rev-parse failed: exit {head.returncode} {head.stderr!r}")
+    expect(status.returncode == 0 and not status.stderr, f"git status failed: exit {status.returncode} {status.stderr!r}")
+    expect(not status.stdout.strip(), f"candidate checkout is not clean: {status.stdout.strip()}")
+    head = head.stdout.strip()
     signal.signal(signal.SIGTERM, terminated)
     root = tempfile.mkdtemp(prefix="account-home.", dir=scratch)
     session = Session(layout, root)
@@ -488,6 +622,8 @@ def main() -> int:
         "helper": "scripts/test-account-home.py",
         "helper_sha256": sha256(os.path.abspath(__file__)),
         "source_head": head,
+        "cargo_lock_sha256": sha256(os.path.join(REPO, "Cargo.lock")),
+        "artifacts": {},
         "limits": {"seconds": LIMIT_S, "work_seconds": WORK_SECONDS, "scratch_mib": SCRATCH_MIB,
                    "cargo_jobs": int(JOBS), "planning_memory_gib": MEMORY_GIB},
         "allocations": [{"phase": name, "seconds": seconds, "peak_owned_mib": mib}
@@ -497,13 +633,29 @@ def main() -> int:
             "tiny fixtures; not a benchmark, real-drive or real-account qualification",
             "the normal artifact is the release profile at opt-level 1, not the installer's opt-level 3",
             "the stand-in replaces the passwd lookup; the real lookup is covered by unit tests only",
+            "phase figures are samples at phase boundaries; the guard's continuous receipt has the actual peak",
+            "children_max_single_rss_bytes is the largest single child, not an aggregate demand",
         ],
     }
-    custody = None
+
+    def resources() -> dict:
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return {
+            "script_seconds": round(time.monotonic() - STARTED, 1),
+            "peak_owned_bytes_at_phase_samples": session.proof.peak,
+            "host_free_min_bytes_at_samples": session.proof.low,
+            "children_max_single_rss_bytes": usage.ru_maxrss,
+            "children_cpu_seconds": round(usage.ru_utime + usage.ru_stime, 1),
+        }
+
+    def artifact(label: str, path: str, caps: dict) -> None:
+        body["artifacts"][label] = {"sha256": sha256(path), "bytes": os.path.getsize(path), "capability": caps}
+
     try:
         session.phase("start")
         controlled = stage(session, "controlled", release=False)
         controlled_caps = capability(controlled)
+        artifact("controlled", controlled, controlled_caps)
         case("the controlled artifact reports compiled proof controls", controlled_caps == {
             "control_state_version": STATE_VERSION, "registration_version": REGISTRATION_VERSION, "test_controls": True}, repr(controlled_caps))
         try:
@@ -516,16 +668,13 @@ def main() -> int:
 
         normal = stage(session, "normal", release=True)
         normal_caps = capability(normal)
+        artifact("normal", normal, normal_caps)
         case("the normal artifact reports no proof controls", normal_caps == {
             "control_state_version": STATE_VERSION, "registration_version": REGISTRATION_VERSION, "test_controls": False}, repr(normal_caps))
         accepted = installer.state_capabilities(normal)
         case("the installer's capability check accepts the normal artifact", accepted == {
             "control_state_version": STATE_VERSION, "registration_version": REGISTRATION_VERSION}, repr(accepted))
         case("the two artifacts differ", sha256(controlled) != sha256(normal))
-        body["artifacts"] = {
-            label: {"sha256": sha256(path), "bytes": os.path.getsize(path), "capability": caps}
-            for label, path, caps in (("controlled", controlled, controlled_caps), ("normal", normal, normal_caps))
-        }
         session.phase("stage-normal")
 
         base = fixture_env(root)
@@ -540,34 +689,36 @@ def main() -> int:
         account_env = {**base, "HOME": harness, ACCOUNT_HOME: account}
         app, pool = account_default(session, controlled, account_env, account, harness)
         session.phase("account-default")
-        custody = removable(session, controlled, account_env, account, harness, app, pool)
+        removable(session, controlled, account_env, account, harness, app, pool)
         account_config(session, controlled, account_env, account)
         session.phase("account-config")
         unavailable(session, controlled, base, harness)
         session.phase("unavailable")
     except BaseException as failure:
-        if session.proof.mount and os.path.ismount(session.proof.mount):
+        # The first fault stays primary; cleanup only records what it did.
+        cleanup = "no owned image"
+        if session.custody is not None:
             try:
-                session.proof.detach()
+                detach_image(session.custody, bounded_run, cleanup_deadline_ns(),
+                             session.writers_unknown or bool(session.proof.unclosed))
             except BaseException as error:
-                print(f"detach after failure not completed: {error!r}", file=sys.stderr)
-        body.update({"result": f"failed: {failure!r}", "cases": CASES, "phases": PHASES, "image": custody,
-                     "unclosed_children": sorted(session.proof.unclosed)})
-        print(f"account-home proof failed; receipt {receipt(evidence, body)}; scratch {root} left to the supervisor", file=sys.stderr)
+                session.custody.record("retained", reason=f"cleanup raised {type(error).__name__}")
+            cleanup = session.custody.facts
+        body.update({"result": f"failed: {failure!r}", "cases": CASES, "phases": PHASES, "image": cleanup,
+                     "resources": resources(), "unclosed_children": sorted(session.proof.unclosed),
+                     "writers_unknown": session.writers_unknown})
+        try:
+            written = receipt(evidence, body)
+        except BaseException as error:
+            written = f"not written ({error!r})"
+        print(f"account-home proof failed; receipt {written}; scratch {root} left to the supervisor", file=sys.stderr)
         raise
-    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     body.update({
         "result": "passed",
         "cases": CASES,
         "phases": PHASES,
-        "image": custody,
-        "resources": {
-            "script_seconds": round(time.monotonic() - STARTED, 1),
-            "peak_owned_bytes_at_phase_checks": session.proof.peak,
-            "host_free_min_bytes": session.proof.low,
-            "children_max_rss_bytes": usage.ru_maxrss,
-            "children_cpu_seconds": round(usage.ru_utime + usage.ru_stime, 1),
-        },
+        "image": session.custody.facts,
+        "resources": resources(),
     })
     path = receipt(evidence, body)
     print(f"account-home proof: {len(CASES)}/{len(CASES)} cases passed in {body['resources']['script_seconds']} s; "
