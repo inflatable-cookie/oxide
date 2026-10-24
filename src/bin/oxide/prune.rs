@@ -6723,6 +6723,158 @@ mod tests {
         assert!(verified_group(&empty, &candidate_of(&debug)).is_err());
     }
 
+    /// P2: pruning a RELEASED root never rewrites the checkout's receipt. When
+    /// the receipt currently selects a different root, that selection and the
+    /// exact receipt bytes survive while the released root's whole group is
+    /// settled and retired.
+    #[test]
+    fn a_released_root_settles_without_rewriting_the_current_selection() {
+        let fixture = Fixture::new();
+        let released = row_for(&fixture.root);
+        let mut row = released.clone();
+        row.member = "debug".to_owned();
+        row.selected = false;
+        row.pruned_ms = Some(5);
+        let current_root = fixture.root.join("current-root");
+        let id = "a".repeat(32);
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: id.clone(),
+            identity: RootIdentity {
+                checkout_id: row.checkout_id.clone(),
+                checkout: row.checkout.clone(),
+                receipt: row.receipt.clone(),
+                member: row.member.clone(),
+                root: row.root.clone(),
+                root_kind: row.root_kind,
+                volume_uuid: row.volume_uuid.clone(),
+                nonce: row.nonce.clone(),
+                generation: row.generation,
+                dev: row.root_dev.unwrap_or(1),
+                ino: row.root_ino.unwrap_or(2),
+                marker_digest: row.marker_digest.clone().unwrap_or_default(),
+            },
+            phase: IntentPhase::Deleted,
+            quarantine: fixture.root.join("quarantine"),
+            preview_sha256: "f".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+            was_selected: false,
+            prior_receipt_sha: String::new(),
+            group: vec![GroupRow {
+                member: row.member.clone(),
+                generation: row.generation,
+                nonce: row.nonce.clone(),
+                root_dev: row.root_dev,
+                root_ino: row.root_ino,
+                marker_digest: row.marker_digest.clone(),
+                selected: false,
+            }],
+            expected_terminal_sha: None,
+            terminal_ms: None,
+        };
+        let control = ready_control(&fixture, vec![row.clone()], vec![intent.clone()]);
+        // The receipt currently selects a DIFFERENT root.
+        let receipt_path = outputs::receipt_path_public(&control, &row.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        let receipt = serde_json::json!({
+            "version": "oxide.outputs.transition/3",
+            "checkout": row.checkout.to_string_lossy(),
+            "checkout_id": row.checkout_id,
+            "generation": 4,
+            "state": "committed",
+            "layout": "profile",
+            "links": [{
+                "member": "debug",
+                "selected": {
+                    "kind": "external",
+                    "root": current_root.to_string_lossy(),
+                    "volume_uuid": row.volume_uuid,
+                    "nonce": "e".repeat(32),
+                    "generation": 3
+                }
+            }],
+            "updated_ms": 1
+        });
+        let bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        fs::write(&receipt_path, &bytes).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        settle_receipt(&control, &id, "deleted").unwrap();
+        // The unrelated current selection is byte-identical.
+        assert_eq!(fs::read(&receipt_path).unwrap(), bytes);
+        let settled = ready_registry(&control).unwrap();
+        assert!(settled.intent(&id).is_none(), "the intent was not settled");
+        assert!(
+            settled
+                .rows
+                .iter()
+                .all(|existing| existing.root != row.root),
+            "the released root's rows were not retired"
+        );
+    }
+
+    /// P2: a pending, reserve-carrying or already-pruning reference keeps the
+    /// root even when its member would otherwise be current authority.
+    #[test]
+    fn a_group_refuses_pending_or_reserved_references() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let base = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 9,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let candidate = candidate_of(&debug);
+        verified_group(&base, &candidate).unwrap();
+        for broken in [
+            Row {
+                pending: true,
+                ..debug.clone()
+            },
+            Row {
+                reservation: Some("reserve".to_owned()),
+                ..debug.clone()
+            },
+            Row {
+                cancelling: Some("cancel".to_owned()),
+                ..debug.clone()
+            },
+            Row {
+                pruning: Some("intent".to_owned()),
+                ..debug.clone()
+            },
+        ] {
+            let registry = Registry {
+                rows: vec![broken.clone()],
+                ..base.clone()
+            };
+            let refused = verified_group(&registry, &candidate).unwrap_err();
+            assert!(refused.contains("not an eligible part"), "{refused}");
+        }
+        // An unusable recorded identity is refused by SHAPE, even in history.
+        let mut broken_history = debug.clone();
+        broken_history.selected = false;
+        broken_history.nonce = Some("zz".to_owned());
+        let registry = Registry {
+            rows: vec![broken_history],
+            ..base.clone()
+        };
+        let refused = verified_group(&registry, &candidate).unwrap_err();
+        assert!(refused.contains("unusable recorded identity"), "{refused}");
+    }
+
     /// P2: the receipt's current references are compared with the SELECTED part
     /// of the group only. Inactive history is never required in the receipt,
     /// and a receipt that selects a historical member is a contradiction.
