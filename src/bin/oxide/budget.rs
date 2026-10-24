@@ -868,9 +868,18 @@ fn run(command: &mut Command, input: Option<Vec<u8>>) -> std::io::Result<Output>
         )));
     }
     let status = status.expect("a status was observed");
+    if let Some(term) = term_at {
+        // The child only ended because the admission window closed: report the
+        // step as stopped rather than as its (induced) signal status.
+        kill_group(id);
+        return Err(std::io::Error::other(format!(
+            "the preparation step was stopped after {}ms of its admission budget",
+            Instant::now().saturating_duration_since(term).as_millis()
+        )));
+    }
     let mut buffer = [None, None];
     let mut settled = 0;
-    let drain_deadline = term_at.map_or(deadline.unwrap(), |term| term + CLOSE_BOUND);
+    let drain_deadline = deadline.unwrap() + CLOSE_BOUND;
     while settled < 2 {
         let left = drain_deadline.saturating_duration_since(Instant::now());
         let wait = if left.is_zero() {
@@ -920,6 +929,10 @@ fn read_capped(mut stream: impl Read) -> Result<Vec<u8>, String> {
     }
 }
 
+fn kill_group(group: i32) {
+    signal_group(group, libc::SIGKILL);
+}
+
 fn signal_group(group: i32, signal: libc::c_int) {
     if group > 1 {
         // SAFETY: a negative PID addresses the group this step created.
@@ -954,6 +967,18 @@ pub(crate) fn events_lost() -> bool {
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    fn clear() {
+        super::STATE.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    fn budgeted() -> bool {
+        with(|state| state.is_some_and(|state| state.options.any()))
+    }
+
+    fn late_start() -> bool {
+        with(|state| state.is_some_and(|state| state.late))
+    }
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -997,7 +1022,7 @@ mod tests {
             assert!(parse_duration(refused).is_err(), "{refused} must refuse");
         }
         // Nine digits of seconds overflow the seven-day cap; nine of ms do not.
-        assert!(parse_duration("999999999ms").is_ok());
+        assert!(parse_duration("999999999ms").is_err());
     }
 
     #[test]
@@ -1213,7 +1238,17 @@ mod tests {
             0,
         );
         let mut text = String::new();
-        reader.read_to_string(&mut text).unwrap();
+        let mut chunk = [0_u8; 1024];
+        for _ in 0..50 {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => text.push_str(&String::from_utf8_lossy(&chunk[..read])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
         assert!(
             text.contains("\"event\":\"admitted_child_started\""),
             "{text}"
