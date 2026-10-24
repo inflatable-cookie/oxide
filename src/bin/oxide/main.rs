@@ -18,6 +18,7 @@ mod guidance;
 mod handoff;
 mod identity;
 mod launch;
+mod layout;
 mod outputs;
 mod process;
 mod prune;
@@ -30,6 +31,7 @@ mod wrapper;
 use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
+use layout::Layout;
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;
@@ -323,6 +325,42 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // released before this command takes a slot.
     outputs::auto_adopt(&selected.store, &checkout, &selected)?;
     let store = selected.store;
+    // The declaration is pure parsing and is computed BEFORE the reservation:
+    // the pre-lease reservation needs the same requested member set binding
+    // will use, and a command this checkout refuses on layout or an unmodelled
+    // command name now refuses before any authority write (oxide#133).
+    let declaration = if invocation.command == "exec" {
+        // The caller's declaration is the complete set of the tool's profile
+        // outputs; an opaque tool that declares none is refused in a profile
+        // checkout rather than guessed.
+        layout::declared(&invocation.declared_outputs)?
+    } else if !cli::models_profile_outputs(&invocation.command) {
+        // An external or unknown subcommand's output directories are opaque.
+        // A profile checkout refuses it before Cargo rather than assuming its
+        // dev profile.
+        outputs::refuse_unknown_layout(
+            Some(&output_control),
+            &checkout,
+            &format!(
+                "`{}` is not a command whose profile outputs Oxide models",
+                invocation.command
+            ),
+        )?;
+        layout::Declaration::empty()
+    } else {
+        match layout::classify(
+            &invocation.command,
+            invocation.profile,
+            invocation.explicit_profile,
+            &invocation.targets,
+        ) {
+            Layout::Declared(declaration) => declaration,
+            Layout::Unknown(reason) => {
+                outputs::refuse_unknown_layout(Some(&output_control), &checkout, &reason)?;
+                layout::Declaration::empty()
+            }
+        }
+    };
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
     // released again before this command waits for a slot.
@@ -330,11 +368,16 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         &store,
         Some(&output_control),
         &checkout,
+        &declaration,
         pool_fallback.as_deref(),
     )?;
     test_pause("reserved");
-    let planned =
-        outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
+    let planned = outputs::planned_destination(
+        Some(&output_control),
+        &checkout,
+        &declaration,
+        pool_fallback.as_deref(),
+    )?;
     let destination = outputs::destination_facts(planned.as_ref());
     let key = SlotKey::resolve_in(
         &checkout,
@@ -539,10 +582,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         (Ok((Some(status), Some(Ok((program, manifest_dir))))), Some(root))
             if run && status.success() && stopped.is_none() =>
         {
-            let program = match program.strip_prefix(key.checkout.join("target")) {
-                Ok(rest) => root.join(rest),
-                Err(_) => program.clone(),
-            };
+            // Only a linked member maps beneath the owned root; a real member
+            // keeps Cargo's own executable path, and the mapped file must be a
+            // real executable before it is run under the held lease.
+            let program = outputs::program_target(&key.checkout, root, &program)
+                .unwrap_or_else(|| program.clone());
             Some((program, manifest_dir.clone()))
         }
         _ => None,

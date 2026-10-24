@@ -323,14 +323,22 @@ def plan(proof: Proof, cwd: str, label: str) -> dict:
     code, stdout, stderr = proof.oxide(["outputs", "plan"], label, cwd)
     expect(code == 0, f"{label}: plan exited {code}: {stderr}")
     report = json.loads(stdout)
-    expect(report["version"] == "oxide.outputs.plan/1", f"{label}: {report}")
+    expect(report["version"] == "oxide.outputs.plan/2", f"{label}: {report}")
+    expect(report["layout"] in ("whole-target", "profile", "none"), f"{label}: {report}")
     expect(report["data_move"] is False, f"{label}: plan claims a data move: {report}")
     expect(len(stdout) < 64 * 1024, f"{label}: plan exceeds its byte bound")
     return report
 
 
-def attach_image(proof: Proof, root: str, name: str) -> str:
-    image = os.path.join(root, "volume.sparseimage")
+def attach_image(
+    proof: Proof, root: str, name: str, owners: bool = False, image_name: str = "volume.sparseimage"
+) -> str:
+    """Attach this proof's OWNED sparse image. `owners` is an optional
+    `hdiutil attach -owners on` request used only by a proof that needs
+    filesystem ownership honored on its private image; `image_name` selects a
+    distinct owned image file when a proof needs a second isolated volume. Both
+    defaults keep every existing selector's command and behaviour unchanged."""
+    image = os.path.join(root, image_name)
     if not os.path.exists(image):
         created = proof.run(
             ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name]
@@ -338,7 +346,11 @@ def attach_image(proof: Proof, root: str, name: str) -> str:
             timeout=60,
         )
         expect(created.returncode == 0, f"image creation failed: {created.stderr!r}")
-    attached = proof.run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist", image], timeout=60)
+    attach_command = ["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist"]
+    if owners:
+        attach_command.extend(["-owners", "on"])
+    attach_command.append(image)
+    attached = proof.run(attach_command, timeout=60)
     expect(
         attached.returncode == 0,
         f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}",
