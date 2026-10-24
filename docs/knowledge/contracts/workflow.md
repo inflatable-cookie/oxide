@@ -604,9 +604,9 @@ nothing after `--` is Oxide's. Other command classes refuse a reserved name
 by name.
 
 ```text
-oxide check --admission-budget 45s --execution-budget 5m
+oxide check --admission-budget 45s --execution-budget 300s
 oxide test --execution-budget 90s --budget-events 3
-oxide run --execution-budget 2m
+oxide run --execution-budget 120s
 ```
 
 - **Grammar.** `--admission-budget <dur>`, `--execution-budget <dur>`,

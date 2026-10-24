@@ -274,9 +274,35 @@ def case_fast_start_and_spawn_failure(root):
         fail(f"unexpected event order: {kinds}")
     if parsed[1].get("outcome") != "child_exit" or parsed[1].get("exit_code") != 0:
         fail(f"unexpected terminal record: {parsed[1]}")
-    if any(entry.get("spawn_late") for entry in parsed):
+    if parsed[0].get("spawn_late") is not False:
         fail("a fast start was reported late")
-    print("ok fast start: started then finished(child_exit), no budget line", flush=True)
+    if parsed[0].get("admission_expired_before_start") is not False:
+        fail("a fast start claimed an expired admission window")
+    if parsed[0].get("admission_ms") != 30_000 or parsed[0].get("execution_ms") != 30_000:
+        fail(f"the started record lost a caller budget: {parsed[0]}")
+    if parsed[0].get("admission_overshoot_ms") is not None:
+        fail("a fast start reported an admission overshoot")
+    # Independently optional axes: an execution-only command reports a null
+    # admission budget, and an admission-only one a null execution budget.
+    read_fd, write_fd = event_reader()
+    with os.fdopen(read_fd, "r") as reader:
+        execution_only = subprocess.run(
+            [str(BINARY), "exec", "--execution-budget", "30s", "--budget-events", str(write_fd), "--", str(tool)],
+            env=env,
+            pass_fds=(write_fd,),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        os.close(write_fd)
+        raw = reader.read()
+    if execution_only.returncode != EXIT_OK:
+        fail(f"the execution-only command exited {execution_only.returncode}")
+    started = (records(raw) or [{}])[0]
+    if started.get("admission_ms") is not None or started.get("execution_ms") != 30_000:
+        fail(f"the execution-only axis is wrong: {started}")
+    print("ok fast start: started then finished(child_exit), nullable axes", flush=True)
 
     missing = run(
         [str(BINARY), "exec", "--execution-budget", "5s", "--", str(root / "absent")],
@@ -452,26 +478,65 @@ def case_events(root):
     print("ok events: type/access/flag refusals, broken reader survives", flush=True)
 
 
+def state_shape(control):
+    """The recorded control state's key set, or None when there is no state."""
+    path = Path(control) / "state.json"
+    if not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "unreadable"
+    return sorted(document) if isinstance(document, dict) else "not-an-object"
+
+
+def state_keys(pool):
+    """The recorded control state's top-level keys (empty when none exists)."""
+    for path in sorted(Path(pool).rglob("state.json")):
+        try:
+            document = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(document, dict):
+            return path.parent, sorted(document)
+    return None, []
+
+
 def case_no_mutation(root):
-    """Budgets never write settings or invent persisted state."""
+    """Budgets add no settings file, persisted field or report line."""
     env = base_env(root, "mutation")
     tool = root / "mutation.sh"
     write_executable(tool, "#!/bin/sh\nexit 0\n")
     pool = Path(env["OXIDE_POOL"])
-    before = sorted(str(path.relative_to(pool)) for path in pool.rglob("*"))
+    home = Path(env["HOME"])
+    config = home / ".config" / "oxide"
+    # Warm the pool with an unbudgeted command so the comparison is about the
+    # budget, not about first-use state.
+    run([str(BINARY), "exec", "--", str(tool)], env, timeout=90, check=True)
+    control, before_keys = state_keys(pool)
+    if control is None:
+        fail("the fixture pool recorded no control state to compare")
     run(
         [str(BINARY), "exec", "--admission-budget", "30s", "--execution-budget", "30s", "--", str(tool)],
         env,
         timeout=90,
         check=True,
     )
-    after = sorted(str(path.relative_to(pool)) for path in pool.rglob("*"))
-    if before != after:
-        fail(f"the budgeted command changed the pool shape: {set(after) - set(before)}")
-    config = Path(env["HOME"]) / ".config" / "oxide"
-    if config.exists():
+    _, after_keys = state_keys(pool)
+    if before_keys != after_keys:
+        fail(f"a budgeted command changed the recorded fields: {set(after_keys) ^ set(before_keys)}")
+    for name in os.listdir(control):
+        if "budget" in name:
+            fail(f"a budgeted command created {name} in the control directory")
+    if config.exists() and any(config.iterdir()):
         fail("a budgeted command wrote a settings file")
-    print("ok no mutation: pool shape and settings unchanged", flush=True)
+    status = run([str(BINARY), "status"], env, timeout=90)
+    if status.returncode != EXIT_OK:
+        fail(f"status exited {status.returncode}: {status.stderr[-800:]}")
+    for word in ("admission budget", "execution budget", "budget-events"):
+        if word in status.stdout or word in status.stderr:
+            fail(f"status gained a budget-only line: {word}")
+    print("ok no mutation: no settings, no new state fields, no budget report lines", flush=True)
 
 
 def case_unbudgeted(root):
@@ -484,6 +549,82 @@ def case_unbudgeted(root):
     if "budget" in result.stderr:
         fail("an unbudgeted command printed a budget line")
     print("ok unbudgeted: unchanged status and output", flush=True)
+
+
+def case_nested(root):
+    """A nested oxide call waits inside, and consumes, the outer window."""
+    env = base_env(root, "nested", OXIDE_MAX_ACTIVE="1")
+    crate = root / "nested-fixture"
+    (crate / "src").mkdir(parents=True, exist_ok=True)
+    (crate / "Cargo.toml").write_text(
+        '[package]\nname = "nested-fixture"\nversion = "0.1.0"\nedition = "2021"\n'
+    )
+    (crate / "src" / "lib.rs").write_text("pub fn value() -> u8 { 1 }\n")
+    marker = root / "nested.started"
+    release = root / "nested.release"
+    holder = hold_slot(root, env, release, "nested")
+    tool = root / "nested-tool.sh"
+    write_executable(
+        tool,
+        "#!/bin/sh\n"
+        f"touch {marker}\n"
+        f"{BINARY} check --admission-budget 60s --manifest-path {crate}/Cargo.toml\n"
+        "exit 0\n",
+    )
+    try:
+        result = run(
+            [str(BINARY), "exec", "--execution-budget", "3s", "--", str(tool)],
+            env,
+            timeout=90,
+        )
+    finally:
+        holder.terminate()
+        holder.wait(timeout=30)
+    if result.returncode != EXECUTION_EXIT:
+        fail(f"the nested case exited {result.returncode}, wanted {EXECUTION_EXIT}")
+    if not marker.exists():
+        fail("the outer tool never started")
+    if "execution budget" not in result.stderr:
+        fail(f"the outer stop did not name the execution budget: {result.stderr[-800:]}")
+    # The inner call was still waiting on the only slot when the outer window
+    # closed: it started no compiler of its own.
+    if (crate / "target").exists():
+        fail("the inner command started a build after the outer window closed")
+    print("ok nested: the outer window kept running while the inner call waited", flush=True)
+
+
+def case_unknown_closure(root):
+    """The debug-only hook proves the held-custody path without a false claim."""
+    env = base_env(root, "closure", OXIDE_TEST_CLOSURE_STUCK="1")
+    tool = root / "closure.sh"
+    write_executable(tool, "#!/bin/sh\nexec sleep 60\n")
+    read_fd, write_fd = event_reader()
+    with os.fdopen(read_fd, "r") as reader:
+        result = subprocess.run(
+            [str(BINARY), "exec", "--execution-budget", "1s", "--budget-events", str(write_fd), "--", str(tool)],
+            env=env,
+            pass_fds=(write_fd,),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        os.close(write_fd)
+        raw = reader.read()
+    if result.returncode != 1:
+        fail(f"the injected unknown closure exited {result.returncode}, wanted 1")
+    terminal = [entry for entry in (records(raw) or []) if entry.get("event") == "finished"]
+    if len(terminal) != 1:
+        fail(f"the unknown-closure case emitted {len(terminal)} terminal records")
+    record = terminal[0]
+    if record.get("outcome") != "unconfirmed_closure":
+        fail(f"unexpected unknown-closure outcome: {record}")
+    if record.get("drain") == "complete" or record.get("lease") != "held":
+        fail(f"unknown closure claimed completion or release: {record}")
+    held = run([str(BINARY), "status"], env, timeout=90)
+    if "held" not in held.stdout and "interrupted" not in held.stdout:
+        fail(f"status did not show the held slot: {held.stdout[-800:]}")
+    print("ok unknown closure: exit 1, typed unconfirmed_closure, custody held", flush=True)
 
 
 def main():
@@ -504,6 +645,8 @@ def main():
     case_precedence(work)
     case_cumulative_run(work)
     case_events(work)
+    case_nested(work)
+    case_unknown_closure(work)
     case_no_mutation(work)
     case_unbudgeted(work)
     shutil.rmtree(work / "target", ignore_errors=True)

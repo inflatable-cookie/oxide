@@ -89,8 +89,8 @@ the observed start. Either may be given alone; an omitted axis is unbounded.
 ```bash
 oxide test --execution-budget 90s          # stop a hung test run
 oxide check --admission-budget 45s         # give up before starting Cargo
-oxide run --execution-budget 2m            # one window through build + program
-oxide exec --execution-budget 5m -- npm run tauri build
+oxide run --execution-budget 120s          # one window through build + program
+oxide exec --execution-budget 300s -- npm run tauri build
 ```
 
 `dur` is milliseconds or seconds (`30s`, `1500ms`), at most seven days.

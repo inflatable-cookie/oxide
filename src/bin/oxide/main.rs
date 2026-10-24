@@ -78,7 +78,8 @@ everything before a successful primary child start (preparation, slot waits,
 freshness); --execution-budget <dur> bounds compilation, Cargo locks, tests,
 drain and closeout from the observed start, and a bounded `run` keeps one
 cumulative window through build and program. Each is independently optional;
-an omitted axis is unbounded. dur is milliseconds or seconds (30s, 1500ms).
+an omitted axis is unbounded. dur is a positive whole number of
+milliseconds or seconds (30s, 1500ms); minutes and hours are refused.
 An expired admission window starts no child (exit 124); an expired execution
 window stops the owned group with the existing TERM/KILL escalation (exit
 125). --budget-events <fd> writes one bounded JSON record per line to an
@@ -181,6 +182,14 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         );
     }
     let budgeted = leased && budget::reserved_prefix(rest);
+    if budgeted {
+        // Syntax and descriptor shape first, then the one monotonic owner:
+        // both precede the hand-off check, `run` selection and all other
+        // preparation (oxide#140 freeze 1).
+        let (options, _rest) = budget::scan(rest)?;
+        budget::install(options)?;
+    }
+    budget::refuse_absent_test_hook()?;
     // One pre-effect hand-off check (oxide#122), after help, version, list and
     // toolchain handling and before any arm opens a store. Plain passthrough,
     // usage-only `exec` and `status --launch-check` do no work of their own.
@@ -340,9 +349,8 @@ fn test_pause_with(point: &str, detail: &str) {
 }
 
 fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
-    // The one monotonic owner starts before the hand-off check's successors,
-    // `run` selection and every other preparation step (oxide#140).
-    budget::install(invocation.budget)?;
+    // The clock was installed by `run` before the hand-off check; nothing here
+    // may re-arm it (oxide#140).
     let exec = invocation.command == "exec";
     process::install_signal_handlers()?;
     if let Some(code) = pick_run_target(&mut invocation)? {
@@ -580,9 +588,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut(), &mut budget_stop),
         Ok(()) => match watchdog.as_mut() {
             Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, &mut budget_stop)
-                .map(|status| (status, None)),
+                .map(|status| (status, None, true)),
             None => process::wait_leader_budgeted(&mut group, &mut budget_stop)
-                .map(|status| (status, None)),
+                .map(|status| (status, None, true)),
         },
         Err(error) => {
             // SAFETY: the negative PID addresses the group this command created.
@@ -596,13 +604,19 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // Release only after positive closure. A watchdog that cannot confirm
     // the stopped group closed leaves the lease held and the record naming
     // the group, so a later command recovers it once the group is empty.
-    let closed = match (watchdog.as_mut(), &outcome) {
-        (Some(_), Ok((None, _))) => None,
+    let mut closed = match (watchdog.as_mut(), &outcome) {
+        (Some(_), Ok((None, _, _))) => None,
         (Some(watchdog), _) => {
             process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
         }
         (None, _) => process::wait_group_empty_budgeted(group.id, &mut budget_stop),
     };
+    if budget::closure_stuck() {
+        // Debug proof control: report the group and drain as unconfirmed even
+        // though the kernel says otherwise, so the held-custody path is
+        // exercisable without a false custody claim.
+        closed = None;
+    }
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
         report_stop(watchdog, group.id, closed, &store.payload);
@@ -613,7 +627,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         }
         budget::finished(
             budget::Outcome::UnconfirmedClosure,
-            outcome.as_ref().ok().and_then(|(status, _)| *status),
+            outcome.as_ref().ok().and_then(|(status, _, _)| *status),
             execution_started,
             budget::Drain::NotReached,
             budget::Lease::Held,
@@ -659,8 +673,12 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // unbudgeted path keeps today's release-then-exec hand-off.
     let bounded_run = run && budget::has_execution();
     let owned_program = match (&outcome, &output_root) {
-        (Ok((Some(status), Some(Ok((program, manifest_dir))))), root)
-            if run && status.success() && stopped.is_none() && (root.is_some() || bounded_run) =>
+        (Ok((Some(status), Some(Ok((program, manifest_dir))), _drained)), root)
+            if run
+                && status.success()
+                && stopped.is_none()
+                && budget::origin().is_none()
+                && (root.is_some() || bounded_run) =>
         {
             let program = match root {
                 Some(root) => match program.strip_prefix(key.checkout.join("target")) {
@@ -699,7 +717,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         );
     }
     store.release(held, origin)?;
-    let (status, executable) = outcome?;
+    let (status, executable, drained) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
     print_summary(
         &store,
@@ -747,10 +765,10 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         },
         Some(status),
         execution_started,
-        if budget::origin().is_some() {
-            budget::Drain::Gapped
-        } else {
+        if drained {
             budget::Drain::Complete
+        } else {
+            budget::Drain::Gapped
         },
         if retired {
             budget::Lease::Retired
@@ -766,7 +784,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     if !run || !status.success() {
         return Ok(budget::exit_code(process::exit_code(status)));
     }
-    if budget::has_execution() {
+    if budget::has_execution() && budget::origin().is_none() {
         // A bounded `run` never reaches the release-then-exec hand-off.
         eprintln!("oxide: error: no bounded run target was recorded");
         return Ok(101);
@@ -847,13 +865,16 @@ fn run_owned_program(
         Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, budget_stop)?,
         None => process::wait_leader_budgeted(&mut group, budget_stop)?,
     };
-    let closed = match (watchdog.as_mut(), status) {
+    let mut closed = match (watchdog.as_mut(), status) {
         (Some(_), None) => None,
         (Some(watchdog), Some(_)) => {
             process::wait_group_empty_watched(group.id, watchdog, budget_stop)
         }
         (None, _) => process::wait_group_empty_budgeted(group.id, budget_stop),
     };
+    if budget::closure_stuck() {
+        closed = None;
+    }
     drop(foreground);
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
@@ -1012,7 +1033,7 @@ fn collect_run(
     invocation: &Invocation,
     mut watchdog: Option<&mut Watchdog>,
     budget_stop: &mut process::Stop,
-) -> Result<(Option<ExitStatus>, Option<RunTarget>), String> {
+) -> Result<(Option<ExitStatus>, Option<RunTarget>, bool), String> {
     let stdout = group
         .child
         .stdout
@@ -1034,12 +1055,13 @@ fn collect_run(
     while status.is_none() || !closed {
         process::forward_pending(group.id);
         if budget_stop.poll(group.id) {
-            return Ok((None, None));
+            // A stopped drain is reported as such, never as a settled stream.
+            return Ok((None, None, false));
         }
         if let Some(watchdog) = watchdog.as_deref_mut() {
             watchdog.poll(group.id);
             if status.is_none() && watchdog.gave_up() {
-                return Ok((None, None));
+                return Ok((None, None, false));
             }
         }
         match receiver.recv_timeout(Duration::from_millis(20)) {
@@ -1063,6 +1085,8 @@ fn collect_run(
                 .map_err(|error| format!("could not wait for Cargo: {error}"))?;
         }
     }
+    // The reader reported end-of-file before the loop ended, so joining it is
+    // bounded; a stopped drain returned above without joining.
     let _ = reader.join();
     let _ = std::io::stdout().flush();
     let target = match found.len() {
@@ -1079,7 +1103,7 @@ fn collect_run(
             ))
         }
     };
-    Ok((status, Some(target)))
+    Ok((status, Some(target), closed))
 }
 
 /// A bin or example artifact with an executable, matching any selection.

@@ -283,8 +283,7 @@ struct Admission {
 
 struct LiveExecution {
     started: Instant,
-    expires: Instant,
-    /// The stop trigger: `now` for a late start, else `expires`.
+    /// The stop trigger: `now` for a late start, else the armed deadline.
     stop: Instant,
 }
 
@@ -298,6 +297,8 @@ struct State {
     origin: Option<Origin>,
     /// The admission deadline had already passed when the child started.
     late: bool,
+    /// The budget stop has been handed to the wait loops once.
+    stop_requested: bool,
     events: Option<Events>,
     events_lost: bool,
     note_printed: bool,
@@ -332,6 +333,7 @@ pub fn install(options: Options) -> Result<(), String> {
             execution: None,
             origin: None,
             late: false,
+            stop_requested: false,
             events,
             events_lost: false,
             note_printed: false,
@@ -399,7 +401,6 @@ pub fn arm_execution(started: Instant, phase: Phase) {
         let expires = started + limit;
         state.execution = Some(LiveExecution {
             started,
-            expires,
             stop: if late { Instant::now() } else { expires },
         });
         if late {
@@ -434,10 +435,7 @@ fn events_started(
         late,
         optional(admission_limit.map(millis)),
         millis(execution_limit),
-        state
-            .admission
-            .as_ref()
-            .map_or(0, |admission| millis(admission.limit)),
+        millis(state.started.elapsed()),
         optional(execution_started),
         optional(overshoot_ms),
     );
@@ -479,20 +477,23 @@ fn emit(state: &mut State, record: &str) {
 pub fn take_execution_stop() -> Option<Origin> {
     with(|state| {
         let state = state?;
-        if state.origin.is_some() {
+        if state.stop_requested {
             return None;
         }
         let live = state.execution.as_ref()?;
         if Instant::now() < live.stop {
             return None;
         }
+        state.stop_requested = true;
         let origin = if state.late {
             Origin::Admission
         } else {
             Origin::Execution
         };
-        state.origin = Some(origin);
-        Some(origin)
+        state.origin.get_or_insert(origin);
+        // A late start already latched the admission origin in `arm_execution`;
+        // the stop request must still reach the wait loops exactly once.
+        state.origin
     })
 }
 
@@ -512,28 +513,30 @@ pub fn origin() -> Option<Origin> {
 }
 
 /// Record the program-start phase of a bounded `run`. It reports the running
-/// clock and never arms or resets anything.
+/// clock and never arms or resets anything: `execution_started_ms` counts from
+/// the one observed start, and the admission overshoot is null because no new
+/// admission decision happens here.
 pub fn program_started() {
     with(|state| {
         let Some(state) = state else { return };
-        let (started_ms, expires_ms, execution_limit) = match state.execution.as_ref() {
-            Some(live) => (
-                millis(live.started.elapsed()),
-                millis(live.expires.saturating_duration_since(live.started)),
-                state.options.execution.map(millis).unwrap_or(0),
-            ),
-            None => (0, 0, 0),
-        };
+        let seq = next_seq(state);
         let admission_limit = state.admission.as_ref().map(|entry| entry.limit);
-        events_started(
-            state,
-            Phase::RunProgram,
-            false,
-            admission_limit,
-            Duration::from_millis(execution_limit),
-            Some(started_ms),
+        let execution_limit = state.options.execution.map(millis);
+        let execution_started_ms = state
+            .execution
+            .as_ref()
+            .map(|live| millis(live.started.elapsed()));
+        let record = format!(
+            "{{\"v\":1,\"invocation\":\"{}\",\"seq\":{},\"event\":\"admitted_child_started\",\"phase\":\"{}\",\"spawn\":true,\"spawn_late\":false,\"admission_expired_before_start\":false,\"admission_ms\":{},\"execution_ms\":{},\"admission_elapsed_ms\":{},\"execution_started_ms\":{},\"admission_overshoot_ms\":null}}",
+            state.invocation,
+            seq,
+            Phase::RunProgram.label(),
+            optional(admission_limit.map(millis)),
+            optional(execution_limit),
+            millis(state.started.elapsed()),
+            optional(execution_started_ms),
         );
-        let _ = (started_ms, expires_ms);
+        emit(state, &record);
     });
 }
 
@@ -576,6 +579,55 @@ pub fn finished(
         );
         emit(state, &record);
     });
+}
+
+/// The debug-only proof control for a group that never closes.
+pub const CLOSURE_HOOK: &str = "OXIDE_TEST_CLOSURE_STUCK";
+
+/// Whether the debug closeout hook asks this run to report an unconfirmed
+/// group. Release builds have no hook and always answer `false`.
+pub fn closure_stuck() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os(CLOSURE_HOOK).is_some()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+/// A build without the debug hook refuses the variable whenever it is present,
+/// rather than silently ignoring a proof control.
+pub fn refuse_absent_test_hook() -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    {
+        let _ = CLOSURE_HOOK;
+        Ok(())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        if std::env::var_os(CLOSURE_HOOK).is_some() {
+            return Err(format!(
+                "{CLOSURE_HOOK} is a debug-only proof control; this build has no such hook"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// KILL one preparation child and reap it inside a finite bound.
+pub fn kill_and_reap(child: &mut std::process::Child) -> bool {
+    let _ = child.kill();
+    let deadline = Instant::now() + CLOSE_BOUND;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(POLL),
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Final exit code for this command. A latched deadline origin wins over the
@@ -1120,10 +1172,89 @@ mod tests {
         assert!(late_start());
         assert_eq!(origin(), Some(Origin::Admission));
         assert_eq!(exit_code(0), 124);
+        // The late start must still REQUEST a stop for the wait loops: a
+        // latched origin alone never TERMs the group.
+        assert_eq!(take_execution_stop(), Some(Origin::Admission));
+        assert_eq!(take_execution_stop(), None);
         // A second arm cannot grant a new window.
         arm_execution(Instant::now(), Phase::PrimaryCargo);
         assert_eq!(take_execution_stop(), None);
         reset();
+    }
+
+    fn drain_records(reader: &mut std::fs::File) -> Vec<serde_json::Value> {
+        let mut text = String::new();
+        let mut chunk = [0_u8; 1024];
+        for _ in 0..50 {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => text.push_str(&String::from_utf8_lossy(&chunk[..read])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    #[test]
+    fn started_records_carry_real_elapsed_and_nullable_budget_fields() {
+        let (mut reader, writer) = pipe(true);
+        reset();
+        guard(Options {
+            admission: None,
+            execution: Some(Duration::from_secs(30)),
+            events: Some(writer.as_raw_fd()),
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        arm_execution(Instant::now(), Phase::PrimaryCargo);
+        let records = drain_records(&mut reader);
+        assert_eq!(records.len(), 1);
+        let started = &records[0];
+        assert_eq!(started["event"], "admitted_child_started");
+        assert!(started["admission_ms"].is_null());
+        assert_eq!(started["execution_ms"], 30_000);
+        // The elapsed admission fact is measured, not the caller's limit.
+        let elapsed = started["admission_elapsed_ms"].as_u64().unwrap();
+        assert!(elapsed >= 20, "elapsed {elapsed} must include the wait");
+        assert!(elapsed < 30_000);
+        assert_eq!(started["admission_overshoot_ms"], serde_json::Value::Null);
+        assert_eq!(started["spawn_late"], false);
+        reset();
+    }
+
+    #[test]
+    fn program_started_reports_the_running_clock_without_resetting_it() {
+        let (mut reader, writer) = pipe(true);
+        reset();
+        guard(Options {
+            admission: Some(Duration::from_secs(30)),
+            execution: Some(Duration::from_secs(30)),
+            events: Some(writer.as_raw_fd()),
+        });
+        arm_execution(Instant::now(), Phase::PrimaryCargo);
+        std::thread::sleep(Duration::from_millis(20));
+        program_started();
+        let records = drain_records(&mut reader);
+        assert_eq!(records.len(), 2);
+        let program = &records[1];
+        assert_eq!(program["phase"], "run_program");
+        assert_eq!(program["admission_overshoot_ms"], serde_json::Value::Null);
+        // The one execution window is unchanged and already running.
+        assert_eq!(program["execution_ms"], 30_000);
+        assert!(program["execution_started_ms"].as_u64().unwrap() >= 20);
+        assert!(program["admission_elapsed_ms"].as_u64().unwrap() >= 20);
+        reset();
+    }
+
+    #[test]
+    fn the_debug_closure_hook_is_absent_unless_set() {
+        reset();
+        assert!(!closure_stuck());
+        assert!(refuse_absent_test_hook().is_ok());
     }
 
     #[test]

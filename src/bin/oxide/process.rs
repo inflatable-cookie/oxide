@@ -94,11 +94,6 @@ impl Stop {
         Self::default()
     }
 
-    /// Whether a controlled stop has begun.
-    pub fn started(&self) -> bool {
-        self.term_at.is_some()
-    }
-
     /// Latch and escalate a budget stop when its deadline has arrived. Returns
     /// `true` once the group has outlived the finite closeout allowance after
     /// KILL: the caller then keeps custody instead of claiming closure.

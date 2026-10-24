@@ -563,11 +563,10 @@ impl Git {
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) if Instant::now() >= deadline => {
-                    // Our own child; reaping it closes the pipes unless
-                    // something it started still holds them. Those readers
-                    // are detached, so the gate keeps its own clock.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Our own child; a bounded KILL and reap closes its pipes
+                    // unless something it started still holds them. Those
+                    // readers are detached, so the gate keeps its own clock.
+                    let _ = crate::budget::kill_and_reap(&mut child);
                     break Err(format!("git {name} did not finish in time"));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(5)),
@@ -1518,27 +1517,50 @@ pub(crate) fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOu
         .map_err(|error| format!("could not start Cargo: {error}"))?;
     let stdout = child.stdout.take().ok_or("Cargo stdout was not captured")?;
     let stderr = child.stderr.take().ok_or("Cargo stderr was not captured")?;
-    let out = std::thread::spawn(move || read_capped(stdout, stdout_cap));
-    let err = std::thread::spawn(move || read_capped(stderr, MAX_METADATA_ERROR_BYTES));
+    // Readers settle through a channel so a descendant that keeps a pipe open
+    // cannot make this function join forever after a timed kill.
+    let (out_sender, out_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_sender.send(read_capped(stdout, stdout_cap));
+    });
+    let (err_sender, err_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = err_sender.send(read_capped(stderr, MAX_METADATA_ERROR_BYTES));
+    });
     let deadline = Instant::now() + crate::budget::clamp(METADATA_TIME);
+    let mut killed = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() >= deadline => {
-                // Our own child; reaping it closes the pipes.
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err("Cargo did not finish in time".to_owned());
+                // Our own child; a bounded reap closes its pipes unless
+                // something it started still holds them.
+                killed = true;
+                let reaped = crate::budget::kill_and_reap(&mut child);
+                break Err(if reaped {
+                    "Cargo did not finish in time".to_owned()
+                } else {
+                    "Cargo did not finish in time and could not be reaped inside the closeout bound"
+                        .to_owned()
+                });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(error) => break Err(format!("could not wait for Cargo: {error}")),
         }
     };
-    let out = out.join().map_err(|_| "Cargo output reader panicked")?;
-    let err = err.join().map_err(|_| "Cargo error reader panicked")?;
+    let settle = Instant::now() + crate::budget::CLOSE_BOUND;
+    let left = || settle.saturating_duration_since(Instant::now());
+    let read_bounded = |receiver: &mpsc::Receiver<_>, what: &str| -> Result<_, String> {
+        receiver
+            .recv_timeout(left())
+            .map_err(|_| format!("{what} did not settle inside the closeout bound"))
+    };
+    let out = read_bounded(&out_receiver, "Cargo output")?;
+    let err = read_bounded(&err_receiver, "Cargo error output")?;
     let status = status?;
     let (stdout, overflow) = out.map_err(|error| format!("cannot read Cargo output: {error}"))?;
     let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
+    let _ = killed;
     Ok(CargoOutput {
         status,
         stdout,
