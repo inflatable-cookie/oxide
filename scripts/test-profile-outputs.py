@@ -103,6 +103,7 @@ import json
 import os
 import secrets
 import shutil
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -462,6 +463,53 @@ def owned_image_dir() -> str:
     return directory
 
 
+def write_attachment_facts(name: str, record: dict) -> None:
+    """Persist bounded attachment custody in the guard's OWN evidence root,
+    before or after a risky operation, so an interrupted run still leaves the
+    last known mount/device/UUID/image facts for the custodian."""
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+    if not evidence:
+        return None
+    path = os.path.join(evidence, name)
+    with open(path + ".new", "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(path + ".new", path)
+    return path
+
+
+def attachment_facts(proof: Proof, label: str, state: str) -> dict:
+    """Bounded last-known attachment facts for one owned mount."""
+    mount = proof.mount
+    directory = owned_image_dir()
+    backing = os.path.join(directory, "volume.sparseimage")
+    details = {}
+    if mount:
+        info = proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30)
+        if info.returncode == 0:
+            try:
+                plist = perm.plistlib.loads(info.stdout)
+                details = {
+                    "device": plist.get("DeviceIdentifier"),
+                    "volume_uuid": plist.get("VolumeUUID"),
+                    "owners": plist.get("Owners"),
+                    "mount_point": plist.get("MountPoint"),
+                }
+            except Exception:
+                details = {"plist": "unreadable"}
+    return {
+        "label": label,
+        "state": state,
+        "mount": mount,
+        "image": backing,
+        "image_dir": directory,
+        "backing_present": os.path.exists(backing),
+        "owned": True,
+        "unclosed_children": sorted(getattr(proof, "unclosed", set())),
+        "details": details,
+    }
+
+
 def attach_owned_image(
     proof: Proof, label: str, image_name: str = "volume.sparseimage"
 ) -> str:
@@ -477,6 +525,7 @@ def attach_owned_image(
         image_name=image_name,
     )
     owners_honored(proof, mount, label)
+    write_attachment_facts("attachment-facts.json", attachment_facts(proof, label, "attached"))
     return mount
 
 
@@ -519,24 +568,69 @@ def pure_detach_record_control() -> None:
     print("pure detach-failure record control: ok", flush=True)
 
 
+def pure_attachment_facts_control() -> None:
+    """No-subprocess control for A10 custody facts: they are written into the
+    evidence root, replaced atomically, leave no temporary file behind, and
+    are skipped entirely when no evidence root is configured."""
+    written = write_attachment_facts("attachment-unset.json", {"state": "never"})
+    expect(written is None, "the attachment facts were written without an evidence root")
+    with tempfile.TemporaryDirectory() as root:
+        os.environ["OXIDE_PROOF_EVIDENCE"] = root
+        try:
+            write_attachment_facts("attachment-facts.json", {"state": "attached", "mount": "/Volumes/x", "unclosed_children": []})
+            write_attachment_facts("attachment-facts.json", {"state": "detached", "mount": "/Volumes/x", "unclosed_children": []})
+            with open(os.path.join(root, "attachment-facts.json"), encoding="utf-8") as handle:
+                record = json.load(handle)
+            expect(record.get("state") == "detached", f"the attachment facts were not replaced: {record}")
+            expect(record.get("mount") == "/Volumes/x", f"the attachment facts lost the mount: {record}")
+            expect(
+                not os.path.exists(os.path.join(root, "attachment-facts.json.new")),
+                "a temporary attachment-facts file was left behind",
+            )
+        finally:
+            os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+    print("pure attachment-facts control: ok", flush=True)
+
+
 def detach_owned_volume(proof: Proof, label: str) -> None:
     """Ordinary detach of the proof-owned mount, used on success AND after a
-    failure once direct child outcomes are known. A failed detach fails the
-    proof and records the mount/device/UUID/image/ownership; the backing stays
-    in the guard's OWN evidence for the custodian. Backing is removed only
-    after a positive detach confirmation."""
+    failure once direct child outcomes are known. A failed or unresolved
+    detach fails the proof and records the mount/device/UUID/image/ownership;
+    the backing stays in the guard's OWN evidence for the custodian. Backing is
+    removed only after a positive ordinary detach confirmation, never from a
+    process census."""
     mount = proof.mount
     if not mount:
         return
     directory = owned_image_dir()
     backing = os.path.join(directory, "volume.sparseimage")
+    # A10: unknown custody blocks detach. Gated children are settled through
+    # the existing helpers before this point; an unclosed child means their
+    # outcome is not known, so the mount is kept and reported instead.
+    unclosed = sorted(getattr(proof, "unclosed", set()))
+    if unclosed:
+        record = attachment_facts(proof, label, "unresolved: unclosed children")
+        record["reason"] = "refused to detach while child custody is unknown"
+        write_attachment_facts("detach-unresolved.json", record)
+        fail(f"{label}: refusing ordinary detach while {len(unclosed)} child(ren) are unclosed; the mount and backing are retained")
+        return
     expect(os.path.lexists(mount), f"{label}: the owned mount {mount} vanished before ordinary detach")
-    result = proof.run(["/usr/bin/hdiutil", "detach", mount], timeout=60)
+    # Persist the last-known facts BEFORE the risky calls, so an interruption
+    # (including a timeout) still leaves custody facts in evidence.
+    write_attachment_facts("attachment-facts.json", attachment_facts(proof, label, "detaching"))
+    try:
+        result = proof.run(["/usr/bin/hdiutil", "detach", mount], timeout=60)
+    except Exception as error:  # a timeout or a harness fault is unresolved custody
+        record = attachment_facts(proof, label, "unresolved: detach did not complete")
+        record["reason"] = f"detach raised {error!r}"
+        write_attachment_facts("detach-unresolved.json", record)
+        fail(f"{label}: ordinary detach of {mount} did not complete ({error!r}); the backing is retained in the guard evidence")
+        return
     if result.returncode != 0:
-        info = proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30)
         details = {}
-        if info.returncode == 0:
-            try:
+        try:
+            info = proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30)
+            if info.returncode == 0:
                 plist = perm.plistlib.loads(info.stdout)
                 details = {
                     "device": plist.get("DeviceIdentifier"),
@@ -544,8 +638,8 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
                     "owners": plist.get("Owners"),
                     "mount_point": plist.get("MountPoint"),
                 }
-            except Exception:
-                details = {"plist": "unreadable"}
+        except Exception as error:
+            details = {"unavailable": repr(error)}
         record = detach_failure_record(
             label,
             mount,
@@ -559,8 +653,11 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
         with open(os.path.join(evidence, "detach-failure.json"), "w", encoding="utf-8") as handle:
             json.dump(record, handle, indent=2)
             handle.write("\n")
+        write_attachment_facts("detach-unresolved.json", attachment_facts(proof, label, "unresolved: detach failed"))
         fail(f"{label}: ordinary detach of {mount} failed; the backing is retained in the guard evidence")
+        return
     proof.mount = None
+    write_attachment_facts("attachment-facts.json", attachment_facts(proof, label, "detached"))
     if os.path.exists(backing):
         os.remove(backing)
     try:
@@ -695,7 +792,10 @@ def pure_registry_controls() -> None:
 
 def custody_snapshot(pool: str, checkout: str) -> dict:
     """Bounded observable state of one checkout's output authority: receipt
-    bytes, member link texts and the root marker's bytes."""
+    bytes, member link texts, the root marker's bytes, the checkout's own
+    target link (text and inode, so a rewritten legacy link is visible) and the
+    bounded registry authority digest. A8: a wait/no-effect control cannot rest
+    on links and a marker alone."""
     receipt_path = receipt_file(pool, checkout)
     snapshot = {"receipt": perm.sha256_file(receipt_path) if os.path.exists(receipt_path) else "absent"}
     links = {}
@@ -706,6 +806,19 @@ def custody_snapshot(pool: str, checkout: str) -> dict:
     snapshot["links"] = links
     marker = os.path.join(root_of(pool, checkout), MARKER) if os.path.exists(receipt_path) else ""
     snapshot["marker"] = perm.sha256_file(marker) if marker and os.path.exists(marker) else "absent"
+    target = os.path.join(checkout, "target")
+    if os.path.lexists(target):
+        info = os.lstat(target)
+        snapshot["target"] = {
+            "is_link": os.path.islink(target),
+            "text": os.readlink(target) if os.path.islink(target) else "",
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+        }
+    else:
+        snapshot["target"] = "absent"
+    registry = os.path.join(pool, "oxide-managed", "outputs", "registry.json")
+    snapshot["registry"] = perm.sha256_file(registry) if os.path.exists(registry) else "absent"
     return snapshot
 
 
@@ -730,6 +843,7 @@ def adopt(proof: Proof, checkout: str, label: str) -> None:
 def run(proof: Proof, repo: str) -> None:
     pure_registry_controls()
     pure_detach_record_control()
+    pure_attachment_facts_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -1613,11 +1727,20 @@ def run(proof: Proof, repo: str) -> None:
         "OXIDE_CLEAN_GATE": gate,
         "OXIDE_TEST_WATCHDOG_READINGS": readings,
     }
+    # A5: the watched clean runs in the checkout whose OWN receipt and custody
+    # live in this directory-budget pool. It is adopted and built here, so no
+    # receipt authority is copied across pools and `first` (a primary-pool
+    # checkout) is never cleaned under this pool's context.
     seeded = make_checkout(proof, "clean-pool-fixture")
     os.makedirs(os.path.join(seeded, "target"))
-    code, _, stderr = perm.oxide_env(proof, ["build"], "16 clean pool seed", seeded, env)
+    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "16 clean pool adopt", seeded, env)
     expect(code == 0, f"16: creating the directory-budget pool failed: {stderr}")
-    child = perm.start_child(proof, [proof.binary, "clean", "-p", "profileapp"], first, env)
+    code, _, stderr = perm.oxide_env(proof, ["build"], "16 clean pool seed", seeded, env)
+    expect(code == 0, f"16: seeding the directory-budget pool failed: {stderr}")
+    seeded_root = root_of(dirpool, seeded)
+    expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
+    seeded_receipt = perm.read_bytes(receipt_file(dirpool, seeded))
+    child = perm.start_child(proof, [proof.binary, "clean", "-p", "profileapp"], seeded, env)
     perm.wait_for(os.path.join(gate, "started"), "16 watched clean writer start")
     with open(readings, "w", encoding="utf-8") as handle:
         handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
@@ -1627,7 +1750,14 @@ def run(proof: Proof, repo: str) -> None:
         any(word in stderr.lower() for word in ("reserve", "watchdog", "stop")),
         f"16: the stop was not reported honestly: {stderr}",
     )
-    expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
+    # The stopped clean keeps the seeded checkout's own authority: same links,
+    # same receipt bytes, root still present.
+    expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
+    expect(
+        perm.read_bytes(receipt_file(dirpool, seeded)) == seeded_receipt,
+        "16: the stopped clean changed the seeded receipt bytes",
+    )
+    expect(os.path.isdir(seeded_root), "16: the stopped clean removed the seeded root")
     with open(os.path.join(gate, "release"), "wb") as handle:
         handle.write(b"release")
 
@@ -2055,6 +2185,7 @@ def main() -> int:
     if arguments == ["--self-check"]:
         pure_registry_controls()
         pure_detach_record_control()
+        pure_attachment_facts_control()
         return 0
     if arguments:
         print(USAGE, file=sys.stderr)
