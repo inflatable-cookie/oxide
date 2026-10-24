@@ -176,6 +176,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   drive from the account home, not `$HOME`, so a harness that overrides
   HOME still uses them; private pools need an explicit setting. Its proof
   controls exist only in debug builds; any other build refuses them.
+- **Temporary files off the internal drive:** temp files from builds, tests
+  and native proofs go to the selected pool (the Builds drive when present),
+  not the internal SSD. Approved, not built.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
