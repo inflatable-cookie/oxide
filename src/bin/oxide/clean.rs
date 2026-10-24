@@ -41,6 +41,12 @@ const OWNED_FILES: [&str; 4] = [
 /// (`ops/cargo_package/mod.rs` L166, L220) and `.metabuild`
 /// (`core/manifest.rs` L740).
 const OWNED_DIRS: [&str; 5] = ["doc", "cargo-timings", "tmp", "package", ".metabuild"];
+/// Entries of ONE owned member root's payload (oxide#133). A profile directory
+/// such as `root/debug` holds Cargo's artifact FILES (any name: executables,
+/// `.d`, `.rlib`, `.rmeta`) plus these fixed directories. This is a different
+/// question from "is this an entry of the target root", which is why a payload
+/// clean never classifies `deps` or an executable as foreign.
+const PAYLOAD_DIRS: [&str; 5] = ["deps", "incremental", "build", ".fingerprint", "examples"];
 /// Entries of a target-triple directory (`layout.rs` L243-L246 push the
 /// triple onto both roots): its profile directories plus these.
 const TRIPLE_FILES: [&str; 2] = ["CACHEDIR.TAG", ".rustdoc_fingerprint.json"];
@@ -216,9 +222,21 @@ fn triple_dir(path: &Path) -> bool {
 
 /// Whether Cargo creates this top-level target entry. Names alone never
 /// qualify a profile or triple directory: it must carry Cargo's lock file
-/// structure. A symlink is never Cargo-owned.
-fn cargo_owned(path: &Path, name: &OsStr, metadata: &Metadata) -> bool {
+/// structure. A symlink is never Cargo-owned. With `payload` the directory is
+/// one owned member root's payload rather than a target root: Cargo's artifact
+/// files are owned whatever they are called, an unknown directory is foreign
+/// and a symlink is never followed.
+fn cargo_owned(path: &Path, name: &OsStr, metadata: &Metadata, payload: bool) -> bool {
     let name = name.to_str().unwrap_or_default();
+    if payload {
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+        if is_file(metadata) {
+            return true;
+        }
+        return is_dir(metadata) && PAYLOAD_DIRS.contains(&name);
+    }
     if is_file(metadata) {
         return OWNED_FILES.contains(&name);
     }
@@ -239,7 +257,17 @@ type Protected = Option<(u64, u64)>;
 /// `keep_root` is set for a permanent drive's owned output root: the root
 /// directory and its ownership marker are preserved, and only the entries
 /// Cargo (or a foreign entry) created inside it are planned.
-fn plan(target: &Path, pool: Protected, keep_root: bool) -> Result<Option<Plan>, String> {
+/// A path named in `preserve` is never removed. A preserved REAL DIRECTORY is
+/// kept and still descended, because it holds retained owned member links (the
+/// checkout's real target and a triple directory inside it) whose siblings are
+/// still Cargo's payload; only a preserved link or file ends the walk.
+fn plan(
+    target: &Path,
+    pool: Protected,
+    keep_root: bool,
+    preserve: &[PathBuf],
+    payload: bool,
+) -> Result<Option<Plan>, String> {
     let refuse_pool = |path: &Path, metadata: &Metadata| {
         if pool == Some((metadata.dev(), metadata.ino())) {
             Err(format!(
@@ -266,7 +294,11 @@ fn plan(target: &Path, pool: Protected, keep_root: bool) -> Result<Option<Plan>,
     };
     refuse_pool(target, &root)?;
     let mut plan = Plan::default();
-    if keep_root {
+    // The target itself is kept when `keep_root` says so, and also when it is
+    // explicitly preserved: in the profile layout `target` is a REAL directory
+    // that holds this checkout's owned member links, so a whole clean removes
+    // its payload and never the directory itself.
+    if keep_root || preserve.iter().any(|kept| kept == target) {
         plan.preserved.push(target.to_path_buf());
     } else {
         plan.entries.push(Planned {
@@ -274,8 +306,8 @@ fn plan(target: &Path, pool: Protected, keep_root: bool) -> Result<Option<Plan>,
             dir: true,
         });
     }
-    let mut stack = vec![(target.to_path_buf(), 0_usize)];
-    while let Some((dir, depth)) = stack.pop() {
+    let mut stack = vec![(target.to_path_buf(), 0_usize, true)];
+    while let Some((dir, depth, classify)) = stack.pop() {
         let entries = std::fs::read_dir(&dir).map_err(|error| {
             format!(
                 "cannot read {}: {error}; the plan would be incomplete",
@@ -298,14 +330,35 @@ fn plan(target: &Path, pool: Protected, keep_root: bool) -> Result<Option<Plan>,
                     path.display()
                 ));
             }
+            if preserve.iter().any(|kept| kept == &path) {
+                // An owned profile member link is Oxide's placement, never
+                // Cargo's content: a whole clean keeps it and cleans the
+                // root's payload instead. A preserved REAL directory is an
+                // ancestor of such a link, so it stays and its remaining
+                // contents are still planned rather than silently skipped.
+                plan.preserved.push(path.clone());
+                if is_dir(&metadata) {
+                    if depth + 1 >= MAX_DEPTH {
+                        return Err(format!(
+                            "{} is nested deeper than {MAX_DEPTH} levels; Oxide refuses rather than remove an incomplete list",
+                            path.display()
+                        ));
+                    }
+                    stack.push((path, depth + 1, true));
+                }
+                continue;
+            }
             if keep_root && depth == 0 && entry.file_name() == outputs::MARKER {
                 // The root's ownership marker is Oxide's, not Cargo's, and it
                 // stays with the root.
                 plan.preserved.push(path);
                 continue;
             }
-            if depth == 0 && !cargo_owned(&path, &entry.file_name(), &metadata) {
-                plan.foreign.push(entry.file_name());
+            if classify && !cargo_owned(&path, &entry.file_name(), &metadata, payload) {
+                // The name is relative to the target root, so an entry below a
+                // retained ancestor is named unambiguously in the refusal.
+                let relative = path.strip_prefix(target).unwrap_or(&path).to_path_buf();
+                plan.foreign.push(relative.into_os_string());
             }
             if plan.entries.len() > MAX_ENTRIES {
                 return Err(format!(
@@ -326,7 +379,7 @@ fn plan(target: &Path, pool: Protected, keep_root: bool) -> Result<Option<Plan>,
                     path: path.clone(),
                     dir: true,
                 });
-                stack.push((path, depth + 1));
+                stack.push((path, depth + 1, false));
             } else {
                 plan.files += 1;
                 plan.bytes += metadata.len();
@@ -353,7 +406,7 @@ fn names(names: &[OsString]) -> String {
 /// The refusal both the dry run and a real clean give for foreign entries.
 fn refuse_foreign(target: &Path, plan: &Plan) -> String {
     format!(
-        "clean refused: {} holds {} top-level entr{} Cargo does not create: {}. Move {} out of the target, or pass --include-foreign to remove {} too (`oxide clean --dry-run --include-foreign` lists every path)",
+        "clean refused: {} holds {} entr{} Cargo does not create: {}. Move {} out of the target, or pass --include-foreign to remove {} too (`oxide clean --dry-run --include-foreign` lists every path)",
         target.display(),
         plan.foreign.len(),
         if plan.foreign.len() == 1 { "y" } else { "ies" },
@@ -414,9 +467,11 @@ fn checked_plan(
     pool: Protected,
     include_foreign: bool,
     keep_root: bool,
+    preserve: &[PathBuf],
+    payload: bool,
 ) -> Result<Option<Plan>, String> {
-    let plan =
-        plan(target, pool, keep_root).map_err(|reason| format!("clean refused: {reason}"))?;
+    let plan = plan(target, pool, keep_root, preserve, payload)
+        .map_err(|reason| format!("clean refused: {reason}"))?;
     match plan {
         Some(plan) if !plan.foreign.is_empty() && !include_foreign => {
             Err(refuse_foreign(target, &plan))
@@ -463,6 +518,8 @@ fn run_whole(
 ) -> Result<u8, String> {
     // A permanent drive's owned link resolves through its receipt to the
     // selected real root; everything else keeps the real `<workspace>/target`.
+    // In the profile layout `target` is real and every owned member link is
+    // kept while its root's payload is cleaned instead.
     let placement = outputs::clean_placement(workspace)?;
     let target = placement.as_ref().map_or_else(
         || workspace.join("target"),
@@ -471,36 +528,64 @@ fn run_whole(
     let keep_root = placement
         .as_ref()
         .is_some_and(outputs::CleanPlacement::keep_root);
-    let pool = protect_pool(&target, &settings.pool)?;
+    // The real target, every owned member link and every real ancestor that
+    // holds a nested member link are kept; each member root's payload is what
+    // a profile clean removes.
+    let preserve: Vec<PathBuf> = placement
+        .as_ref()
+        .map(outputs::CleanPlacement::preserved)
+        .unwrap_or_default();
+    let member_roots: Vec<PathBuf> = placement
+        .as_ref()
+        .map(|place| {
+            place
+                .members()
+                .iter()
+                .map(|(_, root)| root.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     // Refusal precedes waiting, deletion and any affinity change.
-    let first = checked_plan(&target, pool, include_foreign, keep_root)?;
+    let planned = whole_plans(
+        &target,
+        &member_roots,
+        &preserve,
+        keep_root,
+        include_foreign,
+        settings,
+    )?;
     let kept = placement
         .as_ref()
         .and_then(outputs::CleanPlacement::preserved_note);
     if dry_run {
-        let Some(plan) = first else {
+        if planned.is_empty() {
             eprintln!(
                 "oxide: dry run: {} does not exist; nothing would be removed",
                 target.display()
             );
             return Ok(0);
-        };
-        for planned in &plan.entries {
-            println!("{}", planned.path.display());
         }
-        let foreign = if plan.foreign.is_empty() {
+        let mut entries = 0;
+        for (root, plan) in &planned {
+            for path in &plan.entries {
+                println!("{}", path.path.display());
+            }
+            entries += plan.entries.len();
+            let _ = root;
+        }
+        let foreign = if planned.iter().all(|(_, plan)| plan.foreign.is_empty()) {
             String::new()
         } else {
-            format!(
-                ", including foreign entries (--include-foreign): {}",
-                names(&plan.foreign)
-            )
+            ", including foreign entries (--include-foreign)".to_owned()
         };
         let kept = kept.map(|kept| format!("; {kept}")).unwrap_or_default();
         eprintln!(
-            "oxide: dry run: a clean would remove the {} paths listed ({}){foreign}{kept}; nothing was removed. A clean also drops this checkout's slot affinity; slots stay",
-            plan.entries.len(),
-            summary(&plan)
+            "oxide: dry run: a clean would remove the {entries} paths listed ({}{foreign}){kept}; nothing was removed. A clean also drops this checkout's slot affinity; slots stay",
+            planned
+                .iter()
+                .map(|(root, plan)| format!("{}: {}", root.display(), summary(plan)))
+                .collect::<Vec<_>>()
+                .join("; ")
         );
         return Ok(0);
     }
@@ -515,7 +600,7 @@ fn run_whole(
         None => None,
     };
     // Plan again under the clean barrier: what is removed is what this plan
-    // lists, from the root the receipt selects now.
+    // lists, from the roots the receipt selects now.
     let outcome = refuse_unknown_custody_opt(&store, workspace)
         .and_then(|()| outputs::clean_placement(workspace))
         .and_then(|placement| {
@@ -526,23 +611,46 @@ fn run_whole(
             let keep_root = placement
                 .as_ref()
                 .is_some_and(outputs::CleanPlacement::keep_root);
-            let pool = protect_pool(&target, &settings.pool)?;
-            checked_plan(&target, pool, include_foreign, keep_root).and_then(|plan| match plan {
-                None => Ok(None),
-                Some(plan) => remove(&plan).map(|()| Some((target.clone(), plan))),
-            })
+            let preserve: Vec<PathBuf> = placement
+                .as_ref()
+                .map(outputs::CleanPlacement::preserved)
+                .unwrap_or_default();
+            let member_roots: Vec<PathBuf> = placement
+                .as_ref()
+                .map(|place| {
+                    place
+                        .members()
+                        .iter()
+                        .map(|(_, root)| root.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let planned = whole_plans(
+                &target,
+                &member_roots,
+                &preserve,
+                keep_root,
+                include_foreign,
+                settings,
+            )?;
+            let mut removed = Vec::new();
+            for (root, plan) in planned {
+                remove(&plan)?;
+                removed.push((root, plan));
+            }
+            Ok(removed)
         });
-    let plan = match (outcome, &store, guard) {
-        (Ok(plan), Some(store), Some(guard)) => {
+    let planned = match (outcome, &store, guard) {
+        (Ok(planned), Some(store), Some(guard)) => {
             let detached = store.finish_clean(guard, workspace)?;
             if detached > 0 {
                 eprintln!(
                     "oxide: dropped this checkout's slot affinity; {detached} slot(s) kept until evicted"
                 );
             }
-            plan
+            planned
         }
-        (Ok(plan), _, _) => plan,
+        (Ok(planned), _, _) => planned,
         (Err(reason), Some(store), Some(guard)) => {
             store.abandon_clean(guard)?;
             return Err(reason);
@@ -556,28 +664,54 @@ fn run_whole(
         .as_ref()
         .and_then(outputs::CleanPlacement::preserved_note);
     let kept = kept.map(|kept| format!("; {kept}")).unwrap_or_default();
-    match plan {
-        None => eprintln!(
+    if planned.is_empty() {
+        eprintln!(
             "oxide: {} does not exist; nothing removed{wait}{kept}",
             target.display(),
-        ),
-        Some((target, plan)) => {
-            let foreign = if plan.foreign.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", including foreign entries (--include-foreign): {}",
-                    names(&plan.foreign)
-                )
-            };
-            eprintln!(
-                "oxide: removed {} ({}){foreign}{wait}{kept}",
-                target.display(),
-                summary(&plan)
-            );
-        }
+        );
+    } else {
+        let foreign = if planned.iter().all(|(_, plan)| plan.foreign.is_empty()) {
+            String::new()
+        } else {
+            ", including foreign entries (--include-foreign)".to_owned()
+        };
+        eprintln!(
+            "oxide: removed {}{foreign}{wait}{kept}",
+            planned
+                .iter()
+                .map(|(root, plan)| format!("{} ({})", root.display(), summary(plan)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
     Ok(0)
+}
+
+/// The complete plan of one whole clean before any effect: the checkout's own
+/// target (with every owned member link preserved) and each owned member
+/// root's payload with the root marker kept.
+fn whole_plans(
+    target: &Path,
+    member_roots: &[PathBuf],
+    preserve: &[PathBuf],
+    keep_root: bool,
+    include_foreign: bool,
+    settings: &Settings,
+) -> Result<Vec<(PathBuf, Plan)>, String> {
+    let mut planned = Vec::new();
+    let pool = protect_pool(target, &settings.pool)?;
+    if let Some(plan) = checked_plan(target, pool, include_foreign, keep_root, preserve, false)? {
+        planned.push((target.to_path_buf(), plan));
+    }
+    for root in member_roots {
+        let pool = protect_pool(root, &settings.pool)?;
+        // A member root is payload, not a target root: its `deps` and its
+        // artifact files are Cargo's, not foreign entries.
+        if let Some(plan) = checked_plan(root, pool, include_foreign, true, &[], true)? {
+            planned.push((root.clone(), plan));
+        }
+    }
+    Ok(planned)
 }
 
 /// `cargo clean` with a package, profile or doc selection, against the
@@ -625,14 +759,60 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     if let Some(guard) = &guard {
         guard.share_with_children()?;
     }
+    // The selected clean runs the same supervision as a leased build: the
+    // pool's watchdog is polled while the recorded group runs and closure is
+    // positively witnessed before the barrier lifts. The removable watchdog
+    // watches for volume removal only; it is not a continuous free-space
+    // sampler.
+    let mut watchdog = store.as_ref().and_then(Store::watchdog);
     let status = process::spawn_group(&mut cargo).and_then(|mut group| {
         let recorded = match (&store, &guard) {
             (Some(store), Some(guard)) => store.clean_running(guard, group.id),
             _ => Ok(()),
         };
-        let status = process::wait_leader(&mut group);
-        process::wait_group_empty(group.id);
-        recorded.and(status)
+        // `clean` takes no budget options, so its stop object never fires;
+        // the space/volume watchdog remains its only stop source.
+        let mut budget_stop = process::Stop::new();
+        let status = match watchdog.as_mut() {
+            Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, &mut budget_stop),
+            None => process::wait_leader(&mut group).map(Some),
+        };
+        let closed = match watchdog.as_mut() {
+            Some(watchdog) => {
+                process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
+            }
+            None => {
+                process::wait_group_empty(group.id);
+                Some(std::time::Instant::now())
+            }
+        };
+        if let Some(watchdog) = watchdog.as_ref().filter(|watchdog| watchdog.stopped()) {
+            crate::report_stop(
+                watchdog,
+                group.id,
+                closed,
+                &store
+                    .as_ref()
+                    .map_or_else(|| std::path::PathBuf::new(), |store| store.payload.clone()),
+            );
+        }
+        if closed.is_none() {
+            return Err(format!(
+                "could not confirm the Cargo clean group {} closed after a watchdog stop",
+                group.id
+            ));
+        }
+        let status = match status {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                return Err(format!(
+                    "the Cargo clean group {} was stopped by the pool watchdog",
+                    group.id
+                ))
+            }
+            Err(reason) => return Err(reason),
+        };
+        recorded.map(|()| status)
     });
     let _ = std::fs::remove_dir(scratch.join("build"));
     let _ = std::fs::remove_dir(&scratch);
@@ -756,7 +936,7 @@ mod tests {
         let root = scratch("classify");
         let target = root.join("target");
         cargo_target(&target);
-        let clean = plan(&target, None, false).unwrap().unwrap();
+        let clean = plan(&target, None, false, &[], false).unwrap().unwrap();
         assert!(clean.foreign.is_empty(), "{:?}", clean.foreign);
         assert_eq!(clean.entries[0].path, target);
         // A plausible name without Cargo's lock is not a profile directory;
@@ -769,7 +949,7 @@ mod tests {
         std::fs::create_dir_all(target.join("aarch64-apple-darwin/release")).unwrap();
         std::fs::write(target.join("aarch64-apple-darwin/release/.cargo-lock"), "").unwrap();
         std::fs::write(target.join("aarch64-apple-darwin/extra"), "").unwrap();
-        let mixed = plan(&target, None, false).unwrap().unwrap();
+        let mixed = plan(&target, None, false, &[], false).unwrap().unwrap();
         assert_eq!(
             mixed.foreign,
             os(&[
@@ -782,7 +962,7 @@ mod tests {
         );
         let refusal = refuse_foreign(&target, &mixed);
         assert!(
-            refusal.contains("5 top-level entries") && refusal.contains("handover"),
+            refusal.contains("5 entries") && refusal.contains("handover"),
             "{refusal}"
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -798,10 +978,12 @@ mod tests {
         std::fs::write(outside.join("sentinel"), "keep").unwrap();
         std::fs::create_dir_all(target.join("handover/nested")).unwrap();
         symlink(&outside, target.join("handover/nested/escape")).unwrap();
-        assert!(checked_plan(&target, None, false, false)
+        assert!(checked_plan(&target, None, false, false, &[], false)
             .unwrap_err()
             .contains("handover"));
-        let plan = checked_plan(&target, None, true, false).unwrap().unwrap();
+        let plan = checked_plan(&target, None, true, false, &[], false)
+            .unwrap()
+            .unwrap();
         assert!(plan
             .entries
             .iter()
@@ -817,7 +999,9 @@ mod tests {
         let root = scratch("late");
         let target = root.join("target");
         cargo_target(&target);
-        let plan = checked_plan(&target, None, false, false).unwrap().unwrap();
+        let plan = checked_plan(&target, None, false, false, &[], false)
+            .unwrap()
+            .unwrap();
         std::fs::write(target.join("doc/late"), "new").unwrap();
         let left = remove(&plan).unwrap_err();
         assert!(left.contains("not in the plan"), "{left}");
@@ -837,13 +1021,16 @@ mod tests {
         let alias = std::fs::metadata(root.join("pool-alias")).unwrap();
         let identity = Some((alias.dev(), alias.ino()));
         for include_foreign in [false, true] {
-            let refused = checked_plan(&target, identity, include_foreign, false).unwrap_err();
+            let refused =
+                checked_plan(&target, identity, include_foreign, false, &[], false).unwrap_err();
             assert!(refused.contains("is the Oxide pool"), "{refused}");
         }
         let whole = std::fs::metadata(&target).unwrap();
-        assert!(plan(&target, Some((whole.dev(), whole.ino())), false)
-            .unwrap_err()
-            .contains("is the Oxide pool"));
+        assert!(
+            plan(&target, Some((whole.dev(), whole.ino())), false, &[], false)
+                .unwrap_err()
+                .contains("is the Oxide pool")
+        );
         assert_eq!(std::fs::read(pool.join("sentinel")).unwrap(), b"slot");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -854,7 +1041,9 @@ mod tests {
         let owned = root.join("owned");
         cargo_target(&owned);
         std::fs::write(owned.join(crate::outputs::MARKER), b"{}").unwrap();
-        let plan = checked_plan(&owned, None, false, true).unwrap().unwrap();
+        let plan = checked_plan(&owned, None, false, true, &[], false)
+            .unwrap()
+            .unwrap();
         assert!(plan.foreign.is_empty(), "{:?}", plan.foreign);
         assert!(plan
             .entries
@@ -873,10 +1062,193 @@ mod tests {
         let root = scratch("link");
         std::fs::create_dir(root.join("real")).unwrap();
         symlink(root.join("real"), root.join("target")).unwrap();
-        assert!(plan(&root.join("target"), None, false)
+        assert!(plan(&root.join("target"), None, false, &[], false)
             .unwrap_err()
             .contains("symlink"));
-        assert!(plan(&root.join("absent"), None, false).unwrap().is_none());
+        assert!(plan(&root.join("absent"), None, false, &[], false)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One owned member root's payload: exactly what Cargo writes under a
+    /// profile directory, including an artifact file with an arbitrary name.
+    fn profile_payload(root: &Path) {
+        std::fs::create_dir_all(root.join("deps")).unwrap();
+        std::fs::write(root.join("deps/app-0123.d"), "dep").unwrap();
+        std::fs::create_dir_all(root.join("incremental")).unwrap();
+        std::fs::create_dir_all(root.join("build/app-0123")).unwrap();
+        std::fs::create_dir_all(root.join(".fingerprint")).unwrap();
+        std::fs::write(root.join(".cargo-lock"), "").unwrap();
+        std::fs::write(root.join("app"), "bin").unwrap();
+        std::fs::write(root.join("libapp-0123.rlib"), "rlib").unwrap();
+    }
+
+    /// oxide#133 P1: an owned member root holds PAYLOAD, not a target root, so
+    /// `deps`, `incremental`, `build`, `.fingerprint` and artifact files of any
+    /// name are Cargo's and never foreign entries. An unknown directory and a
+    /// symlink still are, and the payload rule is not widened to target roots.
+    #[test]
+    fn a_profile_payload_never_calls_cargo_payload_foreign() {
+        let root = scratch("payload");
+        let payload = root.join("owned/debug");
+        profile_payload(&payload);
+        let clean = plan(&payload, None, true, &[], true).unwrap().unwrap();
+        assert!(clean.foreign.is_empty(), "{:?}", clean.foreign);
+        std::fs::create_dir_all(payload.join("handover")).unwrap();
+        std::fs::write(payload.join("handover/tool"), "keep").unwrap();
+        symlink(&root, payload.join("link")).unwrap();
+        let mixed = plan(&payload, None, true, &[], true).unwrap().unwrap();
+        assert_eq!(mixed.foreign, os(&["handover", "link"]));
+        // The same names are NOT Cargo's at a target root.
+        let as_target = plan(&payload, None, true, &[], false).unwrap().unwrap();
+        assert!(
+            as_target
+                .foreign
+                .iter()
+                .any(|name| name.to_string_lossy() == "deps"),
+            "{:?}",
+            as_target.foreign
+        );
+        assert!(
+            as_target
+                .foreign
+                .iter()
+                .any(|name| name.to_string_lossy() == "app"),
+            "{:?}",
+            as_target.foreign
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// oxide#133 P1: in the profile layout `target` is a REAL directory. A
+    /// whole clean keeps it, keeps every owned member link and the real triple
+    /// directory that holds a nested link, and still plans the payload around
+    /// them: preserving a directory never skips the walk inside it.
+    #[test]
+    fn a_real_profile_target_and_its_member_ancestors_are_kept() {
+        let root = scratch("profile-target");
+        let target = root.join("target");
+        let owned = root.join("owned");
+        profile_payload(&owned.join("debug"));
+        std::fs::create_dir_all(target.join("aarch64-apple-darwin")).unwrap();
+        // A real directory BESIDE the nested member link inside the kept
+        // triple directory: it is still planned for removal.
+        std::fs::create_dir_all(target.join("aarch64-apple-darwin/tmp")).unwrap();
+        std::fs::create_dir_all(target.join("tmp")).unwrap();
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature").unwrap();
+        symlink(&owned.join("debug"), target.join("debug")).unwrap();
+        symlink(
+            &owned.join("debug"),
+            target.join("aarch64-apple-darwin/debug"),
+        )
+        .unwrap();
+        let preserve = vec![
+            target.clone(),
+            target.join("debug"),
+            target.join("aarch64-apple-darwin"),
+            target.join("aarch64-apple-darwin/debug"),
+        ];
+        let planned = plan(&target, None, false, &preserve, false)
+            .unwrap()
+            .unwrap();
+        // The real target directory itself is never planned for removal.
+        assert!(!planned.entries.iter().any(|entry| entry.path == target));
+        assert!(planned.preserved.contains(&target));
+        // Links and the triple ancestor are kept, but their siblings are still
+        // planned, so keeping an ancestor cannot skip a clean.
+        assert!(planned
+            .preserved
+            .contains(&target.join("aarch64-apple-darwin")));
+        assert!(planned.preserved.contains(&target.join("debug")));
+        assert!(planned
+            .entries
+            .iter()
+            .any(|entry| entry.path == target.join("tmp")));
+        assert!(planned
+            .entries
+            .iter()
+            .any(|entry| entry.path == target.join("CACHEDIR.TAG")));
+        assert!(planned
+            .entries
+            .iter()
+            .any(|entry| entry.path == target.join("aarch64-apple-darwin/tmp")));
+        // Removal leaves the kept target, links and ancestor in place.
+        remove(&planned).unwrap();
+        assert!(target.is_dir());
+        assert!(std::fs::symlink_metadata(target.join("debug"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(target.join("aarch64-apple-darwin/debug").is_symlink());
+        assert!(!target.join("tmp").exists());
+        assert!(!target.join("CACHEDIR.TAG").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// oxide#133 P1, ROOT check: descending a retained real triple directory
+    /// must not quietly accept the entries BESIDE the owned member link. An
+    /// unknown directory, an unknown file and a generic symlink there are
+    /// foreign, so an ordinary clean refuses before any effect instead of
+    /// deleting them because they sit below a kept ancestor.
+    #[test]
+    fn a_foreign_entry_beside_a_retained_triple_link_is_refused() {
+        let root = scratch("profile-foreign");
+        let target = root.join("target");
+        let owned = root.join("owned");
+        profile_payload(&owned.join("debug"));
+        let triple = target.join("aarch64-apple-darwin");
+        std::fs::create_dir_all(triple.join("tmp")).unwrap();
+        symlink(&owned.join("debug"), triple.join("debug")).unwrap();
+        let preserve = vec![target.clone(), triple.clone(), triple.join("debug")];
+        // Only the retained link and real Cargo payload: nothing foreign.
+        let clean = plan(&target, None, false, &preserve, false)
+            .unwrap()
+            .unwrap();
+        assert!(clean.foreign.is_empty(), "{:?}", clean.foreign);
+        // One of each kind beside the retained link.
+        std::fs::create_dir_all(triple.join("handover")).unwrap();
+        std::fs::write(triple.join("handover/tool"), "keep").unwrap();
+        std::fs::write(triple.join("notes.txt"), "").unwrap();
+        symlink(&root, triple.join("link")).unwrap();
+        let mixed = plan(&target, None, false, &preserve, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mixed.foreign,
+            os(&[
+                "aarch64-apple-darwin/handover",
+                "aarch64-apple-darwin/link",
+                "aarch64-apple-darwin/notes.txt",
+            ])
+        );
+        // An ordinary clean refuses with every affected path named, and the
+        // plan that would have removed them is never returned.
+        let refused = checked_plan(&target, None, false, false, &preserve, false).unwrap_err();
+        assert!(refused.contains("3 entries"), "{refused}");
+        assert!(
+            refused.contains("aarch64-apple-darwin/handover"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("aarch64-apple-darwin/notes.txt"),
+            "{refused}"
+        );
+        assert!(refused.contains("--include-foreign"), "{refused}");
+        // With --include-foreign the same entries ARE planned for removal, so
+        // the refusal above is the real gate and not an empty plan.
+        let included = checked_plan(&target, None, true, false, &preserve, false)
+            .unwrap()
+            .unwrap();
+        for name in ["handover", "link", "notes.txt"] {
+            assert!(
+                included
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == triple.join(name)),
+                "{name}"
+            );
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

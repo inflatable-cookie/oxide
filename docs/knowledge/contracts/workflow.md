@@ -3371,6 +3371,312 @@ refused when Git would track it; and `detach` restoring a real directory in
 ephemeral mode (permanent mode: oxide#124). Not a benchmark, real-drive
 qualification or an alias for full QA.
 
+### Owned output members at profile directories (oxide#133)
+
+The bound v1 successor to the whole-target placement. `<checkout>/target`
+itself stays a **real directory**; only positively identified profile members
+become owned links. Cargo's top-level files (`CACHEDIR.TAG`,
+`.rustc_info.json`), `target/tmp` and tool directories such as `target/doc`
+stay real.
+
+**Known detach limitation.** `oxide outputs detach` currently refuses safely
+when an owned host-triple member such as `target/aarch64-apple-darwin/debug`
+is present: it classifies that nested link as foreign and leaves it untouched.
+Detach on non-target checkouts remains as before. Target-member detach and the
+remaining native cases need the separately scoped correction; do not remove
+links or weaken ownership checks to work around this refusal.
+
+- **Members and destinations.** A converted checkout's `target` is real and
+  each linked member selects its own approved subpath beneath the shared root
+  (`R/debug`, `R/release`, `R/<triple>/debug`, `R/<triple>/release`); the root
+  keeps one immutable nonce, marker and creation generation. `run` maps a
+  Cargo-reported program beneath its own owned member's link only; a real
+  (unlinked) member keeps Cargo's own executable path, so a mixed checkout
+  never runs another member's artifact. An internal-pool fallback slot refuses
+  before Cargo while an external member link is live, and a command whose fresh
+  plan no longer selects a member's committed external root (a still-mounted
+  volume that became unusable after the slot was keyed) refuses before Cargo
+  too, with or without a fallback slot and whatever the live link looks like:
+  an owned external member is never moved to another pool automatically, and
+  only an explicit adopt changes where a member is placed. That holds for a
+  plan the production planner derived itself, which falls back to the local
+  spec when the registered volume cannot be verified, not only for a plan
+  supplied to binding. An explicit adopt
+  compares the live link with the desired destination (relinking under custody
+  on a fallback or redock rather than trusting an old receipt match). A profile
+  clean is validated before the legacy whole-target pre-gate, plans each
+  member destination once, and preserves links, root markers and unrelated
+  payloads. In the profile layout `<checkout>/target` is REAL, so a whole
+  clean keeps the target directory itself, every owned member link and every
+  real ancestor directory that holds a nested link (a `<triple>` directory),
+  and removes the payload around them; keeping a kept directory never skips
+  the walk inside it. A retained triple directory is itself a classification
+  boundary: the entries beside its owned member link are held to the same
+  foreign-entry policy, and the refusal names each of them relative to the
+  target (`<triple>/<name>`), so nothing below a kept ancestor is deleted
+  unexamined. An owned member root holds payload, not a target root:
+  its `deps`, `incremental`, `build`, `.fingerprint`, `examples` and artifact
+  files of any name are Cargo's, while an unknown directory or a symlink in it
+  is still foreign and refuses. Prune eligibility and candidate construction
+  are per
+  `(checkout, root)` with a first-sorted representative: a root under one
+  checkout is ONE owner, so its own sibling members never keep each other,
+  while a reference from a different checkout does keep the root. A dangling
+  member link never transitions automatically (a command on an internal
+  fallback names the fallback and `oxide outputs adopt`), and a debug-only stop
+  after the fixed terminal image is published (before settlement) exercises
+  exact-image replay.
+- **Adding a member to a root that already exists.** The transition that
+  created a root consumed its reservation, so a later member of the same root
+  (a host `--target` triple after `debug`, say) needs none: the keyed root must
+  still be one the receipt currently selects, with the same kind, volume,
+  nonce and the root's own immutable creation generation, and must pass the
+  full marker and device check. A placement keys the root's creation
+  generation, never the placement revision that committed it. A nested
+  `<triple>` member's real ancestor directory inside the checkout's `target` is
+  created exclusively before its link is published; a symlink, a file or any
+  other entry there refuses, and nothing outside that target is created.
+- **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and
+  `<triple>/release`. A member has at most two components matching
+  `[A-Za-z0-9_.-]+`, is neither `.` nor `..`, and is never absolute or an
+  escape; members are unique and prefix-free, at most eight per command and 32
+  per receipt. Existing real nonempty member directories are never moved or
+  converted (they are used locally with a notice), a real empty member
+  directory converts only under an explicit `oxide outputs adopt`, and a
+  foreign link refuses. Every first link also checks the actual Git
+  ignore/tracked state of `target/<member>`; a winning parent `target/` ignore
+  is allowed, unknown answers refuse.
+- **Classification and declarations.** `check`, `build`, `run`, `test`,
+  `clippy`, `rustc` and `fix` with `quick`/`debug` map to `debug`, `--release`
+  to `release`. Plain `bench` maps to `release` (Cargo's release-based bench
+  profile) while `bench --profile quick|debug` follows `dev` and maps to
+  `debug`. `doc`/`rustdoc` compile the selected profile's units and are
+  classified the same way, while `target/doc` stays a real tool directory.
+  Every `--target`/`--target=` before `--` is parsed, deduplicated and expands
+  the selected member; more than eight total refuses. Only plain triples are
+  modelled: a JSON target specification, `CARGO_BUILD_TARGET`, `--config
+  build.target` and a configured `build.target` are unknown, and the existing
+  refusal for a modelled `--profile` other than quick/debug/release is
+  unchanged. `oxide exec --output <member>` is repeatable and COMPLETE: the
+  caller declares the tool's entire profile-output set, only the four member
+  forms are accepted, the same validation and eight-total cap apply, and the
+  tool's argv after `--` is untouched. A tool that supplies its own `--target`
+  needs the matching `<triple>/…` declaration in that project's selector; this
+  task changes no consumer selector. A profile checkout with any owned member
+  link refuses a command that declares none before Cargo, naming `oxide exec
+  --output` and `oxide outputs detach`; an unlinked checkout runs it locally as
+  before. Legacy whole-target checkouts keep today's behaviour until explicit
+  migration.
+- **Custody, keys and binding.** Every create, relink, fallback return,
+  detach, clean, migration and replay waits for all checkout writers under the
+  existing barrier, binding mutex and positive cross-pool closure; an unknown
+  writer is never downgraded to clear. The order is: classify; durably reserve
+  a root nonce if needed; plan the sorted destination set; resolve the slot
+  key; release pre-lease custody locks; acquire the lease; then under binding
+  validate the exact surviving reservation, layout and every keyed destination
+  while excluding only this command's own record. Linked profile keys render
+  one `outputs-3 <nonce> <kind> <root> <volume> g<generation> <member>` line
+  per owned member and `real <member>` for a real directory, so a linked and a
+  real member never share a warm slot; legacy whole-target keys stay exactly
+  `outputs-2`. Adding a member to a root preserves the root's nonce; a
+  reservation is root-level and may not be cancelled while another member's
+  consumer owns it. A command whose slot was keyed before the layout changed
+  refuses before Cargo without an automatic retry.
+- **Explicit profile adoption.** `oxide outputs adopt` on a checkout with no
+  receipt selects the profile layout: it creates the real `target`, links the
+  host `debug`/`release` pair (and every member the receipt already places)
+  into one root under the member ignore check, keeps a real nonempty member
+  with a notice, is idempotent, and refuses a legacy whole-target link
+  untouched. `oxide outputs detach` restores real empty member directories,
+  keeps every root and marker, and leaves the receipt detached.
+- **Explicit migration and marker upgrade.** `oxide outputs adopt` on a
+  committed whole-target receipt is the only path that rewrites a legacy
+  placement. It is macOS-only (Linux remains compile-only), runs under the
+  clean barrier, binding mutex and publication custody with all writers
+  closed, and uses exclusive renames; no payload is moved or copied. P0
+  publishes a durable prepared journal pinning the prior receipt digest, the
+  exact target-link text/dev/ino, the parent identity and — for a root/1
+  marker — the marker's dev/ino/SHA plus ONE freshly reserved root nonce. P1
+  creates the transaction's staging directory with only classified member
+  links into the same root and records its identity. The classified set is the
+  host `debug`/`release` pair plus, one bounded component down, the `debug` and
+  `release` directories of each positively identified plain triple directory
+  in the old root; a linked triple directory, a JSON target specification, a
+  custom profile, a third component and every other entry are never
+  classified, and each `<triple>` becomes a real ancestor directory in the new
+  target holding only its own owned member links. The root/1 marker is
+  exclusively renamed to a transaction backup and the root/2 successor is
+  published without replacement, preserving owner, recipe, kind, volume,
+  the original root-creation generation and its original creation timestamp,
+  so only the marker version and the reserved nonce change. P2 exclusively renames the old target
+  link to its recorded backup and P3 exclusively publishes the staging
+  directory as the real target; only the staging INODE recorded at P1 is ever
+  published, so a directory replaced in between with identically shaped links
+  is refused or left pending, and a creator of `target` is preserved and leaves
+  the transaction pending. The COMMIT is reachable only through that same
+  staged inode and requires the pinned pre-P4 backup of the old whole-target
+  link (and, for a root/1 upgrade, the pinned old-marker backup) to still be
+  present with its recorded inode and bytes; a lookalike target directory, a
+  missing or substituted backup leaves the transaction pending instead of
+  committing. P4 verifies the final real directory and exact
+  member link set and commits the receipt, root/2 nonce and outputs-3 member
+  references — the COMMIT point, never rolled back. Journaled backups are
+  removed only under their pinned identities before the journal is dropped.
+  Replay advances only exact recorded identities, including a crash before a
+  phase record; ambiguous identity, a foreign creator, a lost volume, a
+  missing required backup or an unrecognised phase stays pending. For a root/1
+  upgrade the pinned old-marker backup must be POSITIVELY present under the
+  recorded root with its exact inode and bytes before any pre-P4 target rename
+  or staging publication, not merely recorded as a pathname, and a replaced
+  backup with the same bytes but a new inode is refused. A pre-P4
+  rollback restores the exact old marker from its pinned backup, the old
+  target link and the published /2 receipt, and retires the reserved nonce;
+  every rollback effect verifies the recorded parent first and removes only
+  the transaction's own staged inode. The debug-only `OXIDE_TEST_MIGRATION_ROLLBACK` hook and
+  `OXIDE_TEST_OUTPUTS_CRASH=migration-<phase>` crashes exist only in debug
+  builds.
+- **Formats and upgrade.** State version 4 carries the successor fence
+  `owned_outputs: "oxide.outputs/3"`; receipts are
+  `oxide.outputs.transition/3` (layout profile, one placement per member,
+  root-level reservation), the registry is `oxide.outputs.registry/2` schema 2
+  with one reference per member, and the plan is `oxide.outputs.plan/2`. The
+  published `/2` receipt shape, whole-target link, `outputs-2` destination
+  key and in-placement reservation are never redefined; a legacy registry
+  reference keeps member `target` and a schema-1 document reads unchanged.
+  Root/2 marker shape and existing root nonces are unchanged. The fence is
+  published internal-first, then in the paired removable control, only after
+  complete bounded authority reads and positive writer closure across both
+  pools; a missing, inaccessible, corrupt or sticky-incomplete authority
+  refuses and is never rebuilt. A `/2`-fenced pool keeps numeric state version
+  3 so a state-3 binary still runs it; state 4 is forward-only after the
+  successor fence. Status reports the layout and each member's live state, and
+  each leased command on a legacy checkout prints ONE notice naming
+  `oxide outputs adopt`.
+- **Multi-member prune and clean.** All verified members of one root under the
+  same checkout identity form ONE owner; another checkout's reference keeps the
+  root. A prune intent atomically marks every row of the (checkout, root)
+  group and durably records the prior receipt SHA and the complete sorted group
+  (member, generation, nonce, device/inode, marker digest and selection
+  flags). Replay verifies that exact group and the receipt BEFORE recomputing
+  each row's selection; a missing, corrupt or changed receipt, a missing or
+  extra row, a contradictory identity or a pending reference keeps the root
+  (pending/KEEP). The group is stored COMPLETE, never filtered to selected
+  rows: the SELECTED subset is the checkout's current authority and must match
+  the receipt's current placements for this root exactly (member, generation,
+  nonce), while registry-only inactive history — for example a legacy `target`
+  row kept after an explicit migration, with no nonce or an older marker digest
+  — is separately pinned evidence that keeps its own recorded facts and prior
+  role. History is never required to appear in the receipt, never invalidates
+  the upgraded current members and never grants deletion authority. A complete
+  group with ZERO selected rows is valid history for the existing
+  released/Detached-root eligibility (an empty selected subset is not an empty
+  group), and pruning a released root while the receipt currently selects a
+  different root preserves that root and the receipt bytes unchanged. A
+  rollback restores EACH row's own prior selection flag. The receipt's terminal
+  image digest and its FIXED timestamp are durable before publication, and a
+  replay accepts only the recorded preimage or that exact image. `RootIdentity.member` is only the first sorted
+  representative, never the transaction scope. A whole clean plans the
+  checkout target with every owned member link preserved and each owned member
+  root's payload with its marker kept, never follows a generic link, and
+  removes only its plan; a selected clean runs the pool watchdog and the
+  watched leader/group-closure APIs, and the removable watchdog watches volume
+  removal only — not a continuous free-space reserve.
+- **Limits.** Migration, external roots and drive handling are macOS-only;
+  Linux is compile-only. A profile-layout migration of a checkout whose root
+  marker is root/1 reserves its new nonce in the migration journal (never via
+  the unused-root cancellation journal). Automatic custom-profile linking,
+  consumer adoption, live prune, host installation and release actions are
+  outside this task.
+
+**Proof (oxide#133).** `scripts/test-profile-outputs.py` publishes the fixed
+20-case matrix for this design, updated for the corrected distinct member
+destinations (each linked member must select `root/<member>`), the positive
+selected-removable and low-reserve controls, the honest top-level lifecycle and
+the real peer-receipt KEEP, the two base-created legacy fixtures prepared under
+one base-compatible registration before any candidate successor-fence effect,
+and a case-11 registry predicate that separates the selected profile group from
+retained legacy history (a history row without a nonce is non-selected history,
+never a live reference), a real `run` control that executes the artifact of its
+own linked member, and a specific other-owner KEEP reason in the peer-receipt
+oracle; the fixture's own registry/receipt pairs agree member-for-member with
+that rule; and a failure-custody control that settles only the gated children
+this script created, through the existing bounded helpers, and keeps anything
+unestablished unclosed and detach-blocking: one private session per side with
+one owned
+128 MiB scratch APFS image, a private `HOME`, `CARGO_HOME` and directory pool,
+a separately staged base `4a70b83` binary and this HEAD's candidate staged
+offline with 1.97.1 from authenticated pinned source, with asserted distinct
+binary hashes and state-3/state-4 capability probes. It runs under the
+qualified shared supervisor (`scripts/bounded-test.py`, SHA-256
+`961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052`, the
+oxide#142 monitor qualified at main `791f552`; this proof was bound to its
+predecessor `d89115f1…` before that qualification and those runs stay
+historical) as
+`bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3
+scripts/test-profile-outputs.py`; the script prints its own phase allocation
+and assertions with `--plan`. The root owner's scoped amendment
+(2026-10-23T16:10Z) makes this proof 600 s TOTAL instead of 420 (the old 420 s
+publication at 030836f6 is historical and unactivated), with a helper work
+cutoff of about 565 s (its 30 s reserve plus a 5 s refusal margin) inside which
+cleanup and image detach must finish; scratch stays 512 MiB and no runner or
+split-proof change is granted. The published 360-540 s work estimate remains
+UNMEASURED, not an established fit, and independent source-fit may still
+refuse it. Its static disk allocation is 288 MiB staging peak + 128 MiB image
+backing + 48 MiB fixtures + 32 MiB evidence + 16 MiB margin = 512 MiB. CPU controls support a 6 CPU / 8 GiB planning request: the two
+independent stagings are sequential and each is explicitly bounded to 6 Cargo
+jobs, fixture Cargo children are bounded to 2 jobs with at most two gated
+writers overlapping, and the shared staging helper takes that bound explicitly
+after sanitizing inherited `CARGO_BUILD_*` (its default is unchanged for other
+selectors), so the proof peaks at 6 concurrent Cargo jobs. Its private 128 MiB
+APFS fixture image is attached with `hdiutil attach -owners on` on every attach
+and reattach so the mounted root does not ignore filesystem ownership, and the
+prerequisite is asserted by a bounded read-only mount observation plus the
+product's own registration refusal; no real drive, persistent host ownership
+setting, mount permission or registration safety check is changed. The image
+backing lives in the qualified guard's own evidence directory beside (not
+inside) its monitored scratch, so the same guard root counts it within the
+512 MiB allocation; an ordinary detach is used on success and after a failure,
+and a failed detach fails the proof and retains the backing with its
+device/UUID/image identity for the custodian. The script is fail-closed on
+arguments (`--plan` and `--self-check` are effect-free, anything else refuses). The 128 MiB
+image is registered with a 16 MiB reserve and a 64 MiB admission cap, a positive
+control proves an external root is really selected before any external-root
+oracle, and a separate deliberate low-reserve control temporarily raises the
+private pool's recorded registration reserve to 200 MiB and restores its exact
+bytes to prove the honest local fallback; a `/target/` parent-ignore control
+proves a directory-only rule refuses the legacy link but accepts profile members;
+a benign ordinary target-root file on its own checkout makes the top-level
+preservation control nonvacuous (a clean of that checkout must refuse the file
+as foreign and succeed after its removal), a real peer checkout receipt for the
+same root proves another reference keeps it, and `CACHEDIR.TAG`/`.rustc_info.json`
+are asserted real only when present.
+
+**Evidence and acceptance limits, 2026-10-24.** Tom explicitly accepted source
+`a5020b5d93e3c6d658d2660ab9c0fcb8a7fa641f` as-is after the ninth counted native
+failed; this is operator acceptance, not a native or independent review PASS.
+Independent exact-head source/fit reviews passed. The two author runs and all
+nine counted native attempts remain FAIL with zero PASS; the single uncounted
+diagnostic is spent and is not qualification evidence. Counted attempt 9 ran
+the default proof under guard `961164e7` with the explicit direct physical-host
+exception and quiet-host waiver. It completed 14 distinct cases (11 and 01–14,
+with 11 counted once), then failed case 15 when detach rejected the host-triple
+member link. Cases 16–20 remain unexecuted. The guard reported closed, status 1,
+no fault or deadline, certain empty census, and 97.8 MiB monitored whole-root
+peak within 512 MiB; raw EPERM signal results remain in its receipt. Closure
+does not turn the assertion failure into a PASS. The helper and guard receipts
+are distinct. Tom's final acceptance supersedes the earlier conditional
+full-matrix requirement; it does not report that condition fulfilled. No further
+native is authorized for this accepted task. The target-member detach follow-up
+starts from that failure packet and must exercise cases 15–20, without inheriting
+a proof allowance or claiming they already passed. Historical UNCLOSED runs and
+retained unknown backing stay separate from this closed failure.
+
+The script also has an explicitly opt-in `--diagnostic` collection mode. It
+records recoverable oracle failures and skips dependent or tainted premises,
+while unknown device/writer effects and infrastructure errors abort. Its bounded
+receipt is marked diagnostic and unqualified; it never supplies counted PASS
+or closure credit. The default counted mode remains fail-fast.
+
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
 `scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same
 fixture, as the whole command of the qualified shared supervisor (300 s,
@@ -3482,7 +3788,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 - **Nonces and keys.** Every root creation or recreation draws a fresh random 128-bit lowercase-hex nonce. The output destination key includes the nonce, root, volume UUID and recipe; legacy `outputs-1` keys stay distinct and no recreated root claims a warm legacy root. An existing root keeps its marker's nonce.
 - **Registry and overflow.** Rows are keyed by checkout, placement member and root; revision advances before every changed receipt, selection or root effect, and the registry is read as one bounded whole snapshot (8192 files, 64 MiB, 10 s). The live registry is capped at 4096 rows and 4 MiB. Before a cap-exceeding unindexed selection the registry records sticky incompleteness durably; that write failing refuses adoption before its effect, and prune then keeps every root with an explicit reason. The incomplete flag is never cleared by this tranche.
 - **Status.** Default `oxide status` reads only the bounded recorded `outputs/prune-observations.json` (`oxide.outputs.prune-observations/1`, at most 256 KiB and 512 roots) in the pool section. It performs no root walk, replay, lock or reconciliation. Coverage, source and time are explicit; a partial observation never becomes a global orphan total. `--measure` does not scan output roots for prune.
-- **Nonce reservation.** A building command reserves its future root's nonce after automatic adoption and before `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding lock (released before the slot wait) and the internal publication lock: the receipt's `target` placement records `reserved` (transaction ID, fresh random nonce, root, kind, volume UUID, generation) and the registry a pending row with the same transaction and nonce, in one write-ahead publication. An existing root keys its marker nonce; a future root keys only its reserved nonce, never a missing root's old one. Starters for the identical future root share one uncancelled reservation; the commit that creates the root consumes it. Binding validates the exact surviving reservation (receipt, keyed nonce, registry row with no cancellation) before Cargo and refuses a cancelled, replaced or absent one with no automatic retry. `oxide outputs cancel-reservation` (and `detach`, and a starter that needs a different future root) cancels only under the checkout's binding with every writer clear, the reserved root absent and no prune intent: the registry first records the cancellation (authority invalidated, revision advanced), then the receipt commits without it, then the abandoned row is removed; an interrupted cancellation is finished only for its exact recorded transaction. A cancelled nonce is never reused. `oxide outputs plan` stays read-only.
+- **Nonce reservation.** A building command reserves its future root's nonce after automatic adoption and before `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding lock (released before the slot wait) and the internal publication lock: the receipt's `target` placement records `reserved` (transaction ID, fresh random nonce, root, kind, volume UUID, generation) and the registry a pending row with the same transaction and nonce, in one write-ahead publication. An existing root keys its marker nonce; a future root keys only its reserved nonce, never a missing root's old one. Starters for the identical future root share one uncancelled reservation; the commit that creates the root consumes it. Binding validates the exact surviving reservation (receipt, keyed nonce, registry row with no cancellation) before Cargo and refuses a cancelled, replaced or absent one with no automatic retry. `oxide outputs cancel-reservation` (and `detach`, and a starter that needs a different future root) cancels only under the checkout's binding with every writer clear, the reserved root absent and no prune intent: the registry first records the cancellation (authority invalidated, revision advanced), then the receipt commits without it, then the abandoned row is removed; an interrupted cancellation is finished only for its exact recorded transaction. A cancelled nonce is never reused. `oxide outputs plan` stays read-only. The pre-lease reservation applies binding's P4 precondition exactly, so a command that binding will refuse for it changes no authority — no `reserved` field, no generation, no updated timestamp, no link text (oxide#133 case14). That precondition is per REQUESTED member and only for a profile-layout receipt: a requested member whose committed placement is external while this command's fresh selection is not. A member the receipt does not place, a whole-target receipt, and any command whose fresh selection is still external keep their reservation — a whole-target local fallback and a new member beside a committed external sibling both need it for `reservation_matches`. Every other refusal (an unmodelled command, an empty `exec` declaration) still decides after the reservation.
 - **Overflow.** When a reservation would exceed the live row cap, the registry durably records sticky incompleteness and the reservation is retried once with an explicit overflow tag (registry identity, transaction, nonce, revision as provenance) and no registry row. Binding validates that exact tag against the same sticky-incomplete registry and the overflow cancellation journal; an unrelated revision advance never refuses it. Prune keeps the whole batch while the registry is incomplete, and the flag is never cleared by this tranche.
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.
 - **Tombstones.** After a positive completion (both the registry terminal state and the receipt's terminal state committed), the completed row and the settled intent leave the live registry in one revision, and a diagnostic entry is appended best effort to `outputs/tombstones.json` (`oxide.outputs.tombstones/1`, at most 16,384 entries and 4 MiB, oldest compacted first). The ring is never a safety journal or a live cap; unfinished intents and reservations stay in the registry and are never compacted. A recreated root always gets a fresh nonce.

@@ -56,6 +56,14 @@ fn is_building_builtin(command: &str) -> bool {
     matches!(command, "doc" | "bench" | "rustc" | "rustdoc" | "fix")
 }
 
+/// Whether Oxide models this command's profile outputs. Modelled commands and
+/// the building built-ins do; an external or unknown subcommand's output
+/// directories are opaque, so a profile checkout refuses it unless the caller
+/// declares them with `oxide exec --output`.
+pub(crate) fn models_profile_outputs(command: &str) -> bool {
+    classify(command) == Class::Modelled || is_building_builtin(command)
+}
+
 /// Whether Cargo itself reads this leased command's `--config` arguments.
 /// An external subcommand receives them as its own.
 pub fn reads_config_args(command: &str) -> bool {
@@ -148,7 +156,17 @@ pub struct Invocation {
     /// `run` only: the caller asked for JSON messages on stdout.
     pub json_messages: bool,
     pub manifest_path: Option<PathBuf>,
+    /// The first `--target` value before `--`, which keys the slot.
     pub target: Option<String>,
+    /// Every `--target` value before `--`, in order: each one selects a
+    /// profile output member (`<triple>/debug` or `<triple>/release`).
+    pub targets: Vec<String>,
+    /// Whether the caller named a profile; `bench` without one builds the
+    /// release-based bench profile, whose output directory is `release`.
+    pub explicit_profile: bool,
+    /// `exec` only: every `--output <member>` declaration, in order. The
+    /// caller declares the tool's complete profile-output set.
+    pub declared_outputs: Vec<String>,
     /// `exec` only: the tool and its arguments, spawned as given.
     pub tool: Vec<OsString>,
     /// Opt-in per-command admission and execution budgets (oxide#140).
@@ -189,6 +207,7 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
     let args = &args[..];
     let mut profile = None;
     let mut manifest_path = None;
+    let mut declared_outputs = Vec::new();
     let mut iter = args.iter();
     let mut tool = None;
     while let Some(argument) = iter.next() {
@@ -227,6 +246,17 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
             }
             continue;
         }
+        if let Some(name) = value("--output")? {
+            // Validate the member form here, before any effect.
+            crate::layout::Member::parse(&name)?;
+            if declared_outputs.iter().any(|declared| declared == &name) {
+                return Err(format!(
+                    "--output {name} is given more than once; one declaration is enough"
+                ));
+            }
+            declared_outputs.push(name);
+            continue;
+        }
         if text == "--release" || text == "-r" {
             return Err("exec takes --profile release, not --release".to_owned());
         }
@@ -239,6 +269,12 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
     if tool.first().is_none_or(|program| program.is_empty()) {
         return Err("exec needs a command after `--`".to_owned());
     }
+    // The complete declaration is validated as one set: bounded, unique and
+    // prefix-free.
+    let declared = crate::layout::declared(&declared_outputs)?;
+    if declared.members().len() != declared_outputs.len() {
+        return Err("two --output declarations name the same member".to_owned());
+    }
     Ok(Some(Invocation {
         command: "exec".to_owned(),
         profile: profile.unwrap_or(Profile::Quick),
@@ -247,6 +283,9 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
         json_messages: false,
         manifest_path,
         target: None,
+        targets: Vec::new(),
+        explicit_profile: profile.is_some(),
+        declared_outputs,
         tool,
         budget,
         package: None,
@@ -260,7 +299,8 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     refuse_storage_overrides(args)?;
     let package = package_selection(args);
     let manifest_path = flag_value(args, "--manifest-path").map(PathBuf::from);
-    let target = flag_value(args, "--target");
+    let targets = flag_values(args, "--target");
+    let target = targets.first().cloned();
     let modelled = classify(command) == Class::Modelled;
     if !modelled && !is_building_builtin(command) {
         // External and unknown subcommands receive their arguments untouched.
@@ -274,6 +314,9 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
             json_messages: false,
             manifest_path,
             target,
+            targets,
+            explicit_profile: false,
+            declared_outputs: Vec::new(),
             tool: Vec::new(),
             budget,
             package,
@@ -371,6 +414,9 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
         json_messages,
         manifest_path,
         target,
+        targets,
+        explicit_profile: selected.is_some(),
+        declared_outputs: Vec::new(),
         tool: Vec::new(),
         budget,
         package,
@@ -447,6 +493,33 @@ fn flag_value(args: &[OsString], flag: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Every value of `--flag value` and `--flag=value` before any `--`, in the
+/// caller's order. Repeated `--target` values each select a profile output
+/// member.
+fn flag_values(args: &[OsString], flag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut iter = args.iter();
+    let prefix = format!("{flag}=");
+    while let Some(argument) = iter.next() {
+        let Some(text) = argument.to_str() else {
+            continue;
+        };
+        if text == "--" {
+            break;
+        }
+        if text == flag {
+            if let Some(value) = iter.next().and_then(|value| value.to_str()) {
+                values.push(value.to_owned());
+            }
+            continue;
+        }
+        if let Some(value) = text.strip_prefix(&prefix) {
+            values.push(value.to_owned());
+        }
+    }
+    values
 }
 
 /// `--manifest-path`, for commands Oxide does not otherwise parse.
@@ -573,6 +646,27 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_modelled_commands_and_building_builtins_have_profile_outputs() {
+        for command in [
+            "check", "build", "run", "test", "clippy", "doc", "bench", "rustc", "rustdoc", "fix",
+        ] {
+            assert!(models_profile_outputs(command), "{command}");
+        }
+        // An external or unknown subcommand's output directories are opaque:
+        // a profile checkout must refuse it rather than assume `debug`.
+        for command in [
+            "nextest",
+            "deny",
+            "audit",
+            "outdated",
+            "machete",
+            "custom-tool",
+        ] {
+            assert!(!models_profile_outputs(command), "{command}");
+        }
     }
 
     #[test]

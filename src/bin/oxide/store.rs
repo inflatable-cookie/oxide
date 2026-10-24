@@ -64,12 +64,16 @@ pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 /// permanent version-2 fence is actually written.
 const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Permanent control-state fence for revised Store mutations (oxide#118).
-/// Version 3 carries the owned-outputs registry initialization transaction
-/// (oxide#129); version 2 remains readable until the forward fence upgrades
-/// it.
-pub(crate) const STATE_VERSION: u32 = 3;
-/// Version 2 (oxide#128) is read with the strict version-3 field bounds.
-const PREVIOUS_STATE_VERSION: u32 = 2;
+/// Version 4 carries the profile-member owned-outputs fence (oxide#133);
+/// version 3 (the whole-target registry transaction) and version 2 remain
+/// readable until the forward fence upgrades them.
+pub(crate) const STATE_VERSION: u32 = 4;
+/// Version 3 (oxide#129) is the unfenced-shape successor of version 2: a pool
+/// with the whole-target `oxide.outputs/2` fence keeps it so a state-3 binary
+/// can still run.
+const PREVIOUS_STATE_VERSION: u32 = 3;
+/// Version 2 (oxide#128) is read with the same strict field bounds.
+const OLDER_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
@@ -97,10 +101,12 @@ const MAX_LOST_OBJECT_BYTES: usize = 8 * 1024;
 const MAX_HOLDER_OBJECT_BYTES: usize = 5 * 1024;
 const MAX_STATE_HEADER_BYTES: usize = 4 * 1024;
 /// The owned-outputs fence value; see [`State::owned_outputs`].
-pub(crate) const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/2";
-/// The version-1 owned-outputs fence is readable until the version-2 fence and
-/// registry initialization transaction replace it (oxide#129).
-const LEGACY_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
+pub(crate) const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3";
+/// The published whole-target fence: read unchanged (its legacy receipts keep
+/// their place and key) and upgraded only by the explicit successor
+/// transaction. Version 1 is the released original.
+const LEGACY_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/2";
+const RELEASED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
 const MAX_INIT_TRANSACTION_BYTES: usize = 64;
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
@@ -1848,6 +1854,7 @@ impl Store {
             let mut state = store.load()?;
             if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
                 if state.owned_outputs.as_deref() != Some(LEGACY_OWNED_OUTPUTS_FENCE)
+                    && state.owned_outputs.as_deref() != Some(RELEASED_OWNED_OUTPUTS_FENCE)
                     && state.owned_outputs.is_some()
                 {
                     return Err(format!(
@@ -1911,10 +1918,17 @@ impl Store {
                 ..
             }) => {
                 if internal_state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
-                    return Err(
-                        "the internal control records a ready output registry without the version-2 fence; refusing"
-                            .to_owned(),
-                    );
+                    // The published whole-target fence is upgraded to the
+                    // successor only with positive writer closure across both
+                    // pools, internal fence first (oxide#133).
+                    self.upgrade_outputs_fence(own_checkout, &recorded)?;
+                    internal_state = internal.load()?;
+                    if internal_state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+                        return Err(
+                            "the internal control records a ready output registry without the successor fence; refusing"
+                                .to_owned(),
+                        );
+                    }
                 }
                 // A new or reappearing paired control is fenced and marked
                 // ready under the exact recorded transaction before any
@@ -1930,7 +1944,22 @@ impl Store {
                     let mut state = sibling.load()?;
                     match &state.outputs_init {
                         Some(OutputsInit::Ready { transaction, .. })
-                            if transaction == &recorded => {}
+                            if transaction == &recorded =>
+                        {
+                            if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+                                if state.owned_outputs.as_deref().is_some_and(|fence| {
+                                    fence != LEGACY_OWNED_OUTPUTS_FENCE
+                                        && fence != RELEASED_OWNED_OUTPUTS_FENCE
+                                }) {
+                                    return Err(
+                                            "the paired pool carries an unknown owned-outputs fence; refusing"
+                                                .to_owned(),
+                                        );
+                                }
+                                state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                                sibling.save(&state)?;
+                            }
+                        }
                         Some(OutputsInit::Ready { .. }) => return Err(
                             "the paired pool records a different ready output registry; refusing"
                                 .to_owned(),
@@ -2003,6 +2032,10 @@ impl Store {
             writers_closed(&sibling.load()?, "the paired", own_checkout)?;
         }
         writers_closed(&internal_state, "the internal", own_checkout)?;
+        if !fresh && internal_state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+            internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+            internal.save(&internal_state)?;
+        }
         if fresh {
             internal_state.outputs_init = Some(OutputsInit::Initializing {
                 transaction: transaction.clone(),
@@ -2071,6 +2104,98 @@ impl Store {
             }
         }
         Ok(true)
+    }
+
+    /// Upgrade the published whole-target fence to the successor, internal
+    /// control first (oxide#133). The caller holds the internal admission and
+    /// is inside its writer-closure window; this takes the paired pool's
+    /// admission so both are held together, and a missing, unreadable or
+    /// contradicting authority refuses and changes nothing.
+    fn upgrade_outputs_fence(
+        &self,
+        own_checkout: Option<&Path>,
+        transaction: &str,
+    ) -> Result<(), String> {
+        let internal_control = self.owner_control().to_path_buf();
+        let internal = self.view(&internal_control);
+        let mut internal_state = internal.load()?;
+        if internal_state.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE) {
+            return Ok(());
+        }
+        match internal_state.owned_outputs.as_deref() {
+            Some(LEGACY_OWNED_OUTPUTS_FENCE) | Some(RELEASED_OWNED_OUTPUTS_FENCE) => {}
+            None => {
+                return Err(
+                    "the internal control records a ready output registry without an owned-outputs fence; refusing"
+                        .to_owned(),
+                )
+            }
+            Some(_) => {
+                return Err(
+                    "the internal control carries an unknown owned-outputs fence; refusing"
+                        .to_owned(),
+                )
+            }
+        }
+        if !matches!(
+            &internal_state.outputs_init,
+            Some(OutputsInit::Ready { transaction: ready, .. }) if ready == transaction
+        ) {
+            return Err(
+                "the recorded output-registry transaction changed while upgrading the fence; refusing"
+                    .to_owned(),
+            );
+        }
+        writers_closed(&internal_state, "the internal", own_checkout)?;
+        let sibling = self
+            .sibling
+            .as_ref()
+            .filter(|sibling| sibling.control != internal_control)
+            .map(|sibling| (self.view(&sibling.control), sibling.barrier));
+        let mut sibling_admission = None;
+        if let Some((sibling, _barrier)) = &sibling {
+            sibling.ensure_control()?;
+            sibling_admission = Some(sibling.admission()?);
+            let state = sibling.load()?;
+            writers_closed(&state, "the paired", own_checkout)?;
+            match state.outputs_init.as_ref() {
+                Some(OutputsInit::Ready {
+                    transaction: ready, ..
+                }) if ready == transaction => {}
+                Some(_) => {
+                    return Err(
+                        "the paired pool records a different output-registry transaction; refusing"
+                            .to_owned(),
+                    )
+                }
+                None => match state.owned_outputs.as_deref() {
+                    None
+                    | Some(LEGACY_OWNED_OUTPUTS_FENCE)
+                    | Some(RELEASED_OWNED_OUTPUTS_FENCE) => {}
+                    Some(_) => {
+                        return Err(
+                            "the paired pool carries an unknown owned-outputs fence; refusing"
+                                .to_owned(),
+                        )
+                    }
+                },
+            }
+        }
+        internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+        internal.save(&internal_state)?;
+        if let Some((sibling, _barrier)) = &sibling {
+            let _admission = sibling_admission.take();
+            let mut state = sibling.load()?;
+            state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+            if state.outputs_init.is_none() {
+                state.outputs_init = Some(OutputsInit::Ready {
+                    transaction: transaction.to_owned(),
+                    ready_ms: process::now_ms(),
+                });
+            }
+            sibling.save(&state)?;
+        }
+        Ok(())
     }
 
     fn view(&self, control: &Path) -> Store {
@@ -3319,14 +3444,16 @@ impl Store {
             .map_err(|error| format!("Oxide state is invalid: {error}"))?;
         let legacy = match state.version {
             LEGACY_STATE_VERSION => true,
-            PREVIOUS_STATE_VERSION | STATE_VERSION => false,
+            OLDER_STATE_VERSION | PREVIOUS_STATE_VERSION | STATE_VERSION => false,
             _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
         };
         if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
             return Err("Oxide state exceeds its byte limit".to_owned());
         }
         if state.owned_outputs.as_deref().is_some_and(|fence| {
-            fence != OWNED_OUTPUTS_FENCE && fence != LEGACY_OWNED_OUTPUTS_FENCE
+            fence != OWNED_OUTPUTS_FENCE
+                && fence != LEGACY_OWNED_OUTPUTS_FENCE
+                && fence != RELEASED_OWNED_OUTPUTS_FENCE
         }) {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
         }
@@ -3343,16 +3470,19 @@ impl Store {
         // fields and object caps first; an oversized legacy field refuses
         // with the original file untouched.
         let mut fenced = state.clone();
-        // The released `oxide.outputs/1` fence is not consent to the version-3
-        // numeric format: a released binary still reads it. Only the version-2
-        // owned-outputs fence or a recorded initialization transaction may
-        // advance the numeric version.
-        let initialized = fenced.outputs_init.is_some()
-            || fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
-        fenced.version = if initialized {
+        // Only the successor `oxide.outputs/3` fence advances the numeric
+        // version to 4. The published `/2` fence keeps version 3 so a state-3
+        // binary still runs a pool it understands, and the released `/1` fence
+        // advances nothing.
+        let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
+        let previous = fenced.outputs_init.is_some()
+            || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
+        fenced.version = if successor {
             STATE_VERSION
-        } else {
+        } else if previous {
             PREVIOUS_STATE_VERSION
+        } else {
+            OLDER_STATE_VERSION
         };
         validate_state(&fenced, false)?;
         let bytes = serde_json::to_vec(&fenced).map_err(|error| error.to_string())?;
@@ -3385,7 +3515,7 @@ impl Store {
 fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
     if !matches!(
         state.version,
-        LEGACY_STATE_VERSION | PREVIOUS_STATE_VERSION | STATE_VERSION
+        LEGACY_STATE_VERSION | OLDER_STATE_VERSION | PREVIOUS_STATE_VERSION | STATE_VERSION
     ) {
         return Err("Oxide state has an unsupported version".to_owned());
     }
@@ -4485,12 +4615,11 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(PREVIOUS_STATE_VERSION))
+            Some(u64::from(OLDER_STATE_VERSION))
         );
-        // A released version-1 owned-outputs fence is not consent to the
-        // version-3 numeric format; only the /2 fence or an init record is.
+        // Neither released fence is consent to a successor numeric format.
         let released = State {
-            owned_outputs: Some(LEGACY_OWNED_OUTPUTS_FENCE.to_owned()),
+            owned_outputs: Some(RELEASED_OWNED_OUTPUTS_FENCE.to_owned()),
             ..State::default()
         };
         internal.save(&released).unwrap();
@@ -4499,9 +4628,31 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(PREVIOUS_STATE_VERSION)),
+            Some(u64::from(OLDER_STATE_VERSION)),
             "a released /1 fence advanced the numeric state version"
         );
+        // The published whole-target fence keeps version 3, so a state-3
+        // binary still runs a pool it understands.
+        let published = State {
+            owned_outputs: Some(LEGACY_OWNED_OUTPUTS_FENCE.to_owned()),
+            outputs_init: Some(OutputsInit::Ready {
+                transaction: "b".repeat(32),
+                ready_ms: 1,
+            }),
+            ..State::default()
+        };
+        internal.save(&published).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&fs::read(internal.control.join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc["version"].as_u64(),
+            Some(u64::from(PREVIOUS_STATE_VERSION)),
+            "the published /2 fence left its numeric version"
+        );
+        // A pool that has not opted into owned outputs initializes from a
+        // fresh state below.
+        internal.save(&State::default()).unwrap();
         let transaction = "a".repeat(32);
         let created = std::cell::Cell::new(0);
         internal
@@ -5286,7 +5437,7 @@ mod tests {
         bounded.records[0].checkout = Some(PathBuf::from("/checkout"));
         store.save(&bounded).expect("bounded legacy state saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], serde_json::json!(PREVIOUS_STATE_VERSION));
+        assert_eq!(stored["version"], serde_json::json!(OLDER_STATE_VERSION));
         assert!(stored.get("owned_outputs").is_none());
         // Only the forward fence (or initialization) advances the numeric
         // version.

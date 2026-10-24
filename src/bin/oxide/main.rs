@@ -19,6 +19,7 @@ mod guidance;
 mod handoff;
 mod identity;
 mod launch;
+mod layout;
 mod outputs;
 mod process;
 mod prune;
@@ -31,6 +32,7 @@ mod wrapper;
 use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
+use layout::Layout;
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;
@@ -413,6 +415,42 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         return Ok(stop_for_admission());
     }
     let store = selected.store;
+    // The declaration is pure parsing and is computed BEFORE the reservation:
+    // the pre-lease reservation needs the same requested member set binding
+    // will use, and a command this checkout refuses on layout or an unmodelled
+    // command name now refuses before any authority write (oxide#133).
+    let declaration = if invocation.command == "exec" {
+        // The caller's declaration is the complete set of the tool's profile
+        // outputs; an opaque tool that declares none is refused in a profile
+        // checkout rather than guessed.
+        layout::declared(&invocation.declared_outputs)?
+    } else if !cli::models_profile_outputs(&invocation.command) {
+        // An external or unknown subcommand's output directories are opaque.
+        // A profile checkout refuses it before Cargo rather than assuming its
+        // dev profile.
+        outputs::refuse_unknown_layout(
+            Some(&output_control),
+            &checkout,
+            &format!(
+                "`{}` is not a command whose profile outputs Oxide models",
+                invocation.command
+            ),
+        )?;
+        layout::Declaration::empty()
+    } else {
+        match layout::classify(
+            &invocation.command,
+            invocation.profile,
+            invocation.explicit_profile,
+            &invocation.targets,
+        ) {
+            Layout::Declared(declaration) => declaration,
+            Layout::Unknown(reason) => {
+                outputs::refuse_unknown_layout(Some(&output_control), &checkout, &reason)?;
+                layout::Declaration::empty()
+            }
+        }
+    };
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
     // released again before this command waits for a slot.
@@ -420,16 +458,20 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         &store,
         Some(&output_control),
         &checkout,
+        &declaration,
         pool_fallback.as_deref(),
     ));
     test_pause("reserved");
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
+    // #133 supplies the profile declaration; #140 keeps the admission window
+    // around the same preparation step.
     let planned = prep!(outputs::planned_destination(
         Some(&output_control),
         &checkout,
-        pool_fallback.as_deref()
+        &declaration,
+        pool_fallback.as_deref(),
     ));
     let destination = outputs::destination_facts(planned.as_ref());
     let key = prep!(SlotKey::resolve_in(
@@ -709,11 +751,13 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
                 && budget::origin().is_none()
                 && (root.is_some() || bounded_run) =>
         {
+            // #133 maps only a linked member beneath its owned root and
+            // requires the mapped file to be a real executable; #140 keeps the
+            // Cargo path when no root was bound (a bounded run without a
+            // converted checkout).
             let program = match root {
-                Some(root) => match program.strip_prefix(key.checkout.join("target")) {
-                    Ok(rest) => root.join(rest),
-                    Err(_) => program.clone(),
-                },
+                Some(root) => outputs::program_target(&key.checkout, root, &program)
+                    .unwrap_or_else(|| program.clone()),
                 None => program.clone(),
             };
             Some((program, manifest_dir.clone()))
@@ -2282,6 +2326,9 @@ mod tests {
             json_messages: false,
             manifest_path: None,
             target: None,
+            targets: Vec::new(),
+            explicit_profile: false,
+            declared_outputs: Vec::new(),
             tool: Vec::new(),
             budget: budget::Options::default(),
             package: None,

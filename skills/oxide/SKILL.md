@@ -21,7 +21,7 @@ oxide nextest run      # other external subcommands are leased
 oxide exec -- npm run tauri build   # a tool that runs Cargo itself
 ```
 
-`oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command…>`
+`oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] [--output <member>]… -- <command…>`
 runs one tool that calls Cargo for one workspace with Oxide's storage, recipe
 and wrapper policy. Oxide's options go before `--`; the command after it is
 kept exactly and keeps your working directory. `--profile` picks the recipe
@@ -30,6 +30,17 @@ only: the tool still chooses dev or release itself. Outputs stay in
 group exits. A terminal stdin is not passed (the tool reads end-of-file).
 Cooperative only: a tool that sets its own `CARGO_TARGET_DIR`, switches
 workspace or toolchain, or daemonizes escapes Oxide.
+
+A checkout whose outputs Oxide places at profile members (`target/debug`,
+`target/release`, `target/<triple>/debug`, `target/<triple>/release`) refuses a
+tool that does not say which members it writes. Declare the tool's complete
+profile-output set with `--output`, repeatable: `oxide exec --output debug --
+npm run tauri build`. A tool that passes its own `--target` needs the matching
+`<triple>/debug` or `<triple>/release` declaration in that project's selector.
+Real documentation and tool directories (such as `target/doc`) are outside the
+declared set. `oxide outputs adopt` selects that layout explicitly and
+`oxide outputs detach` returns the checkout to real directories; a checkout
+that has not been converted keeps the whole-target layout.
 
 Plain `cargo` still works but builds privately and wastes space;
 `oxide status` reports that output.

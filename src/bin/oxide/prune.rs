@@ -33,7 +33,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/1";
+pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
+/// Schema 1 named only a whole `target` placement; schema 2 names one
+/// reference per profile member and is read from a version-1 document without
+/// changing its meaning.
+const LEGACY_REGISTRY_VERSION: &str = "oxide.outputs.registry/1";
 pub const OBSERVATIONS_VERSION: &str = "oxide.outputs.prune-observations/1";
 pub const PREVIEW_VERSION: &str = "oxide.outputs.prune-preview/1";
 pub const INTENT_VERSION: &str = "oxide.outputs.prune-intent/1";
@@ -41,7 +45,9 @@ pub const RESOLUTION_VERSION: &str = "oxide.outputs.prune-resolution/1";
 
 const REGISTRY_FILE: &str = "registry.json";
 /// The registry's frozen numeric format.
-const REGISTRY_SCHEMA: u32 = 1;
+const REGISTRY_SCHEMA: u32 = 2;
+/// A version-1 registry predates profile member references.
+const LEGACY_REGISTRY_SCHEMA: u32 = 1;
 const OBSERVATIONS_FILE: &str = "prune-observations.json";
 /// The diagnostic tombstone ring (oxide#129): settled prune outcomes only,
 /// oldest first, compactable. Never a safety journal or a live cap.
@@ -222,11 +228,45 @@ struct Intent {
     /// unfinished: its receipt step is replayed, never assumed.
     #[serde(default)]
     receipt_settled: bool,
-    /// Whether the registry row was a live selection when the intent was
-    /// journaled (a released root is not); an intent-phase rollback
-    /// restores exactly this.
+    /// Whether the representative registry row was a live selection when the
+    /// intent was journaled. Only a group member's own flag is restored from
+    /// [`Intent::group`]; this field is diagnostic for the representative.
     #[serde(default = "selected_by_default")]
     was_selected: bool,
+    /// The checkout receipt's exact bytes at intent publication. A replay or
+    /// rollback acts only while the live receipt still matches this preimage.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    prior_receipt_sha: String,
+    /// Every verified reference of this (checkout, root) group, sorted by
+    /// member. The group — never a single row — is the transaction scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    group: Vec<GroupRow>,
+    /// Persisted before the terminal receipt publication: the exact terminal
+    /// image digest and its FIXED timestamp. A replay accepts only the
+    /// recorded preimage or this exact image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_terminal_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_ms: Option<u64>,
+}
+
+/// One reference of an intent's (checkout, root) group: its member, immutable
+/// root-creation generation, nonce and recorded identity, and the selection
+/// flag the rollback restores.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRow {
+    member: String,
+    generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_dev: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marker_digest: Option<String>,
+    selected: bool,
 }
 
 fn selected_by_default() -> bool {
@@ -494,47 +534,53 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
                 Ok(None) => continue,
                 Err(error) => return Err(error),
             };
-        let member = outputs::MEMBER;
         let checkout_volume_uuid = volume_uuid_of(&stub.checkout).ok().flatten();
-        for (selected, is_selected) in receipt
-            .current()
-            .map(|selected| (selected, true))
-            .into_iter()
-            .chain(receipt.prepared_ref().map(|prepared| (&prepared.to, false)))
-        {
-            if registry.rows.iter().any(|row| {
-                row.checkout_id == stub.checkout_id
-                    && row.member == member
-                    && row.root == selected.root()
-            }) {
-                continue;
+        for placement in receipt.links() {
+            let member = placement.member();
+            for (selected, is_selected) in placement
+                .selected_ref()
+                .map(|selected| (selected, true))
+                .into_iter()
+                .chain(
+                    placement
+                        .prepared_ref()
+                        .map(|prepared| (&prepared.to, false)),
+                )
+            {
+                if registry.rows.iter().any(|row| {
+                    row.checkout_id == stub.checkout_id
+                        && row.member == member
+                        && row.root == selected.root()
+                }) {
+                    continue;
+                }
+                if registry.rows.len() >= MAX_ROWS {
+                    return Err("the receipt seed reached the registry row limit".to_owned());
+                }
+                let identity = row_identity(selected)?;
+                registry.rows.push(Row {
+                    checkout_id: stub.checkout_id.clone(),
+                    checkout: stub.checkout.clone(),
+                    checkout_volume_uuid: checkout_volume_uuid.clone(),
+                    receipt: outputs::receipt_path_public(control, &stub.checkout_id),
+                    member: member.to_owned(),
+                    root: selected.root().to_path_buf(),
+                    root_kind: selected.kind(),
+                    volume_uuid: selected.volume_uuid().map(str::to_owned),
+                    recipe: outputs::RECIPE_PUBLIC.to_owned(),
+                    nonce: selected.nonce().map(str::to_owned),
+                    generation: selected.generation(),
+                    root_dev: identity.0,
+                    root_ino: identity.1,
+                    marker_digest: identity.2,
+                    selected: is_selected,
+                    pending: !is_selected,
+                    pruning: None,
+                    pruned_ms: None,
+                    reservation: None,
+                    cancelling: None,
+                });
             }
-            if registry.rows.len() >= MAX_ROWS {
-                return Err("the receipt seed reached the registry row limit".to_owned());
-            }
-            let identity = row_identity(selected)?;
-            registry.rows.push(Row {
-                checkout_id: stub.checkout_id.clone(),
-                checkout: stub.checkout.clone(),
-                checkout_volume_uuid: checkout_volume_uuid.clone(),
-                receipt: outputs::receipt_path_public(control, &stub.checkout_id),
-                member: member.to_owned(),
-                root: selected.root().to_path_buf(),
-                root_kind: selected.kind(),
-                volume_uuid: selected.volume_uuid().map(str::to_owned),
-                recipe: outputs::RECIPE_PUBLIC.to_owned(),
-                nonce: selected.nonce().map(str::to_owned),
-                generation: selected.generation(),
-                root_dev: identity.0,
-                root_ino: identity.1,
-                marker_digest: identity.2,
-                selected: is_selected,
-                pending: !is_selected,
-                pruning: None,
-                pruned_ms: None,
-                reservation: None,
-                cancelling: None,
-            });
         }
     }
     Ok(())
@@ -691,12 +737,19 @@ fn ready_registry(control: &Path) -> Result<Registry, String> {
 
 impl Registry {
     fn validate(&self) -> Result<(), String> {
-        if self.version != REGISTRY_VERSION || self.schema != REGISTRY_SCHEMA {
-            return Err(format!(
-                "the output registry has an unsupported version {:?}",
-                self.version
-            ));
-        }
+        let schema = match self.version.as_str() {
+            REGISTRY_VERSION if self.schema == REGISTRY_SCHEMA => REGISTRY_SCHEMA,
+            LEGACY_REGISTRY_VERSION if self.schema == LEGACY_REGISTRY_SCHEMA => {
+                LEGACY_REGISTRY_SCHEMA
+            }
+            _ => {
+                return Err(format!(
+                    "the output registry has an unsupported version {:?}",
+                    self.version
+                ))
+            }
+        };
+        let _ = schema;
         if self.revision == 0 {
             return Err("the output registry has no revision".to_owned());
         }
@@ -784,6 +837,26 @@ impl Intent {
         {
             return Err("the output registry has an unusable prune intent".to_owned());
         }
+        if !self.prior_receipt_sha.is_empty() && !hex64(&self.prior_receipt_sha) {
+            return Err("the output registry has an unusable intent preimage".to_owned());
+        }
+        if let Some(sha) = &self.expected_terminal_sha {
+            if !hex64(sha) || self.terminal_ms.is_none() {
+                return Err("the output registry has an unusable terminal image".to_owned());
+            }
+        }
+        let mut names: Vec<&str> = self.group.iter().map(|row| row.member.as_str()).collect();
+        let sorted = names.clone();
+        names.sort_unstable();
+        names.dedup();
+        if names != sorted {
+            return Err("the prune intent group is not sorted and unique".to_owned());
+        }
+        for row in &self.group {
+            if !text(&row.member) {
+                return Err("the prune intent group has an unusable member".to_owned());
+            }
+        }
         Ok(())
     }
 }
@@ -834,7 +907,7 @@ fn hex32(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn hex64(value: &str) -> bool {
+pub(crate) fn hex64(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -868,22 +941,70 @@ pub fn unsettled_for(control: &Path, checkout_id: &str) -> Result<Option<String>
 /// Publish one receipt's live references into the registry. Called from
 /// `outputs::write_receipt` while the internal publication lock is held, and
 /// strictly before the changed receipt becomes visible.
+///
+/// One row is kept per (checkout, member, root) reference. A legacy receipt's
+/// one `target` placement keeps the schema-1 meaning exactly; a profile
+/// receipt publishes one reference per positively identified member and
+/// upgrades the document to schema 2, which only happens after the caller's
+/// forward fence.
 pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     require_registry(control)?;
     let mut registry = ready_registry(control)?;
     registry.validate()?;
+    if receipt.layout() == outputs::LayoutKind::Profile {
+        registry.version = REGISTRY_VERSION.to_owned();
+        registry.schema = REGISTRY_SCHEMA;
+    }
+    let checkout_id = receipt.checkout_id().to_owned();
+    let receipt_path = outputs::receipt_path_public(control, &checkout_id);
+    let checkout_volume_uuid = volume_uuid_of(receipt.checkout()).ok().flatten();
+    registry.bump()?;
+    for placement in receipt.links() {
+        note_placement(
+            &mut registry,
+            receipt,
+            placement,
+            &receipt_path,
+            checkout_volume_uuid.clone(),
+        )?;
+    }
+    // Members this receipt no longer places keep their identity as history but
+    // are neither selected nor pending; a blocking prune intent still owns its
+    // row.
+    let members: Vec<String> = receipt
+        .links()
+        .iter()
+        .map(|placement| placement.member().to_owned())
+        .collect();
+    for row in registry
+        .rows
+        .iter_mut()
+        .filter(|row| row.checkout_id == checkout_id && !members.contains(&row.member))
+    {
+        row.selected = false;
+        row.pending = false;
+    }
+    note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
+    write_registry(control, &registry)
+}
+
+/// Publish one placement's selected and proposed references.
+fn note_placement(
+    registry: &mut Registry,
+    receipt: &Receipt,
+    placement: &outputs::LinkPlacement,
+    receipt_path: &Path,
+    checkout_volume_uuid: Option<String>,
+) -> Result<(), String> {
     let checkout_id = receipt.checkout_id();
     let checkout = receipt.checkout();
-    let receipt_path = outputs::receipt_path_public(control, checkout_id);
-    let member = "target";
-    let selected = receipt.current();
-    let prepared = receipt.prepared_ref();
+    let member = placement.member();
+    let selected = placement.selected_ref();
+    let proposed = placement.prepared_ref().map(|prepared| &prepared.to);
     // A prepared transition still selects its committed root until the commit
     // is durable; a missing reference is never treated as non-selection.
     // Detach and pruned states retain identity but select nothing.
     let keep_selected = selected.is_some() && receipt.holds_selection();
-    let proposed = prepared.map(|prepared| &prepared.to);
-    registry.bump()?;
     let mut matched_selected = false;
     let mut matched_pending = false;
     for row in registry
@@ -924,9 +1045,9 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
         }
     }
     if proposed.is_none() {
-        // The receipt is authoritative for this checkout's placement: a
-        // receipt with no prepared transition cannot still have a pending
-        // reference. This is what clears a rolled-back preparation.
+        // The receipt is authoritative for this placement: a placement with
+        // no prepared transition cannot still have a pending reference. This
+        // is what clears a rolled-back preparation.
         for row in registry
             .rows
             .iter_mut()
@@ -935,18 +1056,17 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
             row.pending = false;
         }
     }
-    let checkout_volume_uuid = volume_uuid_of(checkout).ok().flatten();
     if let Some(selected) = selected {
         if (keep_selected && !matched_selected) || (proposed.is_some() && !matched_pending) {
             let identity = row_identity(selected)?;
             if registry.rows.len() >= MAX_ROWS {
-                mark_incomplete(&mut registry, "the registry row limit was reached")?;
+                mark_incomplete(registry, "the registry row limit was reached")?;
             } else {
                 let row = Row {
                     checkout_id: checkout_id.to_owned(),
                     checkout: checkout.to_path_buf(),
                     checkout_volume_uuid: checkout_volume_uuid.clone(),
-                    receipt: receipt_path.clone(),
+                    receipt: receipt_path.to_path_buf(),
                     member: member.to_owned(),
                     root: selected.root().to_path_buf(),
                     root_kind: selected.kind(),
@@ -971,14 +1091,14 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     if let Some(proposed) = proposed {
         if !matched_pending {
             if registry.rows.len() >= MAX_ROWS {
-                mark_incomplete(&mut registry, "the registry row limit was reached")?;
+                mark_incomplete(registry, "the registry row limit was reached")?;
             } else {
                 let identity = row_identity(proposed)?;
                 registry.rows.push(Row {
                     checkout_id: checkout_id.to_owned(),
                     checkout: checkout.to_path_buf(),
                     checkout_volume_uuid: checkout_volume_uuid.clone(),
-                    receipt: receipt_path.clone(),
+                    receipt: receipt_path.to_path_buf(),
                     member: member.to_owned(),
                     root: proposed.root().to_path_buf(),
                     root_kind: proposed.kind(),
@@ -999,8 +1119,7 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
             }
         }
     }
-    note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
-    write_registry(control, &registry)
+    Ok(())
 }
 
 /// The marker a reservation write returns after it durably published sticky
@@ -1033,7 +1152,15 @@ fn note_reservation(
     checkout_volume_uuid: Option<String>,
 ) -> Result<(), String> {
     let checkout_id = receipt.checkout_id();
-    let member = outputs::MEMBER;
+    // A reservation is root-level: every member of this checkout shares the
+    // pending reference. New rows name the first sorted member (the legacy
+    // `target` for a whole-target receipt).
+    let member = receipt
+        .links()
+        .first()
+        .map(|placement| placement.member().to_owned())
+        .unwrap_or_else(|| outputs::MEMBER.to_owned());
+    let member = member.as_str();
     let reserved = receipt.reserved();
     let current_id = reserved.map(|reserved| reserved.id.as_str());
     let selected_root = receipt
@@ -1045,7 +1172,7 @@ fn note_reservation(
     for row in registry
         .rows
         .iter_mut()
-        .filter(|row| row.checkout_id == checkout_id && row.member == member)
+        .filter(|row| row.checkout_id == checkout_id)
     {
         let Some(id) = row.reservation.clone() else {
             continue;
@@ -1084,9 +1211,11 @@ fn note_reservation(
         }
         return Ok(());
     }
-    if let Some(row) = registry.rows.iter_mut().find(|row| {
-        row.checkout_id == checkout_id && row.member == member && row.root == reserved.root
-    }) {
+    if let Some(row) = registry
+        .rows
+        .iter_mut()
+        .find(|row| row.checkout_id == checkout_id && row.root == reserved.root)
+    {
         if row.cancelling.is_some() {
             return Err(format!(
                 "reservation {} is being cancelled; refusing to republish it",
@@ -1917,12 +2046,40 @@ fn evaluate(
     let mut receipts: std::collections::HashMap<String, Result<Receipt, String>> =
         std::collections::HashMap::new();
     let mut evaluated = Vec::new();
-    let rows: Vec<Row> = registry
+    // Eligibility and candidate construction are per (checkout, root): every
+    // member of one root under the same checkout is ONE owner, so one
+    // representative (the first sorted member) is evaluated and the full group
+    // is verified again at intent publication. A group carrying a pending or
+    // otherwise unsettled reference is kept, never offered as a candidate.
+    let mut rows: Vec<Row> = registry
         .rows
         .iter()
         .filter(|row| row.live() || row.pruned_ms.is_none())
         .cloned()
         .collect();
+    rows.sort_by(|left, right| {
+        (
+            left.checkout_id.as_str(),
+            left.root.as_path(),
+            left.member.as_str(),
+        )
+            .cmp(&(
+                right.checkout_id.as_str(),
+                right.root.as_path(),
+                right.member.as_str(),
+            ))
+    });
+    let mut grouped: Vec<Row> = Vec::new();
+    let mut group_keys: Vec<(String, PathBuf)> = Vec::new();
+    for row in rows {
+        let key = (row.checkout_id.clone(), row.root.clone());
+        if group_keys.iter().any(|known| known == &key) {
+            continue;
+        }
+        group_keys.push(key);
+        grouped.push(row);
+    }
+    let rows = grouped;
     if rows.len() > SNAPSHOT_MAX_RECEIPTS {
         // A cap is not permission to consider part of the registry.
         return Ok(rows
@@ -2106,12 +2263,15 @@ fn eligibility(
             "a root reservation still references this root".to_owned(),
         ));
     }
-    if registry.live_rows().any(|other| {
-        other.root == row.root
-            && !(other.checkout_id == row.checkout_id && other.member == row.member)
-    }) {
+    // One root under one checkout is ONE owner: its own sibling members are
+    // the same reference group, not another live reference. Only a reference
+    // from a DIFFERENT checkout keeps the root.
+    if registry
+        .live_rows()
+        .any(|other| other.root == row.root && other.checkout_id != row.checkout_id)
+    {
         return Ok(Some(
-            "another live reference also names this root".to_owned(),
+            "another checkout's live reference also names this root".to_owned(),
         ));
     }
     let Some(receipt) = receipt else {
@@ -3723,6 +3883,187 @@ fn prune_journaled(
     finish_quarantine(store, control, session, &id)
 }
 
+/// Every registry row that references one (checkout, root) group, sorted by
+/// member. The group, never one row, is the transaction scope.
+fn group_rows<'a>(registry: &'a Registry, checkout_id: &str, root: &Path) -> Vec<&'a Row> {
+    let mut rows: Vec<&Row> = registry
+        .rows
+        .iter()
+        .filter(|row| row.checkout_id == checkout_id && row.root == root)
+        .collect();
+    rows.sort_by(|left, right| left.member.cmp(&right.member));
+    rows
+}
+
+/// The verified group of one candidate root: all references share the root's
+/// immutable identity, none is pending or already owned by another
+/// transaction. Anything else refuses.
+fn verified_group(registry: &Registry, candidate: &Candidate) -> Result<Vec<GroupRow>, String> {
+    let rows = group_rows(registry, &candidate.checkout_id, &candidate.root);
+    if rows.is_empty() {
+        return Err("no registry row references the candidate root".to_owned());
+    }
+    for row in &rows {
+        if row.pending
+            || row.pruning.is_some()
+            || row.reservation.is_some()
+            || row.cancelling.is_some()
+        {
+            return Err(format!(
+                "the registry reference {} is not an eligible part of this root's group",
+                row.member
+            ));
+        }
+        // A historical row keeps its OWN recorded facts. Only a row that is
+        // currently selected is part of the checkout's current authority and
+        // therefore has to agree with the root's live identity; requiring
+        // every historical row to match the representative would reject a
+        // legitimate inactive legacy `target` row (no nonce, old digest).
+        if row.nonce.as_deref().is_some_and(|nonce| !is_nonce(nonce))
+            || row
+                .marker_digest
+                .as_deref()
+                .is_some_and(|digest| !hex64(digest))
+        {
+            return Err(format!(
+                "the registry reference {} carries an unusable recorded identity",
+                row.member
+            ));
+        }
+    }
+    // The CURRENT authority is the selected subset. A released or detached
+    // root legitimately has none: its complete group is valid history, and
+    // physical identity is still proven by the observation behind `candidate`.
+    let current: Vec<&Row> = rows.iter().copied().filter(|row| row.selected).collect();
+    if let Some(first) = current.first() {
+        for row in &current {
+            if row.nonce != first.nonce
+                || row.generation != first.generation
+                || row.root_dev != first.root_dev
+                || row.root_ino != first.root_ino
+                || row.marker_digest != first.marker_digest
+                || row.root_kind != first.root_kind
+                || row.volume_uuid != first.volume_uuid
+            {
+                return Err(
+                    "the root's currently selected registry references disagree about its identity"
+                        .to_owned(),
+                );
+            }
+        }
+        if first.nonce != candidate.nonce
+            || first.root_dev != Some(candidate.dev)
+            || first.root_ino != Some(candidate.ino)
+            || first.marker_digest.as_deref() != Some(candidate.marker_digest.as_str())
+        {
+            return Err("the root's registry identity changed since the plan".to_owned());
+        }
+    }
+    Ok(rows
+        .iter()
+        .map(|row| GroupRow {
+            member: row.member.clone(),
+            generation: row.generation,
+            nonce: row.nonce.clone(),
+            root_dev: row.root_dev,
+            root_ino: row.root_ino,
+            marker_digest: row.marker_digest.clone(),
+            selected: row.selected,
+        })
+        .collect())
+}
+
+/// The checkout receipt's exact bytes, for the intent's preimage pin.
+fn receipt_preimage(control: &Path, checkout_id: &str) -> Result<String, String> {
+    let path = outputs::receipt_path_public(control, checkout_id);
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Verify, before any selection flag is recomputed, that the checkout receipt
+/// is the recorded preimage and that its owned references to this root are
+/// exactly the recorded group (same members, generations and nonce), with no
+/// prepared transition.
+fn verify_group_receipt(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    root: &Path,
+    group: &[GroupRow],
+) -> Result<(), String> {
+    let receipt = outputs::read_receipt_for_prune(control, checkout, checkout_id)?
+        .ok_or_else(|| "the checkout's receipt disappeared".to_owned())?;
+    if receipt.prepared_ref().is_some() {
+        return Err("the checkout receipt has a pending transition".to_owned());
+    }
+    // Normalize the receipt's current placements and hand them to the pure
+    // comparison. Only the CURRENTLY SELECTED part of the group is the
+    // checkout's current authority; registry-only inactive history is never
+    // invented into the receipt and is not required to appear there.
+    let current: Vec<(String, PathBuf, u64, Option<String>)> = receipt
+        .links()
+        .iter()
+        .filter_map(|placement| {
+            placement.selected_ref().map(|selected| {
+                (
+                    placement.member().to_owned(),
+                    selected.root().to_path_buf(),
+                    selected.generation(),
+                    selected.nonce().map(str::to_owned),
+                )
+            })
+        })
+        .collect();
+    selected_group_mismatch(&current, root, group)
+}
+
+/// The exact rule between a receipt's current references and the recorded
+/// group: the receipt's current members for THIS root must be exactly the
+/// group's SELECTED members, each with the recorded generation and nonce.
+///
+/// Historical rows (an inactive legacy `target`, or any released member) keep
+/// their own recorded facts and are intentionally absent from this comparison,
+/// and a group with no selected row requires the receipt to select nothing for
+/// this root. Kept separate from the receipt type so the rule is unit-tested
+/// without a receipt fixture.
+fn selected_group_mismatch(
+    current: &[(String, PathBuf, u64, Option<String>)],
+    root: &Path,
+    group: &[GroupRow],
+) -> Result<(), String> {
+    let mut receipt_members: Vec<&str> = current
+        .iter()
+        .filter(|(_, receipt_root, _, _)| receipt_root == root)
+        .map(|(member, _, _, _)| member.as_str())
+        .collect();
+    receipt_members.sort_unstable();
+    let selected: Vec<&GroupRow> = group.iter().filter(|row| row.selected).collect();
+    let mut group_members: Vec<&str> = selected.iter().map(|row| row.member.as_str()).collect();
+    group_members.sort_unstable();
+    if receipt_members != group_members {
+        return Err(
+            "the checkout receipt's current references do not match the selected part of the recorded group"
+                .to_owned(),
+        );
+    }
+    for row in selected {
+        let Some((_, _, generation, nonce)) = current
+            .iter()
+            .find(|(member, receipt_root, _, _)| member == &row.member && receipt_root == root)
+        else {
+            return Err("the receipt lost a selected group member".to_owned());
+        };
+        if *generation != row.generation || nonce.as_deref() != row.nonce.as_deref() {
+            return Err(format!(
+                "the receipt's reference for {} disagrees with the recorded group",
+                row.member
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Publish the durable intent under internal admission. `Ok(false)` means the
 /// registry revision is no longer the one the locked recheck read: nothing
 /// was written.
@@ -3747,6 +4088,8 @@ fn journal_intent(
         ));
     }
     let mut was_selected = false;
+    let mut group = Vec::new();
+    let mut prior_receipt_sha = String::new();
     if candidate.receiptless {
         // A temporary pruning row, within the live caps; never a selection.
         if registry.rows.iter().any(|row| row.root == candidate.root) {
@@ -3782,27 +4125,29 @@ fn journal_intent(
             cancelling: None,
         });
     } else {
-        let row = registry
+        let verified = verified_group(&registry, candidate).map_err(Stop::Refuse)?;
+        prior_receipt_sha =
+            receipt_preimage(control, &candidate.checkout_id).map_err(Stop::Refuse)?;
+        verify_group_receipt(
+            control,
+            &candidate.checkout,
+            &candidate.checkout_id,
+            &candidate.root,
+            &verified,
+        )
+        .map_err(Stop::Refuse)?;
+        was_selected = verified.iter().any(|row| row.selected);
+        // Atomically mark ALL of the group's rows: one root, one owner.
+        for row in registry
             .rows
             .iter_mut()
-            .find(|row| {
-                row.checkout_id == candidate.checkout_id
-                    && row.member == candidate.member
-                    && row.root == candidate.root
-            })
-            .ok_or_else(|| Stop::Refuse("the registry row disappeared".to_owned()))?;
-        if row.pending
-            || row.pruning.is_some()
-            || row.reservation.is_some()
-            || row.cancelling.is_some()
+            .filter(|row| row.checkout_id == candidate.checkout_id && row.root == candidate.root)
         {
-            return Err(Stop::Refuse(
-                "the registry row is no longer an eligible root".to_owned(),
-            ));
+            row.selected = false;
+            row.pending = false;
+            row.pruning = Some(id.to_owned());
         }
-        was_selected = row.selected;
-        row.selected = false;
-        row.pruning = Some(id.to_owned());
+        group = verified;
     }
     while registry.intents.len() >= MAX_INTENTS {
         let completed = registry
@@ -3842,6 +4187,10 @@ fn journal_intent(
         resolved_ms: None,
         receipt_settled: false,
         was_selected,
+        prior_receipt_sha,
+        group,
+        expected_terminal_sha: None,
+        terminal_ms: None,
     });
     registry.bump().map_err(Stop::Refuse)?;
     // A failed publication may still have landed: the journal is then an
@@ -3910,15 +4259,20 @@ fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> R
                 intent.phase = IntentPhase::Deleted;
                 intent.updated_ms = process::now_ms();
             }
-            if let Some(row) = registry.rows.iter_mut().find(|row| {
+            let now = process::now_ms();
+            let group: Vec<String> = registry
+                .intent(id)
+                .map(|intent| intent.group.iter().map(|row| row.member.clone()).collect())
+                .unwrap_or_default();
+            for row in registry.rows.iter_mut().filter(|row| {
                 row.checkout_id == identity.checkout_id
-                    && row.member == identity.member
                     && row.root == identity.root
+                    && (group.is_empty() || group.contains(&row.member))
             }) {
                 row.selected = false;
                 row.pending = false;
                 row.pruning = None;
-                row.pruned_ms = Some(process::now_ms());
+                row.pruned_ms = Some(now);
             }
             registry.bump().map_err(Stop::Refuse)?;
             write_registry(control, &registry).map_err(Stop::Refuse)?;
@@ -3926,6 +4280,110 @@ fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> R
     }
     crash_point("terminal").map_err(Stop::Pending)?;
     settle_receipt(control, id, outcome).map_err(Stop::Pending)
+}
+
+/// Publish the checkout receipt's terminal image with its FIXED recorded
+/// timestamp. The expected image digest is durable before the publication;
+/// a replay accepts only the recorded preimage or that exact image.
+fn publish_terminal_receipt(
+    control: &Path,
+    intent: &Intent,
+    id: &str,
+    outcome: &str,
+) -> Result<(), String> {
+    let path = outputs::receipt_path_public(control, &intent.identity.checkout_id);
+    let read_digest = |path: &Path| -> Result<String, String> {
+        let bytes = fs::read(path).map_err(|error| {
+            format!(
+                "cannot read the checkout receipt {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(sha256_hex(&bytes))
+    };
+    match (&intent.expected_terminal_sha, intent.terminal_ms) {
+        (Some(expected), Some(at_ms)) => {
+            let live = read_digest(&path)?;
+            if &live == expected {
+                return Ok(());
+            }
+            if !intent.prior_receipt_sha.is_empty() && live == intent.prior_receipt_sha {
+                outputs::mark_pruned_at(
+                    control,
+                    &intent.identity.checkout,
+                    &intent.identity.checkout_id,
+                    id,
+                    outcome,
+                    at_ms,
+                )?;
+                let after = read_digest(&path)?;
+                if &after != expected {
+                    return Err(format!(
+                        "the terminal receipt image for intent {id} is not the recorded one; it is kept pending"
+                    ));
+                }
+                return Ok(());
+            }
+            Err(format!(
+                "the checkout receipt is neither the recorded preimage nor the recorded terminal image for intent {id}; it is kept pending"
+            ))
+        }
+        _ => {
+            let live = read_digest(&path)?;
+            if !intent.prior_receipt_sha.is_empty() && live != intent.prior_receipt_sha {
+                return Err(format!(
+                    "the checkout receipt changed since prune intent {id}; nothing was published"
+                ));
+            }
+            let at_ms = process::now_ms();
+            let image = outputs::terminal_receipt_image(
+                control,
+                &intent.identity.checkout,
+                &intent.identity.checkout_id,
+                id,
+                outcome,
+                at_ms,
+            )?;
+            let expected = sha256_hex(&image);
+            // Durable before publication: the fixed timestamp and the exact
+            // expected image. Another writer's record wins; we then publish
+            // exactly that image.
+            let (expected, at_ms) = {
+                let _guard = store::publication_guard(control)?;
+                let mut registry = ready_registry(control)?;
+                let Some(record) = registry.intents.iter_mut().find(|record| record.id == id)
+                else {
+                    return Err(format!("prune intent {id} disappeared"));
+                };
+                match (&record.expected_terminal_sha, record.terminal_ms) {
+                    (Some(sha), Some(ms)) => (sha.clone(), ms),
+                    _ => {
+                        record.expected_terminal_sha = Some(expected.clone());
+                        record.terminal_ms = Some(at_ms);
+                        record.updated_ms = process::now_ms();
+                        registry.bump()?;
+                        write_registry(control, &registry)?;
+                        (expected, at_ms)
+                    }
+                }
+            };
+            outputs::mark_pruned_at(
+                control,
+                &intent.identity.checkout,
+                &intent.identity.checkout_id,
+                id,
+                outcome,
+                at_ms,
+            )?;
+            let after = read_digest(&path)?;
+            if after != expected {
+                return Err(format!(
+                    "the terminal receipt image for intent {id} is not the recorded one; it is kept pending"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// After the registry terminal state is durable: commit the checkout
@@ -3954,13 +4412,12 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
                 .is_some_and(|selected| selected.root() == intent.identity.root)
     });
     if owns_terminal {
-        outputs::mark_pruned(
-            control,
-            &intent.identity.checkout,
-            &intent.identity.checkout_id,
-            id,
-            outcome,
-        )?;
+        publish_terminal_receipt(control, &intent, id, outcome)?;
+        // Debug-only proof stop AFTER the expected terminal image digest is
+        // durable and that exact image is published, but BEFORE the intent is
+        // marked settled. The existing `terminal` hook keeps its earlier
+        // pre-settlement meaning.
+        crash_point("terminal-image")?;
     }
     {
         let _guard = store::publication_guard(control)?;
@@ -3979,7 +4436,6 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
         registry.intents.retain(|record| record.id != id);
         registry.rows.retain(|row| {
             !(row.checkout_id == record.identity.checkout_id
-                && row.member == record.identity.member
                 && row.root == record.identity.root
                 && row.pruned_ms.is_some()
                 && !row.live())
@@ -4240,10 +4696,60 @@ fn rollback_intent(_store: &Store, control: &Path, intent: &Intent) -> Result<()
             registry.rows.retain(|row| {
                 !(matches(row) && row.pruning.as_deref() == Some(intent.id.as_str()))
             });
-        } else if let Some(row) = registry.rows.iter_mut().find(|row| matches(row)) {
-            row.selected = intent.was_selected;
-            row.pending = false;
-            row.pruning = None;
+        } else {
+            // The group and the receipt must still be exactly what the intent
+            // recorded; anything else keeps the root (pending3/KEEP).
+            if !intent.prior_receipt_sha.is_empty()
+                && receipt_preimage(control, &identity.checkout_id)? != intent.prior_receipt_sha
+            {
+                return Err(
+                    "the checkout receipt changed since the prune intent; the root is kept"
+                        .to_owned(),
+                );
+            }
+            // The group, not the representative member, is the transaction
+            // scope: every row of (checkout, root) is compared and restored.
+            let live: Vec<&Row> = registry
+                .rows
+                .iter()
+                .filter(|row| row.checkout_id == identity.checkout_id && row.root == identity.root)
+                .collect();
+            if live.len() != intent.group.len() {
+                return Err(
+                    "the root's registry references changed since the prune intent; the root is kept"
+                        .to_owned(),
+                );
+            }
+            for recorded in &intent.group {
+                let Some(row) = live.iter().find(|row| row.member == recorded.member) else {
+                    return Err("a recorded group member disappeared; the root is kept".to_owned());
+                };
+                if row.nonce != recorded.nonce
+                    || row.generation != recorded.generation
+                    || row.root_dev != recorded.root_dev
+                    || row.root_ino != recorded.root_ino
+                    || row.marker_digest != recorded.marker_digest
+                    || row.selected
+                    || row.pending
+                    || row.pruning.as_deref() != Some(intent.id.as_str())
+                {
+                    return Err(format!(
+                        "the registry reference for {} changed since the prune intent; the root is kept",
+                        recorded.member
+                    ));
+                }
+            }
+            for recorded in &intent.group {
+                if let Some(row) = registry.rows.iter_mut().find(|row| {
+                    row.checkout_id == identity.checkout_id
+                        && row.root == identity.root
+                        && row.member == recorded.member
+                }) {
+                    row.selected = recorded.selected;
+                    row.pending = false;
+                    row.pruning = None;
+                }
+            }
         }
         registry.bump()?;
         write_registry(control, &registry)?;
@@ -4822,20 +5328,33 @@ fn complete_resolution(
             record.resolved_ms = Some(process::now_ms());
             record.updated_ms = process::now_ms();
         }
-        let Some(row) = registry.rows.iter_mut().find(|row| {
-            row.checkout_id == intent.identity.checkout_id
-                && row.member == intent.identity.member
-                && row.root == intent.identity.root
-        }) else {
-            return Err("the intent's blocking registry row disappeared".to_owned());
+        let blocking: Vec<usize> = registry
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.checkout_id == intent.identity.checkout_id
+                    && row.root == intent.identity.root
+                    && row.pruning.as_deref() == Some(intent.id.as_str())
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let expected = if intent.group.is_empty() {
+            1
+        } else {
+            intent.group.len()
         };
-        if row.pruning.as_deref() != Some(intent.id.as_str()) {
-            return Err("the intent's blocking registry reference changed".to_owned());
+        if blocking.len() != expected {
+            return Err("the intent's blocking registry references changed".to_owned());
         }
-        row.selected = false;
-        row.pending = false;
-        row.pruning = None;
-        row.pruned_ms = Some(process::now_ms());
+        let now = process::now_ms();
+        for index in blocking {
+            let row = &mut registry.rows[index];
+            row.selected = false;
+            row.pending = false;
+            row.pruning = None;
+            row.pruned_ms = Some(now);
+        }
         registry.bump()?;
         write_registry(control, &registry)?;
     }
@@ -4945,6 +5464,115 @@ mod tests {
             reservation: None,
             cancelling: None,
         }
+    }
+
+    /// Two references of one root under the same checkout form one group; the
+    /// registry durably keeps the sorted group, its preimage pin and the
+    /// expected terminal image, and refuses a group that is not sorted.
+    #[test]
+    fn a_root_group_is_sorted_durable_and_validated() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 1,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![release.clone(), debug.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let rows = group_rows(&registry, &debug.checkout_id, &debug.root);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            ["debug", "release"]
+        );
+        registry.validate().unwrap();
+        let root = debug.root.clone();
+        let group: Vec<GroupRow> = rows
+            .iter()
+            .map(|row| GroupRow {
+                member: row.member.clone(),
+                generation: row.generation,
+                nonce: row.nonce.clone(),
+                root_dev: row.root_dev,
+                root_ino: row.root_ino,
+                marker_digest: row.marker_digest.clone(),
+                selected: row.selected,
+            })
+            .collect();
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: "d".repeat(32),
+            identity: RootIdentity {
+                checkout_id: debug.checkout_id.clone(),
+                checkout: debug.checkout.clone(),
+                receipt: debug.receipt.clone(),
+                member: "debug".to_owned(),
+                root: root.clone(),
+                root_kind: debug.root_kind,
+                volume_uuid: debug.volume_uuid.clone(),
+                nonce: debug.nonce.clone(),
+                generation: debug.generation,
+                dev: debug.root_dev.unwrap(),
+                ino: debug.root_ino.unwrap(),
+                marker_digest: debug.marker_digest.clone().unwrap(),
+            },
+            phase: IntentPhase::Intent,
+            quarantine: root.join(".prune-intent"),
+            preview_sha256: "e".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+            was_selected: true,
+            prior_receipt_sha: "f".repeat(64),
+            group: group.clone(),
+            expected_terminal_sha: None,
+            terminal_ms: None,
+        };
+        intent.validate().unwrap();
+        let mut registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 2,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug, release],
+            intents: vec![intent.clone()],
+            cancelled_overflow: Vec::new(),
+        };
+        write_registry(&fixture.root, &registry).unwrap();
+        let loaded = read_registry(&fixture.root).unwrap().unwrap();
+        assert_eq!(loaded.intents[0].group, group);
+        assert_eq!(loaded.intents[0].prior_receipt_sha, "f".repeat(64));
+        // An unsorted or duplicated group is refused.
+        let mut unsorted = registry.intents[0].clone();
+        unsorted.group.reverse();
+        assert!(unsorted.validate().is_err());
+        let mut terminal = registry.intents[0].clone();
+        terminal.expected_terminal_sha = Some("1".repeat(64));
+        assert!(
+            terminal.validate().is_err(),
+            "a terminal image needs its fixed timestamp"
+        );
+        terminal.terminal_ms = Some(7);
+        terminal.validate().unwrap();
+        // The fixed terminal image only accepts a recorded preimage or itself.
+        terminal.prior_receipt_sha = String::new();
+        registry.intents = vec![terminal];
+        write_registry(&fixture.root, &registry).unwrap();
+        let loaded = read_registry(&fixture.root).unwrap().unwrap();
+        assert_eq!(loaded.intents[0].terminal_ms, Some(7));
     }
 
     #[test]
@@ -5318,6 +5946,10 @@ mod tests {
             resolved_ms: None,
             receipt_settled: false,
             was_selected: true,
+            prior_receipt_sha: String::new(),
+            group: Vec::new(),
+            expected_terminal_sha: None,
+            terminal_ms: None,
         };
         let mut registry = Registry {
             version: REGISTRY_VERSION.to_owned(),
@@ -5393,7 +6025,38 @@ mod tests {
         let fixture = Fixture::new();
         let row = row_for(&fixture.root);
         let candidate = candidate_of(&row);
-        let control = ready_control(&fixture, vec![row], Vec::new());
+        let control = ready_control(&fixture, vec![row.clone()], Vec::new());
+        // The intent pins the checkout receipt's exact bytes and verifies its
+        // references against the group, so a committed receipt must exist.
+        let receipt_path = outputs::receipt_path_public(&control, &row.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": "oxide.outputs.transition/2",
+                "checkout": row.checkout.to_string_lossy(),
+                "checkout_id": row.checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "links": [{
+                    "member": "target",
+                    "selected": {
+                        "kind": "external",
+                        "root": row.root.to_string_lossy(),
+                        "volume_uuid": row.volume_uuid,
+                        "nonce": row.nonce,
+                        "generation": 1
+                    }
+                }],
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
         let id = "e".repeat(32);
         let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
@@ -5405,10 +6068,11 @@ mod tests {
         let unchanged = ready_registry(&control).unwrap();
         assert_eq!(unchanged.revision, 5);
         assert!(unchanged.intents.is_empty() && unchanged.rows[0].selected);
-        assert!(matches!(
-            journal_intent(&store, &control, &candidate, &plan, &id, &quarantine, 5),
-            Ok(true)
-        ));
+        match journal_intent(&store, &control, &candidate, &plan, &id, &quarantine, 5) {
+            Ok(true) => {}
+            Ok(false) => panic!("the journal did not publish (revision changed)"),
+            Err(stop) => panic!("the journal refused: {}", stop_text(stop)),
+        }
         let journaled = ready_registry(&control).unwrap();
         assert_eq!(journaled.revision, 6);
         assert_eq!(journaled.intent(&id).unwrap().phase, IntentPhase::Intent);
@@ -5430,6 +6094,237 @@ mod tests {
             ready_registry(&control).unwrap().intent(&id).unwrap().phase,
             IntentPhase::Renamed
         );
+    }
+
+    /// Eligibility follows the (checkout, root) owner group: sibling members
+    /// of the gone checkout do not keep each other, while a reference from a
+    /// DIFFERENT checkout still keeps the root.
+    #[test]
+    fn eligibility_keeps_a_root_for_another_checkout_but_not_for_sibling_members() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        debug.root_kind = RootKind::Local;
+        debug.volume_uuid = None;
+        debug.checkout = fixture.root.join("gone");
+        debug.receipt = fixture.root.join("receipt.json");
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let rows = vec![debug.clone(), release.clone()];
+        let control = ready_control(&fixture, rows.clone(), Vec::new());
+        let registry = ready_registry(&control).unwrap();
+        let receipt_path = outputs::receipt_path_public(&control, &debug.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": "oxide.outputs.transition/2",
+                "checkout": debug.checkout.to_string_lossy(),
+                "checkout_id": debug.checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "links": [{
+                    "member": "target",
+                    "selected": {
+                        "kind": "local",
+                        "root": debug.root.to_string_lossy(),
+                        "nonce": debug.nonce,
+                        "generation": 1
+                    }
+                }],
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let receipt =
+            outputs::read_receipt_for_prune(&control, &debug.checkout, &debug.checkout_id).unwrap();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let mut budget = SNAPSHOT_MAX_BYTES;
+        let reason = eligibility(
+            &store,
+            &control,
+            &registry,
+            &debug,
+            receipt.as_ref(),
+            None,
+            &mut budget,
+            false,
+        )
+        .unwrap();
+        assert!(
+            reason.as_deref() != Some("another checkout's live reference also names this root"),
+            "a sibling member kept its own root: {reason:?}"
+        );
+        // A reference from another checkout keeps the shared root.
+        let mut other = debug.clone();
+        other.checkout_id = "b".repeat(64);
+        other.checkout = fixture.root.join("other-gone");
+        let mut with_other = ready_registry(&control).unwrap();
+        with_other.rows.push(other);
+        let reason = eligibility(
+            &store,
+            &control,
+            &with_other,
+            &debug,
+            receipt.as_ref(),
+            None,
+            &mut budget,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some("another checkout's live reference also names this root"),
+            "another checkout's reference did not keep the root"
+        );
+        let _ = registry;
+    }
+
+    /// Two members of one root under the same checkout are ONE owner: the
+    /// intent marks and journals the complete group, and rollback restores
+    /// every row only while the pinned receipt preimage is unchanged.
+    #[test]
+    fn a_root_group_is_journaled_and_rolled_back_as_one_owner() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let rows = vec![debug.clone(), release.clone()];
+        let control = ready_control(&fixture, rows, Vec::new());
+        let receipt_path = outputs::receipt_path_public(&control, &debug.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        let selected = |member: &str| {
+            serde_json::json!({
+                "member": member,
+                "selected": {
+                    "kind": "external",
+                    "root": debug.root.to_string_lossy(),
+                    "volume_uuid": debug.volume_uuid,
+                    "nonce": debug.nonce,
+                    "generation": 1
+                }
+            })
+        };
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": "oxide.outputs.transition/3",
+                "checkout": debug.checkout.to_string_lossy(),
+                "checkout_id": debug.checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "layout": "profile",
+                // `release` is INACTIVE history for this root in the registry
+                // (selected = false), so the receipt's current references are
+                // exactly `debug`. P2 requires that exact agreement; the group
+                // still holds both rows and the rollback restores each role.
+                "links": [selected("debug")],
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let candidate = candidate_of(&debug);
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let id = "a".repeat(32);
+        let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
+        let plan = "f".repeat(64);
+        let revision = ready_registry(&control).unwrap().revision;
+        match journal_intent(
+            &store,
+            &control,
+            &candidate,
+            &plan,
+            &id,
+            &quarantine,
+            revision,
+        ) {
+            Ok(true) => {}
+            Ok(false) => panic!("the group journal did not publish"),
+            Err(stop) => panic!("the group journal refused: {}", stop_text(stop)),
+        }
+        let journaled = ready_registry(&control).unwrap();
+        let intent = journaled.intent(&id).unwrap();
+        assert_eq!(
+            intent.group.len(),
+            2,
+            "the group did not record both members"
+        );
+        assert_eq!(
+            intent
+                .group
+                .iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            ["debug", "release"]
+        );
+        for row in journaled.rows.iter().filter(|row| row.root == debug.root) {
+            assert_eq!(
+                row.pruning.as_deref(),
+                Some(id.as_str()),
+                "{} was not marked",
+                row.member
+            );
+            assert!(!row.selected);
+        }
+        // Restoring the recorded preimage rolls back BOTH rows.
+        rollback_intent(&store, &control, intent).unwrap();
+        let rolled = ready_registry(&control).unwrap();
+        for row in rolled.rows.iter().filter(|row| row.root == debug.root) {
+            assert!(row.pruning.is_none(), "{} kept a pruning mark", row.member);
+            if row.member == "debug" {
+                assert!(row.selected);
+            }
+        }
+        // A changed receipt keeps the root: the second journal must roll back
+        // to an error, leaving both rows marked.
+        let revision = ready_registry(&control).unwrap().revision;
+        match journal_intent(
+            &store,
+            &control,
+            &candidate,
+            &plan,
+            &"b".repeat(32),
+            &quarantine,
+            revision,
+        ) {
+            Ok(true) => {}
+            Ok(false) => panic!("the second group journal did not publish"),
+            Err(stop) => panic!("the second group journal refused: {}", stop_text(stop)),
+        }
+        let mut changed = fs::read(&receipt_path).unwrap();
+        changed.push(b'\n');
+        fs::write(&receipt_path, &changed).unwrap();
+        let intent = ready_registry(&control)
+            .unwrap()
+            .intent(&"b".repeat(32))
+            .cloned()
+            .unwrap();
+        assert!(
+            rollback_intent(&store, &control, &intent).is_err(),
+            "rollback restored rows for a changed receipt"
+        );
+        let kept = ready_registry(&control).unwrap();
+        for row in kept.rows.iter().filter(|row| row.root == debug.root) {
+            assert_eq!(
+                row.pruning.as_deref(),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                "{} was restored",
+                row.member
+            );
+        }
     }
 
     /// A deleted or resolved intent whose checkout receipt has not committed
@@ -5466,6 +6361,10 @@ mod tests {
             resolved_ms: None,
             receipt_settled: false,
             was_selected: true,
+            prior_receipt_sha: String::new(),
+            group: Vec::new(),
+            expected_terminal_sha: None,
+            terminal_ms: None,
         };
         let checkout_id = row.checkout_id.clone();
         let control = ready_control(&fixture, vec![row], vec![intent.clone()]);
@@ -5607,7 +6506,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(!reason.contains("another live reference"), "{reason}");
+        assert!(
+            !reason.contains("another checkout's live reference"),
+            "a same-owner row kept its own root: {reason}"
+        );
         let mut other = row.clone();
         other.checkout_id = "e".repeat(64);
         let control2 = fixture.root.join("second");
@@ -5626,7 +6528,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(reason.contains("another live reference"), "{reason}");
+        assert!(
+            reason.contains("another checkout's live reference"),
+            "another checkout's reference did not keep the root: {reason}"
+        );
     }
 
     /// A registered `/Volumes` checkout's mount is `/Volumes/<name>`
@@ -5734,6 +6639,420 @@ mod tests {
         )
         .unwrap());
         assert!(!outputs::receipt_path_public(&control, &second.checkout_id).exists());
+    }
+
+    /// P2: registry-only inactive history stays in the COMPLETE group and is
+    /// never required to agree with the root's current identity. Only the
+    /// currently selected rows are the checkout's current authority.
+    #[test]
+    fn a_group_keeps_inactive_history_beside_current_members() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        // An inactive legacy `target` row preserved as history: no nonce, no
+        // recorded device/ino/marker digest, and not selected.
+        let mut history = debug.clone();
+        history.member = outputs::MEMBER.to_owned();
+        history.nonce = None;
+        history.root_dev = None;
+        history.root_ino = None;
+        history.marker_digest = None;
+        history.selected = false;
+        history.generation = 1;
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 7,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug.clone(), release.clone(), history.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let candidate = candidate_of(&debug);
+        let group = verified_group(&registry, &candidate).unwrap();
+        assert_eq!(
+            group
+                .iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            vec!["debug", "release", "target"]
+        );
+        // Each row keeps its OWN recorded facts and prior role.
+        let target = group.iter().find(|row| row.member == "target").unwrap();
+        assert!(!target.selected, "history must stay unselected");
+        assert_eq!(target.nonce, None, "history keeps its absent nonce");
+        assert_eq!(target.marker_digest, None);
+        assert_eq!(target.root_dev, None);
+        assert!(group.iter().filter(|row| row.selected).count() == 2);
+    }
+
+    /// P2: a complete group with ZERO selected rows is valid history for the
+    /// existing released/Detached-root eligibility. It is not a missing group.
+    #[test]
+    fn a_zero_selected_group_is_valid_history() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        debug.selected = false;
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 8,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug.clone(), release.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let group = verified_group(&registry, &candidate_of(&debug)).unwrap();
+        assert_eq!(group.len(), 2);
+        assert!(group.iter().all(|row| !row.selected));
+        // A group that is empty is still a refusal: zero SELECTED is not zero
+        // recorded rows.
+        let empty = Registry {
+            rows: Vec::new(),
+            ..registry
+        };
+        assert!(verified_group(&empty, &candidate_of(&debug)).is_err());
+    }
+
+    /// P2: a group whose recorded HISTORY no longer matches the registry (a
+    /// missing or extra row) keeps the root: the rollback refuses instead of
+    /// restoring part of it.
+    #[test]
+    fn a_rollback_refuses_a_group_whose_history_changed() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let id = "c".repeat(32);
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: id.clone(),
+            identity: RootIdentity {
+                checkout_id: debug.checkout_id.clone(),
+                checkout: debug.checkout.clone(),
+                receipt: debug.receipt.clone(),
+                member: debug.member.clone(),
+                root: debug.root.clone(),
+                root_kind: debug.root_kind,
+                volume_uuid: debug.volume_uuid.clone(),
+                nonce: debug.nonce.clone(),
+                generation: debug.generation,
+                dev: debug.root_dev.unwrap_or(1),
+                ino: debug.root_ino.unwrap_or(2),
+                marker_digest: debug.marker_digest.clone().unwrap_or_default(),
+            },
+            phase: IntentPhase::Intent,
+            quarantine: fixture.root.join("quarantine"),
+            preview_sha256: "f".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+            was_selected: true,
+            prior_receipt_sha: String::new(),
+            group: vec![
+                GroupRow {
+                    member: "debug".to_owned(),
+                    generation: debug.generation,
+                    nonce: debug.nonce.clone(),
+                    root_dev: debug.root_dev,
+                    root_ino: debug.root_ino,
+                    marker_digest: debug.marker_digest.clone(),
+                    selected: true,
+                },
+                GroupRow {
+                    member: "release".to_owned(),
+                    generation: release.generation,
+                    nonce: release.nonce.clone(),
+                    root_dev: release.root_dev,
+                    root_ino: release.root_ino,
+                    marker_digest: release.marker_digest.clone(),
+                    selected: false,
+                },
+            ],
+            expected_terminal_sha: None,
+            terminal_ms: None,
+        };
+        // The registry keeps the group marked by this intent, but the recorded
+        // HISTORY row `release` has disappeared.
+        let control = ready_control(
+            &fixture,
+            vec![debug.clone(), release.clone()],
+            vec![intent.clone()],
+        );
+        let mut registry = ready_registry(&control).unwrap();
+        for row in registry.rows.iter_mut() {
+            row.selected = false;
+            row.pruning = Some(id.clone());
+        }
+        registry.rows.retain(|row| row.member != "release");
+        registry.bump().unwrap();
+        write_registry(&control, &registry).unwrap();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let refused = rollback_intent(&store, &control, &intent).unwrap_err();
+        assert!(
+            refused.contains("changed since the prune intent"),
+            "{refused}"
+        );
+        let kept = ready_registry(&control).unwrap();
+        let row = kept
+            .rows
+            .iter()
+            .find(|row| row.member == "debug")
+            .expect("the remaining row disappeared");
+        assert_eq!(
+            row.pruning.as_deref(),
+            Some(id.as_str()),
+            "the rollback restored a row for an incomplete group"
+        );
+    }
+
+    /// P2: pruning a RELEASED root never rewrites the checkout's receipt. When
+    /// the receipt currently selects a different root, that selection and the
+    /// exact receipt bytes survive while the released root's whole group is
+    /// settled and retired.
+    #[test]
+    fn a_released_root_settles_without_rewriting_the_current_selection() {
+        let fixture = Fixture::new();
+        let released = row_for(&fixture.root);
+        let mut row = released.clone();
+        row.member = "debug".to_owned();
+        row.selected = false;
+        row.pruned_ms = Some(5);
+        let current_root = fixture.root.join("current-root");
+        let id = "a".repeat(32);
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: id.clone(),
+            identity: RootIdentity {
+                checkout_id: row.checkout_id.clone(),
+                checkout: row.checkout.clone(),
+                receipt: row.receipt.clone(),
+                member: row.member.clone(),
+                root: row.root.clone(),
+                root_kind: row.root_kind,
+                volume_uuid: row.volume_uuid.clone(),
+                nonce: row.nonce.clone(),
+                generation: row.generation,
+                dev: row.root_dev.unwrap_or(1),
+                ino: row.root_ino.unwrap_or(2),
+                marker_digest: row.marker_digest.clone().unwrap_or_default(),
+            },
+            phase: IntentPhase::Deleted,
+            quarantine: fixture.root.join("quarantine"),
+            preview_sha256: "f".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+            was_selected: false,
+            prior_receipt_sha: String::new(),
+            group: vec![GroupRow {
+                member: row.member.clone(),
+                generation: row.generation,
+                nonce: row.nonce.clone(),
+                root_dev: row.root_dev,
+                root_ino: row.root_ino,
+                marker_digest: row.marker_digest.clone(),
+                selected: false,
+            }],
+            expected_terminal_sha: None,
+            terminal_ms: None,
+        };
+        let control = ready_control(&fixture, vec![row.clone()], vec![intent.clone()]);
+        // The receipt currently selects a DIFFERENT root.
+        let receipt_path = outputs::receipt_path_public(&control, &row.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        let receipt = serde_json::json!({
+            "version": "oxide.outputs.transition/3",
+            "checkout": row.checkout.to_string_lossy(),
+            "checkout_id": row.checkout_id,
+            "generation": 4,
+            "state": "committed",
+            "layout": "profile",
+            "links": [{
+                "member": "debug",
+                "selected": {
+                    "kind": "external",
+                    "root": current_root.to_string_lossy(),
+                    "volume_uuid": row.volume_uuid,
+                    "nonce": "e".repeat(32),
+                    "generation": 3
+                }
+            }],
+            "updated_ms": 1
+        });
+        let bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        fs::write(&receipt_path, &bytes).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        settle_receipt(&control, &id, "deleted").unwrap();
+        // The unrelated current selection is byte-identical.
+        assert_eq!(fs::read(&receipt_path).unwrap(), bytes);
+        let settled = ready_registry(&control).unwrap();
+        assert!(settled.intent(&id).is_none(), "the intent was not settled");
+        assert!(
+            settled
+                .rows
+                .iter()
+                .all(|existing| existing.root != row.root),
+            "the released root's rows were not retired"
+        );
+    }
+
+    /// P2: a pending, reserve-carrying or already-pruning reference keeps the
+    /// root even when its member would otherwise be current authority.
+    #[test]
+    fn a_group_refuses_pending_or_reserved_references() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let base = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 9,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let candidate = candidate_of(&debug);
+        verified_group(&base, &candidate).unwrap();
+        for broken in [
+            Row {
+                pending: true,
+                ..debug.clone()
+            },
+            Row {
+                reservation: Some("reserve".to_owned()),
+                ..debug.clone()
+            },
+            Row {
+                cancelling: Some("cancel".to_owned()),
+                ..debug.clone()
+            },
+            Row {
+                pruning: Some("intent".to_owned()),
+                ..debug.clone()
+            },
+        ] {
+            let registry = Registry {
+                rows: vec![broken.clone()],
+                ..base.clone()
+            };
+            let refused = verified_group(&registry, &candidate).unwrap_err();
+            assert!(refused.contains("not an eligible part"), "{refused}");
+        }
+        // An unusable recorded identity is refused by SHAPE, even in history.
+        let mut broken_history = debug.clone();
+        broken_history.selected = false;
+        broken_history.nonce = Some("zz".to_owned());
+        let registry = Registry {
+            rows: vec![broken_history],
+            ..base.clone()
+        };
+        let refused = verified_group(&registry, &candidate).unwrap_err();
+        assert!(refused.contains("unusable recorded identity"), "{refused}");
+    }
+
+    /// P2: the receipt's current references are compared with the SELECTED part
+    /// of the group only. Inactive history is never required in the receipt,
+    /// and a receipt that selects a historical member is a contradiction.
+    #[test]
+    fn the_receipt_is_compared_with_the_selected_part_of_the_group() {
+        let root = PathBuf::from("/volumes/owned/root");
+        let group = vec![
+            GroupRow {
+                member: "debug".to_owned(),
+                generation: 3,
+                nonce: Some("b".repeat(32)),
+                root_dev: Some(1),
+                root_ino: Some(2),
+                marker_digest: Some("c".repeat(64)),
+                selected: true,
+            },
+            GroupRow {
+                member: "release".to_owned(),
+                generation: 3,
+                nonce: Some("b".repeat(32)),
+                root_dev: Some(1),
+                root_ino: Some(2),
+                marker_digest: Some("c".repeat(64)),
+                selected: true,
+            },
+            GroupRow {
+                member: "target".to_owned(),
+                generation: 1,
+                nonce: None,
+                root_dev: None,
+                root_ino: None,
+                marker_digest: None,
+                selected: false,
+            },
+        ];
+        let current = vec![
+            ("debug".to_owned(), root.clone(), 3u64, Some("b".repeat(32))),
+            (
+                "release".to_owned(),
+                root.clone(),
+                3u64,
+                Some("b".repeat(32)),
+            ),
+        ];
+        // Exactly the two selected members: history is absent and that is fine.
+        selected_group_mismatch(&current, &root, &group).unwrap();
+        // A historical member appearing as current is a contradiction.
+        let mut with_history = current.clone();
+        with_history.push(("target".to_owned(), root.clone(), 1, None));
+        let refused = selected_group_mismatch(&with_history, &root, &group).unwrap_err();
+        assert!(
+            refused.contains("do not match the selected part"),
+            "{refused}"
+        );
+        // A missing selected member is a contradiction.
+        let missing = vec![current[0].clone()];
+        assert!(selected_group_mismatch(&missing, &root, &group).is_err());
+        // A changed generation or nonce is a contradiction.
+        let mut changed = current.clone();
+        changed[1].2 = 4;
+        assert!(selected_group_mismatch(&changed, &root, &group).is_err());
+        let mut renamed = current.clone();
+        renamed[0].3 = Some("d".repeat(32));
+        assert!(selected_group_mismatch(&renamed, &root, &group).is_err());
+        // Another root's placement never counts as this root's authority.
+        let elsewhere = vec![(
+            "debug".to_owned(),
+            PathBuf::from("/volumes/other/root"),
+            3u64,
+            Some("b".repeat(32)),
+        )];
+        assert!(selected_group_mismatch(&elsewhere, &root, &group).is_err());
+        // A ZERO-selected group requires the receipt to select nothing here.
+        let detached: Vec<GroupRow> = group
+            .iter()
+            .cloned()
+            .map(|row| GroupRow {
+                selected: false,
+                ..row
+            })
+            .collect();
+        selected_group_mismatch(&[], &root, &detached).unwrap();
+        assert!(selected_group_mismatch(&current, &root, &detached).is_err());
     }
 
     #[test]

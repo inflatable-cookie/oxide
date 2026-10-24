@@ -156,10 +156,22 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   with a loud warning when a build falls back to the internal pool.
   `oxide pool describe --json` reports it to other tools.
 - **Final outputs** stay checkout-local by default. Permanent drive mode adds
-  one per-checkout owned `target` link: a fresh checkout with no `target`
-  gets it on its first build, others by explicit adoption. It never moves
-  existing output, and ephemeral mode is unchanged
+  owned output links: a fresh checkout with no `target` gets its first
+  conversion on build, others by explicit adoption. Existing whole-target
+  links migrate only by explicit adoption. It never moves existing output,
+  and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
+- **Owned links at profile directories** (v1, operator accepted): a converted
+  checkout keeps `target` itself a real directory and owns only the positively
+  identified members `debug`, `release`, `<triple>/debug` and
+  `<triple>/release`, so tools that mount `target` keep working. An existing
+  whole-target link moves only through an explicit `oxide outputs adopt` under
+  a durable journal, a real nonempty profile directory is never moved or
+  converted, and an undeclared opaque tool refuses instead of guessing. The
+  profile layout is implemented with a known fail-safe detach refusal for
+  host-triple member links and incomplete native coverage. The as-is acceptance,
+  contract, formats and evidence limits are owned by the
+  [workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides
   HOME still uses them; private pools need an explicit setting. Its proof
@@ -175,8 +187,6 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - owned output links at the profile directory (`target/debug` and the
-    like) instead of `target`, so tools that mount `target` keep working;
   - cold-slot seeding from matching units, conservative first, with
     one-use temp workspaces handled as seeded, first-evicted slots;
   - per-slot test scratch;
@@ -224,6 +234,25 @@ the operating rules.
   closure, and removable media: adds an independent reviewer native session.
 - **Bounds:** wall-clock time and scratch budget. Resource figures are
   reported, not gated.
+- **Proof authoring guidance** (product architect, 2026-10-24): briefs that
+  author or correct a native proof script, its fixtures or its oracles declare
+  **HIGH** complexity. Queue still selects the models. Before a counted native,
+  the author runs the script's safe opt-in diagnostic keep-going mode as an
+  uncounted collection run, using an existing mode or adding one for a new
+  script. Where no safe diagnostic exists, use a documented source
+  premise/oracle sweep against current shipped behaviour instead. Check the
+  executable case bodies, not only their plan text: automatic adoption,
+  private-HOME controls, Cargo's external-subcommand argv and command-prefix
+  parsing are examples of premises that have caused false failures.
+  - Record diagnostic failures and dependent or tainted skips honestly;
+    unknown device/writer effects, infrastructure faults and uncertain custody
+    still abort. Keep the default counted path fail-fast and preserve the
+    qualified guard and cleanup bounds.
+  - The collection receipt is diagnostic only, never a counted PASS or closure
+    claim. It still needs its own scoped activation, exact source/input pins,
+    supported route, time and scratch bounds. This guidance grants no native
+    start, extra diagnostic allowance or clock reset. The counted run exercises
+    an already-swept script.
 - **Mechanical native-evidence gates** (Supervisor, 2026-10-23): every Oxide
   brief requiring counted native evidence encodes it in Queue before
   promotion. Use `reviewVerdicts: true` with a `reviewPassGate` subject such
