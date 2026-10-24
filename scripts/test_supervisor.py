@@ -1696,8 +1696,9 @@ class PureDefaultScratch(unittest.TestCase):
         # The qualification must not mask default selection with --root-parent;
         # it finds the candidate receipt through --evidence instead.
         text = BOOTSTRAP.read_text()
-        self.assertNotIn('"--root-parent"', text)
-        self.assertIn('"--evidence"', text)
+        self.assertNotIn('"--root-parent"', text, "the bootstrap would mask default selection")
+        self.assertNotIn('"--evidence"', text, "external evidence would sit outside the monitored root")
+        self.assertIn('"OXIDE_SUPERVISOR_LAYOUT"', text, "the suite layout record is not wired")
 
     # The owned leaf
 
@@ -1747,7 +1748,197 @@ class PureDefaultScratch(unittest.TestCase):
         self.assertFalse(os.path.lexists(leaf))
 
 
+
+# Qualification layout (oxide#145) ------------------------------------------------
+
+qspec = importlib.util.spec_from_file_location("qualify_supervisor", BOOTSTRAP)
+qualify = importlib.util.module_from_spec(qspec)
+qspec.loader.exec_module(qualify)
+
+VOLUME = "/Volumes/Builds"
+DRIVE_DEVICE = 2000
+
+
+class TopologyFacts:
+    """Injected device, canonical-path, free-space and document facts for the
+    qualification's pass checks; real documents may also be read."""
+
+    def __init__(self, nodes, documents=None, boot=1, realpaths=None, free=None):
+        self.nodes, self.documents, self.boot = dict(nodes), dict(documents or {}), boot
+        self.realpaths, self.free_bytes = dict(realpaths or {}), dict(free or {})
+
+    def device(self, path):
+        try:
+            return self.nodes[path]
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+
+    def realpath(self, path):
+        return self.realpaths.get(path, path)
+
+    def boot_device(self):
+        return self.boot
+
+    def free(self, path):
+        try:
+            return self.free_bytes[path]
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+
+    def document(self, path):
+        if path in self.documents:
+            return self.documents[path]
+        with open(path) as handle:
+            return json.load(handle)
+
+
+class PureQualificationTopology(unittest.TestCase):
+    """The actual new-default qualification: nested case resources, evidence
+    and reserve all on the selected volume inside the monitored owned root,
+    with a separately labelled boot reserve."""
+
+    def layout(self):
+        """A real owned-root tree inside the suite's scratch, with the
+        selected volume's device facts injected (no drive is touched)."""
+        sandbox = Path(tempfile.mkdtemp(prefix="qualify.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        parent = str(sandbox)
+        root = os.path.join(parent, "oxide-proof.abc123")
+        evidence, scratch = os.path.join(root, "evidence"), os.path.join(root, "scratch")
+        for path in (evidence, scratch):
+            os.makedirs(path)
+        case = os.path.join(evidence, "nested", "test_exit_zero_closed.1")
+        os.makedirs(os.path.join(case, "evidence"))
+        (Path(case) / "evidence" / "receipt.json").write_text("{}")
+        registration = os.path.join(parent, "registration.json")
+        with open(registration, "w") as handle:
+            json.dump({"version": 2, "mount_point": VOLUME, "volume_uuid": DRIVE_UUID}, handle)
+        facts = TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, evidence: DRIVE_DEVICE,
+                               scratch: DRIVE_DEVICE, "/private/tmp": 1,
+                               os.path.join(parent, "pool"): DRIVE_DEVICE},
+                              documents={os.path.join(parent, "topology.json"):
+                                         {"scratch": scratch, "evidence": evidence}},
+                              boot=1, free={parent: 500 * 1024 ** 3, VOLUME: 500 * 1024 ** 3,
+                                          "/private/tmp": 30 * 1024 ** 3})
+        return sandbox, parent, root, evidence, scratch, case, registration, facts
+
+    def receipt(self, parent, root, evidence, scratch, registration, case):
+        return {
+            "phase": "monitor_complete: pending_custodian",
+            "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False},
+            "root": root, "scratch": scratch, "evidence": evidence,
+            "scratch_default": {"source": "selected-volume", "root_parent": parent, "pool":
+                                os.path.join(parent, "pool"), "pool_source": "account config",
+                                "registration": registration, "mount": VOLUME,
+                                "volume_uuid": DRIVE_UUID, "reason": None},
+            "reserve": {"samples": 4, "minimum": 400 * 1024 ** 3, "max_gap_ns": 10, "first_ns": 1,
+                        "last_ns": 2, "path": root, "device": DRIVE_DEVICE},
+            "owned_bytes": {"maximum": 8 * 1024 ** 2, "budget": 512 * 1024 ** 2},
+            "custodian": [{"event": "gate_open", "at": 5}],
+        }
+
+    def test_nested_cases_and_evidence_stay_inside_the_monitored_root(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, problems = qualify.topology(str(sandbox), expected, facts)
+        self.assertEqual(problems, [])
+        self.assertEqual(record["root"], root)
+        self.assertEqual(qualify.nested_cases({"cases": [{"case": "zero", "dir": case}]}, record), [])
+        receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": case}]}
+        problems = qualify.check(receipt, results, expected, record, facts)
+        self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
+
+    def test_a_case_outside_the_monitored_root_fails(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        outside = "/private/tmp/nested/elsewhere.1"
+        problems = qualify.nested_cases({"cases": [{"case": "zero", "dir": outside}]}, record)
+        self.assertTrue(any("outside the monitored root" in p for p in problems), problems)
+        self.assertTrue(any("no nested case directory" in p for p in
+                            qualify.nested_cases({"cases": []}, record)))
+
+    def test_receipt_evidence_must_be_the_suite_recorded_layout(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+        receipt["evidence"] = "/private/tmp/evidence"
+        problems = qualify.default_scratch(receipt, expected, record, facts)
+        self.assertTrue(any("is not the suite's recorded" in p for p in problems), problems)
+
+    def test_topology_refusals(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        cases = {
+            "not directly on the selected volume": dict(record={"scratch": os.path.join(parent, "sub",
+                                                                                     "oxide-proof.x", "scratch"),
+                                                               "evidence": os.path.join(parent, "sub",
+                                                                                        "oxide-proof.x",
+                                                                                        "evidence")},
+                                                        nodes={}),
+            "not members of one owned root": dict(record={"scratch": scratch, "evidence": parent},
+                                                  nodes={}),
+            "not canonical": dict(record={"scratch": scratch, "evidence": evidence},
+                                  realpaths={scratch: "/private/tmp/elsewhere"}),
+            "not on the selected volume's device": dict(record={"scratch": scratch, "evidence": evidence},
+                                                       nodes={root: 1}),
+        }
+        for marks, override in cases.items():
+            with self.subTest(marks):
+                probe = TopologyFacts(dict(facts.nodes, **override.get("nodes", {})),
+                                      documents={os.path.join(str(sandbox), "topology.json"):
+                                                 override["record"]},
+                                      boot=facts.boot, realpaths=override.get("realpaths"), free=facts.free_bytes)
+                _, problems = qualify.topology(str(sandbox), expected, probe)
+                self.assertTrue(any(marks in p for p in problems), problems)
+        for label, document in (("missing", None), ("not an object", [1]),
+                                ("no scratch and evidence", {"root": root})):
+            with self.subTest(label):
+                probe = TopologyFacts(facts.nodes, documents={}, boot=facts.boot, free=facts.free_bytes)
+                if document is not None:
+                    probe.documents[os.path.join(str(sandbox), "topology.json")] = document
+                record, problems = qualify.topology(str(sandbox), expected, probe)
+                self.assertIsNone(record)
+                self.assertTrue(problems)
+
+    def test_default_scratch_facts_are_rechecked(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+        self.assertEqual(qualify.default_scratch(receipt, expected, record, facts), [])
+        booted = TopologyFacts(facts.nodes, documents={}, boot=DRIVE_DEVICE, free=facts.free_bytes)
+        self.assertTrue(any("boot volume" in p for p in qualify.default_scratch(receipt, expected, record, booted)))
+        reserve = dict(receipt, reserve=dict(receipt["reserve"], device=1))
+        self.assertTrue(any("reserve is not sampled" in p for p in
+                            qualify.default_scratch(reserve, expected, record, facts)))
+        payload_root = os.path.join(parent, "pool", "oxide-proof.abc")
+        payload_nodes = dict(facts.nodes)
+        payload_nodes[payload_root] = DRIVE_DEVICE
+        payload_facts = TopologyFacts(payload_nodes, documents={}, boot=1, free=facts.free_bytes)
+        in_pool = dict(receipt, root=payload_root)
+        record_in_pool = dict(record, root=payload_root)
+        self.assertTrue(any("inside the pool payload" in p for p in
+                            qualify.default_scratch(in_pool, expected, record_in_pool, payload_facts)))
+        fallback = dict(receipt, scratch_default=dict(receipt["scratch_default"], source="fallback"))
+        self.assertTrue(any("did not use the selected volume" in p for p in
+                            qualify.default_scratch(fallback, expected, record, facts)))
+
+    def test_reserve_readings_identify_the_scratch_volume_and_the_boot_volume_separately(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        readings = qualify.reserve_readings(parent, "/private/tmp", facts)
+        self.assertEqual(readings["scratch_volume"]["path"], parent)
+        self.assertEqual(readings["scratch_volume"]["free"], 500 * 1024 ** 3)
+        self.assertEqual(readings["boot_volume"]["path"], "/private/tmp")
+        self.assertEqual(readings["boot_volume"]["free"], 30 * 1024 ** 3)
+        self.assertEqual(readings["scratch_volume"]["threshold"], qualify.THRESHOLD)
+        self.assertEqual(readings["boot_volume"]["threshold"], qualify.THRESHOLD)
+
+
 # Real cases --------------------------------------------------------------------
+
 
 
 def alive(pid):
@@ -1765,6 +1956,22 @@ def nested_root():
     root = Path(OUTER_EVIDENCE) / "nested"
     root.mkdir(exist_ok=True)
     return root.resolve()
+
+
+def record_layout():
+    """Record the layout this suite ran in for the qualification bootstrap
+    (oxide#145): the candidate's owned root, scratch and evidence. Nested
+    real-case directories are created in OXIDE_PROOF_EVIDENCE, so recording
+    and verifying this record is what proves the nested resources stayed
+    inside the candidate's monitored root on the selected volume."""
+    path = os.environ.get("OXIDE_SUPERVISOR_LAYOUT")
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+    if not path or not scratch or not OUTER_EVIDENCE:
+        return
+    record = {"scratch": os.path.realpath(scratch), "evidence": os.path.realpath(OUTER_EVIDENCE),
+              "suite_pid": os.getpid()}
+    with open(path, "w") as handle:
+        json.dump(record, handle)
 
 
 class Real(unittest.TestCase):
@@ -2244,12 +2451,13 @@ def write(name, size):
 
 def main():
     signal.alarm(250)  # secondary bound; the supervisor's deadline is primary
+    record_layout()
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
-                                           PureTraversal, PureDefaultScratch))
+                                           PureTraversal, PureDefaultScratch, PureQualificationTopology))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer
