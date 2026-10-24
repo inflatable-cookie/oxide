@@ -527,7 +527,7 @@ def attach_image(custody: Custody, run, timeout: float) -> str:
     cleanup can detach what this run owns."""
     custody.record("attach-requested")
     try:
-        code, out, err = run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist", custody.image], timeout)
+        code, out, err = run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-owners", "on", "-plist", custody.image], timeout)
     except subprocess.TimeoutExpired:
         custody.record("attach-unknown", reason="attach timed out; device custody unknown")
         raise RuntimeError("attach timed out; image and custody kept")
