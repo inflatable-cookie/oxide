@@ -535,7 +535,7 @@ def main() -> int:
         write(os.path.join(parent, "elsewhere", "rust-toolchain.toml"), f'[toolchain]\nchannel = "{BUILDER}"\n')
         env = {name: value for name, value in stage_env.items()
                if not name.startswith("CARGO_") and name not in ("RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER")}
-        env.update({"HOME": home, "CARGO_HOME": os.path.join(parent, "cargo-home"),
+        env.update({"OXIDE_TEST_HOME_FROM_ENV": "1", "HOME": home, "CARGO_HOME": os.path.join(parent, "cargo-home"),
                     "RUSTUP_HOME": os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup"),
                     "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never",
                     "TMPDIR": os.path.join(parent, "tmp"),

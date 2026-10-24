@@ -63,6 +63,7 @@ import errno
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -483,7 +484,32 @@ def build_binaries(extra: tuple = (), env: dict | None = None) -> dict:
             executables[name] = message["executable"]
     if "oxide" not in executables:
         fail("compiled artifact oxide was not reported")
+    if "--release" not in extra:
+        # Fixture cases rely on the debug-only proof controls; refuse an
+        # artifact that does not report them before any case runs.
+        probe = subprocess.run([executables["oxide"], "__oxide-build-capabilities"],
+                               capture_output=True, text=True, timeout=min(30, remaining()))
+        try:
+            controls = json.loads(probe.stdout).get("test_controls")
+        except (json.JSONDecodeError, AttributeError):
+            controls = None
+        if probe.returncode or controls is not True:
+            fail(f"staged oxide does not report compiled proof controls: {probe.stdout!r}")
     return executables
+
+
+def scrubbed(environ) -> dict:
+    """The inherited environment without anything that selects Oxide's
+    config, pool, proof controls or XDG roots, so fixture overrides are the
+    only storage inputs. Rustup keeps the invoking default (its RUSTUP_HOME,
+    else the invoking HOME's .rustup, read before any fixture replaces HOME)
+    and never installs a toolchain."""
+    env = {name: value for name, value in environ.items()
+           if name not in ("OXIDE_CONFIG", "OXIDE_POOL") and not name.startswith(("OXIDE_TEST_", "XDG_"))}
+    invoking_home = environ.get("HOME") or pwd.getpwuid(os.geteuid()).pw_dir
+    env["RUSTUP_HOME"] = environ.get("RUSTUP_HOME") or os.path.join(invoking_home, ".rustup")
+    env["RUSTUP_AUTO_INSTALL"] = "0"
+    return env
 
 
 class Runner:
@@ -499,7 +525,7 @@ class Runner:
         self.cargo_home = os.path.join(parent, "cargo-home")
         for path in (self.bin, self.tmp, self.cargo_home):
             os.makedirs(path, mode=0o700, exist_ok=True)
-        env = dict(os.environ)
+        env = scrubbed(os.environ)
         for name in (
             "CARGO",
             "CARGO_TARGET_DIR",
@@ -511,8 +537,14 @@ class Runner:
             "OXIDE_MAX_ACTIVE",
         ):
             env.pop(name, None)
+        # A private HOME through the proof control: no case reads or writes
+        # the operator's account config, state or pool.
+        self.home = os.path.join(parent, "home")
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
         env.update(
             {
+                "HOME": self.home,
+                "OXIDE_TEST_HOME_FROM_ENV": "1",
                 "OXIDE_POOL": self.pool,
                 "CARGO_HOME": self.cargo_home,
                 "PATH": self.bin + os.pathsep + env.get("PATH", ""),
@@ -3145,7 +3177,7 @@ def clean_safety_main() -> int:
     no_pool = os.path.join(parent, "never-created-pool")
     home = os.path.join(parent, "cargo-home")
     os.makedirs(home, mode=0o700)
-    base = {name: value for name, value in os.environ.items()
+    base = {name: value for name, value in scrubbed(os.environ).items()
             if not (name.startswith(("CARGO_NET_", "CARGO_REGISTR", "CARGO_SOURCE_", "CARGO_UNSTABLE_", "CARGO_HTTP_", "CARGO_TARGET_DIR", "CARGO_BUILD_"))
                     or name.lower().endswith("_proxy") or name in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "CARGO_HOME"))}
     # An empty private home for the fixture build and locate calls; the
@@ -3154,7 +3186,10 @@ def clean_safety_main() -> int:
     os.makedirs(build_home, mode=0o700)
     base["CARGO_HOME"] = os.path.realpath(build_home)
     real_env = {**base, "CARGO_NET_OFFLINE": "true"}
-    env = {**base, "PATH": bindir + os.pathsep + base.get("PATH", ""), "OXIDE_POOL": no_pool,
+    private_home = os.path.join(parent, "private-home")
+    os.makedirs(private_home, mode=0o700)
+    env = {**base, "HOME": private_home, "OXIDE_TEST_HOME_FROM_ENV": "1",
+           "PATH": bindir + os.pathsep + base.get("PATH", ""), "OXIDE_POOL": no_pool,
            "OXIDE_PROOF_CARGO_LOG": cargo_log, "OXIDE_PROOF_REAL_CARGO": real_cargo}
 
     def call(cwd: str, args: list, extra: dict | None = None, cargo_home: str | None = None):

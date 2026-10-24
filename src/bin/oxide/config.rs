@@ -15,9 +15,9 @@
 //! directory variable.
 
 use longhorn_storage_layout::{
-    native_platform_directory_fact, native_platform_directory_fact_from, resolve_storage_root,
-    PlatformDirectoryFact, PlatformEnvironment, RootKind, StorageIdentity, StorageLayoutError,
-    StorageLayoutRequest, TargetPlatform,
+    native_platform_directory_fact_from, resolve_storage_root, PlatformDirectoryFact,
+    PlatformEnvironment, RootKind, StorageIdentity, StorageLayoutError, StorageLayoutRequest,
+    TargetPlatform,
 };
 use serde::Deserialize;
 use std::ffi::OsString;
@@ -45,14 +45,235 @@ const MAX_KNOWN_POOLS_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub macos: bool,
-    /// For `~` in config paths and the ignored macOS legacy config.
+    /// The home every Oxide storage root, `~` in config paths and the ignored
+    /// macOS legacy config derive from: the account's home directory, never
+    /// `$HOME` (a harness that overrides HOME still gets the machine pool).
     pub home: Option<OsString>,
+    /// `$HOME` as the process saw it, only for the status notice.
+    pub env_home: Option<OsString>,
+    /// Why `home` holds what it does.
+    pub home_source: HomeSource,
+    /// A malformed or unsupported proof-control request; it refuses every
+    /// configuration access, explicit pool and config included.
+    pub control_error: Option<String>,
     pub directories: Directories,
     pub oxide_config: Option<OsString>,
     pub oxide_pool: Option<OsString>,
     pub oxide_pool_cap: Option<OsString>,
     pub oxide_max_active: Option<OsString>,
     pub physical_cores: PhysicalCoreCount,
+}
+
+/// Where the home fact came from.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum HomeSource {
+    /// Injected by a unit test.
+    #[default]
+    Injected,
+    /// The account's passwd entry (`getpwuid_r(geteuid())`).
+    Account,
+    /// A stand-in account home, through the debug-build-only proof control.
+    TestAccount,
+    /// `$HOME`, through the debug-build-only proof control.
+    TestEnvironment,
+    /// The account lookup failed; nothing derives from a home.
+    Unavailable(String),
+}
+
+/// The debug-build-only proof control that restores `$HOME` as the home
+/// input. Release builds never read it.
+pub const TEST_HOME_FROM_ENV: &str = "OXIDE_TEST_HOME_FROM_ENV";
+/// The debug-build-only proof control that replaces the passwd lookup with a
+/// controlled account home, or `!unavailable` for an injected failure.
+pub const TEST_ACCOUNT_HOME: &str = "OXIDE_TEST_ACCOUNT_HOME";
+
+/// The account's real home directory from its passwd entry, looked up once
+/// per process so every resolution in one invocation sees the same fact.
+fn passwd_home() -> Result<OsString, String> {
+    static HOME: std::sync::OnceLock<Result<OsString, String>> = std::sync::OnceLock::new();
+    HOME.get_or_init(lookup_passwd_home).clone()
+}
+
+fn lookup_passwd_home() -> Result<OsString, String> {
+    use std::ffi::CStr;
+    let uid = unsafe { libc::geteuid() };
+    let mut size = 1024usize;
+    loop {
+        let mut buffer = vec![0 as libc::c_char; size];
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer refers to live, correctly sized storage owned here.
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE && size < 1 << 20 {
+            size *= 4;
+            continue;
+        }
+        if code != 0 {
+            return Err(format!(
+                "the account home directory is unavailable (getpwuid_r: {})",
+                std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        if result.is_null() || entry.pw_dir.is_null() {
+            return Err(format!(
+                "the account home directory is unavailable (no passwd entry for uid {uid})"
+            ));
+        }
+        // SAFETY: getpwuid_r succeeded, so pw_dir is a NUL-terminated string in `buffer`.
+        let bytes = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes();
+        return passwd_dir(bytes);
+    }
+}
+
+/// The passwd directory bytes as a home: non-empty and absolute, or refused.
+fn passwd_dir(bytes: &[u8]) -> Result<OsString, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let home = std::ffi::OsStr::from_bytes(bytes).to_owned();
+    if bytes.is_empty() {
+        return Err("the account home directory is unavailable (empty passwd home)".to_owned());
+    }
+    if !Path::new(&home).is_absolute() {
+        return Err("the account home directory is unavailable (relative passwd home)".to_owned());
+    }
+    Ok(home)
+}
+
+/// What the proof controls ask for, validated before any configuration is
+/// read so a malformed request can never fall through to the real account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ControlRequest {
+    None,
+    HomeFromEnv,
+    AccountHome(OsString),
+    AccountUnavailable,
+}
+
+fn proof_controls(
+    debug: bool,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<ControlRequest, String> {
+    let home_env = var(TEST_HOME_FROM_ENV);
+    let account = var(TEST_ACCOUNT_HOME);
+    if home_env.is_none() && account.is_none() {
+        return Ok(ControlRequest::None);
+    }
+    if !debug {
+        let name = if home_env.is_some() {
+            TEST_HOME_FROM_ENV
+        } else {
+            TEST_ACCOUNT_HOME
+        };
+        return Err(format!(
+            "{name} is set, but this build has no proof controls"
+        ));
+    }
+    if home_env.is_some() && account.is_some() {
+        return Err(format!(
+            "{TEST_HOME_FROM_ENV} and {TEST_ACCOUNT_HOME} are both set; use one"
+        ));
+    }
+    if let Some(value) = home_env {
+        return if value == "1" {
+            Ok(ControlRequest::HomeFromEnv)
+        } else {
+            Err(format!("{TEST_HOME_FROM_ENV} must be exactly 1"))
+        };
+    }
+    let value = account.unwrap_or_default();
+    let scratch = supervisor_scratch(var)?;
+    if value == "!unavailable" {
+        return Ok(ControlRequest::AccountUnavailable);
+    }
+    controlled_account_home(&value, &scratch).map(ControlRequest::AccountHome)
+}
+
+/// The qualified shared supervisor's own layout: a canonical
+/// `OXIDE_TASK_SCRATCH_ROOT` at `<root>/scratch` and `OXIDE_PROOF_EVIDENCE`
+/// at `<root>/evidence` under one `oxide-proof.*` root, plus a `u64`
+/// `OXIDE_PROOF_DEADLINE_NS`. The account control works only inside it.
+fn supervisor_scratch(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
+    let refuse = |why: &str| Err(format!("{TEST_ACCOUNT_HOME} refused: {why}"));
+    let canonical = |name: &str| {
+        let path = PathBuf::from(var(name)?);
+        let resolved = path.canonicalize().ok()?;
+        (resolved == path && resolved.is_dir()).then_some(resolved)
+    };
+    let Some(scratch) = canonical("OXIDE_TASK_SCRATCH_ROOT") else {
+        return refuse(
+            "OXIDE_TASK_SCRATCH_ROOT is not a canonical directory (not under the proof supervisor)",
+        );
+    };
+    let root = scratch.parent().filter(|root| {
+        scratch.file_name().is_some_and(|name| name == "scratch")
+            && root
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("oxide-proof."))
+    });
+    let Some(root) = root else {
+        return refuse("OXIDE_TASK_SCRATCH_ROOT is not the supervisor's <oxide-proof.*>/scratch");
+    };
+    if canonical("OXIDE_PROOF_EVIDENCE").as_deref() != Some(root.join("evidence").as_path()) {
+        return refuse("OXIDE_PROOF_EVIDENCE is not the supervisor's sibling evidence directory");
+    }
+    let deadline = var("OXIDE_PROOF_DEADLINE_NS").unwrap_or_default();
+    if deadline
+        .to_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .is_none()
+    {
+        return refuse("OXIDE_PROOF_DEADLINE_NS is not the supervisor's deadline");
+    }
+    Ok(scratch)
+}
+
+/// A proof's stand-in account home: a real, canonical directory strictly
+/// inside the supervisor's scratch, so it can never name the operator's home.
+fn controlled_account_home(value: &std::ffi::OsStr, scratch: &Path) -> Result<OsString, String> {
+    let refuse = |why: &str| Err(format!("{TEST_ACCOUNT_HOME} refused: {why}"));
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return refuse("not an absolute path");
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return refuse("the path does not resolve");
+    };
+    if canonical != path {
+        return refuse("the path is not canonical");
+    }
+    if canonical == scratch || !canonical.starts_with(scratch) {
+        return refuse("not strictly inside OXIDE_TASK_SCRATCH_ROOT");
+    }
+    if !canonical.is_dir() {
+        return refuse("not a directory");
+    }
+    Ok(canonical.into_os_string())
+}
+
+/// The home input and its source, from an already validated control request.
+fn resolve_home(
+    request: &ControlRequest,
+    env_home: Option<OsString>,
+) -> (Option<OsString>, HomeSource) {
+    let account = match request {
+        ControlRequest::HomeFromEnv => return (env_home, HomeSource::TestEnvironment),
+        ControlRequest::AccountHome(home) => return (Some(home.clone()), HomeSource::TestAccount),
+        ControlRequest::AccountUnavailable => {
+            Err("the account home directory is unavailable (injected)".to_owned())
+        }
+        ControlRequest::None => passwd_home(),
+    };
+    match account {
+        Ok(home) => (Some(home), HomeSource::Account),
+        Err(error) => (None, HomeSource::Unavailable(error)),
+    }
 }
 
 /// Where platform directory facts come from.
@@ -106,9 +327,18 @@ impl ActiveBuildLimit {
 impl Facts {
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+        let env_home = var("HOME");
+        let (control_error, (home, home_source)) =
+            match proof_controls(cfg!(debug_assertions), &|name| std::env::var_os(name)) {
+                Ok(request) => (None, resolve_home(&request, env_home.clone())),
+                Err(error) => (Some(error.clone()), (None, HomeSource::Unavailable(error))),
+            };
         Self {
             macos: cfg!(target_os = "macos"),
-            home: var("HOME"),
+            home,
+            env_home,
+            home_source,
+            control_error,
             directories: Directories::Process,
             oxide_config: var("OXIDE_CONFIG"),
             oxide_pool: var("OXIDE_POOL"),
@@ -118,55 +348,189 @@ impl Facts {
         }
     }
 
+    /// A malformed proof-control request refuses before anything is read.
+    fn check_controls(&self) -> Result<(), String> {
+        self.control_error.clone().map_or(Ok(()), Err)
+    }
+
     fn home(&self) -> Result<PathBuf, String> {
+        self.check_controls()?;
         let home = self
             .home
             .as_ref()
             .map(PathBuf::from)
-            .ok_or("HOME is unset; set OXIDE_CONFIG and OXIDE_POOL explicitly")?;
+            .ok_or_else(|| self.missing_home())?;
         if home.is_absolute() {
             Ok(home)
         } else {
-            Err("HOME is not an absolute path".to_owned())
+            Err("the home directory is not an absolute path".to_owned())
         }
+    }
+
+    fn missing_home(&self) -> String {
+        match &self.home_source {
+            HomeSource::Unavailable(reason) => {
+                format!("{reason}; set OXIDE_CONFIG and OXIDE_POOL explicitly")
+            }
+            _ => "HOME is unset; set OXIDE_CONFIG and OXIDE_POOL explicitly".to_owned(),
+        }
+    }
+
+    /// Whether `$HOME` differs from an account home Oxide resolved from.
+    fn home_differs(&self) -> bool {
+        matches!(
+            self.home_source,
+            HomeSource::Account | HomeSource::TestAccount
+        ) && self.home.is_some()
+            && self.env_home != self.home
+    }
+
+    /// The status `home:` line: which home Oxide used and why.
+    pub fn home_line(&self) -> String {
+        let home = || {
+            self.home
+                .as_deref()
+                .map_or_else(|| "none".to_owned(), shown)
+        };
+        let line = match &self.home_source {
+            HomeSource::Account => format!("account home {} (passwd entry)", home()),
+            HomeSource::TestAccount => {
+                format!(
+                    "account home {} (proof control {TEST_ACCOUNT_HOME})",
+                    home()
+                )
+            }
+            HomeSource::TestEnvironment => {
+                format!("HOME {} (proof control {TEST_HOME_FROM_ENV})", home())
+            }
+            HomeSource::Injected => format!("{} (injected)", home()),
+            HomeSource::Unavailable(reason) => format!("unavailable ({})", bounded(reason)),
+        };
+        if self.home_differs() {
+            format!("{line}; HOME is {}", self.env_home_shown())
+        } else {
+            line
+        }
+    }
+
+    fn env_home_shown(&self) -> String {
+        self.env_home
+            .as_deref()
+            .map_or_else(|| "unset".to_owned(), shown)
+    }
+
+    /// One stderr line when `$HOME` differs from the account home and the
+    /// pool is the built-in default under that home; `None` when an explicit
+    /// override (`OXIDE_POOL`, a config-file path or an honoured XDG cache
+    /// root) chose the pool.
+    fn home_notice(&self, pool: &Path, pool_source: Source) -> Option<String> {
+        if !self.home_differs() || pool_source != Source::Default || !self.cache_from_home() {
+            return None;
+        }
+        Some(format!(
+            "HOME is {}; using the account pool at {} (account home {}); set OXIDE_POOL to isolate",
+            self.env_home_shown(),
+            shown(pool.as_os_str()),
+            self.home
+                .as_deref()
+                .map_or_else(|| "none".to_owned(), shown),
+        ))
     }
 
     /// One platform-native root under the `oxide` leaf. Only this root's
     /// platform fact is read; Oxide's file names stay beneath it.
     fn storage_root(&self, kind: RootKind) -> Result<PathBuf, String> {
+        self.root_from(kind, None)
+    }
+
+    /// Whether the home chose the cache root, and so the default pool: the
+    /// root moves when only the home input changes. An honoured XDG cache
+    /// root does not, even when it names the home's default path.
+    fn cache_from_home(&self) -> bool {
+        // Two fixed alternatives, so the probe always differs from the home.
+        let probe = [
+            "/oxide-home-provenance-probe-a",
+            "/oxide-home-provenance-probe-b",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|probe| self.home.as_deref().map(Path::new) != Some(*probe))
+        .unwrap_or(Path::new("/"));
+        matches!(
+            (self.root_from(RootKind::Cache, None), self.root_from(RootKind::Cache, Some(probe))),
+            (Ok(actual), Ok(moved)) if actual != moved
+        )
+    }
+
+    /// One root from the process or injected facts, with the home input
+    /// replaced by `home` when given. The resolver reads no files.
+    fn root_from(&self, kind: RootKind, home: Option<&Path>) -> Result<PathBuf, String> {
+        self.check_controls()?;
         let fact = match kind {
             RootKind::Config => PlatformDirectoryFact::Config,
             RootKind::Cache => PlatformDirectoryFact::Cache,
             RootKind::State => PlatformDirectoryFact::State,
             _ => return Err(format!("{kind:?} is not an Oxide storage root")),
         };
-        let facts = match &self.directories {
+        let macos = match &self.directories {
             // Longhorn also has a Windows policy; Oxide keeps to the two
             // platforms it resolved before.
             Directories::Process if !cfg!(any(target_os = "macos", target_os = "linux")) => {
                 return Err("no Oxide storage-root policy for this platform".to_owned());
             }
-            Directories::Process => {
-                native_platform_directory_fact(fact).map_err(|error| error.to_string())?
-            }
-            Directories::Injected(environment) => {
-                let platform = if self.macos {
-                    TargetPlatform::MacOs
-                } else {
-                    TargetPlatform::Linux
-                };
-                native_platform_directory_fact_from(platform, fact, environment)
-            }
+            Directories::Process => cfg!(target_os = "macos"),
+            Directories::Injected(_) => self.macos,
         };
+        let platform = if macos {
+            TargetPlatform::MacOs
+        } else {
+            TargetPlatform::Linux
+        };
+        let environment = match &self.directories {
+            Directories::Process => self.process_environment(fact),
+            Directories::Injected(environment) => environment.clone(),
+        };
+        let environment = match home {
+            Some(home) => environment.with_home_dir(Some(home.to_path_buf())),
+            None => environment,
+        };
+        let facts = native_platform_directory_fact_from(platform, fact, &environment);
         let identity = StorageIdentity::new("oxide").map_err(|error| error.to_string())?;
         match resolve_storage_root(&StorageLayoutRequest::new(identity, facts), kind) {
             Ok(Some(root)) => Ok(root.path().to_path_buf()),
             Ok(None) => Err(format!("no {kind:?} root resolved")),
-            Err(StorageLayoutError::MissingPlatformFact { .. }) => Err(
-                "HOME is unset or not an absolute path; set OXIDE_CONFIG and OXIDE_POOL explicitly"
+            Err(StorageLayoutError::MissingPlatformFact { .. }) => Err(match &self.home_source {
+                HomeSource::Unavailable(reason) => {
+                    format!("{reason}; set OXIDE_CONFIG and OXIDE_POOL explicitly")
+                }
+                _ => "HOME is unset or not an absolute path; set OXIDE_CONFIG and OXIDE_POOL explicitly"
                     .to_owned(),
-            ),
+            }),
             Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The one fact's inputs: the resolved home in place of `$HOME`, and on
+    /// Linux the XDG variable for that fact, read from the process as Longhorn
+    /// would.
+    fn process_environment(&self, fact: PlatformDirectoryFact) -> PlatformEnvironment {
+        let home = self.home.as_ref().map(PathBuf::from);
+        let variable = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        let environment = PlatformEnvironment::default().with_home_dir(home);
+        if cfg!(target_os = "macos") {
+            return environment;
+        }
+        match fact {
+            PlatformDirectoryFact::Config => {
+                environment.with_xdg_config_home(variable("XDG_CONFIG_HOME"))
+            }
+            PlatformDirectoryFact::Cache => {
+                environment.with_xdg_cache_home(variable("XDG_CACHE_HOME"))
+            }
+            PlatformDirectoryFact::State => {
+                environment.with_xdg_state_home(variable("XDG_STATE_HOME"))
+            }
+            _ => environment,
         }
     }
 
@@ -176,6 +540,32 @@ impl Facts {
 
     fn state_dir(&self) -> Result<PathBuf, String> {
         self.storage_root(RootKind::State)
+    }
+}
+
+/// A path for a one-line message: control characters escaped, bounded.
+fn shown(value: &std::ffi::OsStr) -> String {
+    bounded(&Path::new(value).display().to_string())
+}
+
+fn bounded(text: &str) -> String {
+    const LIMIT: usize = 240;
+    let escaped: String = text
+        .chars()
+        .flat_map(|c| {
+            let escape = c.is_control();
+            let mut buffer = Vec::new();
+            if escape {
+                buffer.extend(c.escape_default());
+            } else {
+                buffer.push(c);
+            }
+            buffer
+        })
+        .collect();
+    match escaped.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}…", &escaped[..cut]),
+        None => escaped,
     }
 }
 
@@ -237,10 +627,16 @@ pub struct Settings {
     pub active_build_limit: ActiveBuildLimit,
     pub ignored_legacy_config: Option<PathBuf>,
     pub file: ConfigFile,
+    /// Which home Oxide used and why, for `status`.
+    pub home_line: String,
+    /// Set when `$HOME` differs from the account home and the pool is the
+    /// built-in default under that home.
+    pub home_notice: Option<String>,
 }
 
 /// The config file the platform selects, or `OXIDE_CONFIG`.
 pub fn config_file(facts: &Facts) -> Result<ConfigFile, String> {
+    facts.check_controls()?;
     let (path, explicit) = match &facts.oxide_config {
         Some(path) => {
             let path = PathBuf::from(path);
@@ -277,6 +673,7 @@ pub fn ignored_legacy_config(facts: &Facts) -> Option<PathBuf> {
 
 /// Resolve the effective settings: environment, then file, then default.
 pub fn settings(facts: &Facts) -> Result<Settings, String> {
+    facts.check_controls()?;
     let file = config_file(facts)?;
     let parsed = if file.present {
         read_config(&file.path)?
@@ -324,6 +721,7 @@ pub fn settings(facts: &Facts) -> Result<Settings, String> {
     };
     let active_build_limit = resolve_active_build_limit(facts, section.max_active, &file.path)?;
     let ignored_legacy_config = ignored_legacy_config(facts);
+    let home_notice = facts.home_notice(&pool, pool_source);
     Ok(Settings {
         pool,
         pool_source,
@@ -331,6 +729,8 @@ pub fn settings(facts: &Facts) -> Result<Settings, String> {
         budget_source,
         active_build_limit,
         ignored_legacy_config,
+        home_line: facts.home_line(),
+        home_notice,
         file,
     })
 }
@@ -835,6 +1235,349 @@ mod tests {
 
     fn facts(macos: bool) -> Facts {
         at_home(macos, Some("/home/user"))
+    }
+
+    #[test]
+    fn the_account_home_is_absolute_and_never_read_from_home() {
+        let home = passwd_home().expect("the test account has a passwd home");
+        assert!(Path::new(&home).is_absolute(), "{home:?}");
+        assert_eq!(passwd_home(), Ok(home), "one fact per process");
+    }
+
+    #[test]
+    fn a_passwd_home_must_be_present_and_absolute() {
+        assert_eq!(
+            passwd_dir(b"/Users/someone"),
+            Ok(OsString::from("/Users/someone"))
+        );
+        let empty = passwd_dir(b"").expect_err("empty");
+        assert!(empty.contains("empty passwd home"), "{empty}");
+        let relative = passwd_dir(b"Users/someone").expect_err("relative");
+        assert!(relative.contains("relative passwd home"), "{relative}");
+    }
+
+    /// A fresh `<base>/oxide-proof.<n>/{scratch,evidence}` layout and the
+    /// supervisor variables that describe it.
+    fn supervisor() -> (PathBuf, Vec<(&'static str, OsString)>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .canonicalize()
+            .expect("canonical test scratch");
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root = base.join(format!(
+            "config-{}-{id}/oxide-proof.test",
+            std::process::id()
+        ));
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&scratch).expect("scratch");
+        fs::create_dir_all(root.join("evidence")).expect("evidence");
+        let variables = vec![
+            ("OXIDE_TASK_SCRATCH_ROOT", scratch.clone().into_os_string()),
+            (
+                "OXIDE_PROOF_EVIDENCE",
+                root.join("evidence").into_os_string(),
+            ),
+            ("OXIDE_PROOF_DEADLINE_NS", OsString::from("123456789")),
+        ];
+        (scratch, variables)
+    }
+
+    fn controls(debug: bool, variables: &[(&str, OsString)]) -> Result<ControlRequest, String> {
+        proof_controls(debug, &|name| {
+            variables
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        })
+    }
+
+    fn with(
+        variables: &[(&'static str, OsString)],
+        extra: &[(&'static str, &str)],
+    ) -> Vec<(&'static str, OsString)> {
+        let mut all = variables.to_vec();
+        for (name, value) in extra {
+            all.retain(|(key, _)| key != name);
+            all.push((name, OsString::from(value)));
+        }
+        all
+    }
+
+    #[test]
+    fn proof_controls_refuse_in_release_mixed_or_malformed() {
+        assert_eq!(controls(false, &[]), Ok(ControlRequest::None));
+        assert_eq!(controls(true, &[]), Ok(ControlRequest::None));
+        for name in [TEST_HOME_FROM_ENV, TEST_ACCOUNT_HOME] {
+            let error = controls(false, &with(&[], &[(name, "1")])).expect_err("release");
+            assert!(
+                error.contains(name) && error.contains("no proof controls"),
+                "{error}"
+            );
+        }
+        let mixed = controls(
+            true,
+            &with(
+                &[],
+                &[
+                    (TEST_HOME_FROM_ENV, "1"),
+                    (TEST_ACCOUNT_HOME, "!unavailable"),
+                ],
+            ),
+        );
+        assert!(mixed.expect_err("mixed").contains("both set"));
+        for value in ["true", "0", "", "1 "] {
+            let error =
+                controls(true, &with(&[], &[(TEST_HOME_FROM_ENV, value)])).expect_err(value);
+            assert!(error.contains("exactly 1"), "{error}");
+        }
+        assert_eq!(
+            controls(true, &with(&[], &[(TEST_HOME_FROM_ENV, "1")])),
+            Ok(ControlRequest::HomeFromEnv)
+        );
+    }
+
+    #[test]
+    fn the_account_controls_need_the_supervisor_layout() {
+        let (scratch, supervisor) = supervisor();
+        let stand_in = scratch.join("account");
+        fs::create_dir_all(&stand_in).expect("stand-in");
+        let stand_in_text = stand_in.to_str().expect("utf-8 scratch");
+        for value in ["!unavailable", stand_in_text] {
+            let request = with(&[], &[(TEST_ACCOUNT_HOME, value)]);
+            let error = controls(true, &request).expect_err("no supervisor");
+            assert!(error.contains("OXIDE_TASK_SCRATCH_ROOT"), "{error}");
+            for (name, wrong) in [
+                ("OXIDE_PROOF_EVIDENCE", scratch.to_str().expect("utf-8")),
+                ("OXIDE_PROOF_EVIDENCE", ""),
+                ("OXIDE_PROOF_DEADLINE_NS", "soon"),
+                ("OXIDE_PROOF_DEADLINE_NS", "-1"),
+                ("OXIDE_PROOF_DEADLINE_NS", "18446744073709551616"),
+                ("OXIDE_PROOF_DEADLINE_NS", ""),
+                ("OXIDE_TASK_SCRATCH_ROOT", stand_in_text),
+            ] {
+                let mut variables = with(&supervisor, &[(TEST_ACCOUNT_HOME, value), (name, wrong)]);
+                if wrong.is_empty() {
+                    variables.retain(|(key, _)| *key != name);
+                }
+                let error = controls(true, &variables).expect_err(name);
+                assert!(
+                    error.contains(TEST_ACCOUNT_HOME) && error.contains(name),
+                    "{name}={wrong}: {error}"
+                );
+            }
+        }
+        assert_eq!(
+            controls(
+                true,
+                &with(&supervisor, &[(TEST_ACCOUNT_HOME, "!unavailable")])
+            ),
+            Ok(ControlRequest::AccountUnavailable)
+        );
+        assert_eq!(
+            controls(
+                true,
+                &with(&supervisor, &[(TEST_ACCOUNT_HOME, stand_in_text)])
+            ),
+            Ok(ControlRequest::AccountHome(
+                stand_in.clone().into_os_string()
+            ))
+        );
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&stand_in, &link).expect("symlink");
+        let outside = scratch.parent().expect("root").join("evidence");
+        for (path, why) in [
+            (link.as_path(), "not canonical"),
+            (outside.as_path(), "not strictly inside"),
+            (scratch.as_path(), "not strictly inside"),
+            (Path::new("relative/home"), "not an absolute path"),
+            (&scratch.join("missing"), "does not resolve"),
+        ] {
+            let request = with(
+                &supervisor,
+                &[(TEST_ACCOUNT_HOME, path.to_str().expect("utf-8"))],
+            );
+            let error = controls(true, &request).expect_err(why);
+            assert!(error.contains(why), "{path:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_control_error_refuses_before_any_config_even_when_explicit() {
+        let mut facts = facts(true);
+        facts.oxide_pool = Some(OsString::from("/private/tmp/explicit-pool"));
+        facts.oxide_config = Some(OsString::from("/private/tmp/explicit-config.toml"));
+        facts.control_error = Some(format!("{TEST_HOME_FROM_ENV} must be exactly 1"));
+        for error in [
+            settings(&facts).expect_err("settings"),
+            config_file(&facts).expect_err("config file"),
+            facts.cache_dir().expect_err("cache root"),
+            facts.home().expect_err("home"),
+        ] {
+            assert_eq!(error, format!("{TEST_HOME_FROM_ENV} must be exactly 1"));
+        }
+        assert_eq!(known_pools(&facts), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_differing_home_is_noticed_only_for_the_default_pool_under_it() {
+        let mut facts = facts(true);
+        facts.home_source = HomeSource::Account;
+        facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        let default = settings(&facts).expect("settings resolve");
+        assert_eq!(
+            default.home_notice.as_deref(),
+            Some("HOME is /private/tmp/harness-home; using the account pool at /home/user/Library/Caches/oxide/build-pool (account home /home/user); set OXIDE_POOL to isolate")
+        );
+        assert_eq!(
+            default.home_line,
+            "account home /home/user (passwd entry); HOME is /private/tmp/harness-home"
+        );
+
+        facts.oxide_config = Some(OsString::from("/private/tmp/absent-config.toml"));
+        assert!(
+            settings(&facts).expect("settings").home_notice.is_some(),
+            "an explicit config without a pool path leaves the default pool"
+        );
+        facts.oxide_config = None;
+
+        facts.oxide_pool = Some(OsString::from("/private/tmp/explicit-pool"));
+        let explicit = settings(&facts).expect("settings resolve");
+        assert_eq!(explicit.home_notice, None, "OXIDE_POOL chose the pool");
+        assert!(explicit
+            .home_line
+            .ends_with("; HOME is /private/tmp/harness-home"));
+        facts.oxide_pool = None;
+
+        facts.env_home = Some(OsString::from("/home/user"));
+        let matching = settings(&facts).expect("settings resolve");
+        assert_eq!(matching.home_notice, None, "a matching HOME is quiet");
+        assert_eq!(matching.home_line, "account home /home/user (passwd entry)");
+
+        facts.env_home = None;
+        let unset = settings(&facts)
+            .expect("settings")
+            .home_notice
+            .expect("unset HOME differs");
+        assert!(unset.starts_with("HOME is unset;"), "{unset}");
+
+        facts.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        facts.home_source = HomeSource::TestAccount;
+        let stand_in = settings(&facts).expect("settings");
+        assert!(
+            stand_in.home_notice.is_some(),
+            "the stand-in behaves as the account"
+        );
+        assert!(stand_in
+            .home_line
+            .contains(&format!("(proof control {TEST_ACCOUNT_HOME})")));
+
+        facts.home_source = HomeSource::TestEnvironment;
+        let environment = settings(&facts).expect("settings");
+        assert_eq!(
+            environment.home_notice, None,
+            "HOME is the home under this control"
+        );
+        assert_eq!(
+            environment.home_line,
+            format!("HOME /home/user (proof control {TEST_HOME_FROM_ENV})")
+        );
+    }
+
+    #[test]
+    fn a_config_file_pool_or_honoured_xdg_cache_root_is_not_noticed() {
+        let dir = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("config-notice-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch");
+        let config = dir.join("config.toml");
+        fs::write(&config, "[pool]\npath = \"~/file-pool\"\n").expect("config");
+        let mut mac = facts(true);
+        mac.home_source = HomeSource::Account;
+        mac.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        mac.oxide_config = Some(config.into_os_string());
+        let file = settings(&mac).expect("settings");
+        assert_eq!(file.pool, Path::new("/home/user/file-pool"));
+        assert_eq!(file.home_notice, None, "the config file chose the pool");
+
+        let mut linux = facts(false);
+        linux.home_source = HomeSource::Account;
+        linux.env_home = Some(OsString::from("/private/tmp/harness-home"));
+        assert!(settings(&linux).expect("settings").home_notice.is_some());
+        environment(&mut linux, |environment| {
+            environment.with_xdg_cache_home(Some(PathBuf::from("/srv/cache")))
+        });
+        let xdg = settings(&linux).expect("settings");
+        assert_eq!(xdg.pool, Path::new("/srv/cache/oxide/build-pool"));
+        assert_eq!(
+            xdg.home_notice, None,
+            "an honoured XDG cache root chose the pool"
+        );
+        environment(&mut linux, |environment| {
+            environment.with_xdg_cache_home(Some(PathBuf::from("/home/user/.cache")))
+        });
+        let same = settings(&linux).expect("settings");
+        for captured in [
+            "/oxide-home-provenance-probe-a",
+            "/oxide-home-provenance-probe-a/",
+        ] {
+            let mut probe_home = at_home(false, Some(captured));
+            probe_home.home_source = HomeSource::Account;
+            probe_home.env_home = Some(OsString::from("/private/tmp/harness-home"));
+            assert!(
+                settings(&probe_home)
+                    .expect("settings")
+                    .home_notice
+                    .is_some(),
+                "a home equivalent to the first probe ({captured}) still moves the root"
+            );
+        }
+        assert_eq!(same.pool, Path::new("/home/user/.cache/oxide/build-pool"));
+        assert_eq!(
+            same.home_notice, None,
+            "an XDG cache root naming the home default still chose the pool"
+        );
+    }
+
+    #[test]
+    fn home_messages_escape_control_characters_and_stay_bounded() {
+        let mut facts = facts(true);
+        facts.home_source = HomeSource::Account;
+        facts.env_home = Some(OsString::from(format!(
+            "/tmp/a\nb\u{1b}[31m{}",
+            "x".repeat(1000)
+        )));
+        let line = facts.home_line();
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("a\\nb\\u{1b}[31m"), "{line}");
+        assert!(
+            line.ends_with('…') && line.chars().count() < 400,
+            "{}",
+            line.len()
+        );
+        let notice = settings(&facts)
+            .expect("settings")
+            .home_notice
+            .expect("notice");
+        assert!(!notice.chars().any(char::is_control) && notice.chars().count() < 1200);
+    }
+
+    #[test]
+    fn an_unavailable_account_home_refuses_and_names_the_lookup() {
+        let mut facts = at_home(true, None);
+        facts.home_source = HomeSource::Unavailable(
+            "the account home directory is unavailable (no passwd entry for uid 1)".to_owned(),
+        );
+        let error = facts.home().expect_err("no home");
+        assert!(error.contains("no passwd entry"), "{error}");
+        assert!(error.contains("OXIDE_POOL"), "{error}");
+        assert_eq!(
+            facts.home_line(),
+            "unavailable (the account home directory is unavailable (no passwd entry for uid 1))"
+        );
     }
 
     /// `home` feeds both `~` expansion and the injected directory snapshot.

@@ -122,6 +122,7 @@ def environment(root: str) -> dict:
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.path.join(root, "home"),
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
         "CARGO_HOME": os.path.join(root, "cargo-home"),
         "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", os.path.join(real_home, ".rustup")),
         "RUSTUP_TOOLCHAIN": BUILDER,
@@ -278,7 +279,7 @@ def provenance(proof: Proof, stamp: tuple, unstamped: str, root: str) -> None:
     home, destination, receipt_path = install(stamp, proof.stamped, root)
     fake = fake_cargo(proof, "provenance")
     log = os.path.join(work, "cargo.log")
-    env = {**ENV, "HOME": home, "PATH": fake + os.pathsep + ENV["PATH"], "FAKE_CARGO_LOG": log}
+    env = {**ENV, "OXIDE_TEST_HOME_FROM_ENV": "1", "HOME": home, "PATH": fake + os.pathsep + ENV["PATH"], "FAKE_CARGO_LOG": log}
     code, out, _ = run(proof, destination, ["--version"], work, env)
     receipt_digest = digest(receipt_path)
     pin, instance = stamp
@@ -488,6 +489,14 @@ def capacity(proof: Proof, root: str) -> None:
     )
 
 
+def require_test_controls(binary: str) -> None:
+    """The staged debug artifact must report compiled proof controls before
+    any case relies on OXIDE_TEST_HOME_FROM_ENV or OXIDE_TEST_ACCOUNT_HOME."""
+    probe = subprocess.run([binary, "__oxide-build-capabilities"], capture_output=True, text=True, timeout=10)
+    expect(probe.returncode == 0 and json.loads(probe.stdout).get("test_controls") is True,
+           f"{binary} does not report compiled proof controls: {probe.stdout!r}")
+
+
 def main() -> int:
     if sys.platform != "darwin":
         fail("the everyday CLI proof requires macOS")
@@ -511,9 +520,11 @@ def main() -> int:
     try:
         stage = stage_root(proof)
         proof.binary = cargo_build(proof, repo, "unstamped", stage, None)
+        require_test_controls(proof.binary)
         with open(proof.binary, "rb") as handle:
             expect(CANDIDATE_MARKER in handle.read(), "the staged binary lacks the capacity probe")
         proof.stamped = cargo_build(proof, repo, "stamped", stage, stamp)
+        require_test_controls(proof.stamped)
         unstamped = digest(proof.binary)
         stamped = digest(proof.stamped)
         expect(unstamped != stamped, "the stamped build is not a different binary")

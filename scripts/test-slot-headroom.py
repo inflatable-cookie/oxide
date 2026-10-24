@@ -131,6 +131,7 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
             "OXIDE_POOL_CAP": "64MiB",
             "OXIDE_MAX_ACTIVE": "16",
             "HOME": os.path.join(ROOT, "home"),
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "CARGO_HOME": os.path.join(ROOT, "cargo-home"),
             "CARGO_NET_OFFLINE": "true",
             "CARGO_TERM_COLOR": "never",

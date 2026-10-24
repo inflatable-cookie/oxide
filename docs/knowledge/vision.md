@@ -160,6 +160,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   gets it on its first build, others by explicit adoption. It never moves
   existing output, and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
+- **Machine pool from the account:** Oxide resolves its config, pool and
+  drive from the account home, not `$HOME`, so a harness that overrides
+  HOME still uses them; private pools need an explicit setting. Its proof
+  controls exist only in debug builds; any other build refuses them.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
@@ -171,8 +175,6 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - the machine pool and drive resolved from the account, not `$HOME`, so a
-    harness that overrides HOME cannot bypass them; isolation is explicit;
   - owned output links at the profile directory (`target/debug` and the
     like) instead of `target`, so tools that mount `target` keep working;
   - cold-slot seeding from matching units, conservative first, with

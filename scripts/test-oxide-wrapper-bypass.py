@@ -398,6 +398,7 @@ def prove(proof: Proof, oxide: Path, parent: Path) -> None:
     base = proof.env(
         {
             "HOME": str(home),
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "RUSTUP_HOME": os.environ.get("RUSTUP_HOME")
             or os.path.join(os.path.expanduser("~"), ".rustup"),
             "RUSTUP_TOOLCHAIN": BUILDER,

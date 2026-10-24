@@ -591,6 +591,7 @@ def run(proof: Proof, parent: str) -> None:
             "CARGO_HOME": cargo_home,
             # Oxide's config, state and legacy lookups stay in scratch.
             "HOME": home,
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "RUSTUP_HOME": real_rustup,
             "PATH": bin_dir + os.pathsep + env.get("PATH", ""),
             "CARGO_NET_OFFLINE": "true",
