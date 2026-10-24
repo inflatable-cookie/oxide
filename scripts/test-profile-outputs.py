@@ -1380,6 +1380,28 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build"], "08 build", mixed)
     expect(code == 0, f"08: build with a kept real member failed: {stderr}")
     expect_layout(mixed, {"debug": f"link:{root_of(pool, mixed)}", "release": "real"})
+    # A3 positive mixture control: `release` is REAL here and `debug` is
+    # LINKED, so `run --release` must execute the real member's own Cargo path
+    # while a plain `run` executes the linked member's destination. Neither may
+    # fall back to one global root assumption.
+    mixed_root = root_of(pool, mixed)
+    code, _, stderr = oxide(proof, ["build", "--release"], "08 release build", mixed)
+    expect(code == 0, f"08: release build with a real member failed: {stderr}")
+    expect_layout(mixed, {"debug": f"link:{mixed_root}", "release": "real"})
+    real_exe = os.path.join(mixed, "target", "release", "profileapp")
+    code, stdout, stderr = oxide(proof, ["run", "--release"], "08 release run", mixed)
+    expect(code == 0, f"08: mixed run --release failed: {stderr}")
+    expect(
+        "profile-app 7 " in stdout and real_exe in stdout,
+        f"08: run --release did not execute the real member artifact {real_exe}: {stdout}",
+    )
+    linked_exe = member_destination(mixed_root, "debug")
+    code, stdout, stderr = oxide(proof, ["run"], "08 linked run", mixed)
+    expect(code == 0, f"08: mixed plain run failed: {stderr}")
+    expect(
+        "profile-app 7 " in stdout and linked_exe in stdout,
+        f"08: plain run did not execute the linked member artifact {linked_exe}: {stdout}",
+    )
     other = make_checkout(proof, "empty-member")
     # An empty release directory is converted only by this explicit adopt.
     os.makedirs(os.path.join(other, "target", "release"), exist_ok=True)
