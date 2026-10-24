@@ -101,6 +101,7 @@ sys.dont_write_bytecode = True
 import importlib.util
 import json
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -251,8 +252,10 @@ def plan_only() -> int:
     print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
     print("  ignore          the fixture uses /target (valid for whole-target links and")
     print("                  member parents) plus a separate /target/ parent-ignore control")
-    print("  peer keep       a REAL peer checkout receipt for the same root (not a")
-    print("                  synthetic row or a missing receipt) keeps that root")
+    print("  peer keep       an injected committed peer receipt plus matching registry")
+    print("                  rows (SYNTHETIC INJECTED AUTHORITY, not a bind-produced")
+    print("                  receipt) keeps that root; a second, distinct eligible gone")
+    print("                  root is a candidate in the SAME preview")
     print("  clean           the reserve stop uses a positively created directory-budget")
     print("                  pool with a gated delegating fake cargo; the removable")
     print("                  watchdog is removal-only and is not claimed as a reserve stop")
@@ -572,6 +575,115 @@ def pure_detach_record_control() -> None:
     expect(record["details"].get("owners") is True, "the detach-failure record does not carry ownership")
     expect(record["backing_present"] is True, "the detach-failure record does not report the retained backing")
     print("pure detach-failure record control: ok", flush=True)
+
+
+def reserve_stop_facts(stderr: str, trigger: int) -> dict:
+    """Parse and validate ONE injected reserve-stop report (A11).
+
+    Source: watchdog.rs::report emits
+      "oxide: reserve stop (injected test readings): pool filesystem available
+       <reading> bytes fell below the <trigger> byte trigger (20 GiB reserve +
+       2 GiB margin); Cargo group <id>: <TERM | TERM, then KILL after N ms>;
+       sampled minimum <bytes> bytes, overshoot past trigger <bytes> bytes,
+       stop latency <ms>; budget-only pool: best-effort stop, ..."
+    Every fact is required: the injected reason, a real reading and trigger, a
+    concrete group id, a numeric sampled minimum, an overshoot that follows from
+    trigger minus minimum, and a CONFIRMED closure latency.
+    """
+    line = next((entry for entry in stderr.splitlines() if "oxide: reserve stop" in entry), "")
+    expect(line != "", f"no reserve-stop line in the clean summary: {stderr}")
+    expect("(injected test readings)" in line, f"the stop did not name the injected readings: {line}")
+    numbers = re.search(r"pool filesystem available (\d+) bytes fell below the (\d+) byte trigger", line)
+    expect(numbers is not None, f"no reading/trigger in the stop: {line}")
+    reading, seen_trigger = int(numbers.group(1)), int(numbers.group(2))
+    expect(seen_trigger == trigger, f"the trigger is {seen_trigger}, not {trigger}: {line}")
+    group = re.search(r"Cargo group (-?\d+): (TERM(?:, then KILL after \d+ ms)?)", line)
+    expect(group is not None, f"no concrete Cargo group and signal in the stop: {line}")
+    minimum = re.search(r"sampled minimum (\d+) bytes", line)
+    expect(minimum is not None, f"the sampled minimum is not a number: {line}")
+    overshoot = re.search(r"overshoot past trigger (\d+) bytes", line)
+    expect(overshoot is not None, f"no overshoot in the stop: {line}")
+    expect(
+        int(overshoot.group(1)) == seen_trigger - int(minimum.group(1)),
+        f"the overshoot does not follow from the trigger and minimum: {line}",
+    )
+    latency = re.search(r"stop latency (\d+) ms", line)
+    expect(latency is not None, f"the stop closure was not confirmed: {line}")
+    expect("20 GiB reserve + 2 GiB margin" in line, f"the reserve/margin numbers changed: {line}")
+    return {
+        "line": line,
+        "reading": reading,
+        "trigger": seen_trigger,
+        "group": int(group.group(1)),
+        "escalated": "then KILL" in line,
+        "minimum": int(minimum.group(1)),
+    }
+
+
+def reserve_stop_status(facts: dict) -> set:
+    """The exit statuses a watchdog-terminated Cargo child can really return.
+
+    Source chain: the clean waits with wait_leader_watched (reaping the leader)
+    and then wait_group_empty_watched, which escalates only REMAINING
+    descendants. So a report of "TERM, then KILL after N ms" can still leave the
+    leader reaped by TERM -> 143; 137 requires the leader itself to be killed.
+    Therefore: TERM-only permits exactly 143; an escalated report permits 143 or
+    137. A blanket 1 (or any other code) is never acceptable."""
+    return {143, 137} if facts["escalated"] else {143}
+
+
+def pure_reserve_stop_control() -> None:
+    """No-subprocess matched/mismatched controls for the reserve-stop parser."""
+    trigger = 22 * 1024 * 1024 * 1024
+    reading = trigger - 4096
+    head = (
+        f"oxide: reserve stop (injected test readings): pool filesystem available {reading} bytes "
+        f"fell below the {trigger} byte trigger (20 GiB reserve + 2 GiB margin); Cargo group 4242: "
+    )
+    tail = f"; sampled minimum {reading} bytes, overshoot past trigger 4096 bytes, stop latency 12 ms; budget-only pool: best-effort stop, no guarantee against faster writers or other processes"
+    plain = head + "TERM" + tail
+    escalated = head + "TERM, then KILL after 250 ms" + tail
+    facts = reserve_stop_facts(plain, trigger)
+    expect(facts["reading"] == reading and facts["group"] == 4242, f"the plain stop parsed wrong: {facts}")
+    expect(
+        reserve_stop_status(facts) == {143},
+        f"a TERM stop must permit exactly 143, not {reserve_stop_status(facts)}",
+    )
+    facts = reserve_stop_facts(escalated, trigger)
+    expect(facts["escalated"] is True, f"the escalation was not parsed: {facts}")
+    # ROOT nuance: the leader may be reaped by TERM before descendants escalate,
+    # so an escalated report permits 143 as well as 137 - but never anything
+    # else, and a TERM-only report permits only 143.
+    expect(
+        reserve_stop_status(facts) == {143, 137},
+        "an escalated stop must permit exactly the leader's TERM or KILL status",
+    )
+    expect(
+        reserve_stop_status(reserve_stop_facts(plain, trigger)) == {143},
+        "a TERM-only stop must permit only 143",
+    )
+    for wrong in (0, 1, 2, 130, 137):
+        expect(
+            wrong not in reserve_stop_status(reserve_stop_facts(plain, trigger)),
+            f"a TERM-only stop must not accept status {wrong}",
+        )
+    for bad, why in (
+        (plain.replace("(injected test readings)", "(real volume)"), "unnamed injected source"),
+        (plain.replace(f"available {reading} bytes", "available plenty bytes", 1), "a non-numeric reading"),
+        (plain.replace(f"fell below the {trigger} byte trigger", "fell below the 1024 byte trigger"), "wrong trigger"),
+        (plain.replace("Cargo group 4242", "Cargo group unknown"), "no concrete group id"),
+        (plain.replace(f"sampled minimum {reading} bytes", "sampled minimum unknown bytes"), "unknown minimum"),
+        (plain.replace("overshoot past trigger 4096 bytes", "overshoot past trigger 7 bytes"), "overshoot that does not follow"),
+        (plain.replace("stop latency 12 ms", "closure not confirmed"), "unconfirmed closure"),
+        ("oxide: quick profile, build strategy, slot abc123 cold, 0.6s, new slot", "a normal successful build"),
+        ("oxide: reserve stop (injected test readings): pool filesystem available 1 bytes fell below the 2 byte trigger", "a truncated stop"),
+    ):
+        try:
+            reserve_stop_facts(bad, trigger)
+        except Exception:
+            continue
+        raise AssertionError(f"the reserve-stop parser accepted {why}")
+    print("pure reserve-stop control: ok", flush=True)
 
 
 def pure_slot_state_control() -> None:
@@ -894,6 +1006,7 @@ def run(proof: Proof, repo: str) -> None:
     pure_detach_record_control()
     pure_attachment_facts_control()
     pure_slot_state_control()
+    pure_reserve_stop_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -1368,9 +1481,40 @@ def run(proof: Proof, repo: str) -> None:
     # check is about case 06's refusal, not leftover state.
     if os.path.exists(external_marker):
         os.remove(external_marker)
+    authority_before = {
+        "receipt": perm.sha256_file(perm.receipt_path(pool, first)),
+        "links": {member: os.readlink(member_link(first, member)) for member in ("debug", "release")},
+        "root_entries": sorted(os.listdir(root)),
+    }
     code, _, stderr = perm.oxide_env(proof, ["nextest", "--profile", "custom"], "06 opaque custom", first, fake_env)
-    expect(code != 0, f"06: an opaque tool's custom profile was accepted: {stderr}")
+    # A11: main.rs treats an opaque command as unmodelled and calls
+    # outputs::refuse_unknown_layout, whose Err maps to exit 1. Require that
+    # exact status and the two source-defined semantic parts (the unmodelled
+    # reason naming the command, and the declare-or-detach remedy), never an
+    # arbitrary nonzero.
+    expect(code == 1, f"06: an opaque tool's custom profile exited {code}, not 1: {stderr}")
+    expect(
+        "`nextest` is not a command whose profile outputs Oxide models" in stderr,
+        f"06: the unmodelled-command reason changed: {stderr}",
+    )
+    expect(
+        "will not guess where this command writes" in stderr
+        and "delete its outputs with `oxide exec --output <member>`" not in stderr,
+        f"06: the refusal remedy changed: {stderr}",
+    )
+    expect(
+        "declare its outputs with `oxide exec --output <member>`" in stderr
+        and "oxide outputs detach" in stderr,
+        f"06: the declare-or-detach remedy is missing: {stderr}",
+    )
     expect(not os.path.exists(external_marker), "06: the opaque tool ran in a linked checkout")
+    expect(
+        perm.sha256_file(perm.receipt_path(pool, first)) == authority_before["receipt"]
+        and {member: os.readlink(member_link(first, member)) for member in ("debug", "release")}
+        == authority_before["links"]
+        and sorted(os.listdir(root)) == authority_before["root_entries"],
+        "06: the opaque refusal changed the checkout authority",
+    )
 
     # ----- case 07: exec declarations -------------------------------------
     script = os.path.join(first, "declared.sh")
@@ -1843,10 +1987,22 @@ def run(proof: Proof, repo: str) -> None:
     with open(readings, "w", encoding="utf-8") as handle:
         handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
     code, _, stderr = perm.finish_child(proof, child, "16 watched clean")
-    expect(code != 0, f"16: a stopped clean claimed success: {stderr}")
+    # A11: the stop is judged by the source-defined report, not by a word
+    # match. watchdog.rs::report emits the injected reason, the reading and
+    # trigger, a concrete Cargo group, the sampled minimum, the overshoot and
+    # a confirmed closure latency; the clean command then returns the child's
+    # SIGNAL-derived status (process::exit_code), TERM -> 143 and 137 only if
+    # the stop escalated to KILL. An unrelated nonzero or a bare 1 fails here.
+    stop_trigger = 22 * 1024 * 1024 * 1024
+    facts = reserve_stop_facts(stderr, stop_trigger)
     expect(
-        any(word in stderr.lower() for word in ("reserve", "watchdog", "stop")),
-        f"16: the stop was not reported honestly: {stderr}",
+        facts["reading"] == stop_trigger - 4096,
+        f"16: the reported reading is {facts['reading']}, not the injected trigger-4096: {facts['line']}",
+    )
+    expect(
+        code in reserve_stop_status(facts),
+        f"16: the clean exited {code}, which the reported stop does not permit "
+        f"({'TERM or KILL' if facts['escalated'] else 'TERM only'}): {facts['line']}",
     )
     # The stopped clean keeps the seeded checkout's own authority: same links,
     # same receipt bytes, root still present.
@@ -2411,7 +2567,7 @@ def run(proof: Proof, repo: str) -> None:
 
 
 
-USAGE = "usage: test-profile-outputs.py [--plan|--self-check]\n--plan prints the fixed allocation and cases; --self-check runs the pure\nregistry predicates only. Neither has filesystem effects."
+USAGE = "usage: test-profile-outputs.py [--plan|--self-check]\n--plan prints the fixed allocation and cases; --self-check runs the pure\npredicates only (registry, detach record, attachment facts, slot state,\nreserve-stop report). Neither has filesystem effects."
 
 
 def main() -> int:
@@ -2423,6 +2579,7 @@ def main() -> int:
         pure_detach_record_control()
         pure_attachment_facts_control()
         pure_slot_state_control()
+        pure_reserve_stop_control()
         return 0
     if arguments:
         print(USAGE, file=sys.stderr)
