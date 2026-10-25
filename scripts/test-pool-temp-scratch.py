@@ -452,6 +452,18 @@ def refusal_names(stderr: str, path: str) -> bool:
     return bool(path) and path.rstrip("/") in stderr
 
 
+def same_alias_selection(held_env: dict, query_env: dict) -> bool:
+    """Whether a measured-status query uses the same temp aliases as the child.
+
+    The product's `temp:` line describes the *querying* command's prospective
+    choice, so a status query with a writable same-device `TMPDIR` would
+    correctly print `temp: inherited` for itself and prove nothing about the
+    held command's owned directory.
+    """
+    keys = ("TMPDIR", "TMP", "TEMP")
+    return all(held_env.get(key) == query_env.get(key) for key in keys)
+
+
 def delta_verdict(baseline: int, after: int, unique: int) -> tuple:
     """Whether a measured slot delta accounts for one unique allocation.
 
@@ -1867,6 +1879,10 @@ def accounting(world: World, crate: str) -> None:
         # child, or it correctly describes its own prospective inherited value
         # instead of the held command's owned directory.
         status_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+        expect(
+            same_alias_selection(env, status_env),
+            "the measured status query does not use the held child's aliases",
+        )
         baseline = measure_slot(world, crate, slot, status_env)
         # 16 MiB of unique data plus a hard link to one 8 MiB file: a walk that
         # counted the link by name would measure about 24 MiB. The baseline is
@@ -3205,6 +3221,23 @@ def self_check() -> int:
         not ok_double and delta_double == 2 * unique,
     )
     property_true("a zero delta is rejected", not ok_vacuous)
+    # The measured status must use the held child's aliases: a query that keeps
+    # its own writable same-device TMPDIR would legitimately describe an
+    # inherited directory and prove nothing about the held owned directory.
+    property_true(
+        "a status query with the held child's aliases matches",
+        same_alias_selection(
+            {"TMPDIR": None, "TMP": None, "TEMP": None},
+            {"TMPDIR": None, "TMP": None, "TEMP": None},
+        ),
+    )
+    property_true(
+        "negative control: a wrong status environment is detected",
+        not same_alias_selection(
+            {"TMPDIR": None, "TMP": None, "TEMP": None},
+            {"TMPDIR": "/x/pt/fixture-scratch", "TMP": None, "TEMP": None},
+        ),
+    )
 
     # 11. Image custody: the backing is deleted only after a positive ordinary
     #     detach, and every ambiguous outcome keeps it.
