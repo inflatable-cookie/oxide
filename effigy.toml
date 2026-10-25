@@ -99,9 +99,17 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 # clean, refusals and the root-group prune. It has not run: each side's run is
 # a separately counted owner activation, and the merge hold requires the exact
 # head author and reviewer native receipts.
+# Internal-placement exception (decision bd357a4c, 2026-10-25): its private
+# fixture pools are genuine internal directory-budget pools, which the product
+# correctly refuses on an external volume, so this recipe declares the
+# qualified guard's explicit internal root (`--root-parent /private/tmp`). One
+# monitored owned root still holds staging, fixtures, temp, evidence and the
+# single owned 128 MiB image under the unchanged 600 s / 512 MiB / reserve /
+# custody / cleanup rules; ordinary builds, tests and proofs keep the
+# selected-volume default.
 [tasks."rust:profile-outputs"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
 
 # The SAME fixed 20-case proof in its own opt-in diagnostic collection mode
 # (`--diagnostic`, decision 1e4feb57): recoverable oracle failures are recorded
@@ -110,10 +118,12 @@ run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- p
 # diagnostic can be routed through a selector instead of passing arguments to
 # the counted one; the counted selector above stays byte-for-byte its own
 # fail-fast command. Its receipt is marked diagnostic and never claims PASS,
-# closure or counted credit, and it needs its own owner activation.
+# closure or counted credit, and it needs its own owner activation. It keeps
+# the same declared internal root (see the counted selector's exception note)
+# and the unchanged 600 s / 512 MiB bound.
 [tasks."rust:profile-outputs:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --diagnostic"
 
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the
@@ -654,16 +664,26 @@ run = [
 # writes a uniquely named bounded helper receipt beside the guard's own; that
 # receipt never claims guard closure. Fit is unmeasured; HELD for owner
 # activation — this declaration activates nothing.
+# Internal-placement exception (decision bd357a4c, 2026-10-25): every fixture
+# labels its own pool as `OXIDE_POOL_BACKEND=directory-budget`, a genuine
+# internal directory-budget pool that the product correctly refuses on an
+# external volume, so this recipe declares the qualified guard's explicit
+# internal root (`--root-parent /private/tmp`). One monitored owned root still
+# holds staging, fixtures, temp and evidence under the unchanged 300 s /
+# 512 MiB / reserve / custody / cleanup rules; ordinary builds, tests and
+# proofs keep the selected-volume default.
 [tasks."rust:command-budgets"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"
 
 # Uncounted keep-going collection for oxide#140, run through the same qualified
 # guard, bounds and custody: the fixed script's --diagnostic mode records
 # recoverable oracle failures, continues only into dependency-independent
 # cases and aborts on an unknown child, custody uncertainty, a prerequisite
 # failure or an exhausted deadline. Its receipt is distinctly qualified=false
-# and is never a counted PASS; this declaration activates nothing.
+# and is never a counted PASS; this declaration activates nothing. It keeps
+# the same declared internal root (see the counted selector's exception note)
+# and the unchanged 300 s / 512 MiB bound.
 [tasks."rust:command-budgets:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py --diagnostic"
