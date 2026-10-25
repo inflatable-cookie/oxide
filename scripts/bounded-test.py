@@ -48,13 +48,26 @@ writers are outside the promise. Host free space is a sampled abort
 threshold; the owned-byte budget is monitored, not a hard ceiling. macOS
 only.
 
-Default scratch (oxide#145): with no caller `OXIDE_TASK_SCRATCH_ROOT` and no
-`--root-parent`, the owned root is created under a private area on the volume
-the effect-free pool selection names, outside the pool payload; a selected
-volume must not be the boot volume, and an absent, unreadable, malformed or
-unsafe selection falls back to /private/tmp with one bounded warning.
-Reserve sampling reads the filesystem that actually holds the scratch, and
-the receipt records the selection source and the reserve path and device.
+Default scratch (oxide#145, oxide#151): with no caller `OXIDE_TASK_SCRATCH_ROOT`
+and no `--root-parent`, the owned root is created under the owned subtree
+`<mount>/scratch/oxide` of the volume the effect-free pool selection names,
+outside the pool payload; a selected volume must not be the boot volume, and an
+absent, unreadable, malformed or unsafe selection falls back to /private/tmp
+with one bounded warning. Selection itself creates nothing: the blocking setup
+creates and validates the subtree components (0700, no symlink, this user,
+canonical, the selected device) and then one `oxide-proof.*` root. Reserve
+sampling reads the filesystem that actually holds the scratch, and the receipt
+records the selection source, the prepared parent, the reserve path and device,
+the bounded sweep summary and the owner-marker state.
+
+Owner markers and bounded self-expiry (oxide#151): every root in that subtree
+carries one private `.oxide-scratch.json` written before any run resource and
+updated only at a genuine conclusion. Before its own root exists, one bounded
+startup sweep may remove only owner-marked roots whose marker records a positive
+conclusion of all their owned resources strictly older than seven days. The
+entry and time budgets are fixed constants checked between filesystem steps;
+there is no background reaper, and unmarked, corrupt, foreign, unconcluded or
+nested-UNCLOSED roots are never touched.
 
 OXIDE_SUPERVISOR_INJECT (comma list from INJECTIONS) is a test-only
 fault-injection hook used by scripts/test_supervisor.py.
@@ -64,6 +77,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import json
+import math
 import os
 import pwd
 import secrets
@@ -131,6 +145,37 @@ CONFIG_MAX_BYTES = 64 * 1024
 REGISTRATION_MAX_BYTES = 64 * 1024
 SCRATCH_LEAF = "oxide-proof."
 REGISTRATION = ("oxide-managed", "removable.json")
+
+# Selected-volume scratch layout (oxide#151). Proof scratch lives in one owned
+# subtree of the selected volume, `<mount>/scratch/oxide`, instead of the drive
+# root; selection only reports it and the supervisor's blocking setup creates
+# and validates it, keeping the warned /private/tmp fallback on a refusal.
+SCRATCH_SUBDIR = "scratch"
+SCRATCH_OWNER = "oxide"
+QUALIFY_LEAF = "oxide-supervisor-qualify."
+RUN_ROOT_LEAVES = (SCRATCH_LEAF, QUALIFY_LEAF)
+
+# Owner marker and bounded self-expiry (oxide#151, Tom 2026-10-25). Every run
+# root in the owned subtree carries one private marker file, written before any
+# child or run resource and updated only at a genuine conclusion. A root is
+# eligible for the bounded startup sweep only when its marker records a positive
+# conclusion of all its owned resources strictly older than seven days. Nothing
+# else is ever removed, no marker is a liveness probe, and an absent, foreign or
+# corrupt marker fails closed.
+MARKER_NAME = ".oxide-scratch.json"
+MARKER_VERSION = 1
+MARKER_MAX_BYTES = 4096
+MARKER_KEYS = frozenset({"version", "run_id", "root", "owner_uid", "device", "inode",
+                         "created_unix", "concluded_unix", "outcome", "closure", "kept_reason"})
+MARKER_OUTCOMES = ("running", "closed", "unclosed", "failed")
+MARKER_CLOSURES = ("positive", "none")
+MARKER_REASONS = ("none", "evidence", "unclosed", "exception", "nested-unclosed",
+                  "qualify-base", "qualify-failed")
+MARKER_EXPIRABLE_REASONS = ("evidence", "qualify-base")
+EXPIRY_S = 7 * 24 * 60 * 60
+SWEEP_TIME_BUDGET_NS = 1 * NS  # of the 10 s setup budget, checked between filesystem steps
+SWEEP_ENTRY_BUDGET = 4096  # examined entries plus recursive steps, across all roots
+SWEEP_ROWS = 20  # bounded result rows in the receipt; the rest count as omitted
 INJECTIONS = {
     "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
@@ -1494,16 +1539,27 @@ def mount_root(path, probe):
         current = parent
 
 
+def scratch_parent(mount):
+    """The owned scratch parent of a selected volume: one private subtree, never
+    the drive root. Naming it creates nothing."""
+    return os.path.join(mount, SCRATCH_SUBDIR, SCRATCH_OWNER)
+
+
 def select_default_parent(env, probe=None):
-    """The default root parent for proof scratch (oxide#145).
+    """The default root parent for proof scratch (oxide#145, oxide#151).
 
     When no caller scratch or root parent is supplied, scratch belongs to a
     private area on the volume the effect-free pool selection names: the
     registered removable volume when the registration and a cheap presence
     and identity check pass, otherwise the configured pool's own volume. A
-    volume is eligible only when it is not the boot volume. Anything absent,
+    volume is eligible only when it is not the boot volume.
+
+    `root_parent` is the owned subtree `<mount>/scratch/oxide` of that volume,
+    not the mount root, and `mount` keeps the actual mount. Anything absent,
     unreadable, malformed or unsafe falls back to /private/tmp with a bounded
-    warning; nothing is created here."""
+    warning. Nothing is created here: creating and validating the subtree is
+    the caller's blocking setup, so plans, probes and refusal paths stay
+    effect-free."""
     probe = probe if probe is not None else DefaultProbe()
     facts = {"source": "fallback", "root_parent": FALLBACK_PARENT, "reason": None,
              "pool": None, "pool_source": None, "registration": None, "mount": None,
@@ -1519,7 +1575,7 @@ def select_default_parent(env, probe=None):
         else:
             facts["registration"] = registration
             mount, identifier = checked_volume(recorded[0], probe, boot, VOLUMES, recorded[1])
-        facts.update(source="selected-volume", root_parent=mount, mount=mount,
+        facts.update(source="selected-volume", root_parent=scratch_parent(mount), mount=mount,
                      volume_uuid=identifier, device=probe.stat(mount).st_dev)
     except SelectionRefused as refusal:
         facts["reason"] = str(refusal)
@@ -1563,6 +1619,477 @@ def create_owned_root(parent, probe, make_dir=None):
             pass
         raise
     return root
+
+
+# Owned selected-volume scratch parent ------------------------------------------
+
+def checked_component(path, device, probe):
+    """The facts one owned scratch component must have: a real canonical
+    directory of this user, private, on the selected volume's device."""
+    info = probe.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise SelectionRefused(f"scratch component {path} is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        raise SelectionRefused(f"scratch component {path} is not a directory")
+    if info.st_uid != probe.euid():
+        raise SelectionRefused(f"scratch component {path} is not owned by this user")
+    if info.st_mode & 0o077:
+        raise SelectionRefused(f"scratch component {path} is not private to this user")
+    if probe.realpath(path) != path:
+        raise SelectionRefused(f"scratch component {path} is not canonical")
+    if probe.stat(path).st_dev != device:
+        raise SelectionRefused(f"scratch component {path} is not on the selected device")
+    return info
+
+
+def prepare_scratch_parent(selection, probe, make_dir=None):
+    """Ensure the selected volume's owned scratch parent exists and is safe.
+
+    Selection stays effect-free; this runs in the supervisor's blocking setup,
+    before any mkdtemp, reserve reading or run resource. Missing `scratch` and
+    `oxide` components are created with 0700. An existing component is only
+    ever validated and never chmodded, adopted, renamed or removed, so a
+    symlink, foreign owner, non-directory, unreadable, non-canonical or
+    other-device component refuses and the caller keeps its warned fallback. A
+    concurrent creator that wins the mkdir is validated the same way."""
+    make_dir = make_dir or os.mkdir
+    mount, device, parent = selection.get("mount"), selection.get("device"), selection.get("root_parent")
+    if selection.get("source") != "selected-volume" or not isinstance(mount, str):
+        raise SelectionRefused("no selected volume to prepare")
+    expected = scratch_parent(mount)
+    if not isinstance(parent, str) or parent != expected:
+        raise SelectionRefused(f"scratch parent {parent!r} is not {expected}")
+    try:
+        info = probe.lstat(mount)
+    except OSError as error:
+        raise SelectionRefused(f"selected mount {mount} is unreadable: {type_name(error)}")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SelectionRefused(f"selected mount {mount} is not a real directory")
+    if probe.realpath(mount) != mount:
+        raise SelectionRefused(f"selected mount {mount} is not canonical")
+    if probe.stat(mount).st_dev != device:
+        raise SelectionRefused(f"selected mount {mount} is not on the selected device")
+    current = mount
+    for name in (SCRATCH_SUBDIR, SCRATCH_OWNER):
+        current = os.path.join(current, name)
+        try:
+            checked_component(current, device, probe)
+            continue
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise SelectionRefused(f"scratch component {current} is unreadable: {type_name(error)}")
+        try:
+            make_dir(current, 0o700)
+        except FileExistsError:
+            pass  # a concurrent run created it; validate it instead of adopting it
+        except OSError as error:
+            raise SelectionRefused(f"scratch component {current} cannot be created: {type_name(error)}")
+        try:
+            checked_component(current, device, probe)
+        except OSError as error:
+            raise SelectionRefused(f"scratch component {current} is unreadable: {type_name(error)}")
+    return parent
+
+
+# Owner marker and bounded self-expiry ------------------------------------------
+
+class MarkerInvalid(Exception):
+    """A marker that cannot be trusted; its root is never eligible."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+class UnsafeEntry(Exception):
+    """An entry inside a root this sweep refuses to descend or delete."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+class SweepStop(Exception):
+    """The sweep's fixed entry or time budget stopped the work."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def new_run_id():
+    return os.urandom(16).hex()
+
+
+def marker_number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
+
+
+def marker_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def marker_document(run_id, root, probe, created_unix=None):
+    """The initial marker of a freshly created owned root: identity facts only,
+    no conclusion."""
+    info = probe.lstat(root)
+    return {"version": MARKER_VERSION, "run_id": run_id, "root": root,
+            "owner_uid": probe.euid(), "device": info.st_dev, "inode": info.st_ino,
+            "created_unix": time.time() if created_unix is None else created_unix,
+            "concluded_unix": None, "outcome": "running", "closure": "none",
+            "kept_reason": "none"}
+
+
+def read_marker(root, probe):
+    """The validated marker of `root`, or MarkerInvalid. Strict by design: an
+    absent, symlinked, foreign-owned, non-private, oversized or unreadable
+    marker, an unknown version, a field set that is not exactly the schema, a
+    wrong type or an unknown state value all fail closed."""
+    path = os.path.join(root, MARKER_NAME)
+    try:
+        info = probe.lstat(path)
+    except FileNotFoundError:
+        raise MarkerInvalid("absent")
+    except OSError:
+        raise MarkerInvalid("unreadable")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise MarkerInvalid("not-regular")
+    if info.st_uid != probe.euid():
+        raise MarkerInvalid("foreign")
+    if info.st_mode & 0o077:
+        raise MarkerInvalid("not-private")
+    if info.st_size > MARKER_MAX_BYTES:
+        raise MarkerInvalid("oversized")
+    try:
+        raw = probe.read(path, MARKER_MAX_BYTES)
+    except SelectionRefused:
+        raise MarkerInvalid("not-regular")
+    except OSError:
+        raise MarkerInvalid("unreadable")
+    if len(raw) > MARKER_MAX_BYTES:
+        raise MarkerInvalid("oversized")
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise MarkerInvalid("not-json")
+    if not isinstance(document, dict) or set(document) != MARKER_KEYS:
+        raise MarkerInvalid("schema")
+    if not marker_int(document["version"]) or document["version"] != MARKER_VERSION:
+        raise MarkerInvalid("version")
+    run_id = document["run_id"]
+    if (not isinstance(run_id, str) or len(run_id) != 32
+            or any(character not in "0123456789abcdef" for character in run_id)):
+        raise MarkerInvalid("run-id")
+    if document["root"] != root:
+        raise MarkerInvalid("identity")
+    if not marker_int(document["owner_uid"]) or document["owner_uid"] != probe.euid():
+        raise MarkerInvalid("owner")
+    if (not marker_int(document["device"]) or not marker_int(document["inode"])
+            or document["inode"] == 0):
+        raise MarkerInvalid("identity")
+    if not marker_number(document["created_unix"]):
+        raise MarkerInvalid("created")
+    if document["concluded_unix"] is not None and not marker_number(document["concluded_unix"]):
+        raise MarkerInvalid("concluded")
+    if (document["outcome"] not in MARKER_OUTCOMES or document["closure"] not in MARKER_CLOSURES
+            or document["kept_reason"] not in MARKER_REASONS):
+        raise MarkerInvalid("state")
+    concluded = document["concluded_unix"] is not None
+    if concluded and (document["outcome"] != "closed" or document["closure"] != "positive"):
+        raise MarkerInvalid("state")
+    if not concluded and document["closure"] != "none":
+        raise MarkerInvalid("state")
+    return document
+
+
+def write_marker(root, document, probe):
+    """Write the marker privately and atomically inside `root`: one private
+    temporary file in the same directory, then one replace. The root itself is
+    rechecked first, so a swapped, symlinked or foreign directory is never
+    written. The payload is bounded and the schema is validated before use."""
+    try:
+        info = probe.lstat(root)
+    except OSError as error:
+        raise MarkerInvalid("root")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise MarkerInvalid("root")
+    if info.st_uid != probe.euid():
+        raise MarkerInvalid("root-owner")
+    if probe.realpath(root) != root:
+        raise MarkerInvalid("root")
+    if not isinstance(document, dict) or set(document) != MARKER_KEYS:
+        raise MarkerInvalid("schema")
+    payload = json.dumps(document, sort_keys=True).encode()
+    if len(payload) > MARKER_MAX_BYTES:
+        raise MarkerInvalid("oversized")
+    temporary = os.path.join(root, MARKER_NAME + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, os.path.join(root, MARKER_NAME))
+    return os.path.join(root, MARKER_NAME)
+
+
+def record_conclusion(root, run_id, probe, outcome, closure, kept_reason, wall=None):
+    """Record a genuine conclusion (or keep the root unconcluded) on an existing
+    marker. Only the authority holding the actual closure facts calls this: the
+    marker is never updated from age, a disappearing PID, a helper's success or
+    a finished task. `closure == "positive"` is the only state that can ever
+    make a root eligible for expiry, and it requires the matching conclusion."""
+    if outcome not in MARKER_OUTCOMES or closure not in MARKER_CLOSURES \
+            or kept_reason not in MARKER_REASONS:
+        raise MarkerInvalid("state")
+    if outcome == "running" or (closure == "positive") != (outcome == "closed"):
+        raise MarkerInvalid("state")  # a conclusion is terminal and never back to running
+    document = read_marker(root, probe)
+    if document["run_id"] != run_id:
+        raise MarkerInvalid("identity")
+    updated = dict(document, concluded_unix=(time.time() if wall is None else wall)
+                   if closure == "positive" else None,
+                   outcome=outcome, closure=closure, kept_reason=kept_reason)
+    write_marker(root, updated, probe)
+    return updated
+
+
+class SweepBudget:
+    """The startup sweep's fixed entry and time bounds, checked between
+    filesystem steps; exhaustion leaves the unreached work for a later run."""
+
+    def __init__(self, entries=SWEEP_ENTRY_BUDGET, deadline_ns=None, clock=None):
+        self.clock = clock or now_ns
+        self.entries = entries
+        self.started_ns = self.clock()
+        self.deadline_ns = (self.started_ns + SWEEP_TIME_BUDGET_NS
+                            if deadline_ns is None else deadline_ns)
+        self.used = 0
+        self.exhausted = None
+
+    def step(self):
+        self.used += 1
+        if self.used > self.entries:
+            self.exhausted = "entries"
+            raise SweepStop("entries")
+        if self.clock() >= self.deadline_ns:
+            self.exhausted = "time"
+            raise SweepStop("time")
+
+
+def entry_stat(name, dir_fd):
+    """The facts of one directory entry by descriptor, never following a link.
+    A separate seam so a synthetic probe can stand in for an entry it cannot
+    create (such as a foreign-owned file) in the pure cases."""
+    return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+
+def entry_facts(path, device, probe, budget, dir_fd=None):
+    """Why an entry is not a run root this sweep may touch, or None. Never
+    follows a link: `lstat` sees the entry itself, and the device and ownership
+    checks are the same ones the owned root already passed."""
+    budget.step()
+    if dir_fd is None:
+        info = probe.lstat(path)
+    else:
+        info = entry_stat(path, dir_fd)
+    if stat.S_ISLNK(info.st_mode):
+        return "symlink"
+    if not stat.S_ISDIR(info.st_mode):
+        return "not-a-directory"
+    if info.st_uid != probe.euid():
+        return "foreign-owner"
+    if info.st_dev != device:
+        return "other-device"
+    if dir_fd is None and probe.realpath(path) != path:
+        return "not-canonical"
+    return None
+
+
+def empty_directory(fd, probe, budget, device):
+    """Remove every entry of an already-open directory except the marker, which
+    the eligible root's own deletion removes last. Every entry is lstat-checked;
+    a symlink, a foreign owner, another device or a link that is not a real
+    directory stops the deletion instead of following anything."""
+    for name in sorted(os.listdir(fd)):
+        if name == MARKER_NAME:
+            continue
+        budget.step()
+        info = entry_stat(name, fd)
+        if stat.S_ISLNK(info.st_mode):
+            raise UnsafeEntry("symlink")
+        if info.st_uid != probe.euid():
+            raise UnsafeEntry("foreign-owner")
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise UnsafeEntry("not-a-regular-entry")
+        if info.st_dev != device:
+            raise UnsafeEntry("other-device")
+        if not stat.S_ISDIR(info.st_mode):
+            os.unlink(name, dir_fd=fd)
+            continue
+        inner = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            empty_directory(inner, probe, budget, device)
+        finally:
+            os.close(inner)
+        os.rmdir(name, dir_fd=fd)
+
+
+def remove_marked_root(root, marker, marker_identity, probe, budget):
+    """Delete one positively concluded root: its own entries first, then the
+    marker, then the root itself. The marker stays until last, so a partial
+    bounded deletion never turns a damaged root into an unmarked one and never
+    makes an unknown root eligible. Every destructive step is preceded by an
+    identity recheck of the root and its marker."""
+    fd = None
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        opened = os.fstat(fd)
+        if opened.st_dev != marker["device"] or opened.st_ino != marker["inode"]:
+            return False, "changed-during-sweep"
+        try:
+            empty_directory(fd, probe, budget, marker["device"])
+        except SweepStop as stop:
+            return False, "partial-" + stop.code
+        except UnsafeEntry as unsafe:
+            return False, "unsafe-" + unsafe.code
+        try:
+            current = entry_stat(MARKER_NAME, fd)
+        except FileNotFoundError:
+            return False, "marker-vanished"
+        if (not stat.S_ISREG(current.st_mode) or current.st_uid != probe.euid()
+                or (current.st_dev, current.st_ino) != marker_identity):
+            return False, "marker-changed"
+        os.unlink(MARKER_NAME, dir_fd=fd)
+        os.close(fd)
+        fd = None
+        try:
+            after = os.lstat(root)
+        except FileNotFoundError:
+            return True, None
+        if after.st_dev != marker["device"] or after.st_ino != marker["inode"]:
+            return False, "changed-during-sweep"
+        try:
+            os.rmdir(root)
+        except FileNotFoundError:
+            return True, None
+        except OSError:
+            return False, "rmdir"
+        return True, None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def sweep_concluded_roots(parent, device, probe, now=None, entries=SWEEP_ENTRY_BUDGET,
+                          deadline_ns=None, clock=None):
+    """One bounded startup sweep of the owned selected-volume scratch parent.
+
+    It removes only a real owner-marked run root whose marker records a positive
+    conclusion of all its owned resources strictly older than seven days by the
+    wall clock. Everything else is skipped and reported within fixed bounds: an
+    unmarked, foreign, symlinked, non-directory, other-device, non-canonical,
+    corrupt, future-dated, unconcluded, non-positive or non-expirable root is
+    never touched, and neither is anything outside this one subtree. The entry
+    and time budgets are checked between filesystem steps; exhaustion leaves the
+    unreached work for a later run, and there is no background reaper."""
+    clock = clock or now_ns
+    wall = time.time() if now is None else now
+    budget = SweepBudget(entries, deadline_ns, clock)
+    summary = {"parent": parent, "examined": 0, "steps": 0, "removed_total": 0,
+               "skipped_total": 0, "rows": [], "omitted": 0, "stop": None,
+               "entry_budget": entries, "time_budget_ns": SWEEP_TIME_BUDGET_NS,
+               "expiry_s": EXPIRY_S, "elapsed_ns": 0}
+
+    def row(name, result):
+        if len(summary["rows"]) < SWEEP_ROWS:
+            summary["rows"].append({"name": name, "result": result})
+        else:
+            summary["omitted"] += 1
+
+    try:
+        problem = entry_facts(parent, device, probe, budget)
+        if problem is not None:
+            raise SelectionRefused(f"scratch parent {parent} is unusable: {problem}")
+        names = sorted(os.listdir(parent))
+    except FileNotFoundError:
+        summary["stop"] = "parent-absent"
+        summary["elapsed_ns"] = clock() - budget.started_ns
+        return summary
+    except SweepStop as stop:
+        summary["stop"] = stop.code
+        summary["elapsed_ns"] = clock() - budget.started_ns
+        return summary
+    try:
+        for index, name in enumerate(names):
+            if not name.startswith(RUN_ROOT_LEAVES):
+                summary["skipped_total"] += 1
+                row(name, "not-a-run-root")
+                continue
+            summary["examined"] += 1
+            result = sweep_one_root(os.path.join(parent, name), device, probe, budget, wall)
+            if result == "removed":
+                summary["removed_total"] += 1
+            else:
+                summary["skipped_total"] += 1
+            row(name, result)
+    except SweepStop as stop:
+        summary["stop"] = stop.code
+        summary["omitted"] += len(names) - index
+    if budget.exhausted and summary["stop"] is None:
+        summary["stop"] = budget.exhausted  # a partial deletion used the last step
+    summary["steps"] = budget.used
+    summary["elapsed_ns"] = clock() - budget.started_ns
+    return summary
+
+
+def sweep_one_root(path, device, probe, budget, now):
+    """One entry's verdict: "removed", or a bounded skip code. Reads only."""
+    try:
+        problem = entry_facts(path, device, probe, budget)
+    except FileNotFoundError:
+        return "vanished"
+    except OSError:
+        return "unreadable"
+    if problem is not None:
+        return problem
+    try:
+        marker = read_marker(path, probe)
+        info = probe.lstat(os.path.join(path, MARKER_NAME))
+        root_info = probe.lstat(path)
+    except MarkerInvalid as invalid:
+        return "marker-" + invalid.code
+    except FileNotFoundError:
+        return "vanished"
+    except OSError:
+        return "unreadable"
+    marker_identity = (info.st_dev, info.st_ino)
+    if root_info.st_dev != marker["device"] or root_info.st_ino != marker["inode"]:
+        return "marker-identity"
+    if marker["concluded_unix"] is None:
+        return "unconcluded"
+    if marker["outcome"] != "closed" or marker["closure"] != "positive":
+        return "not-positive"
+    if marker["kept_reason"] not in MARKER_EXPIRABLE_REASONS:
+        return "kept-" + marker["kept_reason"]
+    if marker["concluded_unix"] > now or marker["created_unix"] > now:
+        return "future-clock"
+    if now - marker["concluded_unix"] <= EXPIRY_S:
+        return "young"
+    try:  # the destructive step's own rechecks, immediately before it
+        if entry_facts(path, device, probe, budget) is not None:
+            return "changed-during-sweep"
+        again = read_marker(path, probe)
+        identity = probe.lstat(os.path.join(path, MARKER_NAME))
+    except (MarkerInvalid, OSError):
+        return "changed-during-sweep"
+    if (again["run_id"] != marker["run_id"] or again["concluded_unix"] != marker["concluded_unix"]
+            or (identity.st_dev, identity.st_ino) != marker_identity):
+        return "changed-during-sweep"
+    removed, reason = remove_marked_root(path, marker, marker_identity, probe, budget)
+    return "removed" if removed else reason
 
 
 class Monitor:
@@ -1637,26 +2164,46 @@ class Monitor:
     def owned_root(self):
         """This run's owned root and the selection facts behind it. A caller's
         `--root-parent` keeps its existing semantics; the default is the
-        source-owned selected-volume choice, with a warned fallback."""
+        source-owned selected-volume choice, prepared inside `<mount>/scratch/oxide`
+        with one bounded self-expiry sweep and an owner marker written before any
+        run resource, with a warned fallback."""
         ctx = self.ctx
         if ctx["root_parent"] is not None:
             parent = ctx["root_parent"]
             root = os.path.realpath(tempfile.mkdtemp(prefix=SCRATCH_LEAF, dir=parent))
-            return {"source": "explicit-root-parent", "root_parent": parent, "reason": None,
-                    "pool": None, "pool_source": None, "registration": None,
-                    "mount": None, "volume_uuid": None, "device": None}, root
+            return ({"source": "explicit-root-parent", "root_parent": parent, "reason": None,
+                     "pool": None, "pool_source": None, "registration": None,
+                     "mount": None, "volume_uuid": None, "device": None}, root,
+                    {"path": None, "state": "none", "run_id": None, "sweep": None})
         probe = DefaultProbe()
         selection = select_default_parent(os.environ, probe)
+        sweep, root, marker, refusal = None, None, None, None
         try:
-            return selection, create_owned_root(selection["root_parent"], probe)
-        except (SelectionRefused, OSError) as error:
-            reason = str(error) if isinstance(error, SelectionRefused) else type_name(error)
-            fallback = {"source": "fallback", "root_parent": FALLBACK_PARENT,
-                        "reason": f"{selection['root_parent']}: {reason}",
-                        "pool": selection.get("pool"), "pool_source": selection.get("pool_source"),
-                        "registration": selection.get("registration"), "mount": None,
-                        "volume_uuid": None, "device": None}
-            return fallback, create_owned_root(FALLBACK_PARENT, probe)
+            parent = prepare_scratch_parent(selection, probe)
+            sweep = sweep_concluded_roots(parent, selection["device"], probe)
+            root = create_owned_root(parent, probe)
+            run_id = new_run_id()
+            path = write_marker(root, marker_document(run_id, root, probe), probe)
+            marker = {"path": path, "state": "written", "run_id": run_id, "sweep": sweep}
+        except (SelectionRefused, MarkerInvalid) as error:
+            refusal = str(error)
+        except OSError as error:
+            refusal = type_name(error)
+        if marker is not None:
+            selection["prepared_parent"] = parent
+            return selection, root, marker
+        if root is not None:  # remove exactly the empty root this call created
+            try:
+                shutil.rmtree(root, ignore_errors=True)
+            except BaseException:
+                pass
+        fallback = {"source": "fallback", "root_parent": FALLBACK_PARENT,
+                    "reason": f"{selection['root_parent']}: {refusal or 'the owned scratch parent is unusable'}",
+                    "pool": selection.get("pool"), "pool_source": selection.get("pool_source"),
+                    "registration": selection.get("registration"), "mount": None,
+                    "volume_uuid": None, "device": None}
+        return fallback, create_owned_root(FALLBACK_PARENT, probe), {
+            "path": None, "state": "none", "run_id": None, "sweep": sweep}
 
     def setup(self):
         """All blocking setup, inside the custodian's setup deadline: the
@@ -1677,12 +2224,14 @@ class Monitor:
             selection = {"source": "adopted-scratch-root", "root_parent": None, "reason": None,
                          "pool": None, "pool_source": None, "registration": None,
                          "mount": None, "volume_uuid": None, "device": None}
+            marker = {"path": None, "state": "none", "run_id": None, "sweep": None}
         else:
-            selection, root = self.owned_root()
+            selection, root, marker = self.owned_root()
             scratch, owned = os.path.join(root, "scratch"), True
             reserve_path = root
             os.mkdir(scratch)
             evidence = ctx["evidence_arg"] or os.path.join(root, "evidence")
+        ctx["marker"] = marker
         if selection["source"] == "fallback":
             report(fallback_warning(selection))
         try:
@@ -1709,6 +2258,8 @@ class Monitor:
             "scratch_owned": ctx["owned"], "start_ns": ctx["start_ns"], "abort_threshold": THRESHOLD,
             "terminal_mode": dict(terminal_mode),
             "scratch_default": dict(ctx["selection"]),
+            "scratch_sweep": marker.get("sweep"),
+            "scratch_marker": {key: marker.get(key) for key in ("path", "state", "run_id")},
             "phase": None, "leader": None, "custodian": [], "outcome": None,
             "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None,
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
@@ -1934,10 +2485,33 @@ class Monitor:
             self.publish("cleanup_complete")
         else:
             self.publish("unclosed: scratch_kept")
+        self.receipt["scratch_marker"] = self.conclude_marker(decision == "cleanup")
         self.publish("monitor_complete: pending_custodian")
         self.summary()
         self.send("monitor_complete")
         self.stop.set()
+
+    def conclude_marker(self, closed):
+        """Record this run's genuine conclusion on its owner marker, or leave it
+        unconcluded. Only the monitor's own closure decision (which is the
+        custodian's, taken after the leader was reaped) is passed here; a failed
+        write leaves the marker untouched and the root kept, and never changes
+        the run's outcome."""
+        marker = self.ctx.get("marker") or {}
+        record = {"path": marker.get("path"), "state": "none", "run_id": marker.get("run_id")}
+        if not marker.get("path") or not marker.get("run_id"):
+            return record
+        try:
+            document = record_conclusion(self.ctx["root"], marker["run_id"], DefaultProbe(),
+                                         "closed" if closed else "unclosed",
+                                         "positive" if closed else "none",
+                                         "evidence" if closed else "unclosed")
+            record.update(state="concluded" if closed else "kept",
+                          kept_reason=document["kept_reason"],
+                          concluded_unix=document["concluded_unix"])
+        except BaseException:
+            record["state"] = "unknown"
+        return record
 
     def summary(self):
         receipt, reserve = self.receipt, self.receipt["reserve"]

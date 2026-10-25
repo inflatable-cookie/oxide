@@ -1618,7 +1618,11 @@ identity lines.
 described below, under the qualified supervisor bytes
 `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`; the owner
 accepted the narrow internal-root exception for genuine internal-placement
-proofs. The Oxide children rule is implemented on the oxide#136 branch but is
+proofs. Oxide#151 moves that default from a leaf at the drive root into the
+owned `<mount>/scratch/oxide` subtree and adds the owner marker and bounded
+seven-day self-expiry described below; that source is **unqualified** until its
+own separate author and independent reviewer `proof:supervisor:qualify`
+receipts exist, and the `a6d73326` receipts stay bound to their own bytes. The Oxide children rule is implemented on the oxide#136 branch but is
 not installed or qualified: its counted native has not passed, its required
 uncounted diagnostic has been attempted and failed, and the independent
 reviewer native is missing. Neither facility establishes measured SSD-write
@@ -1654,19 +1658,63 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   - otherwise the configured pool's own volume (mount root of `OXIDE_POOL`,
     the user config file's `[pool] path` with `~` as the account home, or the
     built-in pool), again only when it is not the boot volume.
-  The owned leaf is one `oxide-proof.*` directory created privately (0700,
-  this user, canonical, same device as the mount) directly on that volume,
-  outside `oxide-pool` and `oxide-outputs` payload. Absent, unreadable,
-  malformed, symlinked, wrong-device or otherwise unsafe selection falls back
-  to `/private/tmp` with one bounded warning and never manufactures a mount
-  path or an internal shadow. Reserve sampling reads the filesystem actually
-  holding the scratch, with the existing thresholds, cadence and staleness;
-  the receipt records the selection source, the actual root and the reserve
-  path and device. Explicit `--root-parent` and adopted
-  `OXIDE_TASK_SCRATCH_ROOT` keep their ownership, retention and refusal
-  contracts: this changes the default, not caller ownership. This is not the
-  product's verified build-time selection (no container/role check), and the
-  narrow config reader understands only a simple `[pool] path` entry.
+  The default parent is the owned subtree `<mount>/scratch/oxide` of that
+  volume, not the drive root (oxide#151); `mount` stays the actual mount and
+  the volume UUID and device facts are unchanged. Selection is effect-free: it
+  only reports the parent, and creating it belongs to the supervisor's own
+  blocking setup, so plans, pure probes and refusal paths create nothing.
+  - **Preparation.** Missing `scratch` and `oxide` components are created with
+    0700. An existing component is only validated — `lstat`, no symlink, this
+    user, no group/other bits, canonical, the selected device — and is never
+    chmodded, adopted, renamed or removed. A concurrent creator that wins the
+    mkdir is validated the same way. A refusal keeps the established
+    single-line warned fallback to `/private/tmp`, and the qualification
+    bootstrap still refuses to qualify on a fallback.
+  - **Run roots.** Each run is one `oxide-proof.*` directory (and each
+    qualification bootstrap base one `oxide-supervisor-qualify.*` directory)
+    created privately (0700, this user, canonical, same device as the parent)
+    directly in that subtree, outside `oxide-pool` and `oxide-outputs` payload.
+    Absent, unreadable, malformed, symlinked, wrong-device or otherwise unsafe
+    selection falls back to `/private/tmp` with one bounded warning and never
+    manufactures a mount path or an internal shadow.
+  - **Owner marker and self-expiry.** Immediately after its root is
+    exclusively created and before any child or run resource, a run writes one
+    private `.oxide-scratch.json` marker: strict fixed schema, unique run ID,
+    canonical root, owner UID, device and inode, creation time, initially null
+    conclusion, outcome, closure and kept-reason. The marker is written
+    atomically (private temporary file, then one replace) and is updated only
+    at a genuine conclusion: a closed session records `outcome: closed`,
+    `closure: positive` and kept-reason `evidence`; an unclosed or failed run
+    records an honest non-positive state with a null conclusion, or—on an
+    abrupt exit—keeps its initial marker. It disambiguates outcome from positive
+    closure, is never a process-liveness probe, and an absent, foreign,
+    symlinked, oversized, corrupt, unknown-version, future-dated or
+    schema-divergent marker fails closed. Before its own root exists, one
+    bounded startup sweep confined to the canonical owned subtree may remove
+    only real owner-marked roots whose marker records a positive conclusion of
+    every owned resource strictly older than seven days. The fixed budgets are
+    1 s and 4096 examined entries plus recursive steps, checked between
+    filesystem steps; exhaustion leaves the unreached work for a later run and
+    there is no background reaper. Nothing else is ever removed: unmarked,
+    foreign-owned, non-directory, symlinked, other-device, non-canonical,
+    non-expirable, unconcluded or nested-UNCLOSED entries are skipped and
+    reported within a bounded row count, symlinks are never followed at any
+    level, and the root's marker is removed only after its own contents are
+    gone so a partial bounded deletion never turns a damaged root into an
+    unmarked or eligible one. A retained nested UNCLOSED fixture keeps its
+    candidate root unconcluded even when the outer session closed and the suite
+    passed, and a failed qualification keeps the bootstrap base unconcluded;
+    neither can expire while that holds. Historical unmarked roots from earlier
+    runs stay unmarked and ineligible. Reserve sampling reads the filesystem
+    actually holding the scratch, with the existing thresholds, cadence and
+    staleness; the receipt records the selection source, the prepared parent,
+    the actual root, the reserve path and device, the bounded sweep summary and
+    the marker state. Explicit `--root-parent` and adopted
+    `OXIDE_TASK_SCRATCH_ROOT` keep their ownership, retention and refusal
+    contracts and create no marker: this changes the default, not caller
+    ownership. This is not the product's verified build-time selection (no
+    container/role check), and the narrow config reader understands only a
+    simple `[pool] path` entry.
 
 Supervisor SHA-256
 `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
@@ -1836,6 +1884,19 @@ guard bytes they ran under as history; the prior qualified
 `961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052` is qualified
 only at its old bytes and no old run is retroactively migrated.
 
+**Selected-volume routing, owner markers and self-expiry (oxide#151,
+unqualified source).** The current `bounded-test.py` and
+`qualify-supervisor.py` route the default scratch parent to
+`<mount>/scratch/oxide`, prepare it in blocking setup, mark every run root
+there, run one bounded startup sweep for positively concluded roots older than
+seven days, and have the bootstrap verify the routing, sweep summary, marker
+conclusion and its own kept base. Those bytes are **unqualified**: they change
+both source files the qualification binds, so they need their own exact-head
+source review, uncounted keep-going diagnostic and separate author and
+independent reviewer `proof:supervisor:qualify` receipts, with fresh activation
+clocks. The `a6d73326` receipts above stay bound to their own bytes and no
+earlier run is migrated.
+
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
 run that ends with no completed post-reap census round can be told apart from
@@ -1848,7 +1909,8 @@ the `a6d73326` bytes above stay the qualified ones for their own runs. The
 bootstrap file changes with it for two concrete reasons and no others: its
 expected case count follows the suite's new total (160 pure + 40 real = 200)
 and it gains one limitation line describing this observation, so it adds no
-bound and no effect. Every quality fact here binds to the digests its own
+bound and no effect. Oxide#151 later raises the expected total to its own 187
+pure + 40 real = 227 with the routing, marker and sweep cases below. Every quality fact here binds to the digests its own
 receipt records, never to the `#145` digests above.
 
 - The monitor's receipt gains a `settlement` object with a fixed schema:
@@ -2146,17 +2208,20 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     forwarded up to 32 MiB, and the rest is counted and discarded.
 - **Scratch.** Without a caller's `OXIDE_TASK_SCRATCH_ROOT`, it owns
   `<root-parent>/oxide-proof.*/{scratch,evidence}`. The default root parent is
-  the private selected-volume area described under
-  [temporary scratch placement](#temporary-scratch-placement): the volume the
-  effect-free pool selection names, never the boot volume, with the warned
-  `/private/tmp` fallback; `--root-parent` overrides it with unchanged caller
-  semantics. It passes `scratch` as `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`
-  and `TEMP`, and counts the whole root, evidence included. A caller's root is
-  adopted and never removed; evidence goes in a `supervisor-evidence.*`
-  directory inside it. Evidence directories are kept for review. Reserve
-  sampling reads the filesystem holding the scratch in every case, and the
-  receipt records `scratch_default` (source, pool, registration, mount, volume
-  UUID, device) with the reserve path and device.
+  the owned `<mount>/scratch/oxide` subtree of the selected volume described
+  under [temporary scratch placement](#temporary-scratch-placement): the
+  volume the effect-free pool selection names, never the boot volume and never
+  the drive root, with the warned `/private/tmp` fallback; `--root-parent`
+  overrides it with unchanged caller semantics and creates no marker. It
+  passes `scratch` as `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP`,
+  and counts the whole root, evidence included. A caller's root is adopted and
+  never removed; evidence goes in a `supervisor-evidence.*` directory inside
+  it. Evidence directories are kept for review. Reserve sampling reads the
+  filesystem holding the scratch in every case, and the receipt records
+  `scratch_default` (source, prepared parent, pool, registration, mount,
+  volume UUID, device) with the reserve path and device, plus the bounded
+  startup sweep summary (`scratch_sweep`) and the owner-marker state
+  (`scratch_marker`).
 - **Owned bytes.** The monitored count is `st_blocks * 512` for every
   distinct (device, inode) under the root, with no symlink followed, taken
   every 2 s. `PC_PATH_MAX` is only the choice between two lookup forms: a
@@ -2203,11 +2268,19 @@ bounds:
 - on candidate overrun, TERM then KILL of its own unreaped candidate child
   only, from its own reap loop, so no signal can follow the reap.
 
-It deletes nothing. Real case directories live under the candidate's
-`OXIDE_PROOF_EVIDENCE`, outside the candidate's cleanup. `UNCLOSED` cases
-leave live fixture processes whose only bound is their finite fallback, and
-fallback expiry is not closure. The scratch base is therefore kept, and its
-path is printed for the owner.
+The bootstrap deletes nothing. It prepares the owned
+`<mount>/scratch/oxide` parent through the candidate's own seam, runs one
+bounded startup sweep there before creating its base, and marks that base
+before the candidate starts; the candidate's own setup then runs its one
+bounded sweep, which must have seen and kept that unconcluded base. Real case
+directories live under the candidate's `OXIDE_PROOF_EVIDENCE`, outside the
+candidate's cleanup. `UNCLOSED` cases leave live fixture processes whose only
+bound is their finite fallback, and fallback expiry is not closure. The
+scratch base is therefore kept, and its path is printed for the owner. A base
+or candidate root that carries a retained nested `UNCLOSED` fixture stays
+unconcluded with an honest reason even when the outer session closed and the
+suite passed, so it can never expire; only a fully concluded base or candidate
+root older than seven days is eligible for a later run's bounded sweep.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py` with **no** `--root-parent` **and no
@@ -2234,7 +2307,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 160 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 187 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2305,8 +2378,51 @@ runs in order:
   unreadable or malformed registration, the narrow config path forms and the
   built-in pool, the bounded single-line fallback warning, `--root-parent`
   and adopted scratch keeping their own contracts, that the qualification
-  bootstrap still passes no `--root-parent`, and the owned leaf's privacy,
-  ownership, device and canonical refusals with the refused leaf removed;
+  bootstrap still passes no `--root-parent` (and does prepare the owned parent
+  and sweep before its own base), that the unit-suite recipe in `AGENTS.md`
+  follows the helper's prepared parent rather than a hardcoded mount, that a
+  selected volume reports `<mount>/scratch/oxide` without creating it, and the
+  owned leaf's privacy, ownership, device and canonical refusals with the
+  refused leaf removed;
+- the owned scratch parent preparation on real owned fixtures: missing
+  `scratch`/`oxide` components created 0700 with nothing else created, already
+  safe components kept byte- and inode-identical, a concurrent creator's
+  component validated rather than adopted (including its 0755 refusal without
+  a chmod), and symlink, non-directory, non-private, foreign-owner,
+  other-device, unreadable, non-canonical, wrong-parent, wrong-mount and
+  non-selected-volume refusals that leave the component in place and create no
+  sibling;
+- the owner marker through its real write and read seams: an initial marker
+  round-trips privately (0600, no temporary file, null conclusion, running
+  outcome), and every schema divergence fails closed — extra or missing field,
+  unknown version, malformed run ID, mismatched root/device/inode, wrong owner,
+  negative/NaN/infinite creation time, ill-typed conclusion, unknown outcome,
+  closure or kept-reason, a conclusion without positive closure and a closure
+  claimed while unconcluded — plus absent, symlinked, non-private,
+  foreign-owned, oversized and non-JSON markers, refused writes that leave no
+  file, and conclusions that only a terminal closed/positive pair can record;
+  no marker field is a PID or liveness fact;
+- the bounded startup sweep against real owned fixtures and an injected wall
+  clock: a positively concluded root older than seven days removed whole, the
+  exact seven-day boundary and young conclusions kept, eligibility decided by
+  the kept-reason rather than age (both expirable reasons removed, every
+  non-expirable one kept), old unconcluded/unclosed/nested-UNCLOSED/failed
+  roots kept, unmarked, foreign-owned, symlinked, plain-file, other-device and
+  unrelated entries untouched with their referents intact, corrupt, oversized,
+  non-private, symlinked or identity-mismatched markers and future-dated
+  conclusions kept, a symlink or foreign entry inside an eligible root
+  stopping its deletion with the marker and root kept, entry-budget and
+  time-budget stops leaving a partial root whose marker survives for a later
+  retry that finishes it, no cross-root deletion, a marker or root identity
+  that changes during the sweep refused with its payload intact, a foreign or
+  symlinked parent refused and an absent one reported, and fixed bounded
+  summary rows with an exact omitted count;
+- the qualification checks for this routing: a real owned tree whose parent is
+  `<mount>/scratch/oxide` passes end to end, while the bare mount as parent, a
+  root created directly at the drive root, a missing sweep summary, a sweep on
+  another parent, an unrecognised sweep stop, invalid counts, a closed
+  candidate without a marker conclusion and a missing bootstrap base are each
+  refused;
 - the closure decision path with fake events only: both DISTINCT stream EOF
   witnesses may close without a fault, one or none refuses, a duplicate stdout
   witness never counts as two, an uncertain census refuses before any EOF
@@ -2394,18 +2510,23 @@ expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
 - established closure with status 0;
-- the default scratch on the selected volume, as above;
+- the default scratch on the selected volume inside the owned
+  `<mount>/scratch/oxide` subtree, as above, with the bootstrap's own base still
+  present after the candidate's bounded startup sweep;
+- the candidate's bounded startup sweep summary and its owner-marker
+  conclusion on the owned parent;
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 175 cases;
+- all 227 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
 It prints a receipt binding the commit, SHA-256 of all three sources, the
 platform, each case's exit, phase, outcome and signal custody, the suite's
-recorded layout, the scratch-volume and boot-volume reserve readings, the
-kept base and `UNCLOSED` case directories, and the limitations. Admission waits fall outside its 300 s. `effigy
+recorded layout, the prepared parent, both bounded sweep summaries, both
+marker states, the scratch-volume and boot-volume reserve readings, the kept
+base and `UNCLOSED` case directories, and the limitations. Admission waits fall outside its 300 s. `effigy
 proof:supervisor:test` runs the pure cases alone.
 
 `test rust`, `test rust-cargo`, the profile proofs, `rust:pool-scale`,
