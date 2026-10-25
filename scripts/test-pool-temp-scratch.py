@@ -24,8 +24,10 @@ Cases (each one is a real child, nothing is simulated):
 2. same-volume inherited `TMPDIR` kept: the child reports the canonical
    directory, no Oxide directory is created, and a planted file inside it is
    untouched after the command.
-3. absent, file, relative, unwritable, other-device and symlink-escaping
-   inherited directories are replaced by one owned directory.
+3. absent, file, relative, unwritable and symlink-escaping inherited
+   directories are replaced by one owned directory; an other-device value is
+   replaced too when this host has a writable directory on another device, and
+   the case says so instead of asserting a control the fixture cannot build.
 4. an existing **relative** `TMPDIR` resolves against the parent's working
    directory and reaches the child as the canonical absolute path, so a child
    that changes directory still uses the qualified directory; a relative
@@ -57,11 +59,12 @@ Cases (each one is a real child, nothing is simulated):
     an over-bound derived path refuses the command rather than leaving the
     child on the machine default.
 11. one owned 128 MiB scratch APFS image registered as the removable pool: the
-    child's temporary files land on the image, the inherited `/private/tmp`
+    child's temporary files land on the image, the inherited fixture scratch
     (another device) is replaced, release removes the directory, and after an
-    ordinary detach the internal pool's own scratch is used with no stale
-    `/Volumes/<name>` directory created. With an inherited same-device
-    `TMPDIR`, the fallback keeps it and creates nothing.
+    ordinary detach the same registration's selection falls back to the
+    internal pool, whose own scratch is used with no stale `/Volumes/<name>`
+    directory created. With an inherited same-device `TMPDIR`, the fallback
+    keeps it and creates nothing.
 12. the longest injected path is reported in bytes and characters against the
     91-byte socket bound.
 
@@ -118,7 +121,7 @@ CASE_NAMES = [
     "aliases follow the chosen value",
     "owned scratch observed while held, hard link counted once",
     "normal release removes the owned scratch",
-    "crash with a surviving group keeps it; recovery deletes the slot whole",
+    "crash with a surviving group keeps it; the leftover never survives closure",
     "test, exec and run children observe the chosen directory",
     "foreign, linked and over-bound positions refuse",
     "removable image and absent-volume internal fallback",
@@ -560,15 +563,35 @@ def replaced(world: World, crate: str) -> None:
     if os.path.lexists(escape):
         os.unlink(escape)
     os.symlink(os.path.join(world.root, "absent-target"), escape)
+    # A directory on another device is only a control when one exists on this
+    # host: the fixture scratch is usually a sibling of the directory pool and
+    # therefore on the same device, where the inherited directory is correctly
+    # kept. The image case proves the other-device rule against a real second
+    # volume.
+    pool_device = os.stat(canonical(world.pool)).st_dev
+    other_device = None
+    for candidate in (world.scratch, os.environ.get("TMPDIR"), "/private/tmp"):
+        if not candidate or not os.path.isdir(candidate):
+            continue
+        if os.stat(canonical(candidate)).st_dev != pool_device:
+            other_device = candidate
+            break
+    cases = [
+        ("absent", missing),
+        ("file", file_path),
+        ("relative", "relative/tmp"),
+        ("unwritable", closed),
+        ("symlink escape", escape),
+    ]
+    if other_device is None:
+        say(
+            "no writable directory on another device here; the other-device "
+            "rule is exercised against the owned image in the removable case"
+        )
+    else:
+        cases.append(("other device", other_device))
     try:
-        for label, value in (
-            ("absent", missing),
-            ("file", file_path),
-            ("relative", "relative/tmp"),
-            ("unwritable", closed),
-            ("symlink escape", escape),
-            ("other device", world.scratch),
-        ):
+        for label, value in cases:
             result = world.run(["check"], cwd=crate, env=world.env(TMPDIR=value))
             observed = reported(result.stderr, "dir")
             held_by_pool(world, observed)
@@ -1211,45 +1234,41 @@ def removable(world: World, crate: str) -> None:
             detached.returncode == 0, f"ordinary detach failed: {detached.stderr}"
         )
         expect(not os.path.exists(mount), f"the mount point {mount} was recreated")
-        internal = os.path.join(world.root, "internal-pool")
+        # The registration still exists and its volume is gone, so this build
+        # must go through the product's own fallback selection on the
+        # original pool; it is not pointed at a fresh pool.
         fallback = world.run(
-            ["check"],
-            cwd=crate,
-            env=world.env(
-                TMPDIR=None,
-                TMP=None,
-                TEMP=None,
-                OXIDE_POOL=internal,
-                OXIDE_POOL_CAP="64MiB",
-            ),
+            ["check"], cwd=crate, env=world.env(TMPDIR=None, TMP=None, TEMP=None)
         )
-        observed = reported(fallback.stderr, "dir")
+        observed = reported(fallback.stderr, "dir").rstrip("/")
         expect(
             os.path.realpath(observed).startswith(
-                os.path.realpath(os.path.join(internal, "payload")) + os.sep
+                os.path.realpath(os.path.join(world.pool, "payload")) + os.sep
             ),
             f"the fallback did not use the internal pool's scratch: {observed}",
+        )
+        say(
+            "post-detach selection: "
+            + " | ".join(
+                line
+                for line in fallback.stderr.splitlines()
+                if "select" in line or "removable" in line
+            )[:400]
         )
         expect(not os.path.exists(mount), f"the fallback recreated {mount}")
         # With a same-device inherited TMPDIR the fallback keeps it and
         # creates nothing.
-        inherited = private_dir(os.path.join(internal, "keep-tmp"))
+        inherited = private_dir(os.path.join(world.pool, "keep-tmp"))
         kept = world.run(
             ["check"],
             cwd=crate,
-            env=world.env(
-                TMPDIR=inherited,
-                TMP=None,
-                TEMP=None,
-                OXIDE_POOL=internal,
-                OXIDE_POOL_CAP="64MiB",
-            ),
+            env=world.env(TMPDIR=inherited, TMP=None, TEMP=None),
         )
         expect(
             reported(kept.stderr, "dir").rstrip("/") == canonical(inherited),
             f"the fallback did not keep the same-device inherited directory: {kept.stderr[-1500:]}",
         )
-        slots = os.path.join(internal, "payload", "slots")
+        slots = os.path.join(world.pool, "payload", "slots")
         for root, _, _ in os.walk(slots):
             expect(
                 not os.path.exists(os.path.join(root, "scratch")),
