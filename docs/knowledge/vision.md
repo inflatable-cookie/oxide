@@ -168,14 +168,38 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   whole-target link moves only through an explicit `oxide outputs adopt` under
   a durable journal, a real nonempty profile directory is never moved or
   converted, and an undeclared opaque tool refuses instead of guessing. The
-  profile layout is implemented with a known fail-safe detach refusal for
-  host-triple member links and incomplete native coverage. The as-is acceptance,
-  contract, formats and evidence limits are owned by the
+  profile layout is implemented; `oxide outputs detach` recognises the host
+  triple and every other supported member link by its approved destination
+  and this checkout's root marker, so a `<triple>/debug` member no longer
+  refuses a safe detach, while an unowned, wrong-destination, dangling or
+  malformed link still refuses with nothing changed. Corrected native
+  coverage of detach, clean and prune is still unactivated. The as-is
+  acceptance, contract, formats and evidence limits are owned by the
   [workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides
   HOME still uses them; private pools need an explicit setting. Its proof
   controls exist only in debug builds; any other build refuses them.
+- **Temporary files off the internal drive:** a leased command's children
+  (tests, run programs, build scripts, `oxide exec` tools) put temporary files
+  on the selected pool. An inherited `TMPDIR` is kept, as its canonical
+  directory, only when it is a writable directory on the pool's own device;
+  external owners retain cleanup of their inherited paths and Oxide never
+  writes to or removes one. Otherwise Oxide owns one short per-command
+  directory inside the slot, removed at release after writer closure; a `run`
+  program that uses one keeps the lease until its own group closes
+  ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It is
+  implemented on the oxide#136 branch but is not installed or qualified: its
+  counted native has not passed and both uncounted diagnostics were attempted
+  and failed. The separate proof and validation tooling
+  default is implemented and qualified by oxide#145 (merged at `0520fc04`,
+  guard `a6d73326`), which places and monitors proof scratch on the selected
+  pool's own volume with a warned `/private/tmp` fallback
+  ([placement](contracts/workflow.md#temporary-scratch-placement)). Internal-
+  placement proofs may declare an explicit internal root as the owner-accepted
+  narrow exception, with their fixtures beside the pool, never inside it. Both
+  cover Oxide-owned scratch only: CI, Queue worktrees, containers and host
+  settings stay as they are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
@@ -189,13 +213,18 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Approved, not built:**
   - cold-slot seeding from matching units, conservative first, with
     one-use temp workspaces handled as seeded, first-evicted slots;
-  - per-slot test scratch;
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).
-- **Declined:** cached slot accounting; revisit only on new evidence.
+- **Approved, not built** (Tom, 2026-10-25): recorded per-slot accounting
+  replaces whole-payload admission walks. Closed-slot records are bound to
+  generation/incarnation; missing or invalid records require bounded slot
+  walks, and cross-slot hard-link overcount is accepted. Removable pools
+  also use the volume's used-space bound. The [accounting contract](contracts/local-lease.md#recorded-per-slot-accounting-approved-not-implemented)
+  owns the direction and trust limits. This supersedes the earlier cached
+  accounting decline for this scope; its negative reviews remain history.
 
 ### Adoption pattern
 
@@ -234,25 +263,36 @@ the operating rules.
   closure, and removable media: adds an independent reviewer native session.
 - **Bounds:** wall-clock time and scratch budget. Resource figures are
   reported, not gated.
-- **Proof authoring guidance** (product architect, 2026-10-24): briefs that
-  author or correct a native proof script, its fixtures or its oracles declare
-  **HIGH** complexity. Queue still selects the models. Before a counted native,
-  the author runs the script's safe opt-in diagnostic keep-going mode as an
-  uncounted collection run, using an existing mode or adding one for a new
-  script. Where no safe diagnostic exists, use a documented source
-  premise/oracle sweep against current shipped behaviour instead. Check the
-  executable case bodies, not only their plan text: automatic adoption,
-  private-HOME controls, Cargo's external-subcommand argv and command-prefix
-  parsing are examples of premises that have caused false failures.
-  - Record diagnostic failures and dependent or tainted skips honestly;
-    unknown device/writer effects, infrastructure faults and uncertain custody
-    still abort. Keep the default counted path fail-fast and preserve the
-    qualified guard and cleanup bounds.
-  - The collection receipt is diagnostic only, never a counted PASS or closure
-    claim. It still needs its own scoped activation, exact source/input pins,
-    supported route, time and scratch bounds. This guidance grants no native
-    start, extra diagnostic allowance or clock reset. The counted run exercises
-    an already-swept script.
+- **Proof authoring guidance** (product architect, 2026-10-24; diagnostic
+  requirement strengthened 2026-10-25): briefs that author or correct a native
+  proof script, its fixtures or its oracles declare **HIGH** complexity. Queue
+  still selects the models. Before the first counted native, the author must
+  execute a separately activated, **uncounted diagnostic** of the fixed proof.
+  Use its existing safe keep-going mode; if none exists, add a minimal opt-in
+  `--diagnostic` that records oracle failures and continues through
+  dependency-independent safe cases. A source sweep alone no longer satisfies
+  this gate. Apply this before the next counted runs of #136 and #140 and to
+  every future proof.
+  - Keep the counted default fail-fast and preserve the qualified guard,
+    existing wall-clock and scratch bounds, custody and cleanup. Record
+    dependency or taint skips honestly; infrastructure faults, unknown device
+    or writer effects, uncertain custody and an unrecordable receipt abort.
+    Do not invent fixture repair or presume a reaped child proves closure.
+    If no safe diagnostic can fit these constraints, return the concrete
+    design issue to the owner before a counted run.
+  - Every brief also applies the fixed [proof-authoring premise checklist](contracts/workflow.md#proof-authoring-premise-checklist)
+    to the executable case bodies and helpers, recording each disposition or
+    reason it does not apply. This source sweep complements the execution;
+    it does not replace it.
+  - The diagnostic receipt is explicitly uncounted and never a native PASS,
+    closure claim or substitute for the counted proof. It records all reached,
+    completed, failed, skipped and unexecuted cases, reasons and first fault.
+    Its execution needs its own exact source/input pins, supported route,
+    resource basis and fixed activation window. This guidance grants no
+    automatic run, cap increase, clock reset or reuse of a spent allowance.
+    Earlier counted failures remain counted failures, never retrospectively
+    relabelled as diagnostics. Changed proof inputs need the applicable
+    diagnostic and review before their counted activation.
 - **Mechanical native-evidence gates** (Supervisor, 2026-10-23): every Oxide
   brief requiring counted native evidence encodes it in Queue before
   promotion. Use `reviewVerdicts: true` with a `reviewPassGate` subject such

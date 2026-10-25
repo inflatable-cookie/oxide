@@ -250,6 +250,11 @@ pub(super) struct Pool {
     /// starting a fresh one.
     deadline: Option<Instant>,
     reconciliation_blocked: bool,
+    /// Why this open admitted a new slot without a complete walk, if it did.
+    admission_note: Option<String>,
+    /// A removable payload this open already found too large to walk within
+    /// `VOLUME_WALK_MS`, with only bound gaps: later checks reuse it.
+    unwalkable: Option<AccountingScan>,
 }
 
 /// Entry points for the `oxide` front door. They open a budget-only
@@ -678,6 +683,8 @@ impl Pool {
             limits: accounting_limits(),
             deadline: None,
             reconciliation_blocked: false,
+            admission_note: None,
+            unwalkable: None,
         };
         pool.reconcile_evicting()?;
         Ok(pool)
@@ -717,6 +724,8 @@ impl Pool {
             // Coverage for a measurement made without reconciliation is
             // unknown while a recorded deletion is pending.
             reconciliation_blocked: pending,
+            admission_note: None,
+            unwalkable: None,
         })
     }
 
@@ -817,6 +826,7 @@ impl Pool {
                 return Ok(Leased {
                     grant: self.grant_from(existing, true)?,
                     measured: None,
+                    admission_note: None,
                 });
             }
             if existing.state == SlotPersistState::Held {
@@ -867,6 +877,7 @@ impl Pool {
                     unique_allocated_bytes: _unique,
                     dir,
                 }),
+                admission_note: None,
             });
         }
         self.ensure_capacity_policy()?;
@@ -881,9 +892,11 @@ impl Pool {
         workspace: PathBuf,
         request: &LeaseRequest,
     ) -> Result<Leased, LeaseError> {
+        let grant = self.allocate(project, workspace, request)?;
         Ok(Leased {
-            grant: self.allocate(project, workspace, request)?,
+            grant,
             measured: None,
+            admission_note: self.admission_note.take(),
         })
     }
 
@@ -955,12 +968,19 @@ impl Pool {
         }
         // New-slot admission needs the whole-payload walk complete, before
         // and after any eviction. Below both count ceilings and without byte
-        // pressure nothing is evicted.
-        if self.payload_accounting().require_complete()? >= self.budget {
-            self.evict_idle_until_under_cap()?;
-            if self.payload_accounting().require_complete()? >= self.budget {
-                return Err(LeaseError::Full);
+        // pressure nothing is evicted. A removable volume whose payload is
+        // too large to walk within the bounds is admitted by the volume's
+        // own used bytes instead (see `admit_by_volume_usage`).
+        match self.payload_check()? {
+            Some(used) => {
+                if used >= self.budget {
+                    self.evict_idle_until_under_cap()?;
+                    if self.payload_accounting().require_complete()? >= self.budget {
+                        return Err(LeaseError::Full);
+                    }
+                }
             }
+            None => self.admit_by_volume_usage()?,
         }
         let slot_id = self.ledger.next_slot;
         if slot_id == 0 {
@@ -1244,8 +1264,9 @@ impl Pool {
                 "replacement slot ID must be a positive integer",
             ));
         }
-        // The whole-payload walk must be complete before any deletion.
-        self.payload_accounting().require_complete()?;
+        // The whole-payload walk must be complete before any deletion; a
+        // removable payload too large to walk passes on bound gaps alone.
+        self.payload_check()?;
         let Some((incarnation, project, profile)) = self
             .slot(id)
             .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
@@ -1262,8 +1283,9 @@ impl Pool {
         let mut remaining = self.ledger.slots.len();
         while self.ledger.slots.len() > max_slots && remaining > 0 {
             // A count replacement still needs complete accounting first; an
-            // incomplete walk refuses instead of deleting blindly.
-            self.payload_accounting().require_complete()?;
+            // incomplete walk refuses instead of deleting blindly, except a
+            // removable payload whose only gaps are the walk's own bounds.
+            self.payload_check()?;
             let before = self.ledger.slots.len();
             if !self.evict_one_idle()? {
                 break;
@@ -1274,6 +1296,73 @@ impl Pool {
             remaining -= 1;
         }
         Ok(())
+    }
+
+    /// New-slot admission on a removable volume when the whole-payload walk
+    /// is incomplete: the volume's used bytes (capacity less available, from
+    /// the verified binding) stand in for the payload. They include
+    /// everything else on the volume, so they never undercount. Under the
+    /// budget, admit with a note; otherwise evict least-recently-used idle
+    /// whole slots, re-reading the volume after each, at most
+    /// `VolumeAdmission::EVICTION_LIMIT` times, then refuse with the original
+    /// incomplete scan. Any other walk failure keeps refusing; the internal
+    /// directory pool never takes this path.
+    fn admit_by_volume_usage(&mut self) -> Result<(), LeaseError> {
+        let scan = self
+            .unwalkable
+            .clone()
+            .ok_or(LeaseError::UnknownAccounting)?;
+        let mut decision = VolumeAdmission::new(scan, self.budget)?;
+        loop {
+            let used = self.volume_used_bytes()?;
+            match decision.step(used)? {
+                VolumeStep::Admit(note) => {
+                    self.admission_note = Some(note);
+                    return Ok(());
+                }
+                VolumeStep::Evict => {
+                    if !self.evict_one_idle()? {
+                        return Err(decision.refuse());
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole payload's unique allocated bytes, or `None` for a removable
+    /// payload too large to walk within `VOLUME_WALK_MS` whose only gaps
+    /// are the walk's bounds (cached for this open). Any other gap, and any
+    /// incomplete walk of the internal directory pool, refuses as before.
+    fn payload_check(&mut self) -> Result<Option<u64>, LeaseError> {
+        if self.unwalkable.is_some() {
+            return Ok(None);
+        }
+        if !matches!(self.backing, Payload::Volume { .. }) {
+            return self.payload_accounting().require_complete().map(Some);
+        }
+        let mut limits = self.walk_limits();
+        limits.max_elapsed_ms = limits.max_elapsed_ms.min(VOLUME_WALK_MS);
+        match inventory_sizes_with(self.backing.payload_root(), 2, limits).require_complete() {
+            Ok(used) => Ok(Some(used)),
+            Err(LeaseError::AccountingIncomplete(scan)) => {
+                let admission = VolumeAdmission::new(*scan, self.budget)?;
+                self.unwalkable = Some(admission.scan);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Capacity less available bytes of the bound removable volume.
+    fn volume_used_bytes(&self) -> Result<u64, LeaseError> {
+        let Payload::Volume { binding, .. } = &self.backing else {
+            return Err(LeaseError::UnknownAccounting);
+        };
+        let facts = binding.verify().map_err(|_| LeaseError::BackingMismatch)?;
+        match (facts.capacity_bytes, facts.available_bytes) {
+            (Some(capacity), Some(available)) => Ok(capacity.saturating_sub(available)),
+            _ => Err(LeaseError::UnknownAccounting),
+        }
     }
 
     fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
@@ -1775,6 +1864,81 @@ impl Sizes {
     }
 }
 
+/// A removable payload walk longer than this falls back to the volume's used
+/// bytes: a 127-slot USB pool cannot be walked within the 60 s bound.
+const VOLUME_WALK_MS: u64 = 5_000;
+
+/// The removable-volume admission decision, separated from its effects so
+/// it can be tested without a volume. `new` refuses any scan whose gaps are
+/// not only the elapsed-deadline or entry bounds: an unreadable or missing
+/// entry is never papered over by the volume's used bytes.
+struct VolumeAdmission {
+    scan: AccountingScan,
+    budget: u64,
+    evicted: usize,
+}
+
+enum VolumeStep {
+    Admit(String),
+    Evict,
+}
+
+impl VolumeAdmission {
+    const EVICTION_LIMIT: usize = 8;
+
+    fn new(scan: AccountingScan, budget: u64) -> Result<Self, LeaseError> {
+        let bounds_only = scan.coverage == AccountingCoverage::Partial
+            && !scan.gaps.is_empty()
+            && scan.gaps.iter().all(|gap| {
+                matches!(
+                    gap.kind,
+                    AccountingGapKind::ElapsedDeadline | AccountingGapKind::EntryLimit
+                )
+            });
+        if bounds_only {
+            Ok(Self {
+                scan,
+                budget,
+                evicted: 0,
+            })
+        } else {
+            Err(LeaseError::AccountingIncomplete(Box::new(scan)))
+        }
+    }
+
+    /// One reading of the volume's used bytes: admit under the budget,
+    /// otherwise ask for one more idle eviction until the limit.
+    fn step(&mut self, used: u64) -> Result<VolumeStep, LeaseError> {
+        if used < self.budget {
+            return Ok(VolumeStep::Admit(format!(
+                "pool accounting could not finish ({} entries walked before its bound); admitted by the volume's used bytes ({} of a {} budget){}",
+                self.scan.entries_visited,
+                gigabytes(used),
+                gigabytes(self.budget),
+                if self.evicted > 0 {
+                    format!(" after evicting {} idle slot(s)", self.evicted)
+                } else {
+                    String::new()
+                }
+            )));
+        }
+        if self.evicted >= Self::EVICTION_LIMIT {
+            return Err(self.refuse());
+        }
+        self.evicted += 1;
+        Ok(VolumeStep::Evict)
+    }
+
+    fn refuse(&self) -> LeaseError {
+        LeaseError::AccountingIncomplete(Box::new(self.scan.clone()))
+    }
+}
+
+/// Decimal gigabytes with one place, for admission notes.
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
 /// A record's membership fields, as status and the ledger view show them.
 fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
     LedgerSlot {
@@ -2234,4 +2398,102 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod volume_admission_tests {
+    use super::*;
+
+    fn scan(gaps: &[AccountingGapKind]) -> AccountingScan {
+        AccountingScan {
+            coverage: AccountingCoverage::Partial,
+            gaps: gaps
+                .iter()
+                .map(|kind| AccountingGap {
+                    kind: *kind,
+                    occurrences: 1,
+                })
+                .collect(),
+            vanished: 0,
+            entries_visited: 318_620,
+            elapsed_ms: 60_005,
+            max_entries: 2_000_000,
+            max_depth: 66,
+            max_elapsed_ms: 60_000,
+        }
+    }
+
+    #[test]
+    fn a_deadline_bound_walk_under_budget_admits_with_a_note() {
+        let mut decision =
+            VolumeAdmission::new(scan(&[AccountingGapKind::ElapsedDeadline]), 750_000_000_000)
+                .expect("bounds-only gaps qualify");
+        match decision.step(579_000_000_000).expect("step") {
+            VolumeStep::Admit(note) => {
+                assert!(note.contains("318620 entries"), "{note}");
+                assert!(note.contains("579.0 GB of a 750.0 GB budget"), "{note}");
+                assert!(!note.contains("evicting"), "{note}");
+            }
+            VolumeStep::Evict => panic!("under budget must not evict"),
+        }
+    }
+
+    #[test]
+    fn over_budget_evicts_one_at_a_time_then_admits() {
+        let mut decision =
+            VolumeAdmission::new(scan(&[AccountingGapKind::EntryLimit]), 100).expect("qualifies");
+        assert!(matches!(
+            decision.step(150).expect("step"),
+            VolumeStep::Evict
+        ));
+        assert!(matches!(
+            decision.step(120).expect("step"),
+            VolumeStep::Evict
+        ));
+        match decision.step(90).expect("step") {
+            VolumeStep::Admit(note) => {
+                assert!(note.contains("after evicting 2 idle slot(s)"), "{note}")
+            }
+            VolumeStep::Evict => panic!("under budget after evictions must admit"),
+        }
+    }
+
+    #[test]
+    fn eviction_is_bounded_and_then_refuses_with_the_original_scan() {
+        let mut decision = VolumeAdmission::new(scan(&[AccountingGapKind::ElapsedDeadline]), 100)
+            .expect("qualifies");
+        for _ in 0..VolumeAdmission::EVICTION_LIMIT {
+            assert!(matches!(
+                decision.step(500).expect("step"),
+                VolumeStep::Evict
+            ));
+        }
+        let error = decision.step(500).err().expect("refuses past the limit");
+        assert_eq!(error.reason(), "unknown_accounting");
+        assert!(
+            matches!(error, LeaseError::AccountingIncomplete(ref refused) if refused.entries_visited == 318_620)
+        );
+    }
+
+    #[test]
+    fn unreadable_or_missing_entries_never_fall_back_to_volume_bytes() {
+        for gaps in [
+            vec![AccountingGapKind::UnreadableEntry],
+            vec![
+                AccountingGapKind::ElapsedDeadline,
+                AccountingGapKind::MissingMetadata,
+            ],
+            vec![AccountingGapKind::RootMissing],
+            vec![AccountingGapKind::DepthLimit],
+            vec![],
+        ] {
+            let error = VolumeAdmission::new(scan(&gaps), 100)
+                .err()
+                .expect("refused");
+            assert_eq!(error.reason(), "unknown_accounting", "{gaps:?}");
+        }
+        let mut complete = scan(&[AccountingGapKind::ElapsedDeadline]);
+        complete.coverage = AccountingCoverage::Unknown;
+        assert!(VolumeAdmission::new(complete, 100).is_err());
+    }
 }

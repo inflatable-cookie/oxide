@@ -532,6 +532,13 @@ pub struct Lease {
     pub slot_id: String,
     pub reused: bool,
     pub build_dir: PathBuf,
+    /// The pool's recorded store identity and this slot's incarnation: the
+    /// durable binding of anything the command owns inside the slot.
+    pub store_id: String,
+    pub incarnation: String,
+    /// The command's owned child temporary directory (oxide#136), removed at
+    /// release after positive writer closure.
+    pub scratch: Option<crate::child_temp::Owned>,
     /// The slot's history for the freshness gate.
     pub prior: Prior,
     /// Checkout whose idle slot this command took; restored if the gate
@@ -550,6 +557,11 @@ impl Lease {
     /// every other command in the same checkout.
     pub fn record_id(&self) -> u64 {
         self.record
+    }
+
+    /// The library's lease identity, recorded in its ledger for this grant.
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
     }
 }
 
@@ -1623,7 +1635,7 @@ impl Store {
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission = self.admission()?;
-        if !self.flush_before_idle(&held.slot_id, held.record)? {
+        if !self.discard_scratch(&held) || !self.flush_before_idle(&held.slot_id, held.record)? {
             return Ok(());
         }
         release(&self.pool, &held.lease_id)
@@ -1645,7 +1657,7 @@ impl Store {
     /// release it and give it back, origin unchanged.
     pub fn unshare(&self, held: Lease) -> Result<(), String> {
         let _admission = self.admission()?;
-        if !self.flush_before_idle(&held.slot_id, held.record)? {
+        if !self.discard_scratch(&held) || !self.flush_before_idle(&held.slot_id, held.record)? {
             return Ok(());
         }
         release(&self.pool, &held.lease_id)
@@ -1662,6 +1674,31 @@ impl Store {
             self.write_origin(held.record, state.records[index].last_used, origin)?;
         }
         self.save(&state)
+    }
+
+    /// Remove the command's owned child temporary directory (oxide#136)
+    /// before the slot can go idle. The caller has already seen its own
+    /// process group empty; a failure is reported and never fails an
+    /// otherwise successful command, and the slot's own accounting and
+    /// deletion are unchanged, so a kept leftover is never counted twice.
+    /// `false` means the owned directory could not be removed (another
+    /// incarnation's, a foreign entry, an unreadable tree): the slot is not
+    /// marked idle then, exactly as for an unconfirmed group closure, and a
+    /// later command recovers it once its closure and ownership rules pass.
+    fn discard_scratch(&self, held: &Lease) -> bool {
+        let Some(scratch) = held.scratch.as_ref() else {
+            return true;
+        };
+        match crate::child_temp::discard(scratch) {
+            Ok(()) => true,
+            Err(reason) => {
+                eprintln!(
+                    "oxide: {reason}; slot {} stays held, and a later oxide command recovers it once its closure and ownership rules pass",
+                    held.slot_id
+                );
+                false
+            }
+        }
     }
 
     /// A removable-volume slot is flushed to the device before it can go
@@ -3018,7 +3055,12 @@ impl Store {
             .position(|entry| entry.id == record)
             .ok_or("Oxide slot record disappeared")?;
         let (grant, measured) = match outcome {
-            Ok(leased) => (leased.grant, leased.measured),
+            Ok(leased) => {
+                if let Some(note) = &leased.admission_note {
+                    eprintln!("oxide: warning: {note}");
+                }
+                (leased.grant, leased.measured)
+            }
             Err(error) => {
                 state.settle_idle(index);
                 if shared_from.is_some() {
@@ -3064,6 +3106,9 @@ impl Store {
             slot_id: grant.slot_id,
             reused: grant.reused_slot,
             build_dir: grant.env.cargo_build_build_dir,
+            store_id: grant.store_id,
+            incarnation: grant.incarnation,
+            scratch: None,
             prior,
             shared_from,
             measured,
@@ -4951,6 +4996,102 @@ mod tests {
         for lease in held {
             drop(lease);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A run program that uses an owned temporary directory is still that
+    /// directory's writer. The lease is the fence: while the holder's group
+    /// is alive a competing command takes another slot and never reconciles
+    /// the live directory, and only the holder's own release — which the
+    /// product performs after positive group closure — removes it.
+    #[test]
+    fn a_live_program_keeps_its_owned_temporary_directory_from_a_competing_lease() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-live-scratch-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let pool = fs::canonicalize(&root).unwrap().join("pool");
+        init_budget_pool(&pool, 1 << 30).unwrap();
+        let store = Store {
+            control: pool.join(MANAGED_NAME),
+            payload: pool.join("payload"),
+            pool: pool.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: Some(1 << 30),
+            recorded_budget: 1 << 30,
+            max_active: 16,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        let checkout = fs::canonicalize(&root).unwrap().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "identity".to_owned(),
+            compatibility: "quick-key".to_owned(),
+        };
+        let mut live = lease(&store, &key, Some("exec run program")).expect("the run leased");
+        let store_id = store.ledger().unwrap().store_id.clone();
+        let slot_dir = live.build_dir.parent().expect("slot dir").to_path_buf();
+        let scratch = crate::child_temp::choose_with(
+            None,
+            &store.payload,
+            &slot_dir,
+            crate::child_temp::Identity {
+                store_id,
+                slot_id: live.slot_id.clone(),
+                incarnation: live.incarnation.clone(),
+                lease_id: live.lease_id().to_owned(),
+            },
+            4096,
+        )
+        .expect("the run's owned directory");
+        let owned = scratch.owned().expect("owned directory");
+        assert!(owned.path().is_dir());
+        fs::write(owned.path().join("program-marker"), b"live writer").unwrap();
+        live.scratch = Some(owned.clone());
+        // The program's own group is alive for the whole competing attempt.
+        // SAFETY: getpgrp has no preconditions.
+        let group = unsafe { libc::getpgrp() };
+        store.mark_spawning(&live).unwrap();
+        store.mark_running(&live, group).unwrap();
+
+        // A competing command in the same checkout takes another slot and
+        // leaves the live directory alone: it never reconciles, deletes or
+        // re-creates it.
+        let competing = lease(&store, &key, None).expect("a competing command leased");
+        assert_ne!(competing.slot_id, live.slot_id);
+        assert!(
+            owned.path().is_dir(),
+            "a competing lease removed the live program's directory"
+        );
+        assert_eq!(
+            fs::read(owned.path().join("program-marker")).unwrap(),
+            b"live writer"
+        );
+        // The held slot is not evictable by the project cap either.
+        let view = store.ledger().unwrap();
+        let held = view
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == live.slot_id)
+            .expect("the live slot is a ledger member");
+        assert_eq!(held.state, SlotOccupancy::Held);
+        store.release(competing, None).unwrap();
+        assert!(owned.path().is_dir(), "releasing another slot touched it");
+
+        // Only this holder's release removes it, which the product performs
+        // after its own group is observed empty.
+        store.release(live, None).unwrap();
+        assert!(
+            !owned.path().exists(),
+            "the released holder kept its owned directory"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

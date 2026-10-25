@@ -429,6 +429,10 @@ pub struct ReuseMeasurement {
 pub struct Leased {
     pub grant: LeaseGrant,
     pub measured: Option<ReuseMeasurement>,
+    /// Set when a new slot on a removable volume was admitted by the
+    /// volume's own used bytes because the whole-payload walk could not
+    /// finish within its bounds; the caller shows it as a warning.
+    pub admission_note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

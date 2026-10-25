@@ -10,6 +10,7 @@ mod adopt;
 mod budget;
 mod capacity;
 mod cargo_home;
+mod child_temp;
 mod clean;
 mod cli;
 mod config;
@@ -37,6 +38,7 @@ use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -499,7 +501,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let mut waits = store::WaitAccounting::default();
     let resolution = cli::resolution(&invocation.cargo_args);
     let label = exec_label(&invocation.tool);
-    let (held, gate) = match lease_with_gate(
+    let (mut held, gate) = match lease_with_gate(
         &store,
         &key,
         invocation.profile,
@@ -586,6 +588,41 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         &key.checkout,
         invocation.profile,
     );
+    // Where this command's children put temporary files (oxide#136): an
+    // inherited `TMPDIR` that is a writable directory on the selected pool's
+    // own device is kept for every child; otherwise the command gets one
+    // Oxide-owned directory inside the held slot. The choice is made before
+    // any writer starts and published through the shared child environment.
+    // The slot directory is the build directory's parent; a command whose
+    // children can be given neither a qualified inherited directory nor an
+    // owned one refuses here, before any writer starts, instead of leaving
+    // them on the machine default this decision rejected.
+    let chosen_temp = match held.build_dir.parent() {
+        Some(slot_dir) => child_temp::choose(
+            std::env::var_os("TMPDIR"),
+            &store.payload,
+            slot_dir,
+            child_temp::Identity {
+                store_id: held.store_id.clone(),
+                slot_id: held.slot_id.clone(),
+                incarnation: held.incarnation.clone(),
+                lease_id: held.lease_id().to_owned(),
+            },
+        ),
+        None => Err("the held slot path has no directory".to_owned()),
+    };
+    let chosen_temp = match chosen_temp {
+        Ok(chosen) => chosen,
+        Err(reason) => {
+            let origin = held.prior.unchanged();
+            store.release(held, origin)?;
+            return Err(reason);
+        }
+    };
+    chosen_temp.apply(&mut cargo);
+    // The owned directory is a lease property: release removes it after
+    // positive writer closure, and a crash keeps it with the held slot.
+    held.scratch = chosen_temp.owned();
     if run {
         cargo.stdout(Stdio::piped());
     }
@@ -724,6 +761,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+    notes.push(chosen_temp.note());
     if selection_mode == Some(removable::DriveMode::Permanent) {
         if let Some(reason) = fallback_reason.as_deref() {
             notes.push(format!(
@@ -787,6 +825,47 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             &invocation.program_args,
             execution_started,
             &mut budget_stop,
+            &chosen_temp,
+        );
+    }
+    // An unconverted `run` program is an Oxide-launched child too, and when
+    // this command owns a temporary directory the program is still its
+    // writer. The lease is the only fence that keeps a competing lease or
+    // whole-slot eviction from reconciling that directory, so such a program
+    // runs under the same custody as a converted checkout's program
+    // (`run_owned_program`): its own group, the record naming it, forwarded
+    // signals, and release — which removes the owned directory — only after
+    // the group is observed empty. A program with no owned directory to
+    // protect keeps the plain release-then-exec path.
+    let fenced_program = match (&outcome, chosen_temp.owned()) {
+        (Ok((Some(status), Some(Ok((program, manifest_dir))), _drained)), Some(_))
+            if run && status.success() && stopped.is_none() =>
+        {
+            Some((program.clone(), manifest_dir.clone()))
+        }
+        _ => None,
+    };
+    if let Some((program, manifest_dir)) = fenced_program {
+        print_summary(
+            &store,
+            &invocation,
+            &slot,
+            warm,
+            measured.as_ref(),
+            started,
+            note.as_deref(),
+            &waits,
+        );
+        return run_owned_program(
+            &store,
+            held,
+            origin,
+            &program,
+            &manifest_dir,
+            &invocation.program_args,
+            execution_started,
+            &mut budget_stop,
+            &chosen_temp,
         );
     }
     store.release(held, origin)?;
@@ -864,11 +943,15 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
-            // Lease released: the program runs from the private target dir.
-            let error = Command::new(&program)
+            // Lease released and this command owns no temporary directory,
+            // so the program runs from the private target dir with the kept
+            // inherited directory.
+            let mut command = Command::new(&program);
+            command
                 .args(&invocation.program_args)
-                .env("CARGO_MANIFEST_DIR", manifest_dir)
-                .exec();
+                .env("CARGO_MANIFEST_DIR", manifest_dir);
+            chosen_temp.apply(&mut command);
+            let error = command.exec();
             Err(format!("could not execute {}: {error}", program.display()))
         }
         Err(message) => {
@@ -894,9 +977,11 @@ fn run_owned_program(
     args: &[OsString],
     execution_started: Option<Instant>,
     budget_stop: &mut process::Stop,
+    child_temp: &child_temp::Chosen,
 ) -> Result<u8, String> {
     let mut command = Command::new(program);
     command.args(args).env("CARGO_MANIFEST_DIR", manifest_dir);
+    child_temp.apply(&mut command);
     if let Err(error) = store.mark_spawning(&held) {
         store.release(held, origin)?;
         return Err(error);
@@ -1395,6 +1480,10 @@ fn print_pools(
         uses.push(("removable", removable_use));
     }
     println!("{}", recent_use_line(&uses, process::now_ms()));
+    println!(
+        "{}",
+        temp_line(internal, removable.as_ref(), reason, measured)
+    );
 
     for section in sections(removable.as_ref(), reason, measured) {
         match section {
@@ -1530,10 +1619,36 @@ fn selection_line(
     }
 }
 
+/// The child temporary-directory fact for `status` (oxide#136). Recorded
+/// status never opens the selected volume, so it states the rule without
+/// pretending to know the answer; a measured status verifies the selected
+/// pool exactly as a build would and names the choice a leased command there
+/// would make. Nothing here creates, reads or removes a temporary directory.
+fn temp_line(
+    internal: &Store,
+    removable: Option<&removable::RemovableStatus>,
+    reason: Option<&str>,
+    measured: bool,
+) -> String {
+    if !measured {
+        return "temp: chosen per leased command (an inherited TMPDIR only on the selected pool's volume, else owned per-command scratch in the slot); --measure names it".to_owned();
+    }
+    let selected = match removable {
+        Some(status) if reason.is_none() => status.recorded.as_ref().ok(),
+        _ => None,
+    };
+    let store = selected.unwrap_or(internal);
+    match std::fs::metadata(&store.payload) {
+        Ok(meta) => child_temp::describe(std::env::var_os("TMPDIR").as_deref(), meta.dev()),
+        Err(error) => format!(
+            "temp: unknown (cannot read {}: {error})",
+            store.payload.display()
+        ),
+    }
+}
+
 /// The most recently used slot across pools, from each pool's recorded
 /// latest use. Pools are listed in display order; equal times name the
-/// first and say so. An unreadable pool or a use with no recorded time
-/// makes the cross-pool answer unknown rather than guessed.
 fn recent_use_line(uses: &[(&str, Result<Option<store::LastUse>, String>)], now_ms: u64) -> String {
     let describe = |pool: &str, last: &store::LastUse| {
         let slot = last

@@ -271,6 +271,21 @@ entry ownership are verified. The target is never followed or removed.
 Deletion never touches project or workspace paths. A lost delete is
 reconciled only for the recorded evicting slot path.
 
+**A command's child temporary directory is inside its slot (oxide#136).**
+`<slot>/scratch` is an ordinary owned entry of the slot tree, so the same
+unique-allocated `(device, inode)` union counts it once with the rest of the
+slot, its capacity walk covers it, and whole-slot eviction, crash recovery
+and lost-volume retirement remove or keep it with the slot they already own.
+Its own ownership marker (pool store identity, slot, incarnation) says whose
+directory it is; it is never a closure proof. The one earlier removal is at
+release, after positive writer closure — and a `run` program that uses an
+owned directory keeps the lease until its own group is empty precisely so
+that no competing lease can reconcile it while it writes. An entry the marker
+does not claim is kept and reported, never deleted, and a removal that cannot
+be completed keeps the slot held rather than marking it idle. An inherited
+`TMPDIR` is outside Oxide's ownership entirely: it is neither accounted as
+the pool's nor removed.
+
 **Accounting walks (oxide#108).** Every pool accounting walk uses the same
 pool-specific bounds: 2,000,000 entries, depth 64 below the walked root and a
 60 s cooperative deadline. The whole-payload walk starts at the payload root,
@@ -285,6 +300,24 @@ defaults, which are unchanged. The callers:
 | The whole-payload walk before a new slot, and again after eviction | Must be complete, or the lease refuses |
 | The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
+
+**Removable-volume fallback (2026-10-25 hotfix, Tom's ruling).** A
+removable `apfs-volume-v1` payload walks for at most 5 s before a new slot
+or a count replacement (`VOLUME_WALK_MS`). If that walk is incomplete and
+its only gaps are `elapsed_deadline` or `entry_limit`, the open caches that
+result. Admission then uses the volume's own used bytes (capacity less
+available, from the verified binding), which include everything else on the
+volume and so never undercount. Under the budget it admits and the command
+prints one warning naming the entries walked and the used and budget bytes.
+Over the budget it evicts least-recently-used idle whole slots one at a
+time, re-reading the volume after each, at most 8 times, then refuses with
+the original scan. Count replacements (the per-project and pool slot caps)
+proceed on the same bound-only result. Any other gap (unreadable, missing
+or unusable metadata, mount boundary, depth limit, root problems) still
+refuses, and the internal `directory-budget-v1` pool keeps every gate in
+the table above unchanged. Reason: a 127-slot USB pool could not be walked
+within 60 s, so every new-slot admission refused. Faster recorded
+accounting is the planned replacement.
 
 **How one walk reads (oxide#141).** The walk itself is unchanged in scope,
 bounds, policy and refusal classes. Each enumerated regular file or directory
@@ -549,7 +582,48 @@ are unit tests in `effigy test rust`. Not covered natively: the nine-grant
 freshness bound is a bounded-loop inspection, and no large live inventory or
 physical multi-million-entry performance is claimed.
 
-### Parked: cached closed-slot accounting (lead `cbb2824d`)
+### Recorded per-slot accounting (approved, not implemented)
+
+Tom's 2026-10-25 ruling, "We need a much faster way to do the accounting
+too" (Queue decision `8c6b8319-b20e-4a78-b987-c09dee69886c`), approves a
+different policy from the exact-cache proposal below. The removable-volume
+hotfix remains the implemented admission path until its reviewed replacement.
+
+At release after writer closure, record unique allocated bytes by walking
+only that slot, bounded, with the record bound to its generation/incarnation.
+Admission and eviction use the sum of current slot records and walk only
+slots without a current record. A missing, crashed or legacy record grants no
+size estimate; an incomplete required walk keeps the existing refusal rules.
+Held/writer transitions invalidate closed records. Publication, flush,
+recovery, version fencing and crash ordering require an independently
+reviewed detailed design before implementation.
+
+Cross-slot hard links may be counted more than once; that conservative
+overcount is accepted. This is not the old exact inode-union cache. A closed
+record is trusted until its generation changes or a held/crashed transition
+invalidates it: later changes inside an otherwise recorded idle slot need not
+be detected at each admission. That deliberate trust relaxation must remain
+explicit; a record does not prove immutable bytes or writer closure.
+Unrecorded slots still enforce ownership, unreadable-entry, foreign-entry and
+symlink refusals. Whole-slot eviction remains limited to positively owned
+idle slots, never active or uncertain writers or retained evidence.
+
+Removable pools also bound admission by verified volume used bytes. The
+internal directory pool uses the recorded sum. Default status reports
+recorded totals with their provenance; `status --measure` keeps the full walk
+as an audit. The implementation must justify removing the hotfix's 5 s
+fallback or retaining it only for legacy pools.
+
+Acceptance requires O(slots) admission with no inventory walks when all
+records are current, fixture comparisons where the sum is at least the
+full-walk union, crash/legacy migration and bounded unknown handling. The
+focused proof uses tiny fixtures and debug-only controls, with a premise
+sweep or safe diagnostic before a counted run. Changes decide deletion under
+byte pressure, so validation is elevated; author and independent reviewer
+native sessions remain separately activated. No live-pool migration,
+cleanup, installation or consumer change follows from this design approval.
+
+### Historical parked exact cache (lead `cbb2824d`)
 
 Parked on 2026-10-21, not implemented. Sol's re-review of revision 2 (`d578447`) was again changes required. Transient hard-link mutation means an idle slot's contents and link topology cannot be shown to be unchanged cheaply, and out-of-lock walks need snapshot and conditional-commit rules. An exact cache therefore needs an immutability mechanism or an explicit policy relaxation. The per-command cost is addressed first by removing the front door's non-authoritative whole-payload walks, a separate correction. Both review verdicts are kept on the lead. Revision 2 text follows for reference. Revision 2 answers Sol's prospective review of `5852670` (changes required: shared-inode mutation, metadata outside slots, transition rules). Revision 2 drops revision 1's held baselines and overcounting sums.
 
