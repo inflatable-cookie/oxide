@@ -793,13 +793,24 @@ impl Receipt {
             }
         }
         let consistent = match self.state {
+            // A whole-target receipt names its one committed link. A profile
+            // receipt places each member independently: a member with no
+            // selection is a real local directory, or one left unselected by
+            // a detach that a later adoption converts again, so only the
+            // receipt as a whole must still select one place.
             ReceiptState::Committed => {
                 prepared.is_none()
                     && !self.links.is_empty()
-                    && self
-                        .links
-                        .iter()
-                        .all(|placement| placement.selected.is_some())
+                    && match self.layout {
+                        LayoutKind::Profile => self
+                            .links
+                            .iter()
+                            .any(|placement| placement.selected.is_some()),
+                        LayoutKind::WholeTarget => self
+                            .links
+                            .iter()
+                            .all(|placement| placement.selected.is_some()),
+                    }
             }
             ReceiptState::Detached => {
                 prepared.is_none()
@@ -820,10 +831,15 @@ impl Receipt {
                             .all(|placement| placement.prepared.is_none())
                 }
                 None => {
+                    // The write-ahead transition names exactly one placement;
+                    // a profile receipt's other members may be unselected
+                    // (detached, awaiting their own re-adoption) without
+                    // contradicting the pending transition.
                     prepared.is_some()
-                        && self.links.iter().all(|placement| {
-                            placement.selected.is_some() || placement.prepared.is_some()
-                        })
+                        && (self.layout == LayoutKind::Profile
+                            || self.links.iter().all(|placement| {
+                                placement.selected.is_some() || placement.prepared.is_some()
+                            }))
                 }
             },
         };
@@ -5180,8 +5196,10 @@ fn link_state(link: &Path, checkout: &Path, checkout_id: &str) -> Result<TargetS
         }
         // A profile member link selects a distinct subpath beneath the owned
         // root, whose marker lives at the root itself. Ownership is decided by
-        // that root marker, never by following an arbitrary ancestor.
-        if let Some(member_root) = member_root_for_target(&root) {
+        // that root marker, never by following an arbitrary ancestor, and the
+        // destination's own shape (`<profile>` or `<triple>/<profile>`) is only
+        // a candidate list: it grants nothing without the marker.
+        for member_root in member_root_candidates(&root) {
             if owned_root(checkout, checkout_id, &member_root).is_ok() {
                 // The root is ours; the member destination is only an owned
                 // link while it actually exists.
@@ -5210,28 +5228,36 @@ fn link_state(link: &Path, checkout: &Path, checkout_id: &str) -> Result<TargetS
     })
 }
 
-/// The owned root a member destination belongs to: strip a valid v1 member
-/// suffix (`debug`, `release`, `<triple>/debug`, `<triple>/release`) and return
-/// the candidate root. Ownership is still proven by the marker at that root.
-fn member_root_for_target(target: &Path) -> Option<PathBuf> {
-    let name = target.file_name()?.to_str()?;
+/// The candidate owned roots one member destination can belong to: strip a
+/// valid v1 member suffix and return every root that shape could name, most
+/// specific first. A plain `<root>/<profile>` destination names its parent; a
+/// `<root>/<triple>/<profile>` destination names its grandparent, whose child
+/// directory is the triple. Both are only candidates — ownership is decided by
+/// the marker at the root, and a wrong root simply fails that check.
+fn member_root_candidates(target: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return roots;
+    };
     if name != "debug" && name != "release" {
-        return None;
+        return roots;
     }
-    let parent = target.parent()?;
-    // <root>/<profile>
-    if let Ok(member) = crate::layout::Member::parse(name) {
-        if member.name() == name {
-            return Some(parent.to_path_buf());
+    let Some(parent) = target.parent() else {
+        return roots;
+    };
+    // <root>/<triple>/<profile>, then <root>/<profile>. The triple form is
+    // tried first so a nested link is reported against the root that really
+    // owns it when a checkout's root is itself named like a member component.
+    if let (Some(triple), Some(grandparent)) = (
+        parent.file_name().and_then(|triple| triple.to_str()),
+        parent.parent(),
+    ) {
+        if crate::layout::Member::parse(&format!("{triple}/{name}")).is_ok() {
+            roots.push(grandparent.to_path_buf());
         }
     }
-    // <root>/<triple>/<profile>
-    let triple = parent.file_name()?.to_str()?;
-    let grandparent = parent.parent()?;
-    let member = format!("{triple}/{name}");
-    crate::layout::Member::parse(&member)
-        .ok()
-        .map(|_| grandparent.to_path_buf())
+    roots.push(parent.to_path_buf());
+    roots
 }
 
 /// A root is owned by this checkout when it is a real directory carrying this
@@ -7455,6 +7481,39 @@ mod tests {
         receipt
     }
 
+    /// A profile receipt places members independently: a detach leaves every
+    /// member unselected, and the per-member transitions that re-adopt them
+    /// must be able to write a receipt where one member is committed while the
+    /// others are still unselected. The whole-target receipt keeps the strict
+    /// rule, and no profile receipt may select nothing at all.
+    #[test]
+    fn profile_receipts_place_members_independently_but_always_select_one() {
+        let fixture = Fixture::new();
+        let id = identity::digest(&fixture.checkout.to_string_lossy());
+        let mut profile = profile_receipt(&fixture);
+        profile.place_member("release").selected = None;
+        profile
+            .validate(&fixture.checkout, &id)
+            .expect("a profile receipt with one unselected member is coherent");
+        let mut unselected = profile.clone();
+        unselected.place_member("debug").selected = None;
+        assert!(
+            unselected.validate(&fixture.checkout, &id).is_err(),
+            "a profile receipt that selects nothing was accepted"
+        );
+        // A whole-target receipt still requires its one placement selected.
+        let mut whole = fixture.receipt();
+        whole.state = ReceiptState::Committed;
+        whole.generation = 1;
+        whole.link_mut().selected = Some(fixture.local().selected(1));
+        whole.validate(&fixture.checkout, &id).unwrap();
+        whole.link_mut().selected = None;
+        assert!(
+            whole.validate(&fixture.checkout, &id).is_err(),
+            "a whole-target receipt with no selection was accepted"
+        );
+    }
+
     #[test]
     fn profile_destinations_separate_linked_and_real_members() {
         let fixture = Fixture::new();
@@ -8329,6 +8388,230 @@ mod tests {
             link_state(&other, &fixture.checkout, &context.checkout_id).unwrap(),
             TargetState::Foreign
         );
+    }
+
+    /// The exact accepted-proof counterexample (oxide#133 case 15): after a
+    /// `--target <host triple>` build, `target/<triple>/debug` selects
+    /// `R/<triple>/debug` and must be classified as owned through the marker at
+    /// `R`, never as foreign.
+    #[test]
+    fn a_host_triple_member_link_is_owned_through_the_marker_at_its_root() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        for member in [
+            "debug",
+            "release",
+            "aarch64-apple-darwin/debug",
+            "aarch64-apple-darwin/release",
+            "x86_64-unknown-linux-gnu/debug",
+        ] {
+            let destination = member_destination(spec.root(), member);
+            fs::create_dir_all(&destination).unwrap();
+            let link = fixture.checkout.join("target").join(member);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(&destination, &link).unwrap();
+            assert_eq!(
+                link_state(&link, &fixture.checkout, &context.checkout_id).unwrap(),
+                TargetState::OwnedLink(destination),
+                "{member}"
+            );
+        }
+        // The same shape under a root that carries no marker stays foreign: the
+        // member suffix is a candidate, never a grant.
+        let unmarked = fixture.root.join("unmarked");
+        fs::create_dir_all(unmarked.join("aarch64-apple-darwin/debug")).unwrap();
+        let unmarked_link = fixture.checkout.join("target/aarch64-apple-darwin/release");
+        let _ = fs::remove_file(&unmarked_link);
+        symlink(unmarked.join("aarch64-apple-darwin/debug"), &unmarked_link).unwrap();
+        assert_eq!(
+            link_state(&unmarked_link, &fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Foreign
+        );
+        // A root of another checkout's marker is equally not this checkout's.
+        let other = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let other_context = other.context();
+        let other_spec = other.local();
+        ensure_root(&other_context, &other_spec, 1).unwrap();
+        fs::create_dir_all(other_spec.root().join("aarch64-apple-darwin/release")).unwrap();
+        let foreign_link = fixture
+            .checkout
+            .join("target/x86_64-unknown-linux-gnu/release");
+        fs::create_dir_all(foreign_link.parent().unwrap()).unwrap();
+        symlink(
+            other_spec.root().join("aarch64-apple-darwin/release"),
+            &foreign_link,
+        )
+        .unwrap();
+        assert_eq!(
+            link_state(&foreign_link, &fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Foreign
+        );
+        // A root whose marker exists but whose member destination does not is
+        // dangling, not owned: detach must not act on it.
+        let dangling = fixture
+            .checkout
+            .join("target/aarch64-unknown-linux-gnu/debug");
+        fs::create_dir_all(dangling.parent().unwrap()).unwrap();
+        symlink(
+            member_destination(spec.root(), "aarch64-unknown-linux-gnu/debug"),
+            &dangling,
+        )
+        .unwrap();
+        assert_eq!(
+            link_state(&dangling, &fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Dangling(member_destination(
+                spec.root(),
+                "aarch64-unknown-linux-gnu/debug"
+            ))
+        );
+    }
+
+    /// A committed profile receipt that places the host-triple member beside
+    /// `debug` and `release`, with every link live and the root marked.
+    fn host_triple_profile(fixture: &Fixture) -> (Context, Receipt, PathBuf) {
+        let context = fixture.context();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let selected = spec.selected(1);
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        for member in ["debug", "release", "aarch64-apple-darwin/debug"] {
+            receipt.place_member(member).selected = Some(selected.clone());
+            let destination = member_destination(spec.root(), member);
+            fs::create_dir_all(&destination).unwrap();
+            let link = fixture.checkout.join("target").join(member);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(&destination, &link).unwrap();
+        }
+        write_receipt(&fixture.control, &receipt).unwrap();
+        (context, receipt, spec.root().to_path_buf())
+    }
+
+    /// Detach recognises the host-triple and the plain members, converts each
+    /// owned link to a real empty directory, and keeps the root, its marker and
+    /// its payload byte for byte. Re-adoption restores every placement.
+    #[test]
+    fn detach_recognizes_host_triple_member_links_and_preserves_every_root_byte() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let (context, receipt, root) = host_triple_profile(&fixture);
+        let marker = fs::read(root.join(MARKER)).unwrap();
+        fs::write(root.join("debug/profileapp"), b"payload").unwrap();
+        fs::write(
+            root.join("aarch64-apple-darwin/debug/profileapp"),
+            b"payload",
+        )
+        .unwrap();
+        let root_metadata = fs::symlink_metadata(&root).unwrap();
+        let (detached, changed) = detach_profile(&context, &fixture.control, receipt).unwrap();
+        assert!(changed);
+        assert_eq!(detached.state, ReceiptState::Detached);
+        for member in ["debug", "release", "aarch64-apple-darwin/debug"] {
+            let link = fixture.checkout.join("target").join(member);
+            let metadata = fs::symlink_metadata(&link).unwrap();
+            assert!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "{member} is not a real directory after detach"
+            );
+            assert!(
+                fs::read_dir(&link).unwrap().next().is_none(),
+                "{member} is not empty after detach"
+            );
+            // The placement survives the detach as authority for re-adoption.
+            assert!(
+                detached
+                    .placement(member)
+                    .is_some_and(|placement| placement.selected.is_none()),
+                "{member} lost its placement"
+            );
+        }
+        assert!(fs::symlink_metadata(context.link()).unwrap().is_dir());
+        // No root, marker or payload byte moved.
+        assert_eq!(fs::read(root.join(MARKER)).unwrap(), marker);
+        assert_eq!(fs::read(root.join("debug/profileapp")).unwrap(), b"payload");
+        assert_eq!(
+            fs::read(root.join("aarch64-apple-darwin/debug/profileapp")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&root).unwrap().ino(),
+            root_metadata.ino()
+        );
+        // Re-adoption converts every recorded placement again, the triple one
+        // included, and the triple link selects its own destination.
+        let (readopted, _, converted) = adopt_profile(&context, detached).unwrap();
+        assert!(converted);
+        assert_eq!(readopted.state, ReceiptState::Committed);
+        for member in ["debug", "release", "aarch64-apple-darwin/debug"] {
+            let link = fixture.checkout.join("target").join(member);
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
+        }
+    }
+
+    /// Every failure mode around a host-triple member refuses with no mutation:
+    /// a wrong destination, an unmarked referent, a dangling destination and a
+    /// relative (malformed) link each leave the link, the receipt and the other
+    /// members exactly as they were.
+    #[test]
+    fn detach_refuses_unowned_host_triple_links_without_mutating_anything() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let (context, receipt, root) = host_triple_profile(&fixture);
+        let triple_link = fixture.checkout.join("target/aarch64-apple-darwin/debug");
+        let receipt_before =
+            fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap();
+        let check_untouched = |label: &str, link: &Path, text: &Path| {
+            let error = detach_profile(&context, &fixture.control, receipt.clone())
+                .expect_err(&format!("{label}: detach accepted an unowned member"));
+            assert!(
+                error.contains("target/aarch64-apple-darwin/debug"),
+                "{label}: the refusal did not name the member: {error}"
+            );
+            assert_eq!(fs::read_link(link).unwrap(), text, "{label}");
+            assert_eq!(
+                fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap(),
+                receipt_before,
+                "{label}: the refusal rewrote the receipt"
+            );
+            for member in ["debug", "release"] {
+                let path = fixture.checkout.join("target").join(member);
+                assert_eq!(
+                    fs::read_link(&path).unwrap(),
+                    member_destination(&root, member),
+                    "{label}: {member} was changed"
+                );
+            }
+        };
+        // A wrong destination: the link names `R/debug` while the placement
+        // promises `R/<triple>/debug`.
+        fs::remove_file(&triple_link).unwrap();
+        let wrong = member_destination(&root, "debug");
+        symlink(&wrong, &triple_link).unwrap();
+        check_untouched("wrong destination", &triple_link, &wrong);
+        // An unmarked referent of the right shape.
+        fs::remove_file(&triple_link).unwrap();
+        let unmarked = root.join("unmarked/aarch64-apple-darwin/debug");
+        fs::create_dir_all(&unmarked).unwrap();
+        symlink(&unmarked, &triple_link).unwrap();
+        check_untouched("unmarked referent", &triple_link, &unmarked);
+        // A destination that does not exist although the root is ours.
+        fs::remove_file(&triple_link).unwrap();
+        let vanished = member_destination(&root, "aarch64-apple-darwin/release");
+        symlink(&vanished, &triple_link).unwrap();
+        check_untouched("dangling destination", &triple_link, &vanished);
+        // A relative, malformed link text is never treated as owned.
+        fs::remove_file(&triple_link).unwrap();
+        let relative = PathBuf::from("../../.oxide-outputs/local/aarch64-apple-darwin/debug");
+        symlink(&relative, &triple_link).unwrap();
+        check_untouched("relative link", &triple_link, &relative);
     }
 
     #[test]

@@ -38,9 +38,17 @@ oracle. The fixture `.gitignore` uses `/target` (valid for a whole-target link
 and as a member parent rule) and a separate `/target/` parent-ignore control
 proves a directory-only rule refuses the legacy link but accepts profile member
 links. The top-level preservation control lives on its own checkout so the
-cleaned checkout carries no foreign entry. The selected-clean reserve stop uses
-a positively created directory-budget pool and a gated delegating fake cargo;
-the removable watchdog is removal-only and is never claimed as a reserve stop.
+cleaned checkout carries no foreign entry. The selected-clean reserve stop runs
+on the internal directory-budget store while the pool's OWN recorded permanent
+registration still grants drive mode: the existing low-reserve pattern raises
+that recorded reserve above the image's free space, so selection falls back to
+the directory-budget store (reserve watchdog) and a dedicated seeded checkout
+with its own receipt, links and root is cleaned under a gated delegating fake
+cargo. A second registration on the same image is impossible by production rule
+(a sub-directory is not a mount point, the shared payload is not empty, and
+`pool set-mode` refuses an absent registration), so no auxiliary pool, second
+image or hand-written registration is created; the removable watchdog is
+removal-only and is never claimed as a reserve stop.
 A SEPARATE deliberate low-reserve control temporarily raises this
 private pool's recorded registration reserve to 200 MiB (above the image's free
 space), asserts the honest checkout-local fallback and its warning, then
@@ -259,7 +267,7 @@ def plan_only() -> int:
     print("  time estimate   two sequential 6-job stagings ~45-80 s each, 25 s setup,")
     print("                  150-240 s cases (base control, p0/parent races, unknown")
     print("                  custody, prune oracles), plus the controls added in this phase:")
-    print("                  a seeded directory-budget adopt+build for the watched clean,")
+    print("                  a seeded directory-budget fallback adopt+build for the watched clean,")
     print("                  three extra fixture builds/adopts (mixed run, second eligible")
     print("                  gone root, cleared-target parent-ignore), settled-background")
     print("                  waits and additional dry runs (~60-90 s), 30 s cleanup")
@@ -299,8 +307,9 @@ def plan_only() -> int:
     print("                  rows (SYNTHETIC INJECTED AUTHORITY, not a bind-produced")
     print("                  receipt) keeps that root; a second, distinct eligible gone")
     print("                  root is a candidate in the SAME preview")
-    print("  clean           the reserve stop uses a positively created directory-budget")
-    print("                  pool with a gated delegating fake cargo; the removable")
+    print("  clean           the reserve stop runs on the internal directory-budget store")
+    print("                  under the pool's own permanent registration (low-reserve")
+    print("                  fallback) with a gated delegating fake cargo; the removable")
     print("                  watchdog is removal-only and is not claimed as a reserve stop")
     print("  environment     one private HOME, CARGO_HOME and directory pool per session")
     print("  diagnostic      ONE opt-in --diagnostic run records every oracle failure,")
@@ -849,6 +858,250 @@ def pure_reserve_stop_control() -> None:
             continue
         raise AssertionError(f"the reserve-stop parser accepted {why}")
     print("pure reserve-stop control: ok", flush=True)
+
+
+def watched_clean_premise_sequence(registration, free_bytes: int) -> dict:
+    """Model ONE case-16 fixture-setup sequence over the recorded registration.
+
+    `registration` is the pool's recorded `removable.json` (or None), exactly what
+    `removable::read_registration` returns. The model mirrors the production rules
+    the watched-clean fixture depends on:
+
+    * `outputs::Context::mode` reads the drive mode from that one document, so an
+      unregistered pool has no mode and `outputs plan`/`adopt` refuse it.
+    * `removable::select` keeps the registration's mode but selects the internal
+      store when the registration is unusable (available <= reserve), which is
+      the directory-budget store whose watchdog is the reserve watchdog.
+    """
+    mode = registration.get("mode") if registration else None
+    refused = mode != "permanent"
+    usable = not refused and free_bytes > registration["reserve_bytes"]
+    return {
+        "mode": mode,
+        "adopt_refused": refused,
+        "selected_store": "external" if usable else "internal-directory-budget",
+        "reserve_watchdog": (not refused) and not usable,
+    }
+
+
+def auxiliary_registration_possible(
+    diskutil_mount_point: str, given_path: str, payload_entries: int, set_mode_registered: bool
+) -> dict:
+    """Whether production could register a SECOND provider on the same image.
+
+    `removable::register` requires `diskutil info <path>` to report `MountPoint`
+    equal to the given path (a sub-directory of a volume is not a mount point),
+    `init_volume_pool` refuses a non-empty `<mount>/oxide-pool`, and `set_mode`
+    refuses an absent registration without creating one.
+    """
+    return {
+        "register_refused": diskutil_mount_point != given_path or payload_entries != 0,
+        "set_mode_refused": not set_mode_registered,
+    }
+
+
+def pure_watched_clean_premise_control() -> None:
+    """Pure counterfactual of the ACTUAL case-16 fixture preconditions.
+
+    No subprocess, no fixture, no device: it exercises the three registration
+    states the fixture used to assume, and the production rules that make an
+    auxiliary registration on the one owned image impossible.
+    """
+    image_free = 120 * 1024 * 1024
+    recorded = {"version": 2, "mode": "permanent", "reserve_bytes": 16 * 1024 * 1024}
+    raised = dict(recorded, reserve_bytes=LOW_RESERVE_MIB * 1024 * 1024)
+    # (a) The premise that failed diagnostic 1: an auxiliary pool control with no
+    # registration has no drive mode, so adopt refuses and no watchdog is claimed.
+    absent = watched_clean_premise_sequence(None, image_free)
+    expect(absent["mode"] is None, "a pool without a registration reported a drive mode")
+    expect(absent["adopt_refused"], "an unregistered pool did not refuse adopt")
+    expect(not absent["reserve_watchdog"], "an unregistered pool claimed a reserve watchdog")
+    # (b) The corrected sequence: the pool's OWN recorded permanent registration
+    # still grants the mode, and the low-reserve pattern forces the internal
+    # directory-budget store with the reserve watchdog at the same time.
+    forced = watched_clean_premise_sequence(raised, image_free)
+    expect(forced["mode"] == "permanent", "the corrected premise lost permanent mode")
+    expect(not forced["adopt_refused"], "the corrected premise still refused adopt")
+    expect(
+        forced["selected_store"] == "internal-directory-budget",
+        f"the corrected premise selected {forced['selected_store']}",
+    )
+    expect(forced["reserve_watchdog"], "the corrected premise did not select the reserve watchdog")
+    # (c) A registration that is still usable selects the external store: the
+    # low-reserve pattern is what forces the internal store, and it is restored.
+    usable = watched_clean_premise_sequence(recorded, image_free)
+    expect(usable["selected_store"] == "external", "a usable registration lost the external store")
+    expect(not usable["reserve_watchdog"], "a usable registration claimed a reserve watchdog")
+    expect(
+        json.loads(json.dumps(recorded, indent=2) + "\n") == recorded,
+        "the restored registration document does not round-trip",
+    )
+    # (d) A second provider for the same image is impossible: a sub-directory is
+    # not a mount point, the shared payload is not empty, and set-mode has no
+    # registration to update. This is why the fixture reuses the known registration.
+    subdirectory = auxiliary_registration_possible("/Volumes/Owned", "/Volumes/Owned/aux", 6, False)
+    expect(subdirectory["register_refused"], "a sub-directory mount point was registerable")
+    expect(subdirectory["set_mode_refused"], "set-mode accepted an absent registration")
+    same_mount = auxiliary_registration_possible("/Volumes/Owned", "/Volumes/Owned", 6, False)
+    expect(same_mount["register_refused"], "a non-empty payload directory was registerable")
+    fresh = auxiliary_registration_possible("/Volumes/Owned", "/Volumes/Owned", 0, True)
+    expect(
+        not fresh["register_refused"] and not fresh["set_mode_refused"],
+        "a fresh payload with a present registration became unreachable",
+    )
+    # (e) Stream agreement, read from this script's own text: each asserted notice
+    # must be looked for on the stream its producer actually prints to at the
+    # pinned product source -- adopt notice `println!` (stdout,
+    # outputs.rs:1977), permanent-mode fallback warning `eprintln!` (stderr,
+    # main.rs:392), summary/backend line `eprintln!` (stderr, main.rs:974) and
+    # watchdog report `eprintln!` (stderr, main.rs:744). A source review caught
+    # this class of mistake once; this keeps it from drifting back silently.
+    with open(__file__, encoding="utf-8") as handle:
+        own_text = handle.read()
+    expect(
+        '"local fallback root" in stdout' in own_text,
+        "the watched-clean adopt notice is not asserted on stdout",
+    )
+    expect(
+        '"permanent removable mode fell back to the internal pool" in stderr' in own_text,
+        "the permanent-mode fallback warning is not asserted on stderr",
+    )
+    expect(
+        '"directory-budget-v1" in stderr' in own_text,
+        "the directory-budget summary is not asserted on stderr",
+    )
+    print("pure watched-clean premise control: ok", flush=True)
+
+
+def case18_transition(seed, repeat, linked) -> dict:
+    """The case-18 placement transition as ONE executable rule.
+
+    Each argument is a `(slot, state)` pair exactly as `perm.slot_state` parses it
+    from a build summary. The rule the native case and its pure control share:
+
+    * the ADOPTED real placement positively keys a fresh (`cold`) slot;
+    * an ACTUAL repeat at that same adopted layout is `warm` in that same parsed
+      slot (the unconverted pre-adopt build cannot warm it: adoption changes the
+      members and destination identity);
+    * after the real member directory is removed and `outputs adopt` relinks the
+      member, the linked build is `cold` in a DIFFERENT parsed slot.
+    """
+    return {
+        "seed_cold": seed[1] == "cold",
+        "repeat_warm": repeat[1] == "warm",
+        "repeat_same_slot": repeat[0] == seed[0],
+        "linked_cold": linked[1] == "cold",
+        "linked_distinct_slot": linked[0] != seed[0],
+    }
+
+
+def pure_case18_transition_control() -> None:
+    """No-subprocess counterfactuals of the executable case-18 transition.
+
+    Exercises the same `case18_transition` the native case calls, so the fixture
+    cannot drift back to accepting a cold build as the warm repeat or a linked
+    build that reuses the real placement's slot.
+    """
+    seed = ("31", "cold")
+    # (a) No post-adopt repeat at all: the seed's own cold result must not pass.
+    missing = case18_transition(seed, seed, ("32", "cold"))
+    expect(not missing["repeat_warm"], "a missing warm repeat was accepted as warm")
+    expect(missing["repeat_same_slot"], "the missing-repeat control used a foreign slot")
+    # (b) A warm repeat from a DIFFERENT slot does not satisfy the same-slot rule.
+    elsewhere = case18_transition(seed, ("99", "warm"), ("32", "cold"))
+    expect(elsewhere["repeat_warm"], "a warm repeat from another slot was not warm")
+    expect(
+        not elsewhere["repeat_same_slot"],
+        "a warm repeat from another slot passed the same-slot rule",
+    )
+    # (c) The real sequence: same-slot warm, then a cold linked build in a new slot.
+    correct = case18_transition(seed, ("31", "warm"), ("32", "cold"))
+    expect(all(correct.values()), f"the correct case-18 transition was rejected: {correct}")
+    # (d) A linked build that reuses the real placement's slot is rejected.
+    reused = case18_transition(seed, ("31", "warm"), ("31", "cold"))
+    expect(
+        not reused["linked_distinct_slot"],
+        "a linked build reusing the real placement's slot was accepted",
+    )
+    print("pure case-18 transition control: ok", flush=True)
+
+
+def pure_slot_identity_control() -> None:
+    """Pure counterfactuals of the owned slot mapping and identity snapshot.
+
+    Exercises the SAME `slot_index`/`slot_snapshot` the native cases 18 and 19
+    call, on a private temp tree shaped exactly like the backend
+    (`slots/<label>-<short-id>/<profile>-<id>`). No subprocess, no proof pool and
+    no device: this reproduces diagnostic 3's wrong top-level lookup and proves
+    the corrected retention/no-effect checks detect what they must.
+    """
+    root = tempfile.mkdtemp(prefix="oxide-slot-control.")
+
+    def slot_path(project: str, profile: str, slot: int) -> str:
+        path = os.path.join(root, project)
+        os.makedirs(path, exist_ok=True)
+        child = os.path.join(path, f"{profile}-{slot}")
+        os.makedirs(child, exist_ok=True)
+        return child
+
+    def refuses(action, why: str) -> None:
+        try:
+            action()
+        except OracleFailure:
+            return
+        raise AssertionError(f"the slot helper accepted {why}")
+
+    try:
+        # (a) Nested project/quick-32 maps to exactly slot 32 ... while the
+        # diagnostic-3 expectation of a TOP-LEVEL "32" is false: the negative
+        # control reproduces that failure without weakening the mapping.
+        exact = slot_path("oxide-3fa2c1d4", "quick", 32)
+        index = slot_index(root, "control")
+        expect(index.get("32") == exact, f"nested project/quick-32 mapped to {index.get('32')}, not {exact}")
+        expect("32" not in os.listdir(root), "the top-level listing unexpectedly held a numeric slot name")
+        expect(slot_snapshot(root, "control")["32"][0] == exact, "the snapshot lost the exact slot path")
+        # (h) An unchanged tree passes the no-effect comparison.
+        expect(slot_snapshot(root, "control") == slot_snapshot(root, "control"), "an unchanged tree did not compare equal")
+        # (f) A child slot added under an EXISTING project folder changes it.
+        before = slot_snapshot(root, "control")
+        slot_path("oxide-3fa2c1d4", "debug", 33)
+        expect(slot_snapshot(root, "control") != before, "a new child slot under an existing project folder was not detected")
+        os.rmdir(os.path.join(root, "oxide-3fa2c1d4", "debug-33"))
+        # (e) Removing slot 32 while its parent project folder stays behind must
+        # fail the retained-slot oracle.
+        identity = slot_snapshot(root, "control")["32"]
+        os.rmdir(exact)
+        expect(os.path.isdir(os.path.join(root, "oxide-3fa2c1d4")), "the parent project folder disappeared")
+        expect(
+            slot_snapshot(root, "control").get("32") != identity,
+            "deleting slot 32 while keeping its project folder passed the retained-slot oracle",
+        )
+        # (g) Replacing the slot directory - same name, new identity - is detected.
+        os.makedirs(exact)
+        expect(
+            slot_snapshot(root, "control").get("32") != identity,
+            "a re-created slot directory with a new identity compared equal to the old one",
+        )
+        # (d) An ambiguous duplicate slot id across two project folders refuses.
+        slot_path("other-1111aaaa", "quick", 32)
+        refuses(lambda: slot_index(root, "control"), "an ambiguous duplicate slot id")
+        os.rmdir(os.path.join(root, "other-1111aaaa", "quick-32"))
+        # (b) A foreign child name is not an owned slot directory.
+        os.makedirs(os.path.join(root, "oxide-3fa2c1d4", "payload"))
+        refuses(lambda: slot_index(root, "control"), "a foreign child name in the slot tree")
+        os.rmdir(os.path.join(root, "oxide-3fa2c1d4", "payload"))
+        # (c) A symlinked project folder or slot directory is refused, never followed.
+        outside = os.path.join(root, "outside-project")
+        os.makedirs(os.path.join(outside, "quick-9"))
+        os.symlink(outside, os.path.join(root, "linked-2222bbbb"))
+        refuses(lambda: slot_index(root, "control"), "a symlinked project folder")
+        os.unlink(os.path.join(root, "linked-2222bbbb"))
+        os.symlink(outside, os.path.join(root, "oxide-3fa2c1d4", "quick-9"))
+        refuses(lambda: slot_index(root, "control"), "a symlinked slot directory")
+        os.unlink(os.path.join(root, "oxide-3fa2c1d4", "quick-9"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("pure slot-identity control: ok", flush=True)
 
 
 class _FakeCustodyChild:
@@ -1615,6 +1868,63 @@ def selected_backend_slots(proof: Proof, pool: str, label: str) -> str:
     return slots
 
 
+# One owned slot directory below `slots/`: `<profile>-<id>` (oxide#104 layout).
+SLOT_CHILD = re.compile(r"^(quick|debug|release)-([0-9]+)$")
+
+
+def slot_index(slots_dir: str, label: str = "") -> dict:
+    """`{slot id: exact owned slot directory}` for ONE backend's `slots/` tree.
+
+    The build summary names the numeric slot ID; the backend stores that slot at
+    `slots/<label>-<short-id>/<profile>-<id>` (owned layout: `<n>` is the slot
+    ID). This reads exactly those two bounded levels and nothing else, so the
+    summary ID resolves to a UNIQUE owned path rather than to a project folder
+    name or a substring. Symlinks, non-directories, foreign child names and
+    duplicate IDs refuse with a clear message instead of being guessed.
+    """
+    index = {}
+    if not os.path.isdir(slots_dir):
+        return index
+    for project in sorted(os.listdir(slots_dir)):
+        project_path = os.path.join(slots_dir, project)
+        expect(
+            os.path.isdir(project_path) and not os.path.islink(project_path),
+            f"{label}: {project_path} is not a real project folder in the slot tree",
+        )
+        for child in sorted(os.listdir(project_path)):
+            child_path = os.path.join(project_path, child)
+            match = SLOT_CHILD.match(child)
+            expect(
+                match is not None,
+                f"{label}: {child_path} is not an owned <profile>-<id> slot directory",
+            )
+            expect(
+                os.path.isdir(child_path) and not os.path.islink(child_path),
+                f"{label}: {child_path} is not a real slot directory",
+            )
+            slot = match.group(2)
+            expect(
+                slot not in index,
+                f"{label}: slot id {slot} is ambiguous between {index.get(slot)} and {child_path}",
+            )
+            index[slot] = child_path
+    return index
+
+
+def slot_snapshot(slots_dir: str, label: str = "") -> dict:
+    """`{slot id: (path, dev, ino)}` for the backend's owned slots.
+
+    Identity, not names: a slot removed, re-created or replaced under the same
+    project folder changes this snapshot, and comparing it before/after a
+    command detects exactly that instead of a vacuous listing of project names.
+    """
+    snapshot = {}
+    for slot, path in slot_index(slots_dir, label).items():
+        info = os.lstat(path)
+        snapshot[slot] = (path, info.st_dev, info.st_ino)
+    return snapshot
+
+
 def custody_snapshot(pool: str, checkout: str) -> dict:
     """Bounded observable state of one checkout's output authority: receipt
     bytes, member link texts, the root marker's bytes, the checkout's own
@@ -2363,6 +2673,9 @@ def run(proof: Proof, repo: str) -> None:
     pure_attachment_facts_control()
     pure_slot_state_control()
     pure_reserve_stop_control()
+    pure_watched_clean_premise_control()
+    pure_case18_transition_control()
+    pure_slot_identity_control()
     pure_child_custody_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
@@ -3469,15 +3782,38 @@ def run(proof: Proof, repo: str) -> None:
         try:
             # ----- case 15: detach and re-adopt ----------------------------------
             case_reached("15")
+            # Case 04's real `--target <host triple>` build left an owned
+            # `target/<triple>/debug` link beside the adopted pair. The
+            # accepted run refused this very detach as foreign (oxide#144);
+            # name the pre-state first so the assertion below is not vacuous.
+            host = proof.run(["rustc", "-vV"], cwd=first, env=proof.env, timeout=30).stdout.decode()
+            triple = next(line.split(": ", 1)[1] for line in host.splitlines() if line.startswith("host: "))
+            expect_layout(
+                first,
+                {
+                    "debug": f"link:{root_of(pool, first)}",
+                    "release": f"link:{root_of(pool, first)}",
+                    f"{triple}/debug": f"link:{root_of(pool, first)}",
+                },
+            )
             code, _, stderr = oxide(proof, ["outputs", "detach"], "15 detach", first)
             expect(code == 0, f"15: detach failed: {stderr}")
-            expect_layout(first, {"debug": "real", "release": "real"})
+            # Every recognised member link — the host-triple one included —
+            # becomes a real empty directory, and no root is deleted.
+            expect_layout(first, {"debug": "real", "release": "real", f"{triple}/debug": "real"})
             expect(receipt(pool, first)["state"] == "detached", "15: receipt not detached")
             expect(os.path.isdir(root), "15: a root was deleted by detach")
             adopt(proof, first, "15 readopt")
-            expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
-            host = proof.run(["rustc", "-vV"], cwd=first, env=proof.env, timeout=30).stdout.decode()
-            triple = next(line.split(": ", 1)[1] for line in host.splitlines() if line.startswith("host: "))
+            # Re-adoption restores every placement the detached receipt kept,
+            # so the host-triple member is a link again as well (oxide#144).
+            expect_layout(
+                first,
+                {
+                    "debug": f"link:{root_of(pool, first)}",
+                    "release": f"link:{root_of(pool, first)}",
+                    f"{triple}/debug": f"link:{root_of(pool, first)}",
+                },
+            )
             code, _, stderr = oxide(proof, ["build", "--target", triple], "15 triple build", first)
             expect(code == 0, f"15: host-triple build failed: {stderr}")
             expect_layout(first, {f"{triple}/debug": f"link:{root_of(pool, first)}"})
@@ -3520,11 +3856,24 @@ def run(proof: Proof, repo: str) -> None:
             expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
             # The selected clean runs the existing pool watchdog. The REMOVABLE
             # watchdog is removal-only (its reserve trigger is disabled), so the
-            # reserve stop is exercised through a positively created directory-budget
-            # pool: a gated fake cargo that delegates `locate-project` and every other
-            # non-clean command to the real cargo starts the recorded group FIRST, then
-            # a below-reserve reading stops it and the stop is reported.
-            dirpool = os.path.join(proof.root, "clean-pool")
+            # reserve stop must be exercised on the internal directory-budget store
+            # while the pool still grants permanent drive mode. Production authority
+            # for that mode is the pool's own recorded registration
+            # (`removable::read_registration` -> `Context::mode`), and no second
+            # provider can be created on this one owned image: an auxiliary
+            # directory-budget pool can neither register the same image
+            # (`init_volume_pool` refuses a non-empty `<mount>/oxide-pool`, and
+            # `register` requires `diskutil`'s MountPoint to equal the given path, so
+            # a sub-directory is not a mount point) nor `pool set-mode` an absent
+            # registration. So this fixture reuses the ONE owned image and its known
+            # registration with the existing low-reserve pattern: a recorded reserve
+            # above the image's free space makes selection fall back to the internal
+            # directory-budget store (Statfs watchdog) with the mode still permanent.
+            # A dedicated checkout is adopted, seeded and cleaned here with its OWN
+            # receipt, member links and root in this pool; no receipt or registry
+            # authority is copied, no second pool, image or hand-written registration
+            # is created, and `first` is never cleaned under another context. The
+            # exact registration bytes are restored after the stop, before 17-20.
             real_cargo = shutil.which("cargo")
             expect(real_cargo is not None, "16: no real cargo on PATH for the fake to delegate to")
             binaries = os.path.join(proof.root, "fake-bin")
@@ -3551,59 +3900,106 @@ def run(proof: Proof, repo: str) -> None:
                 handle.write(str(23 * 1024 * 1024 * 1024))
             env = {
                 **proof.env,
-                "OXIDE_POOL": dirpool,
-                "OXIDE_POOL_BACKEND": "directory-budget",
                 "PATH": binaries + os.pathsep + proof.env.get("PATH", ""),
                 "OXIDE_CLEAN_GATE": gate,
                 "OXIDE_TEST_WATCHDOG_READINGS": readings,
             }
-            # A5: the watched clean runs in the checkout whose OWN receipt and custody
-            # live in this directory-budget pool. It is adopted and built here, so no
-            # receipt authority is copied across pools and `first` (a primary-pool
-            # checkout) is never cleaned under this pool's context.
-            seeded = make_checkout(proof, "clean-pool-fixture")
-            os.makedirs(os.path.join(seeded, "target"))
-            code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "16 clean pool adopt", seeded, env)
-            expect(code == 0, f"16: creating the directory-budget pool failed: {stderr}")
-            code, _, stderr = perm.oxide_env(proof, ["build"], "16 clean pool seed", seeded, env)
-            expect(code == 0, f"16: seeding the directory-budget pool failed: {stderr}")
-            seeded_root = root_of(dirpool, seeded)
-            expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
-            seeded_receipt = perm.read_bytes(receipt_file(dirpool, seeded))
-            child = perm.start_child(proof, [proof.binary, "clean", "-p", "profileapp"], seeded, env)
-            CUSTODY.track(child, gate, "16 watched clean")
-            perm.wait_for(os.path.join(gate, "started"), "16 watched clean writer start")
-            with open(readings, "w", encoding="utf-8") as handle:
-                handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
-            code, _, stderr = perm.finish_child(proof, child, "16 watched clean")
-            CUSTODY.finished(child)
-            # A11: the stop is judged by the source-defined report, not by a word
-            # match. watchdog.rs::report emits the injected reason, the reading and
-            # trigger, a concrete Cargo group, the sampled minimum, the overshoot and
-            # a confirmed closure latency; the clean command then returns the child's
-            # SIGNAL-derived status (process::exit_code), TERM -> 143 and 137 only if
-            # the stop escalated to KILL. An unrelated nonzero or a bare 1 fails here.
-            stop_trigger = 22 * 1024 * 1024 * 1024
-            facts = reserve_stop_facts(stderr, stop_trigger)
+            registration_file = perm.registration_path(pool)
+            recorded_registration = perm.read_bytes(registration_file)
+            registration = json.loads(recorded_registration)
+            # Prerequisite 1, asserted rather than assumed (the premise that failed
+            # diagnostic 1): this pool's recorded registration grants permanent mode.
             expect(
-                facts["reading"] == stop_trigger - 4096,
-                f"16: the reported reading is {facts['reading']}, not the injected trigger-4096: {facts['line']}",
+                registration.get("mode") == "permanent",
+                f"16: the fixture pool is not registered in permanent mode: {registration.get('mode')}",
             )
+            registration["reserve_bytes"] = LOW_RESERVE_MIB * 1024 * 1024
+            with open(registration_file, "w", encoding="utf-8") as handle:
+                json.dump(registration, handle, indent=2)
+                handle.write("\n")
+            os.chmod(registration_file, 0o600)
+            try:
+                seeded = make_checkout(proof, "watched-clean-fixture")
+                os.makedirs(os.path.join(seeded, "target"))
+                code, stdout, stderr = perm.oxide_env(
+                    proof, ["outputs", "adopt"], "16 watched clean adopt", seeded, env
+                )
+                expect(code == 0, f"16: adopting the watched-clean checkout failed: {stderr}")
+                # Prerequisite 2: the adopt is permanent-mode and selects the
+                # checkout-local fallback root, never an external placement. The
+                # notice is `println!` on STDOUT (`RootKind::label()` is "local
+                # fallback"); the stream is asserted, not assumed.
+                expect(
+                    "local fallback root" in stdout,
+                    f"16: the watched-clean adopt did not select the local fallback root: {stdout}{stderr}",
+                )
+                code, _, stderr = perm.oxide_env(
+                    proof, ["build"], "16 watched clean seed", seeded, env
+                )
+                expect(code == 0, f"16: seeding the watched-clean checkout failed: {stderr}")
+                # Prerequisite 3: selection really is the internal directory-budget
+                # store (the reserve watchdog) while permanent mode stays in force.
+                expect(
+                    "permanent removable mode fell back to the internal pool" in stderr,
+                    f"16: the seeded build did not report the honest permanent-mode fallback: {stderr}",
+                )
+                expect(
+                    "directory-budget-v1" in stderr,
+                    f"16: the seeded build did not use the directory-budget store: {stderr}",
+                )
+                seeded_root = root_of(pool, seeded)
+                expect(
+                    seeded_root.startswith(seeded + os.sep + ".oxide-outputs" + os.sep),
+                    f"16: the watched-clean root {seeded_root} is not the checkout-local fallback",
+                )
+                expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
+                seeded_receipt = perm.read_bytes(receipt_file(pool, seeded))
+                child = perm.start_child(
+                    proof, [proof.binary, "clean", "-p", "profileapp"], seeded, env
+                )
+                CUSTODY.track(child, gate, "16 watched clean")
+                perm.wait_for(os.path.join(gate, "started"), "16 watched clean writer start")
+                with open(readings, "w", encoding="utf-8") as handle:
+                    handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
+                code, _, stderr = perm.finish_child(proof, child, "16 watched clean")
+                CUSTODY.finished(child)
+                # A11: the stop is judged by the source-defined report, not by a word
+                # match. watchdog.rs::report emits the injected reason, the reading and
+                # trigger, a concrete Cargo group, the sampled minimum, the overshoot and
+                # a confirmed closure latency; the clean command then returns the child's
+                # SIGNAL-derived status (process::exit_code), TERM -> 143 and 137 only if
+                # the stop escalated to KILL. An unrelated nonzero or a bare 1 fails here.
+                stop_trigger = 22 * 1024 * 1024 * 1024
+                facts = reserve_stop_facts(stderr, stop_trigger)
+                expect(
+                    facts["reading"] == stop_trigger - 4096,
+                    f"16: the reported reading is {facts['reading']}, not the injected trigger-4096: {facts['line']}",
+                )
+                expect(
+                    code in reserve_stop_status(facts),
+                    f"16: the clean exited {code}, which the reported stop does not permit "
+                    f"({'TERM or KILL' if facts['escalated'] else 'TERM only'}): {facts['line']}",
+                )
+                # The stopped clean keeps the seeded checkout's own authority: same
+                # links, same receipt bytes, root still present.
+                expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
+                expect(
+                    perm.read_bytes(receipt_file(pool, seeded)) == seeded_receipt,
+                    "16: the stopped clean changed the seeded receipt bytes",
+                )
+                expect(os.path.isdir(seeded_root), "16: the stopped clean removed the seeded root")
+                with open(os.path.join(gate, "release"), "wb") as handle:
+                    handle.write(b"release")
+            finally:
+                # Restore the exact recorded registration bytes this fixture changed
+                # (cases 17-20 depend on the unchanged permanent registration).
+                with open(registration_file, "wb") as handle:
+                    handle.write(recorded_registration)
+                os.chmod(registration_file, 0o600)
             expect(
-                code in reserve_stop_status(facts),
-                f"16: the clean exited {code}, which the reported stop does not permit "
-                f"({'TERM or KILL' if facts['escalated'] else 'TERM only'}): {facts['line']}",
+                perm.read_bytes(registration_file) == recorded_registration,
+                "16: the watched-clean fixture did not restore the recorded registration",
             )
-            # The stopped clean keeps the seeded checkout's own authority: same links,
-            # same receipt bytes, root still present.
-            expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
-            expect(
-                perm.read_bytes(receipt_file(dirpool, seeded)) == seeded_receipt,
-                "16: the stopped clean changed the seeded receipt bytes",
-            )
-            expect(os.path.isdir(seeded_root), "16: the stopped clean removed the seeded root")
-            with open(os.path.join(gate, "release"), "wb") as handle:
-                handle.write(b"release")
             DIAG.finished("16.1")
         except BaseException as error:
             DIAG.failed_step(proof, "16.1", error)
@@ -3707,29 +4103,62 @@ def run(proof: Proof, repo: str) -> None:
             cold_root = root_of(pool, cold)
             expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
             facts_real = perm.plan(proof, cold, "18 real plan")["members"]
-            code, _, stderr = oxide(proof, ["build"], "18 real build again", cold)
-            expect(code == 0, f"18: second real-member build failed: {stderr}")
+            # The UNCONVERTED first build did not warm the adopted key: adoption
+            # changed the members/destination identity. Establish the ADOPTED real
+            # placement with its own first build, then repeat at that same layout.
+            code, _, stderr = oxide(proof, ["build"], "18 real placement seed", cold)
+            expect(code == 0, f"18: post-adopt real-placement build failed: {stderr}")
             expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
-            # A8: the real placement's slot is read from the parsed summary, and the
-            # repeat is required to be WARM in that exact slot - not a substring test.
+            seed_slot, seed_state = perm.slot_state(stderr)
+            expect(
+                seed_state == "cold",
+                f"18: the adopted real placement did not key a fresh slot: {summary(stderr)}",
+            )
+            code, _, stderr = oxide(proof, ["build"], "18 real placement repeat", cold)
+            expect(code == 0, f"18: second post-adopt real-placement build failed: {stderr}")
+            expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
+            # A8: the repeat is required to be WARM in the seed slot the adopted
+            # layout positively keyed - a parsed comparison of both facts, never a
+            # substring test and never an assumed warmth.
             real_slot, real_state = perm.slot_state(stderr)
             expect(real_state == "warm", f"18: the real placement's repeat was not warm: {summary(stderr)}")
+            expect(
+                real_slot == seed_slot,
+                f"18: the repeat used slot {real_slot}, not the adopted seed slot {seed_slot}",
+            )
             # A8: the selected removable backend's own slot root, plus the internal
-            # pool's authority for a no-effect comparison.
+            # pool's authority for a no-effect comparison. The summary names the
+            # numeric slot ID; resolve it at the real owned depth
+            # (`slots/<project>/<profile>-<id>`) and keep its identity.
             slots_dir = selected_backend_slots(proof, pool, "18")
-            slots_before = sorted(os.listdir(slots_dir))
-            internal_slots = os.path.join(pool, "payload", "slots")
-            internal_before = sorted(os.listdir(internal_slots)) if os.path.isdir(internal_slots) else []
+            slots_before = slot_snapshot(slots_dir, "18")
             expect(
                 real_slot in slots_before,
-                f"18: the real placement's slot {real_slot} is not in the selected backend tree {slots_dir}",
+                f"18: the real placement's slot {real_slot} is not an owned slot directory under {slots_dir}: "
+                f"{sorted(slots_before)}",
             )
+            real_identity = slots_before[real_slot]
+            internal_slots = os.path.join(pool, "payload", "slots")
+            internal_before = slot_snapshot(internal_slots, "18") if os.path.isdir(internal_slots) else None
             shutil.rmtree(os.path.join(cold, "target", "debug"))
             adopt(proof, cold, "18 relink")
             expect_layout(cold, {"debug": f"link:{cold_root}", "release": f"link:{cold_root}"})
             code, _, stderr = oxide(proof, ["build"], "18 linked debug", cold)
             expect(code == 0, f"18: linked build failed: {stderr}")
             linked_slot, linked_state = perm.slot_state(stderr)
+            transition = case18_transition(
+                (seed_slot, seed_state),
+                (real_slot, real_state),
+                (linked_slot, linked_state),
+            )
+            expect(
+                transition["linked_distinct_slot"],
+                f"18: the linked build reused the real placement's slot: {transition} {summary(stderr)}",
+            )
+            expect(
+                transition["linked_cold"],
+                f"18: the linked build was not cold: {transition} {summary(stderr)}",
+            )
             expect(
                 linked_state == "cold",
                 f"18: the linked placement reused the real placement's slot: {summary(stderr)}",
@@ -3738,18 +4167,28 @@ def run(proof: Proof, repo: str) -> None:
                 linked_slot != real_slot,
                 f"18: the placement change reused slot {real_slot} ({real_state}); a distinct key needs its own slot",
             )
-            slots_after = sorted(os.listdir(slots_dir))
+            slots_after = slot_snapshot(slots_dir, "18")
+            expect(
+                linked_slot in slots_after,
+                f"18: the linked build's slot {linked_slot} is not an owned slot directory under {slots_dir}: "
+                f"{sorted(slots_after)}",
+            )
+            expect(
+                linked_slot not in slots_before,
+                f"18: the linked placement reused an existing slot id {linked_slot} ({slots_before.get(linked_slot)})",
+            )
             expect(
                 set(slots_before).issubset(set(slots_after)),
-                f"18: the real placement's slot was evicted instead of remaining available: {slots_before} -> {slots_after}",
+                f"18: an older slot was evicted instead of remaining available: {sorted(slots_before)} -> {sorted(slots_after)}",
             )
             expect(
-                real_slot in slots_after,
-                f"18: the real placement's slot {real_slot} left the selected backend tree",
+                slots_after.get(real_slot) == real_identity,
+                f"18: the real placement's slot {real_slot} was removed or replaced: "
+                f"{real_identity} -> {slots_after.get(real_slot)}",
             )
-            if os.path.isdir(internal_slots):
+            if internal_before is not None:
                 expect(
-                    sorted(os.listdir(internal_slots)) == internal_before,
+                    slot_snapshot(internal_slots, "18") == internal_before,
                     "18: the internal pool's slot authority changed during external builds",
                 )
             facts_linked = perm.plan(proof, cold, "18 linked plan")["members"]
@@ -3768,9 +4207,12 @@ def run(proof: Proof, repo: str) -> None:
             snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
             receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
             slots_dir = selected_backend_slots(proof, pool, "19")
-            slots_before = sorted(os.listdir(slots_dir))
+            # Identity snapshots at the owned slot depth, so creating, removing or
+            # replacing a slot inside an EXISTING project folder is detected; a
+            # listing of project folder names would be vacuous.
+            slots_before = slot_snapshot(slots_dir, "19")
             internal_slots = os.path.join(pool, "payload", "slots")
-            internal_before = sorted(os.listdir(internal_slots)) if os.path.isdir(internal_slots) else []
+            internal_before = slot_snapshot(internal_slots, "19") if os.path.isdir(internal_slots) else None
             # Working base control immediately before the refusal: the same base
             # binary serves a fresh private pool normally.
             control = proof.run([base, "--version"], cwd=migrated, env=proof.env, timeout=60)
@@ -3800,12 +4242,12 @@ def run(proof: Proof, repo: str) -> None:
                 expect(os.readlink(member_link(migrated, member)) == target, "19: the refusal changed a member link")
             expect(perm.sha256_file(perm.receipt_path(pool, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
             expect(
-                sorted(os.listdir(slots_dir)) == slots_before,
-                "19: the refused state-3 run created or changed a slot in the selected backend",
+                slot_snapshot(slots_dir, "19") == slots_before,
+                "19: the refused state-3 run created, removed or replaced an owned slot in the selected backend",
             )
-            if os.path.isdir(internal_slots):
+            if internal_before is not None:
                 expect(
-                    sorted(os.listdir(internal_slots)) == internal_before,
+                    slot_snapshot(internal_slots, "19") == internal_before,
                     "19: the refused state-3 run changed the internal pool authority",
                 )
             DIAG.finished("19.1")
@@ -4281,6 +4723,9 @@ def main() -> int:
         pure_attachment_facts_control()
         pure_slot_state_control()
         pure_reserve_stop_control()
+        pure_watched_clean_premise_control()
+        pure_case18_transition_control()
+        pure_slot_identity_control()
         pure_child_custody_control()
         return 0
     if arguments == [DIAGNOSTIC_ARGUMENT]:
