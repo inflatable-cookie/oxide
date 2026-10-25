@@ -4,9 +4,9 @@ use super::pool::{
     recover_injected, release_injected, status_injected, with_accounting_limits,
 };
 use super::{
-    AccountingCoverage, AccountingGapKind, AccountingScan, LeaseError, LeaseRequest, Profile,
-    SlotLayout, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_LEDGER_BYTES,
+    remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, LeaseError,
+    LeaseRequest, Profile, SlotLayout, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_LEDGER_BYTES,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -2711,4 +2711,37 @@ fn measure_walks_share_one_cumulative_deadline() {
         bounds.windows(2).all(|pair| pair[0] >= pair[1]),
         "the remaining bound must not grow between walks: {bounds:?}"
     );
+}
+
+#[test]
+fn owned_read_only_directories_left_by_tests_are_deleted_whole() {
+    // Effigy fixtures under a slot's child scratch leave
+    // `.effigy/state/objects/<hash>` read-only (2026-10-25: slot 1987's
+    // recorded deletion could not complete and blocked every lease).
+    let fixture = Fixture::new("readonly-tree");
+    let slot = fixture.dir("slot");
+    let objects = slot.join("scratch/.tmpX/.effigy/state/objects");
+    let object = objects.join("4bcd");
+    fs::create_dir_all(&object).expect("object dir");
+    fs::write(object.join("data"), b"x").expect("object file");
+    fs::set_permissions(object.join("data"), fs::Permissions::from_mode(0o444)).expect("ro file");
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o555)).expect("ro dir");
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o500)).expect("ro parent");
+
+    remove_tree_owned(fixture.path(), &slot).expect("owned read-only tree is removed");
+    assert!(!slot.exists(), "the whole slot is gone");
+}
+
+#[test]
+fn a_symlink_inside_a_read_only_directory_is_unlinked_not_followed() {
+    let fixture = Fixture::new("readonly-symlink");
+    let slot = fixture.dir("slot");
+    let outside = fixture.dir("outside");
+    let inner = slot.join("ro");
+    fs::create_dir(&inner).expect("inner");
+    symlink(&outside, inner.join("link")).expect("symlink");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o500)).expect("ro inner");
+    // The owned symlink is unlinked as a leaf; its target is never touched.
+    remove_tree_owned(fixture.path(), &slot).expect("owned symlink leaf removed");
+    assert!(outside.exists(), "symlink target untouched");
 }
