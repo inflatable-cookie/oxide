@@ -90,10 +90,15 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
   01 init: adopt publishes the current control format (state version 4 with
      the `oxide.outputs/3` owned-outputs fence and a ready transaction in both
      controls) and `oxide.outputs.registry/1` exists. Older-binary control
-     (root-authorized read-only artifact): the exact installed d246d400 binary
-     and its install receipt are verified (pin, SHA-256 bd52cb42..., size,
-     no-follow regular owned files, metadata stable across the read), copied
-     into owned scratch, and only the copy runs: its capability probe reports
+     (root-authorized read-only artifact): the exact released d246d400
+     control-2 binary is read from its durable release-audit copy
+     (`OLD_ARTIFACT_PATH`, recovered and independently hash/size verified)
+     together with its original install receipt, and verified (pin, SHA-256
+     bd52cb42..., size 2756576, no-follow regular owned files, metadata stable
+     across the read). The receipt's recorded `installed.path` is the
+     historical `/Users/tom/.local/bin/oxide`, which now holds the current
+     4df3dfd binary: it is provenance text only and is never opened. Only a
+     private copy inside owned scratch runs: its capability probe reports
      control state 2, and its `check` and `outputs adopt` in the fixture both
      exit nonzero with no handoff, no host path and complete pool, volume-tree
      and checkout bytes and metadata unchanged. The version-1 fixture for case
@@ -210,13 +215,16 @@ adoption is not assumed: every converted checkout is adopted explicitly and
 each receipt state is asserted. No fake Cargo subcommand is used.
 
 Not run here: real-drive qualification, live inventory or cleanup. Case 01's
-older-binary fence control needs a preserved copy of binary sha256 bd52cb42…
-(pin d246d400, control state 2). At this head the pinned *receipt* exists at
-/Users/tom/.local/state/oxide/install/20261023T095314Z-d246d400f5cc.json but
-/Users/tom/.local/bin/oxide is now the 4df3dfd artifact, so that prerequisite
-is UNAVAILABLE: the case aborts naming it and must not be retargeted, stubbed
-or rebuilt. ROOT supplies the artifact or authorises the bounded pure-fence
-alternative.
+older-binary fence control reads the recovered, independently hash/size
+verified artifact at
+/Users/tom/.local/share/northstar/release-audits/oxide/2026-10-25/d246d400-artifact/old-oxide-d246d400
+(sha256 bd52cb42…, 2756576 bytes, pin d246d400, control state 2) beside its
+provenance-only custody JSON, together with the original receipt
+/Users/tom/.local/state/oxide/install/20261023T095314Z-d246d400f5cc.json. The
+receipt's `installed.path` /Users/tom/.local/bin/oxide is historical: it now
+holds the current 4df3dfd binary, which this proof never reads or copies. A
+different identity at either input aborts naming the requirement instead of
+retargeting, stubbing or rebuilding anything.
 """
 
 from __future__ import annotations
@@ -277,13 +285,31 @@ CASE_ALLOCATION = [
 PLAIN = '[package]\nname = "plain"\nversion = "0.1.0"\nedition = "2021"\n'
 
 # The older-binary fence control (Opus 9a6af8bb, root-authorized READ-ONLY):
-# the exact installed d246d400 binary and its install receipt. They are read
-# with no-follow bounded reads, verified, copied into owned scratch and only
-# the COPY is executed, never against the host pool.
-OLD_BINARY = "/Users/tom/.local/bin/oxide"
+# the exact released d246d400 control-2 artifact and its original install
+# receipt. Two SEPARATE paths, deliberately not interchangeable:
+#
+#   OLD_INSTALLED_PATH  the historical installation path the original receipt
+#                       records as `installed.path`. It is provenance text
+#                       only: that path now holds the current 4df3dfd binary,
+#                       which this proof must NEVER read or copy.
+#   OLD_ARTIFACT_PATH   the durable, independently hash/size-verified copy of
+#                       the recovered artifact, which is the actual proof
+#                       input. It is read with a bounded no-follow read, its
+#                       identity is rechecked before and after, and only a
+#                       private copy inside owned scratch is ever executed.
+#
+# The custody JSON beside the durable copy is provenance only; this proof
+# trusts nothing in it and requires the ORIGINAL receipt's pin, SHA-256 and
+# size plus the read bytes' own SHA-256.
+OLD_INSTALLED_PATH = "/Users/tom/.local/bin/oxide"
+OLD_ARTIFACT_PATH = (
+    "/Users/tom/.local/share/northstar/release-audits/oxide/2026-10-25/"
+    "d246d400-artifact/old-oxide-d246d400"
+)
 OLD_RECEIPT = "/Users/tom/.local/state/oxide/install/20261023T095314Z-d246d400f5cc.json"
 OLD_PIN = "d246d400f5ccb8e0a601ea6415b93b8346bc2698"
 OLD_SHA = "bd52cb42842c06451b0f8a9bc364ba7de74cfe6f014d33804890c4adbc51fc2b"
+OLD_SIZE = 2_756_576
 OLD_BINARY_CAP = 8 * 1024 * 1024
 OLD_RECEIPT_CAP = 64 * 1024
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
@@ -920,11 +946,11 @@ def copy_old_artifact(root: str) -> str:
         raise
     except BaseException as error:
         raise Aborted(
-            "older-binary fence control: the exact pinned control-2 artifact is unavailable "
-            f"({type(error).__name__}: {error}); it needs a preserved copy of binary "
-            f"sha256 {OLD_SHA} (pin {OLD_PIN}) plus its receipt at a known audit path. "
-            "Nothing was substituted: ROOT must supply that artifact or authorise the "
-            "bounded pure-fence alternative"
+            "older-binary fence control: the durable artifact or the original receipt did not "
+            f"verify ({type(error).__name__}: {error}); the proof requires binary sha256 "
+            f"{OLD_SHA}, size {OLD_SIZE} bytes (pin {OLD_PIN}, control state 2) at "
+            f"{OLD_ARTIFACT_PATH} plus the original receipt {OLD_RECEIPT}. Nothing is "
+            "substituted: the current installed binary and the custody JSON are never read"
         ) from error
 
 
@@ -933,13 +959,21 @@ def _copy_old_artifact(root: str) -> str:
     receipt = json.loads(receipt_bytes)
     installed = receipt.get("installed", {})
     expect(receipt.get("pin") == OLD_PIN, f"receipt pin {receipt.get('pin')} is not {OLD_PIN}")
-    expect(installed.get("path") == OLD_BINARY, f"receipt path {installed.get('path')}")
+    # The receipt's `installed.path` is the HISTORICAL installation path, which
+    # now holds the current 4df3dfd binary: it is checked as provenance text
+    # and never opened. The proof input is the separate durable artifact.
+    expect(
+        installed.get("path") == OLD_INSTALLED_PATH,
+        f"receipt installed.path {installed.get('path')} is not the historical {OLD_INSTALLED_PATH}",
+    )
     expect(installed.get("sha256") == OLD_SHA and receipt.get("built_sha256") == OLD_SHA, "receipt hash mismatch")
     expect(receipt.get("control_state_version") == 2, f"receipt control state {receipt.get('control_state_version')}")
-    binary, binary_id = read_nofollow(OLD_BINARY, OLD_BINARY_CAP)
-    expect(len(binary) == installed.get("size"), "installed size differs from the receipt")
-    expect(hashlib.sha256(binary).hexdigest() == OLD_SHA, "installed binary hash differs from the pin")
-    for path, before in ((OLD_RECEIPT, receipt_id), (OLD_BINARY, binary_id)):
+    expect(installed.get("size") == OLD_SIZE, f"receipt size {installed.get('size')} is not {OLD_SIZE}")
+    expect(OLD_ARTIFACT_PATH != OLD_INSTALLED_PATH, "the artifact source path is the installed path")
+    binary, binary_id = read_nofollow(OLD_ARTIFACT_PATH, OLD_BINARY_CAP)
+    expect(len(binary) == OLD_SIZE, f"artifact size {len(binary)} is not the pinned {OLD_SIZE}")
+    expect(hashlib.sha256(binary).hexdigest() == OLD_SHA, "artifact hash differs from the pin")
+    for path, before in ((OLD_RECEIPT, receipt_id), (OLD_ARTIFACT_PATH, binary_id)):
         after = os.lstat(path)
         expect(
             (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == before,
@@ -959,6 +993,17 @@ def _copy_old_artifact(root: str) -> str:
                 "source_pin": OLD_PIN,
                 "binary_sha256": OLD_SHA,
                 "binary_size": len(binary),
+                "control_state_version": 2,
+                "source_artifact_path": OLD_ARTIFACT_PATH,
+                "historical_installed_path": OLD_INSTALLED_PATH,
+                "historical_installed_path_note": (
+                    "recorded by the original receipt as installed.path; that path now holds the "
+                    "current 4df3dfd binary and is never opened by this proof"
+                ),
+                "custody_note": (
+                    "the custody JSON beside the durable copy is provenance only; identity comes "
+                    "from the original receipt's pin/sha/size and the read bytes' SHA-256"
+                ),
                 "receipt_path": OLD_RECEIPT,
                 "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
                 "copy": copy,
@@ -1074,7 +1119,12 @@ def run(proof, repo: str) -> None:
             print(f"----- old binary {args}: exit {result.returncode} -----\n{stderr}", flush=True)
             expect(result.returncode != 0, f"the older binary's {args} did not refuse")
             expect(HANDOFF_NOTICE not in stderr, f"the older binary's {args} selected a handoff; STOP")
-            expect(OLD_BINARY not in stderr and "/.local/state/oxide" not in stderr, f"a host path appeared: {stderr}")
+            expect(
+                OLD_INSTALLED_PATH not in stderr
+                and OLD_ARTIFACT_PATH not in stderr
+                and "/.local/state/oxide" not in stderr,
+                f"a host path appeared: {stderr}",
+            )
             expect([tree_snapshot(path) for path in watched] == before, f"the older binary's {args} changed fixture state")
 
     with case("02") as scope, scope.run():
@@ -1766,6 +1816,43 @@ def self_test() -> int:
         }
 
     check("shared staging helper compatibility", helper_compatibility)
+
+    def artifact_inputs() -> None:
+        # The older-binary fence control's INPUT is the durable recovered
+        # artifact. The original receipt's recorded installation path is
+        # provenance text only (that path now holds the current 4df3dfd
+        # binary), so the two must never be the same constant and the proof
+        # must read/execute only the durable copy.
+        assert OLD_INSTALLED_PATH == "/Users/tom/.local/bin/oxide", OLD_INSTALLED_PATH
+        assert OLD_ARTIFACT_PATH.startswith(
+            "/Users/tom/.local/share/northstar/release-audits/oxide/2026-10-25/"
+            "d246d400-artifact/"
+        ), OLD_ARTIFACT_PATH
+        assert OLD_ARTIFACT_PATH.endswith("/old-oxide-d246d400"), OLD_ARTIFACT_PATH
+        assert OLD_ARTIFACT_PATH != OLD_INSTALLED_PATH
+        assert (
+            OLD_PIN,
+            OLD_SHA,
+            OLD_SIZE,
+        ) == (
+            "d246d400f5ccb8e0a601ea6415b93b8346bc2698",
+            "bd52cb42842c06451b0f8a9bc364ba7de74cfe6f014d33804890c4adbc51fc2b",
+            2_756_576,
+        ), (OLD_PIN, OLD_SHA, OLD_SIZE)
+        body = inspect.getsource(_copy_old_artifact)
+        assert "read_nofollow(OLD_ARTIFACT_PATH" in body, body
+        assert "read_nofollow(OLD_INSTALLED_PATH" not in body, body
+        assert 'installed.get("path") == OLD_INSTALLED_PATH' in body, body
+        assert 'os.path.join(root, "old-oxide-d246d400")' in body, body
+        assert "hashlib.sha256(binary).hexdigest() == OLD_SHA" in body, body
+        assert "((OLD_RECEIPT, receipt_id), (OLD_ARTIFACT_PATH, binary_id))" in body, body
+        case_one = inspect.getsource(run)
+        assert "copy_old_artifact(proof.root)" in case_one, "case 01 does not verify the artifact"
+        assert "probe = proof.run([old, CAPABILITIES_PROBE]" in case_one, case_one
+        assert 'json.loads(probe.stdout).get("control_state_version") == 2' in case_one, case_one
+        assert '(["check"], ["outputs", "adopt"])' in case_one
+
+    check("older-binary artifact input path", artifact_inputs)
 
     def counted_fail_fast() -> None:
         ran: list[str] = []
