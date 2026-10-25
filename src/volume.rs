@@ -141,6 +141,123 @@ pub struct Binding {
     device: String,
 }
 
+/// Test-only verified-volume facts.
+///
+/// Unit tests cannot mount an APFS volume, and a fabricated `Facts` value alone
+/// would bypass the descriptor and path checks that protect production. This
+/// adapter therefore sits *inside* `Binding::verify()`: the real descriptor
+/// observation, mount rule, device comparison and path re-check all still run
+/// on the fixture directory, and only the volume capacity/available figures a
+/// mount would report are substituted. It is compiled only under `cfg(test)`,
+/// has no environment or public entry point, and models a verified volume — it
+/// is never evidence that a real volume was verified.
+#[cfg(test)]
+pub(crate) mod verified_facts {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct VolumeFacts {
+        /// Substitute for the volume's reported capacity.
+        pub capacity_bytes: Option<u64>,
+        /// Substitute for the volume's reported available bytes.
+        pub available_bytes: Option<u64>,
+        /// Model a volume that fails verification outright.
+        pub verify_error: Option<String>,
+        /// Successive available-byte readings, consumed one per verification,
+        /// so a test can model a re-read after a prune. When exhausted the
+        /// last value repeats.
+        pub available_sequence: Vec<Option<u64>>,
+        /// Fail verification once this many successful readings have happened.
+        pub verify_error_after: Option<u64>,
+        /// How many substituted verifications have happened (test sequencing).
+        pub reads: u64,
+    }
+
+    thread_local! {
+        static CURRENT: RefCell<Option<VolumeFacts>> = const { RefCell::new(None) };
+    }
+
+    /// Run `body` with these facts installed on this thread.
+    pub(crate) fn with<R>(facts: VolumeFacts, body: impl FnOnce() -> R) -> R {
+        let previous = CURRENT.with(|cell| cell.replace(Some(facts)));
+        let result = body();
+        CURRENT.with(|cell| cell.replace(previous));
+        result
+    }
+
+    /// Replace the available bytes mid-run, as a re-read after a prune would.
+    pub(crate) fn set_available(bytes: Option<u64>) {
+        CURRENT.with(|cell| {
+            if let Some(facts) = cell.borrow_mut().as_mut() {
+                facts.available_bytes = bytes;
+            }
+        });
+    }
+
+    pub(crate) fn reads() -> u64 {
+        CURRENT.with(|cell| cell.borrow().as_ref().map_or(0, |facts| facts.reads))
+    }
+
+    /// The modelled verification result, or `None` when no adapter is set.
+    pub(super) fn modelled() -> Result<Option<super::Facts>, String> {
+        let current = CURRENT.with(|cell| cell.borrow().clone());
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if let Some(error) = current.verify_error {
+            return Err(error);
+        }
+        let read = CURRENT.with(|cell| {
+            let mut borrowed = cell.borrow_mut();
+            let installed = borrowed.as_mut().expect("adapter installed");
+            installed.reads += 1;
+            installed.reads
+        });
+        let available = CURRENT.with(|cell| {
+            let mut borrowed = cell.borrow_mut();
+            let installed = borrowed.as_mut().expect("adapter installed");
+            if installed.available_sequence.is_empty() {
+                return installed.available_bytes;
+            }
+            let index = (read as usize - 1).min(installed.available_sequence.len() - 1);
+            installed.available_sequence[index]
+        });
+        if current.verify_error_after.is_some_and(|limit| read > limit) {
+            return Err("the fixture volume stopped verifying".to_owned());
+        }
+        let mut facts = super::Facts {
+            mounted_on: PathBuf::new(),
+            device: String::new(),
+            fstype: String::new(),
+            read_only: false,
+            root_fs: false,
+            uuid: None,
+            dev: 0,
+            capacity_bytes: current.capacity_bytes,
+            available_bytes: available,
+        };
+        facts.available_bytes = available;
+        Ok(Some(facts))
+    }
+}
+
+/// Build a `Binding` over an owned fixture directory.
+///
+/// Test-only: the descriptor and mount point are real (so the structural
+/// checks in `verify()` still run), while the volume identity is the fixture's
+/// own. Production never constructs a binding this way.
+#[cfg(test)]
+pub(crate) fn binding_for_test(root: &Path, uuid: &str) -> Result<Binding, String> {
+    let fd = open_dir(None, root)?;
+    Ok(Binding {
+        fd,
+        mount_point: root.to_path_buf(),
+        uuid: uuid.to_owned(),
+        device: "fixture".to_owned(),
+    })
+}
+
 impl std::fmt::Debug for Binding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -211,6 +328,10 @@ impl Binding {
     /// same volume's root, and the path still resolves to that root rather
     /// than a directory left behind after an unmount.
     pub fn verify(&self) -> Result<Facts, String> {
+        #[cfg(test)]
+        if let Some(modelled) = verified_facts::modelled()? {
+            return Ok(modelled);
+        }
         let facts = observe(&self.fd)?;
         judge(&self.mount_point, &facts, Some(&self.uuid))?;
         if facts.device != self.device {

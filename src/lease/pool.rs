@@ -41,8 +41,10 @@ pub struct LeaseRequest {
     pub budget_bytes: Option<u64>,
     /// The registered removable volume's free-space reserve, when the caller
     /// owns that fact. It is a **reserve** signal, never a pool-budget input:
-    /// an unknown pool size may admit only on positively measured free space
-    /// above this reserve, and that route never evicts a slot.
+    /// an unknown pool size admits on positively measured free space above
+    /// this reserve, and free space at or below it prunes eligible idle whole
+    /// slots until it recovers, with a named hard floor deciding when nothing
+    /// is left to prune.
     pub reserve_bytes: Option<u64>,
     /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
     pub layout: Option<SlotLayout>,
@@ -1311,7 +1313,7 @@ impl Pool {
     /// is required before the deletion, and the rank sequence was already
     /// checked before this admission changed anything. A victim that is no
     /// longer idle refuses as busy without touching it.
-    fn replace_idle_slot_for_admission(&mut self, id: u64) -> Result<(), LeaseError> {
+    pub(super) fn replace_idle_slot_for_admission(&mut self, id: u64) -> Result<(), LeaseError> {
         if id == 0 {
             return Err(LeaseError::InvalidInput(
                 "replacement slot ID must be a positive integer",
@@ -1332,7 +1334,7 @@ impl Pool {
         self.retire_idle_slot(id, incarnation, &project, profile)
     }
 
-    fn evict_idle_until(&mut self, max_slots: usize) -> Result<(), LeaseError> {
+    pub(super) fn evict_idle_until(&mut self, max_slots: usize) -> Result<(), LeaseError> {
         // Bound admission to the allocated entries it saw when it began, so
         // concurrent-looking state cannot extend the loop.
         let mut remaining = self.ledger.slots.len();
@@ -1357,13 +1359,20 @@ impl Pool {
     /// not finish inside its bounds.
     ///
     /// Pool size is **unknown**, so this route never compares bytes against
-    /// the pool cap and never evicts: it admits only when the verified
-    /// volume's free space is positively above the caller's registered
-    /// reserve, and refuses with the original incomplete scan otherwise.
-    /// Everything else on the volume — caches, scratch, another tool's
-    /// Desktop — is irrelevant here, which is why the decision takes no
-    /// "volume used" figure at all.
-    fn admit_unknown_removable(&mut self, scan: &AccountingScan) -> Result<(), LeaseError> {
+    /// the pool cap and never uses the volume's total usage: it acts on
+    /// positively measured free space, the caller's registered reserve and the
+    /// named hard floor. Above the reserve (and at or above the floor) it
+    /// admits with no eviction; at or below the reserve, or below the floor
+    /// while anything is left to prune, it retires one eligible idle whole
+    /// slot in the existing LRU order and re-reads; once nothing is left to
+    /// prune, free space at or above the floor admits with a warning and below
+    /// it refuses with the original incomplete scan. Everything else on the
+    /// volume — caches, scratch, another tool's Desktop — is irrelevant here,
+    /// which is why the decision takes no "volume used" figure at all.
+    pub(super) fn admit_unknown_removable(
+        &mut self,
+        scan: &AccountingScan,
+    ) -> Result<(), LeaseError> {
         let mut idle_available = true;
         loop {
             let available = self.volume_available_bytes()?;
@@ -1399,10 +1408,10 @@ impl Pool {
     }
 
     /// The bounds an admission's own walks use. A removable pool keeps the
-    /// legacy `VOLUME_WALK_MS` bound on the walks a pressure figure needs, so
-    /// a payload too large to measure in 5 s still reaches the legacy
-    /// volume-used-bytes fallback; an internal directory pool keeps the full
-    /// accounting bound.
+    /// `VOLUME_WALK_MS` bound on the walks a pool figure needs, so a payload
+    /// too large to measure in 5 s reaches the unknown-size reserve route
+    /// instead of timing out mid-measurement; an internal directory pool keeps
+    /// the full accounting bound.
     fn pressure_limits(&self) -> InventoryLimits {
         let mut limits = self.walk_limits();
         if self.is_removable() {
@@ -1664,7 +1673,7 @@ impl Pool {
         Ok(facts.available_bytes)
     }
 
-    fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
+    pub(super) fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
         let mut remaining = self.ledger.slots.len();
         loop {
             // Byte pressure remeasures the recorded figure after each deletion
@@ -2260,12 +2269,12 @@ fn unknown_removable_step(
     let (Some(available), Some(reserve)) = (available, reserve) else {
         return Err(LeaseError::AccountingIncomplete(Box::new(scan.clone())));
     };
-    // The hard floor is a stop in every branch: below it nothing admits,
-    // even when a legacy registration's reserve is set lower than the floor.
-    if available < floor {
-        return Ok(UnknownRemovableStep::Refuse(scan.clone()));
-    }
-    if available > reserve {
+    // Recovering space comes first: while any eligible idle whole slot
+    // remains, free space at or below the reserve — and any free space below
+    // the hard floor, including when a legacy reserve sits lower than the
+    // floor — prunes one slot and re-reads. The floor decides only once
+    // nothing is left to prune.
+    if available > reserve && available >= floor {
         return Ok(UnknownRemovableStep::Admit(format!(
             "pool size unknown (the walk stopped at its bound after {} entries); admitted on {} free above the {} reserve; nothing was evicted and the pool cap is unverified",
             scan.entries_visited,
@@ -2276,18 +2285,24 @@ fn unknown_removable_step(
     if idle_available {
         return Ok(UnknownRemovableStep::Evict);
     }
-    Ok(UnknownRemovableStep::AdmitAtFloor(format!(
-        "pool size unknown (the walk stopped at its bound after {} entries); {} free is at or below the {} reserve, at or above the {} hard floor, and no idle slot is left to prune, so this admission proceeds with a warning; nothing was evicted and the pool cap is unverified",
-        scan.entries_visited,
-        gigabytes(available),
-        gigabytes(reserve),
-        gigabytes(floor)
-    )))
+    if available >= floor {
+        return Ok(UnknownRemovableStep::AdmitAtFloor(format!(
+            "pool size unknown (the walk stopped at its bound after {} entries); {} free is at or below the {} reserve, at or above the {} hard floor, and no idle slot is left to prune, so this admission proceeds with a warning; nothing was evicted and the pool cap is unverified",
+            scan.entries_visited,
+            gigabytes(available),
+            gigabytes(reserve),
+            gigabytes(floor)
+        )));
+    }
+    Ok(UnknownRemovableStep::Refuse(scan.clone()))
 }
 
-/// Decimal gigabytes with one place, for admission notes.
+/// Binary gibibytes with one place, for admission notes.
+///
+/// The reserve and the hard floor are both binary quantities
+/// (`10 * 1024^3`), so their notes must not reprint them as decimal GB.
 fn gigabytes(bytes: u64) -> String {
-    format!("{:.1} GB", bytes as f64 / 1e9)
+    format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// A record's membership fields, as status and the ledger view show them.
@@ -2840,6 +2855,134 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
     Ok(())
 }
 
+/// Build a removable-backed `Pool` over an owned fixture payload directory.
+///
+/// Test-only. The backing is `Payload::Volume` (so every production branch for
+/// a removable pool is taken) with a real descriptor over the fixture
+/// directory, and the volume's capacity/available figures come from
+/// [`crate::volume::verified_facts`]. `Binding::verify()` still performs its
+/// real descriptor, mount-rule, device and path checks; only the numbers a
+/// mount would report are substituted. Nothing here is a public or environment
+/// interface, and it is never native verification of a real volume.
+#[cfg(test)]
+pub(super) fn volume_pool_for_test(
+    pool_root: &Path,
+    payload: &Path,
+    budget: u64,
+    reserve: Option<u64>,
+) -> Result<Pool, LeaseError> {
+    let store_id = "b".repeat(32);
+    let binding = crate::volume::binding_for_test(payload, &"1".repeat(36))
+        .map_err(|_| LeaseError::BackingMismatch)?;
+    let fd = binding
+        .fd()
+        .try_clone_to_owned()
+        .map_err(|error| LeaseError::Io(error.to_string()))?;
+    let config = PoolConfig {
+        version: LEASE_VERSION,
+        backend: VOLUME_BACKEND_APFS_V1.to_owned(),
+        store_id: store_id.clone(),
+        cap_bytes: budget,
+        image_bytes: 0,
+        volume: Some(VolumeConfig {
+            mount_point: payload.to_path_buf(),
+            volume_uuid: "1".repeat(36),
+            payload_dir: "payload".to_owned(),
+        }),
+    };
+    let ledger = Ledger {
+        version: LEASE_VERSION,
+        store_id,
+        cap_bytes: budget,
+        next_slot: 1,
+        next_lease: 1,
+        capacity_policy: None,
+        next_rank: None,
+        slots: Vec::new(),
+    };
+    Ok(Pool {
+        _lock: None,
+        root: pool_root.to_path_buf(),
+        config,
+        backing: Payload::Volume {
+            binding,
+            root: payload.to_path_buf(),
+            fd,
+        },
+        budget,
+        ledger,
+        limits: accounting_limits(),
+        deadline: None,
+        reconciliation_blocked: false,
+        admission_note: None,
+        reserve,
+    })
+}
+
+/// Test-only: give this pool an idle whole slot with a closed observation.
+#[cfg(test)]
+pub(super) fn add_idle_slot_for_test(
+    pool: &mut Pool,
+    id: u64,
+    rank: u64,
+    recorded_bytes: u64,
+    payload_files: usize,
+) -> Result<PathBuf, LeaseError> {
+    let slot_path = pool.slot_path_in(id, None)?;
+    fs::create_dir_all(slot_path.join("build")).map_err(io_error)?;
+    for index in 0..payload_files {
+        fs::write(
+            slot_path.join("build").join(format!("blob-{index}")),
+            vec![b'x'; 64 * 1024],
+        )
+        .map_err(io_error)?;
+    }
+    let last_lease_id = format!("v1.{}.{id}.1.{id}", pool.config.store_id);
+    pool.ledger.slots.push(SlotRecord {
+        id,
+        incarnation: 1,
+        state: SlotPersistState::Idle,
+        project: PathBuf::from("/fixture/project"),
+        workspace: PathBuf::from("/fixture/workspace"),
+        profile: Profile::Dev,
+        holder: "fixture".to_owned(),
+        lease_id: None,
+        last_lease_id: last_lease_id.clone(),
+        dir: None,
+        rank,
+        recorded: Some(RecordedSize {
+            for_lease: last_lease_id,
+            unique_bytes: recorded_bytes,
+            logical_bytes: recorded_bytes,
+            entries: payload_files as u64,
+            at_ms: 1,
+        }),
+    });
+    pool.ledger.next_slot = id + 1;
+    pool.ledger.next_rank = Some(rank + 1);
+    Ok(slot_path)
+}
+
+/// Test-only: the pool's slot IDs in ledger order.
+#[cfg(test)]
+pub(super) fn slot_ids_for_test(pool: &Pool) -> Vec<u64> {
+    pool.ledger.slots.iter().map(|slot| slot.id).collect()
+}
+
+/// Test-only: mark a slot held, for victim-safety checks.
+#[cfg(test)]
+pub(super) fn hold_slot_for_test(pool: &mut Pool, id: u64, holder: &str) {
+    let lease = format!("v1.{}.{id}.1.{}", pool.config.store_id, id + 100);
+    if let Some(slot) = pool.slot_mut(id) {
+        slot.state = SlotPersistState::Held;
+        slot.lease_id = Some(lease);
+        slot.holder = holder.to_owned();
+        // The product clears the observation in the same write that records
+        // `Held`; a held slot never carries an idle record.
+        slot.recorded = None;
+    }
+}
+
 /// Test-only: drop one idle slot's closed observation, producing the
 /// legacy-shaped state a pool that never released under this version has.
 #[cfg(test)]
@@ -2943,7 +3086,8 @@ mod unknown_removable_tests {
             .expect("bounds-only gaps qualify");
             assert_eq!(step, UnknownRemovableStep::Evict, "available {available}");
         }
-        // Below the hard floor nothing prunes or admits, even with idle slots.
+        // Below the hard floor the pool still reclaims first: an eligible idle
+        // slot is pruned and free space is re-read before anything decides.
         for available in [FLOOR - 1, 0] {
             let step = unknown_removable_step(
                 &bounds(&[AccountingGapKind::ElapsedDeadline]),
@@ -2953,9 +3097,19 @@ mod unknown_removable_tests {
                 true,
             )
             .expect("bounds-only gaps qualify");
+            assert_eq!(step, UnknownRemovableStep::Evict, "available {available}");
+            // With nothing left to prune the same free space refuses.
+            let step = unknown_removable_step(
+                &bounds(&[AccountingGapKind::ElapsedDeadline]),
+                Some(available),
+                Some(RESERVE),
+                FLOOR,
+                false,
+            )
+            .expect("bounds-only gaps qualify");
             assert!(
                 matches!(step, UnknownRemovableStep::Refuse(_)),
-                "available {available}"
+                "available {available} with no idle left"
             );
         }
     }
@@ -2963,8 +3117,19 @@ mod unknown_removable_tests {
     #[test]
     fn the_hard_floor_wins_over_a_lower_legacy_reserve() {
         let original = bounds(&[AccountingGapKind::EntryLimit]);
-        // 5 GiB free, a legacy 2 GiB reserve: free is above the reserve, yet
-        // below the floor, so nothing admits and nothing is evicted.
+        // 5 GiB free, a legacy 2 GiB reserve: free is above the reserve yet
+        // below the floor, so nothing admits merely because of the reserve.
+        // With an eligible idle slot the pool reclaims first...
+        let step = unknown_removable_step(
+            &original,
+            Some(5 * 1024 * 1024 * 1024),
+            Some(2 * 1024 * 1024 * 1024),
+            FLOOR,
+            true,
+        )
+        .expect("bounds-only gaps qualify");
+        assert_eq!(step, UnknownRemovableStep::Evict);
+        // ...and with nothing left to prune it refuses rather than admitting.
         let step = unknown_removable_step(
             &original,
             Some(5 * 1024 * 1024 * 1024),
@@ -2977,49 +3142,10 @@ mod unknown_removable_tests {
             UnknownRemovableStep::Refuse(scan) => assert_eq!(scan, original),
             other => panic!("the floor must win over a lower reserve: {other:?}"),
         }
-        // The same free space with idle slots available prunes rather than
-        // admitting below the floor.
-        let step = unknown_removable_step(
-            &original,
-            Some(5 * 1024 * 1024 * 1024),
-            Some(2 * 1024 * 1024 * 1024),
-            FLOOR,
-            true,
-        )
-        .expect("bounds-only gaps qualify");
-        match step {
-            UnknownRemovableStep::Refuse(scan) => assert_eq!(scan, original),
-            other => panic!("the floor must stop even with idle slots: {other:?}"),
-        }
         // Equality at the floor admits with a warning when nothing is left.
         let step = unknown_removable_step(&original, Some(FLOOR), Some(RESERVE), FLOOR, false)
             .expect("bounds-only gaps qualify");
         assert!(matches!(step, UnknownRemovableStep::AdmitAtFloor(_)));
-    }
-
-    #[test]
-    fn with_nothing_left_to_prune_the_hard_floor_decides() {
-        let original = bounds(&[AccountingGapKind::EntryLimit]);
-        for available in [RESERVE - 1, FLOOR, FLOOR + 1] {
-            let step =
-                unknown_removable_step(&original, Some(available), Some(RESERVE), FLOOR, false)
-                    .expect("bounds-only gaps qualify");
-            let UnknownRemovableStep::AdmitAtFloor(note) = step else {
-                panic!("{available} free with nothing to prune must admit at the floor: {step:?}");
-            };
-            assert!(note.contains("hard floor"), "{note}");
-            assert!(note.contains("warning"), "{note}");
-            assert!(note.contains("nothing was evicted"), "{note}");
-        }
-        for available in [FLOOR - 1, 0] {
-            let step =
-                unknown_removable_step(&original, Some(available), Some(RESERVE), FLOOR, false)
-                    .expect("bounds-only gaps qualify");
-            match step {
-                UnknownRemovableStep::Refuse(scan) => assert_eq!(scan, original),
-                other => panic!("{available} free is below the floor and must refuse: {other:?}"),
-            }
-        }
     }
 
     #[test]
@@ -3059,6 +3185,280 @@ mod unknown_removable_tests {
             ));
         }
         assert!(bound_gaps_only(&bounds(&[AccountingGapKind::EntryLimit])));
+    }
+}
+
+/// Production-path exercises of a removable-backed pool.
+///
+/// These build a real `Pool` over a tiny owned fixture payload
+/// ([`volume_pool_for_test`]) with verified-volume facts supplied by
+/// [`crate::volume::verified_facts`], then call the same
+/// admission/count/runtime methods production uses. The fake boundary is only
+/// the volume's capacity/available numbers: descriptor, mount rule, device and
+/// path checks in `Binding::verify()` still run for real, and nothing here is
+/// evidence that a real volume was verified or that a disk image was used.
+#[cfg(test)]
+mod removable_pool_path_tests {
+    use super::*;
+    use crate::volume::verified_facts::{self, VolumeFacts};
+    use std::os::unix::fs::PermissionsExt;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const CAP: u64 = 64 * 1024 * 1024;
+    const RESERVE: u64 = 20 * GIB;
+    const FLOOR: u64 = 10 * GIB;
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let parent = base.join("removable-path");
+            fs::create_dir_all(&parent).expect("fixture parent");
+            let root = parent.join(format!("{label}-{:x}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir(&root).expect("fixture root");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
+            Self { root }
+        }
+
+        fn pool(&self, reserve: Option<u64>) -> Pool {
+            let pool_root = self.root.join("pool");
+            let payload = self.root.join("payload");
+            for path in [&pool_root, &payload, &payload.join(SLOTS_NAME)] {
+                fs::create_dir_all(path).expect("fixture directory");
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .expect("private directory");
+            }
+            volume_pool_for_test(&pool_root, &payload, CAP, reserve).expect("removable pool")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn bounds_scan() -> AccountingScan {
+        AccountingScan {
+            coverage: AccountingCoverage::Partial,
+            gaps: vec![AccountingGap {
+                kind: AccountingGapKind::EntryLimit,
+                occurrences: 1,
+            }],
+            vanished: 0,
+            entries_visited: 12,
+            elapsed_ms: 5,
+            max_entries: 1,
+            max_depth: 66,
+            max_elapsed_ms: 60_000,
+        }
+    }
+
+    fn facts(available: u64) -> VolumeFacts {
+        VolumeFacts {
+            capacity_bytes: Some(1024 * GIB),
+            available_bytes: Some(available),
+            verify_error: None,
+            available_sequence: Vec::new(),
+            verify_error_after: None,
+            reads: 0,
+        }
+    }
+
+    /// A volume whose free space changes between readings, as after a prune.
+    fn recovering(readings: &[u64]) -> VolumeFacts {
+        VolumeFacts {
+            available_sequence: readings.iter().map(|bytes| Some(*bytes)).collect(),
+            ..facts(FLOOR)
+        }
+    }
+
+    fn idle_dir(pool: &mut Pool, id: u64, rank: u64) -> PathBuf {
+        let path = add_idle_slot_for_test(pool, id, rank, 1024, 1).expect("idle slot");
+        for directory in [path.clone(), path.join("build")] {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("private slot directory");
+        }
+        path
+    }
+
+    #[test]
+    fn foreign_volume_usage_never_evicts_a_pool_below_its_cap() {
+        let fixture = Fixture::new("foreign");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let idle = idle_dir(&mut pool, 1, 1);
+        let record = pool.slot(1).and_then(|slot| slot.recorded.clone());
+        // 1014 GiB of unrelated data on the volume, pool bytes far below cap.
+        let facts = facts(10 * GIB);
+        verified_facts::with(facts, || {
+            let used = pool.recorded_total().expect("complete pool figure");
+            assert!(used < CAP, "pool figure {used} is not below the cap");
+            // The frozen rule: the cap comparison never sees the volume total.
+            // Restoring `max(recorded, volume_used)` would make this evict.
+            pool.evict_idle_until_under_cap().expect("no pressure");
+            assert!(
+                pool.slot(1).is_some(),
+                "a pool below its cap evicted an idle slot for foreign volume bytes"
+            );
+            assert_eq!(pool.slot(1).and_then(|slot| slot.recorded.clone()), record);
+            assert!(
+                idle.join("build").join("blob-0").is_file(),
+                "payload removed"
+            );
+        });
+    }
+
+    #[test]
+    fn pool_bytes_over_the_cap_evict_the_lru_idle_slot_and_never_a_held_one() {
+        let fixture = Fixture::new("over-cap");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let older = idle_dir(&mut pool, 1, 1);
+        let newer = idle_dir(&mut pool, 2, 2);
+        let newest = idle_dir(&mut pool, 3, 3);
+        // A held slot with the oldest rank: if it were eligible it would be
+        // the first victim, so its survival proves the held exclusion.
+        idle_dir(&mut pool, 4, 0);
+        hold_slot_for_test(&mut pool, 4, "writer");
+        for slot in pool.ledger.slots.iter_mut() {
+            if let Some(record) = slot.recorded.as_mut() {
+                record.unique_bytes = CAP / 3; // pool bytes now at the cap
+            }
+        }
+        verified_facts::with(facts(10 * GIB), || {
+            pool.evict_idle_until_under_cap()
+                .expect("known-byte eviction");
+        });
+        assert!(!older.exists(), "the rank-LRU idle slot was not evicted");
+        assert!(
+            newer.exists() && newest.exists(),
+            "a newer idle slot was evicted first"
+        );
+        assert!(pool.slot(4).is_some(), "a held slot was evicted");
+    }
+
+    #[test]
+    fn the_unknown_route_prunes_one_idle_slot_then_admits_above_the_reserve() {
+        let fixture = Fixture::new("prune-one");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let victim = idle_dir(&mut pool, 1, 1);
+        let mut reads = 0u64;
+        verified_facts::with(recovering(&[FLOOR - GIB, RESERVE + GIB]), || {
+            // Below the floor with an eligible idle slot: prune it, re-read
+            // free space, and admit once it is above the reserve.
+            let outcome = pool.admit_unknown_removable(&bounds_scan());
+            reads = verified_facts::reads();
+            outcome.expect("the recovered admission succeeds");
+        });
+        assert!(
+            reads >= 2,
+            "free space was not re-read after the prune ({reads})"
+        );
+        assert!(!victim.exists(), "the eligible idle slot was not pruned");
+        assert!(
+            slot_ids_for_test(&pool).is_empty(),
+            "a second victim was taken"
+        );
+        let note = pool.admission_note.clone().unwrap_or_default();
+        assert!(note.contains("cap is unverified"), "{note}");
+        assert!(note.contains("GiB"), "the note must use binary GiB: {note}");
+    }
+
+    #[test]
+    fn the_unknown_route_refuses_when_nothing_is_left_and_free_is_below_the_floor() {
+        let fixture = Fixture::new("exhausted");
+        let mut pool = fixture.pool(Some(RESERVE));
+        verified_facts::with(facts(FLOOR - GIB), || {
+            let scan = bounds_scan();
+            match pool.admit_unknown_removable(&scan) {
+                Err(LeaseError::AccountingIncomplete(original)) => {
+                    assert_eq!(*original, scan, "the original scan was not preserved")
+                }
+                other => panic!("below the floor with nothing to prune must refuse: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn the_unknown_route_admits_with_a_warning_between_the_floor_and_the_reserve() {
+        let fixture = Fixture::new("warning");
+        let mut pool = fixture.pool(Some(RESERVE));
+        idle_dir(&mut pool, 1, 1);
+        verified_facts::with(facts(FLOOR), || {
+            pool.admit_unknown_removable(&bounds_scan())
+                .expect("at the floor with nothing left admits");
+        });
+        let note = pool.admission_note.clone().unwrap_or_default();
+        assert!(note.contains("warning"), "{note}");
+        assert!(
+            note.contains("10.0 GiB"),
+            "the floor must print as binary GiB: {note}"
+        );
+    }
+
+    #[test]
+    fn a_failed_verification_after_a_prune_stops_the_route() {
+        let fixture = Fixture::new("verify-fail");
+        let mut pool = fixture.pool(Some(RESERVE));
+        idle_dir(&mut pool, 1, 1);
+        let mut read = 0u64;
+        let mut broken = recovering(&[FLOOR - GIB, FLOOR - GIB]);
+        broken.verify_error_after = Some(1);
+        verified_facts::with(broken, || {
+            let outcome = pool.admit_unknown_removable(&bounds_scan());
+            read = verified_facts::reads();
+            assert!(
+                matches!(outcome, Err(LeaseError::BackingMismatch)),
+                "a failed verification after a prune must stop: {outcome:?}"
+            );
+        });
+        assert!(read >= 1);
+    }
+
+    #[test]
+    fn count_replacement_uses_count_pressure_only() {
+        let fixture = Fixture::new("count");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let victim = idle_dir(&mut pool, 1, 1);
+        idle_dir(&mut pool, 2, 2);
+        hold_slot_for_test(&mut pool, 2, "writer");
+        // A tiny entry bound makes the pool figure genuinely unknown for a
+        // bound gap, which is the only shape the count gate may allow.
+        pool.limits = InventoryLimits {
+            max_entries: 1,
+            ..accounting_limits()
+        };
+        with_accounting_limits(1, 64, 60_000, || {
+            verified_facts::with(facts(10 * GIB), || {
+                pool.pressure_known_or_bounded_removable()
+                    .expect("bounds-only removable count pressure is allowed");
+                pool.replace_idle_slot_for_admission(1)
+                    .expect("the count replacement proceeds");
+            });
+        });
+        assert!(
+            !victim.exists(),
+            "the count replacement did not retire its victim"
+        );
+        assert!(pool.slot(2).is_some(), "the held slot was touched");
+        // The same incomplete figure must not authorise a byte-pressure
+        // deletion on the known-usage path.
+        with_accounting_limits(1, 64, 60_000, || {
+            let outcome = pool.evict_idle_until_under_cap();
+            assert!(
+                matches!(outcome, Err(LeaseError::AccountingIncomplete(_))),
+                "byte pressure on an unknown removable figure must refuse: {outcome:?}"
+            );
+        });
+        assert!(
+            pool.slot(2).is_some(),
+            "an unknown figure deleted a held slot"
+        );
     }
 }
 

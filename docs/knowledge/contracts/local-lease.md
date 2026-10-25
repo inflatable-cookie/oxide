@@ -634,8 +634,9 @@ mutating command's admission gate, before any library write can fence the
 ledger. `Pool::recorded_total()` replaces the whole-payload admission walk
 with `pool_scope()` (a new `inventory::scope_directory` entry point with a
 ledger-membership hard stop, observed on its own debug-only
-`OXIDE_TEST_SCOPE_LOG`) plus one figure per slot; `Pool::pressure()` adds the
-verified volume's used bytes for a removable pool. `release_or_recover`
+`OXIDE_TEST_SCOPE_LOG`) plus one figure per slot, and `Pool::pressure()` is
+that same pool figure for **both** backings: a shared removable volume's other
+occupants are not this pool's usage. `release_or_recover`
 measures the one slot it closes and publishes the record in the same atomic
 `Held -> Idle` replacement; every transition out of `Idle` clears it. Default
 `oxide status` reports the ledger's recorded total and per-slot record as the
@@ -650,10 +651,10 @@ for reconciliation. Reuse of that same idle slot still walks it and still
 refuses. (2) `pool_scope()` needed its own walker: `extra_depth` only raises
 `max_depth` and files at the bound are still counted, so any depth bound would
 either descend into legacy `slots/<id>` roots or report a `DepthLimit` gap at
-labelled `slots/<folder>/<profile>-<id>` roots. (3) The legacy 5 s
-`VOLUME_WALK_MS` bound now applies to the *required* walk of a removable pool,
-so the volume-used-bytes fallback stays reachable exactly where it was: a pool
-that still has unrecorded slots.
+labelled `slots/<folder>/<profile>-<id>` roots. (3) The 5 s
+`VOLUME_WALK_MS` bound applies to the walks a removable pool's figure needs, so
+a pool too large to measure reaches the unknown-size reserve route instead of
+timing out mid-walk.
 
 **Evidence state.** Source and unit regressions are in this change. The
 focused proof `scripts/test-recorded-slot-accounting.py` and its three
@@ -876,11 +877,13 @@ build-time reserve watchdog are unchanged.
 
 An unknown pool size is honest and never zero. When the pool's own walk stops
 at its own bounds (`ElapsedDeadline` or `EntryLimit` only), the reserve route
-applies: free space **above** the registered reserve admits with a bounded
-note and no eviction; at or below the reserve it prunes the eligible idle whole
-slots in the existing LRU order, re-reading free space after each; with nothing
-left to prune, free space **at or above the 10 GiB hard floor** admits with a
-warning and below it refuses with the original incomplete scan. The floor is a
+applies and it **is** allowed to prune: free space above the reserve (and at or
+above the floor) admits with a bounded note and no eviction; free space at or
+below the reserve — and any free space below the hard floor while anything is
+left to prune — retires the eligible idle whole slots in the existing LRU order,
+re-reading free space and re-verifying the binding after each; with nothing left
+to prune, free space **at or above the 10 GiB hard floor** admits with a warning
+and below it refuses with the original incomplete scan. The floor is a
 fixed product constant for this change — not a registration field, selection or
 watchdog setting — and it wins over any lower legacy reserve, so nothing
 admits below it. Every other incomplete shape, an unverifiable binding, unknown
@@ -888,12 +891,14 @@ free or reserve facts, and the internal directory pool's own incompleteness
 refuse exactly as before; a partial scan is never published as a record and the
 cap stays stated as unverified on this route.
 
-Provenance is printed (`recorded n/m slots` plus `volume used X of Y`). The
-volume figure already includes everything else on the volume, so the maximum
-never undercounts; where the two disagree the larger, more conservative figure
-governs eviction order. Unknown capacity or available bytes still refuse
-`unknown_accounting`, and an absent, mismatched or unverifiable backing still
-refuses before any effect.
+Provenance is printed (`recorded n/m slots`). Free space, the reserve and the
+hard floor are printed in binary GiB, the same units they are defined in, and
+the cap comparison never includes the volume's total used bytes. Unknown free or
+reserve facts refuse `unknown_accounting` on the unknown route, and an absent,
+mismatched or unverifiable backing still refuses before any effect. The
+below-reserve *selection* fallback and the running-build reserve watchdog keep
+their existing behaviour; widening them to prune and to use a registration floor
+field is the approved follow-up, not part of this change.
 
 **Fallback disposition.** `admit_by_volume_usage`, its
 `VolumeAdmission` decision and the bounded multi-eviction loop are **retired**:
@@ -1048,9 +1053,11 @@ decision mocks where a real path exists:
    admission), a v4 control still hands off, and a v5 document without the
    fence or with an unknown fence value refuses; old-binary refusal is
    exercised as a ledger parse/validation refusal, not a mutation.
-9. **Removable combination.** `max(sum, volume_used)` arithmetic with
-   controlled facts: sum above used, used above sum, both unknown, and the
-   legacy fallback reachable only with bound-only gaps.
+9. **Removable combination.** The cap uses pool bytes only, so a volume whose
+   unrelated used bytes exceed the cap still admits with no eviction while the
+   pool is below it; the unknown-size route acts on free space against the
+   reserve and the 10 GiB floor (prune, warn-admit or refuse), never on
+   whole-volume usage, and only for bound-only gaps.
 10. **Release failure paths.** Incomplete walk, conditional-recheck mismatch and
     a lost reply all leave the pool consistent and never publish a figure.
 
