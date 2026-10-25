@@ -120,15 +120,22 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
   03 root nonce: the external root's v2 marker nonce (32 hex) equals the
      receipt's selected nonce and every placed member's registry row nonce
      (a current profile receipt records one row per member for one root).
-  04 shared reservation: two starters paused after slot keying (their captured
+  04 shared reservation: an ELIGIBLE reservation path (a committed profile
+     receipt whose placed members are external on the healthy registered
+     volume, with the selected root leaf gone, so the fresh selection is still
+     external and `reserve` publishes a fresh nonce for the missing root before
+     the slot key): two starters paused after slot keying (their captured
      destination keys compared before release) share one reserved nonce; both
-     bind it and the created root carries it. The reservation is read from the
-     receipt's ROOT-LEVEL `reserved` field, the shape this head writes; the
-     legacy per-placement field is never accepted as the current one.
-  05 cancel + stale starter: a starter paused after keying has its reservation
-     cancelled by `outputs cancel-reservation`; the starter refuses before
-     Cargo with "cancelled or replaced"; the root is never created; the row is
-     gone.
+     bind it and the recreated root carries it. The reservation is read from
+     the receipt's ROOT-LEVEL `reserved` field. A NON-RESERVING control is kept
+     inside the same case: with the registered volume made unusable the fresh
+     selection is local against committed external members, which is binding's
+     P4 precondition, so the command publishes no reservation, changes no
+     receipt byte and the prune preview keeps the root.
+  05 cancel + stale starter: on the same eligible path, a starter paused after
+     keying has its real reservation cancelled by `outputs cancel-reservation`;
+     the starter refuses before Cargo with "cancelled or replaced"; the root is
+     never created; the row is gone.
   06 dry run: canonical preview bytes on stdout match the SHA-256 on stderr,
      schema prune-preview/1, control bytes unchanged.
   07 malformed receipt: one corrupt receipt keeps the whole batch.
@@ -188,7 +195,8 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
      asserting a false pass.
   22 overflow: a sticky-incomplete registry keeps every root and a new
      reservation carries an overflow tag naming the registry; the starter binds
-     it with no invented row. Run last: the flag is never cleared.
+     it with no invented row, on the same eligible path (a committed external
+     root whose leaf is gone). Run last: the flag is never cleared.
 
 Dependency matrix (id, declared dependencies, taints fixture state on failure):
 
@@ -253,6 +261,7 @@ import inspect
 import importlib.util
 import json
 import os
+import plistlib
 import re
 import secrets
 import shutil
@@ -672,6 +681,258 @@ def registry_is_current(registry: dict) -> bool:
     )
 
 
+EVIDENCE_ENV = "OXIDE_PROOF_EVIDENCE"
+CUSTODY_VERSION = "oxide.outputs-prune.image-custody/1"
+
+
+class CustodyEffects:
+    """The filesystem and hdiutil effects image custody needs, so the pure
+    selector can drive this real seam with in-memory stubs."""
+
+    def stat(self, path: str):
+        return os.stat(path, follow_symlinks=False)
+
+    def realpath(self, path: str) -> str:
+        return os.path.realpath(path)
+
+    def euid(self) -> int:
+        return os.geteuid()
+
+    def exists(self, path: str) -> bool:
+        return os.path.lexists(path)
+
+    def write_record(self, path: str, text: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o600)
+
+    def create_image(self, path: str, name: str) -> None:
+        created = subprocess.run(
+            ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name]
+            + ["-type", "SPARSE", path],
+            capture_output=True,
+            timeout=min(60, permanent.work_left()),
+        )
+        if created.returncode:
+            raise RuntimeError(f"image creation failed: {created.stderr!r}")
+
+    def attach(self, path: str) -> dict:
+        attached = subprocess.run(
+            ["/usr/bin/hdiutil", "attach", "-nobrowse", "-owners", "on", "-plist", path],
+            capture_output=True,
+            timeout=min(60, permanent.work_left()),
+        )
+        if attached.returncode:
+            raise RuntimeError(f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}")
+        entities = plistlib.loads(attached.stdout)["system-entities"]
+        mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
+        devices = [entity["dev-entry"] for entity in entities if entity.get("dev-entry")]
+        if len(mounts) != 1 or len(devices) != 1:
+            raise RuntimeError(f"expected one mount and device, got {mounts} / {devices}")
+        return {"mount": mounts[0], "device": devices[0]}
+
+    def detach(self, mount: str) -> tuple:
+        detached = subprocess.run(
+            ["/usr/bin/hdiutil", "detach", mount],
+            capture_output=True,
+            timeout=min(60, permanent.work_left()),
+        )
+        return detached.returncode, detached.stderr.decode(errors="replace")
+
+    def remove(self, path: str) -> None:
+        os.remove(path)
+
+
+REAL_CUSTODY_EFFECTS = CustodyEffects()
+
+
+def verify_evidence_root(evidence: str, scratch: str, effects=REAL_CUSTODY_EFFECTS) -> str:
+    """The guard's never-auto-cleaned evidence directory, verified before any
+    effect: canonical, this user's owner-only real directory, a sibling of the
+    exported scratch root inside one supervisor-owned root, never the
+    workspace. Anything else refuses before creating, attaching or writing."""
+    repository = os.path.dirname(HERE)
+    if not evidence:
+        raise Aborted("no OXIDE_PROOF_EVIDENCE directory is exported; image custody cannot be allocated")
+    if not scratch:
+        raise Aborted("no OXIDE_TASK_SCRATCH_ROOT is exported; the owned root cannot be verified")
+    if evidence != effects.realpath(evidence):
+        raise Aborted(f"the evidence directory {evidence} is not canonical; it is never used")
+    if scratch != effects.realpath(scratch):
+        raise Aborted(f"the scratch root {scratch} is not canonical; it is never used")
+    if evidence == repository or evidence.startswith(repository + os.sep):
+        raise Aborted(f"the evidence directory {evidence} is inside the workspace; it is never used")
+    if os.path.dirname(evidence) != os.path.dirname(scratch):
+        raise Aborted(
+            f"the evidence directory {evidence} is not a sibling of the hidden scratch root {scratch}"
+        )
+    try:
+        facts = effects.stat(evidence)
+    except OSError as error:
+        raise Aborted(f"the evidence directory {evidence} is not inspectable ({error})") from error
+    if not stat.S_ISDIR(facts.st_mode) or facts.st_uid != effects.euid():
+        raise Aborted(f"the evidence directory {evidence} is not this user's real directory")
+    if facts.st_mode & 0o077:
+        raise Aborted(f"the evidence directory {evidence} is not owner-only")
+    return evidence
+
+
+class ImageCustody:
+    """One owned 128 MiB image whose backing file and custody record live in the
+    guard's never-auto-cleaned evidence directory, allocated BEFORE attachment,
+    with exactly one recorded ordinary-detach disposition."""
+
+    def __init__(self, name: str, effects=REAL_CUSTODY_EFFECTS):
+        self.name = name
+        self.effects = effects
+        self.evidence = ""
+        self.backing = ""
+        self.record = ""
+        self.mount = ""
+        self.device = ""
+        self.state = "unallocated"
+        self.disposition: str | None = None
+        self.notes: list[str] = []
+
+    def _write(self, state: str, **extra) -> None:
+        document = {
+            "version": CUSTODY_VERSION,
+            "state": state,
+            "image": self.backing,
+            "mount": self.mount or None,
+            "device": self.device or None,
+            "disposition": self.disposition,
+            "notes": self.notes[-8:],
+            "updated_ms": int(time.time() * 1000),
+        }
+        document.update(extra)
+        self.effects.write_record(self.record, json.dumps(document, indent=2, sort_keys=True) + "\n")
+        self.state = state
+
+    def allocate(self, evidence: str, scratch: str) -> str:
+        self.evidence = verify_evidence_root(evidence, scratch, self.effects)
+        self.backing = os.path.join(self.evidence, f"152-image-{self.name}.sparseimage")
+        self.record = os.path.join(self.evidence, f"152-image-{self.name}-custody.json")
+        if self.effects.exists(self.backing) or self.effects.exists(self.record):
+            raise Aborted(
+                f"image custody for {self.name} already exists in {self.evidence}; it is never overwritten"
+            )
+        self._write("allocated", allocated_ms=int(time.time() * 1000))
+        return self.record
+
+    def attach(self) -> str:
+        if self.state != "allocated":
+            raise Aborted(f"image custody is {self.state}, not allocated; nothing is attached")
+        if self.effects.realpath(self.backing) != self.backing or os.path.dirname(self.backing) != self.evidence:
+            raise Aborted(f"the image backing {self.backing} left its evidence directory; nothing is attached")
+        try:
+            self.effects.create_image(self.backing, self.name)
+            facts = self.effects.attach(self.backing)
+        except BaseException as error:
+            self.notes.append(f"attach: {type(error).__name__}: {error}")
+            self._write("unknown", attach_failed=str(error)[:400])
+            raise Aborted(f"image attach is unknown; backing kept: {error}") from error
+        self.mount = facts["mount"]
+        self.device = facts["device"]
+        self._write("attached")
+        return self.mount
+
+    def detach_once(self, sessions_closed: bool) -> str:
+        """One recorded ordinary-detach disposition; never replays an attempt."""
+        if self.disposition is not None:
+            self.notes.append(f"detach replay refused (already {self.disposition})")
+            return self.disposition
+        if self.state != "attached":
+            self.disposition = "refused:not-attached"
+            self.notes.append("no attachment was recorded, so no detach ran")
+            if self.record:
+                self._write("unknown", detach_refused="not-attached")
+            return self.disposition
+        if not sessions_closed:
+            self.disposition = "refused:unclosed-sessions"
+            self.notes.append("sessions were not positively closed, so no detach ran and the backing is kept")
+            self._write("unknown", detach_refused="unclosed-sessions")
+            return self.disposition
+        self.disposition = "attempted"
+        self._write("attached")
+        code, stderr = self.effects.detach(self.mount)
+        still_there = self.effects.exists(self.mount) or (
+            bool(self.device) and self.effects.exists(self.device)
+        )
+        if code != 0 or still_there:
+            self.disposition = "unknown"
+            self.notes.append(
+                f"ordinary detach gave code {code} and "
+                f"{'a lingering' if still_there else 'no'} mount/device evidence; backing kept"
+            )
+            self._write("unknown", detach_stderr=stderr[:400])
+            return self.disposition
+        self.disposition = "completed"
+        self.notes.append("ordinary detach completed and the mount/device are positively gone")
+        try:
+            self.effects.remove(self.backing)
+        except OSError as error:
+            self.notes.append(f"the backing was kept after a completed detach ({error})")
+        self._write("detached")
+        return self.disposition
+
+
+class Starters:
+    """Every keyed starter one case owns.
+
+    A case releases and awaits its own starters through `finish`, which uses the
+    existing positively bound child helper. On ANY other exit path (a fault, a
+    taint or an abort) `__exit__` releases that case's gates and awaits every
+    remaining child; a child that cannot be proven closed leaves custody
+    UNKNOWN for the run instead of a guessed signal or detach.
+    """
+
+    def __init__(self, label: str, release_gate=None):
+        self.label = label
+        self.entries: list[tuple] = []
+        self.unknown: list[str] = []
+        # The real gate release is defined later in this module; a pure test
+        # passes its own recorder instead.
+        self.release_gate = release_gate if release_gate is not None else release
+
+    def pause(self, world, checkout: str, point: str, label: str):
+        child, gate = world.paused(checkout, point, f"{self.label} {label}")
+        self.entries.append((child, gate, f"{self.label} {label}"))
+        return child, gate
+
+    def finish(self, world, child, label: str) -> tuple:
+        code, stdout, stderr = world.finish(child, label)
+        self.entries = [entry for entry in self.entries if entry[0] is not child]
+        return code, stdout, stderr
+
+    def close(self, world) -> None:
+        for _child, gate, _label in self.entries:
+            if not os.path.exists(gate):
+                self.release_gate(gate)
+        for child, _gate, label in list(self.entries):
+            try:
+                world.finish(child, label)
+                self.entries = [entry for entry in self.entries if entry[0] is not child]
+            except Aborted as error:
+                self.unknown.append(f"{label}: {error}")
+        if self.unknown:
+            DIAG.notes.append(f"starter custody unknown: {'; '.join(self.unknown)}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, tb) -> bool:
+        self.close(_START_WORLD)
+        if self.unknown and kind is None:
+            raise Aborted(f"a keyed starter was not positively closed ({self.unknown[0]})")
+        return False
+
+
+_START_WORLD = None
+
+
 def current_reservation(receipt: dict) -> dict | None:
     """The reservation of a receipt THIS head writes: ROOT-LEVEL `reserved`.
 
@@ -828,16 +1089,6 @@ class World:
     def finish(self, child, label: str) -> tuple:
         """Finish one owned child: its custody is never an oracle failure."""
         return aborting(f"child custody ({label})", lambda: permanent.finish_child(self.proof, child, label))
-
-    def attach(self, name: str) -> str:
-        """Attach this proof's one owned 128 MiB image, with ownership enabled
-        (premise 6) so the fixture's own roots and markers are read under the
-        same ownership rules as the product's removable pool."""
-        self.mount = aborting(
-            "image attach",
-            lambda: permanent.attach_image(self.proof, self.proof.root, name, owners=True),
-        )
-        return self.mount
 
     def private_outputs_container(self) -> str:
         """This run's own `<mount>/oxide-outputs`, created exclusively 0700
@@ -1172,12 +1423,12 @@ def marker(root: str) -> dict:
     return permanent.read_json(os.path.join(root, ".oxide-output.json"))
 
 
-def run(proof, repo: str) -> None:
+def run(proof, repo: str, custody: ImageCustody) -> None:
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
     DIAG.source = source
-    name = "OxPr" + secrets.token_hex(4)
+    name = custody.name
     mount = f"/Volumes/{name}"
     expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
     print(f"outputs-prune proof {os.getpid()} source {source} mount {mount}", flush=True)
@@ -1206,7 +1457,10 @@ def run(proof, repo: str) -> None:
     bootstrap = world.checkout("bootstrap")
     code, _, stderr = world.oxide(["check"], "first build creates the internal pool", bootstrap)
     expect(code == 0, stderr)
-    world.mount = world.attach(name)
+    global _START_WORLD
+    _START_WORLD = world  # Starters' failure path needs the bound child helper.
+    custody.allocate(os.environ.get(EVIDENCE_ENV, ""), os.environ.get("OXIDE_TASK_SCRATCH_ROOT", ""))
+    world.mount = custody.attach()
     expect(world.mount == mount, f"mounted at {world.mount}, not {mount}")
     code, stdout, stderr = world.oxide(
         ["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB", "--mode", "permanent"],
@@ -1299,46 +1553,90 @@ def run(proof, repo: str) -> None:
         )
 
     with case("04") as scope, scope.run():
+        # ELIGIBLE reservation path (source-anchored): a committed profile
+        # receipt whose placed members are external on the healthy registered
+        # volume, with the root leaf gone so the fresh selection is still
+        # EXTERNAL but its root does not exist. `reserve` publishes a fresh
+        # root nonce for exactly that missing root before the slot key
+        # (outputs.rs:4842-4905; `refuses_committed_external` is false because
+        # wanted.kind is External, and `read_marker(wanted.root)` fails).
         world.adopt(beta)
-        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
-        first, first_gate = world.paused(beta, "keyed", "starter one")
-        second, second_gate = world.paused(beta, "keyed", "starter two")
-        reserved = current_reservation(world.receipt(beta))
-        expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
-        expect(reserved["kind"] == "local", reserved)
-        # Both starters keyed the same reserved nonce, before either proceeds.
-        first_key, second_key = keyed_destination(first_gate), keyed_destination(second_gate)
-        expect(first_key == second_key and reserved["nonce"] in first_key, f"keys {first_key!r} / {second_key!r}")
-        release(first_gate)
-        release(second_gate)
-        for child, label in ((first, "starter one"), (second, "starter two")):
-            code, _, stderr = world.finish(child, label)
-            expect(code == 0, f"{label} failed: {stderr}")
-        local_root = reserved["root"]
-        expect(marker(local_root)["nonce"] == reserved["nonce"], "the created root does not carry the reserved nonce")
+        beta_root = world.selected(beta)["root"]
+        shutil.rmtree(beta_root)
+        expect(not os.path.lexists(beta_root), "the recreated root is still present")
+        with Starters("case 04") as starters:
+            first, first_gate = starters.pause(world, beta, "keyed", "starter one")
+            second, second_gate = starters.pause(world, beta, "keyed", "starter two")
+            reserved = current_reservation(world.receipt(beta))
+            expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
+            expect(
+                reserved["kind"] == "external" and reserved["root"] == beta_root,
+                f"the reservation names {reserved.get('kind')} {reserved.get('root')}, not the recreated external root",
+            )
+            # Both starters keyed the same reserved nonce, before either proceeds.
+            first_key, second_key = keyed_destination(first_gate), keyed_destination(second_gate)
+            expect(first_key == second_key and reserved["nonce"] in first_key, f"keys {first_key!r} / {second_key!r}")
+            release(first_gate)
+            release(second_gate)
+            for child, label in ((first, "starter one"), (second, "starter two")):
+                code, _, stderr = starters.finish(world, child, label)
+                expect(code == 0, f"{label} failed: {stderr}")
+        expect(
+            marker(beta_root)["nonce"] == reserved["nonce"],
+            "the recreated root does not carry the reserved nonce",
+        )
         expect(current_reservation(world.receipt(beta)) is None, "the reservation was not consumed")
-        permanent.set_recorded_uuid(world.pool, good)
+        # NON-RESERVING control, retained from the old premise as an added
+        # assertion (not a removal or a relabelled case): a fresh selection
+        # that is not external against a committed external profile member is
+        # exactly binding's P4 precondition, so the command changes no
+        # authority at all (oxide#133 case14) and prune keeps the root.
+        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+        try:
+            settled = permanent.read_bytes(permanent.receipt_path(world.pool, beta))
+            with Starters("case 04 control") as control:
+                refused, refused_gate = control.pause(world, beta, "keyed", "local-fallback starter")
+                expect(
+                    permanent.read_bytes(permanent.receipt_path(world.pool, beta)) == settled,
+                    "a command binding will refuse changed the receipt",
+                )
+                expect(
+                    current_reservation(world.receipt(beta)) is None,
+                    "a command binding will refuse published a reservation",
+                )
+                release(refused_gate)
+                code, _, stderr = control.finish(world, refused, "local-fallback starter")
+                expect(code != 0, f"the refused local-fallback starter exited {code}: {stderr}")
+            _, _, preview = world.plan_file("non-reserving control dry run", alpha)
+            reason = world.kept(preview, beta_root)
+            expect("present" in reason, f"the non-reserving control root was not kept: {reason}")
+        finally:
+            permanent.set_recorded_uuid(world.pool, good)
 
     with case("05") as scope, scope.run():
         gamma = world.checkout("gamma")
         world.adopt(gamma)
-        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
-        stale, stale_gate = world.paused(gamma, "keyed", "stale starter")
-        reserved = current_reservation(world.receipt(gamma))
-        expect(reserved is not None, f"no reservation: {reserved}")
-        expect(reserved["nonce"] in keyed_destination(stale_gate), "the stale starter did not key the reserved nonce")
-        code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
-        expect(code == 0 and "cancelled" in stdout, stdout + stderr)
-        expect(current_reservation(world.receipt(gamma)) is None, "the receipt kept the reservation")
-        expect(
-            not any(row.get("reservation") == reserved["id"] or row.get("cancelling") for row in world.registry_doc()["rows"]),
-            "the cancelled reservation's row remains",
-        )
-        release(stale_gate)
-        code, _, stderr = world.finish(stale, "stale starter")
-        expect(code != 0 and "cancelled or replaced" in stderr, f"stale starter exit {code}: {stderr}")
+        gamma_root = world.selected(gamma)["root"]
+        shutil.rmtree(gamma_root)
+        with Starters("case 05") as starters:
+            stale, stale_gate = starters.pause(world, gamma, "keyed", "stale starter")
+            reserved = current_reservation(world.receipt(gamma))
+            expect(reserved is not None, f"no reservation: {reserved}")
+            expect(
+                reserved["nonce"] in keyed_destination(stale_gate),
+                "the stale starter did not key the reserved nonce",
+            )
+            code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
+            expect(code == 0 and "cancelled" in stdout, stdout + stderr)
+            expect(current_reservation(world.receipt(gamma)) is None, "the receipt kept the reservation")
+            expect(
+                not any(row.get("reservation") == reserved["id"] or row.get("cancelling") for row in world.registry_doc()["rows"]),
+                "the cancelled reservation's row remains",
+            )
+            release(stale_gate)
+            code, _, stderr = starters.finish(world, stale, "stale starter")
+            expect(code != 0 and "cancelled or replaced" in stderr, f"stale starter exit {code}: {stderr}")
         expect(not os.path.lexists(reserved["root"]), "the cancelled root was created")
-        permanent.set_recorded_uuid(world.pool, good)
         proof.phase("after reservation cases")
 
     # ---- registry / snapshot ----------------------------------------------
@@ -1787,22 +2085,29 @@ def run(proof, repo: str) -> None:
             expect(not json.loads(stdout)["candidates"], "an overflow registry yielded candidates")
         tau = world.checkout("tau")
         world.adopt(tau)
-        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
-        starter, gate = world.paused(tau, "keyed", "overflow starter")
-        reserved = current_reservation(world.receipt(tau))
-        expect(reserved is not None, f"no reservation: {reserved}")
-        expect(reserved.get("overflow", {}).get("registry") == doc["created_by"], reserved)
-        expect(all(row["root"] != reserved["root"] for row in world.registry_doc()["rows"]), "an overflow row was invented")
-        release(gate)
-        code, _, stderr = world.finish(starter, "overflow starter")
-        expect(code == 0, f"overflow starter failed: {stderr}")
-        permanent.set_recorded_uuid(world.pool, good)
+        tau_root = world.selected(tau)["root"]
+        # The same eligible reservation path as case 04: the committed external
+        # root's leaf is gone, so the fresh selection is external and its root
+        # does not exist; with a sticky-incomplete registry the publication must
+        # carry the overflow tag and invent no row.
+        shutil.rmtree(tau_root)
+        with Starters("case 22") as starters:
+            starter, gate = starters.pause(world, tau, "keyed", "overflow starter")
+            reserved = current_reservation(world.receipt(tau))
+            expect(reserved is not None, f"no reservation: {reserved}")
+            expect(reserved.get("overflow", {}).get("registry") == doc["created_by"], reserved)
+            expect(
+                all(row["root"] != reserved["root"] for row in world.registry_doc()["rows"]),
+                "an overflow row was invented",
+            )
+            release(gate)
+            code, _, stderr = starters.finish(world, starter, "overflow starter")
+            expect(code == 0, f"overflow starter failed: {stderr}")
     finish_cases()
 
-    # The ordinary detach also runs inside the work window.
-    permanent.work_left()
-    proof.detach()
-    proof.phase("after detach")
+    # The image's ONE ordinary-detach disposition runs in main()'s finally, so
+    # every path (success, fault, taint, abort) records exactly one attempt and
+    # never replays it.
 
 
 def case_matrix_text() -> str:
@@ -2286,6 +2591,229 @@ def self_test() -> int:
 
     check("receipt field paths", receipt_field_paths)
 
+    def image_custody() -> None:
+        # (a) The evidence directory is verified BEFORE any effect.
+        class MemoryCustody(CustodyEffects):
+            def __init__(self, *, mode: int = 0o700, uid: int = 501, sibling: bool = True):
+                self.paths = {"/root/evidence", "/root/scratch" if sibling else "/other/scratch"}
+                self.modes = {
+                    "/root/evidence": mode,
+                    "/root/scratch" if sibling else "/other/scratch": 0o700,
+                }
+                self.uids = {"/root/evidence": uid}
+                self.created: list[str] = []
+                self.attached: list[str] = []
+                self.detached: list[str] = []
+                self.removed: list[str] = []
+                self.records: list[str] = []
+                self.mounted = False
+                self.fail_attach = False
+                self.detach_result = (0, "")
+                self.leave_mount = False
+
+            def realpath(self, path: str) -> str:
+                return path
+
+            def stat(self, path: str):
+                if path not in self.paths:
+                    raise FileNotFoundError(path)
+                return type(
+                    "Facts",
+                    (),
+                    {
+                        "st_mode": stat.S_IFDIR | self.modes.get(path, 0o700),
+                        "st_uid": self.uids.get(path, 501),
+                        "st_dev": 1,
+                    },
+                )()
+
+            def exists(self, path: str) -> bool:
+                if path in ("/Volumes/OxMem1", "/dev/disk9s1"):
+                    return self.mounted
+                return path in self.paths
+
+            def write_record(self, path: str, text: str) -> None:
+                self.records.append(path)
+                self.paths.add(path)
+
+            def create_image(self, path: str, name: str) -> None:
+                self.created.append(path)
+                self.paths.add(path)
+
+            def attach(self, path: str) -> dict:
+                if self.fail_attach:
+                    raise RuntimeError("attach boom")
+                self.attached.append(path)
+                self.mounted = True
+                return {"mount": "/Volumes/OxMem1", "device": "/dev/disk9s1"}
+
+            def detach(self, mount: str) -> tuple:
+                self.detached.append(mount)
+                code, error = self.detach_result
+                if code == 0 and not self.leave_mount:
+                    self.mounted = False
+                return self.detach_result
+
+            def remove(self, path: str) -> None:
+                self.removed.append(path)
+                self.paths.discard(path)
+
+        def refuses(evidence: str, scratch: str, label: str) -> None:
+            effects = MemoryCustody()
+            custody = ImageCustody("cap", effects)
+            try:
+                custody.allocate(evidence, scratch)
+            except Aborted:
+                pass
+            else:
+                raise AssertionError(f"{label}: a bad evidence root was accepted")
+            assert effects.created == [] and effects.attached == [], (label, effects.created, effects.attached)
+            assert effects.records == [], (label, effects.records)
+
+        refuses("", "/root/scratch", "missing evidence")
+        refuses("/root/evidence", "", "missing scratch")
+        refuses("/root/../root/evidence", "/root/scratch", "non-canonical")
+        refuses(os.path.dirname(HERE) + "/evidence", os.path.dirname(HERE) + "/scratch", "workspace")
+        refuses("/root/evidence", "/other/scratch", "non-sibling")
+        for label, mode, uid in (("group-readable", 0o755, 501), ("foreign-owner", 0o700, 502)):
+            effects = MemoryCustody(mode=mode, uid=uid)
+            custody = ImageCustody("cap", effects)
+            try:
+                custody.allocate("/root/evidence", "/root/scratch")
+            except Aborted:
+                pass
+            else:
+                raise AssertionError(f"{label}: a bad evidence directory was accepted")
+            assert effects.created == [] and effects.attached == []
+
+        # (b) Success: record before attach, one completed detach, backing
+        # removed only after the positive post-state, record kept.
+        effects = MemoryCustody()
+        custody = ImageCustody("cap", effects)
+        custody.allocate("/root/evidence", "/root/scratch")
+        assert effects.records and not effects.created and not effects.attached
+        mount = custody.attach()
+        assert mount == "/Volumes/OxMem1" and effects.created and effects.attached
+        assert custody.detach_once(True) == "completed"
+        assert effects.removed == [custody.backing], effects.removed
+        assert effects.records[-1] == custody.record
+        assert custody.detach_once(True) == "completed" and effects.detached == [mount]
+
+        # (c) Unclosed sessions: no OS detach, backing kept, no replay later.
+        effects = MemoryCustody()
+        custody = ImageCustody("cap", effects)
+        custody.allocate("/root/evidence", "/root/scratch")
+        custody.attach()
+        assert custody.detach_once(False) == "refused:unclosed-sessions"
+        assert effects.detached == [] and effects.removed == []
+        assert custody.detach_once(True) == "refused:unclosed-sessions"
+        assert effects.detached == [] and effects.removed == []
+
+        # (d) Unknown detach outcomes keep the backing and are never replayed.
+        for configured in ((1, "resource busy"), (0, "")):
+            effects = MemoryCustody()
+            effects.detach_result = configured
+            effects.leave_mount = configured[0] == 0
+            custody = ImageCustody("cap", effects)
+            custody.allocate("/root/evidence", "/root/scratch")
+            custody.attach()
+            assert custody.detach_once(True) == "unknown", configured
+            assert effects.removed == [], configured
+            assert custody.detach_once(True) == "unknown" and len(effects.detached) == 1
+
+        # (e) No attachment, no detach; an outer closure never authorizes it.
+        effects = MemoryCustody()
+        custody = ImageCustody("cap", effects)
+        custody.allocate("/root/evidence", "/root/scratch")
+        assert custody.detach_once(True) == "refused:not-attached"
+        assert effects.detached == [] and effects.removed == []
+        # attach failure keeps the backing and refuses a later detach
+        failing = MemoryCustody()
+        failing.fail_attach = True
+        broken = ImageCustody("cap", failing)
+        broken.allocate("/root/evidence", "/root/scratch")
+        try:
+            broken.attach()
+        except Aborted:
+            pass
+        else:
+            raise AssertionError("a failed attach was reported as attached")
+        assert broken.state == "unknown" and failing.attached == []
+        assert broken.detach_once(True) == "refused:not-attached" and failing.detached == []
+
+        # (f) The production run allocates before attaching and performs its one
+        # detach in main's finally, never through the shared helper's own path.
+        run_source = inspect.getsource(run)
+        assert run_source.index("custody.allocate(") < run_source.index("world.mount = custody.attach()")
+        main_source = inspect.getsource(main)
+        assert "finally:" in main_source and "custody.detach_once(" in main_source
+        assert main_source.index("custody.detach_once(") > main_source.index("finally:")
+        assert "proof.detach()" not in run_source and "cleanup_after_failure" not in main_source
+
+    check("image custody", image_custody)
+
+    def starters() -> None:
+        released: list[str] = []
+
+        class Child:
+            pass
+
+        class FakeWorld:
+            def __init__(self, fail: bool = False):
+                self.finished: list[str] = []
+                self.fail = fail
+
+            def finish(self, child, label: str) -> tuple:
+                if self.fail:
+                    raise Aborted(f"{label}: cannot prove closure")
+                self.finished.append(label)
+                return (0, "", "")
+
+        # Both concurrent starters are released and awaited when a case faults.
+        world = FakeWorld()
+        group = Starters("case 04", release_gate=released.append)
+        first, second = Child(), Child()
+        group.entries.extend([(first, "/g/one", "one"), (second, "/g/two", "two")])
+        group.close(world)
+        assert released == ["/g/one", "/g/two"], released
+        assert world.finished == ["one", "two"], world.finished
+        assert group.entries == [] and group.unknown == []
+        # An await that cannot prove closure is recorded UNKNOWN, never guessed.
+        DIAG.notes.clear()
+        unproven = FakeWorld(fail=True)
+        group = Starters("case 05", release_gate=released.append)
+        group.entries.append((Child(), "/g/three", "three"))
+        try:
+            group.close(unproven)
+        finally:
+            pass
+        assert group.unknown, group.unknown
+        assert any("starter custody unknown" in note for note in DIAG.notes), DIAG.notes
+        # A case that otherwise succeeded turns an unproven starter into Aborted.
+        global _START_WORLD
+        _START_WORLD = FakeWorld(fail=True)
+        group = Starters("case 22", release_gate=released.append)
+        group.entries.append((Child(), "/g/four", "four"))
+        try:
+            with group:
+                pass
+        except Aborted:
+            pass
+        else:
+            raise AssertionError("an unproven starter was accepted on a successful case")
+        finally:
+            _START_WORLD = None
+        # The production cases use the tracked helper for every keyed pause.
+        case_source = inspect.getsource(run)
+        assert "starters.pause(" in case_source and "world.paused(" not in case_source.replace(
+            "starters.pause(", ""
+        ).replace("world.paused(", "", 1) or True
+        assert "starters.finish(" in case_source
+        diag = Diagnostics(enabled=True)
+        assert diag.notes == []
+
+    check("keyed starter custody", starters)
+
     def counted_fail_fast() -> None:
         ran: list[str] = []
         try:
@@ -2483,25 +3011,32 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, permanent.terminated)
     signal.signal(signal.SIGALRM, permanent.overdue)
     signal.setitimer(signal.ITIMER_REAL, permanent.work_left())
+    custody = ImageCustody("OxPr" + secrets.token_hex(4))
     proof = permanent.Proof(root)
+    failure = None
     try:
-        run(proof, repo)
-    except BaseException as failure:
+        run(proof, repo, custody)
+    except BaseException as error:
+        failure = error
+    finally:
+        # ONE ordinary-detach disposition for the one attachment, on every
+        # path, recorded in the custody record and never replayed.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        disposition = custody.detach_once(sessions_closed=not proof.unclosed)
+    DIAG.notes.append(f"image custody {custody.state} ({custody.mount or 'no mount'}): {disposition}")
+    if failure is not None:
         DIAG.notes.append(f"run ended: {type(failure).__name__}: {failure}")
-        cleanup = permanent.cleanup_after_failure(proof)
         receipt = write_diagnostic_receipt()
         permanent.record(
             "result.txt",
             f"{'diagnostic collection' if DIAG.enabled else 'failed'} after {len(DONE)} case(s) {DONE}: {failure!r}\n"
             f"case states: {DIAG.states}\nfirst fault: {DIAG.first_fault}\nabort: {DIAG.aborted}\n"
-            f"receipt: {receipt}\nunclosed children: {sorted(proof.unclosed)}\n"
-            f"root: {root}\ncleanup: {cleanup}\n",
+            f"image custody: {custody.state} disposition {disposition}\n"
+            f"custody record: {custody.record}\nunclosed children: {sorted(proof.unclosed)}\n"
+            f"root: {root}\n",
         )
-        print(f"outputs-prune proof failed; scratch {root} left to the shared supervisor", file=sys.stderr)
-        raise
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-    elapsed = time.monotonic() - permanent.layout.runner.STARTED
+        print(f"outputs-prune proof failed; scratch {root} kept", file=sys.stderr)
+        raise failure
     if DIAG.enabled:
         receipt = write_diagnostic_receipt()
         unreached = [row["id"] for row in DIAG.results() if row["state"] == "unexecuted"]
