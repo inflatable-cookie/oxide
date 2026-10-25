@@ -467,13 +467,15 @@ def same_alias_selection(held_env: dict, query_env: dict) -> bool:
 def delta_verdict(baseline: int, after: int, unique: int) -> tuple:
     """Whether a measured slot delta accounts for one unique allocation.
 
-    The rendered figure is truncated to KiB/MiB, so one MiB of tolerance is
-    honest; a delta near twice the unique bytes means the hard-linked pair was
-    counted by name instead of by inode.
+    The rendered figure is truncated to KiB/MiB, so one MiB of tolerance in
+    either direction is honest. The window is centred on ONE allocation: a
+    delta near twice the unique bytes is the by-name count of the hard-linked
+    pair and must fail, so the upper bound is `unique + 1 MiB`, not
+    `2·unique`.
     """
     delta = after - baseline
     tolerance = MIB
-    return unique - tolerance <= delta < 2 * unique - tolerance, delta
+    return unique - tolerance <= delta <= unique + tolerance, delta
 
 
 def image_custody_decision(mounted_after: bool, detach_ok: bool, mount: str) -> str:
@@ -1366,11 +1368,18 @@ class World:
         self.accepted: list[str] = []
         self.last_owned = ""
 
-    def env(self, **overrides: Optional[str]) -> dict:
-        # A fresh identifier on every launch: Cargo reruns the build script
-        # when it changes, and every consumed observation must carry it.
+    def launch(
+        self, base: Optional[dict] = None, **overrides: Optional[str]
+    ) -> dict:
+        """A fresh launch environment, cloned from `base` when one is given.
+
+        Cloning must NOT reuse the base's observation identifier: several
+        launches derived from one dictionary would share an identifier, so a
+        later command could pass by replaying an earlier run's warnings. The
+        identifier is always minted here, on the launch itself.
+        """
         self.nonces += 1
-        env = dict(self.base)
+        env = dict(base if base is not None else self.base)
         env["OXIDE_PROOF_NONCE"] = f"{self.nonce_seed}-{self.nonces}"
         for key, value in overrides.items():
             if value is None:
@@ -1378,6 +1387,11 @@ class World:
             else:
                 env[key] = value
         return env
+
+    def env(self, **overrides: Optional[str]) -> dict:
+        # A fresh identifier on every launch: Cargo reruns the build script
+        # when it changes, and every consumed observation must carry it.
+        return self.launch(None, **overrides)
 
     def observe(self, text: str, kind: str, env: dict) -> str:
         nonce = env.get("OXIDE_PROOF_NONCE")
@@ -1878,12 +1892,12 @@ def accounting(world: World, crate: str) -> None:
         # The measured status must run with the SAME unset aliases as the held
         # child, or it correctly describes its own prospective inherited value
         # instead of the held command's owned directory.
-        status_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+        baseline_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
         expect(
-            same_alias_selection(env, status_env),
+            same_alias_selection(env, baseline_env),
             "the measured status query does not use the held child's aliases",
         )
-        baseline = measure_slot(world, crate, slot, status_env)
+        baseline = measure_slot(world, crate, slot, baseline_env)
         # 16 MiB of unique data plus a hard link to one 8 MiB file: a walk that
         # counted the link by name would measure about 24 MiB. The baseline is
         # measured first, so build intermediates and the held marker cannot
@@ -1900,7 +1914,8 @@ def accounting(world: World, crate: str) -> None:
             and os.stat(first).st_dev == os.stat(link).st_dev,
             "the planted pair is not one inode",
         )
-        after = measure_slot(world, crate, slot, status_env)
+        after_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+        after = measure_slot(world, crate, slot, after_env)
         unique = 16 * MIB
         ok, delta = delta_verdict(baseline, after, unique)
         say(
@@ -2045,17 +2060,29 @@ def crash_and_recovery(world: World, crate: str) -> None:
         write_private(gate, "")
         if child.poll() is None:
             child.kill()
-            child.wait(timeout=10)
+            try:
+                child.wait(timeout=min(work_left(), 10))
+            except subprocess.TimeoutExpired:
+                pass
+            # Killing the Oxide PID says nothing about its writer group, so the
+            # custody of this fixture is unknown and must abort as such — it is
+            # never downgraded to an oracle failure.
+            abort(
+                "the gated crash child had to be forced closed, so its writers "
+                "are unknown and its scratch custody is uncertain"
+            )
 
 
 def spawns(world: World, crate: str) -> None:
     case(CASE_NAMES[8])
     # An inherited directory reaches every child and is never cleaned.
     inherited = private_dir(world.fixture("spawn-tmp"))
-    env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
-    tested = world.run(
-        ["test"], cwd=crate, env=dict(env, TEMP_EXPECT_PREFIX=inherited)
+    # One fresh environment per launch. `world.launch(<base>, ...)` clones and
+    # re-mints the identifier, so no two launches share one.
+    tested_env = world.env(
+        TMPDIR=inherited, TMP=None, TEMP=None, TEMP_EXPECT_PREFIX=inherited
     )
+    tested = world.run(["test"], cwd=crate, env=tested_env)
     results = tested.stdout + tested.stderr
     expect(
         "test result: ok" in results and "0 failed" in results,
@@ -2070,19 +2097,21 @@ def spawns(world: World, crate: str) -> None:
         open(os.path.join(inherited, "test-marker"), "rb").read() == b"test",
         "the test binary did not write its marker into the chosen directory",
     )
+    exec_env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
     tool = world.run(
         ["exec", "--", "/bin/sh", "-c", 'printf "%s\\n%s\\n%s" "$TMPDIR" "$TMP" "$TEMP"'],
         cwd=crate,
-        env=env,
+        env=exec_env,
     )
     lines = [line.strip() for line in tool.stdout.splitlines() if line.strip()]
     expect(
         {line.rstrip("/") for line in lines} == {canonical(inherited)},
         f"the exec tool did not inherit the chosen directory: {lines}",
     )
-    ran = world.run(["run"], cwd=crate, env=env)
+    run_env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
+    ran = world.run(["run"], cwd=crate, env=run_env)
     expect(
-        world.observe(ran.stdout, "run", env).rstrip("/") == canonical(inherited),
+        world.observe(ran.stdout, "run", run_env).rstrip("/") == canonical(inherited),
         f"the run program did not inherit the chosen directory: {ran.stdout[-1000:]}",
     )
     expect(
@@ -2101,24 +2130,26 @@ def spawns(world: World, crate: str) -> None:
     # The owned branch reaches the same children. The program is still the
     # directory's writer, so it runs under the held lease and the directory is
     # removed only after its group has closed.
-    owned_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
     prefix = os.path.join(os.path.realpath(world.pool), "payload")
-    tested = world.run(
-        ["test"], cwd=crate, env=dict(owned_env, TEMP_EXPECT_PREFIX=prefix)
+    owned_test_env = world.env(
+        TMPDIR=None, TMP=None, TEMP=None, TEMP_EXPECT_PREFIX=prefix
     )
+    tested = world.run(["test"], cwd=crate, env=owned_test_env)
     results = tested.stdout + tested.stderr
     expect(
         "1 passed" in results and "0 failed" in results,
         f"the owned-branch test did not run: {results[-1500:]}",
     )
+    owned_exec_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
     tool = world.run(
         ["exec", "--", "/bin/sh", "-c", 'printf "%s" "$TMPDIR"'],
         cwd=crate,
-        env=owned_env,
+        env=owned_exec_env,
     )
     held_by_pool(world, tool.stdout.strip())
-    ran = world.run(["run"], cwd=crate, env=owned_env)
-    observed = world.observe(ran.stdout, "run", owned_env).rstrip("/")
+    owned_run_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
+    ran = world.run(["run"], cwd=crate, env=owned_run_env)
+    observed = world.observe(ran.stdout, "run", owned_run_env).rstrip("/")
     held_by_pool(world, observed)
     expect(
         not os.path.lexists(observed),
@@ -2133,7 +2164,7 @@ def spawns(world: World, crate: str) -> None:
     if os.path.lexists(gate):
         os.unlink(gate)
     out_path, err_path = world.capture("live")
-    live_env = dict(owned_env, RUN_HOLD=gate)
+    live_env = world.launch(owned_run_env, RUN_HOLD=gate)
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
         live = subprocess.Popen(
             [world.subject, "run"],
@@ -3224,17 +3255,52 @@ def self_check() -> int:
     unique = 16 * MIB
     ok_single, _ = delta_verdict(0, unique, unique)
     ok_truncated, _ = delta_verdict(0, unique - MIB // 2, unique)
-    ok_double, delta_double = delta_verdict(0, 2 * unique, unique)
     ok_vacuous, _ = delta_verdict(0, 0, unique)
     property_true(
         "one unique allocation is accepted within rendered truncation",
         ok_single and ok_truncated,
     )
-    property_true(
-        "a by-name double count is rejected",
-        not ok_double and delta_double == 2 * unique,
-    )
     property_true("a zero delta is rejected", not ok_vacuous)
+    # The exact defect this window exists for: the case plants 8 MiB + 8 MiB
+    # with one hard link, so a walk that counts the link by name reports about
+    # 24 MiB. That figure must be rejected, not just an absurd 32 MiB.
+    for label, planted in (
+        ("the planted by-name 24 MiB count", 3 * 8 * MIB),
+        ("twice the unique allocation", 2 * unique),
+    ):
+        ok, delta = delta_verdict(0, planted, unique)
+        property_true(
+            f"{label} is rejected as a double count",
+            not ok and delta == planted,
+        )
+    property_true(
+        "a delta far above one allocation is rejected",
+        not delta_verdict(0, unique + 3 * MIB, unique)[0],
+    )
+
+    # A launch cloned from an existing dictionary must mint its own identifier;
+    # several launches sharing one dictionary would otherwise share it.
+    launch_base = probe.env(TMPDIR="/x/pt/fx/alias-tmp", TMP=None, TEMP=None)
+    first_launch = probe.launch(launch_base, FIXTURE_HOLD="/x/pt/release")
+    second_launch = probe.launch(launch_base, FIXTURE_HOLD="/x/pt/release")
+    property_true(
+        "a cloned launch mints its own observation identifier",
+        first_launch["OXIDE_PROOF_NONCE"]
+        != second_launch["OXIDE_PROOF_NONCE"]
+        != launch_base["OXIDE_PROOF_NONCE"],
+    )
+    property_true(
+        "a cloned launch keeps the base's other keys",
+        first_launch["TMPDIR"] == launch_base["TMPDIR"]
+        and first_launch["OXIDE_MAX_ACTIVE"] == launch_base["OXIDE_MAX_ACTIVE"]
+        and second_launch["FIXTURE_HOLD"] == "/x/pt/release",
+    )
+    reused_one = dict(launch_base, FIXTURE_HOLD="/x/pt/release")
+    reused_two = dict(launch_base, FIXTURE_HOLD="/x/pt/release")
+    property_true(
+        "negative control: reusing one dictionary reuses its identifier",
+        reused_one["OXIDE_PROOF_NONCE"] == reused_two["OXIDE_PROOF_NONCE"],
+    )
     # The measured status must use the held child's aliases: a query that keeps
     # its own writable same-device TMPDIR would legitimately describe an
     # inherited directory and prove nothing about the held owned directory.

@@ -1034,7 +1034,7 @@ failures: the first two hid the toolchain behind the fixture HOME and used
 `--locked` without a lock, and the diagnostics were refused in turn by an
 external-volume internal pool, inherited-temp fixtures placed inside the pool
 directory, and a pre-created empty pool directory. The pure self-check
-(`effigy proof:pool-temp:test`, 102 properties) covers the constructor layout,
+(`effigy proof:pool-temp:test`, 107 properties) covers the constructor layout,
 rerun completeness, observation freshness, readiness parsing, refusal
 targeting, accounting deltas, image custody and the diagnostic dependency and
 abort rules with no scratch, child or toolchain.
