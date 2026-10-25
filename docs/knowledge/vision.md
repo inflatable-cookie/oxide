@@ -222,8 +222,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   replaces whole-payload admission walks. Closed-slot records are bound to
   generation/incarnation; missing or invalid records require bounded slot
   walks, and cross-slot hard-link overcount is accepted. Removable pools
-  also use the volume's used-space bound. The [accounting contract](contracts/local-lease.md#recorded-per-slot-accounting-approved-not-implemented)
-  owns the direction and trust limits. This supersedes the earlier cached
+  also use the volume's used-space bound. The [accounting contract](contracts/local-lease.md#recorded-per-slot-accounting-oxide146-reviewed-design-not-implemented)
+  owns the reviewed design, the direction and its trust limits. This supersedes the earlier cached
   accounting decline for this scope; its negative reviews remain history.
 
 ### Adoption pattern
