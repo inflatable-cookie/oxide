@@ -153,6 +153,7 @@ REGISTRATION = ("oxide-managed", "removable.json")
 SCRATCH_SUBDIR = "scratch"
 SCRATCH_OWNER = "oxide"
 QUALIFY_LEAF = "oxide-supervisor-qualify."
+VALIDATION_OWNER = "oxide-validation"
 RUN_ROOT_LEAVES = (SCRATCH_LEAF, QUALIFY_LEAF)
 
 # Owner marker and bounded self-expiry (oxide#151, Tom 2026-10-25). Every run
@@ -166,8 +167,14 @@ MARKER_NAME = ".oxide-scratch.json"
 MARKER_VERSION = 1
 MARKER_MAX_BYTES = 4096
 MARKER_KEYS = frozenset({"version", "run_id", "root", "owner_uid", "device", "inode",
-                         "created_unix", "concluded_unix", "outcome", "closure", "kept_reason"})
-MARKER_OUTCOMES = ("running", "closed", "unclosed", "failed")
+                         "created_unix", "concluded_unix", "outcome", "closure", "kept_reason",
+                         "nested_scope"})
+MARKER_OUTCOMES = ("running", "closed", "unclosed", "failed", "retained")
+# A root's own outer closure is a whole-owned-resource conclusion only when the
+# root is exclusive. A root that may host resources created by another authority
+# is `hosting` from before those resources exist, and only that authority can
+# conclude it (oxide#151): the run's own closure is never enough.
+MARKER_SCOPES = ("exclusive", "hosting")
 MARKER_CLOSURES = ("positive", "none")
 MARKER_REASONS = ("none", "evidence", "unclosed", "exception", "nested-unclosed",
                   "qualify-base", "qualify-failed")
@@ -1545,6 +1552,20 @@ def scratch_parent(mount):
     return os.path.join(mount, SCRATCH_SUBDIR, SCRATCH_OWNER)
 
 
+def validation_parent(selection):
+    """The parent of a private unit-validation temp root (oxide#151, after the
+    operator recipe on main `debffbb`): `<mount>/scratch/oxide-validation` on a
+    selected volume, a sibling of the supervisor's marked scratch subtree and
+    therefore never inside its expiry area; on the fallback it is the fallback
+    parent itself. It derives from the mount, never from the already-nested
+    `root_parent`, so no second `scratch` component is ever appended. Naming it
+    creates nothing."""
+    mount = selection.get("mount")
+    if isinstance(mount, str):
+        return os.path.join(mount, SCRATCH_SUBDIR, VALIDATION_OWNER)
+    return selection.get("root_parent") or FALLBACK_PARENT
+
+
 def select_default_parent(env, probe=None):
     """The default root parent for proof scratch (oxide#145, oxide#151).
 
@@ -1739,14 +1760,21 @@ def marker_document(run_id, root, probe, created_unix=None):
             "owner_uid": probe.euid(), "device": info.st_dev, "inode": info.st_ino,
             "created_unix": time.time() if created_unix is None else created_unix,
             "concluded_unix": None, "outcome": "running", "closure": "none",
-            "kept_reason": "none"}
+            "kept_reason": "none", "nested_scope": "exclusive"}
 
 
 def read_marker(root, probe):
-    """The validated marker of `root`, or MarkerInvalid. Strict by design: an
-    absent, symlinked, foreign-owned, non-private, oversized or unreadable
-    marker, an unknown version, a field set that is not exactly the schema, a
-    wrong type or an unknown state value all fail closed."""
+    """The validated marker of `root`, or MarkerInvalid."""
+    document, _identity = read_marker_with_identity(root, probe)
+    return document
+
+
+def read_marker_with_identity(root, probe):
+    """The validated marker of `root` and the identity of the file it was read
+    from. Strict by design: an absent, symlinked, foreign-owned, non-private,
+    oversized or unreadable marker, an unknown version, a field set that is not
+    exactly the schema, a wrong type or an unknown state value all fail
+    closed."""
     path = os.path.join(root, MARKER_NAME)
     try:
         info = probe.lstat(path)
@@ -1794,24 +1822,39 @@ def read_marker(root, probe):
     if document["concluded_unix"] is not None and not marker_number(document["concluded_unix"]):
         raise MarkerInvalid("concluded")
     if (document["outcome"] not in MARKER_OUTCOMES or document["closure"] not in MARKER_CLOSURES
-            or document["kept_reason"] not in MARKER_REASONS):
+            or document["kept_reason"] not in MARKER_REASONS
+            or document["nested_scope"] not in MARKER_SCOPES):
         raise MarkerInvalid("state")
     concluded = document["concluded_unix"] is not None
     if concluded and (document["outcome"] != "closed" or document["closure"] != "positive"):
         raise MarkerInvalid("state")
     if not concluded and document["closure"] != "none":
         raise MarkerInvalid("state")
-    return document
+    return document, (info.st_dev, info.st_ino)
 
 
-def write_marker(root, document, probe):
+def marker_identity(root, probe):
+    """The (device, inode) identity of a root's marker file, so a transition can
+    prove it is rewriting the marker it read."""
+    info = probe.lstat(os.path.join(root, MARKER_NAME))
+    return (info.st_dev, info.st_ino)
+
+
+def write_marker(root, document, probe, expected=None):
     """Write the marker privately and atomically inside `root`: one private
     temporary file in the same directory, then one replace. The root itself is
     rechecked first, so a swapped, symlinked or foreign directory is never
-    written. The payload is bounded and the schema is validated before use."""
+    written. The payload is bounded and the schema is validated before use.
+
+    `expected` makes the transition race-safe: the initial marker requires that
+    no marker exists yet (an unmarked directory is never adopted) and a later
+    transition requires the marker it was derived from to be the one still in
+    place. A marker that changed in between refuses instead of overwriting the
+    other authority's state, so protection and conclusion cannot race."""
+    marker = os.path.join(root, MARKER_NAME)
     try:
         info = probe.lstat(root)
-    except OSError as error:
+    except OSError:
         raise MarkerInvalid("root")
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise MarkerInvalid("root")
@@ -1821,9 +1864,23 @@ def write_marker(root, document, probe):
         raise MarkerInvalid("root")
     if not isinstance(document, dict) or set(document) != MARKER_KEYS:
         raise MarkerInvalid("schema")
+    if document["nested_scope"] not in MARKER_SCOPES:
+        raise MarkerInvalid("state")
     payload = json.dumps(document, sort_keys=True).encode()
     if len(payload) > MARKER_MAX_BYTES:
         raise MarkerInvalid("oversized")
+
+    def unchanged():
+        try:
+            current = probe.lstat(marker)
+        except FileNotFoundError:
+            return expected is None
+        except OSError:
+            return False
+        return expected is not None and (current.st_dev, current.st_ino) == expected
+
+    if not unchanged():
+        raise MarkerInvalid("exists" if expected is None else "changed")
     temporary = os.path.join(root, MARKER_NAME + ".tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
@@ -1831,28 +1888,63 @@ def write_marker(root, document, probe):
         os.write(descriptor, payload)
     finally:
         os.close(descriptor)
-    os.replace(temporary, os.path.join(root, MARKER_NAME))
-    return os.path.join(root, MARKER_NAME)
+    if not unchanged():  # rechecked at the replace instant: no lost update
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise MarkerInvalid("exists" if expected is None else "changed")
+    os.replace(temporary, marker)
+    return marker
 
 
-def record_conclusion(root, run_id, probe, outcome, closure, kept_reason, wall=None):
-    """Record a genuine conclusion (or keep the root unconcluded) on an existing
-    marker. Only the authority holding the actual closure facts calls this: the
-    marker is never updated from age, a disappearing PID, a helper's success or
-    a finished task. `closure == "positive"` is the only state that can ever
-    make a root eligible for expiry, and it requires the matching conclusion."""
+def record_conclusion(root, run_id, probe, outcome, closure, kept_reason, wall=None,
+                      nested_concluded=False):
+    """Record a genuine conclusion (or a truthful non-conclusion) on an existing
+    marker. Only the authority holding the actual facts calls this: the marker
+    is never updated from age, a disappearing PID, a helper's success or a
+    finished task. `closure == "positive"` is the only state that can ever make
+    a root eligible for expiry, and it requires the matching conclusion.
+
+    A `hosting` root is never concluded from the run's own outer closure: the
+    authority that owns the nested window must pass `nested_concluded=True` and
+    is responsible for having positively concluded every owned resource. The
+    marker it read must still be the marker in place, so a protection write
+    cannot be overwritten by a conclusion that started before it."""
     if outcome not in MARKER_OUTCOMES or closure not in MARKER_CLOSURES \
             or kept_reason not in MARKER_REASONS:
         raise MarkerInvalid("state")
     if outcome == "running" or (closure == "positive") != (outcome == "closed"):
         raise MarkerInvalid("state")  # a conclusion is terminal and never back to running
-    document = read_marker(root, probe)
+    document, identity = read_marker_with_identity(root, probe)
     if document["run_id"] != run_id:
         raise MarkerInvalid("identity")
+    if closure == "positive" and document["nested_scope"] == "hosting" and not nested_concluded:
+        raise MarkerInvalid("nested-unconcluded")
     updated = dict(document, concluded_unix=(time.time() if wall is None else wall)
                    if closure == "positive" else None,
                    outcome=outcome, closure=closure, kept_reason=kept_reason)
-    write_marker(root, updated, probe)
+    write_marker(root, updated, probe, expected=identity)
+    return updated
+
+
+def protect_nested_scope(root, probe):
+    """Durably mark an existing run root as hosting resources created by another
+    authority, before any of them exists. A hosting root can never be concluded
+    from its own outer closure, so an unexpected nested UNCLOSED fixture cannot
+    leave an expirable root.
+
+    An unmarked directory is never adopted (`MarkerInvalid("absent")`), an
+    already concluded marker is never downgraded (`"concluded"`), and the
+    marker read must still be the marker in place (`"changed"`), so this cannot
+    race with a conclusion."""
+    document, identity = read_marker_with_identity(root, probe)
+    if document["concluded_unix"] is not None or document["outcome"] != "running":
+        raise MarkerInvalid("concluded")
+    if document["nested_scope"] == "hosting":
+        return document
+    updated = dict(document, nested_scope="hosting")
+    write_marker(root, updated, probe, expected=identity)
     return updated
 
 
@@ -1912,7 +2004,16 @@ def empty_directory(fd, probe, budget, device):
     """Remove every entry of an already-open directory except the marker, which
     the eligible root's own deletion removes last. Every entry is lstat-checked;
     a symlink, a foreign owner, another device or a link that is not a real
-    directory stops the deletion instead of following anything."""
+    directory stops the deletion instead of following anything. A filesystem
+    error on a peer's own entries stops that peer as a bounded skip; it never
+    becomes this run's selection refusal."""
+    try:
+        empty_directory_entries(fd, probe, budget, device)
+    except OSError as error:
+        raise UnsafeEntry("io-" + errno_name(error))
+
+
+def empty_directory_entries(fd, probe, budget, device):
     for name in sorted(os.listdir(fd)):
         if name == MARKER_NAME:
             continue
@@ -1931,7 +2032,7 @@ def empty_directory(fd, probe, budget, device):
             continue
         inner = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
         try:
-            empty_directory(inner, probe, budget, device)
+            empty_directory_entries(inner, probe, budget, device)
         finally:
             os.close(inner)
         os.rmdir(name, dir_fd=fd)
@@ -1945,8 +2046,13 @@ def remove_marked_root(root, marker, marker_identity, probe, budget):
     identity recheck of the root and its marker."""
     fd = None
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        opened = os.fstat(fd)
+        try:
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            opened = os.fstat(fd)
+        except FileNotFoundError:
+            return False, "vanished"
+        except OSError as error:
+            return False, "io-" + errno_name(error)
         if opened.st_dev != marker["device"] or opened.st_ino != marker["inode"]:
             return False, "changed-during-sweep"
         try:
@@ -1959,10 +2065,15 @@ def remove_marked_root(root, marker, marker_identity, probe, budget):
             current = entry_stat(MARKER_NAME, fd)
         except FileNotFoundError:
             return False, "marker-vanished"
+        except OSError as error:
+            return False, "io-" + errno_name(error)
         if (not stat.S_ISREG(current.st_mode) or current.st_uid != probe.euid()
                 or (current.st_dev, current.st_ino) != marker_identity):
             return False, "marker-changed"
-        os.unlink(MARKER_NAME, dir_fd=fd)
+        try:
+            os.unlink(MARKER_NAME, dir_fd=fd)
+        except OSError as error:
+            return False, "io-" + errno_name(error)
         os.close(fd)
         fd = None
         try:
@@ -2012,10 +2123,16 @@ def sweep_concluded_roots(parent, device, probe, now=None, entries=SWEEP_ENTRY_B
     try:
         problem = entry_facts(parent, device, probe, budget)
         if problem is not None:
-            raise SelectionRefused(f"scratch parent {parent} is unusable: {problem}")
+            summary["stop"] = "parent-" + problem
+            summary["elapsed_ns"] = clock() - budget.started_ns
+            return summary
         names = sorted(os.listdir(parent))
     except FileNotFoundError:
         summary["stop"] = "parent-absent"
+        summary["elapsed_ns"] = clock() - budget.started_ns
+        return summary
+    except OSError as error:
+        summary["stop"] = "parent-io-" + errno_name(error)
         summary["elapsed_ns"] = clock() - budget.started_ns
         return summary
     except SweepStop as stop:
@@ -2029,7 +2146,10 @@ def sweep_concluded_roots(parent, device, probe, now=None, entries=SWEEP_ENTRY_B
                 row(name, "not-a-run-root")
                 continue
             summary["examined"] += 1
-            result = sweep_one_root(os.path.join(parent, name), device, probe, budget, wall)
+            try:
+                result = sweep_one_root(os.path.join(parent, name), device, probe, budget, wall)
+            except OSError as error:  # a peer's fault is a bounded skip, never this run's
+                result = "io-" + errno_name(error)
             if result == "removed":
                 summary["removed_total"] += 1
             else:
@@ -2088,7 +2208,10 @@ def sweep_one_root(path, device, probe, budget, now):
     if (again["run_id"] != marker["run_id"] or again["concluded_unix"] != marker["concluded_unix"]
             or (identity.st_dev, identity.st_ino) != marker_identity):
         return "changed-during-sweep"
-    removed, reason = remove_marked_root(path, marker, marker_identity, probe, budget)
+    try:
+        removed, reason = remove_marked_root(path, marker, marker_identity, probe, budget)
+    except OSError as error:
+        return "io-" + errno_name(error)
     return "removed" if removed else reason
 
 
@@ -2259,7 +2382,7 @@ class Monitor:
             "terminal_mode": dict(terminal_mode),
             "scratch_default": dict(ctx["selection"]),
             "scratch_sweep": marker.get("sweep"),
-            "scratch_marker": {key: marker.get(key) for key in ("path", "state", "run_id")},
+            "scratch_marker": {key: marker.get(key) for key in ("path", "state", "run_id", "reason")},
             "phase": None, "leader": None, "custodian": [], "outcome": None,
             "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None,
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
@@ -2493,12 +2616,17 @@ class Monitor:
 
     def conclude_marker(self, closed):
         """Record this run's genuine conclusion on its owner marker, or leave it
-        unconcluded. Only the monitor's own closure decision (which is the
-        custodian's, taken after the leader was reaped) is passed here; a failed
-        write leaves the marker untouched and the root kept, and never changes
-        the run's outcome."""
+        honestly unconcluded. Only the monitor's own closure decision (the
+        custodian's, taken after the leader was reaped) is passed here.
+
+        A root the qualification apparatus protected as `hosting` before any
+        nested case existed is never concluded from that outer closure: the
+        marker stays unconcluded and the receipt says so. Any other failure
+        leaves the marker untouched and is reported with its reason, never
+        silently swallowed and never turned into a positive conclusion."""
         marker = self.ctx.get("marker") or {}
-        record = {"path": marker.get("path"), "state": "none", "run_id": marker.get("run_id")}
+        record = {"path": marker.get("path"), "state": "none", "run_id": marker.get("run_id"),
+                  "reason": None}
         if not marker.get("path") or not marker.get("run_id"):
             return record
         try:
@@ -2509,8 +2637,12 @@ class Monitor:
             record.update(state="concluded" if closed else "kept",
                           kept_reason=document["kept_reason"],
                           concluded_unix=document["concluded_unix"])
-        except BaseException:
+        except MarkerInvalid as invalid:
+            record["state"] = "nested-protected" if invalid.code == "nested-unconcluded" else "unknown"
+            record["reason"] = invalid.code
+        except BaseException as error:
             record["state"] = "unknown"
+            record["reason"] = type_name(error)
         return record
 
     def summary(self):

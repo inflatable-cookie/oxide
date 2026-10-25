@@ -1950,14 +1950,18 @@ class PureDefaultScratch(unittest.TestCase):
         self.assertIn("prepare_scratch_parent", text, "the bootstrap does not prepare the owned parent")
         self.assertIn("sweep_concluded_roots", text, "the bootstrap does not sweep before its own base")
 
-    def test_the_agents_unit_recipe_uses_the_prepared_parent(self):
-        # The documented unit-suite recipe must follow the helper's prepared
-        # parent, not the bare mount and not a hardcoded drive path, and it must
-        # work when the new subtree was initially absent.
+    def test_the_agents_unit_recipe_uses_the_owned_validation_parent(self):
+        # The documented unit-suite recipe must derive its validation parent
+        # from the pool selection's mount, not from the supervisor's nested
+        # root_parent, not from the bare mount and not from a hardcoded drive
+        # path; it must create that parent before one fresh run directory.
         text = (Path(__file__).resolve().parent.parent / "AGENTS.md").read_text()
-        self.assertIn("prepare_scratch_parent", text, "the recipe does not prepare the owned parent")
+        self.assertIn("validation_parent", text, "the recipe does not use the validation parent")
+        self.assertNotIn("prepare_scratch_parent", text,
+                         "the recipe would create the supervisor's marked subtree")
         self.assertNotIn("/Volumes/Builds", text, "the recipe hardcodes a mount path")
-        self.assertIn('select_default_parent', text)
+        self.assertIn('mkdir -p "$scratch_base"', text)
+        self.assertIn('mktemp -d "$scratch_base/run.XXXXXX"', text)
 
     # The owned leaf
 
@@ -2176,6 +2180,28 @@ class PureScratchPreparation(unittest.TestCase):
                                            FixtureProbe())
         self.assertIn("no selected volume", str(caught.exception))
 
+    def test_the_owned_validation_parent_derives_from_the_mount(self):
+        # The unit-validation temp parent is a sibling of the supervisor's
+        # marked subtree: `<mount>/scratch/oxide-validation`, never the nested
+        # root_parent with a second `scratch` appended and never the drive root.
+        selected = {"source": "selected-volume", "mount": "/Volumes/Builds",
+                    "root_parent": "/Volumes/Builds/scratch/oxide", "device": 1}
+        parent = bounded.validation_parent(selected)
+        self.assertEqual(parent, "/Volumes/Builds/scratch/oxide-validation")
+        self.assertEqual(parent.count("/scratch/"), 1, "a duplicate nested scratch component")
+        self.assertNotIn("oxide-validation/scratch", parent)
+        mount, sandbox_selection = self.world()
+        sandbox_parent = bounded.validation_parent(sandbox_selection)
+        self.assertEqual(sandbox_parent, os.path.join(mount, "scratch", "oxide-validation"))
+        self.assertEqual(sandbox_parent[len(mount):].count("/scratch/"), 1)
+        self.assertFalse(os.path.lexists(sandbox_parent), "naming the validation parent created it")
+        self.assertFalse(os.path.lexists(os.path.join(mount, "scratch")),
+                         "naming the validation parent created its parent")
+        fallback = {"source": "fallback", "mount": None, "root_parent": bounded.FALLBACK_PARENT,
+                    "reason": "no eligible selected volume"}
+        self.assertEqual(bounded.validation_parent(fallback), bounded.FALLBACK_PARENT)
+        self.assertEqual(bounded.validation_parent({"source": "fallback", "mount": None}), bounded.FALLBACK_PARENT)
+
     def test_a_creation_refusal_keeps_the_warned_fallback_contract(self):
         mount, selection = self.world()
 
@@ -2190,6 +2216,8 @@ class PureScratchPreparation(unittest.TestCase):
 
 OLD = dict(concluded_unix=1000.0, outcome="closed", closure="positive", kept_reason="evidence")
 NOW = 1000.0 + bounded.EXPIRY_S + 1
+
+
 
 
 class PureMarker(unittest.TestCase):
@@ -2326,6 +2354,66 @@ class PureMarker(unittest.TestCase):
         self.assertEqual(caught.exception.code, "identity")
         self.assertEqual(bounded.read_marker(root, FixtureProbe())["outcome"], "closed",
                          "a refused conclusion changed the marker")
+
+    def test_a_hosting_root_is_never_concluded_from_outer_closure(self):
+        root = self.root()
+        probe = FixtureProbe()
+        run_id = bounded.new_run_id()
+        bounded.write_marker(root, self.document(root, run_id=run_id), probe)
+        self.assertEqual(bounded.read_marker(root, probe)["nested_scope"], "exclusive")
+        protected = bounded.protect_nested_scope(root, probe)
+        self.assertEqual(protected["nested_scope"], "hosting")
+        identity = bounded.marker_identity(root, probe)
+        # Re-protecting is idempotent and rewrites nothing.
+        again = bounded.protect_nested_scope(root, probe)
+        self.assertEqual(again, protected)
+        self.assertEqual(bounded.marker_identity(root, probe), identity)
+        # The run's own outer closure cannot conclude a hosting root.
+        with self.assertRaises(bounded.MarkerInvalid) as caught:
+            bounded.record_conclusion(root, run_id, probe, "closed", "positive", "evidence")
+        self.assertEqual(caught.exception.code, "nested-unconcluded")
+        unchanged = bounded.read_marker(root, probe)
+        self.assertEqual((unchanged["outcome"], unchanged["concluded_unix"],
+                          unchanged["kept_reason"]), ("running", None, "none"))
+        # A truthful non-conclusion is allowed, and only the owning authority
+        # can record the positive conclusion of every owned resource.
+        retained = bounded.record_conclusion(root, run_id, probe, "retained", "none", "nested-unclosed")
+        self.assertIsNone(retained["concluded_unix"])
+        self.assertEqual(retained["kept_reason"], "nested-unclosed")
+        with self.assertRaises(bounded.MarkerInvalid):
+            bounded.protect_nested_scope(root, probe)  # never downgrades a recorded state
+
+    def test_a_new_root_is_never_adopted_and_a_race_never_loses_protection(self):
+        root = self.root()
+        probe = FixtureProbe()
+        with self.assertRaises(bounded.MarkerInvalid) as caught:
+            bounded.protect_nested_scope(root, probe)  # unmarked directories are never adopted
+        self.assertEqual(caught.exception.code, "absent")
+        self.assertEqual(os.listdir(root), [], "an unmarked root gained a marker")
+        run_id = bounded.new_run_id()
+        bounded.write_marker(root, self.document(root, run_id=run_id), probe)
+        with self.assertRaises(bounded.MarkerInvalid) as caught:
+            bounded.write_marker(root, self.document(root, run_id=run_id), probe)  # initial only
+        self.assertEqual(caught.exception.code, "exists")
+        # A conclusion that read the marker before protection cannot overwrite
+        # the protection: the marker identity changed, so it refuses.
+        stale, stale_identity = bounded.read_marker_with_identity(root, probe)
+        bounded.protect_nested_scope(root, probe)
+        original = bounded.read_marker_with_identity
+
+        def stale_read(path, probe_):
+            if path == root:
+                return stale, stale_identity
+            return original(path, probe_)
+
+        with patched(bounded, "read_marker_with_identity", stale_read):
+            with self.assertRaises(bounded.MarkerInvalid) as caught:
+                bounded.record_conclusion(root, run_id, probe, "closed", "positive", "evidence",
+                                          nested_concluded=True)
+        self.assertEqual(caught.exception.code, "changed")
+        final = bounded.read_marker(root, probe)
+        self.assertEqual((final["nested_scope"], final["outcome"], final["concluded_unix"]),
+                         ("hosting", "running", None))
 
     def test_the_marker_records_a_conclusion_not_a_process_state(self):
         # No marker field names a PID, a signal or a liveness fact: expiry reads
@@ -2618,18 +2706,120 @@ class PureSweep(unittest.TestCase):
         self.assertEqual(self.rows(summary), {"oxide-proof.aaa": "changed-during-sweep"})
         self.assertTrue(os.path.isdir(os.path.join(path, "evidence-0")))
 
-    def test_a_foreign_or_linked_parent_is_refused(self):
+    def test_the_pre_correction_marker_shape_can_never_expire(self):
+        # Explicit counterfactual: the old lifecycle's closed/positive/evidence
+        # marker (no nested_scope) over retained UNKNOWN resources must not be
+        # removable, at any age.
+        parent, device = self.parent()
+        path = os.path.join(parent, "oxide-proof.legacy")
+        os.mkdir(path, 0o700)
+        document = bounded.marker_document(bounded.new_run_id(), path, FixtureProbe(), created_unix=10.0)
+        document.update(OLD)
+        document.pop("nested_scope")
+        marker = os.path.join(path, bounded.MARKER_NAME)
+        Path(marker).write_text(json.dumps(document))
+        os.chmod(marker, 0o600)
+        Path(path, "retained-unknown").write_text("UNKNOWN")
+        summary = self.sweep(parent, device)
+        self.assertEqual(summary["removed_total"], 0)
+        self.assertEqual(self.rows(summary), {"oxide-proof.legacy": "marker-schema"})
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(Path(path, "retained-unknown").read_text(), "UNKNOWN")
+
+    def test_a_hosting_root_with_retained_unknown_is_never_eligible(self):
+        parent, device = self.parent()
+        path = os.path.join(parent, "oxide-proof.hosting")
+        os.mkdir(path, 0o700)
+        probe = FixtureProbe()
+        run_id = bounded.new_run_id()
+        bounded.write_marker(path, bounded.marker_document(run_id, path, probe, created_unix=10.0), probe)
+        bounded.protect_nested_scope(path, probe)
+        bounded.record_conclusion(path, run_id, probe, "retained", "none", "nested-unclosed")
+        summary = self.sweep(parent, device)
+        self.assertEqual(summary["removed_total"], 0)
+        self.assertEqual(self.rows(summary), {"oxide-proof.hosting": "unconcluded"})
+        self.assertTrue(os.path.isdir(path))
+
+    def test_peer_io_faults_are_bounded_skips_not_this_runs_fallback(self):
+        # A peer's filesystem fault is reported for that peer and never diverts
+        # this run: the selected parent still hosts this run's own new root.
+        def world():
+            parent, device = self.parent()
+            faulty, _ = self.root(parent, name="oxide-proof.aaa")
+            healthy, _ = self.root(parent, name="oxide-proof.bbb")
+            inodes = {os.lstat(faulty).st_ino, os.lstat(os.path.join(faulty, "evidence-0")).st_ino}
+            return parent, device, faulty, healthy, inodes
+
+        def under_faulty(name, faulty, inodes, dir_fd=None):
+            if isinstance(name, str) and os.path.abspath(name).startswith(os.path.abspath(faulty) + os.sep):
+                return True
+            if isinstance(name, int):
+                dir_fd = name
+            if dir_fd is not None:
+                try:
+                    return os.fstat(dir_fd).st_ino in inodes
+                except OSError:
+                    return False
+            return False
+
+        def run(parent, device, label):
+            original = getattr(os, label)
+
+            def wrapped(*args, **kwargs):
+                name, dir_fd = (args[0] if args else None), kwargs.get("dir_fd")
+                if under_faulty(name, faulty, inodes, dir_fd):
+                    raise PermissionError(errno.EACCES, "denied", name)
+                return original(*args, **kwargs)
+
+            with patched(os, label, wrapped):
+                return self.sweep(parent, device)
+
+        for label in ("unlink", "rmdir", "open", "listdir"):
+            with self.subTest(label=label):
+                parent, device, faulty, healthy, inodes = world()
+                summary = run(parent, device, label)
+                self.assertEqual(summary["removed_total"] + summary["skipped_total"], 2)
+                self.assertTrue(os.path.isdir(faulty), "a faulty peer was treated as removed")
+                self.assertTrue(os.path.lexists(os.path.join(faulty, bounded.MARKER_NAME)))
+                self.assertEqual(self.rows(summary)[os.path.basename(faulty)].startswith("io-")
+                                 or self.rows(summary)[os.path.basename(faulty)].startswith("unsafe-io-"),
+                                 True, summary)
+                self.assertFalse(os.path.lexists(healthy), "a healthy peer was not swept")
+                root = bounded.create_owned_root(parent, FixtureProbe())
+                self.assertTrue(root.startswith(parent + os.sep))
+                shutil.rmtree(root, ignore_errors=True)
+                shutil.rmtree(faulty, ignore_errors=True)
+
+        with self.subTest(label="disappearing-child"):
+            parent, device, faulty, healthy, inodes = world()
+            original = bounded.entry_stat
+
+            def vanishing(name, dir_fd):
+                if isinstance(name, str) and name.startswith("evidence-") and os.fstat(dir_fd).st_ino in inodes:
+                    raise FileNotFoundError(errno.ENOENT, "gone", name)
+                return original(name, dir_fd)
+
+            with patched(bounded, "entry_stat", vanishing):
+                summary = self.sweep(parent, device)
+            self.assertTrue(os.path.isdir(faulty))
+            self.assertTrue(os.path.lexists(os.path.join(faulty, bounded.MARKER_NAME)))
+            self.assertEqual(summary["removed_total"], 1)
+            self.assertFalse(os.path.lexists(healthy))
+
+    def test_a_foreign_or_linked_parent_stops_the_sweep_without_diverting_the_run(self):
         parent, device = self.parent()
         link = os.path.join(str(Path(parent).parent), os.path.basename(parent) + "-link")
         os.symlink(parent, link)
         self.addCleanup(os.unlink, link)
-        with self.assertRaises(bounded.SelectionRefused) as caught:
-            self.sweep(link, device)
-        self.assertIn("unusable", str(caught.exception))
-        with self.assertRaises(bounded.SelectionRefused):
-            self.sweep(parent, device, probe=FixtureProbe(owners={parent: 0}))
-        with self.assertRaises(bounded.SelectionRefused):
-            self.sweep(parent, device + 1)
+        summary = self.sweep(link, device)
+        self.assertEqual(summary["stop"], "parent-symlink")
+        self.assertEqual(summary["removed_total"], 0)
+        summary = self.sweep(parent, device, probe=FixtureProbe(owners={parent: 0}))
+        self.assertEqual(summary["stop"], "parent-foreign-owner")
+        self.assertEqual(summary["removed_total"], 0)
+        summary = self.sweep(parent, device + 1)
+        self.assertEqual(summary["stop"], "parent-other-device")
+        self.assertEqual(summary["removed_total"], 0)
         absent = os.path.join(parent, "absent")
         summary = self.sweep(absent, device)
         self.assertEqual(summary["stop"], "parent-absent")
@@ -2647,6 +2837,244 @@ class PureSweep(unittest.TestCase):
         self.assertEqual(summary["time_budget_ns"], bounded.SWEEP_TIME_BUDGET_NS)
         self.assertLessEqual(bounded.SWEEP_TIME_BUDGET_NS, bounded.SETUP_S * NS)
 
+
+
+class PureExistingParent(unittest.TestCase):
+    """The pre-existing private parent after the operator's same-volume
+    relocation: a safe 0700 current-user parent that already holds a nonempty,
+    unmarked `legacy-retained/` directory is accepted, and that entry is left
+    entirely alone while a marked, positively concluded peer is swept."""
+
+    def test_prepare_and_sweep_accept_the_existing_parent_and_skip_legacy(self):
+        mount = Path(tempfile.mkdtemp(prefix="existing.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(mount), True)
+        device = os.stat(str(mount)).st_dev
+        scratch = os.path.join(str(mount), "scratch")
+        parent = os.path.join(scratch, "oxide")
+        os.mkdir(scratch, 0o700)
+        os.mkdir(parent, 0o700)
+        legacy = os.path.join(parent, "legacy-retained")
+        os.mkdir(legacy, 0o700)
+        sentinels = {}
+        for name in ("oxide-proof.aaa", "oxide-supervisor-qualify.bbb", "oxide-validation.ccc"):
+            inner = os.path.join(legacy, name)
+            for leaf in ("receipt.json", os.path.join("nested", "sentinel")):
+                path = os.path.join(inner, "evidence", leaf)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                Path(path).write_text("UNKNOWN")
+                sentinels[path] = "UNKNOWN"
+        peer = os.path.join(parent, "oxide-proof.peer")
+        os.mkdir(peer, 0o700)
+        probe = bounded.DefaultProbe()
+        run_id = bounded.new_run_id()
+        bounded.write_marker(peer, bounded.marker_document(run_id, peer, probe, created_unix=10.0), probe)
+        bounded.record_conclusion(peer, run_id, probe, "closed", "positive", "evidence", wall=1000.0)
+        Path(peer, "payload.bin").write_bytes(b"x")
+        before = (os.lstat(legacy).st_ino, os.lstat(scratch).st_ino, os.lstat(parent).st_ino)
+        selection = {"source": "selected-volume", "mount": str(mount), "root_parent": parent,
+                     "device": device, "reason": None}
+        listing, opens = [], []
+        original_listdir, original_open = os.listdir, os.open
+
+        def listdir(*args, **kwargs):
+            listing.append(args[0] if args else None)
+            return original_listdir(*args, **kwargs)
+
+        def opening(*args, **kwargs):
+            opens.append(args[0] if args else None)
+            return original_open(*args, **kwargs)
+
+        with patched(os, "listdir", listdir), patched(os, "open", opening):
+            prepared = bounded.prepare_scratch_parent(selection, probe)
+            summary = bounded.sweep_concluded_roots(parent, device, probe, now=NOW)
+        # The existing safe parent is accepted unchanged, not re-created.
+        self.assertEqual(prepared, parent)
+        self.assertEqual((os.lstat(legacy).st_ino, os.lstat(scratch).st_ino, os.lstat(parent).st_ino),
+                         before)
+        # The marked, concluded peer was processed within the budgets.
+        self.assertEqual(summary["stop"], None)
+        self.assertEqual((summary["examined"], summary["removed_total"], summary["skipped_total"]),
+                         (1, 1, 1))
+        self.assertFalse(os.path.lexists(peer))
+        # The unmarked legacy entry is untouched and never enumerated.
+        self.assertEqual(os.lstat(legacy).st_ino, before[0])
+        self.assertTrue(os.path.isdir(legacy))
+        for path, content in sentinels.items():
+            self.assertEqual(Path(path).read_text(), content, path)
+        self.assertFalse(os.path.lexists(os.path.join(legacy, bounded.MARKER_NAME)))
+        for root, _directories, files in os.walk(legacy):
+            self.assertNotIn(bounded.MARKER_NAME, files, "a legacy root gained a marker")
+        for entry in listing + opens:
+            if isinstance(entry, str):
+                self.assertNotIn("legacy-retained", entry,
+                                 "the sweep enumerated into the unmarked legacy entry")
+        # A NEW separately marked run root still lands safely in that parent.
+        root = bounded.create_owned_root(parent, probe)
+        self.assertTrue(root.startswith(parent + os.sep))
+        bounded.write_marker(root, bounded.marker_document(bounded.new_run_id(), root, probe), probe)
+        self.assertEqual(bounded.read_marker(root, probe)["nested_scope"], "exclusive")
+        shutil.rmtree(root, ignore_errors=True)
+
+
+class PureProtectionAndLifecycle(unittest.TestCase):
+    """The nested-window protection that stops an intentional nested UNKNOWN
+    from outliving an expirable marker, and the bootstrap's separation of the
+    suite result from the custody of the owned resources."""
+
+    def world(self):
+        sandbox = Path(tempfile.mkdtemp(prefix="protect.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        guard = qualify.candidate()
+        probe = guard.DefaultProbe()
+
+        def make(name, payload=True):
+            root = os.path.join(str(sandbox), name)
+            os.mkdir(root, 0o700)
+            os.makedirs(os.path.join(root, "evidence"))
+            run_id = guard.new_run_id()
+            if payload:
+                guard.write_marker(root, guard.marker_document(run_id, root, probe, created_unix=10.0),
+                                   probe)
+            return root, run_id
+
+        return sandbox, guard, probe, make
+
+    def test_the_suite_protects_the_outer_root_before_any_case(self):
+        module = sys.modules[__name__]
+        sandbox, guard, _probe, make = self.world()
+        root, run_id = make("oxide-proof.aaa")
+        evidence = os.path.join(root, "evidence")
+        with patched(module, "OUTER_EVIDENCE", evidence):
+            record = module.protect_outer_root()
+        self.assertEqual(record, {"state": "protected", "root": root, "run_id": run_id})
+        self.assertEqual(guard.read_marker(root, guard.DefaultProbe())["nested_scope"], "hosting")
+        # An unmarked root is reported and never adopted.
+        plain, _ = make("oxide-proof.plain", payload=False)
+        with patched(module, "OUTER_EVIDENCE", os.path.join(plain, "evidence")):
+            self.assertEqual(module.protect_outer_root()["state"], "unmarked")
+        self.assertEqual(os.listdir(plain), ["evidence"])
+        # A marker that cannot be protected refuses instead of running cases.
+        corrupt, _ = make("oxide-proof.corrupt")
+        Path(corrupt, bounded.MARKER_NAME).write_text("{}")
+        os.chmod(os.path.join(corrupt, bounded.MARKER_NAME), 0o600)
+        with patched(module, "OUTER_EVIDENCE", os.path.join(corrupt, "evidence")):
+            self.assertEqual(module.protect_outer_root()["state"], "failed")
+        with patched(module, "OUTER_EVIDENCE", None):
+            self.assertEqual(module.protect_outer_root()["state"], "no-outer-root")
+        # The protection call is before every case, and it is recorded.
+        source = Path(module.__file__).read_text()
+        protect_at = source.index("PROTECTION.update(protect_outer_root())")
+        self.assertLess(protect_at, source.index("runner.run(pure)"))
+        self.assertLess(protect_at, source.index("loadTestsFromTestCase(Real)"))
+        self.assertIn('"protection": dict(PROTECTION)', source)
+
+    def test_a_passing_qualification_with_retained_unknown_stays_pass_and_unconcluded(self):
+        sandbox, guard, probe, make = self.world()
+        root, run_id = make("oxide-proof.candidate")
+        guard.protect_nested_scope(root, probe)
+        protection = {"state": "protected", "root": root, "run_id": run_id}
+        problems, concluded = qualify.finish_candidate(guard, probe, {"root": root}, ["case/dir"],
+                                                       protection)
+        self.assertEqual(problems, [])
+        self.assertFalse(concluded)
+        document = guard.read_marker(root, probe)
+        self.assertEqual((document["outcome"], document["closure"], document["kept_reason"],
+                          document["concluded_unix"]), ("retained", "none", "nested-unclosed", None))
+        summary = guard.sweep_concluded_roots(str(sandbox), os.stat(sandbox).st_dev, probe, now=NOW)
+        self.assertEqual(summary["removed_total"], 0)
+        base, base_run = make("oxide-supervisor-qualify.base")
+        self.assertEqual(qualify.finish_base(guard, probe, base, base_run, True, True, False, protection), [])
+        base_document = guard.read_marker(base, probe)
+        self.assertEqual((base_document["outcome"], base_document["kept_reason"],
+                          base_document["concluded_unix"]),
+                         ("retained", "nested-unclosed", None))
+        self.assertEqual(guard.sweep_concluded_roots(str(sandbox), os.stat(sandbox).st_dev, probe,
+                                                     now=NOW)["removed_total"], 0)
+
+    def test_a_fully_concluded_qualification_records_positive_markers(self):
+        sandbox, guard, probe, make = self.world()
+        root, run_id = make("oxide-proof.candidate")
+        guard.protect_nested_scope(root, probe)
+        protection = {"state": "protected", "root": root, "run_id": run_id}
+        problems, concluded = qualify.finish_candidate(guard, probe, {"root": root}, [], protection)
+        self.assertEqual(problems, [])
+        self.assertTrue(concluded)
+        document = guard.read_marker(root, probe)
+        self.assertEqual((document["outcome"], document["closure"], document["kept_reason"]),
+                         ("closed", "positive", "evidence"))
+        base, base_run = make("oxide-supervisor-qualify.base")
+        self.assertEqual(qualify.finish_base(guard, probe, base, base_run, True, False, True, protection), [])
+        base_document = guard.read_marker(base, probe)
+        self.assertEqual((base_document["outcome"], base_document["closure"],
+                          base_document["kept_reason"]), ("closed", "positive", "qualify-base"))
+        # Exactly this now-concluded shape is what the sweep may expire later.
+        later = time.time() + guard.EXPIRY_S + 60
+        summary = guard.sweep_concluded_roots(str(sandbox), os.stat(sandbox).st_dev, probe, now=later)
+        self.assertEqual(summary["removed_total"], 2)
+
+    def test_a_failed_qualification_keeps_the_base_unconcluded(self):
+        sandbox, guard, probe, make = self.world()
+        base, base_run = make("oxide-supervisor-qualify.base")
+        self.assertEqual(qualify.finish_base(guard, probe, base, base_run, False, False, False, None), [])
+        document = guard.read_marker(base, probe)
+        self.assertEqual((document["outcome"], document["kept_reason"], document["concluded_unix"]),
+                         ("failed", "qualify-failed", None))
+        self.assertEqual(guard.sweep_concluded_roots(str(sandbox), os.stat(sandbox).st_dev, probe,
+                                                     now=NOW)["removed_total"], 0)
+
+    def test_the_candidate_is_never_concluded_from_outer_closure(self):
+        _sandbox, guard, probe, make = self.world()
+        root, run_id = make("oxide-proof.candidate")
+        guard.protect_nested_scope(root, probe)
+        problems, concluded = qualify.finish_candidate(
+            guard, probe, {"root": root}, [], {"state": "protected", "root": root,
+                                               "run_id": "b" * 32})
+        self.assertTrue(problems)
+        self.assertFalse(concluded)
+        self.assertEqual(guard.read_marker(root, probe)["concluded_unix"], None)
+        # A hosting root concluded from its outer closure is refused, not trusted.
+        fabricated, fabricated_run = make("oxide-proof.fabricated")
+        guard.protect_nested_scope(fabricated, probe)
+        Path(os.path.join(fabricated, bounded.MARKER_NAME)).write_text(json.dumps(
+            dict(guard.read_marker(fabricated, probe), outcome="closed", closure="positive",
+                 kept_reason="evidence", concluded_unix=1000.0)))
+        os.chmod(os.path.join(fabricated, bounded.MARKER_NAME), 0o600)
+        problems, concluded = qualify.finish_candidate(
+            guard, probe, {"root": fabricated}, [], {"state": "protected", "root": fabricated,
+                                                     "run_id": fabricated_run})
+        self.assertTrue(any("outer closure" in problem for problem in problems), problems)
+        self.assertFalse(concluded)
+        # An unmarked root is left alone and never eligible.
+        plain, _ = make("oxide-proof.plain", payload=False)
+        self.assertEqual(qualify.finish_candidate(guard, probe, {"root": plain}, [], None), ([], False))
+        self.assertEqual(os.listdir(plain), ["evidence"])
+
+    def test_marker_transition_failures_are_reported_not_swallowed(self):
+        _sandbox, guard, probe, make = self.world()
+        root, run_id = make("oxide-proof.candidate")
+        guard.protect_nested_scope(root, probe)
+        protection = {"state": "protected", "root": root, "run_id": run_id}
+        base, base_run = make("oxide-supervisor-qualify.base")
+
+        def failing(*_args, **_kwargs):
+            raise guard.MarkerInvalid("changed")
+
+        with patched(guard, "record_conclusion", failing):
+            problems, concluded = qualify.finish_candidate(guard, probe, {"root": root}, [], protection)
+            self.assertTrue(any("positive conclusion" in problem for problem in problems), problems)
+            self.assertFalse(concluded)
+            problems, _retained = qualify.finish_candidate(guard, probe, {"root": root}, ["dir"], protection)
+            self.assertTrue(any("retention" in problem for problem in problems), problems)
+            base_problems = qualify.finish_base(guard, probe, base, base_run, True, False, True, protection)
+            self.assertTrue(any("base could not record" in problem for problem in base_problems),
+                            base_problems)
+
+        def unreadable(*_args, **_kwargs):
+            raise OSError(errno.EIO, "read error")
+
+        with patched(guard, "record_conclusion", unreadable):
+            problems, _concluded = qualify.finish_candidate(guard, probe, {"root": root}, [], protection)
+            self.assertTrue(problems)
 
 
 # Qualification layout (oxide#145) ------------------------------------------------
@@ -2710,6 +3138,7 @@ class PureQualificationTopology(unittest.TestCase):
         case = os.path.join(evidence, "nested", "test_exit_zero_closed.1")
         os.makedirs(os.path.join(case, "evidence"))
         (Path(case) / "evidence" / "receipt.json").write_text("{}")
+        run_id = self.protect(root)
         registration = os.path.join(parent, "registration.json")
         with open(registration, "w") as handle:
             json.dump({"version": 2, "mount_point": VOLUME, "volume_uuid": DRIVE_UUID}, handle)
@@ -2717,10 +3146,22 @@ class PureQualificationTopology(unittest.TestCase):
                                scratch: DRIVE_DEVICE, "/private/tmp": 1,
                                os.path.join(parent, "pool"): DRIVE_DEVICE},
                               documents={os.path.join(parent, "topology.json"):
-                                         {"scratch": scratch, "evidence": evidence}},
+                                         {"scratch": scratch, "evidence": evidence,
+                                          "protection": {"state": "protected", "root": root,
+                                                         "run_id": run_id}}},
                               boot=1, free={parent: 500 * 1024 ** 3, VOLUME: 500 * 1024 ** 3,
                                           "/private/tmp": 30 * 1024 ** 3})
         return sandbox, parent, root, evidence, scratch, case, registration, facts
+
+    def protect(self, root):
+        """Create the root's real owner marker and protect it as hosting through
+        the production seams, exactly as the suite does before nested cases."""
+        run_id = bounded.new_run_id()
+        probe = bounded.DefaultProbe()
+        bounded.write_marker(root, bounded.marker_document(run_id, root, probe), probe)
+        bounded.protect_nested_scope(root, probe)
+        self.marker_run_id = run_id
+        return run_id
 
     def receipt(self, parent, root, evidence, scratch, registration, case):
         return {
@@ -2742,7 +3183,8 @@ class PureQualificationTopology(unittest.TestCase):
                               "expiry_s": bounded.EXPIRY_S, "rows": [], "omitted": 0,
                               "elapsed_ns": 10},
             "scratch_marker": {"path": os.path.join(root, bounded.MARKER_NAME),
-                               "state": "concluded", "run_id": "a" * 32},
+                               "state": "nested-protected", "reason": "nested-unconcluded",
+                               "run_id": getattr(self, "marker_run_id", "a" * 32)},
         }
 
     def control_records(self, parent, root, kept):
@@ -2914,11 +3356,13 @@ class PureQualificationTopology(unittest.TestCase):
         case = os.path.join(evidence, "nested", "test_zero.1")
         os.makedirs(os.path.join(case, "evidence"))
         (Path(case) / "evidence" / "receipt.json").write_text("{}")
+        run_id = self.protect(root)
         registration = os.path.join(mount, "registration.json")
         with open(registration, "w") as handle:
             json.dump({"version": 2, "mount_point": mount, "volume_uuid": DRIVE_UUID}, handle)
         with open(os.path.join(base, "topology.json"), "w") as handle:
-            json.dump({"scratch": scratch, "evidence": evidence}, handle)
+            json.dump({"scratch": scratch, "evidence": evidence,
+                       "protection": {"state": "protected", "root": root, "run_id": run_id}}, handle)
         facts = TopologyFacts({mount: DRIVE_DEVICE, parent: DRIVE_DEVICE, base: DRIVE_DEVICE,
                                root: DRIVE_DEVICE, evidence: DRIVE_DEVICE, scratch: DRIVE_DEVICE,
                                case: DRIVE_DEVICE, "/private/tmp": 1},
@@ -2971,9 +3415,15 @@ class PureQualificationTopology(unittest.TestCase):
         bad_counts = dict(receipt, scratch_sweep=dict(receipt["scratch_sweep"], examined=-1))
         self.assertTrue(any("no valid examined" in p for p in
                             qualify.scratch_sweep(bad_counts, expected, base, facts)))
-        not_concluded = dict(receipt, scratch_marker={"state": "kept", "path": None})
-        self.assertTrue(any("owner-marker conclusion" in p for p in
-                            qualify.scratch_sweep(not_concluded, expected, base, facts)))
+        deferred = dict(receipt, scratch_marker={"state": "concluded", "path": None})
+        self.assertTrue(any("did not defer" in p for p in
+                            qualify.protected_root(deferred, None)))
+        self.assertTrue(any("no nested-window protection" in p for p in
+                            qualify.protected_root(receipt, None)))
+        no_root = dict(receipt, scratch_marker={"state": "nested-protected", "path": None,
+                                                "reason": "nested-unconcluded"})
+        self.assertTrue(any("has no root" in p for p in
+                            qualify.protected_root(no_root, {"protection": {"state": "protected"}})))
         self.assertTrue(any("is gone" in p for p in
                             qualify.scratch_sweep(receipt, expected, os.path.join(parent, "absent"),
                                                   facts)))
@@ -4404,18 +4854,44 @@ def nested_root():
     return root.resolve()
 
 
+PROTECTION = {}
+
+
+def protect_outer_root():
+    """Durably mark the outer candidate root as `hosting` BEFORE any nested
+    supervisor can exist (oxide#151). A hosting root can never be concluded
+    from its own outer closure, so an intentionally retained nested UNCLOSED
+    fixture cannot leave an expirable root behind. An unmarked root is never
+    adopted and is never eligible either; a marker that exists but cannot be
+    protected aborts this suite before any real case runs, which leaves no
+    nested UNKNOWN resource for a later conclusion to cover."""
+    if not OUTER_EVIDENCE:
+        return {"state": "no-outer-root"}
+    root = os.path.dirname(os.path.realpath(OUTER_EVIDENCE))
+    try:
+        document = bounded.protect_nested_scope(root, bounded.DefaultProbe())
+    except bounded.MarkerInvalid as invalid:
+        if invalid.code == "absent":
+            return {"state": "unmarked", "root": root}
+        return {"state": "failed", "root": root, "reason": "marker-" + invalid.code}
+    except OSError as error:
+        return {"state": "failed", "root": root, "reason": type(error).__name__}
+    return {"state": "protected", "root": root, "run_id": document["run_id"]}
+
+
 def record_layout():
     """Record the layout this suite ran in for the qualification bootstrap
-    (oxide#145): the candidate's owned root, scratch and evidence. Nested
-    real-case directories are created in OXIDE_PROOF_EVIDENCE, so recording
-    and verifying this record is what proves the nested resources stayed
-    inside the candidate's monitored root on the selected volume."""
+    (oxide#145, oxide#151): the candidate's owned root, scratch and evidence,
+    and the nested-window protection it established first. Nested real-case
+    directories are created in OXIDE_PROOF_EVIDENCE, so recording and verifying
+    this record is what proves the nested resources stayed inside the
+    candidate's monitored root on the selected volume."""
     path = os.environ.get("OXIDE_SUPERVISOR_LAYOUT")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
     if not path or not scratch or not OUTER_EVIDENCE:
         return
     record = {"scratch": os.path.realpath(scratch), "evidence": os.path.realpath(OUTER_EVIDENCE),
-              "suite_pid": os.getpid()}
+              "suite_pid": os.getpid(), "protection": dict(PROTECTION)}
     with open(path, "w") as handle:
         json.dump(record, handle)
 
@@ -5032,6 +5508,14 @@ def write(name, size):
 
 def main():
     signal.alarm(250)  # secondary bound; the supervisor's deadline is primary
+    PROTECTION.update(protect_outer_root())
+    if PROTECTION.get("state") == "failed":
+        # No nested case may run when the outer root could not be protected:
+        # that is the one way an intentional nested UNKNOWN could outlive an
+        # expirable marker.
+        print(f"suite: refused before any case: the outer root could not be protected: {PROTECTION}",
+              file=sys.stderr)
+        return 1
     record_layout()
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
@@ -5039,7 +5523,8 @@ def main():
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
-                                           PureMarker, PureSweep, PureQualificationTopology,
+                                           PureMarker, PureSweep, PureExistingParent,
+                                           PureProtectionAndLifecycle, PureQualificationTopology,
                                            PureClosureDecision, PureSettlement, PureInterleavedConfirmation))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:

@@ -1681,7 +1681,17 @@ placement and retention; Oxide changes no consumer or daemon configuration.
     exclusively created and before any child or run resource, a run writes one
     private `.oxide-scratch.json` marker: strict fixed schema, unique run ID,
     canonical root, owner UID, device and inode, creation time, initially null
-    conclusion, outcome, closure and kept-reason. The marker is written
+    conclusion, outcome, closure, kept-reason and `nested_scope`.
+    `nested_scope` decides who may conclude the root: `exclusive` means the
+    run's own established closure is a whole-owned-resource conclusion;
+    `hosting` means the root may contain resources created by another
+    authority, so the run's own closure is never enough and only the authority
+    that owns that nested window can record the positive conclusion. The
+    qualification suite protects the candidate root as `hosting` before any
+    nested case can exist, an unmarked directory is never adopted, an existing
+    conclusion is never downgraded, and every transition re-verifies the marker
+    identity it read, so protection and conclusion cannot race.
+    The marker is written
     atomically (private temporary file, then one replace) and is updated only
     at a genuine conclusion: a closed session records `outcome: closed`,
     `closure: positive` and kept-reason `evidence`; an unclosed or failed run
@@ -1701,11 +1711,23 @@ placement and retention; Oxide changes no consumer or daemon configuration.
     reported within a bounded row count, symlinks are never followed at any
     level, and the root's marker is removed only after its own contents are
     gone so a partial bounded deletion never turns a damaged root into an
-    unmarked or eligible one. A retained nested UNCLOSED fixture keeps its
-    candidate root unconcluded even when the outer session closed and the suite
-    passed, and a failed qualification keeps the bootstrap base unconcluded;
-    neither can expire while that holds. Historical unmarked roots from earlier
-    runs stay unmarked and ineligible. Reserve sampling reads the filesystem
+    unmarked or eligible one. A peer's own filesystem fault (list, open,
+    unlink, rmdir, a vanishing child or a permission error) is a bounded skip
+    with its reason recorded: it never becomes this run's fallback and never
+    aborts it, and the untouched peer keeps its marker until a later bounded
+    run finishes it. A retained nested UNCLOSED fixture keeps its candidate
+    root unconcluded even when the outer session closed and the suite passed,
+    and a failed qualification keeps the bootstrap base unconcluded; neither
+    can expire while that holds. A passing qualification that intentionally
+    retains nested UNKNOWN resources is still a PASS, but its base records
+    `outcome: retained` with kept-reason `nested-unclosed` and a null
+    conclusion, never `qualify-failed` and never a positive conclusion. A safe
+    existing nonempty parent is accepted: an unmarked `legacy-retained/`
+    directory (the operator's relocated drive-root roots) is skipped as one
+    entry with no descendant enumeration, no marker added and nothing deleted,
+    while a marked eligible peer is still swept within budget. Historical
+    unmarked roots from earlier runs stay unmarked and ineligible, and
+    relocation never makes one concluded. Reserve sampling reads the filesystem
     actually holding the scratch, with the existing thresholds, cadence and
     staleness; the receipt records the selection source, the prepared parent,
     the actual root, the reserve path and device, the bounded sweep summary and
@@ -1715,6 +1737,15 @@ placement and retention; Oxide changes no consumer or daemon configuration.
     ownership. This is not the product's verified build-time selection (no
     container/role check), and the narrow config reader understands only a
     simple `[pool] path` entry.
+- **Unit-validation temp (oxide#151, after main `debffbb`).** A private
+  validation temp root derives from the selection's *mount*, not from the
+  supervisor's nested `root_parent`: `<mount>/scratch/oxide-validation` on a
+  selected volume, or the fallback parent itself. It is a sibling of the
+  marked scratch subtree, so it is outside the seven-day self-expiry, and the
+  helper that names it creates nothing; the recipe makes that parent and one
+  fresh `run.*` directory inside it. The AGENTS.md unit-suite recipe follows
+  exactly this shape, with no hardcoded mount and no second `scratch`
+  component.
 
 Supervisor SHA-256
 `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
@@ -1910,7 +1941,8 @@ bootstrap file changes with it for two concrete reasons and no others: its
 expected case count follows the suite's new total (160 pure + 40 real = 200)
 and it gains one limitation line describing this observation, so it adds no
 bound and no effect. Oxide#151 later raises the expected total to its own 187
-pure + 40 real = 227 with the routing, marker and sweep cases below. Every quality fact here binds to the digests its own
+pure + 40 real = 240 with the routing, marker, nested-window protection and
+bounded-sweep cases below. Every quality fact here binds to the digests its own
 receipt records, never to the `#145` digests above.
 
 - The monitor's receipt gains a `settlement` object with a fixed schema:
@@ -2307,7 +2339,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 187 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 200 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2380,8 +2412,9 @@ runs in order:
   and adopted scratch keeping their own contracts, that the qualification
   bootstrap still passes no `--root-parent` (and does prepare the owned parent
   and sweep before its own base), that the unit-suite recipe in `AGENTS.md`
-  follows the helper's prepared parent rather than a hardcoded mount, that a
-  selected volume reports `<mount>/scratch/oxide` without creating it, and the
+  derives `<mount>/scratch/oxide-validation` once from the mount (never from the
+  nested `root_parent`, never a hardcoded mount) and creates nothing itself,
+  that a selected volume reports `<mount>/scratch/oxide` without creating it, and the
   owned leaf's privacy, ownership, device and canonical refusals with the
   refused leaf removed;
 - the owned scratch parent preparation on real owned fixtures: missing
@@ -2417,6 +2450,33 @@ runs in order:
   that changes during the sweep refused with its payload intact, a foreign or
   symlinked parent refused and an absent one reported, and fixed bounded
   summary rows with an exact omitted count;
+- the pre-existing private parent and the operator's relocation: a real safe
+  0700 current-user `<mount>/scratch/oxide` that already holds a nonempty
+  unmarked `legacy-retained/` tree (three unmarked historical roots with nested
+  UNKNOWN sentinels) is accepted by the real preparation seam, its components
+  keep their inodes, and one bounded sweep over it removes only the marked,
+  positively concluded peer: the legacy entry is skipped as one entry with no
+  descendant enumeration (recorded `listdir`/`open` calls never name it), gains
+  no marker, loses no sentinel, and a new separately marked run root still lands
+  safely in that parent;
+- the nested-window protection and the bootstrap's result-versus-custody
+  transitions: the suite protects its outer root as `hosting` through the real
+  seam before any case (and never adopts an unmarked root, refuses a corrupt
+  marker and stops before the cases when protection fails); an outer closure
+  can never conclude a hosting root; a passing qualification that retains nested
+  UNKNOWN resources records `retained`/`nested-unclosed` with a null conclusion
+  for both the candidate root and the base and is still a PASS; a fully
+  concluded qualification records the positive `evidence`/`qualify-base`
+  conclusions that the sweep may later expire; a failed qualification keeps the
+  base `qualify-failed`; a fabricated hosting conclusion, a mismatched
+  protection record, an unmarked root and every marker read/write/re-mark
+  failure are reported problems, never silent passes; and the pre-correction
+  marker shape (closed/positive/evidence without `nested_scope`) is refused by
+  the sweep at any age;
+- the peer-fault boundary: `unlink`, `rmdir`, `open`, `listdir` and a
+  disappearing child inside one eligible peer each become a bounded skip row
+  with the peer's marker retained, a healthy peer beside it is still swept, and
+  this run's own new root is still created on the selected parent;
 - the qualification checks for this routing: a real owned tree whose parent is
   `<mount>/scratch/oxide` passes end to end, while the bare mount as parent, a
   root created directly at the drive root, a missing sweep summary, a sweep on
@@ -2513,12 +2573,13 @@ expiry never counts as closure. The bootstrap requires all of:
 - the default scratch on the selected volume inside the owned
   `<mount>/scratch/oxide` subtree, as above, with the bootstrap's own base still
   present after the candidate's bounded startup sweep;
-- the candidate's bounded startup sweep summary and its owner-marker
-  conclusion on the owned parent;
+- the candidate's bounded startup sweep summary and its deferral of its own
+  marker conclusion to the nested window, with the suite's protection record
+  and the marker agreeing on one run identity;
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 227 cases;
+- all 240 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
