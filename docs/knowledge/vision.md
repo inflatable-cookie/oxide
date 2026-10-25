@@ -180,12 +180,15 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   (tests, run programs, build scripts, `oxide exec` tools) put temporary
   files on the selected pool. An inherited `TMPDIR` is kept, as its canonical
   directory, only when it is a writable directory on the pool's own device;
-  otherwise Oxide owns one short per-command directory inside the slot,
-  removed at release after writer closure; a `run` program that uses one
-  keeps the lease until its own group closes
+  external owners retain cleanup of their inherited paths and Oxide never
+  writes to or removes one. Otherwise Oxide owns one short per-command
+  directory inside the slot, removed at release after writer closure; a `run`
+  program that uses one keeps the lease until its own group closes
   ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It
   covers child launches only: CI, Effigy's own run scratch, Queue worktrees
-  and host settings stay as they are.
+  and host settings stay as they are. Moving the proof/validation tooling's
+  own default scratch root is separate and still approved, not built
+  ([placement](contracts/workflow.md#temporary-scratch-placement)).
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
@@ -204,7 +207,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).
-- **Declined:** cached slot accounting; revisit only on new evidence.
+- **Approved, not built** (Tom, 2026-10-25): recorded per-slot accounting
+  replaces whole-payload admission walks. Closed-slot records are bound to
+  generation/incarnation; missing or invalid records require bounded slot
+  walks, and cross-slot hard-link overcount is accepted. Removable pools
+  also use the volume's used-space bound. The [accounting contract](contracts/local-lease.md#recorded-per-slot-accounting-approved-not-implemented)
+  owns the direction and trust limits. This supersedes the earlier cached
+  accounting decline for this scope; its negative reviews remain history.
 
 ### Adoption pattern
 
