@@ -949,6 +949,27 @@ def pure_watched_clean_premise_control() -> None:
         not fresh["register_refused"] and not fresh["set_mode_refused"],
         "a fresh payload with a present registration became unreachable",
     )
+    # (e) Stream agreement, read from this script's own text: each asserted notice
+    # must be looked for on the stream its producer actually prints to at the
+    # pinned product source -- adopt notice `println!` (stdout,
+    # outputs.rs:1977), permanent-mode fallback warning `eprintln!` (stderr,
+    # main.rs:392), summary/backend line `eprintln!` (stderr, main.rs:974) and
+    # watchdog report `eprintln!` (stderr, main.rs:744). A source review caught
+    # this class of mistake once; this keeps it from drifting back silently.
+    with open(__file__, encoding="utf-8") as handle:
+        own_text = handle.read()
+    expect(
+        '"local fallback root" in stdout' in own_text,
+        "the watched-clean adopt notice is not asserted on stdout",
+    )
+    expect(
+        '"permanent removable mode fell back to the internal pool" in stderr' in own_text,
+        "the permanent-mode fallback warning is not asserted on stderr",
+    )
+    expect(
+        '"directory-budget-v1" in stderr' in own_text,
+        "the directory-budget summary is not asserted on stderr",
+    )
     print("pure watched-clean premise control: ok", flush=True)
 
 
@@ -3710,15 +3731,17 @@ def run(proof: Proof, repo: str) -> None:
             try:
                 seeded = make_checkout(proof, "watched-clean-fixture")
                 os.makedirs(os.path.join(seeded, "target"))
-                code, _, stderr = perm.oxide_env(
+                code, stdout, stderr = perm.oxide_env(
                     proof, ["outputs", "adopt"], "16 watched clean adopt", seeded, env
                 )
                 expect(code == 0, f"16: adopting the watched-clean checkout failed: {stderr}")
                 # Prerequisite 2: the adopt is permanent-mode and selects the
-                # checkout-local fallback root, never an external placement.
+                # checkout-local fallback root, never an external placement. The
+                # notice is `println!` on STDOUT (`RootKind::label()` is "local
+                # fallback"); the stream is asserted, not assumed.
                 expect(
-                    "local fallback root" in stderr,
-                    f"16: the watched-clean adopt did not select the local fallback root: {stderr}",
+                    "local fallback root" in stdout,
+                    f"16: the watched-clean adopt did not select the local fallback root: {stdout}{stderr}",
                 )
                 code, _, stderr = perm.oxide_env(
                     proof, ["build"], "16 watched clean seed", seeded, env
