@@ -248,7 +248,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The qualified supervisor is
-# this tree's `bounded-test.py` (sha256 a6d73326…, oxide#145); 300 s wall and
+# this tree's `bounded-test.py` (sha256 5e5b6617…, oxide#147); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
 # a separately activated diagnostic. Staging reuses the oxide#140 recipe (4
 # Cargo jobs, 16 codegen units, assertions on, no debug info, no incremental,

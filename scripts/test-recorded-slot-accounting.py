@@ -2,7 +2,9 @@
 """Focused native proof for recorded per-slot accounting (oxide#146).
 
 One fixed script and the whole command of the qualified shared proof
-supervisor (`bounded-test.py`, guard sha256 a6d73326..., oxide#145). The
+supervisor (`bounded-test.py`, guard sha256 5e5b6617..., oxide#147). That pin
+is checked against the actual runner file before any effect, so a branch that
+still carries an older guard refuses here instead of spending a run.
 approved recipe is an INTERNAL directory pool, so both heavy selectors pass
 `--root-parent /private/tmp` explicitly (Tom's internal-root exception): a
 pool inside a selected-volume root would be refused by the product itself.
@@ -65,7 +67,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 # The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b"
+GUARD_SHA256 = "5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 MIB = 1024 * 1024
 # Staging recipe (oxide#140): 4 Cargo jobs, 16 codegen units, frozen profile.
@@ -363,10 +365,18 @@ def source_identity() -> str:
     return head
 
 
-def guard_identity() -> str:
-    actual = sha256_file(GUARD_PATH)
-    if actual != GUARD_SHA256:
-        abort(f"the shared supervisor bytes changed: {actual} != {GUARD_SHA256}")
+def guard_identity(guard_path: str = "", expected: str = "") -> str:
+    """The shared supervisor's actual hash, refusing any drift from the pin.
+
+    The default pin is the adopted qualified runner; the pure check calls this
+    with the real file so a stale pin (or a runner swapped under a matching
+    pin) is caught without a subprocess, scratch directory or fixture.
+    """
+    path = guard_path or GUARD_PATH
+    pinned = expected or GUARD_SHA256
+    actual = sha256_file(path)
+    if actual != pinned:
+        abort(f"the shared supervisor bytes changed: {actual} != {pinned}")
     return actual
 
 
@@ -2074,7 +2084,30 @@ def self_check() -> None:
     for attribute in ("command", "cwd", "prerequisite", "Observed phase"):
         expect(attribute in (__doc__ or ""), f"the case map does not name {attribute}")
     expect(ALLOCATION["measured"] is False, "the estimate must not claim measurement")
-    expect(GUARD_SHA256.startswith("a6d73326"), "the guard pin is not the qualified source")
+    # The executable pin must match the runner actually in this tree, and the
+    # owning docs must name the same bytes. This is the cross-file seam a
+    # prefix-only pin check missed when the qualified oxide#147 runner replaced
+    # its predecessor: measure the real file and a real mismatch, no subprocess.
+    expect(len(GUARD_SHA256) == 64 and all(c in "0123456789abcdef" for c in GUARD_SHA256),
+           "the guard pin is not a sha256 hex digest")
+    measured = sha256_file(GUARD_PATH)
+    expect(measured == GUARD_SHA256,
+           f"the guard pin {GUARD_SHA256} is not the runner in this tree ({measured})")
+    expect(guard_identity() == measured, "guard_identity disagrees with the measured runner")
+    for document in ("docs/knowledge/contracts/workflow.md",
+                     "docs/knowledge/contracts/local-lease.md"):
+        with open(os.path.join(REPO, document), encoding="utf-8") as handle:
+            expect(measured in handle.read(),
+                   f"{document} does not name the actual qualified supervisor bytes")
+    # Negative: any other pin is refused before effects, naming both hashes.
+    try:
+        guard_identity(GUARD_PATH, "0" * 64)
+    except CaseFailure as failure:
+        expect(failure.abort, "a mismatched guard pin must abort, not continue")
+        expect(GUARD_SHA256 in str(failure) and "0" * 64 in str(failure),
+               f"the refusal does not name both pins: {failure}")
+    else:
+        fail("a mismatched guard pin was accepted")
     print("self-check: ok (rendering, recipe validator, phase/receipt rules; not evidence)")
 
 
