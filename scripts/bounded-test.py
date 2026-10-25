@@ -830,6 +830,15 @@ class Census:
             state["clean"] = False
         return True
 
+    def retains_member_attribution(self, identity):
+        """Whether an unresolved ESRCH identity keeps its retained member
+        attribution instead of being reported uncertain.
+
+        This is the serial tail rule at 8849f99: a tracked identity that is
+        neither positively Gone nor terminal-accepted stays a member. It is a
+        separate seam so the differential can falsify exactly this branch."""
+        return identity in self.tracked
+
     def terminal_eligible(self, row, first_row, first_error):
         """Whether an actual-ESRCH row qualifies as terminal nonwriter.
 
@@ -978,15 +987,22 @@ class Census:
             try:
                 again = self.reread(row["pid"])
             except Exception as error:
+                # The serial algorithm also reached its ordinary tail here, so
+                # a tracked identity keeps its retained attribution as a member
+                # and only an untracked one becomes uncertain. Marking every
+                # failed final read uncertain would change that result.
                 again = None
                 failure = f"reread: {error}"
-                record["uncertain"] = dict(row, reason=failure)
                 record["diag"] = _diag_attempt(row, tries, confirm_outcome, "read_failed", error=error)
                 try:
                     if self.terminal_allowed is True and row.get("zombie") is True:
                         terminal_tainted = True
                 except BaseException:
                     pass
+                if self.retains_member_attribution(identity):
+                    record["member"] = row  # retained attribution, exactly as the serial tail
+                else:
+                    record["uncertain"] = dict(row, reason=failure)
                 continue
             if again is None:
                 self.tracked.pop(identity, None)
@@ -996,7 +1012,6 @@ class Census:
                 self.tracked.pop(identity, None)
                 record["diag"] = _diag_attempt(row, tries, confirm_outcome, "replaced")
                 continue
-            stable = True
             record["diag"] = _diag_attempt(row, tries, confirm_outcome, "same_identity",
                                            error=state["getsid_error"])
             try:
@@ -1027,7 +1042,7 @@ class Census:
                 terminal_count += 1
                 record["skip"] = True  # kept tracked attribution; neither member nor uncertain
                 continue
-            if identity in self.tracked:
+            if self.retains_member_attribution(identity):
                 record["member"] = row  # tracked attribution kept
             else:
                 record["uncertain"] = dict(row, reason=failure)

@@ -3162,6 +3162,40 @@ def patched(target, name, value):
         setattr(target, name, saved)
 
 
+def owned_witness_report(witnesses, starts):
+    """Coverage of a (possibly clipped) terminal-witness list against the
+    identities this fixture positively holds.
+
+    A shared host census can legitimately retain ambient allowlisted terminal
+    rows, so those are accepted as observations and never treated as foreign
+    writers. They can never stand in for an owned identity: an owned identity
+    must be witnessed with its exact (PID, start). The witness list is bounded
+    by a shared byte budget, so the report names which owned identities were
+    witnessed and which were clipped away rather than claiming all of them
+    from a subset."""
+    rows = [entry for entry in witnesses or [] if isinstance(entry, dict)]
+    owned, ambient, problems = {}, [], []
+    for entry in rows:
+        pid = entry.get("pid")
+        if pid in starts:
+            owned[pid] = entry.get("start")
+            if entry.get("start") != starts[pid]:
+                problems.append(f"owned pid {pid} witnessed with start {entry.get('start')} "
+                                f"instead of {starts[pid]}")
+        else:
+            ambient.append(pid)
+    omitted = sorted(set(starts) - set(owned))
+    if not owned:
+        problems.append(f"no owned identity witnessed ({len(starts)} held, "
+                        f"{len(ambient)} ambient retained, {len(omitted)} omitted)")
+    return {"problems": problems, "owned": owned, "ambient": ambient, "omitted": omitted}
+
+
+def owned_witness_problems(witnesses, starts):
+    """Just the problems from owned_witness_report."""
+    return owned_witness_report(witnesses, starts)["problems"]
+
+
 def ordering_problems(result):
     """Why a round's published lists are not in snapshot order, or [].
 
@@ -3300,6 +3334,8 @@ FAIL_AT_1 = [EPERM]
 FAIL_AT_5 = [dead_row(903)] * 4 + [EPERM]
 CONTRADICTION = [dead_row(904), row(904, start=7)]  # same start token, never SZOMB
 NONZOMBIE = [row(905, start=7)]                     # actual ESRCH, never SZOMB
+FINAL_FAILS = [dead_row(970)] * 20 + [EPERM]        # 20 confirmations, then read 21 fails
+FINAL_FAILS_NONZOMBIE = [row(971, start=7)] * 20 + [EPERM]
 
 
 class PureInterleavedConfirmation(unittest.TestCase):
@@ -3439,6 +3475,78 @@ class PureInterleavedConfirmation(unittest.TestCase):
                      if isinstance(entry, dict)]
         self.assertEqual(witnesses, list(range(960, 960 + len(witnesses))))
         self.assertGreaterEqual(len(witnesses), 8)
+
+    def test_tracked_final_read_failure_keeps_serial_attribution(self):
+        # oxide#147 correction review: a failed FINAL read must follow the
+        # serial tail at 8849f99, where a tracked identity keeps its retained
+        # member attribution and only an untracked one becomes uncertain.
+        for allowed in (False, True):
+            for script, pid in ((FINAL_FAILS, 970), (FINAL_FAILS_NONZOMBIE, 971)):
+                with self.subTest(allowlisted=allowed, script=pid):
+                    table = scenario(esrch=[(pid, script)])
+                    produced = table.census(allowed)
+                    produced.tracked[(pid, 7)] = (dead_row(pid) if pid == 970
+                                                  else row(pid, start=7))
+                    result = produced.round()
+                    reference = scenario(esrch=[(pid, script)]).reference(allowed)
+                    reference.tracked[(pid, 7)] = (dead_row(pid) if pid == 970
+                                                   else row(pid, start=7))
+                    expected = reference.round()
+                    self.assertEqual(result, expected,
+                                     "a tracked final-read failure must keep the serial result")
+                    self.assertEqual([entry["pid"] for entry in result["member_rows"]], [pid])
+                    self.assertEqual(len(table.rereads(pid)), 21)
+                    self.assertEqual(produced.stats["pause_calls"], 19)
+                    self.assertIn((pid, 7), produced.tracked)
+                    self.assertEqual(produced.tracked.keys(), reference.tracked.keys())
+                    self.assertIn("read_failed", result["diagnostics"]["rows"][0]["final"])
+                    if allowed:
+                        # Every ESRCH identity here has a SZOMB snapshot row, so in
+                        # allowlisted mode only the terminal count becomes
+                        # unaccountable and adds the synthetic uncertainty row,
+                        # exactly as the serial did.
+                        self.assertEqual([entry.get("reason") for entry in result["uncertain_rows"]],
+                                         ["terminal count not countable"])
+                    else:
+                        self.assertEqual(result["uncertain_rows"], [])
+                        self.assertEqual(result["certain"], True)
+
+        # Untracked, the same failure is uncertain, exactly as before.
+        table = scenario(esrch=[(970, FINAL_FAILS)])
+        self.assertEqual(table.census(True).round(),
+                         scenario(esrch=[(970, FINAL_FAILS)]).reference(True).round())
+        self.assertEqual(len(table.rereads(970)), 21)
+
+        # The currently incorrect unconditional-uncertain branch must fail.
+        tracked_reference = scenario(esrch=[(970, FINAL_FAILS)]).reference(True)
+        tracked_reference.tracked[(970, 7)] = dead_row(970)
+        expected_tracked = tracked_reference.round()
+        with patched(bounded.Census, "retains_member_attribution", lambda self, identity: False):
+            wrong = scenario(esrch=[(970, FINAL_FAILS)])
+            wrong_census = wrong.census(True)
+            wrong_census.tracked[(970, 7)] = dead_row(970)
+            wrong_result = wrong_census.round()
+        self.assertNotEqual(wrong_result, expected_tracked,
+                            "dropping retained attribution on a failed final read must be detected")
+        self.assertEqual(wrong_result["uncertain_rows"][0]["pid"], 970)
+
+    def test_owned_witness_oracle_accepts_ambient_but_requires_own(self):
+        starts = {5001: 11, 5002: 12}
+        own = [{"pid": 5001, "start": 11, "tracked": False},
+               {"pid": 5002, "start": 12, "tracked": False}]
+        ambient = [{"pid": 9001, "start": 77, "tracked": False}]
+        self.assertEqual(owned_witness_problems(own + ambient, starts), [])
+        self.assertEqual(owned_witness_problems([{"pid": 5001, "start": 11}], starts), [])
+        self.assertTrue(owned_witness_problems(ambient, starts),
+                        "ambient witnesses alone must never stand in for an owned identity")
+        self.assertTrue(owned_witness_problems([], starts),
+                        "an empty retained list cannot prove an owned witness")
+        self.assertTrue(owned_witness_problems([{"pid": 5001, "start": 99}] + ambient, starts),
+                        "an owned PID with the wrong start token must be rejected")
+        # A clipped list that lost every owned identity reports that plainly.
+        report = owned_witness_report([{"pid": 9001, "start": 77}], starts)
+        self.assertEqual((report["owned"], report["omitted"]), ({}, [5001, 5002]))
+        self.assertTrue(report["problems"])
 
     def test_snapshot_order_oracles_reject_a_shuffled_list(self):
         esrch = [(940 + index, [None] if index % 2 == 0 else [row(940 + index, start=7)])
@@ -3843,12 +3951,17 @@ class Real(unittest.TestCase):
             self.assertEqual(self.receipt.get("terminal_mode", {}).get("mode"), "allowlisted")
             self.assertEqual(nested["terminal_count_status"], "valid")
             self.assertGreaterEqual(nested["terminal_nonwriters"], 12)
-            witnesses = [entry for entry in nested.get("terminal_witnesses") or []
-                         if isinstance(entry, dict)]
-            self.assertTrue(witnesses, "no terminal witness survived the budget")
-            for entry in witnesses:  # the shared byte budget may clip the list
-                self.assertIn(entry.get("pid"), starts)
-                self.assertEqual(entry.get("start"), starts[entry.get("pid")])
+            # The global host census may legitimately retain ambient allowlisted
+            # terminal rows. They are observations, never foreign writers, and
+            # they can never stand in for an identity this fixture holds. The
+            # witness list is byte-budget clipped, so report exactly which owned
+            # identities were witnessed and which were clipped away; a clipped
+            # list with no owned witness fails rather than being relaxed.
+            report = owned_witness_report(nested.get("terminal_witnesses"), starts)
+            self.assertEqual(report["problems"], [])
+            self.assertTrue(report["owned"], "a nonvacuous exact owned witness is required")
+            print("[oxide#147] held=%d witnessed=%s omitted=%s ambient=%d"
+                  % (len(starts), sorted(report["owned"]), report["omitted"], len(report["ambient"])))
         finally:
             for pid in held:
                 try:

@@ -1657,7 +1657,7 @@ acceptance gates and not a closure authority: the head that carries them is
 author and independent reviewer `proof:supervisor:qualify` receipts exist, and
 the `a6d73326` bytes above stay the qualified ones for their own runs. The
 bootstrap file changes with it for two concrete reasons and no others: its
-expected case count follows the suite's new total (158 pure + 40 real = 198)
+expected case count follows the suite's new total (160 pure + 40 real = 200)
 and it gains one limitation line describing this observation, so it adds no
 bound and no effect. Every quality fact here binds to the digests its own
 receipt records, never to the `#145` digests above.
@@ -1708,11 +1708,16 @@ receipt records, never to the `#145` digests above.
   never short-circuits; the per-identity terminal/taint/count rules and all
   bounds are unchanged. Published members, uncertain rows, diagnostics and
   terminal witnesses are assembled in snapshot order from per-row records.
-  A round with N persistent zombie rows now pays `N x 0.95 s` of sleep only if
-  N exceeds `CONFIRM_TRIES - 1`; the round's own share is at most 19 pauses.
-  This source remains **unqualified** until its own uncounted keep-going
-  diagnostic and separate author and reviewer `proof:supervisor:qualify`
-  receipts exist.
+  The serial algorithm paid its prescribed pause once per identity per read,
+  so its derived wait grew as about `0.95 s x N` for N persistent zombie rows;
+  the interleaved round shares at most `CONFIRM_TRIES - 1` = 19 pauses
+  whatever N is, while the same reads and CPU work remain. Those figures are
+  pause calls times the declared `CONFIRM_PAUSE`, not independently measured
+  sleep duration, and the historical #140 cause stays inferred rather than
+  reproduced. A tracked identity that fails its final read keeps its retained
+  member attribution, exactly as the pre-correction tail did. This source
+  remains **unqualified** until its own uncounted keep-going diagnostic and
+  separate author and reviewer `proof:supervisor:qualify` receipts exist.
 
 `scripts/bounded-test.py` is the shared proof supervisor. It implements the
 reviewed [pinned-leader correction design](proof-supervisor-correction.md)
@@ -2040,7 +2045,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 158 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 160 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
