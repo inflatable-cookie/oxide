@@ -1296,7 +1296,11 @@ and grants no native start, installation, clock extension or cleanup authority.
    invoking `HOME/.rustup` when it is unset, before replacing `HOME`. Preserve
    that toolchain home in fixture children, keep the pinned toolchain and set
    `RUSTUP_AUTO_INSTALL=0`. Private `HOME` and `CARGO_HOME` stay private; never
-   repair a fixture by downloading or installing a toolchain.
+   repair a fixture by downloading or installing a toolchain. Before any
+   `--locked` Cargo call, establish a manifest-consistent `Cargo.lock` in that
+   fixture; a fresh crate does not have one automatically. Trace the actual
+   setup state as well as argv, and keep any offline lock generation inside
+   the activated proof's owned scratch and bounds.
 2. **Account-home control.** Set `OXIDE_TEST_HOME_FROM_ENV=1` wherever a private
    `HOME` is meant to be honoured. Without that explicit test control, Oxide
    deliberately uses the account home rather than a caller's `HOME`.
