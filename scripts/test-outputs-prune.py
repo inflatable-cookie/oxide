@@ -103,7 +103,12 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
      exit nonzero with no handoff, no host path and complete pool, volume-tree
      and checkout bytes and metadata unchanged. The version-1 fixture for case
      21 is written here, before the registry exists, so the product's own
-     receipt seed records its legacy rows.
+     receipt seed records its legacy rows. Its image's `oxide-outputs`
+     container is created first, exclusively and 0700, before any nested
+     version-1 root: nested-first creation would make Python create that
+     intermediate 0755 and the product's owner-only check would correctly
+     refuse it (the diagnostic-1 finding this correction fixes). An unexpected
+     pre-existing container refuses rather than being adopted or chmodded.
   02 missing ready registry: dry run exits 2, adopt of another checkout
      refuses, nothing is rebuilt; restoring the exact bytes recovers.
   03 root nonce: the external root's v2 marker nonce (32 hex) equals the
@@ -633,6 +638,76 @@ def case(case_id: str) -> _Case:
     return _Case(case_id)
 
 
+class FixtureEffects:
+    """The filesystem effects the fixture's private output container needs, so
+    the pure selector can drive this real seam with in-memory stubs."""
+
+    def mkdir(self, path: str, mode: int) -> None:
+        os.mkdir(path, mode)
+
+    def open_dir(self, path: str) -> int:
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+    def fstat(self, fd: int):
+        return os.fstat(fd)
+
+    def fchmod(self, fd: int, mode: int) -> None:
+        os.fchmod(fd, mode)
+
+    def stat(self, path: str):
+        return os.stat(path, follow_symlinks=False)
+
+    def close(self, fd: int) -> None:
+        os.close(fd)
+
+    def euid(self) -> int:
+        return os.geteuid()
+
+
+REAL_FIXTURE_EFFECTS = FixtureEffects()
+
+
+def create_private_outputs_container(
+    outer: str, mount: str, effects=REAL_FIXTURE_EFFECTS
+) -> str:
+    """Exclusively create this fixture's own `<mount>/oxide-outputs`, 0700.
+
+    The product creates that directory itself, owner-only, and refuses an
+    existing entry that is not an owner-only directory of this user
+    (`volume::dir_at`). A fixture that planted nested roots first would let
+    Python create the intermediate container with the default `0o777 & ~umask`
+    (0755) and the product would correctly refuse it, so the container is
+    created HERE, first, by an exclusive mkdir on this run's own image. An
+    unexpected pre-existing entry refuses: it is never adopted, chmodded or
+    followed, and a mode is only ever tightened through the descriptor this
+    call created.
+    """
+    try:
+        effects.mkdir(outer, 0o700)
+    except FileExistsError as error:
+        raise Aborted(
+            f"the fixture's private output container {outer} already exists; it is never "
+            "adopted, chmodded or followed"
+        ) from error
+    fd = effects.open_dir(outer)
+    try:
+        facts = effects.fstat(fd)
+        if not stat.S_ISDIR(facts.st_mode):
+            raise Aborted(f"the fixture's output container {outer} is not a real directory")
+        if facts.st_uid != effects.euid():
+            raise Aborted(f"the fixture's output container {outer} is not owned by this user")
+        if facts.st_mode & 0o077:
+            effects.fchmod(fd, 0o700)
+            facts = effects.fstat(fd)
+        if facts.st_mode & 0o077:
+            raise Aborted(f"the fixture's output container {outer} is not owner-only")
+        if facts.st_dev != effects.stat(mount).st_dev:
+            raise Aborted(f"the fixture's output container {outer} is on another device")
+    finally:
+        effects.close(fd)
+    return outer
+
+
 class World:
     """The fixture: one staged binary, private HOME/CARGO_HOME/pool and one
     owned scratch volume registered in permanent mode."""
@@ -716,15 +791,28 @@ class World:
         )
         return self.mount
 
+    def private_outputs_container(self) -> str:
+        """This run's own `<mount>/oxide-outputs`, created exclusively 0700
+        before any nested fixture root lands in it."""
+        return create_private_outputs_container(
+            os.path.join(self.mount, "oxide-outputs"), self.mount
+        )
+
     def version_one_fixture(self) -> dict:
         """Two whole-target `oxide.outputs.transition/1` receipts and their
         `root/1` roots, written BEFORE the registry exists, so the product's own
         receipt seed records their legacy rows (no nonce, no invented
         identity). Nothing here is a hand-made registry: the schema comes from
-        the shape oxide#117 published."""
+        the shape oxide#117 published.
+
+        The image's `oxide-outputs` container is created first and exclusively
+        0700. Creating the nested version-1 roots first would let Python create
+        that intermediate with the default 0755, and the product's own
+        owner-only check would (correctly) refuse it."""
         uuid = permanent.real_uuid(self.pool)
         os.makedirs(self.outputs, mode=0o700, exist_ok=True)
         os.chmod(self.outputs, 0o700)
+        self.private_outputs_container()
 
         def marker(checkout: str, checkout_id: str, label: str) -> dict:
             return {
@@ -740,8 +828,10 @@ class World:
             }
 
         def root_for(checkout_id: str, label: str) -> str:
+            # The container above exists, so this is one exclusive leaf mkdir
+            # inside it: no intermediate directory is ever created here.
             root = os.path.join(self.mount, "oxide-outputs", f"{label}-{checkout_id[:8]}")
-            os.makedirs(root, mode=0o700)
+            os.mkdir(root, 0o700)
             os.chmod(root, 0o700)
             with open(os.path.join(root, "artifact"), "wb") as handle:
                 handle.write(b"x" * 4096)
@@ -1853,6 +1943,175 @@ def self_test() -> int:
         assert '(["check"], ["outputs", "adopt"])' in case_one
 
     check("older-binary artifact input path", artifact_inputs)
+
+    class MemoryEffects:
+        """In-memory stand-in for FixtureEffects: the fixture's private
+        container seam driven without a mount, image, child or host effect.
+        `umask` models the process umask that produced the OLD implicit
+        intermediate mode."""
+
+        def __init__(self, mount_dev: int = 7, euid: int = 501, umask: int = 0o022):
+            self.entries: dict[str, dict] = {}
+            self.order: list[tuple] = []
+            self.mount_dev = mount_dev
+            self.uid = euid
+            self.umask = umask
+
+        def _entry(self, path: str, mode: int, dev: int | None = None) -> None:
+            self.entries[path] = {
+                "mode": mode,
+                "uid": self.uid,
+                "dev": self.mount_dev if dev is None else dev,
+            }
+
+        def mkdir(self, path: str, mode: int) -> None:
+            if path in self.entries:
+                raise FileExistsError(path)
+            self._entry(path, mode & ~self.umask)
+            self.order.append(("mkdir", path, self.entries[path]["mode"]))
+
+        def open_dir(self, path: str) -> str:
+            if path not in self.entries:
+                raise FileNotFoundError(path)
+            self.order.append(("open_dir", path))
+            return path
+
+        def fstat(self, fd: str):
+            entry = self.entries[fd]
+            return type(
+                "Facts",
+                (),
+                {
+                    "st_mode": stat.S_IFDIR | entry["mode"],
+                    "st_uid": entry["uid"],
+                    "st_dev": entry["dev"],
+                },
+            )()
+
+        def fchmod(self, fd: str, mode: int) -> None:
+            self.entries[fd]["mode"] = mode
+            self.order.append(("fchmod", fd, mode))
+
+        def stat(self, path: str):
+            if path == "/mnt":
+                return type(
+                    "Facts",
+                    (),
+                    {"st_mode": stat.S_IFDIR, "st_uid": self.uid, "st_dev": self.mount_dev},
+                )()
+            entry = self.entries[path]
+            return type(
+                "Facts",
+                (),
+                {
+                    "st_mode": stat.S_IFDIR | entry["mode"],
+                    "st_uid": entry["uid"],
+                    "st_dev": entry["dev"],
+                },
+            )()
+
+        def close(self, fd: str) -> None:
+            self.order.append(("close", fd))
+
+        def euid(self) -> int:
+            return self.uid
+
+    def owner_only_ok(effects, path: str) -> bool:
+        """The product's own predicate (volume::dir_at): a real directory,
+        owned by this user, with no group or other permission bits."""
+        facts = effects.stat(path)
+        return (
+            stat.S_ISDIR(facts.st_mode)
+            and facts.st_uid == effects.euid()
+            and facts.st_mode & 0o077 == 0
+        )
+
+    def private_container() -> None:
+        container = "/mnt/oxide-outputs"
+        # (a) The fixed setup: an exclusive 0700 container first, so the
+        # product's predicate holds for it.
+        effects = MemoryEffects()
+        created = create_private_outputs_container(container, "/mnt", effects)
+        assert created == container
+        assert effects.entries[container]["mode"] == 0o700, effects.entries[container]
+        assert effects.order[0][:2] == ("mkdir", container), effects.order
+        assert owner_only_ok(effects, container)
+        # (b) The OLD premise is now a proven failure: a nested root created
+        # first makes the intermediate container 0755, which the product
+        # refuses. This is the counterfactual the fixture correction removes.
+        old = MemoryEffects()
+        old._entry(container, 0o777 & ~old.umask)  # Python's makedirs intermediate
+        assert old.entries[container]["mode"] == 0o755, old.entries[container]
+        assert not owner_only_ok(old, container), "the 0755 premise passed the product predicate"
+        # (c) An unexpected pre-existing container refuses; nothing is adopted
+        # or chmodded, not even an already owner-only one.
+        for mode in (0o755, 0o700):
+            existing = MemoryEffects()
+            existing._entry(container, mode)
+            before = dict(existing.entries[container])
+            try:
+                create_private_outputs_container(container, "/mnt", existing)
+            except Aborted as error:
+                assert "already exists" in str(error), error
+            else:
+                raise AssertionError("an existing container was adopted")
+            assert existing.entries[container] == before, existing.entries[container]
+            assert ("fchmod", container, 0o700) not in existing.order, existing.order
+        # (d) A container that does not end up as this user's owner-only
+        # directory on the mount's device refuses instead of being used; the
+        # only mode repair is through the descriptor this call created.
+        class Tampered(MemoryEffects):
+            def __init__(self, *, dev: int | None = None, uid: int | None = None, mode: int | None = None):
+                super().__init__()
+                self.tampered_dev = dev
+                self.tampered_uid = uid
+                self.tampered_mode = mode
+
+            def mkdir(self, path: str, mode: int) -> None:
+                super().mkdir(path, mode)
+                if self.tampered_dev is not None:
+                    self.entries[path]["dev"] = self.tampered_dev
+                if self.tampered_uid is not None:
+                    self.entries[path]["uid"] = self.tampered_uid
+                if self.tampered_mode is not None:
+                    self.entries[path]["mode"] = self.tampered_mode
+
+        for tampered, expected in (
+            (Tampered(dev=8), "another device"),
+            (Tampered(uid=502), "not owned by this user"),
+        ):
+            try:
+                create_private_outputs_container(container, "/mnt", tampered)
+            except Aborted as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError(f"a tampered container was accepted ({expected})")
+        repaired = Tampered(mode=0o755)
+        create_private_outputs_container(container, "/mnt", repaired)
+        assert repaired.entries[container]["mode"] == 0o700, repaired.entries[container]
+        assert ("fchmod", container, 0o700) in repaired.order, repaired.order
+        # (e) The seam is what the fixture actually calls, and it is called
+        # before the first nested root, with no exist_ok/chmod shortcut.
+        fixture_source = inspect.getsource(World.version_one_fixture)
+        assert "self.private_outputs_container()" in fixture_source, fixture_source
+        assert fixture_source.index("self.private_outputs_container()") < fixture_source.index(
+            "root_for("
+        ), "the private container is not created before the nested roots"
+        assert "exist_ok" not in fixture_source.replace(
+            'os.makedirs(self.outputs, mode=0o700, exist_ok=True)', ""
+        ), "a broad exist_ok shortcut remains in the version-1 fixture"
+        seam = inspect.getsource(create_private_outputs_container)
+        assert "effects.mkdir(outer, 0o700)" in seam, seam
+        assert "FileExistsError" in seam and "exist_ok" not in seam, seam
+        assert "effects.fchmod(fd, 0o700)" in seam, seam
+        assert "effects.open_dir(outer)" in seam, seam
+        # The no-follow, descriptor-anchored effects it uses.
+        assert "O_NOFOLLOW" in inspect.getsource(FixtureEffects.open_dir)
+        assert "os.fchmod" in inspect.getsource(FixtureEffects.fchmod)
+        parameters = inspect.signature(create_private_outputs_container).parameters
+        assert parameters["effects"].default is REAL_FIXTURE_EFFECTS, parameters["effects"]
+
+    check("private fixture output container", private_container)
 
     def counted_fail_fast() -> None:
         ran: list[str] = []
