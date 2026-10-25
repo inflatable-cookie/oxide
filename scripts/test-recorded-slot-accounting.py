@@ -49,6 +49,11 @@ Cases (each a real library/CLI path, not a decision mock):
 - G default status reports recorded totals and writes nothing; `--measure`
   keeps the full-walk audit and still writes nothing.
 
+The fixed nine-item premise checklist is recorded in `PREMISE_CHECKLIST` as one
+disposition per item - the executable location, or a concrete reason it does not
+apply (no adopting conversion, no external Cargo subcommand, no image, no
+`mktemp`) - and the diagnostic receipt carries that map.
+
 `--diagnostic` is the safe uncounted collection mode: it records recoverable
 oracle failures, continues only into dependency-independent cases, skips
 tainted dependents with their reasons, aborts on any unknown child, writer,
@@ -501,7 +506,7 @@ def held_writer(fx: Fixture, subject: str, checkout: str) -> tuple[subprocess.Po
     raise AssertionError("unreachable")
 
 
-def release_writer(fx: Fixture, child: subprocess.Popen, checkout: str) -> None:
+def release_writer(fx: Fixture, child: subprocess.Popen, checkout: str) -> str:
     gate = os.path.join(fx.root, f"release-{os.path.basename(checkout)}")
     with open(gate, "w", encoding="utf-8") as handle:
         handle.write("release\n")
@@ -515,6 +520,7 @@ def release_writer(fx: Fixture, child: subprocess.Popen, checkout: str) -> None:
         child.returncode == 0,
         f"the released writer exited {child.returncode}: {(output or '')[-800:]}",
     )
+    return output or ""
 
 
 def case_a_all_recorded_admission_walks_nothing(root: str, subject: str) -> None:
@@ -594,6 +600,7 @@ def case_c_release_publishes_and_reuse_clears(root: str, subject: str) -> None:
     # for the held generation: a held slot never borrows one. The gated writer
     # keeps it held so the ledger can be read at that moment.
     fx.reset_logs()
+    provenance = ""
     child, held_slot = held_writer(fx, subject, checkout)
     try:
         expect(held_slot == idle[0], f"the reuse took slot {held_slot}, not {idle[0]}")
@@ -607,7 +614,13 @@ def case_c_release_publishes_and_reuse_clears(root: str, subject: str) -> None:
             "a held slot still carries the idle generation's record",
         )
     finally:
-        release_writer(fx, child, checkout)
+        provenance = release_writer(fx, child, checkout)
+    # The result line names the reuse measurement it took, which is the only
+    # per-command provenance a reuse reports (nothing measures after release).
+    expect(
+        f"slot {idle[0]} was " in provenance and "MiB when leased" in provenance,
+        f"the reuse result line lost its provenance: {provenance[-600:]}",
+    )
     record = fx.recorded(idle[0])
     expect(record is not None, "the released reuse recorded nothing")
     expect(
@@ -809,7 +822,60 @@ def case_g_status_readonly_and_measure_audit(root: str, subject: str) -> None:
 # Dispatch, dependency map and receipts.
 
 
-# Shared premises every case depends on. A failed premise taints every case.
+# The fixed nine-item proof-authoring premise checklist, with the executable
+# location of each disposition or a concrete reason it does not apply. The
+# diagnostic receipt carries this map; `--self-check` asserts it is complete.
+PREMISE_CHECKLIST = {
+    "1_private_home_and_rustup": (
+        "invoking_rustup_home() resolves RUSTUP_HOME (or $HOME/.rustup) before any "
+        "private HOME exists and aborts if it is unusable; staging_recipe() and "
+        "Fixture.env() set that one value with RUSTUP_TOOLCHAIN=1.97.1 and "
+        "RUSTUP_AUTO_INSTALL=0; Fixture.establish_lock() runs one offline "
+        "`cargo generate-lockfile` child before any --locked call and requires a "
+        "manifest-consistent Cargo.lock. Nothing downloads or installs a toolchain."
+    ),
+    "2_account_home_control": (
+        "Fixture.env() sets OXIDE_TEST_HOME_FROM_ENV=1 so the private HOME is "
+        "honoured; the staged capability probe answers `test_controls` before any "
+        "case runs."
+    ),
+    "3_environment_isolation": (
+        "Fixture.env() drops every inherited OXIDE_* and XDG_* variable and "
+        "TMPDIR/TMP/TEMP/CARGO_ENCODED_RUSTFLAGS before setting only the fixture's "
+        "own OXIDE_POOL, OXIDE_POOL_CAP, logs and temp directory."
+    ),
+    "4_automatic_adoption": (
+        "Not applicable: no case uses permanent outputs, an owned-output link or a "
+        "`target/` placement, so there is no adopting first conversion to create or "
+        "to exclude. Every fixture builds through the pool's own slot."
+    ),
+    "5_cargo_external_argv": (
+        "Not applicable: no case invokes an external Cargo subcommand, so no "
+        "cargo-<tool> argv shape is observed."
+    ),
+    "6_owned_images": (
+        "Not applicable: the proof needs a genuine internal directory-budget pool "
+        "(the approved --root-parent /private/tmp exception) and attaches no image, "
+        "mounts nothing and probes no device, so -owners on has nothing to apply to."
+    ),
+    "7_compiler_flags": (
+        "staging_recipe() removes inherited CARGO_ENCODED_RUSTFLAGS and RUSTFLAGS "
+        "and sets one frozen RUSTFLAGS; Fixture.env() does the same for every child, "
+        "so an inherited encoded value cannot override the staged candidate."
+    ),
+    "8_temporary_storage": (
+        "The heavy commands pass --root-parent /private/tmp explicitly under the "
+        "approved internal-root exception, and every fixture sets TMPDIR/TMP/TEMP "
+        "inside that one monitored root with the pool beside, never inside, it."
+    ),
+    "9_macos_mktemp": (
+        "Not applicable: the script creates no temporary directory itself; fixtures "
+        "are constructed with explicit os.makedirs paths inside the owned root, so "
+        "no mktemp template can ignore TMPDIR."
+    ),
+}
+# Shared runtime premises every case depends on: a failed one taints the run.
+# They are separate from the fixed checklist map above, which is a source record.
 PREMISES = ["staging", "capabilities", "fixture_root"]
 DEPENDS = {
     "a_all_recorded_admission_walks_nothing": [],
@@ -895,6 +961,7 @@ def write_diagnostic_receipt(root: str, subject: str, staging_hash: str) -> str:
         "guard_sha256_expected": GUARD_SHA256,
         "staged_subject_sha256": staging_hash,
         "premises": PREMISES,
+        "premise_checklist": PREMISE_CHECKLIST,
         "dependencies": DEPENDS,
         "reached": REACHED,
         "completed": [name for name in executed if name not in failed and name not in TAINTED],
@@ -978,6 +1045,17 @@ def self_check() -> None:
         all(dependency in {name for name, _ in CASE_FUNCS} for deps in DEPENDS.values() for dependency in deps),
         "a dependency names a case that does not exist",
     )
+    # All nine fixed checklist items carry a disposition or a concrete NA.
+    expect(len(PREMISE_CHECKLIST) == 9, "the premise checklist is incomplete")
+    for item, disposition in PREMISE_CHECKLIST.items():
+        expect(len(disposition) > 40, f"premise {item} has no real disposition")
+    for required in (
+        "1_private_home_and_rustup",
+        "2_account_home_control",
+        "3_environment_isolation",
+        "8_temporary_storage",
+    ):
+        expect(required in PREMISE_CHECKLIST, f"premise {required} is missing")
     # The receipt must be truthful about its mode.
     expect(ALLOCATION["measured"] is False, "the estimate must not claim measurement")
     expect(GUARD_SHA256.startswith("a6d73326"), "the guard pin is not the qualified source")

@@ -947,12 +947,14 @@ fence the one-way step:
 The one-way switch needs ordering the ledger alone cannot provide, because the
 front door's hand-off trigger reads control `state.json` /
 `removable.json`, not the library ledger (oxide#122). Hand-off requires a
-peeked numeric version **greater than the running binary's**, so the value
-must be this tree's `STATE_VERSION + 1` — currently **5**, not the 3 an
-earlier revision of this section proposed, which is a *downgrade* from the
-shipped 4 (`store.rs:71`; v4 is the oxide#133 owned-outputs fence) and would
-leave an installed version-4 binary exposed to `deny_unknown_fields` on
-`recorded`. Phase B therefore writes control `version: 5` **before** the first
+peeked numeric version **greater than the running binary's**, so the value is
+this tree's `STATE_VERSION`, **5** (`store.rs:74`; 4 is the oxide#133
+owned-outputs fence an installed binary already writes). The 3 an earlier
+revision of this section proposed was a *downgrade* from that shipped 4 and
+would leave an installed version-4 binary exposed to `deny_unknown_fields` on
+`recorded`. The fence is installed by the front door's mutating-command
+admission gate, so it is durable before any library write can fence the
+ledger; an owned-outputs-only save still derives version 4. Phase B therefore writes control `version: 5` **before** the first
 recorded ledger write, so an installed version-4 binary hands off to a
 receipt-matching successor instead of refusing the pool it was just handed. A
 crash between the two writes leaves control 5 with a v1 ledger, which is a
@@ -987,7 +989,7 @@ reply as a size.
 | Front-door release order | `store.rs` `release` (`:1622`), `unshare` (`:1640`), `discard_scratch` (`:1674`), `flush_before_idle` (`:1689`) |
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
-| Control state fence | `store.rs` `STATE_VERSION` (`:71`, currently 4), `PREVIOUS_STATE_VERSION` (`:75`), hand-off trigger in `handoff.rs` |
+| Control state fence | `store.rs` `STATE_VERSION` (`:74`, 5 writes the recorded-accounting fence; an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4), `RECORDED_ACCOUNTING_FENCE`, hand-off trigger in `handoff.rs` |
 | Qualified guard | `scripts/bounded-test.py`, sha256 `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b` ([oxide#145](workflow.md#shared-proof-supervisor)) |
 
 #### Acceptance matrix
@@ -1027,9 +1029,12 @@ decision mocks where a real path exists:
 7. **Serialization.** Worst-valid 128-record ledger round-trips under
    `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
 8. **Compatibility.** `capacity_policy: 1`, legacy (no fence) and `2` ledgers;
-   held IDs preserved; control `version: 5` (= `STATE_VERSION + 1`) written
-   before the ledger fence, with a v4 control still handing off; old-binary
-   refusal is exercised as a ledger parse/validation refusal, not a mutation.
+   held IDs preserved; the control fence is `STATE_VERSION` 5 written by the
+   admission gate before the ledger fence, an owned-outputs-only state derives
+   version 4 (proved on `save` directly, not through a path that takes
+   admission), a v4 control still hands off, and a v5 document without the
+   fence or with an unknown fence value refuses; old-binary refusal is
+   exercised as a ledger parse/validation refusal, not a mutation.
 9. **Removable combination.** `max(sum, volume_used)` arithmetic with
    controlled facts: sum above used, used above sum, both unknown, and the
    legacy fallback reachable only with bound-only gaps.
@@ -1065,8 +1070,13 @@ shared supervisor): tiny private fixtures only, debug staging with
 
 Every case applies the nine-item
 [proof-authoring premise checklist](workflow.md#proof-authoring-premise-checklist)
-with an executable location or a concrete not-applicable reason, and the
-uncounted `--diagnostic` gate below runs before the first counted native. The
+with an executable location or a concrete not-applicable reason: the script
+records all nine in `PREMISE_CHECKLIST` (private HOME and rustup, account-home
+control, environment isolation, no adopting conversion, no external Cargo
+subcommand, no image, frozen compiler flags, the internal-root temporary
+storage, no `mktemp`), `--self-check` asserts the map is complete, and the
+diagnostic receipt carries it. The uncounted `--diagnostic` gate below runs
+before the first counted native. The
 brief's own six review subjects (recorded accounting, release observation and
 crash fencing, admission/eviction/ownership, migration/status/compatibility,
 proof source fit, exact-head natives) each map to a section above.

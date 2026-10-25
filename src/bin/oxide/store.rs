@@ -4739,7 +4739,8 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(OLDER_STATE_VERSION))
+            Some(u64::from(LEGACY_FIELDS_STATE_VERSION)),
+            "an ordinary unfenced save advanced the numeric state version"
         );
         // Neither released fence is consent to a successor numeric format.
         let released = State {
@@ -4752,7 +4753,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(OLDER_STATE_VERSION)),
+            Some(u64::from(LEGACY_FIELDS_STATE_VERSION)),
             "a released /1 fence advanced the numeric state version"
         );
         // The published whole-target fence keeps version 3, so a state-3
@@ -4771,7 +4772,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(PREVIOUS_STATE_VERSION)),
+            Some(u64::from(OLDER_STATE_VERSION)),
             "the published /2 fence left its numeric version"
         );
         // A pool that has not opted into owned outputs initializes from a
@@ -5574,7 +5575,11 @@ mod tests {
 
     #[test]
     fn worst_valid_control_state_fits_its_object_and_byte_caps() {
-        let mut state = State::default();
+        // The current representation, so the bound covers the version-5 fence.
+        let mut state = State {
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+            ..State::default()
+        };
         for id in 1..=MAX_RECORDS as u64 {
             state.records.push(worst_record(id));
         }
@@ -5661,32 +5666,68 @@ mod tests {
         bounded.records[0].checkout = Some(PathBuf::from("/checkout"));
         store.save(&bounded).expect("bounded legacy state saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], serde_json::json!(OLDER_STATE_VERSION));
+        assert_eq!(
+            stored["version"],
+            serde_json::json!(LEGACY_FIELDS_STATE_VERSION)
+        );
         assert!(stored.get("owned_outputs").is_none());
-        // Only the forward fence (or initialization) advances the numeric
-        // version.
+        // The version *derivation*, proved on `save` itself so it cannot
+        // depend on which caller reached it: an owned-outputs successor alone
+        // is version 4, and only the recorded-accounting fence (oxide#146)
+        // makes it 5.
+        let owned_only = State {
+            owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+            ..State::default()
+        };
         store
-            .fence_owned_outputs()
-            .expect("the forward fence saves");
+            .save(&owned_only)
+            .expect("an owned-outputs-only state saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        // The owned-outputs successor alone is version 4: version 5 belongs to
-        // the recorded-accounting fence (oxide#146), not to owned outputs.
         assert_eq!(stored["version"], serde_json::json!(PREVIOUS_STATE_VERSION));
         assert_eq!(
             stored["owned_outputs"],
             serde_json::json!(OWNED_OUTPUTS_FENCE)
         );
-        // The recorded-accounting fence advances to version 5, and a second
-        // call is idempotent.
-        store
-            .fence_recorded_accounting()
-            .expect("the recorded-accounting fence saves");
-        let fenced: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(fenced["version"], serde_json::json!(STATE_VERSION));
+        assert!(stored.get("recorded_accounting").is_none());
+        let both = State {
+            owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+            ..State::default()
+        };
+        store.save(&both).expect("a doubly fenced state saves");
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
         assert_eq!(
-            fenced["recorded_accounting"],
+            stored["recorded_accounting"],
             serde_json::json!(RECORDED_ACCOUNTING_FENCE)
         );
+        store
+            .save(&State::default())
+            .expect("an unfenced state saves");
+
+        // The *path* truth: `fence_owned_outputs` is a mutating command, so it
+        // takes the admission gate, which makes the recorded-accounting fence
+        // durable first. That is the ordering the design requires — the
+        // control hand-off must precede any incompatible ledger write — and it
+        // is why this path ends at version 5 with both fences.
+        store
+            .fence_owned_outputs()
+            .expect("the forward fence saves");
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
+        assert_eq!(
+            stored["owned_outputs"],
+            serde_json::json!(OWNED_OUTPUTS_FENCE)
+        );
+        assert_eq!(
+            stored["recorded_accounting"],
+            serde_json::json!(RECORDED_ACCOUNTING_FENCE)
+        );
+        // A repeated recorded fence is idempotent.
+        let fenced = stored;
+        store
+            .fence_recorded_accounting()
+            .expect("a repeated fence is a no-op");
         store
             .fence_recorded_accounting()
             .expect("a repeated fence is a no-op");
