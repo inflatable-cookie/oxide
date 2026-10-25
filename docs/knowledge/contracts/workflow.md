@@ -1002,9 +1002,42 @@ removable pool, where a build's temporary files land on the image, then an
 ordinary detach selects the internal pool's scratch with no stale
 `/Volumes/<name>` directory written. It reports the longest injected path in
 bytes and characters against the bound. It never touches a live pool or the
-registered drive, and it is not a benchmark or an alias for full QA. Its
-native author and reviewer sessions are separately root-activated; no run has
-happened yet.
+registered drive, and it is not a benchmark or an alias for full QA.
+
+Fixture lifecycle (corrected after diagnostic3): the constructor creates only
+the account homes, the crate, its own scratch and the sibling fixture
+directory, and never the pool directory. The first production `oxide` command
+that needs the pool creates it, and the proof then verifies the created
+`config.json` backend, payload, ledger, device and the inherited-directory
+observation, so the product's own exclusion gate is the oracle rather than a
+separate probe. Every fixture launch mints a fresh observation identifier that
+the build script declares to Cargo and echoes, and every consumed observation
+is refused unless it carries the current identifier, so a replayed warning from
+a warm affine slot can never satisfy a kept/replaced oracle. Gated writers
+publish a small atomic readiness record (identifier, chosen directory, process
+group) before waiting, because Cargo does not stream build-script warnings while
+the script runs; the proof polls that record inside the exported deadline and
+writes asynchronous child output to owned files instead of undrained pipes. The
+held-slot accounting oracle measures a baseline and a delta around the planted
+hard-linked pair, the measured status query uses the same unset aliases as the
+held child, the refusal target slot comes from the preceding fresh observation
+rather than directory order, the crash fixture stays in the supervisor session
+and kills only `oxide`, and the one owned image's backing and attachment record
+live under the existing supervisor evidence directory, with the backing deleted
+only after a positively successful ordinary detach. Diagnostic dependency
+handling requires a *passed* predecessor (a skipped one is not passed), and an
+unknown-outcome abort records every remaining planned case as not run, so a
+reached prefix is never reported as a complete collection. Its native author and
+reviewer sessions are separately root-activated; no counted native has passed.
+Author natives 1 and 2 and diagnostics 1, 2 and 3 at earlier heads are spent
+failures: the first two hid the toolchain behind the fixture HOME and used
+`--locked` without a lock, and the diagnostics were refused in turn by an
+external-volume internal pool, inherited-temp fixtures placed inside the pool
+directory, and a pre-created empty pool directory. The pure self-check
+(`effigy proof:pool-temp:test`, 100 properties) covers the constructor layout,
+rerun completeness, observation freshness, readiness parsing, refusal
+targeting, accounting deltas, image custody and the diagnostic dependency and
+abort rules with no scratch, child or toolchain.
 
 ## Execution location
 
