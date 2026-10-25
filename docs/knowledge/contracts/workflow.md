@@ -704,7 +704,13 @@ oxide run --execution-budget 120s
   ~3 s build under one 5 s window (about 10 beats; a reset window would give
   it about 25), never the command's exit or closeout latency; the nested case has the outer command take the only slot first,
   the inner call wait and end on its own 1 s admission budget with no build,
-  and the outer window stop the still-running tool. A run writes a uniquely
+  and the outer window stop the still-running tool. The late-start case first
+  runs one delay-free seed launch on the same private pool, checkout and tool
+  argv, and checks the prepared state positively (exit 0, the pool-creation
+  notice, recorded control state); the timed launch must reuse that state — a
+  second pool-creation notice, a different control root or any pre-spawn expiry
+  is an unexercised-fixture failure, never an alternate pass — and a
+  delay-free follow-up reuses the released slot. A run writes a uniquely
   named bounded helper receipt beside the guard's own on every outcome,
   including a staging, capability, assertion, interrupt or receipt-write
   failure, with the primary fault, candidate identity when known, reached/

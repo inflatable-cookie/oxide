@@ -454,7 +454,7 @@ def plan_document() -> dict:
             {"name": "events-broken-reader", "oracle": "read end closed before start: exit 0, parent survives, one loss note, no typed record"},
             {"name": "unknown-closure-held", "oracle": "debug closure hook + 1s execution: exit 1, finished(unconfirmed_closure), drain not complete, lease held, status shows the held slot"},
             {"name": "preparation-stop-124", "oracle": "fake cargo sleeping in locate-project + 1ms admission: exit 124, no primary marker"},
-            {"name": "late-start", "oracle": "debug spawn delay (9s) placed after the last admission check under an 8s window: one started exec_tool record with spawn_late and admission_expired_before_start true, a positive overshoot and admission_elapsed_ms past 8000, terminal admission_deadline with an admission origin, exit 124 and the slot released; a pre-spawn expiry (no started record) is reported as an unexercised fixture, not as a late start"},
+            {"name": "late-start", "oracle": "one delay-free seed launch of the same private pool, checkout and tool argv with the spawn-delay hook absent (exit 0, pool-creation notice, recorded control state), then the timed launch under a 6s window with a 7s debug delay after the last admission check: it must reuse the prepared state (no second pool-creation notice, same control root) and report exactly one started exec_tool record with spawn_late and admission_expired_before_start true, a positive overshoot and admission_elapsed_ms past 6000, terminal admission_deadline with an admission origin, exit 124, the exact stop line, and a delay-free follow-up exec that reuses the released slot; a no-started pre-spawn expiry or a second pool creation is an unexercised fixture FAIL"},
             {"name": "no-mutation", "oracle": "a refused input leaves home/config/pool unchanged; a successful budgeted command adds no settings file, no new control-state fields and no budget lines in status"},
             {"name": "unbudgeted", "oracle": "exit 3 preserved, no budget diagnostic, no events required"},
         ],
@@ -1500,20 +1500,52 @@ def case_preparation_stop(root: str, subject: str) -> None:
 
 def case_late_start(root: str, subject: str) -> None:
     case("late-start")
-    env = fixture_env(root, "late")
-    crate = create_crate(root, "late")
     # The debug hook sleeps after the last admission check and before the
-    # launch, so the window must survive preparation (pool creation plus the
-    # workspace and toolchain lookups) and must close during the sleep.
-    # Diagnostic1 showed preparation alone consumed a 2 s window before the
-    # hook was reached, so the budget now has real margin above preparation
-    # and the sleep is longer than the budget: any preparation shorter than
-    # the budget yields an observed late start.
-    admission_ms = 8000
-    delay_ms = 9000
-    env["OXIDE_TEST_SPAWN_DELAY_MS"] = str(delay_ms)
+    # launch, so the window must still be open at that check and must close
+    # during the sleep. Cold preparation (pool creation, workspace metadata,
+    # the slot key and the freshness gate) consumed the whole window in
+    # diagnostic1 and diagnostic2, so this case pre-establishes that work with
+    # ONE delay-free seed launch of the same command shape on the same private
+    # pool, checkout and tool argv, and checks the prepared state positively.
+    # The timed launch must reuse it: a second pool-creation notice, a different
+    # control root or any pre-spawn expiry fails as an unexercised fixture. The
+    # budget prefix only governs the clock: `SlotKey::resolve_in` takes the
+    # checkout, profile recipe, target and destination facts, which the seed and
+    # the timed launch share, so both resolve the same prepared slot key.
+    admission_ms = 6000
+    delay_ms = 7000
+    mode = os.path.join(root, "late.run")
     tool = os.path.join(root, "late.sh")
-    write_executable(tool, "#!/bin/sh\nexec sleep 60\n")
+    write_executable(
+        tool,
+        "#!/bin/sh\n"
+        f"if [ -e {mode} ]; then exec sleep 60; fi\n"
+        "exit 0\n",
+    )
+    expect(not os.path.exists(mode), "the late-start fixture started in run mode")
+    crate = create_crate(root, "late")
+    base_env = fixture_env(root, "late")
+    expect(
+        "OXIDE_TEST_SPAWN_DELAY_MS" not in base_env,
+        "the fixture environment must not carry the spawn-delay hook before the timed launch",
+    )
+    seed = run([subject, "exec", "--", tool], cwd=crate, env=base_env, phase_seconds=30)
+    record_detail(
+        "late-start/seed",
+        seed.stderr,
+        returncode=seed.returncode,
+        elapsed=round(seed.elapsed, 3),
+    )
+    expect(seed.returncode == 0, f"the seed launch failed ({seed.returncode}): {stderr_excerpt(seed.stderr)}")
+    expect(
+        "creating the build pool" in seed.stderr,
+        f"the seed did not create the fixture pool: {stderr_excerpt(seed.stderr)}",
+    )
+    control, _keys_before = control_state(base_env)
+    expect(control is not None, "the seed left no recorded control state to reuse")
+    timed_env = dict(base_env)
+    timed_env["OXIDE_TEST_SPAWN_DELAY_MS"] = str(delay_ms)
+    write_private(mode, "run\n")
     read_fd, write_fd = event_pipe()
     try:
         result_run = run(
@@ -1530,7 +1562,7 @@ def case_late_start(root: str, subject: str) -> None:
                 tool,
             ],
             cwd=crate,
-            env=env,
+            env=timed_env,
             phase_seconds=45,
             pass_fds=(write_fd,),
         )
@@ -1548,6 +1580,16 @@ def case_late_start(root: str, subject: str) -> None:
         elapsed=round(result_run.elapsed, 3),
         admission_ms=admission_ms,
         spawn_delay_ms=delay_ms,
+    )
+    expect(
+        "creating the build pool" not in result_run.stderr,
+        "the timed launch created another pool instead of reusing the prepared one: "
+        f"{stderr_excerpt(result_run.stderr)}",
+    )
+    control_after, _keys_after = control_state(base_env)
+    expect(
+        control_after == control,
+        f"the timed launch used a different control root: {control_after!r} != {control!r}",
     )
     started = started_records(records)
     recorded = terminal(records)
@@ -1583,15 +1625,19 @@ def case_late_start(root: str, subject: str) -> None:
     expect(recorded["outcome"] == "admission_deadline", f"the terminal outcome is {recorded['outcome']}")
     expect(recorded["stop_origin"] == "admission", f"the stop origin is {recorded['stop_origin']}")
     expect_budget_diagnostic(result_run.stderr, "admission_stop", "late start")
-    follow_tool = os.path.join(root, "late-ok.sh")
-    write_executable(follow_tool, "#!/bin/sh\nexit 0\n")
-    follow = run([subject, "exec", "--", follow_tool], cwd=crate, env=env, phase_seconds=30)
+    # The delay-free follow-up runs the same tool in seed mode again: the same
+    # slot must be reusable after the late start released it.
+    try:
+        os.unlink(mode)
+    except OSError:
+        pass
+    follow = run([subject, "exec", "--", tool], cwd=crate, env=base_env, phase_seconds=30)
     expect(follow.returncode == 0, f"the slot was not released after a late start: {follow.returncode}")
     result(
         "late-start",
         True,
-        f"started {observed}ms into an {admission_ms}ms window (overshoot {overshoot}ms), "
-        "stopped as admission_deadline, slot released",
+        f"seed prepared the pool, timed launch started {observed}ms into a {admission_ms}ms window "
+        f"(overshoot {overshoot}ms) as admission_deadline, delay-free follow-up reused the slot",
     )
 
 
@@ -2092,8 +2138,12 @@ def self_check() -> None:
     expect("outer 2s window" in nested["oracle"], "the nested oracle must attribute the stop to the outer window")
     late = [entry for entry in plan["cases"] if entry["name"] == "late-start"][0]
     expect(
-        "pre-spawn expiry" in late["oracle"] and "8s" in late["oracle"] and "9s" in late["oracle"],
-        "the late-start premise or its pre-spawn distinction changed",
+        "pre-spawn expiry" in late["oracle"]
+        and "seed launch" in late["oracle"]
+        and "6s" in late["oracle"]
+        and "7s" in late["oracle"]
+        and "delay-free follow-up" in late["oracle"],
+        "the late-start seed premise or its pre-spawn distinction changed",
     )
     expect(remaining_quiet() >= 0.0, "the quiet remaining clock must not raise")
     expect(custody_bound() >= 0.05, "the custody bound must stay positive")
@@ -2429,45 +2479,123 @@ def self_test() -> None:
     expect(load().budget_prefix_ok(["--admission-budget", "1s", "-j", "1"]), "a correct prefix was rejected")
     expect(not load().budget_prefix_ok(["-j", "1", "--admission-budget", "1s"]), "a late budget passed the prefix oracle")
 
-    # ---- late start: an observed late start passes; a pre-spawn expiry and an
-    # on-time start each fail with their own distinct message. ----
-    def late_fake(module_ref, records, returncode, note, follow_code=0):
-        def fake(argv, **kwargs):
-            if not module_ref.budget_prefix_ok(argv[2:]):
-                return completed(argv, 2, "", "error: unexpected argument after the option prefix\n")
-            if "--budget-events" not in argv:
-                return completed(argv, follow_code, "", "")
-            fd = int(flag(argv, "--budget-events"))
-            os.write(fd, stream(records))
-            return completed(argv, returncode, "", note)
-
-        return fake
-
-    admission_note = "oxide: stopped by the admission budget (8000ms) before a usable child start\n"
+    # ---- late start: a delay-free seed establishes the prepared state, the
+    # timed launch must observe a real in-flight late start, and each broken
+    # premise fails with its own message. ----
+    admission_note = "oxide: stopped by the admission budget (6000ms) before a usable child start\n"
+    pool_note = "oxide: creating the build pool at /private/tmp/fixture/pool-late (budget-only)\n"
     started_late = {
         "seq": 1, "event": "admitted_child_started", "phase": "exec_tool",
         "spawn_late": True, "admission_expired_before_start": True,
-        "admission_ms": 8000, "execution_ms": 60000,
-        "admission_elapsed_ms": 10500, "admission_overshoot_ms": 2500,
+        "admission_ms": 6000, "execution_ms": 60000,
+        "admission_elapsed_ms": 8500, "admission_overshoot_ms": 2500,
     }
     finished_admission = {
         "seq": 2, "event": "finished", "outcome": "admission_deadline",
         "stop_origin": "admission", "drain": "not_reached", "lease": "released", "exit_code": 124,
     }
 
+    def late_fake(
+        module_ref,
+        *,
+        calls,
+        seed_code=0,
+        seed_note=pool_note,
+        timed_note=admission_note,
+        records=(started_late, finished_admission),
+        timed_code=124,
+        follow_code=0,
+        timed_creates_pool=False,
+    ):
+        """Fake the seed, timed and follow-up launches of the real case body."""
+
+        def fake(argv, *, cwd, env, phase_seconds, pass_fds=(), stdin=None, stdout=None, stderr=None):
+            tool = argv[-1]
+            mode_path = os.path.join(os.path.dirname(tool), "late.run")
+            calls.append(
+                {
+                    "argv": list(argv),
+                    "cwd": cwd,
+                    "tool": tool,
+                    "mode": os.path.exists(mode_path),
+                    "hook": env.get("OXIDE_TEST_SPAWN_DELAY_MS"),
+                }
+            )
+            if "--budget-events" not in argv:
+                if len(calls) == 1:
+                    return completed(argv, seed_code, "", seed_note)
+                return completed(argv, follow_code, "", "")
+            if not module_ref.budget_prefix_ok(argv[2:]):
+                return completed(argv, 2, "", "error: unexpected argument after the option prefix\n")
+            fd = int(flag(argv, "--budget-events"))
+            os.write(fd, stream(records))
+            note = (pool_note if timed_creates_pool else "") + timed_note
+            return completed(argv, timed_code, "", note)
+
+        return fake
+
+    def late_scratch(tag):
+        """A distinct owned root per faked late-start invocation."""
+        return os.path.join(scratch, f"late-{tag}")
+
     late_ok = load()
-    late_ok.run = late_fake(late_ok, [started_late, finished_admission], 124, admission_note)
+    calls = []
+    late_ok.run = late_fake(late_ok, calls=calls)
     expect(
-        fault_of(late_ok, lambda: late_ok.case_late_start(scratch, "/bin/true")) is None,
-        "an observed late start should pass",
+        fault_of(late_ok, lambda: late_ok.case_late_start(late_scratch("ok"), "/bin/true")) is None,
+        "an observed late start with a delay-free seed should pass",
+    )
+    expect(len(calls) == 3, f"the late-start case did not run seed, timed launch and follow-up: {len(calls)}")
+    expect(
+        calls[0]["hook"] is None and calls[2]["hook"] is None,
+        f"the seed or the follow-up carried the spawn-delay hook: {calls}",
+    )
+    expect(calls[1]["hook"] == "7000", f"the timed launch did not carry the delay: {calls[1]}")
+    expect(
+        calls[0]["mode"] is False and calls[1]["mode"] is True and calls[2]["mode"] is False,
+        f"the fixture mode file was not controlled per launch: {calls}",
+    )
+    expect(
+        {entry["cwd"] for entry in calls} == {calls[0]["cwd"]}
+        and {entry["tool"] for entry in calls} == {calls[0]["tool"]},
+        f"the seed, timed launch and follow-up used different fixture identities: {calls}",
+    )
+
+    seed_broken = load()
+    seed_broken.run = late_fake(seed_broken, calls=[], seed_code=2, seed_note="")
+    fault = fault_of(seed_broken, lambda: seed_broken.case_late_start(late_scratch("seed"), "/bin/true"))
+    expect(fault is not None and "seed launch failed" in fault, f"a failed seed passed: {fault}")
+
+    no_pool = load()
+    no_pool.run = late_fake(no_pool, calls=[], seed_note="")
+    fault = fault_of(no_pool, lambda: no_pool.case_late_start(late_scratch("nopool"), "/bin/true"))
+    expect(fault is not None and "did not create the fixture pool" in fault, f"an unseeded pool passed: {fault}")
+
+    second_pool = load()
+    second_pool.run = late_fake(second_pool, calls=[], timed_creates_pool=True)
+    fault = fault_of(second_pool, lambda: second_pool.case_late_start(late_scratch("warm"), "/bin/true"))
+    expect(fault is not None and "created another pool" in fault, f"a cold timed launch passed: {fault}")
+
+    hook_leak = load()
+    leaked = hook_leak.fixture_env
+    hook_leak.fixture_env = lambda root, label: dict(leaked(root, label), OXIDE_TEST_SPAWN_DELAY_MS="7000")
+    hook_leak.run = late_fake(hook_leak, calls=[])
+    fault = fault_of(hook_leak, lambda: hook_leak.case_late_start(late_scratch("hook"), "/bin/true"))
+    expect(
+        fault is not None and "must not carry the spawn-delay hook" in fault,
+        f"a leaked spawn-delay hook passed the seed premise: {fault}",
     )
 
     late_pre = load()
-    late_pre.run = late_fake(late_pre, [{"seq": 1, "event": "finished",
-                                         "outcome": "admission_deadline", "stop_origin": "admission",
-                                         "drain": "not_reached", "lease": "released", "exit_code": 124}],
-                             124, admission_note)
-    fault = fault_of(late_pre, lambda: late_pre.case_late_start(scratch, "/bin/true"))
+    late_pre.run = late_fake(
+        late_pre,
+        calls=[],
+        records=(
+            {"seq": 1, "event": "finished", "outcome": "admission_deadline",
+             "stop_origin": "admission", "drain": "not_reached", "lease": "released", "exit_code": 124},
+        ),
+    )
+    fault = fault_of(late_pre, lambda: late_pre.case_late_start(late_scratch("pre"), "/bin/true"))
     expect(
         fault is not None and "pre-spawn admission expiry" in fault,
         f"a pre-spawn expiry was not distinguished from a late start: {fault}",
@@ -2478,18 +2606,40 @@ def self_test() -> None:
                    admission_elapsed_ms=500, admission_overshoot_ms=None)
     late_early.run = late_fake(
         late_early,
-        [on_time, {"seq": 2, "event": "finished", "outcome": "child_exit", "stop_origin": None,
-                   "drain": "complete", "lease": "released", "exit_code": 0}],
-        124,
-        admission_note,
+        calls=[],
+        records=(
+            on_time,
+            {"seq": 2, "event": "finished", "outcome": "child_exit", "stop_origin": None,
+             "drain": "complete", "lease": "released", "exit_code": 0},
+        ),
     )
-    fault = fault_of(late_early, lambda: late_early.case_late_start(scratch, "/bin/true"))
+    fault = fault_of(late_early, lambda: late_early.case_late_start(late_scratch("early"), "/bin/true"))
     expect(fault is not None and "was not reported" in fault, f"an on-time start passed as late: {fault}")
 
+    late_overshoot = load()
+    late_overshoot.run = late_fake(
+        late_overshoot,
+        calls=[],
+        records=(dict(started_late, admission_overshoot_ms=0), finished_admission),
+    )
+    fault = fault_of(late_overshoot, lambda: late_overshoot.case_late_start(late_scratch("overshoot"), "/bin/true"))
+    expect(fault is not None and "no positive admission overshoot" in fault, f"a zero overshoot passed: {fault}")
+
     late_bad = load()
-    late_bad.run = make_start(late_bad, beats=0)
-    fault = fault_of(late_bad, lambda: late_bad.case_late_start(scratch, "/bin/true"))
-    expect(fault is not None and "late start" in fault, f"a non-late start passed: {fault}")
+    late_bad.run = late_fake(
+        late_bad,
+        calls=[],
+        timed_code=0,
+        timed_note="",
+        records=(
+            dict(started_late, spawn_late=False, admission_expired_before_start=False,
+                 admission_elapsed_ms=500, admission_overshoot_ms=None),
+            {"seq": 2, "event": "finished", "outcome": "child_exit", "stop_origin": None,
+             "drain": "complete", "lease": "released", "exit_code": 0},
+        ),
+    )
+    fault = fault_of(late_bad, lambda: late_bad.case_late_start(late_scratch("bad"), "/bin/true"))
+    expect(fault is not None and "late start exited" in fault, f"a non-late start passed: {fault}")
 
     # ---- nested: a natural outer exit must fail ----
     nested_ok = load()
