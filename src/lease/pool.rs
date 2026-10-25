@@ -2858,11 +2858,11 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
 /// Build a removable-backed `Pool` over an owned fixture payload directory.
 ///
 /// Test-only. The backing is `Payload::Volume` (so every production branch for
-/// a removable pool is taken) with a real descriptor over the fixture
-/// directory, and the volume's capacity/available figures come from
-/// [`crate::volume::verified_facts`]. `Binding::verify()` still performs its
-/// real descriptor, mount-rule, device and path checks; only the numbers a
-/// mount would report are substituted. Nothing here is a public or environment
+/// a removable pool is taken) with a descriptor over the fixture directory, and
+/// the verification result comes from [`crate::volume::verified_facts`]: while
+/// that adapter is installed `Binding::verify()` returns those modelled facts
+/// and therefore skips `observe()`, the mount-root rule, the device comparison
+/// and the mount-point path re-check. Nothing here is a public or environment
 /// interface, and it is never native verification of a real volume.
 #[cfg(test)]
 pub(super) fn volume_pool_for_test(
@@ -3193,10 +3193,12 @@ mod unknown_removable_tests {
 /// These build a real `Pool` over a tiny owned fixture payload
 /// ([`volume_pool_for_test`]) with verified-volume facts supplied by
 /// [`crate::volume::verified_facts`], then call the same
-/// admission/count/runtime methods production uses. The fake boundary is only
-/// the volume's capacity/available numbers: descriptor, mount rule, device and
-/// path checks in `Binding::verify()` still run for real, and nothing here is
-/// evidence that a real volume was verified or that a disk image was used.
+/// admission/count/runtime methods production uses. The fake boundary is the
+/// whole verification result: with the adapter installed, `Binding::verify()`
+/// returns those modelled facts and skips the structural checks it performs in
+/// production (`observe()`, the mount-root rule, the device comparison and the
+/// mount-point path re-check). Nothing here is evidence that a real volume was
+/// verified or that a disk image was used.
 #[cfg(test)]
 mod removable_pool_path_tests {
     use super::*;
