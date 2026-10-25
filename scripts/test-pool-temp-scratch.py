@@ -83,8 +83,11 @@ and 512 MiB bounds and the same custody and cleanup rules, and it writes a
 bounded, distinct receipt labelled `qualified: false` with the per-case
 outcome, first fault, at most eight secondary faults and every truthful skip
 reason. A diagnostic receipt is never counted native evidence and never claims
-a PASS. No diagnostic run was made in this source phase; ROOT activates it
-separately after independent source review.
+a PASS. It is dispatched only through `effigy rust:pool-temp-scratch:diagnostic`
+(Effigy selectors do not forward passthrough arguments), it is required before
+the next counted native run, and a source sweep complements it but never
+replaces it. No diagnostic run was made in this source phase; ROOT activates
+it separately after independent source review.
 
 Command/state premise walkthrough for all twelve executable cases. Each line
 names the executable commands, their working directory, the state the case

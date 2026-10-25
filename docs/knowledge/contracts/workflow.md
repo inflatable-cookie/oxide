@@ -964,12 +964,15 @@ precondition with one bounded offline `cargo generate-lockfile` setup child in
 the fixture's private Cargo home (the package has no dependencies, so nothing
 is resolved and no network is used), and a pure predicate requires the lock to
 be manifest-consistent — a missing, header-less, mismatched or extra-package
-lock is refused rather than treated as valid. A source-only `--diagnostic`
-mode (not yet activated) records a recoverable oracle failure and continues
-only with cases whose declared dependencies are intact, skips every later case
-after a shared-state failure, aborts on any unknown child/device/writer outcome,
-and writes a bounded receipt labelled `qualified: false`; the default run still
-fails fast. The proof covers: a
+lock is refused rather than treated as valid. The uncounted
+`--diagnostic` mode records a recoverable oracle failure and continues only
+with cases whose declared dependencies are intact, skips every later case
+after a shared-state failure, aborts on any unknown child/device/writer
+outcome, and writes a bounded receipt labelled `qualified: false`; the default
+run still fails fast. It is dispatched only through
+`effigy rust:pool-temp-scratch:diagnostic` (selectors do not forward
+passthrough arguments), is required before the next counted native run, and a
+source sweep complements it but never replaces it. The proof covers: a
 same-volume inherited `TMPDIR` kept canonically with no Oxide directory
 created and the inherited content untouched; absent, file, relative,
 unwritable, other-device and symlink-escaping values replaced by one owned

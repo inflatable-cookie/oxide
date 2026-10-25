@@ -187,6 +187,16 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
 
+# The uncounted diagnostic of the same proof (architect 1841baa1). It is
+# REQUIRED before the next counted rust:pool-temp-scratch run, keeps the same
+# qualified supervisor, 300 s wall limit and 512 MiB monitored scratch, and
+# leaves the script's default fail-fast behaviour untouched: selectors do not
+# forward passthrough arguments, so the mode needs its own task. A diagnostic
+# receipt is explicitly unqualified and is never counted native evidence.
+[tasks."rust:pool-temp-scratch:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py --diagnostic"
+
 # Final outputs on the permanent drive (oxide#117), under the qualified
 # shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored scratch,
 # ordinary detach). Stages this HEAD's debug `oxide` offline with 1.97.1 and
