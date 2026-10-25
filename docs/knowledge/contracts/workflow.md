@@ -1940,7 +1940,7 @@ the `a6d73326` bytes above stay the qualified ones for their own runs. The
 bootstrap file changes with it for two concrete reasons and no others: its
 expected case count follows the suite's new total (160 pure + 40 real = 200)
 and it gains one limitation line describing this observation, so it adds no
-bound and no effect. Oxide#151 later raises the expected total to its own 187
+bound and no effect. Oxide#151 later raises the expected total to its own 200
 pure + 40 real = 240 with the routing, marker, nested-window protection and
 bounded-sweep cases below. Every quality fact here binds to the digests its own
 receipt records, never to the `#145` digests above.
