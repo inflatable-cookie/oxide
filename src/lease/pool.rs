@@ -1015,7 +1015,9 @@ impl Pool {
         // once, bounded.
         //
         // A removable pool whose pool figure is unknown for bound gaps only
-        // takes the reserve route instead: no cap comparison, no eviction.
+        // takes the reserve route instead: no byte-cap comparison at all, but
+        // it may prune eligible idle whole slots while free space is at or
+        // below the reserve or below the hard floor, then admit or refuse.
         match self.pressure() {
             Ok(used) => {
                 if used >= self.budget {
@@ -2203,8 +2205,9 @@ impl Sizes {
     }
 }
 
-/// A removable payload walk longer than this falls back to the volume's used
-/// bytes: a 127-slot USB pool cannot be walked within the 60 s bound.
+/// A removable payload walk longer than this is cut short, so a pool too large
+/// to measure reaches the unknown-size reserve/floor route instead of timing
+/// out mid-walk: a 127-slot USB pool cannot be walked within the 60 s bound.
 const VOLUME_WALK_MS: u64 = 5_000;
 
 /// Is this scan incomplete for the walk's own bounds only?
