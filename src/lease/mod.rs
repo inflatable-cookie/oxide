@@ -320,7 +320,10 @@ pub struct PoolStatus {
     pub payload_logical_bytes: Option<u64>,
     pub payload_unique_allocated_bytes: Option<u64>,
     pub coverage: AccountingCoverage,
-    /// The whole-payload walk, the one new-slot admission needs complete.
+    /// The whole-payload audit walk: what `status`/`--measure` reports. It is
+    /// **not** the admission figure, which is the recorded per-slot sum
+    /// (`recorded_total()` in the library) and never reports a partial scan as
+    /// a size.
     pub payload_accounting: AccountingScan,
     pub full: Option<bool>,
     pub slots: Vec<SlotStatus>,
@@ -464,9 +467,14 @@ pub struct ReuseMeasurement {
 pub struct Leased {
     pub grant: LeaseGrant,
     pub measured: Option<ReuseMeasurement>,
-    /// Set when a new slot on a removable volume was admitted by the
-    /// volume's own used bytes because the whole-payload walk could not
-    /// finish within its bounds; the caller shows it as a warning.
+    /// Set when a new slot on a removable volume was admitted with its pool
+    /// size **unknown** because the pool's own walk stopped at its bounds.
+    /// The note states what decided it: free space above the registered
+    /// reserve, or — after every eligible idle whole slot was pruned and free
+    /// space stayed at or above the 10 GiB hard floor — a warning that the
+    /// prune target could not be recovered. It never reports the volume's
+    /// used bytes as pool usage, and the pool cap stays unverified on this
+    /// route. The caller prints it as a warning.
     pub admission_note: Option<String>,
 }
 

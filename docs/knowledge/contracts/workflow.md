@@ -1075,9 +1075,9 @@ it is not final output, final-output placement or a claim of saved writes.
   incarnation, a missing or unreadable marker, a link, another owner or
   device — is reported and kept, never deleted. The directory is created
   `0700`, refuses to follow a link, and lives inside the slot, so the
-  existing whole-payload accounting counts it exactly once (hard links
-  included), whole-slot eviction and crash recovery delete it with the slot
-  they already own, and a held, lost or quarantined slot keeps it.
+  slot's own recorded figure counts it exactly once (hard links included),
+  whole-slot eviction and crash recovery delete it with the slot they already
+  own, and a held, lost or quarantined slot keeps it.
 - **Lifecycle.** It is removed at release, after the command has seen its own
   process group empty and before the slot can go idle; a removable slot is
   flushed after that removal. A removal that cannot be positively completed
@@ -3468,13 +3468,18 @@ Rules:
   ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
   A compatible idle slot is reused first and kept warm; the half-budget
   recycling rule is retired. A new slot replaces the least-recently-used
-  eligible idle whole slot only at the 128-slot pool ceiling, the eight-slot
-  project ceiling, or when the whole-payload union is at or above the budget;
-  it remeasures after each deletion and refuses `Full` when only held slots
-  remain. Held, uncertain, foreign and unmeasurable slots are never eligible,
-  and a safety failure stops admission instead of skipping. Nothing enforces
-  the budget while a build writes; a build can pass it, and the next new slot
-  evicts.
+  eligible idle whole slot in two distinct cases: **count** pressure at the
+  128-slot pool ceiling or the eight-slot project ceiling, authorised on a
+  complete pool figure or a removable pool's bound-only unknown; and
+  **recorded byte** pressure, when the attributable pool sum — never the
+  shared volume's total — is at or above the budget. It remeasures after each
+  deletion and refuses `Full` when only held slots remain. A removable pool
+  whose own size is unknown takes the reserve/floor route instead of a byte-cap
+  comparison. Held, uncertain, foreign and unmeasurable slots are never
+  eligible, a safety failure stops admission instead of skipping, and the
+  audit walks behind `status --measure` are not admission input. Nothing
+  enforces the budget while a build writes; a build can pass it, and the next
+  new slot evicts.
 - **Watchdog.** Only on a directory pool, only while Oxide supervises a
   leased Cargo group (build and `run` build, `test` execution, building
   passthrough). It samples `statfs` `f_bavail` of the payload directory

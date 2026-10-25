@@ -48,11 +48,14 @@ pub struct LeaseRequest {
     pub reserve_bytes: Option<u64>,
     /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
     pub layout: Option<SlotLayout>,
-    /// A front-door count replacement, never byte pressure: retire this idle
-    /// whole slot as part of this admission, after complete whole-payload
-    /// accounting and before the new slot is allocated. The front door
-    /// chooses the victim by recorded rank; the library rechecks its
-    /// identity, ownership, occupancy and accounting under the pool lock.
+    /// A front-door **count** replacement, never byte pressure: retire this
+    /// idle whole slot as part of this admission, before the new slot is
+    /// allocated. Count pressure is authorised separately from the recorded
+    /// byte figure — a complete pool figure or a removable pool's bound-only
+    /// unknown both allow it — while a recorded byte-pressure admission takes
+    /// the ordinary LRU path instead. The front door chooses the victim by
+    /// recorded rank; the library rechecks its identity, ownership, occupancy
+    /// and accounting under the pool lock.
     pub replace_slot: Option<u64>,
 }
 

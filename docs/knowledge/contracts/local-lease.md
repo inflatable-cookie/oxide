@@ -440,9 +440,10 @@ half-budget recycling rule is retired (oxide#118). Incomplete or unknown
 accounting refuses the lease. A held same-holder replay keeps its exact lease
 and path, and another holder remains busy without touching the held slot.
 Byte pressure is handled by admitting a new slot, not by discarding a
-compatible warm one: with the whole-payload union at or above the budget, the
-oldest eligible idle whole slot is removed until the union is under it, and
-`Full` refuses when only held slots remain.
+compatible warm one: with the attributable pool figure — the recorded per-slot
+sum plus the shallow scope pass, never the shared volume's total — at or above
+the budget, the oldest eligible idle whole slot is removed until that figure is
+under it, and `Full` refuses when only held slots remain.
 
 
 ### Ledger-only view for front-door membership (oxide#110, lead `e4c74399`)
@@ -593,9 +594,14 @@ retired-backed and unresolved `Evicting`. Compatible idle reuse stays first,
 with its complete target walk. Below both count ceilings and without byte
 pressure nothing is evicted, so the old 32/2 counts no longer churn slots.
 At the pool ceiling, the least-recently-used *eligible* idle whole slot is
-replaced and the new slot is built cold; a byte-pressure admission does the
-same using the global idle order and remeasures the inode union after each
-deletion. Each deletion must reduce membership and an admission is bounded by
+replaced and the new slot is built cold. That is **count** pressure, and it is
+authorised separately from bytes: a complete pool figure or a removable pool's
+bound-only unknown both suffice, while an internal, mixed or non-bound
+incompleteness refuses before any deletion. A **recorded byte-pressure**
+admission instead compares the attributable pool sum with the budget, uses the
+global idle order, and recomputes the recorded figure after each deletion; a
+removable pool whose own size is unknown takes the reserve/floor route and
+never a byte-cap comparison. Each deletion must reduce membership and an admission is bounded by
 the entries it saw initially. Held, retired, uncertain (live or unattributable
 lock), foreign and unmeasurable slots are never eligible, and a safety failure
 stops admission instead of skipping to another slot. With no safely eligible
@@ -603,9 +609,11 @@ idle slot, the lease refuses honestly; it does not promise a deletion through
 a failed safety gate. At the eight-slot project ceiling Oxide replaces that
 project's oldest eligible idle whole slot, which also frees pool capacity.
 The front door chooses that victim by recorded rank but asks the library to
-retire it as part of the same admission: complete whole-payload accounting and
-rank headroom are checked before any deletion, and a refusal leaves the victim
-and every metadata record in place.
+retire it as part of the same admission: the count-pressure gate of the
+previous paragraph and rank headroom are checked before any deletion, and a
+refusal leaves the victim and every metadata record in place. The whole-payload
+walk reported by `status --measure` remains an audit view, not admission
+input.
 A command waits only when a specific held compatible slot of its own checkout
 exists under the existing identity and freshness rules; an unrelated build's
 completion is not assumed to free a count or byte ceiling. The freshness loop
