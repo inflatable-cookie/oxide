@@ -572,3 +572,13 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:command-budgets"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"
+
+# Uncounted keep-going collection for oxide#140, run through the same qualified
+# guard, bounds and custody: the fixed script's --diagnostic mode records
+# recoverable oracle failures, continues only into dependency-independent
+# cases and aborts on an unknown child, custody uncertainty, a prerequisite
+# failure or an exhausted deadline. Its receipt is distinctly qualified=false
+# and is never a counted PASS; this declaration activates nothing.
+[tasks."rust:command-budgets:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py --diagnostic"

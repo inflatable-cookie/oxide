@@ -22,6 +22,16 @@ Apparatus contract
   no auto-install, one job, explicit target and build directories inside the
   monitored scratch, then copied out, hashed and identified; only the staging
   directories are removed. Fixtures never see a staged target.
+- Lockfile premise: the only `--locked` invocation in this proof is that
+  staging build of this repository, whose committed `Cargo.lock` is present at
+  the proof's own HEAD. Fixture crates are std-only and are never invoked with
+  `--locked`; Cargo creates their locks inside the pool output, so a fixture
+  checkout without a lock is normal, not an error.
+- Human budget results are recognised only by the product's exact
+  `report_stop`/`LOSS_NOTE` grammar. Ordinary Cargo, path or project output
+  that contains the word `budget` (the fixture crates are named
+  `oxide-budget-<label>`) is not a stop or a channel loss, and a failure
+  records a bounded escaped stderr excerpt plus its typed fields.
 - Every fixture runs in a private scratch tree with its own `HOME`,
   `CARGO_HOME`, `OXIDE_CONFIG`, `OXIDE_POOL` and temp, from a private tiny
   checkout `cwd`, so no case can act on this repository or a live pool. A
@@ -73,6 +83,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -108,16 +119,21 @@ COMMAND = [
     "python3",
     "scripts/test-command-budgets.py",
 ]
-USAGE = """usage: test-command-budgets.py [--plan | --self-check | --self-test | --help]
+USAGE = """usage: test-command-budgets.py [--plan | --self-check | --self-test | --diagnostic | --help]
 
 Without an argument this runs the counted proof under the qualified shared
-supervisor. --plan prints the fixed command, cases, phases, disk allocation,
-child lifetimes, concurrency and limits without any effect. --self-check runs
-the pure plan, argument, duration, event and deadline checks in this process
-without staging or touching a fixture. --self-test executes the corrected case
-bodies against faked process and filesystem seams (no child, image or pool) to
-catch body-versus-plan drift, and exercises the whole-lifecycle fault/receipt
-paths.
+supervisor in fail-fast mode. --plan prints the fixed command, cases, phases,
+disk allocation, child lifetimes, concurrency and limits without any effect.
+--self-check runs the pure plan, argument, duration, event and deadline checks
+in this process without staging or touching a fixture. --self-test executes the
+corrected case bodies against faked process and filesystem seams (no child,
+image or pool) to catch body-versus-plan drift, and exercises the
+whole-lifecycle fault/receipt paths. --diagnostic is an uncounted keep-going
+collection under the same guard: it records recoverable oracle failures and
+continues only with dependency-independent cases, while an unknown child or
+writer, a custody uncertainty, a prerequisite failure or an exhausted deadline
+stops it. Its receipt is distinctly qualified=false and is never a counted
+PASS; only ROOT activates such a run separately.
 """
 # Case allocation in seconds, clipped further by the exported guard deadline.
 # All estimates are unmeasured until a counted native run.
@@ -133,7 +149,29 @@ RESULTS: list[dict] = []
 OWNED: list[subprocess.Popen] = []
 UNCERTAIN: list[str] = []
 PRIMARY_FAULT: str | None = None
+# Bounded first-fault evidence: only the most recent observations are kept.
+FAULT_DETAIL: list[dict] = []
+MAX_FAULT_DETAIL = 3
+MAX_EXCERPT_CHARS = 400
 PHASE_STARTED = time.perf_counter()
+
+# The product's own human budget diagnostics, recognised by their exact
+# grammar (`src/bin/oxide/budget.rs`: report_stop and LOSS_NOTE). Ordinary
+# Cargo, project or path output may contain the word "budget" — the fixture
+# crates are named `oxide-budget-<label>` — so a lowercase substring test is
+# not a budget diagnostic and must never decide an oracle.
+STOP_ADMISSION_RE = re.compile(
+    r"^oxide: stopped by the admission budget \(\d+ms\) before a usable child start$"
+)
+STOP_EXECUTION_RE = re.compile(r"^oxide: stopped by the execution budget \(\d+ms\)$")
+LOSS_NOTE_RE = re.compile(
+    r"^oxide: the budget event channel became unusable; typed results are unavailable for this command$"
+)
+DIAGNOSTIC_TEXT = {
+    "admission_stop": "oxide: stopped by the admission budget (<N>ms) before a usable child start",
+    "execution_stop": "oxide: stopped by the execution budget (<N>ms)",
+    "event_loss": "oxide: the budget event channel became unusable; typed results are unavailable for this command",
+}
 
 
 class Fault(Exception):
@@ -160,6 +198,26 @@ def expect(condition: bool, message: str) -> None:
         fail(message)
 
 
+class Abort(Fault):
+    """An outcome that keep-going diagnostics must not continue past.
+
+    An unknown child, a custody uncertainty, a staging or capability
+    prerequisite failure, or an exhausted guard deadline is not a recoverable
+    oracle failure: a diagnostic stops and reports it instead of continuing.
+    """
+
+
+def abort(message: str) -> None:
+    """Record and raise a non-continuable fault (the first text wins)."""
+    global PRIMARY_FAULT
+    if PRIMARY_FAULT is None:
+        PRIMARY_FAULT = message
+    say(f"ABORT: {message}")
+    for process in OWNED:
+        release(process)
+    raise Abort(message)
+
+
 def say(message: str) -> None:
     print(f"[{time.perf_counter() - PHASE_STARTED:7.1f}s] {message}", flush=True)
 
@@ -180,17 +238,17 @@ def result(name: str, passed: bool, detail: str) -> None:
 def clip(phase_seconds: float, left: float) -> float:
     """The one rule every child timeout uses: never outlive the guard."""
     if left <= 0:
-        fail("the guard's work deadline is exhausted")
+        abort("the guard's work deadline is exhausted")
     return max(1.0, min(float(phase_seconds), left))
 
 
 def work_left() -> float:
     guard = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
     if not guard:
-        fail("OXIDE_PROOF_DEADLINE_NS is not exported; this proof runs only under the guard")
+        abort("OXIDE_PROOF_DEADLINE_NS is not exported; this proof runs only under the guard")
     left = (int(guard) - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9 - SHUTDOWN_MARGIN_S
     if left <= 5:
-        fail("the guard's work deadline is inside its shutdown margin")
+        abort("the guard's work deadline is inside its shutdown margin")
     return left
 
 
@@ -292,6 +350,7 @@ def parse_arguments(argv: list[str]) -> tuple[str, str | None]:
         "--plan": "plan",
         "--self-check": "self-check",
         "--self-test": "self-test",
+        "--diagnostic": "diagnostic",
         "--help": "help",
     }
     if argv[0] in mode:
@@ -364,26 +423,26 @@ def plan_document() -> dict:
         "selector": SELECTOR,
         "command": COMMAND,
         "counted_only_without_argument": True,
-        "modes": ["--plan", "--self-check", "--help"],
+        "modes": ["--plan", "--self-check", "--self-test", "--diagnostic", "--help"],
         "cases": [
-            {"name": "fast-start-axes", "oracle": "both budgets: started then finished(child_exit 0), spawn_late false, both budget fields present; execution-only: admission_ms null; admission-only: execution_ms and execution_started_ms null"},
+            {"name": "fast-start-axes", "oracle": "both budgets: started then finished(child_exit 0), spawn_late false, both budget fields present; execution-only: admission_ms null; admission-only: execution_ms and execution_started_ms null; no budget diagnostic (exact report_stop/LOSS_NOTE grammar) in any axis"},
             {"name": "spawn-failure-event", "oracle": "missing program: exit 127, no started record, exactly one finished(spawn_failure)"},
             {"name": "admission-expiry-no-start", "oracle": "held slot + 1s admission: exit 124, no primary marker, no started record, finished(admission_deadline), contender ticket gone"},
             {"name": "contention-longer-than-execution", "oracle": "held slot released after ~3s + 60s admission/2s execution: starts after release, exit 0, execution_elapsed <=2s though wall >=3s"},
             {"name": "execution-deadline", "oracle": "60s sleeper + 1s execution: exit 125, finished(execution_deadline), budget named, group settled, slot reusable"},
-            {"name": "precedence-child-124", "oracle": "child exits 124 itself under a 60s budget: child_exit 124, no budget line, no latched origin"},
+            {"name": "precedence-child-124", "oracle": "child exits 124 itself under a 60s budget: child_exit 124, no budget diagnostic, no latched origin"},
             {"name": "precedence-caller-signal", "oracle": "SIGTERM before expiry: 143, released, no deadline origin"},
-            {"name": "precedence-child-125", "oracle": "child exits 125 itself under a 60s budget: child_exit, no budget line"},
+            {"name": "precedence-child-125", "oracle": "child exits 125 itself under a 60s budget: child_exit, no budget diagnostic"},
             {"name": "precedence-term-trap", "oracle": "TERM-trapping child under 1s: trap marker present, exit 125, finished(execution_deadline)"},
             {"name": "cumulative-run-window", "oracle": "3s build.rs then a 60s program under one 5s execution window on a budget-only pool: exit 125 in run_program, execution stop origin, and the launched program wrote 2..20 heartbeats of its own 200ms counter (~10 in the remaining window; a reset window would write ~25); the candidate exit and closeout latency are not asserted"},
-            {"name": "nested-outer-window", "oracle": "the outer exec starts first and takes the only slot; its tool starts an inner oxide that waits and ends on its own 1s admission budget with no build; the tool keeps running so the outer 2s window (not a natural exit) stops it: exit 125 with a typed exec_tool start and execution_deadline"},
+            {"name": "nested-outer-window", "oracle": "the outer exec starts first and takes the only slot; its tool starts an inner oxide that waits and ends on its own 1s admission budget (grammar-checked, no Cargo compile lines); the tool keeps running so the outer 2s window (not a natural exit) stops it: exit 125 with a typed exec_tool start and execution_deadline"},
             {"name": "events-matrix", "oracle": "regular file, read end and blocking pipe refuse before any effect; full pipe yields no typed record; contiguous sequence on a healthy stream"},
             {"name": "events-broken-reader", "oracle": "read end closed before start: exit 0, parent survives, one loss note, no typed record"},
             {"name": "unknown-closure-held", "oracle": "debug closure hook + 1s execution: exit 1, finished(unconfirmed_closure), drain not complete, lease held, status shows the held slot"},
             {"name": "preparation-stop-124", "oracle": "fake cargo sleeping in locate-project + 1ms admission: exit 124, no primary marker"},
             {"name": "late-start", "oracle": "debug spawn delay past a 2s admission: exit 124, started record with spawn_late and overshoot, slot released"},
             {"name": "no-mutation", "oracle": "a refused input leaves home/config/pool unchanged; a successful budgeted command adds no settings file, no new control-state fields and no budget lines in status"},
-            {"name": "unbudgeted", "oracle": "exit 3 preserved, no budget line, no events required"},
+            {"name": "unbudgeted", "oracle": "exit 3 preserved, no budget diagnostic, no events required"},
         ],
         "phases": [
             {"name": "stage", "seconds": PHASE_ALLOCATION_S["stage"], "allocation": "one debug oxide, plain Cargo offline, target and build inside scratch, staging deleted before fixtures", "disk_mib": 220},
@@ -410,6 +469,16 @@ def plan_document() -> dict:
             "fixture_cargo_jobs": FIXTURE_JOBS,
             "fixture_commands": "sequential, at most one candidate and one holder at a time",
         },
+        "diagnostic": {
+            "qualified": False,
+            "default_mode": "fail-fast",
+            "continues": "recoverable oracle failures in dependency-independent cases",
+            "aborts": "unknown child or writer outcome, custody uncertainty, a staging or capability prerequisite failure, or an exhausted guard deadline",
+            "dependencies": {name: [] for name in DIAGNOSTIC_DEPENDENCIES},
+            "independence": "every case labels its own private HOME, CARGO_HOME, config and pool paths, so no case depends on another case's fixture state",
+            "receipt": "distinct helper receipt with qualified=false, the failures, bounded evidence, completed functions, truthful skips and any abort reason",
+            "exit": "0 only when the collection completed with no failure and no abort; 1 otherwise; never a counted PASS",
+        },
         "limits": {
             "wall_limit_s": WALL_LIMIT_S,
             "scratch_budget_mib": SCRATCH_BUDGET_MIB,
@@ -422,6 +491,8 @@ def plan_document() -> dict:
             "fixtures": "private HOME/CARGO_HOME/OXIDE_CONFIG/OXIDE_POOL/temp and a private tiny checkout cwd",
             "private_home": "OXIDE_TEST_HOME_FROM_ENV=1 with explicit private config and pool (oxide#143 convention)",
             "toolchain": "RUSTUP_TOOLCHAIN=1.97.1, RUSTUP_AUTO_INSTALL=0, RUSTUP_HOME captured before HOME is replaced",
+            "lockfile": "the only --locked call is the staging build of this repository, whose committed Cargo.lock is present; fixture crates are std-only, are never invoked with --locked, and Cargo creates their lock inside the pool output",
+            "diagnostics": "human budget results are recognised only by the exact report_stop and LOSS_NOTE grammar; innocent project/path/Cargo text containing 'budget' is not a diagnostic",
         },
         "live_pool": False,
         "mounted_volume": False,
@@ -544,7 +615,7 @@ def run(
             note = f"owned pid {process.pid} outlived its clipped timeout ({error}); output is unknown"
             UNCERTAIN.append(note)
             say(f"custody: {note}")
-        fail(fault_text)
+        abort(fault_text)
     result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
     result.elapsed = time.monotonic() - started
     return result
@@ -669,10 +740,10 @@ def hold_slot(
     held = os.path.join(root, f"{label}.held")
     while not os.path.exists(held):
         if process.poll() is not None:
-            fail(f"the {label} holder exited before taking its slot: {process.stderr.read()[-800:]}")
+            abort(f"the {label} holder exited before taking its slot: {process.stderr.read()[-800:]}")
         if time.monotonic() > deadline:
             release(process)
-            fail(f"the {label} holder never took its slot")
+            abort(f"the {label} holder never took its slot")
         time.sleep(0.02)
     return (process, release_file)
 
@@ -746,6 +817,85 @@ def started_records(records: list[dict]) -> list[dict]:
     return [entry for entry in records if entry.get("event") == "admitted_child_started"]
 
 
+def budget_diagnostics(text: str | None) -> list[str]:
+    """The kinds of product budget diagnostic present, by exact grammar.
+
+    Only the three product lines count: an unexplained stop, a later loss note
+    or an innocent mention of "budget" (a crate name, a path, a Cargo line, a
+    user's own tool output) is not a budget result. Incomplete or truncated
+    lines therefore never become positive evidence.
+    """
+    kinds: list[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if STOP_ADMISSION_RE.match(stripped):
+            kinds.append("admission_stop")
+        elif STOP_EXECUTION_RE.match(stripped):
+            kinds.append("execution_stop")
+        elif LOSS_NOTE_RE.match(stripped):
+            kinds.append("event_loss")
+    return kinds
+
+
+def stderr_excerpt(text: str | None, limit: int = MAX_EXCERPT_CHARS) -> str:
+    """A bounded escaped excerpt; truncation is explicit, never silent."""
+    if not text:
+        return "<no stderr captured>"
+    escaped = text.encode("unicode_escape").decode("ascii")
+    if len(escaped) <= limit:
+        return escaped
+    return f"{escaped[:limit]}... <truncated; {len(escaped)} escaped chars total>"
+
+
+def expect_no_budget_diagnostic(text: str | None, label: str) -> None:
+    """No product stop/loss diagnostic; innocent output may mention budget."""
+    found = budget_diagnostics(text)
+    expect(not found, f"{label}: printed a budget diagnostic {found}: {stderr_excerpt(text)}")
+
+
+def expect_budget_diagnostic(text: str | None, kind: str, label: str) -> None:
+    found = budget_diagnostics(text)
+    expect(
+        kind in found,
+        f"{label}: expected the {kind} diagnostic {DIAGNOSTIC_TEXT[kind]!r}, saw {found}: {stderr_excerpt(text)}",
+    )
+
+
+def typed_summary(records: list[dict] | None) -> dict:
+    """A bounded view of the typed records for a failure receipt."""
+    if not records:
+        return {"records": 0}
+    keys = ("seq", "event", "phase", "outcome", "stop_origin", "exit_code", "drain", "lease")
+    return {
+        "records": len(records),
+        "shown": [{key: entry.get(key) for key in keys if key in entry} for entry in records[:8]],
+        "omitted": max(0, len(records) - 8),
+    }
+
+
+def record_detail(
+    label: str,
+    stderr: str | None,
+    records: list[dict] | None = None,
+    **fields,
+) -> None:
+    """Keep bounded first-fault evidence for the helper receipt.
+
+    The label names the exact command and oracle; the stderr excerpt is escaped
+    and length-bounded, and any typed records are summarised rather than copied
+    whole. Only the most recent entries are kept, so the receipt stays small
+    while a failure still carries the facts that separate a grammar bug from
+    product behaviour.
+    """
+    entry: dict = {"label": label, "stderr": stderr_excerpt(stderr)}
+    if records is not None:
+        entry["typed"] = typed_summary(records)
+    if fields:
+        entry["fields"] = {key: fields[key] for key in sorted(fields)}
+    FAULT_DETAIL.append(entry)
+    del FAULT_DETAIL[:-MAX_FAULT_DETAIL]
+
+
 # --------------------------------------------------------------------------
 # Cases.
 
@@ -771,10 +921,20 @@ def case_fast_start_axes(root: str, subject: str) -> None:
                 pass_fds=(write_fd,),
             )
             raw = read_until_record(read_fd)
+            # A fast child writes two records back to back: wait for the first
+            # line deterministically, then take whatever else is already there
+            # instead of leaving the terminal record unread in the pipe.
+            raw += drain(read_fd)
         finally:
             os.close(write_fd)
             os.close(read_fd)
-        expect(answer.returncode == 0, f"{label}: exit {answer.returncode}: {answer.stderr[-800:]}")
+        record_detail(
+            f"fast-start/{label}",
+            answer.stderr,
+            returncode=answer.returncode,
+            elapsed=round(getattr(answer, "elapsed", 0.0), 3),
+        )
+        expect(answer.returncode == 0, f"{label}: exit {answer.returncode}: {stderr_excerpt(answer.stderr)}")
         records = finish_events(raw)
         ok, detail = sequence_oracle(records)
         expect(ok, f"{label}: {detail}")
@@ -788,7 +948,8 @@ def case_fast_start_axes(root: str, subject: str) -> None:
         recorded = terminal(records)
         expect(recorded["outcome"] == "child_exit", f"{label}: outcome {recorded['outcome']}")
         expect(recorded["exit_code"] == 0, f"{label}: terminal exit {recorded['exit_code']}")
-        expect("budget" not in answer.stderr.lower(), f"{label}: printed a budget line")
+        record_detail(f"fast-start/{label}", answer.stderr, records)
+        expect_no_budget_diagnostic(answer.stderr, label)
     result("fast-start-axes", True, "both/execution-only/admission-only axes, nullable fields and sequence")
 
 
@@ -809,12 +970,15 @@ def case_spawn_failure(root: str, subject: str) -> None:
     finally:
         os.close(write_fd)
         os.close(read_fd)
+    record_detail("spawn-failure", answer.stderr, returncode=answer.returncode, drained=len(raw))
     expect(answer.returncode == 127, f"a missing program exited {answer.returncode}, wanted 127")
     records = finish_events(raw)
+    record_detail("spawn-failure", answer.stderr, records)
     expect(not started_records(records), "a spawn failure emitted a started record")
     recorded = terminal(records)
     expect(recorded["outcome"] == "spawn_failure", f"outcome {recorded['outcome']}")
     expect(recorded["child_exit_code"] is None, "a spawn failure reported a child exit code")
+    expect_no_budget_diagnostic(answer.stderr, "spawn-failure")
     result("spawn-failure-event", True, "exit 127, no started record, finished(spawn_failure)")
 
 
@@ -842,10 +1006,12 @@ def case_admission_expiry(root: str, subject: str) -> None:
         os.close(write_fd)
         os.close(read_fd)
         close_holder(holder, _release_file)
+    record_detail("admission-expiry", answer.stderr, returncode=answer.returncode, drained=len(raw))
     expect(answer.returncode == ADMISSION_EXIT, f"admission expiry exited {answer.returncode}")
     expect(not os.path.exists(marker), "an admission-expired command started its child")
-    expect("admission budget" in answer.stderr, f"the stop did not name the admission budget: {answer.stderr[-600:]}")
     records = finish_events(raw)
+    record_detail("admission-expiry", answer.stderr, records)
+    expect_budget_diagnostic(answer.stderr, "admission_stop", "admission expiry")
     expect(not started_records(records), "an admission-expired command emitted a started record")
     expect(terminal(records)["outcome"] == "admission_deadline", "the terminal outcome is not admission_deadline")
     expect(
@@ -892,10 +1058,11 @@ def case_contention(root: str, subject: str) -> None:
         fail("the contender did not finish inside its clipped timeout")
     finally:
         close_holder(holder, release_file)
-    expect(process.returncode == 0, f"the contender exited {process.returncode}: {stderr[-800:]}")
+    expect(process.returncode == 0, f"the contender exited {process.returncode}: {stderr_excerpt(stderr)}")
     expect(waited >= 2.5, f"the contender only waited {waited:.1f}s, not longer than its 2s execution window")
     expect(elapsed <= 6.0, f"the contender took {elapsed:.1f}s after release; execution elapsed must fit its own window")
-    expect("admission budget" not in stderr and "execution budget" not in stderr, f"a budget stop appeared: {stderr[-600:]}")
+    record_detail("contention", stderr, returncode=process.returncode, waited=round(waited, 3), elapsed=round(elapsed, 3))
+    expect_no_budget_diagnostic(stderr, "contention")
     result("contention-longer-than-execution", True, f"waited {waited:.1f}s (over 2s) then succeeded in {elapsed:.1f}s")
 
 
@@ -918,10 +1085,12 @@ def case_execution_deadline(root: str, subject: str) -> None:
     finally:
         os.close(write_fd)
         os.close(read_fd)
+    record_detail("execution-deadline", answer.stderr, returncode=answer.returncode, elapsed=round(answer.elapsed, 3))
     expect(answer.returncode == EXECUTION_EXIT, f"the deadline exited {answer.returncode}")
-    expect("execution budget" in answer.stderr, f"the stop did not name the execution budget: {answer.stderr[-600:]}")
-    expect(answer.elapsed <= 1 + 15, f"the stop took {answer.elapsed:.1f}s past the finite closeout bound")
     records = finish_events(raw)
+    record_detail("execution-deadline", answer.stderr, records)
+    expect_budget_diagnostic(answer.stderr, "execution_stop", "execution deadline")
+    expect(answer.elapsed <= 1 + 15, f"the stop took {answer.elapsed:.1f}s past the finite closeout bound")
     recorded = terminal(records)
     expect(recorded["outcome"] == "execution_deadline", f"outcome {recorded['outcome']}")
     expect(recorded["drain"] == "complete", f"a settled drain was reported {recorded['drain']}")
@@ -952,7 +1121,8 @@ def case_precedence(root: str, subject: str) -> None:
         os.close(write_fd)
         os.close(read_fd)
     expect(answer.returncode == 124, f"a genuine child 124 exited {answer.returncode}")
-    expect("budget" not in answer.stderr.lower(), "a genuine child 124 printed a budget line")
+    record_detail("precedence-child-124", answer.stderr, returncode=answer.returncode)
+    expect_no_budget_diagnostic(answer.stderr, "genuine child 124")
     recorded = terminal(finish_events(raw))
     expect(recorded["outcome"] == "child_exit", f"a genuine 124 was typed {recorded['outcome']}")
     expect(recorded["stop_origin"] is None, f"a genuine 124 latched {recorded['stop_origin']}")
@@ -963,7 +1133,8 @@ def case_precedence(root: str, subject: str) -> None:
     write_executable(self125, "#!/bin/sh\nexit 125\n")
     result_run = run([subject, "exec", "--execution-budget", "60s", "--", self125], cwd=crate, env=env, phase_seconds=30)
     expect(result_run.returncode == 125, f"a genuine child 125 exited {result_run.returncode}")
-    expect("budget" not in result_run.stderr.lower(), "a genuine child 125 printed a budget line")
+    record_detail("precedence-child-125", result_run.stderr, returncode=result_run.returncode)
+    expect_no_budget_diagnostic(result_run.stderr, "genuine child 125")
     result("precedence-child-125", True, "child_exit 125 without a budget line")
 
     case("precedence-caller-signal")
@@ -986,7 +1157,8 @@ def case_precedence(root: str, subject: str) -> None:
         release(process)
         fail("the caller-signal case did not finish inside its clipped timeout")
     expect(process.returncode == 143, f"a caller SIGTERM ended {process.returncode}, wanted 143")
-    expect("execution budget" not in stderr, f"a caller signal printed a budget line: {stderr[-400:]}")
+    record_detail("precedence-caller-signal", stderr, returncode=process.returncode)
+    expect_no_budget_diagnostic(stderr, "caller signal")
     result("precedence-caller-signal", True, "143, no deadline origin")
 
     case("precedence-term-trap")
@@ -1006,6 +1178,8 @@ def case_precedence(root: str, subject: str) -> None:
     )
     expect(result_run.returncode == EXECUTION_EXIT, f"the TERM-trapping child exited {result_run.returncode}")
     expect(os.path.exists(trap_marker), "the escalation never delivered TERM to the trapping child")
+    record_detail("precedence-term-trap", result_run.stderr, returncode=result_run.returncode)
+    expect_budget_diagnostic(result_run.stderr, "execution_stop", "TERM-trap stop")
     result("precedence-term-trap", True, "TERM delivered to the trap, controlled stop still 125")
 
 
@@ -1062,8 +1236,19 @@ def case_cumulative_run(root: str, subject: str) -> None:
         raw = drain(read_fd)
     os.close(write_fd)
     os.close(read_fd)
-    expect(answer.returncode == EXECUTION_EXIT, f"the cumulative run exited {answer.returncode}: {read_text(stderr_path)[-600:]}")
+    record_detail(
+        "cumulative-run-window",
+        read_text(stderr_path),
+        returncode=answer.returncode,
+        elapsed=round(answer.elapsed, 3),
+    )
+    expect(
+        answer.returncode == EXECUTION_EXIT,
+        f"the cumulative run exited {answer.returncode}: {stderr_excerpt(read_text(stderr_path))}",
+    )
     records = finish_events(raw)
+    record_detail("cumulative-run-window", read_text(stderr_path), records)
+    expect_budget_diagnostic(read_text(stderr_path), "execution_stop", "cumulative run")
     phases = [entry.get("phase") for entry in started_records(records)]
     expect("primary_cargo" in phases and "run_program" in phases, f"phases {phases}")
     expect(terminal(records)["outcome"] == "execution_deadline", "the cumulative window did not end as execution_deadline")
@@ -1116,18 +1301,29 @@ def case_nested(root: str, subject: str) -> None:
     finally:
         os.close(write_fd)
         os.close(read_fd)
-    expect(answer.returncode == EXECUTION_EXIT, f"the outer command exited {answer.returncode}")
-    expect("execution budget" in answer.stderr, f"the outer stop did not name the execution budget: {answer.stderr[-600:]}")
+    expect(
+        answer.returncode == EXECUTION_EXIT,
+        f"the outer command exited {answer.returncode}: {stderr_excerpt(answer.stderr)}",
+    )
     records = finish_events(raw)
+    record_detail("nested-outer", answer.stderr, records, returncode=answer.returncode)
+    expect_budget_diagnostic(answer.stderr, "execution_stop", "outer stop")
     phases = [entry.get("phase") for entry in started_records(records)]
     expect("exec_tool" in phases, f"the outer tool start was not reported: {phases}")
     recorded = terminal(records)
     expect(recorded["outcome"] == "execution_deadline", "the outer window did not report execution_deadline")
     expect(recorded["stop_origin"] == "execution", "the outer stop did not carry an execution origin")
     inner = read_text(inner_log)
-    expect("waiting" in inner, f"the inner call never waited for the held slot: {inner[-600:]}")
-    expect("admission budget" in inner or "124" in inner, f"the inner call did not end on its own budget: {inner[-600:]}")
-    expect(not os.path.isdir(os.path.join(inner_crate, "target")), "the inner call started a build")
+    record_detail("nested-inner", inner, fields={"inner_log_bytes": len(inner)})
+    expect("oxide: waiting for" in inner, f"the inner call never waited for the held slot: {stderr_excerpt(inner)}")
+    expect_budget_diagnostic(inner, "admission_stop", "inner call")
+    # `oxide check` places build output in the pool, so a checkout-local
+    # `target/` never appears even when a build happens; assert the absence of
+    # Cargo's own build lines instead of a directory that proves nothing.
+    expect(
+        "Compiling " not in inner and "Finished " not in inner,
+        f"the inner call compiled a crate: {stderr_excerpt(inner)}",
+    )
     result(
         "nested-outer-window",
         True,
@@ -1172,6 +1368,14 @@ def case_events(root: str, subject: str) -> None:
             os.write(write_fd, filler)
         except BlockingIOError:
             break
+    # Fill any remainder byte by byte: a partially filled pipe could still
+    # accept a whole record, which would make the full-channel premise
+    # non-deterministic.
+    while True:
+        try:
+            os.write(write_fd, b"x")
+        except BlockingIOError:
+            break
     full = run(
         [subject, "exec", "--execution-budget", "5s", "--budget-events", str(write_fd), "--", tool],
         cwd=crate,
@@ -1182,8 +1386,10 @@ def case_events(root: str, subject: str) -> None:
     os.close(write_fd)
     drained = drain(read_fd, deadline_s=1.0)
     os.close(read_fd)
+    record_detail("events-full", full.stderr, returncode=full.returncode, drained=len(drained))
     expect(full.returncode == 0, f"a full event pipe changed the outcome: {full.returncode}")
     expect(b'"event"' not in drained, "a record was written after the stream was lost")
+    expect_budget_diagnostic(full.stderr, "event_loss", "full event pipe")
     result("events-matrix", True, "type/access/flag refusals, full pipe writes nothing")
 
 
@@ -1209,7 +1415,9 @@ def case_broken_reader(root: str, subject: str) -> None:
     finally:
         os.close(write_fd)
     expect(result_run.returncode == 0, f"a broken reader changed the outcome: {result_run.returncode}")
-    expect(result_run.stderr.count("event channel became unusable") <= 1, "the loss note repeated")
+    record_detail("events-broken-reader", result_run.stderr, returncode=result_run.returncode)
+    losses = budget_diagnostics(result_run.stderr).count("event_loss")
+    expect(losses == 1, f"the loss note count is {losses}, wanted exactly one: {stderr_excerpt(result_run.stderr)}")
     result("events-broken-reader", True, "EPIPE ignored, parent survives, one loss note at most")
 
 
@@ -1234,6 +1442,7 @@ def case_unknown_closure(root: str, subject: str) -> None:
         os.close(write_fd)
         os.close(read_fd)
     expect(result_run.returncode == 1, f"the injected unknown closure exited {result_run.returncode}")
+    record_detail("unknown-closure", result_run.stderr, returncode=result_run.returncode)
     records = finish_events(raw)
     recorded = terminal(records)
     expect(recorded["outcome"] == "unconfirmed_closure", f"outcome {recorded['outcome']}")
@@ -1270,6 +1479,8 @@ def case_preparation_stop(root: str, subject: str) -> None:
     )
     expect(result_run.returncode == ADMISSION_EXIT, f"a stopped preparation child exited {result_run.returncode}")
     expect(not os.path.exists(marker), "a stopped preparation child started the primary program")
+    record_detail("preparation-stop", result_run.stderr, returncode=result_run.returncode)
+    expect_budget_diagnostic(result_run.stderr, "admission_stop", "preparation stop")
     result("preparation-stop-124", True, "124, no primary child")
 
 
@@ -1306,6 +1517,8 @@ def case_late_start(root: str, subject: str) -> None:
         os.close(read_fd)
     expect(result_run.returncode == ADMISSION_EXIT, f"the late start exited {result_run.returncode}")
     records = finish_events(raw)
+    record_detail("late-start", result_run.stderr, records, returncode=result_run.returncode)
+    expect_budget_diagnostic(result_run.stderr, "admission_stop", "late start")
     started = started_records(records)
     expect(len(started) == 1, f"the late start emitted {len(started)} started records")
     expect(started[0]["spawn_late"] is True, f"the late start was not reported: {started[0]}")
@@ -1370,6 +1583,7 @@ def case_no_mutation(root: str, subject: str) -> None:
     finally:
         os.close(refused_fd)
     expect(refused.returncode != 0, "a refused input was accepted")
+    record_detail("no-mutation/refused", refused.stderr, returncode=refused.returncode)
     expect(sorted(os.listdir(home)) == before_home, "a refused input changed the private HOME")
     expect(read_text(config) == before_config, "a refused input changed the private config")
     expect(not os.path.exists(env["OXIDE_POOL"]), "a refused input created a pool")
@@ -1404,7 +1618,8 @@ def case_unbudgeted(root: str, subject: str) -> None:
     write_executable(tool, "#!/bin/sh\nexit 3\n")
     result_run = run([subject, "exec", "--", tool], cwd=crate, env=env, phase_seconds=20)
     expect(result_run.returncode == 3, f"an unbudgeted exec exited {result_run.returncode}")
-    expect("budget" not in result_run.stderr.lower(), "an unbudgeted command printed a budget line")
+    record_detail("unbudgeted", result_run.stderr, returncode=result_run.returncode)
+    expect_no_budget_diagnostic(result_run.stderr, "unbudgeted command")
     result("unbudgeted", True, "exit 3 preserved, no budget output")
 
 
@@ -1566,6 +1781,32 @@ def write_receipt_safely(document: dict, scratch: str) -> str | None:
         return None
 
 
+CASE_FUNCTIONS = (
+    case_fast_start_axes,
+    case_spawn_failure,
+    case_admission_expiry,
+    case_contention,
+    case_execution_deadline,
+    case_precedence,
+    case_cumulative_run,
+    case_nested,
+    case_events,
+    case_broken_reader,
+    case_unknown_closure,
+    case_preparation_stop,
+    case_late_start,
+    case_no_mutation,
+    case_unbudgeted,
+)
+# A diagnostic continues only with cases that are independent of the failed
+# one. Every case labels its own private HOME, CARGO_HOME, config, pool and
+# checkout paths, so no case reads or writes another case's fixture state; the
+# staged candidate and the scratch root are immutable prerequisites, and a
+# failure there aborts instead of continuing. The empty lists are therefore
+# deliberate declarations, not an unexamined assumption.
+DIAGNOSTIC_DEPENDENCIES: dict[str, list[str]] = {entry.__name__: [] for entry in CASE_FUNCTIONS}
+
+
 class Proof:
     """One counted run: staging, capability handshake, cases and receipt.
 
@@ -1584,7 +1825,12 @@ class Proof:
         self.tree = ""
         self.root: str | None = None
 
-    def run(self) -> None:
+    def prepare(self) -> None:
+        """Prerequisites shared by the counted run and the diagnostic.
+
+        A failure here is not a recoverable oracle failure: there is no
+        identified candidate to test, so a diagnostic aborts.
+        """
         self.commit = git("rev-parse", "HEAD")
         self.tree = git("rev-parse", "HEAD^{tree}")
         self.subject = stage_subject(self.scratch)
@@ -1594,32 +1840,67 @@ class Proof:
         # CARGO_HOME, config or pool fixture is created.
         self.capabilities = probe_capabilities(self.subject, self.scratch)
         self.root = private_dir(os.path.join(self.scratch, "fixture-budgets"))
-        for entry in (
-            case_fast_start_axes,
-            case_spawn_failure,
-            case_admission_expiry,
-            case_contention,
-            case_execution_deadline,
-            case_precedence,
-            case_cumulative_run,
-            case_nested,
-            case_events,
-            case_broken_reader,
-            case_unknown_closure,
-            case_preparation_stop,
-            case_late_start,
-            case_no_mutation,
-            case_unbudgeted,
-        ):
+
+    def run(self) -> None:
+        self.prepare()
+        for entry in CASE_FUNCTIONS:
             entry(self.root, self.subject)
             work_left()
         say(f"cases run: {', '.join(CASES)}")
 
-    def document(self, fault: str | None) -> dict:
+    def run_diagnostic(self, summary: dict) -> None:
+        """Keep-going collection: record recoverable failures, then continue.
+
+        Only dependency-independent cases continue; an unknown child or writer,
+        custody uncertainty, a prerequisite failure or an exhausted deadline
+        aborts. The summary is filled in place so an abort still has truthful
+        facts, and it is never a counted PASS.
+        """
+        global PRIMARY_FAULT
+        self.prepare()
+        pending = list(CASE_FUNCTIONS)
+        while pending:
+            function = pending.pop(0)
+            name = function.__name__
+            uncertain_before = len(UNCERTAIN)
+            fault_before = PRIMARY_FAULT
+            try:
+                function(self.root, self.subject)
+            except Abort as error:
+                summary["aborted"] = f"{name}: {PRIMARY_FAULT or error}"
+                summary["skipped"] = [entry.__name__ for entry in pending]
+                PRIMARY_FAULT = fault_before
+                raise
+            except Fault as error:
+                text = PRIMARY_FAULT or str(error) or "assertion failed"
+                summary["failures"].append(
+                    {
+                        "case": name,
+                        "fault": text,
+                        "labels": list(CASES),
+                        "evidence": list(FAULT_DETAIL),
+                    }
+                )
+                say(f"diagnostic: {name} failed ({text}); continuing with independent cases")
+                if len(UNCERTAIN) != uncertain_before:
+                    summary["aborted"] = f"{name}: unknown child custody after a recoverable failure"
+                    summary["skipped"] = [entry.__name__ for entry in pending]
+                    PRIMARY_FAULT = fault_before
+                    raise Abort(summary["aborted"])
+                PRIMARY_FAULT = fault_before
+                summary["continued_after_failure"].append(name)
+                continue
+            summary["completed"].append(name)
+        say(f"diagnostic cases run: {', '.join(CASES)}")
+
+    def document(self, fault: str | None, diagnostic: dict | None = None) -> dict:
         planned = [entry["name"] for entry in plan_document()["cases"]]
+        recorded = fault
+        if recorded is None and diagnostic is not None and diagnostic.get("failures"):
+            recorded = diagnostic["failures"][0]["fault"]
         failed = [entry for entry in RESULTS if entry["result"] != "pass"]
-        if fault is not None:
-            failed = failed + [{"case": "primary", "result": "fail", "detail": fault}]
+        if recorded is not None:
+            failed = failed + [{"case": "primary", "result": "fail", "detail": recorded}]
         return {
             "task": "oxide#140",
             "kind": "command-budgets helper receipt",
@@ -1639,7 +1920,8 @@ class Proof:
             "failed": failed,
             "unexecuted": [name for name in planned if name not in CASES],
             "cases": RESULTS,
-            "primary_fault": fault,
+            "first_fault_evidence": list(FAULT_DETAIL),
+            "primary_fault": recorded,
             "uncertain_custody": list(UNCERTAIN),
             "allocation": phase_allocation(),
             "limits": {
@@ -1659,7 +1941,8 @@ class Proof:
             "caller exit and the session closure remain separately authoritative.",
             "live_pool": False,
             "mounted_volume": False,
-            "result": "pass" if fault is None else "fail",
+            "result": ("pass" if fault is None else "fail") if diagnostic is None else "diagnostic",
+            **({"mode": "diagnostic", "qualified": False, "diagnostic": diagnostic} if diagnostic is not None else {}),
         }
 
 
@@ -1719,6 +2002,83 @@ def self_check() -> None:
     expect("outer 2s window" in nested["oracle"], "the nested oracle must attribute the stop to the outer window")
     expect(remaining_quiet() >= 0.0, "the quiet remaining clock must not raise")
     expect(custody_bound() >= 0.05, "the custody bound must stay positive")
+    # Human budget diagnostics are recognised by exact grammar, never by the
+    # lowercase substring that ordinary Cargo/path output can contain.
+    innocent = (
+        "   Compiling oxide-budget-both v0.1.0 (/private/tmp/oxide-budget-both)\n"
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s)\n"
+        "note: the budget profile is an ordinary package name\n"
+    )
+    expect(budget_diagnostics(innocent) == [], "innocent output containing 'budget' was read as a diagnostic")
+    expect(budget_diagnostics("") == [], "empty stderr reported a diagnostic")
+    expect(budget_diagnostics(None) == [], "missing stderr reported a diagnostic")
+    expect(
+        budget_diagnostics("oxide: stopped by the admission budget (1000ms) before a usable child start\n")
+        == ["admission_stop"],
+        "the admission stop grammar is not recognised",
+    )
+    expect(
+        budget_diagnostics("oxide: stopped by the execution budget (5000ms)\n") == ["execution_stop"],
+        "the execution stop grammar is not recognised",
+    )
+    expect(
+        budget_diagnostics(DIAGNOSTIC_TEXT["event_loss"] + "\n") == ["event_loss"],
+        "the loss note grammar is not recognised",
+    )
+    expect(
+        budget_diagnostics("prefix oxide: stopped by the execution budget (5000ms)\n") == [],
+        "an embedded stop line was recognised from a non-exact line",
+    )
+    expect(
+        budget_diagnostics("oxide: the budget event channel became unusable\n") == [],
+        "a truncated loss note became positive evidence",
+    )
+    expect(
+        budget_diagnostics("oxide: stopped by the execution budget (x ms)\n") == [],
+        "a malformed duration became positive evidence",
+    )
+    expect("truncated" in stderr_excerpt("x" * (MAX_EXCERPT_CHARS * 2)), "a long excerpt was not marked truncated")
+    expect(stderr_excerpt(None) == "<no stderr captured>", "a missing stderr was not reported honestly")
+    FAULT_DETAIL.clear()
+    for index in range(5):
+        record_detail(f"probe-{index}", "note " * 200)
+    expect(len(FAULT_DETAIL) == MAX_FAULT_DETAIL, "the first-fault evidence is not bounded")
+    expect(MAX_FAULT_DETAIL <= 3, "the first-fault evidence bound grew")
+    expect(len(FAULT_DETAIL[-1]["stderr"]) <= MAX_EXCERPT_CHARS + 80, "a recorded excerpt exceeded its bound")
+    FAULT_DETAIL.clear()
+    # Lockfile premise: one staged build of this repository, whose committed lock
+    # is present; no fixture is invoked with --locked.
+    proof_source = open(SCRIPT, encoding="utf-8").read()
+    expect(os.path.isfile(os.path.join(REPO, "Cargo.lock")), "the staged repository has no Cargo.lock for --locked")
+    locked_flag = "--" + "locked"
+    locked = [
+        node.value
+        for node in ast.walk(ast.parse(proof_source))
+        if isinstance(node, ast.Constant) and node.value == locked_flag
+    ]
+    expect(len(locked) == 1, "the proof gained a --locked call its lockfile premise does not cover")
+    expect(
+        plan["provenance"]["lockfile"].startswith("the only --locked call is the staging build"),
+        "the lockfile premise changed",
+    )
+    expect("grammar" in plan["provenance"]["diagnostics"], "the diagnostic-grammar premise changed")
+    # Diagnostic mode is declared, unqualified and dependency-ordered.
+    expect(parse_arguments(["--diagnostic"]) == ("diagnostic", None), "--diagnostic must parse")
+    expect(plan["diagnostic"]["qualified"] is False, "the diagnostic plan must never be qualified")
+    expect(plan["diagnostic"]["default_mode"] == "fail-fast", "the default mode must stay fail-fast")
+    expect("--diagnostic" in plan["modes"], "the diagnostic mode is missing from the plan")
+    expect(
+        len(plan["diagnostic"]["dependencies"]) == len(CASE_FUNCTIONS),
+        "the diagnostic dependency map does not cover every case",
+    )
+    expect(
+        all(not values for values in plan["diagnostic"]["dependencies"].values()),
+        "a diagnostic case declares a dependency that the independence premise denies",
+    )
+    expect(
+        "private HOME" in plan["diagnostic"]["independence"],
+        "the diagnostic independence premise changed",
+    )
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("budget_proof_shape", SCRIPT)
@@ -1771,6 +2131,7 @@ def self_test() -> None:
             "OXIDE_POOL": os.path.join(root, f"pool-{label}"),
             "HOME": os.path.join(root, f"home-{label}"),
             "OXIDE_CONFIG": os.path.join(root, f"config-{label}.toml"),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         }
         module.create_crate = lambda root, label: module.private_dir(
             os.path.join(root, "checkouts", label)
@@ -1807,7 +2168,14 @@ def self_test() -> None:
                     {"seq": 3, "event": "finished", "outcome": "execution_deadline",
                      "stop_origin": "execution", "exit_code": 125},
                 ]))
-                return completed(argv, 125, "", "oxide: stopped by the execution budget (5000ms)\n")
+                note = "oxide: stopped by the execution budget (5000ms)\n"
+                # The cumulative case redirects stderr to a file, so the fake
+                # must write there rather than return a captured string.
+                if hasattr(stderr, "write"):
+                    stderr.write(note)
+                    stderr.flush()
+                    return completed(argv, 125, "", "")
+                return completed(argv, 125, "", note)
             if program.endswith("nested-tool.sh"):
                 root = os.path.dirname(os.path.dirname(cwd))
                 with open(os.path.join(root, "inner.log"), "w", encoding="utf-8") as handle:
@@ -1838,6 +2206,24 @@ def self_test() -> None:
             return None
         except module.Fault as error:
             return str(error)
+
+    def with_stderr(fake, suffix):
+        """Append human output to a fake command's stderr."""
+
+        def wrapped(argv, **kwargs):
+            answer = fake(argv, **kwargs)
+            answer.stderr = answer.stderr + suffix
+            return answer
+
+        return wrapped
+
+    def plain_run(text, code):
+        """A fake command with no typed stream, for cases that need none."""
+
+        def fake(argv, *, cwd, env, phase_seconds, pass_fds=(), stdin=None, stdout=None, stderr=None):
+            return completed(argv, code, "", text)
+
+        return fake
 
     def holder_start(module):
         """Fake start for holders: refuses an empty program, creates `.held`."""
@@ -1910,6 +2296,31 @@ def self_test() -> None:
     fault = fault_of(broken, lambda: broken.case_fast_start_axes(scratch, "/bin/true"))
     expect(fault is not None and "execution axis" in fault, f"a nulled axis passed: {fault}")
 
+    # ---- the human diagnostic oracle: innocent output containing "budget"
+    # passes; each exact product stop/loss line fails the same negative oracle.
+    innocent = (
+        "   Compiling oxide-budget-both v0.1.0 (/private/tmp/oxide-budget-both)\n"
+        "note: the budget profile is an ordinary package name\n"
+    )
+    tolerated = load()
+    tolerated.run = with_stderr(make_start(tolerated, beats=0), innocent)
+    expect(
+        fault_of(tolerated, lambda: tolerated.case_fast_start_axes(scratch, "/bin/true")) is None,
+        "innocent output containing 'budget' failed the fast-start oracle",
+    )
+    for label, line in (
+        ("admission", "oxide: stopped by the admission budget (30000ms) before a usable child start\n"),
+        ("execution", "oxide: stopped by the execution budget (30000ms)\n"),
+        ("loss", "oxide: the budget event channel became unusable; typed results are unavailable for this command\n"),
+    ):
+        noisy = load()
+        noisy.run = with_stderr(make_start(noisy, beats=0), line)
+        fault = fault_of(noisy, lambda: noisy.case_fast_start_axes(scratch, "/bin/true"))
+        expect(
+            fault is not None and "budget diagnostic" in fault,
+            f"a real {label} diagnostic passed the fast-start negative oracle: {fault}",
+        )
+
     # ---- budget prefix order: the fake refuses late flags, and a mutation of
     # the actual body argv is caught by that same rule ----
     expect(load().budget_prefix_ok(["--admission-budget", "1s", "-j", "1"]), "a correct prefix was rejected")
@@ -1933,7 +2344,7 @@ def self_test() -> None:
                 {"seq": 2, "event": "finished", "outcome": "admission_deadline",
                  "stop_origin": "admission", "exit_code": 124},
             ]))
-            return completed(argv, 124, "", "oxide: stopped by the admission budget (2000ms)\n")
+            return completed(argv, 124, "", "oxide: stopped by the admission budget (2000ms) before a usable child start\n")
 
         return fake
 
@@ -1977,6 +2388,162 @@ def self_test() -> None:
     reset.run = make_start(reset, beats=25)
     fault = fault_of(reset, lambda: reset.case_cumulative_run(scratch, "/bin/true"))
     expect(fault is not None and "window was reset" in fault, f"a reset window passed: {fault}")
+
+    # ---- a positive stop oracle needs the exact grammar, and the actual
+    # execution-deadline / preparation / unbudgeted bodies are driven here.
+    def deadline_run(note):
+        def fake(argv, *, cwd, env, phase_seconds, pass_fds=(), stdin=None, stdout=None, stderr=None):
+            if "--budget-events" not in argv:
+                return completed(argv, 0, "", "")
+            fd = int(flag(argv, "--budget-events"))
+            os.write(fd, stream([
+                {"seq": 1, "event": "admitted_child_started", "phase": "exec_tool"},
+                {"seq": 2, "event": "finished", "outcome": "execution_deadline",
+                 "stop_origin": "execution", "drain": "complete", "lease": "released",
+                 "exit_code": 125},
+            ]))
+            return completed(argv, 125, "", note)
+
+        return fake
+
+    deadline_ok = load()
+    deadline_ok.run = deadline_run("oxide: stopped by the execution budget (1000ms)\n")
+    expect(
+        fault_of(deadline_ok, lambda: deadline_ok.case_execution_deadline(scratch, "/bin/true")) is None,
+        "the execution-deadline body should pass with its exact stop diagnostic",
+    )
+    deadline_bad = load()
+    deadline_bad.run = deadline_run("note: the oxide-budget stop was reported elsewhere\n")
+    fault = fault_of(deadline_bad, lambda: deadline_bad.case_execution_deadline(scratch, "/bin/true"))
+    expect(fault is not None and "execution_stop" in fault, f"a missing execution diagnostic passed: {fault}")
+
+    preparation_ok = load()
+    preparation_ok.run = plain_run("oxide: stopped by the admission budget (1ms) before a usable child start\n", 124)
+    expect(
+        fault_of(preparation_ok, lambda: preparation_ok.case_preparation_stop(scratch, "/bin/true")) is None,
+        "the preparation-stop body should pass with its exact admission diagnostic",
+    )
+    preparation_bad = load()
+    preparation_bad.run = plain_run("   Compiling oxide-budget-preparation v0.1.0\n", 124)
+    fault = fault_of(preparation_bad, lambda: preparation_bad.case_preparation_stop(scratch, "/bin/true"))
+    expect(fault is not None and "admission_stop" in fault, f"an innocent line satisfied the preparation oracle: {fault}")
+
+    plain_ok = load()
+    plain_ok.run = plain_run("   Compiling oxide-budget-plain v0.1.0 (/private/tmp/oxide-budget-plain)\n", 3)
+    expect(
+        fault_of(plain_ok, lambda: plain_ok.case_unbudgeted(scratch, "/bin/true")) is None,
+        "innocent output failed the unbudgeted oracle",
+    )
+    plain_bad = load()
+    plain_bad.run = plain_run("oxide: stopped by the admission budget (1000ms) before a usable child start\n", 3)
+    fault = fault_of(plain_bad, lambda: plain_bad.case_unbudgeted(scratch, "/bin/true"))
+    expect(fault is not None and "budget diagnostic" in fault, f"a stop diagnostic passed the unbudgeted oracle: {fault}")
+
+    # ---- the receipt carries bounded first-fault evidence, including on a
+    # failure, and the excerpt is bounded rather than an unbounded stream copy.
+    evidence = load()
+    evidence.FAULT_DETAIL.clear()
+    for index in range(5):
+        evidence.record_detail(f"probe-{index}", "line of stderr output\n" * 60, [{"seq": 1, "event": "finished"}])
+    expect(len(evidence.FAULT_DETAIL) == evidence.MAX_FAULT_DETAIL, "the receipt evidence is not bounded")
+    expect(
+        len(evidence.FAULT_DETAIL[-1]["stderr"]) <= evidence.MAX_EXCERPT_CHARS + 80,
+        "a receipt excerpt exceeded its bound",
+    )
+    evidence_receipt = evidence.Proof(scratch, "s" * 64).document("boom")
+    expect(
+        bool(evidence_receipt["first_fault_evidence"]) and evidence_receipt["result"] == "fail",
+        "a failure receipt lost its bounded first-fault evidence",
+    )
+    expect(
+        evidence_receipt["first_fault_evidence"][-1]["typed"]["records"] == 1,
+        "the receipt evidence lost its typed summary",
+    )
+
+    # ---- diagnostic keep-going: a recoverable failure continues only into
+    # independent cases; an Abort stops with truthful skips; the receipt is
+    # distinctly unqualified. No child runs here.
+    diag = load()
+    diag.Proof.prepare = lambda self: None
+    diag.CASES.clear()
+    diag.RESULTS.clear()
+    diag.UNCERTAIN.clear()
+    diag.PRIMARY_FAULT = None
+    calls = []
+
+    def diag_first(root, subject):
+        calls.append("first")
+        diag.case("first")
+        diag.record_detail("first", "the first command's stderr\n", [{"seq": 1, "event": "finished"}])
+        diag.fail("first oracle boom")
+
+    def diag_second(root, subject):
+        calls.append("second")
+        diag.case("second")
+
+    def diag_third(root, subject):
+        calls.append("third")
+        diag.case("third")
+        diag.abort("infrastructure boom")
+
+    def diag_fourth(root, subject):
+        calls.append("fourth")
+        diag.case("fourth")
+
+    diag.CASE_FUNCTIONS = (diag_first, diag_second, diag_third, diag_fourth)
+    diag.DIAGNOSTIC_DEPENDENCIES = {entry.__name__: [] for entry in diag.CASE_FUNCTIONS}
+    summary = diag.diagnostic_summary()
+    fault = diag.capture_fault(lambda: diag.Proof(scratch, "s" * 64).run_diagnostic(summary))
+    expect(calls == ["first", "second", "third"], f"diagnostic call order changed: {calls}")
+    expect(fault is not None and "infrastructure boom" in fault, f"an abort was lost: {fault}")
+    expect(
+        summary["failures"] and summary["failures"][0]["case"] == "diag_first",
+        f"a recoverable failure was not recorded: {summary['failures']}",
+    )
+    expect(summary["completed"] == ["diag_second"], f"independent cases did not continue: {summary['completed']}")
+    expect(summary["skipped"] == ["diag_fourth"], f"skips are not truthful: {summary['skipped']}")
+    expect(
+        summary["continued_after_failure"] == ["diag_first"],
+        f"the diagnostic did not record its continuation: {summary['continued_after_failure']}",
+    )
+    diag_receipt = diag.Proof(scratch, "s" * 64).document(fault, diagnostic=summary)
+    expect(
+        diag_receipt["mode"] == "diagnostic" and diag_receipt["qualified"] is False
+        and diag_receipt["result"] == "diagnostic",
+        "the diagnostic receipt is not distinctly unqualified",
+    )
+    expect(diag_receipt["primary_fault"] == fault, "the diagnostic receipt lost its abort text")
+    failure_evidence = diag_receipt["diagnostic"]["failures"][0]["evidence"]
+    expect(
+        failure_evidence and failure_evidence[-1]["label"] == "first"
+        and "stderr" in failure_evidence[-1],
+        f"the diagnostic receipt lost its failure evidence: {failure_evidence}",
+    )
+
+    # An unknown-child custody outcome after a recoverable failure aborts too.
+    uncertain = load()
+    uncertain.Proof.prepare = lambda self: None
+    uncertain.CASES.clear()
+    uncertain.RESULTS.clear()
+    uncertain.UNCERTAIN.clear()
+    uncertain.PRIMARY_FAULT = None
+
+    def uncertain_case(root, subject):
+        uncertain.case("uncertain")
+        uncertain.UNCERTAIN.append("owned pid 1 did not settle")
+        uncertain.fail("oracle boom with unknown custody")
+
+    uncertain.CASE_FUNCTIONS = (uncertain_case,)
+    uncertain.DIAGNOSTIC_DEPENDENCIES = {"uncertain_case": []}
+    uncertain_summary = uncertain.diagnostic_summary()
+    uncertain_fault = uncertain.capture_fault(
+        lambda: uncertain.Proof(scratch, "s" * 64).run_diagnostic(uncertain_summary)
+    )
+    expect(
+        uncertain_fault is not None and "unknown child custody" in uncertain_fault,
+        f"an unknown-child outcome did not abort the diagnostic: {uncertain_fault}",
+    )
+    expect(uncertain_summary["aborted"], "the unknown-child abort was not recorded")
 
     # ---- holder: an empty subject must fail, a real one must acquire ----
     holder = load()
@@ -2038,7 +2605,11 @@ def self_test() -> None:
     expect(failing_receipt.write_receipt_safely({"result": "fail"}, scratch) is None,
            "a receipt-write failure must be reported as not written")
     expect(failing_receipt.PRIMARY_FAULT == "primary boom", "a receipt-write failure replaced the primary fault")
-    print("self-test: ok (faked bodies for fast-start/late/cumulative/nested/holders plus lifecycle fault paths)")
+    print(
+        "self-test: ok (faked bodies for fast-start/late/cumulative/nested/deadline/preparation/"
+        "unbudgeted/holders, human-diagnostic grammar counterfactuals, bounded fault evidence, "
+        "diagnostic keep-going/abort/receipt counterfactuals and lifecycle fault paths)"
+    )
 
 
 def final_status(fault: str | None, receipt_path: str | None) -> int:
@@ -2068,6 +2639,66 @@ def capture_fault(step) -> str | None:
     return None
 
 
+def start_proof() -> tuple[Proof, str]:
+    """Shared prerequisites for the counted run and the diagnostic."""
+    runner = os.path.join(REPO, "scripts", "bounded-test.py")
+    runner_sha = sha256_file(runner)
+    expect(
+        runner_sha == EXPECTED_RUNNER_SHA256,
+        f"supervisor {runner_sha} is not the pinned {EXPECTED_RUNNER_SHA256}",
+    )
+    dirty = git("status", "--porcelain")
+    expect(dirty == "", f"the worktree is not clean, so the staged source would not be HEAD: {dirty[:400]}")
+    scratch, _evidence = require_controls()
+    work_left()
+    say(
+        f"host: project={git('remote', 'get-url', 'origin')} commit={git('rev-parse', 'HEAD')} "
+        f"branch={git('branch', '--show-current')} cpu={os.cpu_count()} load={os.getloadavg()}"
+    )
+    return (Proof(scratch, runner_sha), scratch)
+
+
+def diagnostic_summary() -> dict:
+    """The starting summary of one uncounted keep-going collection."""
+    return {
+        "qualified": False,
+        "mode": "diagnostic",
+        "failures": [],
+        "completed": [],
+        "skipped": [],
+        "aborted": None,
+        "continued_after_failure": [],
+        "dependencies": {name: list(values) for name, values in DIAGNOSTIC_DEPENDENCIES.items()},
+        "authority": "diagnostic only: a recoverable oracle failure is recorded, not a counted PASS; the guard remains closure authority",
+    }
+
+
+def diagnostic_mode() -> int:
+    """Uncounted keep-going collection under the same guard and custody.
+
+    Recoverable oracle failures are recorded and independent cases continue; an
+    abort is written into the receipt. This mode never reports a counted PASS,
+    and ROOT activates it separately from the fail-fast proof.
+    """
+    say("diagnostic: keep-going collection; not a counted PASS, receipts are qualified=false")
+    proof, scratch = start_proof()
+    summary = diagnostic_summary()
+    fault = capture_fault(lambda: proof.run_diagnostic(summary))
+    document = proof.document(fault, diagnostic=summary)
+    path = write_receipt_safely(document, scratch)
+    if fault is None and path is None:
+        fault = "the diagnostic receipt was not written"
+        document = proof.document(fault, diagnostic=summary)
+        path = write_receipt_safely(document, scratch)
+    say(f"diagnostic receipt {path if path else 'NOT WRITTEN'} (result diagnostic, qualified=false)")
+    if summary["aborted"]:
+        say(f"diagnostic aborted: {summary['aborted']}")
+    for entry in summary["failures"]:
+        say(f"diagnostic failure: {entry['case']}: {entry['fault']}")
+    clean = fault is None and not summary["failures"] and bool(path)
+    return 0 if clean else 1
+
+
 def main(argv: list[str]) -> int:
     mode, error = parse_arguments(argv)
     if mode == "refuse":
@@ -2086,21 +2717,9 @@ def main(argv: list[str]) -> int:
     if mode == "self-test":
         self_test()
         return 0
-    runner = os.path.join(REPO, "scripts", "bounded-test.py")
-    runner_sha = sha256_file(runner)
-    expect(
-        runner_sha == EXPECTED_RUNNER_SHA256,
-        f"supervisor {runner_sha} is not the pinned {EXPECTED_RUNNER_SHA256}",
-    )
-    dirty = git("status", "--porcelain")
-    expect(dirty == "", f"the worktree is not clean, so the staged source would not be HEAD: {dirty[:400]}")
-    scratch, _evidence = require_controls()
-    work_left()
-    say(
-        f"host: project={git('remote', 'get-url', 'origin')} commit={git('rev-parse', 'HEAD')} "
-        f"branch={git('branch', '--show-current')} cpu={os.cpu_count()} load={os.getloadavg()}"
-    )
-    proof = Proof(scratch, runner_sha)
+    if mode == "diagnostic":
+        return diagnostic_mode()
+    proof, scratch = start_proof()
     fault = capture_fault(proof.run)
     for process in OWNED:
         release(process)

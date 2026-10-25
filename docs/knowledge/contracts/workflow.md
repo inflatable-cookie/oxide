@@ -709,8 +709,23 @@ oxide run --execution-budget 120s
   including a staging, capability, assertion, interrupt or receipt-write
   failure, with the primary fault, candidate identity when known, reached/
   completed/failed/unexecuted cases and custody uncertainty; that receipt
-  never claims guard closure, which the supervisor alone decides. The
-  300 s/512 MiB fit is unmeasured.
+  never claims guard closure, which the supervisor alone decides. Human budget
+  results are recognised only by the product's exact `report_stop`/
+  `LOSS_NOTE` grammar: innocent Cargo, project or path output that contains
+  the word `budget` (the fixture crates are named `oxide-budget-<label>`) is
+  not a stop or a channel loss, and each failing oracle keeps a bounded
+  escaped stderr excerpt plus its typed fields. `--diagnostic` is a declared
+  but unactivated keep-going collection under the same guard: it records
+  recoverable oracle failures and continues only with dependency-independent
+  cases (each labels its own private fixtures), while an unknown child or
+  writer, custody uncertainty, a prerequisite failure or an exhausted
+  deadline stops it; its distinct receipt is `qualified=false` and is never a
+  counted PASS. `effigy rust:command-budgets:diagnostic` runs that mode as
+  the whole command of the same qualified guard, bounds and custody; like
+  the counted selector it is held for owner activation. The only `--locked` invocation is the staging build of this
+  repository, whose committed `Cargo.lock` is present; fixture crates are
+  std-only and are never invoked with `--locked`. The 300 s/512 MiB fit is
+  unmeasured.
 - **Locking.** A budgeted command waits for the admission, record and
   checkout-binding locks with the existing nonblocking primitive, polling
   against the remaining window in the unchanged order. Abandoning a wait
