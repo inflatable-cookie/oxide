@@ -66,8 +66,10 @@ const RECEIPT_VERSION: &str = "oxide.outputs.transition/2";
 /// and each positively identified profile member is an owned link. A legacy
 /// receipt is never written in this form without an explicit migration.
 const PROFILE_RECEIPT_VERSION: &str = "oxide.outputs.transition/3";
-/// Version-1 receipts are read as legacy and upgraded on the next write,
-/// only behind the version-2 forward fence (oxide#129).
+/// The whole-target receipt oxide#117 published. Prune reads a valid one as
+/// its current in-memory whole-target form (oxide#152) so a legacy root is
+/// not globally unprunable; every other reader still refuses it, and reading
+/// or a dry run never rewrites it.
 const LEGACY_RECEIPT_VERSION: &str = "oxide.outputs.transition/1";
 const MARKER_VERSION: &str = "oxide.outputs.root/2";
 const LEGACY_MARKER_VERSION: &str = "oxide.outputs.root/1";
@@ -1118,7 +1120,6 @@ impl<'de> Deserialize<'de> for Receipt {
             updated_ms: u64,
         }
         let doc = Doc::deserialize(deserializer)?;
-        let legacy = doc.version == LEGACY_RECEIPT_VERSION;
         let legacy_reservations: Vec<Reservation> = doc
             .links
             .iter()
@@ -1131,33 +1132,60 @@ impl<'de> Deserialize<'de> for Receipt {
                         "a version-2 receipt carries no successor layout or migration",
                     ));
                 }
-                let links = if legacy {
-                    if !doc.links.is_empty() {
-                        return Err(serde::de::Error::custom(
-                            "a version-1 receipt cannot carry placements",
-                        ));
-                    }
+                if doc.selected.is_some() || doc.prepared.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "a version-2 receipt carries placements, not top-level references",
+                    ));
+                }
+                let links = doc
+                    .links
+                    .into_iter()
+                    .map(|placement| LinkPlacement {
+                        member: placement.member,
+                        selected: placement.selected,
+                        prepared: placement.prepared,
+                    })
+                    .collect();
+                (RECEIPT_VERSION.to_owned(), LayoutKind::WholeTarget, links)
+            }
+            LEGACY_RECEIPT_VERSION => {
+                // oxide#152: the whole-target shape oxide#117 published. It
+                // predates layouts, placements, root-level reservations,
+                // prune states and root nonces, so a document that carries
+                // one of those is contradictory rather than merely old. It
+                // is decoded into the current in-memory whole-target form;
+                // only the prune readers accept it, and reading writes
+                // nothing.
+                if doc.layout.is_some()
+                    || doc.transition.is_some()
+                    || !doc.links.is_empty()
+                    || !legacy_reservations.is_empty()
+                    || doc.reserved.is_some()
+                    || doc.pruned.is_some()
+                    || matches!(doc.state, ReceiptState::Pruned | ReceiptState::Pruning)
+                    || doc
+                        .selected
+                        .as_ref()
+                        .is_some_and(|selected| selected.nonce.is_some())
+                    || doc
+                        .prepared
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.to.nonce.is_some())
+                    || doc.roots.iter().any(|root| root.nonce.is_some())
+                {
+                    return Err(serde::de::Error::custom(
+                        "a version-1 receipt carries only its whole-target selection",
+                    ));
+                }
+                (
+                    RECEIPT_VERSION.to_owned(),
+                    LayoutKind::WholeTarget,
                     vec![LinkPlacement {
                         member: MEMBER.to_owned(),
                         selected: doc.selected,
                         prepared: doc.prepared,
-                    }]
-                } else {
-                    if doc.selected.is_some() || doc.prepared.is_some() {
-                        return Err(serde::de::Error::custom(
-                            "a version-2 receipt carries placements, not top-level references",
-                        ));
-                    }
-                    doc.links
-                        .into_iter()
-                        .map(|placement| LinkPlacement {
-                            member: placement.member,
-                            selected: placement.selected,
-                            prepared: placement.prepared,
-                        })
-                        .collect()
-                };
-                (RECEIPT_VERSION.to_owned(), LayoutKind::WholeTarget, links)
+                    }],
+                )
             }
             PROFILE_RECEIPT_VERSION => {
                 if doc.selected.is_some() || doc.prepared.is_some() {
@@ -6324,7 +6352,40 @@ fn stop_unknown(prepared: &Prepared, reason: &str) -> String {
     )
 }
 
+/// Whether a receipt reader accepts the version-1 whole-target document.
+/// Prune is the only reader that does (oxide#152); every other path keeps
+/// refusing it, so decoding never widens a bind, adopt, detach, clean,
+/// replay, status or plan format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyReceiptReading {
+    /// Ordinary readers refuse a version-1 receipt, as before oxide#152.
+    Refuse,
+    /// Prune readers decode a valid version-1 receipt into the current
+    /// in-memory whole-target form. Reading writes nothing.
+    Read,
+}
+
+/// Only the version field, so an ordinary reader can refuse a version-1
+/// document before decoding the rest of it.
+#[derive(Deserialize)]
+struct ReceiptVersion {
+    version: String,
+}
+
 fn read_receipt(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+) -> Result<Option<Receipt>, String> {
+    read_receipt_with(LegacyReceiptReading::Refuse, control, checkout, checkout_id)
+}
+
+/// Read one checkout's receipt without creating or repairing anything.
+/// `legacy` decides whether a valid version-1 whole-target document is read or
+/// refused; both readers keep the byte limit, the unknown-field strictness and
+/// the checkout identity check unchanged.
+fn read_receipt_with(
+    legacy: LegacyReceiptReading,
     control: &Path,
     checkout: &Path,
     checkout_id: &str,
@@ -6342,6 +6403,16 @@ fn read_receipt(
             "{} exceeds its {MAX_RECEIPT_BYTES}-byte limit",
             path.display()
         ));
+    }
+    if legacy == LegacyReceiptReading::Refuse {
+        let version: ReceiptVersion = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
+        if version.version == LEGACY_RECEIPT_VERSION {
+            return Err(format!(
+                "{} is invalid: unsupported version {LEGACY_RECEIPT_VERSION:?} of the owned-output receipt",
+                path.display()
+            ));
+        }
     }
     let receipt: Receipt = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
@@ -6386,13 +6457,14 @@ pub(crate) fn receipt_path_public(control: &Path, checkout_id: &str) -> PathBuf 
 }
 
 /// Read one checkout's receipt for the prune snapshot. Never creates or
-/// repairs anything.
+/// repairs anything. A valid version-1 whole-target receipt is read as its
+/// current whole-target form (oxide#152); its bytes stay exactly as they are.
 pub(crate) fn read_receipt_for_prune(
     control: &Path,
     checkout: &Path,
     checkout_id: &str,
 ) -> Result<Option<Receipt>, String> {
-    read_receipt(control, checkout, checkout_id)
+    read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)
 }
 
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.
@@ -6422,7 +6494,7 @@ pub(crate) fn mark_pruned_at(
     outcome: &str,
     at_ms: u64,
 ) -> Result<(), String> {
-    let receipt = read_receipt(control, checkout, checkout_id)?
+    let receipt = read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)?
         .ok_or_else(|| "the checkout's receipt disappeared before its prune receipt".to_owned())?;
     let terminal = pruned_receipt(receipt, intent, outcome, at_ms)?;
     if terminal.pruned.as_ref().is_none() {
@@ -6442,7 +6514,7 @@ pub(crate) fn terminal_receipt_image(
     outcome: &str,
     at_ms: u64,
 ) -> Result<Vec<u8>, String> {
-    let receipt = read_receipt(control, checkout, checkout_id)?
+    let receipt = read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)?
         .ok_or_else(|| "the checkout's receipt disappeared before its prune receipt".to_owned())?;
     let terminal = pruned_receipt(receipt, intent, outcome, at_ms)?;
     serde_json::to_vec_pretty(&terminal)
@@ -6451,7 +6523,10 @@ pub(crate) fn terminal_receipt_image(
 
 /// Apply the terminal prune state to one receipt, clearing every owned
 /// placement of the deleted root and preserving all other placements,
-/// selections and history.
+/// selections and history. This is the ONE place a version-1 receipt's
+/// in-memory whole-target form becomes a current-format document: it runs only
+/// for the exact root the real run prunes, after the normal custody checks,
+/// and its bytes are pinned in the intent before publication (oxide#152).
 fn pruned_receipt(
     mut receipt: Receipt,
     intent: &str,
@@ -6543,7 +6618,12 @@ pub(crate) fn create_pruning_receipt(
     if crate::prune::registry_revision(control)? != expected_revision {
         return Ok(None);
     }
-    let mut receipt = match read_receipt(control, checkout, checkout_id)? {
+    let mut receipt = match read_receipt_with(
+        LegacyReceiptReading::Read,
+        control,
+        checkout,
+        checkout_id,
+    )? {
         None => Receipt::first(checkout, checkout_id),
         Some(existing)
             if existing.state == ReceiptState::Pruning
@@ -7462,6 +7542,263 @@ mod tests {
 
     fn context_id(fixture: &Fixture) -> String {
         identity::digest(&fixture.checkout.to_string_lossy())
+    }
+
+    /// The whole-target receipt oxide#117 published, byte for byte: no
+    /// layout, placements, reservation, prune state or root nonce.
+    fn version_one_receipt(
+        fixture: &Fixture,
+        state: &str,
+        selected: Option<&Path>,
+    ) -> serde_json::Value {
+        let mut document = serde_json::json!({
+            "version": LEGACY_RECEIPT_VERSION,
+            "checkout": fixture.checkout.to_string_lossy(),
+            "checkout_id": context_id(fixture),
+            "generation": 1,
+            "state": state,
+            "updated_ms": 1700000000000u64,
+        });
+        if let Some(root) = selected {
+            let selection = serde_json::json!({
+                "kind": "local",
+                "root": root,
+                "generation": 1,
+            });
+            document["selected"] = selection.clone();
+            document["roots"] = serde_json::json!([selection]);
+        }
+        document
+    }
+
+    /// Publish a raw receipt document into the fixture's control directory.
+    fn write_receipt_document(fixture: &Fixture, document: &serde_json::Value) {
+        let path = receipt_path(&fixture.control, &context_id(fixture));
+        fs::write(&path, serde_json::to_vec_pretty(document).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A receipt's exact bytes and the metadata a read must never touch.
+    fn receipt_proof(fixture: &Fixture) -> (Vec<u8>, u64, u64, u32, i64) {
+        let path = receipt_path(&fixture.control, &context_id(fixture));
+        let bytes = fs::read(&path).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        (
+            bytes,
+            metadata.ino(),
+            metadata.len(),
+            metadata.mode(),
+            metadata.mtime(),
+        )
+    }
+
+    /// oxide#152: prune reads a valid version-1 whole-target receipt as the
+    /// current in-memory whole-target form, every other reader keeps refusing
+    /// it, and a read never rewrites a byte.
+    #[test]
+    fn a_version_one_receipt_reads_for_prune_only_and_is_never_rewritten() {
+        let fixture = Fixture::new();
+        let root = fixture.local().root().to_path_buf();
+        write_receipt_document(
+            &fixture,
+            &version_one_receipt(&fixture, "committed", Some(&root)),
+        );
+        let before = receipt_proof(&fixture);
+        let checkout = fixture.checkout.clone();
+        let id = context_id(&fixture);
+
+        // The pre-oxide#152 refusal is the control: every ordinary reader
+        // still rejects the same bytes as an unsupported version.
+        let refused = read_receipt(&fixture.control, &checkout, &id).unwrap_err();
+        assert!(refused.contains("unsupported version"), "{refused}");
+        assert!(refused.contains(LEGACY_RECEIPT_VERSION), "{refused}");
+
+        let receipt =
+            read_receipt_with(LegacyReceiptReading::Read, &fixture.control, &checkout, &id)
+                .unwrap()
+                .expect("the version-1 receipt was not read");
+        assert_eq!(receipt.version, RECEIPT_VERSION);
+        assert_eq!(receipt.layout(), LayoutKind::WholeTarget);
+        assert_eq!(receipt.state, ReceiptState::Committed);
+        assert_eq!(receipt.checkout(), checkout.as_path());
+        assert_eq!(receipt.checkout_id(), id);
+        assert_eq!(receipt.roots.len(), 1);
+        assert_eq!(receipt.roots[0].root(), root.as_path());
+        assert_eq!(receipt.roots[0].generation(), 1);
+        assert!(receipt
+            .selected()
+            .is_some_and(|selected| selected.root() == root.as_path()));
+        assert!(receipt
+            .selected()
+            .is_some_and(|selected| selected.nonce().is_none()));
+        assert!(receipt.reserved().is_none());
+        assert!(receipt.transition.is_none());
+        assert!(receipt.pruned.is_none());
+        assert_eq!(receipt.links.len(), 1);
+        assert_eq!(receipt.links[0].member(), MEMBER);
+        assert!(receipt.prepared_ref().is_none());
+        // Reading is not a migration: the published bytes, inode, length,
+        // mode and mtime are exactly as oxide#117 left them.
+        assert_eq!(receipt_proof(&fixture), before);
+
+        // A valid noncommitted version-1 state is read, not malformed.
+        write_receipt_document(&fixture, &version_one_receipt(&fixture, "detached", None));
+        let detached =
+            read_receipt_with(LegacyReceiptReading::Read, &fixture.control, &checkout, &id)
+                .unwrap()
+                .expect("the detached version-1 receipt was not read");
+        assert_eq!(detached.state, ReceiptState::Detached);
+        assert!(detached.current().is_none());
+        let mut prepared = version_one_receipt(&fixture, "prepared", Some(&root));
+        prepared["prepared"] = serde_json::json!({
+            "generation": 2,
+            "to": {"kind": "local", "root": root, "generation": 2},
+            "link": fixture.checkout.join("target").to_string_lossy(),
+        });
+        prepared["generation"] = serde_json::json!(1);
+        write_receipt_document(&fixture, &prepared);
+        let transition =
+            read_receipt_with(LegacyReceiptReading::Read, &fixture.control, &checkout, &id)
+                .unwrap()
+                .expect("the prepared version-1 receipt was not read");
+        assert_eq!(transition.state, ReceiptState::Prepared);
+        assert!(transition.prepared_ref().is_some());
+        assert!(transition.current().is_some());
+    }
+
+    /// A document that uses a successor-only surface under the version-1 label
+    /// is contradictory, never "old": both readers refuse it.
+    #[test]
+    fn a_contradictory_version_one_receipt_is_refused_by_both_readers() {
+        let fixture = Fixture::new();
+        let root = fixture.local().root().to_path_buf();
+        let checkout = fixture.checkout.clone();
+        let id = context_id(&fixture);
+        let base = version_one_receipt(&fixture, "committed", Some(&root));
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        for (label, key, value) in [
+            ("layout", "layout", serde_json::json!("profile")),
+            (
+                "links",
+                "links",
+                serde_json::json!([{"member": "target", "selected": {"kind": "local", "root": root, "generation": 1}}]),
+            ),
+            (
+                "reservation",
+                "reserved",
+                serde_json::json!({
+                    "id": "5".repeat(32),
+                    "nonce": "6".repeat(32),
+                    "kind": "local",
+                    "root": root,
+                    "generation": 2,
+                    "created_ms": 1,
+                }),
+            ),
+            (
+                "prune record",
+                "pruned",
+                serde_json::json!({"intent": "7".repeat(32), "outcome": "deleted", "at_ms": 1}),
+            ),
+            ("unknown field", "surprise", serde_json::json!(true)),
+        ] {
+            let mut document = base.clone();
+            document[key] = value;
+            cases.push((label, document));
+        }
+        for (label, mut document) in [
+            ("pruned state", base.clone()),
+            ("pruning state", base.clone()),
+        ] {
+            let state = if label == "pruned state" {
+                "pruned"
+            } else {
+                "pruning"
+            };
+            document["state"] = serde_json::json!(state);
+            cases.push((label, document));
+        }
+        let mut nonce = base.clone();
+        nonce["selected"]["nonce"] = serde_json::json!("8".repeat(32));
+        cases.push(("fabricated root nonce", nonce));
+        let mut unknown = base.clone();
+        unknown["version"] = serde_json::json!("oxide.outputs.transition/9");
+        cases.push(("unknown version", unknown));
+        for (label, document) in cases {
+            write_receipt_document(&fixture, &document);
+            let refused = read_receipt(&fixture.control, &checkout, &id).unwrap_err();
+            assert!(refused.contains("is invalid"), "{label}: {refused}");
+            let refused =
+                read_receipt_with(LegacyReceiptReading::Read, &fixture.control, &checkout, &id)
+                    .unwrap_err();
+            assert!(refused.contains("is invalid"), "{label}: {refused}");
+        }
+    }
+
+    /// The real run's terminal image for an actually pruned version-1 root is
+    /// the current receipt shape; it is deterministic, pinned by the caller's
+    /// digest, and published only through the existing terminal transaction.
+    #[test]
+    fn a_version_one_terminal_image_publishes_the_current_shape() {
+        let fixture = Fixture::new();
+        let root = fixture.local().root().to_path_buf();
+        write_receipt_document(
+            &fixture,
+            &version_one_receipt(&fixture, "committed", Some(&root)),
+        );
+        let published = receipt_proof(&fixture);
+        let checkout = fixture.checkout.clone();
+        let id = context_id(&fixture);
+        let intent = "e".repeat(32);
+        let image =
+            terminal_receipt_image(&fixture.control, &checkout, &id, &intent, "deleted", 42)
+                .unwrap();
+        assert_eq!(
+            image,
+            terminal_receipt_image(&fixture.control, &checkout, &id, &intent, "deleted", 42)
+                .unwrap(),
+            "the terminal image is not deterministic"
+        );
+        // Computing the image reads only: the version-1 bytes are untouched.
+        assert_eq!(receipt_proof(&fixture), published);
+        let document: serde_json::Value = serde_json::from_slice(&image).unwrap();
+        assert_eq!(document["version"], RECEIPT_VERSION);
+        assert_eq!(document["state"], "pruned");
+        assert_eq!(document["pruned"]["intent"], intent);
+        assert_eq!(document["pruned"]["outcome"], "deleted");
+        assert_eq!(document["pruned"]["at_ms"], 42);
+        assert_eq!(
+            document["roots"][0]["root"],
+            root.to_string_lossy().as_ref()
+        );
+        assert!(document["links"][0].get("selected").is_none());
+        mark_pruned_at(&fixture.control, &checkout, &id, &intent, "deleted", 42).unwrap();
+        assert_eq!(
+            fs::read(receipt_path(&fixture.control, &id)).unwrap(),
+            image,
+            "the published image is not the recorded one"
+        );
+        // A replay of the same intent republishes exactly the recorded image
+        // and another intent refuses, changing nothing.
+        mark_pruned_at(&fixture.control, &checkout, &id, &intent, "deleted", 42).unwrap();
+        assert_eq!(
+            fs::read(receipt_path(&fixture.control, &id)).unwrap(),
+            image
+        );
+        let settled = fs::read(receipt_path(&fixture.control, &id)).unwrap();
+        assert!(terminal_receipt_image(
+            &fixture.control,
+            &checkout,
+            &id,
+            &"f".repeat(32),
+            "deleted",
+            43,
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(receipt_path(&fixture.control, &id)).unwrap(),
+            settled
+        );
     }
 
     /// A committed profile receipt for `debug` and `release` on one root.

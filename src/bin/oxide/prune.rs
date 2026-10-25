@@ -2100,7 +2100,10 @@ fn evaluate(
         let entry = receipts.entry(row.checkout_id.clone()).or_insert_with(|| {
             match outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id) {
                 Ok(Some(receipt)) => Ok(receipt),
-                Ok(None) => Err("the receipt is missing".to_owned()),
+                Ok(None) => Err(format!(
+                    "the receipt {} is missing",
+                    outputs::receipt_path_public(control, &row.checkout_id).display()
+                )),
                 Err(reason) => Err(reason),
             }
         });
@@ -5956,6 +5959,383 @@ mod tests {
             .is_some_and(|reason| reason.contains("whole batch"))));
     }
 
+    /// One synthetic checkout whose recorded root sits inside a `/Volumes`
+    /// mount: eligibility stops at the recorded-volume/absence predicate, so a
+    /// test needs no real drive. Its recorded identity is legacy (no nonce)
+    /// unless the caller sets one.
+    fn legacy_snapshot_row(fixture: &Fixture, checkout_id: &str) -> Row {
+        let mut row = row_for(&fixture.root);
+        row.checkout_id = checkout_id.to_owned();
+        row.checkout = fixture.root.join("gone").join(checkout_id);
+        row.receipt = fixture.root.join("unused.json");
+        row.root = PathBuf::from(format!("/Volumes/OxV1/oxide-outputs/{checkout_id}"));
+        row.root_kind = RootKind::External;
+        row.volume_uuid = Some("11111111-2222-3333-4444-555555555555".to_owned());
+        row.checkout_volume_uuid = None;
+        row.nonce = None;
+        row.generation = 1;
+        row.root_dev = Some(1);
+        row.root_ino = Some(2);
+        row.marker_digest = Some("c".repeat(64));
+        row.selected = true;
+        row.pending = false;
+        row
+    }
+
+    /// One receipt document in the published shape of `version`. `root` is the
+    /// receipt's current selection (absent for a detached receipt).
+    fn snapshot_receipt(
+        row: &Row,
+        version: &str,
+        state: &str,
+        root: Option<&Path>,
+    ) -> serde_json::Value {
+        let selection = root.map(|root| {
+            serde_json::json!({
+                "kind": "external",
+                "root": root.to_string_lossy(),
+                "volume_uuid": row.volume_uuid,
+                "generation": row.generation,
+            })
+        });
+        let member = if version == "oxide.outputs.transition/3" {
+            "debug"
+        } else {
+            "target"
+        };
+        let mut document = serde_json::json!({
+            "version": version,
+            "checkout": row.checkout.to_string_lossy(),
+            "checkout_id": row.checkout_id,
+            "generation": row.generation,
+            "state": state,
+            "updated_ms": 1u64,
+        });
+        if version == "oxide.outputs.transition/1" {
+            if let Some(selection) = selection.clone() {
+                document["roots"] = serde_json::json!([selection.clone()]);
+                document["selected"] = selection;
+            }
+            return document;
+        }
+        if version == "oxide.outputs.transition/3" {
+            document["layout"] = serde_json::json!("profile");
+        }
+        if let Some(selection) = selection.clone() {
+            document["roots"] = serde_json::json!([selection.clone()]);
+        }
+        document["links"] = serde_json::json!([{ "member": member, "selected": selection }]);
+        document
+    }
+
+    /// Publish one receipt document for `row` into a control directory.
+    fn publish_snapshot_receipt(control: &Path, row: &Row, document: &serde_json::Value) {
+        let path = outputs::receipt_path_public(control, &row.checkout_id);
+        fs::write(&path, serde_json::to_vec_pretty(document).unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// oxide#152: a mixed snapshot of version-1, version-2 and version-3
+    /// receipts is complete. Every valid legacy receipt is read; each root then
+    /// keeps or proceeds on its OWN recorded predicates, never a whole-batch
+    /// error caused by its age.
+    #[test]
+    fn a_mixed_version_one_two_three_snapshot_is_complete() {
+        let fixture = Fixture::new();
+        let one = legacy_snapshot_row(&fixture, &"a".repeat(64));
+        let two = legacy_snapshot_row(&fixture, &"b".repeat(64));
+        let three = legacy_snapshot_row(&fixture, &"c".repeat(64));
+        let control = ready_control(
+            &fixture,
+            vec![one.clone(), two.clone(), three.clone()],
+            Vec::new(),
+        );
+        publish_snapshot_receipt(
+            &control,
+            &one,
+            &snapshot_receipt(
+                &one,
+                "oxide.outputs.transition/1",
+                "committed",
+                Some(&one.root),
+            ),
+        );
+        publish_snapshot_receipt(
+            &control,
+            &two,
+            &snapshot_receipt(
+                &two,
+                "oxide.outputs.transition/2",
+                "committed",
+                Some(&two.root),
+            ),
+        );
+        publish_snapshot_receipt(
+            &control,
+            &three,
+            &snapshot_receipt(
+                &three,
+                "oxide.outputs.transition/3",
+                "committed",
+                Some(&three.root),
+            ),
+        );
+        // Every document is exactly what its own reader accepts.
+        for row in [&one, &two, &three] {
+            assert!(
+                outputs::read_receipt_for_prune(&control, &row.checkout, &row.checkout_id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let registry = ready_registry(&control).unwrap();
+        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        assert_eq!(evaluated.len(), 3);
+        for entry in &evaluated {
+            let reason = entry.kept.clone().unwrap_or_default();
+            assert!(
+                reason.contains("predates the version-2 registry identity"),
+                "{reason}"
+            );
+            assert!(!reason.contains("whole batch"), "{reason}");
+        }
+        let list = OperatorList {
+            roots: vec![one.root.clone(), two.root.clone(), three.root.clone()],
+            sha256: "d".repeat(64),
+        };
+        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        assert_eq!(evaluated.len(), 3);
+        for entry in &evaluated {
+            let reason = entry.kept.clone().unwrap_or_default();
+            assert!(reason.contains("checkout absence is unknown"), "{reason}");
+            assert!(reason.contains("no recorded volume UUID"), "{reason}");
+        }
+    }
+
+    /// The version-1 predicate ladder: the operator list is required, every
+    /// original receipt, identity, pending and absence predicate still runs,
+    /// and a contradictory or missing document still keeps the whole batch with
+    /// its exact receipt file named.
+    #[test]
+    fn a_version_one_receipt_keeps_every_existing_predicate() {
+        let fixture = Fixture::new();
+        let row = legacy_snapshot_row(&fixture, &"a".repeat(64));
+        let control = ready_control(&fixture, vec![row.clone()], Vec::new());
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let registry = ready_registry(&control).unwrap();
+        let legacy = snapshot_receipt(
+            &row,
+            "oxide.outputs.transition/1",
+            "committed",
+            Some(&row.root),
+        );
+        publish_snapshot_receipt(&control, &row, &legacy);
+        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        assert!(evaluated[0]
+            .kept
+            .as_deref()
+            .is_some_and(|reason| reason.contains("explicit operator list")));
+        let list = OperatorList {
+            roots: vec![row.root.clone()],
+            sha256: "d".repeat(64),
+        };
+        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(evaluated[0]
+            .kept
+            .as_deref()
+            .is_some_and(|reason| reason.contains("checkout absence is unknown")));
+
+        // A receipt that selects another root no longer matches its row.
+        let elsewhere = PathBuf::from("/Volumes/OxV1/oxide-outputs/elsewhere");
+        publish_snapshot_receipt(
+            &control,
+            &row,
+            &snapshot_receipt(
+                &row,
+                "oxide.outputs.transition/1",
+                "committed",
+                Some(&elsewhere),
+            ),
+        );
+        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(evaluated[0]
+            .kept
+            .as_deref()
+            .is_some_and(|reason| reason.contains("the checkout's receipt does not")));
+
+        // A registry row with a recorded nonce is never satisfied by a
+        // version-1 receipt: no nonce is invented for it.
+        publish_snapshot_receipt(&control, &row, &legacy);
+        let mut recorded = row.clone();
+        recorded.nonce = Some("b".repeat(32));
+        write_snapshot_registry(&control, vec![recorded.clone()], Vec::new());
+        let registry = ready_registry(&control).unwrap();
+        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(evaluated[0].kept.as_deref().is_some_and(
+            |reason| reason.contains("does not match the checkout's committed receipt")
+        ));
+
+        // A valid prepared version-1 receipt keeps its live root and its
+        // pending root, without poisoning the batch.
+        write_snapshot_registry(&control, vec![row.clone()], Vec::new());
+        let mut prepared = snapshot_receipt(
+            &row,
+            "oxide.outputs.transition/1",
+            "prepared",
+            Some(&row.root),
+        );
+        prepared["prepared"] = serde_json::json!({
+            "generation": 2,
+            "to": {"kind": "external", "root": row.root.to_string_lossy(), "volume_uuid": row.volume_uuid, "generation": 2},
+            "link": row.checkout.join("target").to_string_lossy(),
+        });
+        publish_snapshot_receipt(&control, &row, &prepared);
+        let registry = ready_registry(&control).unwrap();
+        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let reason = evaluated[0].kept.clone().unwrap_or_default();
+        assert!(reason.contains("not committed for this root"), "{reason}");
+
+        // A contradictory version-1 document is still invalid: the whole
+        // batch is kept and the reason names the exact receipt file.
+        let mut contradictory = legacy.clone();
+        contradictory["state"] = serde_json::json!("pruned");
+        publish_snapshot_receipt(&control, &row, &contradictory);
+        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let reason = evaluated[0].kept.clone().unwrap_or_default();
+        assert!(reason.contains("whole batch"), "{reason}");
+        assert!(
+            reason.contains(
+                &outputs::receipt_path_public(&control, &row.checkout_id)
+                    .display()
+                    .to_string()
+            ),
+            "{reason}"
+        );
+
+        // A missing receipt names its own file in the same bounded summary.
+        fs::remove_file(outputs::receipt_path_public(&control, &row.checkout_id)).unwrap();
+        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let reason = evaluated[0].kept.clone().unwrap_or_default();
+        assert!(reason.contains("whole batch"), "{reason}");
+        assert!(reason.contains("is missing"), "{reason}");
+        assert!(
+            reason.contains(
+                &outputs::receipt_path_public(&control, &row.checkout_id)
+                    .display()
+                    .to_string()
+            ),
+            "{reason}"
+        );
+    }
+
+    /// The real run's receipt step for an actually pruned version-1 root: the
+    /// existing intent/terminal transaction publishes the current receipt shape,
+    /// pinned by its digest, and reading it beforehand changes no byte.
+    #[test]
+    fn a_version_one_root_settles_through_the_existing_terminal_transaction() {
+        let fixture = Fixture::new();
+        let row = legacy_snapshot_row(&fixture, &"a".repeat(64));
+        let id = "e".repeat(32);
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: id.clone(),
+            identity: RootIdentity {
+                checkout_id: row.checkout_id.clone(),
+                checkout: row.checkout.clone(),
+                receipt: outputs::receipt_path_public(
+                    &fixture.root.join("control"),
+                    &row.checkout_id,
+                ),
+                member: row.member.clone(),
+                root: row.root.clone(),
+                root_kind: RootKind::External,
+                volume_uuid: row.volume_uuid.clone(),
+                nonce: None,
+                generation: row.generation,
+                dev: 1,
+                ino: 2,
+                marker_digest: "c".repeat(64),
+            },
+            phase: IntentPhase::Deleted,
+            quarantine: PathBuf::from("/Volumes/OxV1/oxide-outputs/.prune-e"),
+            preview_sha256: "f".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+            was_selected: true,
+            prior_receipt_sha: String::new(),
+            group: Vec::new(),
+            expected_terminal_sha: None,
+            terminal_ms: None,
+        };
+        let control = ready_control(&fixture, vec![row.clone()], vec![intent.clone()]);
+        let path = outputs::receipt_path_public(&control, &row.checkout_id);
+        let legacy = snapshot_receipt(
+            &row,
+            "oxide.outputs.transition/1",
+            "committed",
+            Some(&row.root),
+        );
+        publish_snapshot_receipt(&control, &row, &legacy);
+        let before = fs::read(&path).unwrap();
+        // Reading the terminal image writes nothing.
+        assert!(!outputs::terminal_receipt_image(
+            &control,
+            &row.checkout,
+            &row.checkout_id,
+            &id,
+            "deleted",
+            42
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // The intent's preimage pin is the version-1 bytes exactly.
+        let mut journaled = ready_registry(&control).unwrap();
+        journaled.intents[0].prior_receipt_sha = sha256_hex(&before);
+        write_registry(&control, &journaled).unwrap();
+        settle_receipt(&control, &id, "deleted").unwrap();
+        let published = fs::read(&path).unwrap();
+        assert_ne!(
+            published, before,
+            "the pruned root's receipt was not published"
+        );
+        let document: serde_json::Value = serde_json::from_slice(&published).unwrap();
+        assert_eq!(document["version"], "oxide.outputs.transition/2");
+        assert_eq!(document["state"], "pruned");
+        assert_eq!(document["pruned"]["intent"], id);
+        assert_eq!(document["pruned"]["outcome"], "deleted");
+        assert_eq!(
+            document["roots"][0]["root"],
+            row.root.to_string_lossy().as_ref()
+        );
+        // The published bytes are exactly the image for the recorded fixed
+        // timestamp, and the ordinary reader reads the current shape.
+        let at_ms = document["pruned"]["at_ms"].as_u64().unwrap();
+        assert_eq!(
+            outputs::terminal_receipt_image(
+                &control,
+                &row.checkout,
+                &row.checkout_id,
+                &id,
+                "deleted",
+                at_ms
+            )
+            .unwrap(),
+            published
+        );
+        let read = outputs::read_receipt_for_prune(&control, &row.checkout, &row.checkout_id)
+            .unwrap()
+            .expect("the terminal receipt was not readable");
+        assert!(read.current().is_none());
+        let registry = ready_registry(&control).unwrap();
+        assert!(registry.intents.is_empty(), "the settled intent remains");
+        assert!(registry.rows.iter().all(|row| !row.selected));
+    }
+
     #[test]
     fn resolution_refuses_before_the_volume_without_a_complete_row_bound_snapshot() {
         let fixture = Fixture::new();
@@ -6036,6 +6416,18 @@ mod tests {
         };
         write_registry(&control, &registry).unwrap();
         control
+    }
+
+    /// Replace a control's registry contents in one durable revision, so one
+    /// test can walk several recorded variants of the same fixture.
+    fn write_snapshot_registry(control: &Path, rows: Vec<Row>, intents: Vec<Intent>) {
+        let mut registry = ready_registry(control).unwrap();
+        registry.rows = rows;
+        registry.intents = intents;
+        registry
+            .bump()
+            .expect("the fixture registry revision is exhausted");
+        write_registry(control, &registry).unwrap();
     }
 
     fn candidate_of(row: &Row) -> Candidate {

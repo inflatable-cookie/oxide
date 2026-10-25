@@ -40,13 +40,14 @@ detach helper's 5 s refusal margin: about 325 s of the 360 s limit):
     staging (constrained debug oxide recipe)       37-60 s
     image attach, registration, first build        10-20 s
     old-binary verify/copy, probe, two refusals     2-5 s
-    cases 01-21 (base 60-120 s + source-fit
+    cases 01-22 (base 60-120 s + source-fit
       additions: gated writer build, kappa and
       recreated builds, image checkout, 600-entry
-      root, extra prune runs, status reads)       95-165 s
+      root, extra prune runs, status reads, the
+      version-1 fixture and its runs)            100-175 s
     ordinary detach                                 2-10 s
     ---------------------------------------------  --------
-    total                                        151-265 s   (~60 s margin)
+    total                                        156-270 s   (~60 s margin)
 
 No timing fit is claimed. An overrun fails at the deadline (never a timeout
 success); no split, extra session or automatic retry.
@@ -66,8 +67,9 @@ deleted entries. Any stop leaves the intent pending (exit 3). The debug-only
 injections OXIDE_TEST_PRUNE_LOW_RESERVE_AT / _AFTER_ENTRIES drive the
 pre-rename refusal and the mid-batch stop.
 
-Cases (21 = the original 19-case matrix plus two resolve-intent cases), each
-on tiny owned fixtures with exact exit codes and state assertions:
+Cases (22 = the original 19-case matrix plus two resolve-intent cases and the
+oxide#152 version-1 receipt scenario), each on tiny owned fixtures with exact
+exit codes and state assertions:
 
   fence / init (2)
     01 init: adopt publishes state version 3 with oxide.outputs/2 and a ready
@@ -141,6 +143,19 @@ on tiny owned fixtures with exact exit codes and state assertions:
   resolve-intent (2)
     20 both leaves absent: resolution receipt, `resolved-by-operator`.
     21 quarantine present: exit 2, intent unchanged; replay then completes.
+  version-1 receipt compatibility (1, oxide#152)
+    22 a whole-target `oxide.outputs.transition/1` receipt and its `root/1`
+       root are written before the registry exists, so the product's own
+       receipt seed records a legacy row (no nonce); the live checkout keeps
+       it; a valid NONCOMMITTED version-1 receipt (one committed root plus a
+       prepared transition) keeps its own reference group without poisoning
+       the batch; a dry run changes no receipt, root or control byte; the
+       exact preview bytes and the same operator list prune only the committed
+       legacy root and publish the current receipt shape with its recorded
+       terminal outcome; the kept root's version-1 receipt bytes never change.
+       It shares case 12's boot-Data-volume absence proof: on a host whose
+       supervisor scratch is not on the boot Data volume the legacy root stays
+       kept and this case fails loudly rather than asserting a false pass.
 
 Not run here: an older binary refusing state version 3 (rust:installed-handoff
 covers the numeric peek), real-drive qualification, live inventory or cleanup.
@@ -178,7 +193,7 @@ def _load(name: str, file: str):
 SUPERVISOR = "d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
-CASES = 21
+CASES = 22
 
 ALLOCATION = [
     ("staging (constrained debug oxide)", 288),
@@ -197,6 +212,7 @@ CASE_ALLOCATION = [
     ("crash boundaries", 4),
     ("completion / diagnostic / logical-allocated", 1),
     ("resolve-intent", 2),
+    ("version-1 receipt compatibility", 1),
 ]
 
 PLAIN = '[package]\nname = "plain"\nversion = "0.1.0"\nedition = "2021"\n'
@@ -324,6 +340,99 @@ class World:
 
     def registry_doc(self) -> dict:
         return permanent.read_json(self.registry)
+
+    def version_one_fixture(self) -> dict:
+        """Two whole-target `oxide.outputs.transition/1` receipts and their
+        `root/1` roots, written BEFORE the registry exists, so the product's own
+        receipt seed records their legacy rows (no nonce, no invented
+        identity). Nothing here is a hand-made registry: the schema comes from
+        the shape oxide#117 published."""
+        uuid = permanent.real_uuid(self.pool)
+        os.makedirs(self.outputs, mode=0o700, exist_ok=True)
+        os.chmod(self.outputs, 0o700)
+
+        def marker(checkout: str, checkout_id: str, label: str) -> dict:
+            return {
+                "version": "oxide.outputs.root/1",
+                "checkout": checkout,
+                "checkout_id": checkout_id,
+                "label": label,
+                "recipe": "target-debug-v1",
+                "kind": "external",
+                "volume_uuid": uuid,
+                "generation": 1,
+                "created_ms": 1,
+            }
+
+        def root_for(checkout_id: str, label: str) -> str:
+            root = os.path.join(self.mount, "oxide-outputs", f"{label}-{checkout_id[:8]}")
+            os.makedirs(root, mode=0o700)
+            os.chmod(root, 0o700)
+            with open(os.path.join(root, "artifact"), "wb") as handle:
+                handle.write(b"x" * 4096)
+            return root
+
+        def selected(root: str, generation: int) -> dict:
+            return {"kind": "external", "root": root, "volume_uuid": uuid, "generation": generation}
+
+        def publish(checkout: str, receipt: dict) -> str:
+            checkout_id = receipt["checkout_id"]
+            path = os.path.join(self.outputs, checkout_id + ".json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(receipt, handle, indent=2)
+            os.chmod(path, 0o600)
+            return path
+
+        fixture = {}
+        checkout = self.checkout("legacy-v1")
+        checkout_id = hashlib.sha256(checkout.encode()).hexdigest()
+        root = root_for(checkout_id, "legacy-v1")
+        with open(os.path.join(root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
+            json.dump(marker(checkout, checkout_id, "legacy-v1"), handle)
+        fixture["committed"] = (checkout, root)
+        fixture["committed_receipt"] = publish(
+            checkout,
+            {
+                "version": "oxide.outputs.transition/1",
+                "checkout": checkout,
+                "checkout_id": checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "selected": selected(root, 1),
+                "roots": [selected(root, 1)],
+                "updated_ms": 1,
+            },
+        )
+        # A valid NONCOMMITTED version-1 state: one committed root and one
+        # prepared transition. Neither may be pruned or rewritten, and neither
+        # may poison the batch.
+        prepared = self.checkout("legacy-v1-prepared")
+        prepared_id = hashlib.sha256(prepared.encode()).hexdigest()
+        prepared_root = root_for(prepared_id, "legacy-v1-prepared")
+        with open(os.path.join(prepared_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
+            json.dump(marker(prepared, prepared_id, "legacy-v1-prepared"), handle)
+        next_root = os.path.join(self.mount, "oxide-outputs", f"legacy-v1-next-{prepared_id[:8]}")
+        fixture["prepared"] = (prepared, prepared_root)
+        fixture["prepared_next"] = next_root
+        fixture["prepared_receipt"] = publish(
+            prepared,
+            {
+                "version": "oxide.outputs.transition/1",
+                "checkout": prepared,
+                "checkout_id": prepared_id,
+                "generation": 1,
+                "state": "prepared",
+                "selected": selected(prepared_root, 1),
+                "prepared": {
+                    "generation": 2,
+                    "to": selected(next_root, 2),
+                    "link": os.path.join(prepared, "target"),
+                },
+                "roots": [selected(prepared_root, 1), selected(next_root, 2)],
+                "updated_ms": 2,
+            },
+        )
+        return fixture
 
     def dry_run(self, label: str, cwd: str, listed: str | None = None, extra: dict | None = None) -> tuple:
         args = ["outputs", "prune", "--dry-run"] + (["--operator-list", listed] if listed else [])
@@ -549,6 +658,10 @@ def run(proof, repo: str) -> None:
 
     # ---- fence / init ------------------------------------------------------
     case("init: forward fence and ready registry")
+    # The version-1 fixture (case 22) must exist before the registry does, so
+    # the product's own bounded receipt seed records its legacy rows. No
+    # registry or row is written by hand.
+    world.version_one = world.version_one_fixture()
     world.adopt(alpha)
     for control in (world.control, os.path.join(world.control, "removable", "oxide-managed")):
         state_file = os.path.join(control, "state.json")
@@ -1008,6 +1121,72 @@ def run(proof, repo: str) -> None:
     code, _, stderr = world.real_run("sigma replay", alpha, plan, sha)
     expect(code == 0, f"sigma replay exited {code}: {stderr}")
     proof.phase("after resolve cases")
+
+    # ---- version-1 whole-target receipts (oxide#152) -----------------------
+    case("version-1 whole-target receipts: read for prune, never migrated")
+    # Both receipts were seeded from the product's own receipt seed in case 01:
+    # the committed one has a legacy row (no nonce), the prepared one has a
+    # selected row and a pending row. Any positive prune of a legacy identity
+    # still needs the explicit operator list and the boot-Data-volume absence
+    # proof (the same precondition case 12 uses).
+    v1_checkout, v1_root = world.version_one["committed"]
+    prepared_checkout, prepared_root = world.version_one["prepared"]
+    v1_receipt = world.version_one["committed_receipt"]
+    prepared_receipt = world.version_one["prepared_receipt"]
+    rows = [row for row in world.registry_doc()["rows"] if row["root"] == v1_root]
+    expect(len(rows) == 1 and rows[0]["selected"], rows)
+    expect("nonce" not in rows[0], f"the receipt seed invented a nonce: {rows}")
+    expect(world.registry_doc()["complete"], "the receipt seed is incomplete")
+    expect(permanent.read_bytes(v1_receipt)[:1] == b"{", "the receipt is not JSON")
+    expect(b"oxide.outputs.transition/1" in permanent.read_bytes(v1_receipt), "the receipt was not version 1")
+    listed = os.path.join(proof.root, "list-version-one.json")
+    with open(listed, "w", encoding="utf-8") as handle:
+        json.dump([v1_root, prepared_root], handle)
+    # A live checkout keeps its legacy root.
+    _, _, preview = world.plan_file("version-1 live dry run", alpha, listed)
+    expect(v1_root not in world.candidates(preview), "a live checkout's legacy root became a candidate")
+    expect("present" in world.kept(preview, v1_root), world.kept(preview, v1_root))
+    receipt_before = permanent.read_bytes(v1_receipt)
+    prepared_before = permanent.read_bytes(prepared_receipt)
+    root_before = tree_bytes(v1_root)
+    prepared_root_before = tree_bytes(prepared_root)
+    control_before = tree_bytes(world.control)
+    world.vanish(v1_checkout)
+    prepared_away = world.vanish(prepared_checkout)
+    plan, sha, preview = world.plan_file("version-1 vanished dry run", alpha, listed)
+    expect(v1_root in world.candidates(preview), f"a version-1 root was kept: {world.kept(preview, v1_root)}")
+    expect(preview["operator_list_sha256"] == hashlib.sha256(permanent.read_bytes(listed)).hexdigest(), "the preview does not bind the operator list")
+    # The valid noncommitted version-1 receipt keeps its own reference group.
+    expect(prepared_root not in world.candidates(preview), "a prepared version-1 root became a candidate")
+    reason = world.kept(preview, prepared_root)
+    expect("not committed" in reason, reason)
+    pending_root = world.version_one["prepared_next"]
+    expect(pending_root not in world.candidates(preview), "a pending version-1 root became a candidate")
+    reason = world.kept(preview, pending_root)
+    expect("prepared transition" in reason, reason)
+    # Reading and the dry run are not a migration: no receipt or root byte moved.
+    expect(permanent.read_bytes(v1_receipt) == receipt_before, "the dry run rewrote the version-1 receipt")
+    expect(permanent.read_bytes(prepared_receipt) == prepared_before, "the dry run rewrote the noncommitted receipt")
+    expect(tree_bytes(v1_root) == root_before, "the dry run changed the version-1 root")
+    expect(tree_bytes(prepared_root) == prepared_root_before, "the dry run changed the kept root")
+    expect(tree_bytes(world.control) == control_before, "the dry run changed control bytes")
+    # The exact preview bytes and the same operator list are the real run.
+    code, stdout, stderr = world.real_run("version-1 real run", alpha, plan, sha, listed)
+    expect(code == 0 and "deleted" in stdout, f"version-1 real run exited {code}: {stderr}")
+    expect(not os.path.lexists(v1_root), "the version-1 root remains")
+    # The kept namespace is untouched, including its version-1 receipt bytes.
+    expect(permanent.read_bytes(prepared_receipt) == prepared_before, "the kept version-1 receipt was rewritten")
+    expect(tree_bytes(prepared_root) == prepared_root_before, "the kept root changed")
+    world.restore(prepared_checkout, prepared_away)
+    # The pruned root's receipt is the current shape and the exact image its
+    # intent pinned; version 1 cannot express a prune state.
+    published = permanent.read_json(v1_receipt)
+    expect(published["version"] == "oxide.outputs.transition/2", published)
+    expect(published["state"] == "pruned" and published["pruned"]["outcome"] == "deleted", published)
+    expect(published["roots"][0]["root"] == v1_root, published)
+    # A fresh dry run offers nothing further and still binds the same list.
+    _, _, preview = world.plan_file("version-1 follow-up dry run", alpha, listed)
+    expect(v1_root not in world.candidates(preview), "a pruned root returned as a candidate")
 
     # ---- overflow (last: the sticky flag is never cleared) -----------------
     case("overflow: keep every root; tagged reservation binds with no row")
