@@ -2,7 +2,7 @@
 """Focused native proof for recorded per-slot accounting (oxide#146).
 
 One fixed script and the whole command of the qualified shared proof
-supervisor (`bounded-test.py`, guard sha256 5e5b6617..., oxide#147). That pin
+supervisor (`bounded-test.py`, guard sha256 bc24b238..., oxide#151). That pin
 is checked against the actual runner file before any effect, so a branch that
 still carries an older guard refuses here instead of spending a run. The
 approved recipe is an INTERNAL directory pool, so both heavy selectors pass
@@ -78,7 +78,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 # The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2"
+GUARD_SHA256 = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 
 # The product's serialized pool facts, bound to source by `--self-test`. The
@@ -120,6 +120,8 @@ CASES: list[str] = []
 FAILURES: list[tuple[str, str]] = []
 SKIPS: list[tuple[str, str]] = []
 REACHED: list[str] = []
+# Cases whose function returned normally. Reachability is not success.
+COMPLETED: list[str] = []
 TAINTED: set[str] = set()
 PRIMARY: list[str] = []
 SECONDARY: list[str] = []
@@ -165,6 +167,11 @@ def abort(message: str) -> None:
 def expect(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
+
+
+def record_unknown(error: BaseException) -> None:
+    """main's unknown/unexpected boundary: one abort transition, first fault kept."""
+    mark_abort(f"unknown outcome: {type(error).__name__}: {error}")
 
 
 def mark_abort(reason: str = "") -> None:
@@ -1594,6 +1601,7 @@ def dispatch(root: str, subject: str, cases, diagnostic: bool) -> None:
         REACHED.append(name)
         if not diagnostic:
             function(root, subject)
+            COMPLETED.append(name)
             continue
         try:
             function(root, subject)
@@ -1626,6 +1634,11 @@ def dispatch(root: str, subject: str, cases, diagnostic: bool) -> None:
             mark_abort(f"{name}: unexpected {type(error).__name__}: {error}")
             print(f"abort {name}: unexpected {type(error).__name__}: {error}", flush=True)
             return
+        else:
+            # Only a normal return completes the case. A BaseException such as
+            # an interrupt leaves it reached-but-incomplete, which the state
+            # table reports as a failure rather than a pass.
+            COMPLETED.append(name)
 
 
 # --------------------------------------------------------------------------
@@ -1742,8 +1755,12 @@ def case_states() -> dict[str, str]:
             states[name] = "fail"
         elif name in skipped:
             states[name] = "skip"
-        elif name in REACHED:
+        elif name in COMPLETED:
             states[name] = "pass"
+        elif name in REACHED:
+            # Reached but never returned: an exception left the case before it
+            # completed (for example a propagated interrupt). Never a pass.
+            states[name] = "fail"
         else:
             states[name] = "not_run"
     if ABORTED:
@@ -2197,6 +2214,7 @@ def self_test() -> None:
         FAILURES.clear()
         SKIPS.clear()
         REACHED.clear()
+        COMPLETED.clear()
         TAINTED.clear()
         PRIMARY.clear()
         SECONDARY.clear()
@@ -2389,6 +2407,61 @@ def self_test() -> None:
         expect(document["aborted"] is True and document["collection_complete"] is False,
                "a setup failure produced a dishonest receipt")
 
+        # Completion truth: PASS requires that the case returned. A propagated
+        # interrupt leaves the case reached-but-incomplete, so it is never a
+        # pass, and main's real boundary marks the abort before any receipt.
+        for interrupt in (KeyboardInterrupt(), SystemExit(3)):
+            for position in ("middle", "last"):
+                reset()
+                failing = CASE_NAMES[3] if position == "middle" else CASE_NAMES[-1]
+
+                def interrupted(root, subject, error=interrupt):
+                    raise error
+
+                made = [(name, interrupted) if name == failing else (name, (lambda r, s: None))
+                        for name in CASE_NAMES]
+                try:
+                    dispatch("stub", "stub", made, True)
+                except BaseException as escaped:  # exactly what main() catches
+                    expect(isinstance(escaped, type(interrupt)),
+                           f"dispatch swallowed a {type(interrupt).__name__}")
+                    record_unknown(escaped)  # main's real abort boundary
+                else:
+                    fail(f"a {type(interrupt).__name__} did not escape dispatch")
+                states = case_states()
+                expect(ABORTED, f"a {type(interrupt).__name__} did not abort")
+                expect(states[failing] == "fail",
+                       f"an interrupted {position} case is reported {states[failing]}, not fail")
+                expect(
+                    sum(1 for state in states.values() if state == "pass")
+                    == CASE_NAMES.index(failing),
+                    f"an interrupted {position} case or a later one was counted as a pass: {states}",
+                )
+                expect(
+                    all(states[name] == "not_run_aborted"
+                        for name in CASE_NAMES[CASE_NAMES.index(failing) + 1:]),
+                    f"cases after an interrupted {position} case are not not_run_aborted: {states}",
+                )
+                expect(PRIMARY and type(interrupt).__name__ in PRIMARY[0],
+                       f"the interrupt is not the primary fault: {PRIMARY}")
+                document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+                expect(document["aborted"] is True, "the receipt hid an interrupted collection")
+                expect(document["case_states"] == states, "the receipt states disagree with the interrupt")
+                expect(document["collection_complete"] is False,
+                       "an interrupted collection claimed completeness")
+                expect(document["counts"]["pass"] == CASE_NAMES.index(failing),
+                       f"the receipt counted an interrupted case as a pass: {document['counts']}")
+
+        # The old REACHED==PASS shape must fail: a reached case that never
+        # returned is not success, even with no recorded failure.
+        reset()
+        REACHED.append(CASE_NAMES[0])
+        COMPLETED.clear()
+        expect(case_states()[CASE_NAMES[0]] == "fail",
+               "a reached-but-unreturned case was reported as a pass")
+        expect("ABORTED =" not in inspect.getsource(main) and "record_unknown(" in inspect.getsource(main),
+               "main does not use the shared unknown/abort boundary")
+
         # F3: one real abort state. The old bug was a shadowing local assignment
         # in main, which left the durable receipt saying `aborted: false`.
         reset()
@@ -2560,7 +2633,7 @@ def main() -> None:
     except BaseException as error:  # noqa: BLE001 - re-raised after the receipt
         # An unrecordable or unexpected outcome is never an oracle: record it,
         # then re-raise so the failure is not swallowed.
-        mark_abort(f"unknown outcome: {type(error).__name__}: {error}")
+        record_unknown(error)
         if DIAGNOSTIC_MODE:
             exit_code = 1
         else:

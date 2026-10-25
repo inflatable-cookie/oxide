@@ -30,6 +30,12 @@ minimum_effigy_version = "0.14.0"
 # The shared session supervisor's pure cases (oxide#109): fake clock, process
 # table, signals and readings; spawns nothing. Not the qualification.
 "proof:supervisor:test" = "python3 scripts/test_supervisor.py --pure"
+# Effect-free readiness for the selected host (oxide#151): path, mode, owner and
+# device metadata only. Creates nothing (an absent private leaf is reported as
+# planned), never sweeps, marks, forks the deadline actor or launches the
+# candidate. Point-in-time readiness, not a reservation, admission or
+# qualification; the invoked proof re-checks everything in its own setup.
+"proof:supervisor:preflight" = "python3 scripts/qualify-supervisor.py --preflight"
 # Builds the unpublished oxide-storage-inventory binary and proves the
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
@@ -248,7 +254,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The qualified supervisor is
-# this tree's `bounded-test.py` (sha256 5e5b6617…, oxide#147); 300 s wall and
+# this tree's `bounded-test.py` (sha256 bc24b238…, oxide#151); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
 # a separately activated diagnostic. Staging reuses the oxide#140 recipe (4
 # Cargo jobs, 16 codegen units, assertions on, no debug info, no incremental,

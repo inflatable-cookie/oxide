@@ -1029,7 +1029,7 @@ reply as a size.
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
 | Control state fence | `store.rs` `STATE_VERSION` (`:74`, 5 writes the recorded-accounting fence; an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4), `RECORDED_ACCOUNTING_FENCE`, hand-off trigger in `handoff.rs` |
-| Qualified guard | `scripts/bounded-test.py`, sha256 `5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2` ([oxide#147](workflow.md#shared-proof-supervisor)); the oxide#145 `a6d73326…` bytes are history |
+| Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
 
@@ -1170,10 +1170,11 @@ precedence.
 scratch are unchanged; every write stays inside the owned root, no session,
 group or census is started. The qualified guard is **this tree's** supervisor,
 `scripts/bounded-test.py` sha256
-`5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`
-(oxide#147 source `0adb0c4e`, merged `93ce14cc`; the current qualified source
-per [shared proof supervisor](workflow.md#shared-proof-supervisor)). The earlier
-`a6d73326` (oxide#145) and `961164e7` bytes are history and are not used.
+`bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924`
+(oxide#151, merged `af08749`; the current qualified source per
+[shared proof supervisor](workflow.md#shared-proof-supervisor)). The earlier
+oxide#147 `5e5b6617`, oxide#145 `a6d73326` and `961164e7` bytes are history and
+are not used.
 These figures
 are planning arithmetic, not measurements: the proof's own `--plan` prints them
 and any activation re-measures and reports a **fit blocker** rather than
