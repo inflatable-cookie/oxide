@@ -1644,7 +1644,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 126 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 136 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1717,8 +1717,30 @@ runs in order:
   and adopted scratch keeping their own contracts, that the qualification
   bootstrap still passes no `--root-parent`, and the owned leaf's privacy,
   ownership, device and canonical refusals with the refused leaf removed;
+- the closure decision path with fake events only: both DISTINCT stream EOF
+  witnesses may close without a fault, one or none refuses, a duplicate stdout
+  witness never counts as two, an uncertain census refuses before any EOF
+  question and its fault is preserved, a pre-stop census does not qualify, and
+  the descriptor-transport API the native fixtures need is present;
+- the three new case oracles and their negative mutations (escaped writer:
+  absent child, no escape, stale nonce, no response, deadline, unrelated fault,
+  not retained, suite or escaped-child signalled, leader failure; held stream:
+  wrong pipe, no hold, uncertain or nonempty or missing census, census fault,
+  deadline, not retained, suite signalled; released pair: an always-UNCLOSED
+  oracle, a fault, a wrong exit);
 - writers before and after a simulated staging step;
-- 36 real cases with tiny Python fixtures and injected faults:
+- the escaped writer: it leaves the nested session, keeps the leader's
+  stdout/stderr descriptors open, signals readiness and answers a fresh
+  post-verdict nonce (so liveness is shown, not inferred), and exactly one of
+  the two settle refusals must latch with no signal to the escaped writer or
+  the suite, the leader at status 0 and the case resources retained;
+- EOF-veto fixtures: the nested command sends duplicates of its ACTUAL stdout
+  or stderr write descriptor over a short AF_UNIX socket inside the case's
+  owned directory to this suite process (never a member of the nested session),
+  the suite takes custody, acknowledges and holds them; the held-stream cases
+  must latch exactly the missing-EOF refusal after a certainly empty census,
+  and the paired control that releases both closes with status 0 and no fault;
+- 39 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
   - a case directory that already holds the owned long-path fixture: the
     first scratch reading counts it, closure holds and the command runs (before
@@ -1772,7 +1794,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 162 cases;
+- all 175 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 

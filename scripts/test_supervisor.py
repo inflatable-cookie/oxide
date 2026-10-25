@@ -25,8 +25,10 @@ import errno
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -79,6 +81,237 @@ def spawn_line(code, setsid=False):
     pre = "os.setsid()" if setsid else "os.setpgid(0, 0)"
     return (f"import subprocess, sys\nchild = subprocess.Popen([sys.executable, '-c', {code!r}],"
             f" preexec_fn=lambda: {pre})\nopen(os.environ['CASE_DIR'] + '/child.pid', 'w').write(str(child.pid))\n")
+
+
+# Closure-oracle helpers (test-only) ----------------------------------------------
+#
+# The supervisor keeps two independent closure vetoes: a certain empty census
+# after the leader was reaped, then an output-EOF witness for both streams. The
+# oracles below judge observed facts instead of one fault string, so a case can
+# prove its own property (an escaped live writer, or a held pipe) without
+# claiming which veto the guard reached first. They never decide closure.
+
+CENSUS_FAULT = "closure not established: no certain empty census after the leader was reaped"
+EOF_FAULT = "closure not established: output EOF witness missing"
+SETTLE_REFUSALS = (CENSUS_FAULT, EOF_FAULT)
+FD_SOCKET_NAME = "fdsock"
+FD_ACK_TIMEOUT_S = 10
+NONCE_TIMEOUT_S = 10
+
+# An escaped writer: it leaves the nested session with setsid, keeps the nested
+# leader's stdout/stderr write descriptors open (the pipe therefore never
+# reaches EOF) and answers one fresh nonce after the verdict, which shows it was
+# alive then rather than inferred from an old PID. Its own finite
+# fixture-deadline alarm still bounds it.
+ESCAPED_WRITER = fixture("""
+import os, time
+case = os.environ["CASE_DIR"]
+with open(os.path.join(case, "escaped.ready.tmp"), "w") as handle:
+    handle.write(str(os.getpid()))
+os.replace(os.path.join(case, "escaped.ready.tmp"), os.path.join(case, "escaped.ready"))
+while True:
+    try:
+        with open(os.path.join(case, "nonce")) as handle:
+            token = handle.read().strip()
+    except OSError:
+        token = ""
+    if token:
+        with open(os.path.join(case, "nonce.reply.tmp"), "w") as handle:
+            handle.write(token)
+        os.replace(os.path.join(case, "nonce.reply.tmp"), os.path.join(case, "nonce.reply"))
+        break
+    time.sleep(0.02)
+""")
+
+# Sends duplicates of its own actual stdout/stderr write descriptors to the
+# already-running suite process and exits only after the receiver's ACK.
+FD_HANDOFF = fixture("""
+import os, socket
+cwd = os.getcwd()
+socket_dir, name = os.environ["FD_SOCKET_DIR"], os.environ["FD_SOCKET_NAME"]
+streams = [item for item in os.environ["FD_STREAMS"].split(",") if item]
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(float(os.environ["FD_ACK_TIMEOUT_S"]))
+try:
+    os.chdir(socket_dir)
+    try:
+        sock.connect(name)
+    finally:
+        os.chdir(cwd)
+    socket.send_fds(sock, [b"d"], [1 if item == "stdout" else 2 for item in streams])
+    ack = sock.recv(16)
+    if ack != b"ack":
+        raise SystemExit(3)
+    with open(os.environ["CASE_DIR"] + "/handoff.done", "w") as handle:
+        handle.write(",".join(streams))
+finally:
+    sock.close()
+""")
+
+
+class FdReceiver:
+    """One short AF_UNIX listener inside the case's owned directory. It runs in
+    the suite process, which is never a member of the nested session, so holding
+    a received writer descriptor cannot disturb that session's census. The
+    socket is bound by a relative name after chdir (macOS sun_path is short) and
+    the caller's working directory is restored either way."""
+
+    def __init__(self, directory):
+        self.directory = os.path.realpath(directory)
+        self.received = []
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.directory)
+            self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener.bind(FD_SOCKET_NAME)
+            self.listener.listen(1)
+        finally:
+            os.chdir(cwd)
+
+    @property
+    def path(self):
+        return os.path.join(self.directory, FD_SOCKET_NAME)
+
+    def accept(self, count, timeout):
+        # Receive exactly `count` descriptors, refuse a truncated or short
+        # control message, take custody (close-on-exec) and only then ACK.
+        self.listener.settimeout(timeout)
+        connection, _ = self.listener.accept()
+        fds = []
+        try:
+            connection.settimeout(timeout)
+            message, fds, flags, _address = socket.recv_fds(connection, 1, count + 2)
+            if flags & socket.MSG_CTRUNC:
+                raise AssertionError("descriptor control message was truncated")
+            if not message or len(fds) != count:
+                raise AssertionError(f"descriptor handoff delivered {len(fds)} of {count} descriptors")
+            for fd in fds:
+                os.set_inheritable(fd, False)
+            self.received.extend(fds)
+            connection.sendall(b"ack")
+        except BaseException:
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            connection.close()
+        return list(self.received)
+
+    def close(self):
+        for fd in self.received:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.received = []
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+
+
+def escaped_writer_problems(facts):
+    # The retained native escaped-writer proof, judged from observed facts.
+    problems = []
+    if facts.get("leader_status") != 0:
+        problems.append(f"the nested leader did not exit 0: {facts.get('leader_status')}")
+    if facts.get("exit") != 125:
+        problems.append(f"the nested guardian exit {facts.get('exit')} is not 125")
+    if facts.get("closure") != "UNCLOSED":
+        problems.append(f"closure {facts.get('closure')} is not UNCLOSED")
+    if facts.get("fault") not in SETTLE_REFUSALS:
+        problems.append(f"the fault {facts.get('fault')!r} is not one of the two settle refusals")
+    if facts.get("deadline"):
+        problems.append("the run hit its deadline")
+    if not facts.get("ready"):
+        problems.append("the escaped writer never signalled readiness before the verdict")
+    if not facts.get("nonce_ok"):
+        problems.append("the escaped writer did not answer the fresh post-verdict nonce")
+    child, suite = facts.get("child_pid"), facts.get("suite_pid")
+    if child is None or suite is None:
+        problems.append("the escaped child or suite identity was not observed")
+    for target in facts.get("signal_targets") or []:
+        if target in (child, suite):
+            problems.append(f"a signal targeted the escaped writer or the suite: {target}")
+    for pin in facts.get("signal_pins") or []:
+        if pin not in ("leader", "monitor"):
+            problems.append(f"a signal targeted an unexpected pin: {pin}")
+    if not facts.get("retained"):
+        problems.append("the case resources were not retained")
+    return problems
+
+
+def eof_veto_problems(facts):
+    # A held actual writer descriptor must produce exactly the EOF veto after a
+    # real certain empty census, with the leader's own status kept.
+    problems = []
+    if facts.get("leader_status") != 0:
+        problems.append(f"the nested leader did not exit 0: {facts.get('leader_status')}")
+    if facts.get("exit") != 125:
+        problems.append(f"the nested guardian exit {facts.get('exit')} is not 125")
+    if facts.get("closure") != "UNCLOSED":
+        problems.append(f"closure {facts.get('closure')} is not UNCLOSED")
+    if facts.get("deadline"):
+        problems.append("the run hit its deadline")
+    if facts.get("fault") != EOF_FAULT:
+        problems.append(f"the EOF veto did not latch: {facts.get('fault')!r}")
+    census = facts.get("census") or {}
+    if not (census.get("certain") is True and census.get("members") == 0 and census.get("uncertain") == 0):
+        problems.append(f"the census was not certainly empty, so this is not an EOF-only proof: {census}")
+    if facts.get("held") != facts.get("expected_held"):
+        problems.append(f"held streams {facts.get('held')} are not the expected {facts.get('expected_held')}")
+    for target in facts.get("signal_targets") or []:
+        if target == facts.get("suite_pid"):
+            problems.append("a signal targeted the suite")
+    if not facts.get("retained"):
+        problems.append("the case resources were not retained")
+    return problems
+
+
+def released_streams_problems(facts):
+    # The paired control: releasing both descriptors must close normally.
+    problems = []
+    if facts.get("exit") != 0:
+        problems.append(f"the paired control exit {facts.get('exit')} is not 0")
+    if facts.get("closure") != "closed":
+        problems.append(f"the paired control closure {facts.get('closure')} is not closed")
+    if facts.get("fault") is not None:
+        problems.append(f"the paired control latched a fault: {facts.get('fault')!r}")
+    if facts.get("held"):
+        problems.append(f"the paired control still held descriptors: {facts.get('held')}")
+    return problems
+
+
+def wait_for(path, timeout):
+    # Bounded wait for one owned fixture artifact; never an OS-liveness probe.
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{path} did not appear within {timeout} s")
+        time.sleep(0.02)
+
+
+class _ReleasedReceiver:
+    # Takes custody of the descriptors through the real receiver and releases
+    # them at once, so the paired control can prove normal closure.
+    def __init__(self, receiver):
+        self.receiver = receiver
+        self.released = False
+        self.held_names = []
+
+    def accept(self, count, timeout):
+        fds = self.receiver.accept(count, timeout)
+        for fd in fds:
+            os.close(fd)
+        self.receiver.received = []
+        self.released = True
+        return []
+
+    def still_held(self):
+        return [] if self.released else ["pending"]
 
 
 # Pure cases --------------------------------------------------------------------
@@ -2047,6 +2280,148 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(readings["boot_volume"]["threshold"], qualify.THRESHOLD)
 
 
+
+class PureClosureDecision(unittest.TestCase):
+    """Drive the guard's actual settle()/closure() acceptance with fake events:
+    the EOF veto needs both DISTINCT stream witnesses after a certain empty
+    census, in either order of refusal, and first fault is preserved. Nothing
+    here substitutes for the native fixtures; it pins the decision path they
+    depend on."""
+
+    def custodian(self):
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        custodian = bounded.Custodian(["command"], limit_s=60.0)
+        custodian.run_id = "r"
+        custodian.start = 1000 * NS
+        custodian.absolute = custodian.start + 60 * NS
+        custodian.stop_at = custodian.absolute - bounded.STOP_RESERVE_S * NS
+        custodian.exit_at = custodian.absolute - bounded.EXIT_MARGIN_S * NS
+        custodian.guard = bounded.Guard(start_ns=custodian.start)
+        custodian.leader = 4242
+        custodian.leader_status = 0
+        custodian.reaped_seq = 3
+        custodian.cmd_w = cmd_w
+        custodian.monitor = 4243
+        custodian.monitor_complete = True
+        custodian.monitor_reaped = True
+        return custodian
+
+    def message(self, custodian, kind, **fields):
+        return {"run": custodian.run_id, "seq": custodian.monitor_seq + 1, "leader": [4242, 77],
+                "type": kind, "at": 1, **fields}
+
+    def settle(self, custodian, census_ok, uncertain, eof):
+        custodian.census_ok, custodian.census_uncertain = census_ok, uncertain
+        custodian.eof = set(eof)
+        custodian.exit_at = 1  # the grace window is already past: a bounded decision
+        custodian.settle(True)
+        return custodian.guard.fault
+
+    def test_both_distinct_witnesses_may_close_without_fault(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stderr"))
+        self.assertEqual(custodian.eof, {"stdout", "stderr"})
+        self.assertIsNone(self.settle(custodian, True, False, custodian.eof))
+        self.assertTrue(custodian.closure(True))
+
+    def test_one_or_no_witness_refuses(self):
+        for eof in (set(), {"stdout"}, {"stderr"}):
+            with self.subTest(eof=sorted(eof)):
+                custodian = self.custodian()
+                self.assertEqual(self.settle(custodian, True, False, eof), EOF_FAULT)
+                self.assertFalse(custodian.closure(True))
+
+    def test_duplicate_stdout_witness_never_counts_as_two(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        self.assertEqual(custodian.eof, {"stdout"})
+        self.assertEqual(self.settle(custodian, True, False, custodian.eof), EOF_FAULT)
+
+    def test_uncertain_census_refuses_before_any_eof_question(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "census", after=3, certain=False, members=0, uncertain=1))
+        custodian.accept(self.message(custodian, "census", after=3, certain=True, members=0, uncertain=0))
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stderr"))
+        self.assertIn("census uncertain", custodian.guard.fault)
+        self.assertFalse(custodian.closure(True))
+        self.assertEqual(self.settle(custodian, False, True, {"stdout", "stderr"}),
+                         custodian.guard.fault, "an earlier fault must be preserved")
+        self.assertFalse(custodian.closure(True))
+
+    def test_missing_witness_is_named_after_a_certain_census_only(self):
+        custodian = self.custodian()
+        self.assertEqual(self.settle(custodian, True, False, {"stdout"}), EOF_FAULT)
+        custodian = self.custodian()
+        self.assertEqual(self.settle(custodian, False, False, set()), CENSUS_FAULT)
+
+    def test_pre_stop_census_does_not_qualify(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "census", after=2, certain=True, members=0, uncertain=0))
+        self.assertFalse(custodian.census_ok)
+        self.assertFalse(custodian.closure(True))
+
+    def test_fd_transport_api_is_available(self):
+        # The held-stream fixtures need real descriptor transport; assert the
+        # runtime API rather than assuming it.
+        self.assertTrue(callable(getattr(socket, "send_fds", None)))
+        self.assertTrue(callable(getattr(socket, "recv_fds", None)))
+        self.assertTrue(hasattr(socket, "MSG_CTRUNC"))
+
+    # Negative mutations: each must falsify the oracle it belongs to.
+
+    def test_escaped_writer_oracle_rejects_its_mutations(self):
+        good = {"leader_status": 0, "exit": 125, "closure": "UNCLOSED", "fault": CENSUS_FAULT,
+                "deadline": False, "ready": True, "nonce_ok": True, "child_pid": 5000,
+                "suite_pid": 4000, "signal_targets": [4242], "signal_pins": ["leader", "leader"],
+                "retained": True}
+        self.assertEqual(escaped_writer_problems(good), [])
+        also_eof = dict(good, fault=EOF_FAULT)
+        self.assertEqual(escaped_writer_problems(also_eof), [])
+        for label, mutation in (("absent child", {"child_pid": None}), ("no readiness", {"ready": False}),
+                                ("no escape", {"signal_targets": [5000]}), ("stale nonce", {"nonce_ok": False}),
+                                ("no response", {"nonce_ok": False, "error": "missing nonce.reply"}),
+                                ("deadline", {"deadline": True}), ("resource fault", {"fault": "reserve readings stale"}),
+                                ("unrelated fault", {"fault": "monitor did not complete"}),
+                                ("not retained", {"retained": False}),
+                                ("suite signalled", {"signal_targets": [4000]}),
+                                ("signal outside the pins", {"signal_pins": ["foreign"]}),
+                                ("leader failed", {"leader_status": 1}), ("guardian exit", {"exit": 124}),
+                                ("closed", {"closure": "closed"})):
+            with self.subTest(label):
+                self.assertTrue(escaped_writer_problems(dict(good, **mutation)), label)
+
+    def test_eof_veto_oracle_rejects_its_mutations(self):
+        good = {"leader_status": 0, "exit": 125, "closure": "UNCLOSED", "fault": EOF_FAULT,
+                "deadline": False, "census": {"certain": True, "members": 0, "uncertain": 0},
+                "held": ["stdout"], "expected_held": ["stdout"], "suite_pid": 4000,
+                "signal_targets": [4242], "retained": True}
+        self.assertEqual(eof_veto_problems(good), [])
+        for label, mutation in (("wrong pipe", {"held": ["stderr"], "expected_held": ["stdout"]}),
+                                ("no hold", {"held": []}), ("uncertain census", {"census": {"certain": False, "members": 0,
+                                                                                            "uncertain": 1}}),
+                                ("nonempty census", {"census": {"certain": True, "members": 1, "uncertain": 0}}),
+                                ("missing census", {"census": None}), ("census fault", {"fault": CENSUS_FAULT}),
+                                ("deadline", {"deadline": True}), ("not retained", {"retained": False}),
+                                ("leader failed", {"leader_status": 1}), ("suite signalled", {"signal_targets": [4000]})):
+            with self.subTest(label):
+                self.assertTrue(eof_veto_problems(dict(good, **mutation)), label)
+
+    def test_released_streams_oracle_rejects_an_always_unclosed_oracle(self):
+        self.assertEqual(released_streams_problems({"exit": 0, "closure": "closed", "fault": None, "held": []}), [])
+        for label, mutation in (("held anyway", {"held": ["stdout"]}), ("unclosed", {"closure": "UNCLOSED"}),
+                                ("fault", {"fault": EOF_FAULT}), ("exit", {"exit": 125})):
+            with self.subTest(label):
+                self.assertTrue(released_streams_problems({"exit": 0, "closure": "closed", "fault": None,
+                                                           "held": [], **mutation}), label)
+
+
 # Real cases --------------------------------------------------------------------
 
 
@@ -2089,9 +2464,11 @@ class Real(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp(prefix=self.id().rsplit(".", 1)[-1] + ".", dir=nested_root())).resolve()
         self.started = now_ns()
 
-    def guardian(self, code, inject=(), owned=False, limit=35, signal_after=None, signal_number=None, command=None):
+    def guardian(self, code, inject=(), owned=False, limit=35, signal_after=None, signal_number=None,
+                 command=None, extra_env=None, receiver=None, receiver_count=0):
         env = dict(os.environ, CASE_DIR=str(self.dir), FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS),
                    OXIDE_SUPERVISOR_INJECT=",".join(inject))
+        env.update(extra_env or {})
         args = [sys.executable, str(SUPERVISOR), "--limit", str(limit), "--evidence", str(self.dir / "evidence")]
         if owned:
             env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
@@ -2102,6 +2479,8 @@ class Real(unittest.TestCase):
             guardian = subprocess.Popen(args + ["--"] + (command or [sys.executable, "-c", code]), env=env,
                                         stdout=subprocess.DEVNULL, stderr=log)
             try:
+                if receiver is not None:  # actual descriptor handoff, then ACK, then the wait
+                    receiver.accept(receiver_count, FD_ACK_TIMEOUT_S)
                 if signal_after is not None:
                     deadline = time.monotonic() + 10
                     while not (self.dir / signal_after).exists() and time.monotonic() < deadline:
@@ -2122,7 +2501,8 @@ class Real(unittest.TestCase):
                       "outcome": self.receipt["outcome"], "census": (self.receipt["census"] or {}).get("members"),
                       "wall_s": round((self.verdict_ns - self.started) / NS, 3),
                       "signals": [[s["signal"], s["pin"], s["killpg"], s["held_unreaped"], s["result"]]
-                                  for s in signals]})
+                                  for s in signals],
+                      "held_streams": sorted(getattr(receiver, "held_names", []))})
         for entry in signals:  # custody at every signal
             self.assertTrue(entry["held_unreaped"], entry)
             self.assertIn(entry["pin"], ("leader", "monitor"))
@@ -2207,11 +2587,78 @@ class Real(unittest.TestCase):
         self.assert_kept_outside_outer_cleanup()
 
     def test_escaped_pipe_holder_unclosed(self):
-        code = fixture("import os\n" + spawn_line(SLEEPER, setsid=True))
-        self.assertEqual(self.guardian(code), 125)
-        self.assertIn("EOF", self.outcome()["fault"])
-        self.assertTrue(alive(self.child()))
+        # The escaped writer leaves the nested session, keeps the leader's
+        # stdout/stderr write descriptors open, and proves it is still alive
+        # after the verdict by answering a fresh nonce. Which closure veto
+        # latched is not claimed: both settle refusals are accepted, and every
+        # other outcome is refused.
+        code = fixture("import os\n" + spawn_line(ESCAPED_WRITER, setsid=True))
+        exit_code = self.guardian(code)
+        wait_for(os.path.join(str(self.dir), "escaped.ready"), NONCE_TIMEOUT_S)
+        child_pid = int((self.dir / "child.pid").read_text())
+        token = secrets.token_hex(16)
+        (self.dir / "nonce").write_text(token)
+        wait_for(os.path.join(str(self.dir), "nonce.reply"), NONCE_TIMEOUT_S)
+        reply = (self.dir / "nonce.reply").read_text().strip()
+        signals = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
+        facts = {"leader_status": self.outcome().get("status"), "exit": exit_code,
+                 "closure": self.outcome().get("closure"), "fault": self.outcome().get("fault"),
+                 "deadline": self.outcome().get("deadline"), "ready": True,
+                 "nonce_ok": reply == token, "child_pid": child_pid, "suite_pid": os.getpid(),
+                 "signal_targets": [r["target"] for r in signals], "signal_pins": [r["pin"] for r in signals],
+                 "retained": (self.dir / "evidence" / "receipt.json").exists()}
+        CASES[-1]["nonce_ok"] = facts["nonce_ok"]
+        self.assertEqual(escaped_writer_problems(facts), [], facts)
         self.assert_kept_outside_outer_cleanup()
+
+    def held_stream_case(self, streams):
+        # The nested leader's own command sends duplicates of its actual
+        # stdout/stderr write descriptors to this suite process, which is not a
+        # member of the nested session; the suite holds them through the
+        # verdict and closes them in cleanups. A released pair must close.
+        receiver = FdReceiver(str(self.dir))
+        receiver.held_names = list(streams)
+        self.addCleanup(receiver.close)
+        extra = {"FD_SOCKET_DIR": receiver.directory, "FD_SOCKET_NAME": FD_SOCKET_NAME,
+                 "FD_STREAMS": ",".join(streams), "FD_ACK_TIMEOUT_S": str(FD_ACK_TIMEOUT_S)}
+        exit_code = self.guardian(FD_HANDOFF, extra_env=extra, receiver=receiver,
+                                  receiver_count=len(streams))
+        self.assertTrue((self.dir / "handoff.done").exists(), "the ACK never reached the fixture")
+        held = [name for name in streams] if receiver.received else []
+        signals = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
+        facts = {"leader_status": self.outcome().get("status"), "exit": exit_code,
+                 "closure": self.outcome().get("closure"), "fault": self.outcome().get("fault"),
+                 "deadline": self.outcome().get("deadline"), "census": self.receipt.get("census"),
+                 "held": held, "expected_held": list(streams), "suite_pid": os.getpid(),
+                 "signal_targets": [r["target"] for r in signals],
+                 "retained": (self.dir / "evidence" / "receipt.json").exists()}
+        return facts
+
+    def test_held_stdout_descriptor_keeps_the_eof_veto(self):
+        facts = self.held_stream_case(["stdout"])
+        self.assertEqual(eof_veto_problems(facts), [], facts)
+        self.assert_kept_outside_outer_cleanup()
+
+    def test_held_stderr_descriptor_keeps_the_eof_veto(self):
+        facts = self.held_stream_case(["stderr"])
+        self.assertEqual(eof_veto_problems(facts), [], facts)
+        self.assert_kept_outside_outer_cleanup()
+
+    def test_released_descriptors_close_normally(self):
+        # The paired control: both descriptors transferred and both released by
+        # the suite before the verdict, so the same fixture and handoff must
+        # close with status 0 and no fault. This refuses an always-UNCLOSED oracle.
+        receiver = FdReceiver(str(self.dir))
+        self.addCleanup(receiver.close)
+        extra = {"FD_SOCKET_DIR": receiver.directory, "FD_SOCKET_NAME": FD_SOCKET_NAME,
+                 "FD_STREAMS": "stdout,stderr", "FD_ACK_TIMEOUT_S": str(FD_ACK_TIMEOUT_S)}
+        stream = _ReleasedReceiver(receiver)
+        exit_code = self.guardian(FD_HANDOFF, extra_env=extra, receiver=stream, receiver_count=2)
+        facts = {"exit": exit_code, "closure": self.outcome().get("closure"),
+                 "fault": self.outcome().get("fault"), "held": stream.still_held()}
+        self.assertEqual(released_streams_problems(facts), [], facts)
+
+
 
     def test_terminal_zombie_witness_closed(self):
         # Positive TERMINALNONWRITER fixture: this suite process forks one
@@ -2567,7 +3014,8 @@ def main():
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
-                                           PureTraversal, PureDefaultScratch, PureQualificationTopology))
+                                           PureTraversal, PureDefaultScratch, PureQualificationTopology,
+                                           PureClosureDecision))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

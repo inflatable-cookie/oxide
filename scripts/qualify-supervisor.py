@@ -65,7 +65,7 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 162
+EXPECTED_CASES = 175
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -293,7 +293,7 @@ CONTROL_CASES = {
     "fixture_deadline": {"exit": [-14, -14], "keys": {"case", "exit"}},
 }
 ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome", "census", "wall_s",
-                 "signals", "stale_latency_ns"}
+                 "signals", "stale_latency_ns", "held_streams", "nonce_ok"}
 
 
 def control_case(case, name, root, facts):
