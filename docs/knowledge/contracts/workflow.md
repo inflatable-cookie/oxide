@@ -1047,10 +1047,13 @@ cases 1-10 and aborted at the removable case, whose containment check compared
 the custody directory against the workspace and its parent instead of the
 supervisor's published owned root; that topology and its custody decision are
 corrected here, and the run stays a spent failure. The pure self-check
-(`effigy proof:pool-temp:test`, 137 properties) covers the constructor layout,
+(`effigy proof:pool-temp:test`, 149 properties) covers the constructor layout,
 rerun completeness, observation freshness, readiness parsing, refusal
 targeting, accounting deltas, the published-root containment refusals, the
-removable flow's custody decisions and first-fault precedence, and the
+removable flow's custody decisions (including a missing or swapped device
+binding, a replayed observation identifier, both ambiguous detach post-states
+and a deadline abort raised inside the cleanup decision) and first-fault
+precedence, case 12's socket-bound oracles with fake product states, and the
 diagnostic dependency and abort rules with no scratch, child or toolchain.
 
 ## Execution location

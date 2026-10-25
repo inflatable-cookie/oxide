@@ -2748,6 +2748,15 @@ def removable_flow(
             bool(info.get("VolumeUUID")),
             "the mounted volume has no volume UUID to bind the attachment to",
         )
+        # The mount's own device node must be one of the device entries the
+        # attach actually returned: a missing or swapped binding is refused
+        # before the attachment record claims one.
+        node = info.get("DeviceNode")
+        require(
+            bool(node) and node in devices,
+            "the mounted volume's device node "
+            f"{node!r} is not one of the attached device entries {devices}",
+        )
         # Bind the returned identity before any further effect, so a detach can
         # be checked against the attachment this run actually made.
         effects.write_private(
@@ -2756,7 +2765,7 @@ def removable_flow(
                 {
                     "image": image,
                     "mount": mount,
-                    "device": devices[0] if devices else "",
+                    "device": node,
                     "volume_uuid": info.get("VolumeUUID", ""),
                     "owners_on": True,
                 },
@@ -2808,8 +2817,7 @@ def removable_flow(
         effects.write_private(
             attempt_path,
             json.dumps(
-                {"mount": mount, "device": devices[0] if devices else "",
-                 "planned": "one ordinary detach"},
+                {"mount": mount, "device": node, "planned": "one ordinary detach"},
                 indent=1,
                 sort_keys=True,
             ),
@@ -3728,6 +3736,15 @@ def self_check() -> int:
             self.mode = options.get("mode", 0o700)
             self.dirs_ok = options.get("dirs_ok", True)
             self.canonical_map = options.get("canonical_map", {})
+            self.entity_devices = options.get(
+                "entity_devices", ["/dev/disk9s1", "/dev/disk9"]
+            )
+            self.device_node = options.get("device_node")
+            self.detach_keeps_mounted = options.get("detach_keeps_mounted", False)
+            self.recreate_mount = options.get("recreate_mount", False)
+            self.cleanup_keeps_mounted = options.get("cleanup_keeps_mounted", False)
+            self.work_left_fn = options.get("work_left_fn")
+            self.work_left_calls = 0
             self.detach_calls = 0
 
         def canonical(self, path):
@@ -3765,6 +3782,9 @@ def self_check() -> int:
             return []
 
         def work_left(self):
+            self.work_left_calls += 1
+            if self.work_left_fn is not None:
+                return self.work_left_fn(self.work_left_calls)
             return 60.0
 
         def run(self, argv, *, timeout, text=True):
@@ -3775,14 +3795,12 @@ def self_check() -> int:
             if "attach" in argv:
                 if self.attach_plist is not None:
                     return Proc(self.attach_exit, self.attach_plist)
-                payload = plistlib.dumps(
-                    {
-                        "system-entities": [
-                            {"mount-point": self.mount, "dev-entry": "/dev/disk9s1"},
-                            {"dev-entry": "/dev/disk9"},
-                        ]
-                    }
-                )
+                entities = [{"mount-point": self.mount}]
+                if self.entity_devices and self.entity_devices[0]:
+                    entities[0]["dev-entry"] = self.entity_devices[0]
+                if len(self.entity_devices) > 1 and self.entity_devices[1]:
+                    entities.append({"dev-entry": self.entity_devices[1]})
+                payload = plistlib.dumps({"system-entities": entities})
                 if self.attach_exit == 0:
                     self.mounted.add(self.mount)
                 return Proc(self.attach_exit, payload)
@@ -3793,6 +3811,11 @@ def self_check() -> int:
                         {
                             "GlobalPermissionsEnabled": self.owners,
                             "VolumeUUID": self.volume_uuid,
+                            "DeviceNode": (
+                                self.device_node
+                                if self.device_node is not None
+                                else self.entity_devices[0]
+                            ),
                         }
                     ),
                 )
@@ -3808,21 +3831,37 @@ def self_check() -> int:
                 if failure is not None:
                     raise failure
                 if exit_code == 0:
-                    self.mounted.discard(argv[-1])
+                    keeps = (
+                        self.detach_keeps_mounted
+                        if planned
+                        else self.cleanup_keeps_mounted
+                    )
+                    if not keeps:
+                        self.mounted.discard(argv[-1])
+                    if planned and self.recreate_mount:
+                        self.dirs.add(argv[-1])
                 return Proc(exit_code, "", "" if exit_code == 0 else "detach refused")
             return Proc(1, "", f"unexpected command {argv}")
 
     class FakeWorld:
-        """The product side of the removable case, with fake observations."""
+        """The product side of the removable case, with fake observations.
+
+        `observe` is the real `World.observe`, so the live identifier check and
+        the accepted-path bookkeeping are exercised rather than re-stated.
+        """
+
+        observe = World.observe
 
         def __init__(
             self, mount="/Volumes/oxide-temp-proof", observed=None,
-            root="/owned/root/scratch/pt",
+            root="/owned/root/scratch/pt", stale_nonce=False,
         ):
             self.root = root
             self.pool = os.path.join(root, "p")
             self.mount = mount
             self.runs = []
+            self.accepted = []
+            self.stale_nonce = stale_nonce
             self.pending = list(
                 observed
                 if observed is not None
@@ -3848,15 +3887,27 @@ def self_check() -> int:
 
         def run(self, args, *, cwd, env, check=True):
             self.runs.append(tuple(args))
-            return Proc(0, "", self.stderr)
-
-        def observe(self, text, kind, env):
-            return self.pending.pop(0)
+            nonce = "n-stale" if self.stale_nonce else env.get("OXIDE_PROOF_NONCE")
+            # Only a check consumes the next observation; the registration call
+            # before it carries no observation of its own.
+            target = self.pending[0] if self.pending else ""
+            if self.pending and args and args[0] == "check":
+                target = self.pending.pop(0)
+            return Proc(
+                0,
+                "",
+                f"cargo:warning=OXIDE-TEMP nonce={nonce}\n"
+                f"cargo:warning=OXIDE-TEMP dir={target}\n"
+                f"temp: oxide {target}\n",
+            )
 
     def run_flow(**options):
         effects = FakeEffects(**options)
         world = FakeWorld(
-            effects.mount, options.get("observed"), options.get("world_root", "/owned/root/scratch/pt")
+            effects.mount,
+            options.get("observed"),
+            options.get("world_root", "/owned/root/scratch/pt"),
+            options.get("stale_nonce", False),
         )
         caught = None
         try:
@@ -4029,6 +4080,165 @@ def self_check() -> int:
         and "custody is unknown" in str(caught)
         and "not on the image" in str(caught)
         and "primary fault" in str(caught),
+    )
+
+    # Live-seam counterfactuals: a wrong or missing device binding, an
+    # identifier the real observe rejects, both ambiguous detach post-states,
+    # a cleanup that leaves the volume mounted, and a deadline abort raised
+    # inside the cleanup decision. Each drives the real custody functions.
+    caught, effects, _world = run_flow(entity_devices=[""])
+    property_true(
+        "a missing device binding aborts before the attachment record exists",
+        isinstance(caught, UnknownOutcome)
+        and "bound no device entry" in str(caught)
+        and os.path.join(custody_dir, "attachment.json") not in effects.files
+        and os.path.join(custody_dir, "detach-attempt.json") not in effects.files,
+    )
+    caught, effects, _world = run_flow(entity_devices=["", "/dev/disk9"])
+    property_true(
+        "an attach record with no mount device node is refused",
+        isinstance(caught, UnknownOutcome)
+        and "not one of the attached device entries" in str(caught)
+        and image_path in effects.files,
+    )
+    caught, effects, _world = run_flow(device_node="/dev/disk99s1")
+    property_true(
+        "a swapped device binding is refused before the attachment record",
+        isinstance(caught, UnknownOutcome)
+        and "/dev/disk99s1" in str(caught)
+        and os.path.join(custody_dir, "attachment.json") not in effects.files
+        and image_path in effects.files,
+    )
+    caught, effects, world = run_flow(observed=wrong_scratch, stale_nonce=True)
+    property_true(
+        "a replayed observation identifier fails through the real observe",
+        isinstance(caught, Recoverable)
+        and "stale observation identifier" in str(caught)
+        and world.accepted == [],
+    )
+    caught, effects, _world = run_flow(detach_keeps_mounted=True)
+    property_true(
+        "a detach that reports success but leaves the volume mounted aborts",
+        isinstance(caught, UnknownOutcome)
+        and "still mounted after detach" in str(caught)
+        and effects.detach_calls == 1
+        and image_path in effects.files,
+    )
+    caught, effects, _world = run_flow(recreate_mount=True)
+    property_true(
+        "a detach whose mount point is recreated aborts and keeps the backing",
+        isinstance(caught, UnknownOutcome)
+        and "was recreated" in str(caught)
+        and effects.detach_calls == 1
+        and image_path in effects.files,
+    )
+    caught, effects, _world = run_flow(
+        observed=wrong_scratch, cleanup_keeps_mounted=True
+    )
+    property_true(
+        "a cleanup detach that leaves the volume mounted keeps custody unknown",
+        isinstance(caught, UnknownOutcome)
+        and "image custody is unknown" in str(caught)
+        and "not positively established" in str(caught)
+        and image_path in effects.files,
+    )
+
+    def armed_deadline(call: int) -> float:
+        # The wrong-observation failure reaches the custody decision on the
+        # fourth work_left call (create, attach, diskutil, cleanup), so the
+        # real deadline abort is raised inside the cleanup decision itself.
+        if call >= 4:
+            work_left(now_ns=2_000_000_000, deadline_ns=1_000_000_000, margin_s=30)
+        return 60.0
+
+    caught, effects, _world = run_flow(
+        observed=wrong_scratch, work_left_fn=armed_deadline
+    )
+    property_true(
+        "a deadline abort inside the cleanup decision keeps custody unknown",
+        isinstance(caught, UnknownOutcome)
+        and "image custody is unknown" in str(caught)
+        and "work deadline reached" in str(caught)
+        and "not on the image" in str(caught)
+        and image_path in effects.files,
+    )
+
+    # Case 12's 91-byte oracles with fake product states, through the real
+    # path_bound body: a socket-safe observation passes, and an over-bound
+    # observation, a non-scratch leaf and an over-bound accepted path each
+    # fail rather than being accepted by a vacuous check.
+    class FakePathWorld:
+        observe = World.observe
+
+        def __init__(self, observed, accepted=()):
+            self.pool = "/private/tmp/oxide-proof.abcd1234/scratch/pt/p"
+            self.observed = observed
+            self.accepted = list(accepted)
+            self.calls = 0
+
+        def env(self, **overrides):
+            env = {"OXIDE_PROOF_NONCE": "n"}
+            for key, value in overrides.items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
+            return env
+
+        def run(self, args, *, cwd, env, check=True):
+            self.calls += 1
+            return Proc(
+                0,
+                "",
+                f"cargo:warning=OXIDE-TEMP nonce={env.get('OXIDE_PROOF_NONCE')}\n"
+                f"cargo:warning=OXIDE-TEMP dir={self.observed}\n",
+            )
+
+    def run_path_bound(observed, accepted=()):
+        world = FakePathWorld(observed, accepted)
+        saved_cases = list(CASES)
+        caught = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                path_bound(world, "/crate")
+        except BaseException as error:  # noqa: BLE001 - the oracle asserts on it
+            caught = error
+        finally:
+            CASES[:] = saved_cases
+        return caught, world
+
+    slot = (
+        "/private/tmp/oxide-proof.abcd1234/scratch/pt/p/payload/slots/"
+        "t-1abcdef/quick-1/scratch"
+    )
+    caught, world = run_path_bound(slot)
+    property_true(
+        "case 12 accepts a real socket-safe observation and records it",
+        caught is None
+        and world.calls == 1
+        and world.accepted == [slot]
+        and len(slot.encode()) <= SOCKET_PATH_BOUND,
+    )
+    long_leaf = (
+        "/private/tmp/oxide-proof.abcd1234/scratch/pt/p/payload/slots/"
+        "t-1abcdef/quick-1/" + "s" * 30 + "/scratch"
+    )
+    caught, _world = run_path_bound(long_leaf)
+    property_true(
+        "case 12 refuses an over-bound observation",
+        isinstance(caught, Recoverable) and "over the 91-byte bound" in str(caught),
+    )
+    caught, _world = run_path_bound(slot[: -len("/scratch")] + "/tmpdir")
+    property_true(
+        "case 12 refuses an observation that does not end in scratch",
+        isinstance(caught, Recoverable) and "does not end in scratch" in str(caught),
+    )
+    caught, _world = run_path_bound(slot, accepted=[long_leaf])
+    property_true(
+        "case 12 refuses an over-bound previously accepted path",
+        isinstance(caught, Recoverable) and "an accepted path is" in str(caught),
     )
 
     # An abort inside case 11 still records case 12 as not run, through the
