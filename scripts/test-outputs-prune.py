@@ -116,10 +116,13 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
   02 missing ready registry: dry run exits 2, adopt of another checkout
      refuses, nothing is rebuilt; restoring the exact bytes recovers.
   03 root nonce: the external root's v2 marker nonce (32 hex) equals the
-     receipt's selected nonce and the registry row's nonce.
+     receipt's selected nonce and every placed member's registry row nonce
+     (a current profile receipt records one row per member for one root).
   04 shared reservation: two starters paused after slot keying (their captured
      destination keys compared before release) share one reserved nonce; both
-     bind it and the created root carries it.
+     bind it and the created root carries it. The reservation is read from the
+     receipt's ROOT-LEVEL `reserved` field, the shape this head writes; the
+     legacy per-placement field is never accepted as the current one.
   05 cancel + stale starter: a starter paused after keying has its reservation
      cancelled by `outputs cancel-reservation`; the starter refuses before
      Cargo with "cancelled or replaced"; the root is never created; the row is
@@ -665,6 +668,20 @@ def registry_is_current(registry: dict) -> bool:
         and registry.get("schema") == REGISTRY_SCHEMA
         and registry.get("complete") is True
     )
+
+
+def current_reservation(receipt: dict) -> dict | None:
+    """The reservation of a receipt THIS head writes: ROOT-LEVEL `reserved`.
+
+    `oxide outputs adopt` publishes a profile receipt
+    (`oxide.outputs.transition/3`), whose reservation is root-level. The
+    per-placement `links[<n>].reserved` shape is emitted only for the legacy
+    whole-target `transition/2` document, which the product still writes on a
+    legacy-only path and reads as legacy. This proof's current-write oracle
+    therefore reads the root-level field only, so a case can never silently
+    pass on that stale placement path.
+    """
+    return receipt.get("reserved")
 
 
 class FixtureEffects:
@@ -1267,15 +1284,24 @@ def run(proof, repo: str) -> None:
         nonce = root_marker["nonce"]
         expect(len(nonce) == 32 and all(c in "0123456789abcdef" for c in nonce), nonce)
         expect(selected.get("nonce") == nonce, f"receipt nonce {selected.get('nonce')} != {nonce}")
+        # A current profile receipt places one link per member, so the
+        # registry records one row per member for the same root (the legacy
+        # whole-target document had exactly one). Every row must agree on the
+        # nonce and the selection, and the member set must be the placed set.
         rows = [row for row in world.registry_doc()["rows"] if row["root"] == selected["root"]]
-        expect(len(rows) == 1 and rows[0]["nonce"] == nonce and rows[0]["selected"], rows)
+        expect(
+            len(rows) == 2
+            and all(row["nonce"] == nonce and row["selected"] for row in rows)
+            and sorted(row["member"] for row in rows) == ["debug", "release"],
+            rows,
+        )
 
     with case("04") as scope, scope.run():
         world.adopt(beta)
         permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
         first, first_gate = world.paused(beta, "keyed", "starter one")
         second, second_gate = world.paused(beta, "keyed", "starter two")
-        reserved = world.receipt(beta)["links"][0].get("reserved")
+        reserved = current_reservation(world.receipt(beta))
         expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
         expect(reserved["kind"] == "local", reserved)
         # Both starters keyed the same reserved nonce, before either proceeds.
@@ -1288,7 +1314,7 @@ def run(proof, repo: str) -> None:
             expect(code == 0, f"{label} failed: {stderr}")
         local_root = reserved["root"]
         expect(marker(local_root)["nonce"] == reserved["nonce"], "the created root does not carry the reserved nonce")
-        expect(world.receipt(beta)["links"][0].get("reserved") is None, "the reservation was not consumed")
+        expect(current_reservation(world.receipt(beta)) is None, "the reservation was not consumed")
         permanent.set_recorded_uuid(world.pool, good)
 
     with case("05") as scope, scope.run():
@@ -1296,11 +1322,12 @@ def run(proof, repo: str) -> None:
         world.adopt(gamma)
         permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
         stale, stale_gate = world.paused(gamma, "keyed", "stale starter")
-        reserved = world.receipt(gamma)["links"][0]["reserved"]
+        reserved = current_reservation(world.receipt(gamma))
+        expect(reserved is not None, f"no reservation: {reserved}")
         expect(reserved["nonce"] in keyed_destination(stale_gate), "the stale starter did not key the reserved nonce")
         code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
         expect(code == 0 and "cancelled" in stdout, stdout + stderr)
-        expect(world.receipt(gamma)["links"][0].get("reserved") is None, "the receipt kept the reservation")
+        expect(current_reservation(world.receipt(gamma)) is None, "the receipt kept the reservation")
         expect(
             not any(row.get("reservation") == reserved["id"] or row.get("cancelling") for row in world.registry_doc()["rows"]),
             "the cancelled reservation's row remains",
@@ -1760,7 +1787,8 @@ def run(proof, repo: str) -> None:
         world.adopt(tau)
         permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
         starter, gate = world.paused(tau, "keyed", "overflow starter")
-        reserved = world.receipt(tau)["links"][0]["reserved"]
+        reserved = current_reservation(world.receipt(tau))
+        expect(reserved is not None, f"no reservation: {reserved}")
         expect(reserved.get("overflow", {}).get("registry") == doc["created_by"], reserved)
         expect(all(row["root"] != reserved["root"] for row in world.registry_doc()["rows"]), "an overflow row was invented")
         release(gate)
@@ -2197,6 +2225,64 @@ def self_test() -> int:
         assert 'registry["version"] ==' not in case_one, "case 01 still compares the version inline"
 
     check("current registry format oracle", registry_oracle)
+
+    def receipt_field_paths() -> None:
+        # (a) The current-write reservation is ROOT-LEVEL. A profile receipt
+        # (`oxide.outputs.transition/3`) carries `reserved` at the top level; a
+        # placement-level reservation belongs to the legacy whole-target
+        # `transition/2` document and must never satisfy this oracle.
+        reservation = {"id": "a" * 32, "nonce": "b" * 32}
+        assert current_reservation({"reserved": reservation}) is reservation
+        assert current_reservation(
+            {"links": [{"member": "debug", "reserved": reservation}]}
+        ) is None, "a stale per-placement reservation satisfied the current oracle"
+        # Both shapes present: the current root-level field wins and nothing is
+        # merged from the legacy placement field.
+        mixed = {"reserved": reservation, "links": [{"member": "debug", "reserved": {"id": "c" * 32}}]}
+        assert current_reservation(mixed) is reservation
+        assert current_reservation({"links": [{"member": "debug"}]}) is None
+        assert current_reservation({}) is None
+        # (b) Tie the rule to the FROZEN product's serializer: the placement
+        # field is emitted only for the whole-target version and the root-level
+        # field for the others, and those versions are /2 and /3.
+        source_path = os.path.join(os.path.dirname(HERE), "src", "bin", "oxide", "outputs.rs")
+        with open(source_path, encoding="utf-8") as handle:
+            text = handle.read(2 * 1024 * 1024)
+        assert 'const RECEIPT_VERSION: &str = "oxide.outputs.transition/2";' in text
+        assert 'const PROFILE_RECEIPT_VERSION: &str = "oxide.outputs.transition/3";' in text
+        assert "let legacy = self.version == RECEIPT_VERSION;" in text, "serializer layout rule changed"
+        assert "reserved: legacy.then_some(self.reserved.as_ref()).flatten()," in text, (
+            "the per-placement reservation is no longer gated on the legacy version"
+        )
+        assert "reserved: (!legacy).then_some(self.reserved.as_ref()).flatten()," in text, (
+            "the root-level reservation is no longer the current write"
+        )
+        # (c) The production cases use the accessor, and no case still reads a
+        # placement-level reservation or assumes one registry row per root.
+        case_source = inspect.getsource(run)
+        assert '["links"][0]["reserved"]' not in case_source, case_source
+        assert '["links"][0].get("reserved")' not in case_source, case_source
+        assert case_source.count("current_reservation(") >= 5, case_source
+        # Case 03 no longer assumes one registry row per root; case 21 keeps
+        # its own legacy whole-target one-row assertion (the legacy receipt
+        # places exactly one `target` link).
+        assert 'rows[0]["nonce"] == nonce and rows[0]["selected"]' not in case_source, (
+            case_source
+        )
+        assert 'sorted(row["member"] for row in rows) == ["debug", "release"]' in case_source
+        # (case 21 keeps its own legacy whole-target one-row assertion.)
+        assert 'expect(len(rows) == 1 and rows[0]["selected"], rows)' in case_source
+        # (d) A current profile receipt places one link per member, so the
+        # registry's per-member rows are the current shape (prune.rs
+        # note_placement keys rows by checkout, member and root).
+        prune_path = os.path.join(os.path.dirname(HERE), "src", "bin", "oxide", "prune.rs")
+        with open(prune_path, encoding="utf-8") as handle:
+            prune = handle.read(2 * 1024 * 1024)
+        assert "row.checkout_id == checkout_id && row.member == member" in prune, (
+            "registry rows are no longer keyed by member"
+        )
+
+    check("receipt field paths", receipt_field_paths)
 
     def counted_fail_fast() -> None:
         ran: list[str] = []
