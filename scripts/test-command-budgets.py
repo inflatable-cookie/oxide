@@ -25,8 +25,9 @@ Apparatus contract
 - Lockfile premise: the only `--locked` invocation in this proof is that
   staging build of this repository, whose committed `Cargo.lock` is present at
   the proof's own HEAD. Fixture crates are std-only and are never invoked with
-  `--locked`; Cargo creates their locks inside the pool output, so a fixture
-  checkout without a lock is normal, not an error.
+  `--locked`; Cargo writes their lock beside each fixture manifest in its
+  private checkout, so a fixture checkout without a lock is normal, not an
+  error.
 - Human budget results are recognised only by the product's exact
   `report_stop`/`LOSS_NOTE` grammar. Ordinary Cargo, path or project output
   that contains the word `budget` (the fixture crates are named
@@ -216,6 +217,19 @@ def abort(message: str) -> None:
     for process in OWNED:
         release(process)
     raise Abort(message)
+
+
+def custody_guard(stage: str) -> None:
+    """Stop when any owned child's custody is currently unknown.
+
+    This is shared safety state, not a per-case delta: a case that returns
+    normally can still have left an unresolved owned child (`close_holder` or
+    `release` record it), and direct leader reaping is not descendant closure.
+    Both the counted run and the diagnostic call this before dispatch and after
+    every outcome, so no later case can start on unknown custody.
+    """
+    if UNCERTAIN:
+        abort(f"unknown child custody {stage}: {UNCERTAIN[-1]}")
 
 
 def say(message: str) -> None:
@@ -491,7 +505,7 @@ def plan_document() -> dict:
             "fixtures": "private HOME/CARGO_HOME/OXIDE_CONFIG/OXIDE_POOL/temp and a private tiny checkout cwd",
             "private_home": "OXIDE_TEST_HOME_FROM_ENV=1 with explicit private config and pool (oxide#143 convention)",
             "toolchain": "RUSTUP_TOOLCHAIN=1.97.1, RUSTUP_AUTO_INSTALL=0, RUSTUP_HOME captured before HOME is replaced",
-            "lockfile": "the only --locked call is the staging build of this repository, whose committed Cargo.lock is present; fixture crates are std-only, are never invoked with --locked, and Cargo creates their lock inside the pool output",
+            "lockfile": "the only --locked call is the staging build of this repository, whose committed Cargo.lock is present; fixture crates are std-only, are never invoked with --locked, and Cargo writes their lock beside each fixture manifest in its private checkout",
             "diagnostics": "human budget results are recognised only by the exact report_stop and LOSS_NOTE grammar; innocent project/path/Cargo text containing 'budget' is not a diagnostic",
         },
         "live_pool": False,
@@ -1844,7 +1858,9 @@ class Proof:
     def run(self) -> None:
         self.prepare()
         for entry in CASE_FUNCTIONS:
+            custody_guard(f"before {entry.__name__}")
             entry(self.root, self.subject)
+            custody_guard(f"after {entry.__name__}")
             work_left()
         say(f"cases run: {', '.join(CASES)}")
 
@@ -1860,10 +1876,16 @@ class Proof:
         self.prepare()
         pending = list(CASE_FUNCTIONS)
         while pending:
-            function = pending.pop(0)
-            name = function.__name__
-            uncertain_before = len(UNCERTAIN)
+            name = pending[0].__name__
             fault_before = PRIMARY_FAULT
+            # Custody is shared state: pre-existing uncertainty stops dispatch.
+            try:
+                custody_guard("before dispatch")
+            except Abort as error:
+                summary["aborted"] = f"{name}: {error}"
+                summary["skipped"] = [entry.__name__ for entry in pending]
+                raise
+            function = pending.pop(0)
             try:
                 function(self.root, self.subject)
             except Abort as error:
@@ -1882,22 +1904,40 @@ class Proof:
                     }
                 )
                 say(f"diagnostic: {name} failed ({text}); continuing with independent cases")
-                if len(UNCERTAIN) != uncertain_before:
-                    summary["aborted"] = f"{name}: unknown child custody after a recoverable failure"
-                    summary["skipped"] = [entry.__name__ for entry in pending]
-                    PRIMARY_FAULT = fault_before
-                    raise Abort(summary["aborted"])
                 PRIMARY_FAULT = fault_before
+                try:
+                    custody_guard("after a recoverable failure")
+                except Abort as custody_error:
+                    summary["aborted"] = f"{name}: {custody_error}"
+                    summary["skipped"] = [entry.__name__ for entry in pending]
+                    raise
                 summary["continued_after_failure"].append(name)
                 continue
+            # A nominally successful case can still have left unknown custody.
+            try:
+                custody_guard("after a successful case")
+            except Abort as custody_error:
+                summary["aborted"] = f"{name}: {custody_error}"
+                summary["skipped"] = [entry.__name__ for entry in pending]
+                raise
             summary["completed"].append(name)
         say(f"diagnostic cases run: {', '.join(CASES)}")
 
     def document(self, fault: str | None, diagnostic: dict | None = None) -> dict:
         planned = [entry["name"] for entry in plan_document()["cases"]]
         recorded = fault
-        if recorded is None and diagnostic is not None and diagnostic.get("failures"):
+        if diagnostic is not None and diagnostic.get("failures"):
+            # The earliest recorded oracle failure stays the primary fault even
+            # when a later custody abort ends the collection; the abort itself
+            # remains visible under diagnostic.aborted.
             recorded = diagnostic["failures"][0]["fault"]
+        # The live evidence ring can be overwritten by later cases, so a
+        # diagnostic keeps the first failure's evidence snapshot as primary.
+        evidence = list(FAULT_DETAIL)
+        if diagnostic is not None and diagnostic.get("failures"):
+            first_evidence = diagnostic["failures"][0].get("evidence") or []
+            if first_evidence:
+                evidence = list(first_evidence)
         failed = [entry for entry in RESULTS if entry["result"] != "pass"]
         if recorded is not None:
             failed = failed + [{"case": "primary", "result": "fail", "detail": recorded}]
@@ -1920,7 +1960,7 @@ class Proof:
             "failed": failed,
             "unexecuted": [name for name in planned if name not in CASES],
             "cases": RESULTS,
-            "first_fault_evidence": list(FAULT_DETAIL),
+            "first_fault_evidence": evidence,
             "primary_fault": recorded,
             "uncertain_custody": list(UNCERTAIN),
             "allocation": phase_allocation(),
@@ -2058,7 +2098,8 @@ def self_check() -> None:
     ]
     expect(len(locked) == 1, "the proof gained a --locked call its lockfile premise does not cover")
     expect(
-        plan["provenance"]["lockfile"].startswith("the only --locked call is the staging build"),
+        plan["provenance"]["lockfile"].startswith("the only --locked call is the staging build")
+        and "beside each fixture manifest" in plan["provenance"]["lockfile"],
         "the lockfile premise changed",
     )
     expect("grammar" in plan["provenance"]["diagnostics"], "the diagnostic-grammar premise changed")
@@ -2512,7 +2553,14 @@ def self_test() -> None:
         and diag_receipt["result"] == "diagnostic",
         "the diagnostic receipt is not distinctly unqualified",
     )
-    expect(diag_receipt["primary_fault"] == fault, "the diagnostic receipt lost its abort text")
+    expect(
+        diag_receipt["primary_fault"] == summary["failures"][0]["fault"],
+        "the diagnostic receipt lost its first recorded fault",
+    )
+    expect(
+        "infrastructure boom" in (diag_receipt["diagnostic"].get("aborted") or ""),
+        "the diagnostic receipt lost the later abort",
+    )
     failure_evidence = diag_receipt["diagnostic"]["failures"][0]["evidence"]
     expect(
         failure_evidence and failure_evidence[-1]["label"] == "first"
@@ -2544,6 +2592,133 @@ def self_test() -> None:
         f"an unknown-child outcome did not abort the diagnostic: {uncertain_fault}",
     )
     expect(uncertain_summary["aborted"], "the unknown-child abort was not recorded")
+
+    # ---- custody is shared safety state: ANY current uncertainty stops
+    # dispatch before and after every outcome, in both modes, including when a
+    # case returns green. A mutation that removes the check must be visible.
+    def custody_cases(module, order):
+        def green_then_unknown(root, subject):
+            order.append("green")
+            module.case("green-unknown")
+            module.UNCERTAIN.append("owned pid 4242 did not settle")
+
+        def never_again(root, subject):
+            order.append("next")
+            module.case("next-independent")
+
+        return (green_then_unknown, never_again)
+
+    guarded = load()
+    guarded.Proof.prepare = lambda self: None
+    order = []
+    guarded.CASE_FUNCTIONS = custody_cases(guarded, order)
+    guarded.DIAGNOSTIC_DEPENDENCIES = {entry.__name__: [] for entry in guarded.CASE_FUNCTIONS}
+    green_summary = guarded.diagnostic_summary()
+    green_fault = guarded.capture_fault(lambda: guarded.Proof(scratch, "s" * 64).run_diagnostic(green_summary))
+    expect(order == ["green"], f"a case started after green-case custody uncertainty: {order}")
+    expect(
+        green_fault is not None and "unknown child custody" in green_fault,
+        f"a green case's custody uncertainty did not abort: {green_fault}",
+    )
+    expect(green_summary["completed"] == [], "an uncertain green case was reported completed")
+    expect(green_summary["skipped"] == ["never_again"], f"skips are not truthful: {green_summary['skipped']}")
+
+    # The mutation removing the post-success check lets the next case run, so
+    # the test above is meaningful rather than vacuous.
+    unguarded = load()
+    unguarded.Proof.prepare = lambda self: None
+    unguarded.custody_guard = lambda stage: None
+    mutated_order = []
+    unguarded.CASE_FUNCTIONS = custody_cases(unguarded, mutated_order)
+    unguarded.DIAGNOSTIC_DEPENDENCIES = {entry.__name__: [] for entry in unguarded.CASE_FUNCTIONS}
+    mutated_summary = unguarded.diagnostic_summary()
+    unguarded.capture_fault(lambda: unguarded.Proof(scratch, "s" * 64).run_diagnostic(mutated_summary))
+    expect(
+        mutated_order == ["green", "next"],
+        f"the post-success custody mutation was not observable: {mutated_order}",
+    )
+
+    # Pre-existing uncertainty stops dispatch before the first case runs.
+    preexisting = load()
+    preexisting.Proof.prepare = lambda self: None
+    preexisting.UNCERTAIN.append("owned pid 4343 was already unknown")
+    preexisting_order = []
+    preexisting.CASE_FUNCTIONS = (
+        lambda root, subject: preexisting_order.append("first"),
+    )
+    preexisting.DIAGNOSTIC_DEPENDENCIES = {"<lambda>": []}
+    preexisting_summary = preexisting.diagnostic_summary()
+    preexisting_fault = preexisting.capture_fault(
+        lambda: preexisting.Proof(scratch, "s" * 64).run_diagnostic(preexisting_summary)
+    )
+    expect(preexisting_order == [], f"a case ran with pre-existing custody uncertainty: {preexisting_order}")
+    expect(
+        preexisting_fault is not None and "unknown child custody" in preexisting_fault,
+        f"pre-existing uncertainty did not abort: {preexisting_fault}",
+    )
+
+    # Counted mode uses the same boundary: green + uncertainty aborts and no
+    # later case starts; a clean dispatch still completes.
+    counted = load()
+    counted.Proof.prepare = lambda self: None
+    counted_order = []
+    counted.CASE_FUNCTIONS = custody_cases(counted, counted_order)
+    counted_fault = counted.capture_fault(lambda: counted.Proof(scratch, "s" * 64).run())
+    expect(counted_order == ["green"], f"counted mode started a case after uncertainty: {counted_order}")
+    expect(
+        counted_fault is not None and "unknown child custody" in counted_fault,
+        f"counted mode continued on unknown custody: {counted_fault}",
+    )
+    clean_counted = load()
+    clean_counted.Proof.prepare = lambda self: None
+    clean_counted.CASE_FUNCTIONS = (
+        lambda root, subject: clean_counted.case("one"),
+        lambda root, subject: clean_counted.case("two"),
+    )
+    expect(
+        clean_counted.capture_fault(lambda: clean_counted.Proof(scratch, "s" * 64).run()) is None,
+        "a clean counted dispatch changed",
+    )
+
+    # An earlier recorded oracle stays the primary fault and keeps its own
+    # bounded evidence after a later green case aborts on unknown custody.
+    sequence = load()
+    sequence.Proof.prepare = lambda self: None
+
+    def oracle_case(root, subject):
+        sequence.case("early-oracle")
+        sequence.record_detail("early-oracle", "earlier stderr line\n", [{"seq": 1, "event": "finished"}])
+        sequence.fail("earlier oracle boom")
+
+    def later_unknown(root, subject):
+        sequence.CASE_FUNCTIONS  # keep the closure explicit
+        sequence.case("later-green")
+        sequence.UNCERTAIN.append("owned pid 4545 did not settle")
+
+    sequence.CASE_FUNCTIONS = (oracle_case, later_unknown)
+    sequence.DIAGNOSTIC_DEPENDENCIES = {entry.__name__: [] for entry in sequence.CASE_FUNCTIONS}
+    sequence_summary = sequence.diagnostic_summary()
+    sequence_fault = sequence.capture_fault(
+        lambda: sequence.Proof(scratch, "s" * 64).run_diagnostic(sequence_summary)
+    )
+    expect(
+        sequence_fault is not None and "unknown child custody" in sequence_fault,
+        f"the later custody abort was not visible: {sequence_fault}",
+    )
+    sequence_receipt = sequence.Proof(scratch, "s" * 64).document(sequence_fault, diagnostic=sequence_summary)
+    expect(
+        sequence_receipt["primary_fault"] == "earlier oracle boom",
+        f"the earlier oracle stopped being primary: {sequence_receipt['primary_fault']}",
+    )
+    expect(
+        sequence_receipt["first_fault_evidence"]
+        and sequence_receipt["first_fault_evidence"][-1]["label"] == "early-oracle",
+        "the earlier oracle's bounded evidence was overwritten by the later abort",
+    )
+    expect(
+        "unknown child custody" in (sequence_receipt["diagnostic"].get("aborted") or ""),
+        "the receipt hid the later custody abort",
+    )
 
     # ---- holder: an empty subject must fail, a real one must acquire ----
     holder = load()
@@ -2608,7 +2783,8 @@ def self_test() -> None:
     print(
         "self-test: ok (faked bodies for fast-start/late/cumulative/nested/deadline/preparation/"
         "unbudgeted/holders, human-diagnostic grammar counterfactuals, bounded fault evidence, "
-        "diagnostic keep-going/abort/receipt counterfactuals and lifecycle fault paths)"
+        "diagnostic keep-going/abort/receipt counterfactuals, shared custody boundaries "
+        "(pre-existing, green, post-failure, counted/default) and lifecycle fault paths)"
     )
 
 
