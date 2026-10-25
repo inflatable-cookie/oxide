@@ -36,6 +36,7 @@ import tempfile
 import time
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -2422,6 +2423,1212 @@ class PureClosureDecision(unittest.TestCase):
                                                            "held": [], **mutation}), label)
 
 
+# Settlement observation (oxide#147) --------------------------------------------
+#
+# The supervisor records observation-only evidence of the 10 s settlement window
+# so a run that ends with no completed post-reap census round can be told apart
+# from one whose round was certain and empty. These helpers judge a record that
+# the REAL monitor/custodian paths produced; the mutations below prove each
+# check is load-bearing rather than a restatement of the constants.
+
+SETTLE_KEYS = {
+    "schema", "clock", "stopped_sent_ns", "stopped_received_ns", "stopped_seq",
+    "receive_latency_ns", "leader_bound", "thread_start_ns", "thread_start_latency_ns",
+    "census_built_ns", "first_round_ns", "first_round_latency_ns", "stop_requested_ns",
+    "loop_exit_ns", "rounds_started", "rounds_completed", "omitted", "phase", "rounds",
+}
+SETTLE_ROUND_KEYS = {
+    "index", "phase", "start_ns", "scanned_ns", "snapshot_ns", "scan_ns", "rows",
+    "esrch_rows", "zombie_rows", "confirm_reads", "pause_calls", "lock_wait_ns",
+    "lock_acquired_ns", "lock_released_ns", "sent_ns", "end_ns", "certain", "members",
+    "uncertain",
+}
+SETTLE_ROUND_STAMPS = ("start_ns", "lock_wait_ns", "lock_acquired_ns", "lock_released_ns",
+                       "sent_ns", "end_ns")
+
+
+def _stamp(value):
+    return value is None or (type(value) is int and 0 <= value <= bounded.U64MAX)
+
+
+def _count(value):
+    return value is None or (type(value) is int and 0 <= value <= bounded.U64MAX)
+
+
+def settlement_stamps(record):
+    """Every stamp in the record, in the order the real path writes them."""
+    stamps = [record.get("stopped_sent_ns"), record.get("stopped_received_ns"),
+              record.get("thread_start_ns"), record.get("first_round_ns")]
+    for entry in record.get("rounds") or []:
+        if isinstance(entry, dict):
+            stamps += [entry.get(name) for name in SETTLE_ROUND_STAMPS]
+    return [value for value in stamps if value is not None]
+
+
+def settlement_problems(record):
+    """Why an observed settlement record is not usable evidence, or []."""
+    if not isinstance(record, dict):
+        return ["not an object"]
+    problems = []
+    if set(record) != SETTLE_KEYS:
+        problems.append(f"schema keys differ: {sorted(set(record) ^ SETTLE_KEYS)}")
+    if record.get("schema") != 1 or record.get("clock") != "CLOCK_UPTIME_RAW":
+        problems.append("unknown schema or clock")
+    if record.get("phase") not in bounded.SETTLE_PHASES:
+        problems.append(f"unknown phase {record.get('phase')!r}")
+    if not isinstance(record.get("leader_bound"), (bool, type(None))):
+        problems.append("ill-typed leader_bound")
+    if not _count(record.get("stopped_seq")):
+        problems.append("ill-typed stopped_seq")
+    for name in ("stopped_sent_ns", "stopped_received_ns", "thread_start_ns", "census_built_ns",
+                 "first_round_ns", "receive_latency_ns", "thread_start_latency_ns",
+                 "first_round_latency_ns", "stop_requested_ns", "loop_exit_ns"):
+        if not _stamp(record.get(name)):
+            problems.append(f"ill-typed {name}")
+    for name in ("rounds_started", "rounds_completed", "omitted"):
+        if type(record.get(name)) is not int or record[name] < 0:
+            problems.append(f"bad counter {name}")
+    rounds = record.get("rounds")
+    if not isinstance(rounds, list) or len(rounds) > bounded.SETTLE_MAX_ROUNDS:
+        return problems + ["round list missing or over the cap"]
+    if type(record.get("rounds_started")) is int and type(record.get("omitted")) is int and \
+            record["rounds_started"] != len(rounds) + record["omitted"]:
+        problems.append("rounds_started does not equal kept plus omitted")
+    completed = 0
+    for index, entry in enumerate(rounds):
+        if not isinstance(entry, dict) or set(entry) != SETTLE_ROUND_KEYS:
+            problems.append(f"round {index} schema")
+            continue
+        if entry.get("phase") not in bounded.SETTLE_ROUND_STEPS:
+            problems.append(f"round {index} unknown phase {entry.get('phase')!r}")
+        if entry.get("index") != index:
+            problems.append(f"round {index} wrong index")
+        if not all(_stamp(entry.get(name)) for name in SETTLE_ROUND_STAMPS):
+            problems.append(f"round {index} ill-typed stamp")
+            continue
+        if not all(_count(entry.get(name)) for name in ("snapshot_ns", "scan_ns", "rows", "esrch_rows",
+                                                        "zombie_rows", "confirm_reads", "pause_calls",
+                                                        "members", "uncertain")):
+            problems.append(f"round {index} ill-typed count")
+        if not isinstance(entry.get("certain"), (bool, type(None))):
+            problems.append(f"round {index} ill-typed certain")
+        stamps = [entry[name] for name in SETTLE_ROUND_STAMPS if entry[name] is not None]
+        if any(later < earlier for earlier, later in zip(stamps, stamps[1:])):
+            problems.append(f"round {index} stamps not non-decreasing: {stamps}")
+        if entry.get("phase") == "complete":
+            completed += 1
+            if len(stamps) != len(SETTLE_ROUND_STAMPS):
+                problems.append(f"round {index} complete with a missing stamp")
+            if entry.get("scanned_ns") is None or entry.get("certain") is None:
+                problems.append(f"round {index} complete without its phases")
+            elif entry["scanned_ns"] < entry["start_ns"]:
+                problems.append(f"round {index} scanned before it started")
+    if type(record.get("rounds_completed")) is int and record.get("omitted") == 0 \
+            and completed != record["rounds_completed"]:
+        problems.append("rounds_completed does not match the complete records")
+    chain = [value for value in (record.get("stopped_sent_ns"), record.get("stopped_received_ns"),
+                                 record.get("thread_start_ns"), record.get("first_round_ns"),
+                                 rounds[0].get("start_ns") if rounds else None) if type(value) is int]
+    if any(later < earlier for earlier, later in zip(chain, chain[1:])):
+        problems.append(f"settlement stamps out of order: {chain}")
+    every = settlement_stamps(record)
+    if len(every) > 2 and len(set(every)) == 1:
+        problems.append("every stamp is one value: a frozen clock, not an observation")
+    try:
+        blob = json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        if len(blob) > bounded.SETTLE_MAX_BYTES:
+            problems.append(f"settlement over the byte ceiling: {len(blob)}")
+    except BaseException:
+        problems.append("settlement is not serializable")
+    return problems
+
+
+class FakeCensus:
+    """Stands in for the host snapshot in the pure settlement cases: it reads
+    no host process and spawns nothing."""
+
+    rounds = 0
+
+    def __init__(self, sid, terminal_allowed=False):
+        self.sid, self.terminal_allowed = sid, terminal_allowed
+        self.stats = {"rows": 3, "esrch_rows": 1, "zombie_rows": 1, "confirm_reads": 2,
+                      "pause_calls": 1, "terminal": 0, "snapshot_ns": 5, "scan_ns": 7,
+                      "snapshot_error": False}
+
+    def round(self):
+        FakeCensus.rounds += 1
+        return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                "uncertain_rows": [], "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+
+class OneShotStop:
+    """`census_stop` stand-in whose first wait ends the real loop after the
+    round it follows, so the loop body runs exactly once."""
+
+    def __init__(self, stopped=False):
+        self.stopped = stopped
+
+    def is_set(self):
+        return self.stopped
+
+    def wait(self, _timeout):
+        self.stopped = True
+        return True
+
+    def set(self):
+        self.stopped = True
+
+
+class PureSettlement(unittest.TestCase):
+    """Oxide#147: the settlement diagnostics the real monitor and custodian
+    write, and the oracles that must reject a missing, reordered, duplicated,
+    over-cap or frozen assertion instead of mirroring the constants."""
+
+    def monitor(self, leader=(4242, 77)):
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_r, out_r, err_r, ctl_w, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor({"run_id": "r", "inject": [],
+                                   "terminal_mode": {"mode": "strict"}},
+                                  ctl_w, cmd_r, out_r, err_r)
+        # The receipt setup() builds holds this same object, so a publish
+        # serializes the diagnostics without a second write path.
+        monitor.receipt = {"census": None, "census_rounds": 0, "settlement": monitor.settlement}
+        monitor.leader = None if leader is None else list(leader)
+        monitor.census_stop = OneShotStop()
+        return monitor, ctl_r
+
+    def run_loop(self, monitor, after=7):
+        saved = bounded.Census
+        bounded.Census = FakeCensus
+        try:
+            monitor.census_loop(after)
+        finally:
+            bounded.Census = saved
+
+    def custodian(self):
+        read_end, cmd_w = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, cmd_w)
+        custodian = bounded.Custodian(["true"])
+        custodian.run_id = "r"
+        custodian.cmd_w = cmd_w
+        custodian.guard = bounded.Guard(0)
+        custodian.leader = 4242
+        custodian.leader_status = 0
+        custodian.reaped_seq = 3
+        custodian.exit_at = 1  # the grace window is already past: a bounded decision
+        return custodian, read_end
+
+    def records(self, custodian, read_end):
+        blob = os.read(read_end, 1 << 20).decode()
+        out = []
+        for line in blob.splitlines():
+            message = json.loads(line)
+            if message.get("type") == "record":
+                out.append(message["record"])
+        return out
+
+    def message(self, custodian, kind, **fields):
+        return {"run": custodian.run_id, "seq": custodian.monitor_seq + 1, "leader": [4242, 77],
+                "type": kind, "at": 1, **fields}
+
+    # The real census thread and receipt path.
+
+    def test_census_loop_records_the_real_round_and_keeps_the_message(self):
+        monitor, ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS + 250_000)
+        self.run_loop(monitor)
+        record = monitor.settlement
+        self.assertEqual(settlement_problems(record), [])
+        self.assertEqual((record["rounds_started"], record["rounds_completed"]), (1, 1))
+        self.assertEqual((record["phase"], record["stopped_seq"], record["leader_bound"]),
+                         ("loop-exit", 7, True))
+        self.assertEqual(record["receive_latency_ns"], 250_000)
+        entry = record["rounds"][0]
+        self.assertEqual((entry["rows"], entry["confirm_reads"], entry["pause_calls"],
+                          entry["snapshot_ns"], entry["scan_ns"]), (3, 2, 1, 5, 7))
+        self.assertEqual((entry["certain"], entry["members"], entry["uncertain"]), (True, 0, 0))
+        self.assertEqual(entry["phase"], "complete")
+        self.assertIs(monitor.receipt["settlement"], record)
+        self.assertEqual(monitor.receipt["census_rounds"], 1)
+        blob = os.read(ctl_r, 1 << 20).decode().splitlines()
+        self.assertEqual(len(blob), 1)
+        message = json.loads(blob[0])
+        self.assertEqual(set(message), {"run", "leader", "seq", "at", "type", "after", "members",
+                                        "uncertain", "certain"})
+        self.assertEqual((message["after"], message["certain"]), (7, True))
+
+    def test_missing_completion_is_distinguishable_from_an_empty_census(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 9, "sent": 100}, 200)
+        monitor.census_stop = OneShotStop(stopped=True)  # the loop exits before a round
+        self.run_loop(monitor, after=9)
+        stalled = monitor.settlement
+        self.assertEqual((stalled["rounds_started"], stalled["rounds_completed"]), (0, 0))
+        self.assertIsNone(stalled["first_round_ns"])
+        self.assertIsNotNone(stalled["thread_start_ns"])
+        self.assertIsNone(monitor.receipt["census"])
+        self.assertEqual(settlement_problems(stalled), [])
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 9, "sent": 100}, 200)
+        self.run_loop(monitor, after=9)
+        finished = monitor.settlement
+        self.assertEqual((finished["rounds_started"], finished["rounds_completed"]), (1, 1))
+        self.assertEqual(monitor.receipt["census"]["certain"], True)
+        self.assertEqual(monitor.receipt["census"]["members"], 0)
+        self.assertNotEqual(stalled["rounds_completed"], finished["rounds_completed"])
+
+    def test_a_frozen_clock_is_rejected_not_mirrored(self):
+        monitor, _ctl_r = self.monitor()
+        saved = bounded.now_ns
+        bounded.now_ns = lambda: 1000 * NS
+        try:
+            monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS)
+            self.run_loop(monitor)
+        finally:
+            bounded.now_ns = saved
+        problems = settlement_problems(monitor.settlement)
+        self.assertTrue(problems)
+        self.assertTrue(any("frozen clock" in problem for problem in problems), problems)
+
+    def test_reordered_or_duplicated_stamps_are_rejected(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS + 250_000)
+        self.run_loop(monitor)
+        self.assertEqual(settlement_problems(monitor.settlement), [])
+        entry = monitor.settlement["rounds"][0]
+        good = dict(entry)
+        for label, mutation, needle in (
+                ("sent before the lock", {"sent_ns": good["lock_wait_ns"] - 1}, "non-decreasing"),
+                ("complete without a stamp", {"end_ns": None}, "missing stamp"),
+                ("duplicate under a new name", {"end_ns_copy": good["end_ns"]}, "schema"),
+                ("unknown phase", {"phase": "finished"}, "unknown phase"),
+                ("scanned before it started", {"scanned_ns": good["start_ns"] - 1}, "scanned"),
+                ("bool as a count", {"rows": True}, "ill-typed count"),
+                ("wrong index", {"index": 9}, "wrong index")):
+            with self.subTest(label):
+                entry.clear()
+                entry.update(good)
+                entry.update(mutation)
+                problems = settlement_problems(monitor.settlement)
+                self.assertTrue(any(needle in problem for problem in problems), problems)
+
+    def test_record_level_mutations_are_rejected(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS + 250_000)
+        self.run_loop(monitor)
+        record = monitor.settlement
+        self.assertEqual(settlement_problems(record), [])
+        saved = dict(record)
+        for label, mutation, needle in (
+                ("extra field", {"settled_ns": 1}, "schema keys"),
+                ("unknown clock", {"clock": "mach_absolute"}, "unknown schema"),
+                ("unknown phase", {"phase": "idle"}, "unknown phase"),
+                ("completed without a record", {"rounds_completed": 2}, "rounds_completed"),
+                ("started without kept or omitted", {"rounds_started": 3}, "does not equal"),
+                ("receive before the send", {"stopped_received_ns": 1000 * NS - 1}, "out of order"),
+                ("string stamp", {"thread_start_ns": "now"}, "ill-typed"),
+                ("bool stamp", {"first_round_ns": True}, "ill-typed")):
+            with self.subTest(label):
+                record.clear()
+                record.update(saved)
+                record.update(mutation)
+                problems = settlement_problems(record)
+                self.assertTrue(any(needle in problem for problem in problems), problems)
+
+    def test_round_records_are_capped_and_the_remainder_counted(self):
+        monitor, _ctl_r = self.monitor()
+        entries = [monitor.note_round(index * NS) for index in range(bounded.SETTLE_MAX_ROUNDS + 5)]
+        record = monitor.settlement
+        self.assertEqual(len(record["rounds"]), bounded.SETTLE_MAX_ROUNDS)
+        self.assertEqual((record["omitted"], record["rounds_started"]),
+                         (5, bounded.SETTLE_MAX_ROUNDS + 5))
+        self.assertIsNone(entries[-1])
+        monitor.note(entries[-1], phase="complete", sent_ns=1)  # a capped round takes nothing
+        self.assertEqual(record["rounds"][-1]["phase"], "start")
+        self.assertEqual(settlement_problems(record), [])
+
+    def test_worst_case_record_stays_under_the_byte_ceiling(self):
+        monitor, _ctl_r = self.monitor()
+        base = NS
+        monitor.note(stopped_sent_ns=base - 3, stopped_received_ns=base - 2,
+                     thread_start_ns=base - 1, census_built_ns=base)
+        for index in range(bounded.SETTLE_MAX_ROUNDS):
+            start = base + index * 10
+            entry = monitor.note_round(start)
+            monitor.note(entry, phase="complete", scanned_ns=start + 1, snapshot_ns=bounded.U64MAX,
+                         scan_ns=bounded.U64MAX, rows=bounded.U64MAX, esrch_rows=bounded.U64MAX,
+                         zombie_rows=bounded.U64MAX, confirm_reads=bounded.U64MAX,
+                         pause_calls=bounded.U64MAX, lock_wait_ns=start + 2,
+                         lock_acquired_ns=start + 3, lock_released_ns=start + 4,
+                         sent_ns=start + 5, end_ns=bounded.U64MAX, certain=True,
+                         members=bounded.U64MAX, uncertain=bounded.U64MAX)
+        monitor.note(rounds_completed=bounded.SETTLE_MAX_ROUNDS, phase="loop-exit")
+        record = monitor.settlement
+        blob = json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        self.assertLessEqual(len(blob), bounded.SETTLE_MAX_BYTES)
+        self.assertEqual(settlement_problems(record), [])
+        record["rounds"][0]["rows"] = bounded.U64MAX + 1  # over the fixed integer width
+        self.assertTrue(any("ill-typed count" in problem for problem in settlement_problems(record)))
+
+    def test_missing_or_ill_typed_custodian_clock_is_unknown(self):
+        monitor, _ctl_r = self.monitor()
+        for command, expected in (
+                ({"seq": 5}, None), ({"seq": 5, "sent": "1000"}, None),
+                ({"seq": 5, "sent": True}, None), ({"seq": 5, "sent": -1}, None),
+                ({"seq": 5, "sent": 2000}, None),  # later than the receive: never a latency
+                ({"seq": 5, "sent": 1000}, 500)):
+            with self.subTest(command=command):
+                monitor.settlement.clear()
+                monitor.settlement.update(bounded.settlement_record())
+                monitor.note_stopped(command, 1500)
+                self.assertEqual(monitor.settlement["receive_latency_ns"], expected)
+                self.assertEqual(monitor.settlement["stopped_received_ns"], 1500)
+                self.assertEqual(monitor.settlement["stopped_seq"], 5)
+                self.assertEqual(monitor.settlement["phase"], "received")
+        monitor.settlement.clear()
+        monitor.settlement.update(bounded.settlement_record())
+        monitor.note_stopped(["not", "an", "object"], 1500)  # never raises
+        self.assertIsNone(monitor.settlement["receive_latency_ns"])
+
+    # The real census round's observation-only counters.
+
+    def test_census_counters_follow_the_real_reads_and_leave_classification_alone(self):
+        table = FakeTable([row(108, zombie=True)], {108: ProcessLookupError(3, "gone")},
+                          reread={108: lambda reads: row(108, zombie=True)})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
+        self.assertNotIn("stats", result)
+        stats = check.stats
+        self.assertEqual((stats["rows"], stats["zombie_rows"], stats["esrch_rows"]), (1, 1, 1))
+        self.assertEqual((stats["confirm_reads"], stats["pause_calls"]), (bounded.CONFIRM_TRIES,
+                                                                          bounded.CONFIRM_TRIES - 1))
+        self.assertGreaterEqual(stats["scan_ns"], 0)
+        self.assertGreaterEqual(stats["snapshot_ns"], 0)
+        table.rows, table.sessions, table.rereads = [], {}, {}
+        check.round()
+        self.assertEqual((check.stats["rows"], check.stats["confirm_reads"], check.stats["pause_calls"]),
+                         (0, 0, 0))  # counters reset per round
+
+    def test_failed_snapshot_is_recorded_without_changing_the_result(self):
+        def broken():
+            raise OSError(12, "injected")
+
+        check = bounded.Census(100, snapshot=broken)
+        result = check.round()
+        self.assertFalse(result["certain"])
+        self.assertTrue(check.stats["snapshot_error"])
+        self.assertEqual(check.stats["rows"], 0)
+        self.assertNotIn("stats", result)
+
+    # The real custodian decision-time snapshot.
+
+    def test_custodian_snapshot_names_the_decision_time_facts(self):
+        custodian, read_end = self.custodian()
+        for kind, fields in (("output_eof", {"stream": "stdout"}), ("output_eof", {"stream": "stderr"}),
+                             ("census", {"after": 2, "members": 4, "uncertain": 0, "certain": True}),
+                             ("census", {"after": 3, "members": 0, "uncertain": 0, "certain": True})):
+            custodian.accept(self.message(custodian, kind, **fields))
+        self.assertTrue(custodian.census_ok)
+        custodian.settle(True)
+        settlement = [record for record in self.records(custodian, read_end)
+                      if record["event"] == "settlement"]
+        self.assertEqual(len(settlement), 1)
+        snapshot = settlement[0]
+        self.assertEqual((snapshot["census_messages"], snapshot["census_eligible"]), (2, 1))
+        self.assertTrue(snapshot["census_ok"])
+        self.assertFalse(snapshot["census_uncertain"])
+        self.assertIsNone(snapshot["fault"])
+        self.assertIsNotNone(snapshot["stopped_sent_ns"])
+        self.assertEqual(snapshot["census_end_ns"], 1)  # bounded by exit_at, not a new clock
+        self.assertEqual(snapshot["wait_ns"], 0)
+        # Only the post-reap message is timed; the pre-reap one is counted but
+        # never mistaken for settlement evidence.
+        self.assertEqual(snapshot["first_census_ns"], snapshot["last_census_ns"])
+        self.assertEqual(snapshot["eof"], ["stderr", "stdout"])
+
+    def test_custodian_snapshot_records_an_absent_census_as_zero_messages(self):
+        custodian, read_end = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stderr"))
+        custodian.settle(True)
+        snapshot = [record for record in self.records(custodian, read_end)
+                    if record["event"] == "settlement"][0]
+        self.assertEqual(snapshot["census_messages"], 0)
+        self.assertIsNone(snapshot["first_census_ns"])
+        self.assertIsNone(snapshot["last_census_ns"])
+        self.assertFalse(snapshot["census_ok"])
+        self.assertEqual(snapshot["fault"], CENSUS_FAULT)
+
+    def test_a_failed_observation_write_can_never_latch_or_reopen_a_closure(self):
+        custodian, _read_end = self.custodian()
+        fd = os.open(os.devnull, os.O_WRONLY)
+        os.close(fd)
+        custodian.cmd_w = fd  # every write fails with EBADF
+        custodian.census_ok, custodian.eof = True, {"stdout", "stderr"}
+        custodian.observe_settlement(True, None)
+        self.assertIsNone(custodian.guard.fault)
+        self.assertTrue(custodian.closure(True))
+        custodian.observe_settlement(True, custodian.exit_at)
+        self.assertIsNone(custodian.guard.fault)
+
+
+# Oxide#147 correction: serial reference scheduling at 8849f99 ----------------
+#
+# Production now confirms ESRCH identities in shared passes (one CONFIRM_PAUSE
+# per pass, one reread per pending identity per pass). The reference below is a
+# verbatim copy of `Census.confirm_gone_info` and `Census.round` from
+# scripts/bounded-test.py at 8849f99, before that correction: one identity at a
+# time with its own pause before every further confirmation read. Production
+# never selects this class; only the differential cases instantiate it, to show
+# the corrected scheduling returns exactly the same round data and still grants
+# every identity exactly its existing observations and spacing.
+#
+# The module names the copied bodies use are bound here once, so a mutation of
+# a production constant or helper cannot silently move the reference with it.
+
+CONFIRM_TRIES = bounded.CONFIRM_TRIES
+CONFIRM_PAUSE = bounded.CONFIRM_PAUSE
+U64MAX = bounded.U64MAX
+TERMINAL_STATUS_VALUES = bounded.TERMINAL_STATUS_VALUES
+DIAG_MAX_BYTES = bounded.DIAG_MAX_BYTES
+DIAG_MAX_ROWS = bounded.DIAG_MAX_ROWS
+_diag_row = bounded._diag_row
+_diag_classify = bounded._diag_classify
+_terminal_fields = bounded._terminal_fields
+_same_complete_zombie = bounded._same_complete_zombie
+_terminal_witness_row = bounded._terminal_witness_row
+_fit_witnesses = bounded._fit_witnesses
+_ERRNO = bounded._ERRNO
+_diag_object = bounded._diag_object
+
+
+class SerialCensus(bounded.Census):
+    """Test-only serial reference: the scheduling in use at 8849f99.
+
+    It binds the shared terminal predicate itself, so a counterfactual that
+    patches the production method cannot silently move the reference too."""
+
+    terminal_eligible = bounded.Census.terminal_eligible
+
+    def confirm_gone_info(self, row):
+        """Confirm absence, reporting how. Returns (gone, tries, outcome,
+        error, first_row, first_error, all_clean).
+
+        `gone` follows the existing Gone rule (a successful read lacking the
+        identity); `tries` is the bounded 1..20 re-read count; `outcome` is
+        one of absent/replaced/matching_exhausted/read_failed; `error` is
+        the reread exception or None. `first_row`/`first_error` carry the
+        FIRST existing confirmation read (a dict, None when absent, or the
+        exception). `all_clean` reports whether every actually performed
+        non-terminal read showed the same complete SZOMB identity (a later
+        Gone still takes priority and ends the confirmation). The terminal
+        rule reuses all of this with no added reads. Same reads, pauses
+        and budget as confirm_gone; no early short-circuit."""
+        tries, first_row, first_error, all_clean = 0, "unset", None, True
+        for attempt in range(CONFIRM_TRIES):
+            if attempt:
+                self.pause(CONFIRM_PAUSE)
+                try:
+                    self.stats["pause_calls"] += 1  # observation only
+                except BaseException:
+                    pass
+            tries += 1
+            try:
+                self.stats["confirm_reads"] += 1  # observation only
+            except BaseException:
+                pass
+            try:
+                again = self.reread(row["pid"])
+            except Exception as error:
+                if attempt == 0:
+                    first_error = error
+                return (False, tries, "read_failed", error, first_row, first_error, False)
+            if attempt == 0:
+                first_row, first_error = again, None
+            if again is None:
+                return (True, tries, "absent", None, first_row, first_error, all_clean)
+            if again["start"] != row["start"]:
+                return (True, tries, "replaced", None, first_row, first_error, all_clean)
+            if not _same_complete_zombie(row, again):
+                all_clean = False
+        return (False, tries, "matching_exhausted", None, first_row, first_error, all_clean)
+
+    def round(self):
+        self.reset_stats()
+        begun = now_ns()
+        try:
+            rows = self.snapshot()
+        except Exception as error:
+            try:
+                self.stats["snapshot_ns"] = now_ns() - begun
+                self.stats["snapshot_error"] = True
+            except BaseException:
+                pass
+            return {"certain": False, "members": len(self.tracked), "uncertain": 1,
+                    "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": [],
+                    "terminal_count_status": "invalid", "terminal_nonwriters": None}
+        try:
+            self.stats["snapshot_ns"] = now_ns() - begun  # observation only
+            self.stats["rows"] = len(rows)
+            self.stats["zombie_rows"] = sum(1 for row in rows if row.get("zombie") is True)
+        except BaseException:
+            pass
+        present = {(row["pid"], row["start"]) for row in rows}
+        for identity in list(self.tracked):
+            if identity not in present:
+                del self.tracked[identity]
+        members, uncertain = [], []
+        diag_attempted, diag_saturated, diag_rows = 0, False, []
+        terminal_count, terminal_witnesses, terminal_tainted = 0, [], False
+        for row in rows:
+            identity = (row["pid"], row["start"])
+            failure, getsid_error = None, None
+            try:
+                session = self.getsid(row["pid"])
+            except ProcessLookupError as error:
+                try:
+                    actual_esrch = _ERRNO.__get__(error) == errno.ESRCH
+                except BaseException:
+                    actual_esrch = False
+                if actual_esrch:
+                    session, failure, getsid_error = None, "gone", error
+                else:
+                    session, failure = None, f"getsid: {error}"
+            except OSError as error:
+                session, failure = None, f"getsid: {error}"
+            if failure == "gone":
+                if diag_attempted >= U64MAX:
+                    diag_saturated = True
+                else:
+                    diag_attempted += 1
+                gone, tries, confirm_outcome, _cerr, first_row, first_error, all_clean = self.confirm_gone_info(row)
+                if gone:
+                    self.tracked.pop(identity, None)
+                    try:
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "not_read", "none", None))
+                    except BaseException:
+                        pass
+                    continue
+                try:
+                    again = self.reread(row["pid"])
+                except Exception as error:
+                    again = None
+                    failure = f"reread: {error}" if failure in (None, "gone") else failure
+                    try:
+                        category, number = _diag_classify(error)
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "read_failed", category, number))
+                    except BaseException:
+                        pass
+                    try:
+                        if self.terminal_allowed is True and row.get("zombie") is True:
+                            terminal_tainted = True
+                    except BaseException:
+                        pass
+                    stable = False
+                else:
+                    if again is None:
+                        self.tracked.pop(identity, None)
+                        try:
+                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "absent", "none", None))
+                        except BaseException:
+                            pass
+                        continue
+                    if again["start"] != row["start"]:
+                        self.tracked.pop(identity, None)
+                        try:
+                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "replaced", "none", None))
+                        except BaseException:
+                            pass
+                        continue
+                    stable = True
+                    try:
+                        category, number = _diag_classify(getsid_error)
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "same_identity", category, number))
+                    except BaseException:
+                        pass
+                    try:
+                        terminal = (confirm_outcome == "matching_exhausted" and all_clean
+                                    and self.terminal_eligible(row, first_row, first_error)
+                                    and _same_complete_zombie(row, again))
+                    except BaseException:
+                        terminal = False
+                    if not terminal:
+                        # An actual-ESRCH row with a SZOMB snapshot that is
+                        # neither Gone nor terminal-accepted stays
+                        # unaccounted and taints the terminal count, but only
+                        # when terminal acceptance is possible at all. In
+                        # strict mode the count is accountably zero; rows that
+                        # were never terminal candidates (no SZOMB snapshot)
+                        # leave an accountable count alone.
+                        try:
+                            if self.terminal_allowed is True and row.get("zombie") is True:
+                                terminal_tainted = True
+                        except BaseException:
+                            pass
+                    if terminal:
+                        try:
+                            witness = _terminal_witness_row(row, identity in self.tracked)
+                        except BaseException:
+                            witness = None
+                        if witness is not None:
+                            terminal_witnesses.append(witness)
+                        terminal_count += 1
+                        continue  # kept tracked attribution; neither member nor uncertain
+                    failure = "getsid ESRCH, absence not confirmed"
+                if failure is None and stable and session == self.sid:
+                    self.tracked[identity] = row
+                    members.append(row)
+                elif identity in self.tracked:
+                    members.append(row)
+                elif failure is None and stable:
+                    continue  # positively foreign
+                else:
+                    uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
+                continue
+            try:
+                again = self.reread(row["pid"])
+            except Exception as error:
+                again, failure = None, f"reread: {error}" if failure in (None, "gone") else failure
+            stable = again is not None and again["start"] == row["start"]
+            if failure == "gone":
+                failure = "getsid ESRCH, absence not confirmed"
+            if failure is None and stable and session == self.sid:
+                self.tracked[identity] = row
+                members.append(row)
+            elif identity in self.tracked:
+                members.append(row)
+            elif failure is None and stable:
+                continue  # positively foreign
+            else:
+                uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
+        try:
+            self.stats["scan_ns"] = now_ns() - begun - self.stats["snapshot_ns"]  # observation only
+            self.stats["esrch_rows"] = diag_attempted
+            self.stats["terminal"] = terminal_count
+        except BaseException:
+            pass
+        try:
+            status, value = _terminal_fields(terminal_count, terminal_tainted, False)
+        except BaseException:
+            status, value = "invalid", None
+        if status not in TERMINAL_STATUS_VALUES:
+            status, value = "invalid", None
+        if status in ("invalid", "overflow") and not uncertain:
+            # An unaccountable terminal count must block closure through
+            # the unchanged IPC fields, even if no row was uncertain.
+            uncertain.append({"reason": "terminal count not countable"})
+        result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
+                "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+        result["terminal_count_status"] = status
+        result["terminal_nonwriters"] = value if (
+            status == "valid" and type(value) is int and 0 <= value <= U64MAX) else None
+        diag_compact_len, diag_kept = 0, 0
+        if diag_attempted:
+            try:
+                diagnostics = _diag_object(diag_attempted, diag_rows, diag_saturated)
+            except BaseException:
+                diagnostics = None
+            if diagnostics is not None:
+                try:
+                    check = json.dumps(diagnostics, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+                    if len(check) <= DIAG_MAX_BYTES and len(diagnostics.get("rows", [])) <= DIAG_MAX_ROWS:
+                        result["diagnostics"] = diagnostics
+                        diag_compact_len, diag_kept = len(check), len(diagnostics.get("rows", []))
+                except BaseException:
+                    pass
+        if terminal_witnesses:
+            try:
+                fitted = _fit_witnesses(terminal_witnesses, diag_kept, diag_compact_len)
+            except BaseException:
+                fitted = []
+            if fitted:
+                result["terminal_witnesses"] = fitted
+        return result
+
+@contextmanager
+def patched(target, name, value):
+    """Temporarily replace one production seam, restoring it afterwards."""
+    saved = getattr(target, name)
+    setattr(target, name, value)
+    try:
+        yield
+    finally:
+        setattr(target, name, saved)
+
+
+def owned_witness_report(witnesses, starts):
+    """Coverage of a (possibly clipped) terminal-witness list against the
+    identities this fixture positively holds.
+
+    A shared host census can legitimately retain ambient allowlisted terminal
+    rows, so those are accepted as observations and never treated as foreign
+    writers. They can never stand in for an owned identity: an owned identity
+    must be witnessed with its exact (PID, start). The witness list is bounded
+    by a shared byte budget, so the report names which owned identities were
+    witnessed and which were clipped away rather than claiming all of them
+    from a subset."""
+    rows = [entry for entry in witnesses or [] if isinstance(entry, dict)]
+    owned, ambient, problems = {}, [], []
+    for entry in rows:
+        pid = entry.get("pid")
+        if pid in starts:
+            owned[pid] = entry.get("start")
+            if entry.get("start") != starts[pid]:
+                problems.append(f"owned pid {pid} witnessed with start {entry.get('start')} "
+                                f"instead of {starts[pid]}")
+        else:
+            ambient.append(pid)
+    omitted = sorted(set(starts) - set(owned))
+    if not owned:
+        problems.append(f"no owned identity witnessed ({len(starts)} held, "
+                        f"{len(ambient)} ambient retained, {len(omitted)} omitted)")
+    return {"problems": problems, "owned": owned, "ambient": ambient, "omitted": omitted}
+
+
+def owned_witness_problems(witnesses, starts):
+    """Just the problems from owned_witness_report."""
+    return owned_witness_report(witnesses, starts)["problems"]
+
+
+def ordering_problems(result):
+    """Why a round's published lists are not in snapshot order, or [].
+
+    The applied check on the corrected source, and the oracle the shuffled
+    counterfactual below must falsify: rows and diagnostic entries are ordered
+    by PID just as the snapshot was, before any clipping."""
+    problems = []
+    for name in ("member_rows", "uncertain_rows"):
+        pids = [entry.get("pid") for entry in result.get(name) or [] if isinstance(entry, dict)]
+        if pids != sorted(pids):
+            problems.append(f"{name} not in snapshot order")
+    diagnostics = result.get("diagnostics")
+    if diagnostics:
+        pids = [entry.get("pid") for entry in diagnostics.get("rows") or [] if isinstance(entry, dict)]
+        if pids != sorted(pids):
+            problems.append("diagnostic rows not in snapshot order")
+        if diagnostics.get("omitted", 0) != diagnostics.get("attempted", 0) - len(diagnostics["rows"]):
+            problems.append("diagnostic clipping does not add up")
+    return problems
+
+
+class ScriptedTable:
+    """Deterministic per-identity census fixture for the differential cases.
+
+    Each PID carries its snapshot row, its getsid result and its own script of
+    KERN_PROC_PID reread outcomes. The n-th reread of a PID consumes that PID's
+    n-th script entry and the last entry repeats, so behaviour depends only on
+    how many times THAT identity was read - never on a shared global read
+    count - and the identical script can drive the production round and the
+    serial reference independently. Every call is logged in one ordered list.
+    """
+
+    def __init__(self, rows, sessions, scripts):
+        self.rows = list(rows)
+        self.sessions = dict(sessions)
+        self.scripts = {pid: list(items) for pid, items in scripts.items()}
+        self.reads = {}
+        self.log = []
+
+    def snapshot(self):
+        self.log.append(("snapshot", None, None))
+        return list(self.rows)
+
+    def getsid(self, pid):
+        self.log.append(("getsid", pid, None))
+        value = self.sessions[pid]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def reread(self, pid):
+        self.reads[pid] = self.reads.get(pid, 0) + 1
+        items = self.scripts.get(pid) or [None]
+        value = items[min(self.reads[pid] - 1, len(items) - 1)]
+        self.log.append(("reread", pid, self.reads[pid]))
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def pause(self, seconds):
+        self.log.append(("pause", None, seconds))
+
+    def census(self, terminal_allowed=False):
+        return bounded.Census(100, snapshot=self.snapshot, getsid=self.getsid,
+                              reread=self.reread, pause=self.pause,
+                              terminal_allowed=terminal_allowed)
+
+    def reference(self, terminal_allowed=False):
+        return SerialCensus(100, snapshot=self.snapshot, getsid=self.getsid,
+                            reread=self.reread, pause=self.pause,
+                            terminal_allowed=terminal_allowed)
+
+    def rereads(self, pid):
+        return [entry for entry in self.log if entry[0] == "reread" and entry[1] == pid]
+
+    def pauses(self):
+        return [entry for entry in self.log if entry[0] == "pause"]
+
+    def pause_between(self, pid, first, second):
+        """Whether at least one pause sits between two numbered reads of pid."""
+        seen, between = 0, 0
+        for kind, who, _value in self.log:
+            if kind == "reread" and who == pid:
+                seen += 1
+                if seen == second:
+                    return between >= 1
+            elif kind == "pause" and first <= seen < second:
+                between += 1
+        return False
+
+    def first_read_follows_getsid(self):
+        """Whether every confirmed identity's first reread follows its own
+        getsid immediately, with no other call in between."""
+        problems = []
+        for position, entry in enumerate(self.log):
+            if entry[0] != "getsid":
+                continue
+            following = self.log[position + 1] if position + 1 < len(self.log) else None
+            if following is None or following[0] != "reread" or following[1] != entry[1]:
+                problems.append(entry[1])
+        return problems
+
+
+ESRCH = ProcessLookupError(3, "gone")
+EPERM = PermissionError(1, "denied")
+
+
+def dead_row(pid, start=7):
+    return row(pid, start=start, zombie=True)
+
+
+def scenario(esrch=(), members=(), foreign=(), unclear=()):
+    """A ScriptedTable from per-identity confirmation scripts.
+
+    `esrch` is a sequence of (pid, script) pairs: getsid raises an actual ESRCH
+    and the script drives that identity's confirmation history."""
+    rows, sessions, scripts = [], {}, {}
+    for pid in members:
+        rows.append(row(pid, start=11)); sessions[pid] = 100; scripts[pid] = [row(pid, start=11)]
+    for pid in foreign:
+        rows.append(row(pid, start=12)); sessions[pid] = 7; scripts[pid] = [row(pid, start=12)]
+    for pid in unclear:
+        rows.append(row(pid, start=13)); sessions[pid] = EPERM; scripts[pid] = [row(pid, start=13)]
+    for pid, script in esrch:
+        rows.append(dead_row(pid)); sessions[pid] = ESRCH; scripts[pid] = script
+    return ScriptedTable(rows, sessions, scripts)
+
+
+# Confirmation histories the serial algorithm at 8849f99 already handled, and
+# the exact per-identity reread counts it produced: the 20 confirmation reads
+# plus the one separate final read wherever the identity reached it.
+PERSISTENT = [dead_row(900)]
+GONE_AT_3 = [dead_row(901), dead_row(901), None]
+REPLACED_AT_7 = [dead_row(902)] * 6 + [row(902, start=8)]
+FAIL_AT_1 = [EPERM]
+FAIL_AT_5 = [dead_row(903)] * 4 + [EPERM]
+CONTRADICTION = [dead_row(904), row(904, start=7)]  # same start token, never SZOMB
+NONZOMBIE = [row(905, start=7)]                     # actual ESRCH, never SZOMB
+FINAL_FAILS = [dead_row(970)] * 20 + [EPERM]        # 20 confirmations, then read 21 fails
+FINAL_FAILS_NONZOMBIE = [row(971, start=7)] * 20 + [EPERM]
+
+
+class PureInterleavedConfirmation(unittest.TestCase):
+    """Oxide#147 correction: shared confirmation passes must return exactly the
+    round data the serial algorithm at 8849f99 returned, while every identity
+    keeps its existing observations and spacing and one shared pause per pass
+    replaces one pause per identity."""
+
+    def compare(self, script, allowed, **kwargs):
+        """Run the corrected round and the serial reference over two
+        independently scripted fixtures, and assert identical round data."""
+        produced_table = scenario(esrch=script, **kwargs)
+        reference_table = scenario(esrch=script, **kwargs)
+        produced = produced_table.census(allowed)
+        result = produced.round()
+        self.assertEqual(result, reference_table.reference(allowed).round(),
+                         "corrected round data must equal the serial reference")
+        return produced_table, produced, result
+
+    def test_persistent_zombies_share_one_pause_per_pass(self):
+        for count in (0, 1, 4, 12, 15):
+            for allowed in (False, True):
+                with self.subTest(zombies=count, allowlisted=allowed):
+                    pids = list(range(910, 910 + count))
+                    script = [(pid, [dead_row(pid)]) for pid in pids]
+                    table, produced, result = self.compare(
+                        script, allowed, members=[800], foreign=[810], unclear=[820])
+                    for pid in pids:
+                        self.assertEqual(len(table.rereads(pid)), 21,
+                                         "20 confirmation reads plus one separate final read")
+                    self.assertEqual(produced.stats["pause_calls"], 19 if count else 0)
+                    if count:
+                        # The serial reference pays one pause per identity per
+                        # pass; the corrected round pays one pause per pass.
+                        serial = scenario(esrch=script, members=[800], foreign=[810],
+                                          unclear=[820]).reference(allowed)
+                        self.assertEqual(serial.round(), result)
+                        self.assertEqual(serial.stats["pause_calls"], 19 * count)
+                        self.assertEqual(serial.stats["confirm_reads"], produced.stats["confirm_reads"])
+                    self.assertEqual(table.first_read_follows_getsid(), [])
+
+    def test_every_candidate_resolving_at_the_first_read_never_pauses(self):
+        for allowed in (False, True):
+            with self.subTest(allowlisted=allowed):
+                table, produced, _result = self.compare(
+                    [(921, [None]), (922, [row(922, start=99)])], allowed)
+                self.assertEqual(produced.stats["pause_calls"], 0)
+                self.assertEqual((len(table.rereads(921)), len(table.rereads(922))), (1, 1),
+                                 "a Gone identity is never read again and gets no final read")
+
+    def test_mixed_resolutions_match_the_serial_reference(self):
+        for allowed in (False, True):
+            with self.subTest(allowlisted=allowed):
+                table, produced, result = self.compare(
+                    [(900, PERSISTENT), (901, GONE_AT_3), (902, REPLACED_AT_7),
+                     (903, FAIL_AT_5), (904, CONTRADICTION), (905, NONZOMBIE)],
+                    allowed, members=[800], foreign=[810], unclear=[820])
+                self.assertEqual({pid: len(table.rereads(pid)) for pid in (900, 901, 902, 903, 904, 905)},
+                                 {900: 21, 901: 3, 902: 7, 903: 6, 904: 21, 905: 21})
+                self.assertEqual([entry["pid"] for entry in result["member_rows"]], [800])
+                self.assertEqual(result["members"], 1)
+                self.assertEqual(produced.stats["pause_calls"], 19)
+                self.assertNotIn("stats", result)
+                # 800 is the only member; 810 is foreign and 820 unreadable,
+                # and the four unresolved ESRCH identities block certainty.
+                self.assertFalse(result["certain"])
+                for pid in (900, 901, 902, 903, 904, 905):
+                    confirmations = min(len(table.rereads(pid)), 20)
+                    for index in range(2, confirmations + 1):
+                        self.assertTrue(table.pause_between(pid, index - 1, index),
+                                        f"pid {pid} confirmation reads {index - 1}->{index} must be a pause apart")
+                self.assertEqual(table.first_read_follows_getsid(), [])
+
+    def test_tracked_attribution_is_unchanged(self):
+        for allowed, expected_members in ((False, 1), (True, 0)):
+            with self.subTest(allowlisted=allowed):
+                table = scenario(esrch=[(950, [dead_row(950)])])
+                produced = table.census(allowed)
+                produced.tracked[(950, 7)] = dead_row(950)
+                result = produced.round()
+                reference = scenario(esrch=[(950, [dead_row(950)])]).reference(allowed)
+                reference.tracked[(950, 7)] = dead_row(950)
+                self.assertEqual(result, reference.round())
+                self.assertEqual(result["members"], expected_members,
+                                 "strict keeps the tracked identity as a member; terminal keeps it tracked")
+                self.assertEqual(result["terminal_nonwriters"], 1 if allowed else 0)
+                self.assertEqual((produced.tracked.get((950, 7)) is not None),
+                                 (reference.tracked.get((950, 7)) is not None))
+
+    def test_one_identity_resolving_early_leaves_the_others_independent(self):
+        both, _produced, both_result = self.compare([(900, PERSISTENT), (901, GONE_AT_3)], False)
+        self.assertEqual((len(both.rereads(900)), len(both.rereads(901))), (21, 3))
+        solo, _produced, solo_result = self.compare([(900, PERSISTENT)], False)
+        self.assertEqual(len(solo.rereads(900)), 21)
+        self.assertEqual((solo_result["uncertain"], both_result["uncertain"]), (1, 1),
+                         "a Gone identity is never uncertain and adds no uncertainty")
+        self.assertEqual((solo_result["diagnostics"]["attempted"],
+                          both_result["diagnostics"]["attempted"]), (1, 2),
+                         "the extra Gone identity is the only difference")
+
+    def test_a_first_read_failure_keeps_the_existing_final_read(self):
+        for allowed in (False, True):
+            with self.subTest(allowlisted=allowed):
+                table, produced, result = self.compare([(930, FAIL_AT_1)], allowed)
+                self.assertEqual(len(table.rereads(930)), 2, "one failed confirmation and the final read")
+                self.assertIn("reread", result["uncertain_rows"][0]["reason"])
+                self.assertEqual(produced.stats["pause_calls"], 0)
+
+    def test_more_than_twenty_rows_keep_snapshot_order_and_clipping(self):
+        # Persistent identities that can never be terminal, so the uncertain
+        # list itself overflows 20 and must be clipped in snapshot order.
+        esrch = [(940 + index, [row(940 + index, start=7)]) for index in range(26)]
+        _table, _produced, result = self.compare(esrch, True, members=[800], foreign=[810], unclear=[820])
+        self.assertEqual(ordering_problems(result), [])
+        self.assertEqual([entry["pid"] for entry in result["uncertain_rows"]],
+                         [820] + list(range(940, 959)),
+                         "the unreadable row keeps its snapshot position and the list clips at 20")
+        self.assertEqual(result["uncertain"], 27)
+        diagnostics = result["diagnostics"]
+        self.assertEqual([entry["pid"] for entry in diagnostics["rows"]], list(range(940, 960)),
+                         "diagnostic rows keep snapshot order and clip at 20")
+        self.assertEqual((diagnostics["attempted"], diagnostics["omitted"]), (26, 6))
+        self.assertEqual(result["terminal_count_status"], "invalid",
+                         "unrelated uncertainty makes the terminal count unaccountable")
+        self.assertIsNone(result["terminal_nonwriters"])
+
+        # The same shape with persistent zombies stays terminal-counted rather
+        # than uncertain, still in snapshot order.
+        zombies = [(960 + index, [dead_row(960 + index)]) for index in range(12)]
+        _table, _produced, zombie_result = self.compare(zombies, True)
+        self.assertEqual(ordering_problems(zombie_result), [])
+        self.assertTrue(zombie_result["certain"])
+        self.assertEqual((zombie_result["uncertain"], zombie_result["terminal_nonwriters"]), (0, 12))
+        # Witness rows share one byte budget with the diagnostics, so the
+        # kept prefix is a subset of the snapshot order and never reordered.
+        witnesses = [entry["pid"] for entry in zombie_result["terminal_witnesses"]
+                     if isinstance(entry, dict)]
+        self.assertEqual(witnesses, list(range(960, 960 + len(witnesses))))
+        self.assertGreaterEqual(len(witnesses), 8)
+
+    def test_tracked_final_read_failure_keeps_serial_attribution(self):
+        # oxide#147 correction review: a failed FINAL read must follow the
+        # serial tail at 8849f99, where a tracked identity keeps its retained
+        # member attribution and only an untracked one becomes uncertain.
+        for allowed in (False, True):
+            for script, pid in ((FINAL_FAILS, 970), (FINAL_FAILS_NONZOMBIE, 971)):
+                with self.subTest(allowlisted=allowed, script=pid):
+                    table = scenario(esrch=[(pid, script)])
+                    produced = table.census(allowed)
+                    produced.tracked[(pid, 7)] = (dead_row(pid) if pid == 970
+                                                  else row(pid, start=7))
+                    result = produced.round()
+                    reference = scenario(esrch=[(pid, script)]).reference(allowed)
+                    reference.tracked[(pid, 7)] = (dead_row(pid) if pid == 970
+                                                   else row(pid, start=7))
+                    expected = reference.round()
+                    self.assertEqual(result, expected,
+                                     "a tracked final-read failure must keep the serial result")
+                    self.assertEqual([entry["pid"] for entry in result["member_rows"]], [pid])
+                    self.assertEqual(len(table.rereads(pid)), 21)
+                    self.assertEqual(produced.stats["pause_calls"], 19)
+                    self.assertIn((pid, 7), produced.tracked)
+                    self.assertEqual(produced.tracked.keys(), reference.tracked.keys())
+                    self.assertIn("read_failed", result["diagnostics"]["rows"][0]["final"])
+                    if allowed:
+                        # Every ESRCH identity here has a SZOMB snapshot row, so in
+                        # allowlisted mode only the terminal count becomes
+                        # unaccountable and adds the synthetic uncertainty row,
+                        # exactly as the serial did.
+                        self.assertEqual([entry.get("reason") for entry in result["uncertain_rows"]],
+                                         ["terminal count not countable"])
+                    else:
+                        self.assertEqual(result["uncertain_rows"], [])
+                        self.assertEqual(result["certain"], True)
+
+        # Untracked, the same failure is uncertain, exactly as before.
+        table = scenario(esrch=[(970, FINAL_FAILS)])
+        self.assertEqual(table.census(True).round(),
+                         scenario(esrch=[(970, FINAL_FAILS)]).reference(True).round())
+        self.assertEqual(len(table.rereads(970)), 21)
+
+        # The currently incorrect unconditional-uncertain branch must fail.
+        tracked_reference = scenario(esrch=[(970, FINAL_FAILS)]).reference(True)
+        tracked_reference.tracked[(970, 7)] = dead_row(970)
+        expected_tracked = tracked_reference.round()
+        with patched(bounded.Census, "retains_member_attribution", lambda self, identity: False):
+            wrong = scenario(esrch=[(970, FINAL_FAILS)])
+            wrong_census = wrong.census(True)
+            wrong_census.tracked[(970, 7)] = dead_row(970)
+            wrong_result = wrong_census.round()
+        self.assertNotEqual(wrong_result, expected_tracked,
+                            "dropping retained attribution on a failed final read must be detected")
+        self.assertEqual(wrong_result["uncertain_rows"][0]["pid"], 970)
+
+    def test_owned_witness_oracle_accepts_ambient_but_requires_own(self):
+        starts = {5001: 11, 5002: 12}
+        own = [{"pid": 5001, "start": 11, "tracked": False},
+               {"pid": 5002, "start": 12, "tracked": False}]
+        ambient = [{"pid": 9001, "start": 77, "tracked": False}]
+        self.assertEqual(owned_witness_problems(own + ambient, starts), [])
+        self.assertEqual(owned_witness_problems([{"pid": 5001, "start": 11}], starts), [])
+        self.assertTrue(owned_witness_problems(ambient, starts),
+                        "ambient witnesses alone must never stand in for an owned identity")
+        self.assertTrue(owned_witness_problems([], starts),
+                        "an empty retained list cannot prove an owned witness")
+        self.assertTrue(owned_witness_problems([{"pid": 5001, "start": 99}] + ambient, starts),
+                        "an owned PID with the wrong start token must be rejected")
+        # A clipped list that lost every owned identity reports that plainly.
+        report = owned_witness_report([{"pid": 9001, "start": 77}], starts)
+        self.assertEqual((report["owned"], report["omitted"]), ({}, [5001, 5002]))
+        self.assertTrue(report["problems"])
+
+    def test_snapshot_order_oracles_reject_a_shuffled_list(self):
+        esrch = [(940 + index, [None] if index % 2 == 0 else [row(940 + index, start=7)])
+                 for index in range(8)]  # persistent but never SZOMB: stays uncertain
+        result = scenario(esrch=esrch).census(True).round()
+        self.assertEqual(ordering_problems(result), [])
+        shuffled = dict(result, uncertain_rows=list(reversed(result["uncertain_rows"])))
+        self.assertTrue(ordering_problems(shuffled))
+        diagnostics = dict(result["diagnostics"], rows=list(reversed(result["diagnostics"]["rows"])))
+        self.assertTrue(ordering_problems(dict(result, diagnostics=diagnostics)))
+
+    def live_run(self, allowed=True):
+        """One production round over a persistent zombie; returns its observable
+        facts so a mutation can be judged by the same checks."""
+        table = scenario(esrch=[(900, PERSISTENT)])
+        produced = table.census(allowed)
+        result = produced.round()
+        return {"result": result,
+                "reference": scenario(esrch=[(900, PERSISTENT)]).reference(allowed).round(),
+                "reads": len(table.rereads(900)),
+                "pauses": produced.stats["pause_calls"],
+                "pause_values": [entry[2] for entry in table.pauses()],
+                "witnesses": result.get("terminal_witnesses") or []}
+
+    def test_counterfactuals_fail_the_differential(self):
+        baseline = self.live_run()
+        self.assertEqual(baseline["result"], baseline["reference"])
+        self.assertEqual((baseline["reads"], baseline["pauses"], len(baseline["witnesses"])), (21, 19, 1))
+        self.assertTrue(all(value == bounded.CONFIRM_PAUSE for value in baseline["pause_values"]))
+
+        # Fewer tries: the identity loses confirmation reads and its final read.
+        with patched(bounded, "CONFIRM_TRIES", bounded.CONFIRM_TRIES - 1):
+            observed = self.live_run()
+        self.assertNotEqual(observed["reads"], baseline["reads"], "fewer tries must be detected")
+
+        # A zero pause constant: the per-identity spacing evidence disappears.
+        with patched(bounded, "CONFIRM_PAUSE", 0.0):
+            observed = self.live_run()
+        self.assertNotEqual(observed["pause_values"], baseline["pause_values"],
+                            "a changed pause constant must be detected")
+
+        # A no-op batch that never reads must not look like a confirmation.
+        with patched(bounded.Census, "confirmation_attempt", lambda self, row_, state: True):
+            observed = self.live_run()
+        self.assertEqual(observed["reads"], 1, "a no-op batch must be detected")
+
+        # A dropped final read leaves 20 instead of 21 rereads and changes the
+        # Gone classification, so it must be detected.
+        table = scenario(esrch=[(900, PERSISTENT)])
+        produced = table.census(True)
+        real_reread = produced.reread
+        produced.reread = lambda pid: None if len(table.rereads(pid)) >= 20 else real_reread(pid)
+        dropped = produced.round()
+        self.assertNotEqual(dropped, scenario(esrch=[(900, PERSISTENT)]).reference(True).round(),
+                            "a dropped final read must be detected")
+        self.assertEqual(len(table.rereads(900)), 20)
+
+        # A lost terminal witness changes the receipt evidence.
+        with patched(bounded, "_terminal_witness_row", lambda row_, tracked: None):
+            observed = self.live_run()
+        self.assertEqual(observed["witnesses"], [], "a lost witness must be detected")
+
+        # A matching early exit: treating a matching read as a resolution must
+        # be detected, because a match never short-circuits.
+        real_attempt = bounded.Census.confirmation_attempt
+        def early_exit(self, row_, state):
+            matched = real_attempt(self, row_, state)
+            if matched:
+                state["outcome"] = "matching_exhausted"
+            return False
+        with patched(bounded.Census, "confirmation_attempt", early_exit):
+            observed = self.live_run()
+        self.assertEqual(observed["reads"], 2, "a matching early exit must be detected")
+        self.assertNotEqual(observed["result"], observed["reference"],
+                            "a matching early exit must change the round data")
+
+        # Relaxed terminal eligibility changes the strict classification.
+        with patched(bounded.Census, "terminal_eligible", lambda self, row_, first, error: True):
+            observed = self.live_run(allowed=False)
+        self.assertNotEqual(observed["result"], observed["reference"],
+                            "relaxed terminal eligibility must be detected")
+
 # Real cases --------------------------------------------------------------------
 
 
@@ -2698,6 +3905,69 @@ class Real(unittest.TestCase):
                 os.waitpid(held, 0)
             except OSError:
                 pass
+
+    def test_twelve_held_zombies_share_one_confirmation_budget(self):
+        # Oxide#147 correction, Real coverage: this suite process holds twelve
+        # real exited/unreaped children while a nested guardian runs a trivial
+        # command. The nested round must stay inside the unchanged 10 s grace
+        # with at most 19 SHARED confirmation pauses (the per-identity budget,
+        # not twelve times it), still witness the held identities as terminal
+        # nonwriters, and close with status 0 and no fault. The children are
+        # reaped in finally, so the fixture leaves nothing behind; a failure
+        # keeps the nested case directory under the ordinary unknown-resource
+        # retention and is never relabelled as closed.
+        held = []
+        try:
+            for _ in range(12):
+                pid = os.fork()
+                if pid == 0:
+                    os._exit(0)
+                held.append(pid)
+            deadline = time.monotonic() + 5
+            starts = {}
+            while time.monotonic() < deadline and len(starts) < 12:
+                for pid in held:
+                    struck = bounded.Kinfo.one(pid)
+                    if struck is not None and struck.get("zombie") is True:
+                        starts[pid] = struck["start"]
+                if len(starts) < 12:
+                    time.sleep(0.01)
+            self.assertEqual(len(starts), 12, "not every held child became an unreaped zombie")
+            self.assertEqual(
+                self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
+            outcome = self.outcome()
+            self.assertEqual(outcome["closure"], "closed")
+            self.assertIsNone(outcome["fault"])
+            self.assertFalse(outcome["deadline"])
+            self.assertGreaterEqual(self.receipt["census_rounds"], 1)
+            settlement = self.receipt.get("settlement") or {}
+            self.assertGreaterEqual(settlement.get("rounds_completed", 0), 1,
+                                    "a completed post-reap round is required, not a missing one")
+            rounds = settlement.get("rounds") or []
+            self.assertTrue(rounds, "the round record must be present")
+            self.assertLessEqual(rounds[0].get("pause_calls"), bounded.CONFIRM_TRIES - 1,
+                                 "shared pauses must stay within one per-identity read budget")
+            nested = self.receipt["census"]
+            self.assertEqual(self.receipt.get("terminal_mode", {}).get("mode"), "allowlisted")
+            self.assertEqual(nested["terminal_count_status"], "valid")
+            self.assertGreaterEqual(nested["terminal_nonwriters"], 12)
+            # The global host census may legitimately retain ambient allowlisted
+            # terminal rows. They are observations, never foreign writers, and
+            # they can never stand in for an identity this fixture holds. The
+            # witness list is byte-budget clipped, so report exactly which owned
+            # identities were witnessed and which were clipped away; a clipped
+            # list with no owned witness fails rather than being relaxed.
+            report = owned_witness_report(nested.get("terminal_witnesses"), starts)
+            self.assertEqual(report["problems"], [])
+            self.assertTrue(report["owned"], "a nonvacuous exact owned witness is required")
+            print("[oxide#147] held=%d witnessed=%s omitted=%s ambient=%d"
+                  % (len(starts), sorted(report["owned"]), report["omitted"], len(report["ambient"])))
+        finally:
+            for pid in held:
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
 
     def test_live_real_child_injected_error_blocks(self):
         # Contrast: a genuinely LIVE owned child whose session lookup is
@@ -3015,7 +4285,7 @@ def main():
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
                                            PureTraversal, PureDefaultScratch, PureQualificationTopology,
-                                           PureClosureDecision))
+                                           PureClosureDecision, PureSettlement, PureInterleavedConfirmation))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

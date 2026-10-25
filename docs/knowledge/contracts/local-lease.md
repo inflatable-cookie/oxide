@@ -1029,7 +1029,7 @@ reply as a size.
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
 | Control state fence | `store.rs` `STATE_VERSION` (`:74`, 5 writes the recorded-accounting fence; an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4), `RECORDED_ACCOUNTING_FENCE`, hand-off trigger in `handoff.rs` |
-| Qualified guard | `scripts/bounded-test.py`, sha256 `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b` ([oxide#145](workflow.md#shared-proof-supervisor)) |
+| Qualified guard | `scripts/bounded-test.py`, sha256 `5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2` ([oxide#147](workflow.md#shared-proof-supervisor)); the oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
 
@@ -1157,12 +1157,10 @@ first-fault precedence.
 scratch are unchanged; every write stays inside the owned root, no session,
 group or census is started. The qualified guard is **this tree's** supervisor,
 `scripts/bounded-test.py` sha256
-`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
-(oxide#145 merged `0520fc04`, the current qualified source per
-[shared proof supervisor](workflow.md#shared-proof-supervisor)); `961164e7` is
-historical and is not used. That retarget is the exact-head review direction
-(comment `6398168416`) against the verified file hash here, and it supersedes
-the brief's older pin under its own "explicitly rebound with review" clause.
+`5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`
+(oxide#147 source `0adb0c4e`, merged `93ce14cc`; the current qualified source
+per [shared proof supervisor](workflow.md#shared-proof-supervisor)). The earlier
+`a6d73326` (oxide#145) and `961164e7` bytes are history and are not used.
 These figures
 are planning arithmetic, not measurements: the proof's own `--plan` prints them
 and any activation re-measures and reports a **fit blocker** rather than

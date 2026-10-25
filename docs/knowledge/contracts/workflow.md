@@ -1620,7 +1620,7 @@ identity lines.
 
 **Status.** The proof and validation tooling uses the selected-volume default
 described below, under the qualified supervisor bytes
-`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`; the owner
+`5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`; the owner
 accepted the narrow internal-root exception for genuine internal-placement
 proofs. The Oxide children rule is implemented on the oxide#136 branch but is
 not installed or qualified: its counted native has not passed, its required
@@ -1673,11 +1673,14 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   narrow config reader understands only a simple `[pool] path` entry.
 
 Supervisor SHA-256
-`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
-has independent exact-head source review and separate author and reviewer
-`proof:supervisor:qualify` receipts, each exercising all 175 cases with the
-selected-volume default and positive outer closure. Qualification is bound to
-those bytes and evidence; an older hash's receipts do not transfer to new bytes.
+`5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`
+is the current qualified source: oxide#147 source head
+`0adb0c4e9d24f104996013fe735030fb8f5e7e42`, merged at
+`93ce14cc4233cfa1d27a63bfa7c1f5135a4b545c`, has independent exact-head source
+review and separate author and reviewer `proof:supervisor:qualify` receipts with
+the selected-volume default and positive outer closure (oxide#147's own records
+hold the case counts, runs and events). Qualification is bound to those bytes
+and evidence; an older hash's receipts do not transfer to new bytes.
 
 **Internal-placement proofs (oxide#136, accepted narrow exception).** A proof
 whose subject is the *internal* directory pool cannot run over the
@@ -1824,21 +1827,26 @@ Operator source: Supervisor `7cc9444d-a355-463d-a2ca-3c135645a042`, Tom's
 verbatim "1. Yes 2. Yes 3. Yes", item 3. Existing proof bounds, unknown-writer
 handling, failure history and separate adoption/install gates remain.
 
-**Current qualified supervisor (oxide#145, merged `0520fc04`).** The shared
-supervisor bytes `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
-are qualified: oxide#145 source head `4830c187` passed
-`proof:supervisor:qualify` 175/175 for the author (two runs) and 175/175 for the
-independent reviewer (one run), reviewed at event
-`50b6ba7105aac44f04634f9d9d25559bd033afea69351e4a5c446473ebdceb7a`. Its
-`test_supervisor.py` is `79031c195910175ef125f007edb39cbea75628a51bd12f511a4538ea1b87c7d0`
-and `qualify-supervisor.py` is
-`736f0cf0610339b66345f32f8aafbe6edbf945c5122f4a14e74c8f631de73e45`. It selects
+**Current qualified supervisor (oxide#147, merged `93ce14cc`).** The shared
+supervisor bytes `5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`
+are qualified: oxide#147 source head
+`0adb0c4e9d24f104996013fe735030fb8f5e7e42` carries independent exact-head source
+review and separate author and reviewer `proof:supervisor:qualify` receipts, each
+exercising every case with the selected-volume default and positive outer
+closure (oxide#147's own records hold the counts, runs and review event ids).
+Its `test_supervisor.py` is
+`25b706cc8fb9c7b30fe89005670edb20f0c2946c5f6228e73a3c96607ac8dbc3` and
+`qualify-supervisor.py` is
+`0789e18372b7d6f787dc8d9ba3357885f0facacee860c476ca5a012d4891a194`. It selects
 and monitors the volume the effect-free pool selection names, with the
 `/private/tmp` warning fallback described under
-[scratch placement](#temporary-scratch-placement). Earlier proofs keep the
-guard bytes they ran under as history; the prior qualified
-`961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052` is qualified
-only at its old bytes and no old run is retroactively migrated.
+[scratch placement](#temporary-scratch-placement), and its census settles a stop
+only on a census started after the leader was reaped with no member left. Earlier
+proofs keep the guard bytes they ran under as history: the previous qualified
+`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b` (oxide#145,
+`test_supervisor.py` `79031c19…`, `qualify-supervisor.py` `736f0cf0…`) and the
+older `961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052` are
+qualified only at their own bytes, and no old run is retroactively migrated.
 
 `scripts/bounded-test.py` is the shared proof supervisor. It implements the
 reviewed [pinned-leader correction design](proof-supervisor-correction.md)
