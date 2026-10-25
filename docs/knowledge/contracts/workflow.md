@@ -798,8 +798,10 @@ oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <co
   characters escaped, at most 160 characters), live or interrupted. The
   summary line names the `build+execute` strategy.
 
-**Limits.** This is a cooperative contract, not containment. A tool escapes
-Oxide's storage if it sets `CARGO_TARGET_DIR` or a build directory itself,
+**Limits.** This is a cooperative contract, not containment. A tool that
+sets its own `CARGO_TARGET_DIR` or `--target-dir` moves only its final outputs;
+its intermediates still go to the held slot. A tool escapes Oxide's storage if
+it sets a build directory itself (`CARGO_BUILD_BUILD_DIR` or `build.build-dir`),
 changes workspace or toolchain, or builds an unrelated project. A descendant
 that calls `setsid` or daemonizes leaves the group: it is not a qualified
 writer, and Oxide makes no crash-closure claim for it. The explicit wrapper
@@ -1359,13 +1361,13 @@ variables cleared and `LC_ALL=C`.
 
 The standard pattern for consumer projects (Tom, 2026-10-20, [vision](../vision.md#product-workflow-direction)). It was first applied to Underlay, Praxis, Longhorn, Figmatic and Acowtancy; Queue lead `f4813b68` tracks the rollout.
 
-- **Selectors.** Ordinary build, check, clippy, test and nextest selectors call `oxide`. Each main selector keeps a `:cargo` sibling with the plain-Cargo command, for when `oxide` is broken.
-- **CI-aware rule.** When CI or release workflows call the same Effigy selectors and the runners lack `oxide`, the selector runs `cargo` under `GITHUB_ACTIONS=true` and `oxide` otherwise. Locally, a missing `oxide` fails loudly and names the `:cargo` escape; it never falls back silently. Workflow files do not change. Installing `oxide` on runners waits on publication (Q-005).
-- **Stays on Cargo:**
-  - scripts that choose their own `CARGO_TARGET_DIR`, because Oxide replaces an inherited value with `<workspace>/target`;
-  - tools that run Cargo themselves (the Tauri CLI, packaging scripts) unless moved to [`oxide exec`](#oxide-exec-cargo-wrapping-tools), and anything that sets its own target or build directory;
-  - Queue warm-merge hooks;
-  - container builds;
+Tom ruled on 2026-10-25 that every Rust project in `~/Dev/projects` moves fully to Oxide, and that per-selector `:cargo` escapes are removed. This supersedes the earlier sibling rule and exception list.
+
+- **Selectors.** Every ordinary build, check, clippy, test, nextest and format route calls `oxide`. There are no `:cargo` sibling selectors. The escapes for a broken `oxide` are Effigy's `EFFIGY_OXIDE_ESCAPE=cargo`, or running `cargo` by hand.
+- **CI-aware rule.** When CI or release workflows call the same Effigy selectors and the runners lack `oxide`, the selector runs `cargo` under `GITHUB_ACTIONS=true` and `oxide` otherwise. Locally, a missing `oxide` fails loudly and names the escape; it never falls back silently. Workflow files do not change. Installing `oxide` on runners waits on publication (Q-005).
+- **Tools and private target directories.** A tool that runs Cargo itself (the Tauri CLI, packaging scripts, Python or TypeScript drivers), or a script that chooses its own `--target-dir` or `CARGO_TARGET_DIR`, runs under [`oxide exec`](#oxide-exec-cargo-wrapping-tools) unchanged. Its inner Cargo keeps its own target directory for final outputs, and its intermediates go to the held slot through the inherited build directory.
+- **Named proof exceptions.** Only a proof whose subject is Cargo's own target layout (for example a scanner that reads `target/<profile>/deps`) or that must build without any shared intermediate state may set its own build directory. It runs under `oxide exec`, places that private directory under the drive's `scratch/<project>/` or the proof's `OXIDE_TASK_SCRATCH_ROOT` (never `/var/folders`, `~` or a drive root), removes it afterwards, and is listed by name in the project as an intentional proof exception.
+- **Stays on Cargo:** CI and release workflows (above), container builds inside Linux images without `oxide`, product code that runs Cargo as part of its own behaviour, and test fixtures.
   - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user; #106 moved only the final outputs to `target/debug/`. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
 - **nextest.** `oxide nextest run` with no profile flag builds with the quick recipe in the quick slot. Drop an existing `--cargo-profile oxide-quick`: it still builds, but into `target/oxide-quick/`.
 - **Final outputs.** Since #106, `quick` and `debug` binaries are in `target/debug/`, so scripts that read them there can move to `oxide`. Earlier adopters' `target/oxide-quick/` directories are left alone; `oxide clean` removes them with the rest of `target/`.
