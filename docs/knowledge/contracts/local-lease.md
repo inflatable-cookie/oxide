@@ -271,6 +271,21 @@ entry ownership are verified. The target is never followed or removed.
 Deletion never touches project or workspace paths. A lost delete is
 reconciled only for the recorded evicting slot path.
 
+**A command's child temporary directory is inside its slot (oxide#136).**
+`<slot>/scratch` is an ordinary owned entry of the slot tree, so the same
+unique-allocated `(device, inode)` union counts it once with the rest of the
+slot, its capacity walk covers it, and whole-slot eviction, crash recovery
+and lost-volume retirement remove or keep it with the slot they already own.
+Its own ownership marker (pool store identity, slot, incarnation) says whose
+directory it is; it is never a closure proof. The one earlier removal is at
+release, after positive writer closure — and a `run` program that uses an
+owned directory keeps the lease until its own group is empty precisely so
+that no competing lease can reconcile it while it writes. An entry the marker
+does not claim is kept and reported, never deleted, and a removal that cannot
+be completed keeps the slot held rather than marking it idle. An inherited
+`TMPDIR` is outside Oxide's ownership entirely: it is neither accounted as
+the pool's nor removed.
+
 **Accounting walks (oxide#108).** Every pool accounting walk uses the same
 pool-specific bounds: 2,000,000 entries, depth 64 below the walked root and a
 60 s cooperative deadline. The whole-payload walk starts at the payload root,

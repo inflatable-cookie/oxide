@@ -851,6 +851,211 @@ explicit `recover` unless they adopt it.
   admission; `oxide clean --cargo-cache` asks
   Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
 
+### Child temporary files (oxide#136)
+
+Implemented. It owns where a leased command's children put temporary files;
+it is not final output, final-output placement or a claim of saved writes.
+
+- **One rule, two answers, no third.** Before any writer starts, a leased
+  command decides once for its whole child tree:
+  - an inherited `TMPDIR` is **kept** when it canonically resolves to an
+    existing directory this user can write and that directory is on the
+    **same device** as the selected pool's payload root (the actual
+    selection, so the internal pool's device when the drive is absent);
+  - otherwise the command gets one Oxide-owned `0700` directory,
+    `<slot>/scratch`, inside the held slot.
+
+  `TMPDIR`, `TMP` and `TEMP` are all set to the chosen value on every child
+  Oxide launches for the command, so a conflicting alias never survives and
+  a value this decision rejected never reaches a child. The choice is made
+  after the lease and before the spawn, so the child environment never
+  influences workspace classification.
+- **The kept directory is the canonical one.** Children receive the resolved
+  absolute directory, never the raw text: a relative or symlinked `TMPDIR`
+  would otherwise be re-resolved against each child's own working directory
+  after a `chdir`. Directory identity is the resolved device and an existing
+  writable directory, never a path prefix.
+- **An inherited directory is never Oxide's.** Oxide creates nothing inside
+  it, writes no management data into it and never removes or cleans it; the
+  owning tool keeps its own retention rules (an Effigy per-run scratch root
+  stays Effigy's). The caller's own environment is unchanged.
+- **Where an owned directory is prepared, and what it covers.** Cargo (every
+  leased command, `run` and `test` included, and modelled external
+  subcommands through it), `oxide exec`'s tool, and a converted checkout's
+  owned `run` program under its held lease all receive it; descendants — test
+  binaries, build scripts, `run` programs, tools' own Cargo calls — inherit
+  it. An unconverted `run` whose children use an **owned** directory keeps
+  the `oxide` lease for the program, because the program is still that
+  directory's writer: it runs under the existing owned-program custody — its
+  own process group named in the record, signals forwarded, the removable
+  pool's removal watchdog, and release only after the group is observed
+  empty, which is also the one point where the directory is removed. A
+  released-lease `exec` is used only when no owned directory exists (the
+  kept inherited one, which outlives the lease and is nobody's to clean).
+  Ownership markers and the slot incarnation prove *whose* directory it is,
+  never that a writer has closed, so nothing is reconciled merely because a
+  lease is available.
+- **Not covered, deliberately.** Effect-free work keeps the inherited
+  environment and creates nothing: plain passthrough (no lease), `--version`,
+  probes, `status`, `oxide clean`/`init`/`new`'s own Cargo calls, and the
+  freshness gate's `cargo metadata` and lockfile calls, which run before the
+  choice. `OXIDE_TASK_SCRATCH_ROOT` and the four-variable macOS validation
+  contract keep their meaning; when the selected pool is on another volume,
+  the child's three variables follow the pool (the adopted scratch root
+  itself is never deleted or redirected).
+- **The owned directory is bound and short.** Its ownership marker records
+  the pool's store identity, the slot and its incarnation (the lease that
+  created it is recorded too), is written before any writer starts, and
+  decides every later deletion: a leftover bound to the same incarnation is
+  reconciled by the next lease of that slot, and anything else — another
+  incarnation, a missing or unreadable marker, a link, another owner or
+  device — is reported and kept, never deleted. The directory is created
+  `0700`, refuses to follow a link, and lives inside the slot, so the
+  existing whole-payload accounting counts it exactly once (hard links
+  included), whole-slot eviction and crash recovery delete it with the slot
+  they already own, and a held, lost or quarantined slot keeps it.
+- **Lifecycle.** It is removed at release, after the command has seen its own
+  process group empty and before the slot can go idle; a removable slot is
+  flushed after that removal. A removal that cannot be positively completed
+  keeps the slot held and reported, exactly like an unconfirmed closure, and
+  a later command recovers it. A `run` program with an owned directory is
+  inside that same lease (previous bullet), so a competing command cannot
+  take the slot, reconcile the directory or have it evicted while the
+  program lives. An `oxide exec` tool, a kept rustc wrapper or an interrupted
+  command obeys the existing custody rules unchanged; a crash leaves the
+  directory with the held slot.
+- **Length is a limit, not a preference.** Unix-domain sockets need a short
+  path. The injected path is the held slot plus `scratch`; a path over 91
+  bytes (macOS `sun_path` is 104 bytes including the NUL, less `/` and an
+  eleven-byte socket name; Linux allows 108) is reported with its measured
+  byte count and the command **refuses before spawning** rather than running
+  its children on the machine default this decision rejected. No alias,
+  symlink or settings change shortens a configured pool path.
+- **Visibility.** A leased command's summary carries the bounded, escaped
+  fragment `temp: inherited <path>` or `temp: oxide <path>`. `status
+  --measure` names the choice the next leased command would make on the pool
+  it verifies; recorded `status` states the rule and never opens the volume
+  to answer it (oxide#128).
+- **Scope.** This is not a general temporary-file redirection: it applies only
+  to children Oxide launches for leased commands. CI, Effigy's own run
+  scratch, Queue worktrees, container scratch, `$HOME` and host or global
+  settings are untouched, and no other-platform default is guessed.
+
+**Proof.** `effigy rust:pool-temp-scratch` is one fixed script,
+`scripts/test-pool-temp-scratch.py`, and the whole command of the qualified
+shared proof supervisor (`bounded-test.py --limit 300
+--scratch-budget-mib 512`; an ELEVATED trigger: it deletes owned scratch, decides
+writer closure and writes to an owned removable fixture volume). It stages
+this clean HEAD's debug `oxide` offline with 1.97.1 and covers, on tiny
+fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Staging and
+every fixture child share one resolved absolute toolchain home — an inherited
+`RUSTUP_HOME` when it is absolute and usable, else the account default
+`$HOME/.rustup` resolved from the original HOME *before* the private fixture
+HOME exists — with the pinned 1.97.1, `RUSTUP_AUTO_INSTALL=0` and offline
+Cargo; an unusable toolchain home refuses before scratch or staging rather than
+hiding the toolchain behind a fake HOME (the first authorised author native
+failed exactly there). Fixture children carry the debug build's
+`OXIDE_TEST_HOME_FROM_ENV=1` account-home control, a freshly built environment
+that imports no ambient `OXIDE_*`/`XDG_*`/`CARGO_ENCODED_RUSTFLAGS`, and one
+frozen `RUSTFLAGS` shared with staging; the script's `--self-check` is a pure,
+pre-scratch pure regression of that construction (`--self-check`). Before any
+`--locked` invocation, the fixture constructor establishes the crate's lock
+precondition with one bounded offline `cargo generate-lockfile` setup child in
+the fixture's private Cargo home (the package has no dependencies, so nothing
+is resolved and no network is used), and a pure predicate requires the lock to
+be manifest-consistent — a missing, header-less, mismatched or extra-package
+lock is refused rather than treated as valid. The uncounted
+`--diagnostic` mode records a recoverable oracle failure and continues only
+with cases whose declared dependencies are intact, skips every later case
+after a shared-state failure, aborts on any unknown child/device/writer
+outcome, and writes a bounded receipt labelled `qualified: false`; the default
+run still fails fast. It is dispatched only through
+`effigy rust:pool-temp-scratch:diagnostic` (selectors do not forward
+passthrough arguments), is required before the next counted native run, and a
+source sweep complements it but never replaces it. Inherited-`TMPDIR` fixtures are planted in a sibling fixture directory inside
+the same monitored root, never inside the directory-budget pool, because the
+product correctly refuses a pool directory that holds unexpected entries. The
+proof covers: a
+same-volume inherited `TMPDIR` kept canonically with no Oxide directory
+created and the inherited content untouched; absent, file, relative,
+unwritable, other-device and symlink-escaping values replaced by one owned
+directory; an **existing relative** value resolved against the parent's
+working directory and delivered canonically; aliases following the chosen
+value in both branches; the owned directory observed on the selected pool
+while a gated writer holds it, with a hard-linked pair counted once against
+the measured slot figure (16 MiB unique must stay below 24 MiB) and the held
+scratch untouched by `status --measure`; normal release removing it; an
+injected crash whose writer group is observed closed from outside the way the
+product observes closure (`kill(-pgid, 0)` on the group the fixture reports),
+after which a later command neither adopts nor keeps the dead command's
+leftover — this slot's same-incarnation directory is reconciled by its next
+lease, or the untrusted slot is evicted whole, and both existing rules are
+accepted outcomes rather than one assumed mechanism; `oxide
+test`, `oxide exec -- <tool>` and `oxide run` each observing the chosen
+directory, with a **live** `run` program plus a competing `oxide check` in the
+same checkout proving the competing command takes another slot and the live
+directory and its bytes stay intact until that program's own release after its
+group closes; a foreign entry, a link and an over-bound
+derived path each refusing the command without spawning, deleting or
+following anything; and one owned 128 MiB scratch APFS image used as the
+removable pool, where a build's temporary files land on the image, then an
+ordinary detach selects the internal pool's scratch with no stale
+`/Volumes/<name>` directory written. It reports the longest injected path in
+bytes and characters against the bound. It never touches a live pool or the
+registered drive, and it is not a benchmark or an alias for full QA.
+
+Fixture lifecycle (corrected after diagnostic3): the constructor creates only
+the account homes, the crate, its own scratch and the sibling fixture
+directory, and never the pool directory. The first production `oxide` command
+that needs the pool creates it, and the proof then verifies the created
+`config.json` backend, payload, ledger, device and the inherited-directory
+observation, so the product's own exclusion gate is the oracle rather than a
+separate probe. Every fixture launch mints a fresh observation identifier that
+the build script declares to Cargo and echoes, and every consumed observation
+is refused unless it carries the current identifier, so a replayed warning from
+a warm affine slot can never satisfy a kept/replaced oracle. Gated writers
+publish a small atomic readiness record (identifier, chosen directory, process
+group) before waiting, because Cargo does not stream build-script warnings while
+the script runs; the proof polls that record inside the exported deadline and
+writes asynchronous child output to owned files instead of undrained pipes. The
+held-slot accounting oracle measures a baseline and a delta around the planted
+hard-linked pair, the measured status query uses the same unset aliases as the
+held child, the refusal target slot comes from the preceding fresh observation
+rather than directory order, the crash fixture stays in the supervisor session
+and kills only `oxide`, and the one owned image's custody is derived from the
+supervisor's own published pair: the canonical `OXIDE_TASK_SCRATCH_ROOT` and
+`OXIDE_PROOF_EVIDENCE` must be the `scratch` and `evidence` siblings of one
+non-shared, non-group-writable owned root, this proof's scratch workspace must
+be inside the published scratch, and the custody directory must stay inside
+that evidence directory — all verified before the custody directory, the image
+or an intent record exists, with no fallback to the workspace root. The backing
+is deleted only after a positively successful ordinary detach and its matching
+post-state; the planned detach records its attempt before the call and is never
+replayed, and any failed, timed-out or unclassifiable detach or cleanup keeps
+the backing and records and aborts as an unknown outcome instead of being
+downgraded to the case's own oracle failure. Diagnostic dependency
+handling requires a *passed* predecessor (a skipped one is not passed), and an
+unknown-outcome abort records every remaining planned case as not run, so a
+reached prefix is never reported as a complete collection. Its native author and
+reviewer sessions are separately root-activated; no counted native has passed.
+Author natives 1 and 2 and diagnostics 1, 2 and 3 at earlier heads are spent
+failures: the first two hid the toolchain behind the fixture HOME and used
+`--locked` without a lock, and the diagnostics were refused in turn by an
+external-volume internal pool, inherited-temp fixtures placed inside the pool
+directory, and a pre-created empty pool directory. Diagnostic 4 then reached
+cases 1-10 and aborted at the removable case, whose containment check compared
+the custody directory against the workspace and its parent instead of the
+supervisor's published owned root; that topology and its custody decision are
+corrected here, and the run stays a spent failure. The pure self-check
+(`effigy proof:pool-temp:test`, 149 properties) covers the constructor layout,
+rerun completeness, observation freshness, readiness parsing, refusal
+targeting, accounting deltas, the published-root containment refusals, the
+removable flow's custody decisions (including a missing or swapped device
+binding, a replayed observation identifier, both ambiguous detach post-states
+and a deadline abort raised inside the cleanup decision) and first-fault
+precedence, case 12's socket-bound oracles with fake product states, and the
+diagnostic dependency and abort rules with no scratch, child or toolchain.
+
 ## Execution location
 
 Every command becomes a request handed to an executor:
@@ -1249,16 +1454,23 @@ identity lines.
 
 ### Temporary scratch placement
 
-The proof and validation tooling uses the selected-volume default described
-below. The Oxide children rule remains approved direction (queue #136), rather
-than installed behaviour. Neither establishes measured SSD-write savings.
+**Status.** The proof and validation tooling uses the selected-volume default
+described below, under the qualified supervisor bytes
+`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`; the owner
+accepted the narrow internal-root exception for genuine internal-placement
+proofs. The Oxide children rule is implemented on the oxide#136 branch but is
+not installed or qualified: its counted native has not passed, its required
+uncounted diagnostic has been attempted and failed, and the independent
+reviewer native is missing. Neither facility establishes measured SSD-write
+savings.
 
 Tom, 2026-10-25: "Test and proof temp folders definitely should move to the
 drive." The two Oxide facilities have separate qualification boundaries.
 Effigy owns its own test/run temp
 placement and retention; Oxide changes no consumer or daemon configuration.
 
-- **Oxide children.** The selected pool's actual volume decides temp placement
+- **Oxide children: implemented** ([contract](#child-temporary-files-oxide136)).
+  The selected pool's actual volume decides temp placement
   for Cargo and its tests/build scripts, run programs, modelled external
   subcommands and `oxide exec` tools. The product architect's same-day interface
   ruling keeps an inherited `TMPDIR` only if it resolves canonically to an
@@ -1302,6 +1514,28 @@ has independent exact-head source review and separate author and reviewer
 `proof:supervisor:qualify` receipts, each exercising all 175 cases with the
 selected-volume default and positive outer closure. Qualification is bound to
 those bytes and evidence; an older hash's receipts do not transfer to new bytes.
+
+**Internal-placement proofs (oxide#136, accepted narrow exception).** A proof
+whose subject is the *internal* directory pool cannot run over the
+selected-volume default: the product correctly refuses a `directory-budget`
+internal pool on an external volume, and that refusal is not bendable (no
+debug-only exception). The owner accepted this narrow exception for genuine
+internal-placement proofs (decision `bd357a4c`, 2026-10-25). Such a proof may
+declare the internal root explicitly through the qualified guard's existing
+`--root-parent` option — for oxide#136, `--root-parent /private/tmp` in both its
+counted and diagnostic selectors. The guard still creates ONE fresh owned
+monitored root under that canonical internal directory and applies the
+unchanged 300 s, 512 MiB, 22 GiB reserve, custody, retention and cleanup rules
+to everything inside it, including staging, the fixture pool, temp and the
+single owned 128 MiB image. The selected-volume default is unchanged for every
+other caller: builds, tests and ordinary proofs keep the drive placement. The
+exception authorises placement only; each such proof still needs its own
+independent exact-head source confirmation and separate execution activation.
+Its fixtures must stay outside the directory-budget pool on the same device —
+inherited `TMPDIR` values under the pool directory are not valid, and the
+product's pool-membership refusal is never weakened. The observed ~58 MiB peak
+in an oxide#136 diagnostic is a measurement, not a bound reduction or a
+guarantee for other work.
 
 **Genuine internal-placement proofs (Tom, 2026-10-25).** Tom answered decision
 `bd357a4c-2e1d-4190-bafb-290d7c2ae244`: "Accept the internal-root exception for
@@ -1397,6 +1631,22 @@ Operator source: Supervisor `7cc9444d-a355-463d-a2ca-3c135645a042`, Tom's
 verbatim "1. Yes 2. Yes 3. Yes", item 3. Existing proof bounds, unknown-writer
 handling, failure history and separate adoption/install gates remain.
 
+**Current qualified supervisor (oxide#145, merged `0520fc04`).** The shared
+supervisor bytes `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
+are qualified: oxide#145 source head `4830c187` passed
+`proof:supervisor:qualify` 175/175 for the author (two runs) and 175/175 for the
+independent reviewer (one run), reviewed at event
+`50b6ba7105aac44f04634f9d9d25559bd033afea69351e4a5c446473ebdceb7a`. Its
+`test_supervisor.py` is `79031c195910175ef125f007edb39cbea75628a51bd12f511a4538ea1b87c7d0`
+and `qualify-supervisor.py` is
+`736f0cf0610339b66345f32f8aafbe6edbf945c5122f4a14e74c8f631de73e45`. It selects
+and monitors the volume the effect-free pool selection names, with the
+`/private/tmp` warning fallback described under
+[scratch placement](#temporary-scratch-placement). Earlier proofs keep the
+guard bytes they ran under as history; the prior qualified
+`961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052` is qualified
+only at its old bytes and no old run is retroactively migrated.
+
 `scripts/bounded-test.py` is the shared proof supervisor. It implements the
 reviewed [pinned-leader correction design](proof-supervisor-correction.md)
 (revision 4, `29f0950e`) for oxide#109. It counts as qualified only once
@@ -1432,7 +1682,10 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
 - **Future proofs.** A proof is one short fixed script that is the whole
   supervised command, run as an Effigy `heavy` task:
   `python3 scripts/bounded-test.py python3 scripts/<proof>.py`.
-  - It writes only inside `OXIDE_TASK_SCRATCH_ROOT`.
+  - It writes only inside `OXIDE_TASK_SCRATCH_ROOT` for its ordinary fixtures;
+    a retained fixture image's intent, attachment and backing live in
+    `OXIDE_PROOF_EVIDENCE`, the sibling evidence directory of the same
+    monitored owned root, and an owned mounted image writes bind that backing.
   - It may read `OXIDE_PROOF_DEADLINE_NS`, the absolute `CLOCK_UPTIME_RAW`
     deadline, and write evidence to keep under `OXIDE_PROOF_EVIDENCE`, the
     evidence directory: counted in owned bytes, never removed by cleanup.

@@ -230,6 +230,16 @@ fails, Oxide reports that the wait duration is unavailable.
   `OXIDE_CONFIG` another config file; `status` still reads the account's own
   records.
 - `OXIDE_POOL_CAP` sets the cap only when a pool is first created.
+- A leased command's children put temporary files on the selected pool: an
+  inherited `TMPDIR` is kept, as its canonical path, when it is a writable
+  directory on the pool's device, and otherwise Oxide owns one short
+  directory inside the held slot and removes it at release; a `run` program
+  that uses one keeps the lease until it exits, so a competing command cannot
+  delete its temporary files. The summary says
+  `temp: inherited <path>` or `temp: oxide <path>`. Oxide never writes to or
+  cleans an inherited directory; `TMPDIR`, `TMP` and `TEMP` are all set to
+  the chosen value for children only, and a command that can provide neither
+  refuses instead of running on the machine default.
 - Use `oxide clean`, never plain `cargo clean`. `oxide clean` waits for active
   commands in this checkout, removes its private output and slot affinity, and
   leaves shared slots intact. If `target/` holds anything Cargo did not

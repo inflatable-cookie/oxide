@@ -180,14 +180,26 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   drive from the account home, not `$HOME`, so a harness that overrides
   HOME still uses them; private pools need an explicit setting. Its proof
   controls exist only in debug builds; any other build refuses them.
-- **Temporary files off the internal drive:** temp files from builds, tests
-  and native proofs go to the selected pool (the Builds drive when present),
-  not the internal SSD. The proof and validation tooling default is in source
-  (oxide#145) and awaits independent review and requalification at the new
-  source; temp for product builds and tests is approved, not built. The
-  [scratch placement contract](contracts/workflow.md#temporary-scratch-placement)
-  owns same-volume inherited-temp retention, fallback and supervisor
-  requalification; external owners retain cleanup of their inherited paths.
+- **Temporary files off the internal drive:** a leased command's children
+  (tests, run programs, build scripts, `oxide exec` tools) put temporary files
+  on the selected pool. An inherited `TMPDIR` is kept, as its canonical
+  directory, only when it is a writable directory on the pool's own device;
+  external owners retain cleanup of their inherited paths and Oxide never
+  writes to or removes one. Otherwise Oxide owns one short per-command
+  directory inside the slot, removed at release after writer closure; a `run`
+  program that uses one keeps the lease until its own group closes
+  ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It is
+  implemented on the oxide#136 branch but is not installed or qualified: its
+  counted native has not passed and both uncounted diagnostics were attempted
+  and failed. The separate proof and validation tooling
+  default is implemented and qualified by oxide#145 (merged at `0520fc04`,
+  guard `a6d73326`), which places and monitors proof scratch on the selected
+  pool's own volume with a warned `/private/tmp` fallback
+  ([placement](contracts/workflow.md#temporary-scratch-placement)). Internal-
+  placement proofs may declare an explicit internal root as the owner-accepted
+  narrow exception, with their fixtures beside the pool, never inside it. Both
+  cover Oxide-owned scratch only: CI, Queue worktrees, containers and host
+  settings stay as they are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
@@ -201,7 +213,6 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Approved, not built:**
   - cold-slot seeding from matching units, conservative first, with
     one-use temp workspaces handled as seeded, first-evicted slots;
-  - per-slot test scratch;
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
 
