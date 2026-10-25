@@ -305,7 +305,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # receiptless legacy roots, custody, containment, four crash boundaries,
 # completion diagnostics, resolve-intent and the version-1 receipt scenario.
 # `--root-parent /private/tmp` is the owner-accepted internal-placement
-# exception (decision bd357a4c v4): cases 12 and 22 prove checkout absence on
+# exception (decision bd357a4c v4): cases 10 and 21 prove checkout absence on
 # the boot Data volume, and the fixture's internal directory pool is a genuine
 # internal pool the product correctly refuses on an external volume. The
 # supervisor monitors that same root. Each side's run is a separately counted

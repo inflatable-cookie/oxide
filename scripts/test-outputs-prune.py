@@ -15,7 +15,7 @@ Both heavy selectors are
 `python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360
 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py
 [--diagnostic]`. `--root-parent /private/tmp` is the owner-accepted
-internal-placement exception (decision bd357a4c v4): cases 12 and 22 prove
+internal-placement exception (decision bd357a4c v4): cases 10 and 21 prove
 checkout absence on the boot Data volume, and the fixture's directory pool is
 a genuine internal pool that the product correctly refuses on an external
 volume. The supervisor monitors that same root, owns the 360 s deadline
@@ -81,94 +81,124 @@ injections OXIDE_TEST_PRUNE_LOW_RESERVE_AT / _AFTER_ENTRIES drive the
 pre-rename refusal and the mid-batch stop.
 
 Cases (22 = the original 19-case matrix plus two resolve-intent cases and the
-oxide#152 version-1 receipt scenario), each on tiny owned fixtures with exact
-exit codes and state assertions:
+oxide#152 version-1 receipt scenario), in execution order, each on tiny owned
+fixtures with exact exit codes and state assertions. This list is the proof's
+own machine-checked matrix: `--self-test` fails if it drifts from
+CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
+`--diagnostic` run uses to decide which cases may still run.
 
-  fence / init (2)
-    01 init: adopt publishes state version 3 with oxide.outputs/2 and a ready
-       transaction in both controls, and oxide.outputs.registry/1 exists.
-       Older-binary control (root-authorized read-only artifact): the exact
-       installed d246d400 binary and its install receipt are verified (pin,
-       SHA-256 bd52cb42..., size, no-follow regular owned files, metadata
-       stable across the read), copied into owned scratch, and only the copy
-       runs: its capability probe reports control state 2, and its `check`
-       and `outputs adopt` in the fixture both exit nonzero with no handoff,
-       no host path and complete pool, volume-tree and checkout bytes and
-       metadata unchanged.
-    02 missing ready registry: dry run exits 2, adopt of another checkout
-       refuses, nothing is rebuilt; restoring the exact bytes recovers.
-  nonce / reservation / cancel / recreation key (4)
-    03 root nonce: the external root's v2 marker nonce (32 hex) equals the
-       receipt's selected nonce and the registry row's nonce.
-    04 shared reservation: two starters paused after slot keying (their
-       captured destination keys compared before release) share
-       one reserved nonce; both bind it and the created root carries it.
-    05 cancel + stale starter: a starter paused after keying has its reservation cancelled by
-       `outputs cancel-reservation`; the starter refuses before Cargo with
-       "cancelled or replaced"; the root is never created; the row is gone.
-    06 recreation: a pruned checkout re-created at the same path adopts a
-       fresh root nonce different from the deleted root's recorded nonce, and
-       its first build keys a different, cold slot.
-  registry / snapshot / overflow (3)
-    07 dry run: canonical preview bytes on stdout match the SHA-256 on
-       stderr, schema prune-preview/1, control bytes unchanged.
-    08 malformed receipt: one corrupt receipt keeps the whole batch.
-    09 overflow: a sticky-incomplete registry keeps every root and a new
-       reservation carries an overflow tag naming the registry; the starter
-       binds it with no invented row. Run last: the flag is never cleared.
-  eligibility / operator list / absence (3)
-    10 live checkout kept; a live (present) detached checkout's root kept;
-       the same released root is a candidate once its checkout is gone; a
-       registered checkout on the attached image is a candidate when gone
-       (absence through the verified mount and recorded UUID).
-    11 unreadable ancestor kept: a debug-only EACCES (OXIDE_TEST_PRUNE_EACCES,
-       bound to the supervisor's scratch/evidence layout) keeps the root, its
-       firing is recorded in evidence, and the same fixture without injection
-       is a genuine-absence candidate; no real unreadable directory exists.
-       A listed relative path and a duplicate refuse with exit 2.
-    12 receiptless legacy roots: the one whose checkout is on the boot Data
-       volume (device + APFS UUID proof) gets its exclusive pruning receipt
-       and is deleted (receipt `pruned`/`deleted`); the one whose checkout is
-       on the attached scratch image, a foreign directory and a marker whose
-       checkout identity is not its path digest are kept, bytes unchanged.
-  custody / containment / removal (2)
-    13 active writer: a build script holds Cargo Running in a vanished
-       checkout; its root is kept with a writer reason.
-    14 containment and reserve: a root replaced by a symlink is kept; a
-       symlink descendant stops deletion (exit 3, target untouched) and
-       replay completes; an injected low reserve at the pre-rename check
-       refuses (exit 2, root bytes unchanged, nothing journaled); one between
-       delete batches of a 600-entry root stops (exit 3) with some but not
-       all entries deleted, and replay completes.
-  crash boundaries (4)
-    15 after intent: exit 3, root in place; replay rolls back and deletes.
-    16 after rename: exit 3, quarantine present; a recreated checkout's
-       build refuses while the intent is unsettled; replay completes.
-    17 during delete: exit 3; replay completes.
-    18 after registry terminal: exit 3, receipt not yet pruned; replay
-       settles the receipt.
-  completion / diagnostics / logical-allocated (1)
-    19 completion: deleted root, registry row and intent gone, tombstone,
-       prune-observations recorded; logical bytes equal an independent
-       by-name oracle and allocated bytes equal an independent unique-inode
-       oracle (a hard-linked 64 KiB inode counted once; complete coverage);
-       `oxide status` shows the observation.
-  resolve-intent (2)
-    20 both leaves absent: resolution receipt, `resolved-by-operator`.
-    21 quarantine present: exit 2, intent unchanged; replay then completes.
-  version-1 receipt compatibility (1, oxide#152)
-    22 a whole-target `oxide.outputs.transition/1` receipt and its `root/1`
-       root are written before the registry exists, so the product's own
-       receipt seed records a legacy row (no nonce); the live checkout keeps
-       it; a valid NONCOMMITTED version-1 receipt (one committed root plus a
-       prepared transition) keeps its own reference group without poisoning
-       the batch; a dry run changes no receipt, root or control byte; the
-       exact preview bytes and the same operator list prune only the committed
-       legacy root and publish the current receipt shape with its recorded
-       terminal outcome; the kept root's version-1 receipt bytes never change.
-       It shares case 12's boot-Data-volume absence proof: on a host whose
-       supervisor scratch is not on the boot Data volume the legacy root stays
-       kept and this case fails loudly rather than asserting a false pass.
+  01 init: adopt publishes the current control format (state version 4 with
+     the `oxide.outputs/3` owned-outputs fence and a ready transaction in both
+     controls) and `oxide.outputs.registry/1` exists. Older-binary control
+     (root-authorized read-only artifact): the exact installed d246d400 binary
+     and its install receipt are verified (pin, SHA-256 bd52cb42..., size,
+     no-follow regular owned files, metadata stable across the read), copied
+     into owned scratch, and only the copy runs: its capability probe reports
+     control state 2, and its `check` and `outputs adopt` in the fixture both
+     exit nonzero with no handoff, no host path and complete pool, volume-tree
+     and checkout bytes and metadata unchanged. The version-1 fixture for case
+     21 is written here, before the registry exists, so the product's own
+     receipt seed records its legacy rows.
+  02 missing ready registry: dry run exits 2, adopt of another checkout
+     refuses, nothing is rebuilt; restoring the exact bytes recovers.
+  03 root nonce: the external root's v2 marker nonce (32 hex) equals the
+     receipt's selected nonce and the registry row's nonce.
+  04 shared reservation: two starters paused after slot keying (their captured
+     destination keys compared before release) share one reserved nonce; both
+     bind it and the created root carries it.
+  05 cancel + stale starter: a starter paused after keying has its reservation
+     cancelled by `outputs cancel-reservation`; the starter refuses before
+     Cargo with "cancelled or replaced"; the root is never created; the row is
+     gone.
+  06 dry run: canonical preview bytes on stdout match the SHA-256 on stderr,
+     schema prune-preview/1, control bytes unchanged.
+  07 malformed receipt: one corrupt receipt keeps the whole batch.
+  08 eligibility: a live checkout is kept; a live (present) detached
+     checkout's root is kept; the same released root is a candidate once its
+     checkout is gone; a registered checkout on the attached image is a
+     candidate when gone (absence through the verified mount and recorded
+     UUID).
+  09 unreadable ancestor kept: a debug-only EACCES (OXIDE_TEST_PRUNE_EACCES,
+     bound to the supervisor's scratch/evidence layout) keeps the root, its
+     firing is recorded in evidence, and the same fixture without injection is
+     a genuine-absence candidate; no real unreadable directory exists. A
+     listed relative path and a duplicate refuse with exit 2.
+  10 receiptless legacy roots: the one whose checkout is on the boot Data
+     volume (device + APFS UUID proof) gets its exclusive pruning receipt and
+     is deleted (receipt `pruned`/`deleted`); the one whose checkout is on the
+     attached scratch image, a foreign directory and a marker whose checkout
+     identity is not its path digest are kept, bytes unchanged.
+  11 active writer: a build script holds Cargo Running in a vanished checkout;
+     its root is kept with a writer reason.
+  12 containment and reserve: a root replaced by a symlink is kept; a symlink
+     descendant stops deletion (exit 3, target untouched) and replay
+     completes; an injected low reserve at the pre-rename check refuses (exit
+     2, root bytes unchanged, nothing journaled); one between delete batches of
+     a 600-entry root stops (exit 3) with some but not all entries deleted, and
+     replay completes.
+  13 crash after intent: exit 3, root in place; replay rolls back and deletes.
+  14 crash after rename: exit 3, quarantine present; a recreated checkout's
+     build refuses while the intent is unsettled; replay completes.
+  15 crash during delete: exit 3; replay completes.
+  16 crash after registry terminal: exit 3, receipt not yet pruned; replay
+     settles the receipt.
+  17 completion: deleted root, registry row and intent gone, tombstone,
+     prune-observations recorded; logical bytes equal an independent by-name
+     oracle and allocated bytes equal an independent unique-inode oracle (a
+     hard-linked 64 KiB inode counted once; complete coverage); `oxide status`
+     shows the observation.
+  18 recreation: a pruned checkout re-created at the same path adopts a fresh
+     root nonce different from the deleted root's recorded nonce, and its first
+     build keys a different, cold slot.
+  19 resolve-intent with both leaves absent: resolution receipt,
+     `resolved-by-operator`.
+  20 resolve-intent refuses while the quarantine is present: exit 2, intent
+     unchanged; replay then completes.
+  21 version-1 receipt compatibility (oxide#152): a whole-target
+     `oxide.outputs.transition/1` receipt and its `root/1` root (written before
+     the registry existed, so the product's own receipt seed recorded a legacy
+     row with no nonce); the live checkout keeps it; a valid NONCOMMITTED
+     version-1 receipt (one committed root plus a prepared transition) keeps
+     its own reference group without poisoning the batch; a dry run changes no
+     receipt, root or control byte; the exact preview bytes and the same
+     operator list prune only the committed legacy root and publish the current
+     receipt shape with its recorded terminal outcome; the kept root's
+     version-1 receipt bytes never change. It shares case 10's boot-Data-volume
+     absence proof: on a host whose supervisor scratch is not on the boot Data
+     volume the legacy root stays kept and this case fails loudly rather than
+     asserting a false pass.
+  22 overflow: a sticky-incomplete registry keeps every root and a new
+     reservation carries an overflow tag naming the registry; the starter binds
+     it with no invented row. Run last: the flag is never cleared.
+
+Dependency matrix (id, declared dependencies, taints fixture state on failure):
+
+    01  deps -  no taint
+    02  deps 01  taints
+    03  deps 01  no taint
+    04  deps 01,02  taints
+    05  deps 01,04  taints
+    06  deps 01  no taint
+    07  deps 01,06  taints
+    08  deps 01,07  no taint
+    09  deps 01,08  no taint
+    10  deps 01,09  taints
+    11  deps 01,10  taints
+    12  deps 01,10  taints
+    13  deps 01,12  taints
+    14  deps 01,12  taints
+    15  deps 01,12  taints
+    16  deps 01,12  taints
+    17  deps 01,12,16  taints
+    18  deps 01,17  no taint
+    19  deps 01,18  taints
+    20  deps 01,19  taints
+    21  deps 01,20  taints
+    22  deps 01,21  taints
+
+Receipts from runs before this matrix was published used a different thematic
+numbering; they stay historical and their ids are never read as the matrix
+above.
 
 Nine-premise sweep (source fit, UNMEASURED): private `HOME`/`CARGO_HOME` with
 the invoking `RUSTUP_HOME`, `RUSTUP_AUTO_INSTALL=0` and `OXIDE_TEST_HOME_FROM_ENV=1`;
@@ -1008,7 +1038,7 @@ def run(proof, repo: str) -> None:
 
     # ---- fence / init ------------------------------------------------------
     with case("01") as scope, scope.run():
-        # The version-1 fixture (case 22) must exist before the registry does, so
+        # The version-1 fixture (case 21) must exist before the registry does, so
         # the product's own bounded receipt seed records its legacy rows. No
         # registry or row is written by hand.
         world.version_one = world.version_one_fixture()
@@ -1484,7 +1514,7 @@ def run(proof, repo: str) -> None:
         # the committed one has a legacy row (no nonce), the prepared one has a
         # selected row and a pending row. Any positive prune of a legacy identity
         # still needs the explicit operator list and the boot-Data-volume absence
-        # proof (the same precondition case 12 uses).
+        # proof (the same precondition case 10 uses).
         v1_checkout, v1_root = world.version_one["committed"]
         prepared_checkout, prepared_root = world.version_one["prepared"]
         v1_receipt = world.version_one["committed_receipt"]
@@ -1574,6 +1604,18 @@ def run(proof, repo: str) -> None:
     permanent.work_left()
     proof.detach()
     proof.phase("after detach")
+
+
+def case_matrix_text() -> str:
+    """The dependency matrix, generated from CASE_PLAN. The module docstring
+    embeds exactly this text, and `--self-test` fails if the two drift, so the
+    owning documentation can never describe a different case identity than the
+    dispatcher executes."""
+    return "\n".join(
+        f"    {case_id}  deps {','.join(deps) if deps else '-'}  "
+        f"{'taints' if taints else 'no taint'}"
+        for case_id, deps, taints in CASE_PLAN
+    )
 
 
 def finish_cases() -> None:
@@ -1691,6 +1733,18 @@ def self_test() -> int:
         )]
 
     check("case table", table)
+
+    def documented_matrix() -> None:
+        # The owning docstring must describe exactly the bodies this run
+        # dispatches: same ids, same order, same names, same dependencies.
+        assert case_matrix_text() in (__doc__ or ""), "the docstring matrix drifted from CASE_PLAN"
+        documented = [line.strip() for line in (__doc__ or "").splitlines() if line.startswith("  21 ")
+                      or line.startswith("  22 ")]
+        assert documented and documented[0].startswith("21 version-1"), documented
+        assert documented[1].startswith("22 overflow"), documented
+        assert "cases 10 and 21 prove" in (__doc__ or "")
+
+    check("documented case matrix", documented_matrix)
 
     def helper_compatibility() -> None:
         # The shared installed-handoff staging helper gained only an optional
