@@ -911,12 +911,13 @@ An `unrecorded` slot makes the total a stated lower bound. Default status never
 publishes, refreshes, reconciles or creates a lock, and a snapshot may still
 straddle a concurrent replacement and says so.
 
-**Doc obligation.** `workflow.md` currently states that default status reports
+**Owning sentence.** `workflow.md` used to state that default status reports
 recorded sidecar facts and that "recorded facts are never summed into a pool
-total". Phase B rewrites exactly that sentence in
+total". The same change rewrites exactly that sentence in
 [storage and space management](workflow.md#storage-and-space-management) to
-name the two sources above. This PR does not, because the shipped binary does
-not yet show a ledger total.
+name the two sources above, because the binary now does show a ledger total:
+that older sentence was true of the sidecar only and would otherwise
+contradict the implementation.
 
 `oxide status --measure` keeps the full payload and per-slot walk as the
 audit: unchanged bounds, no lock, no publication, coverage/cause/elapsed
