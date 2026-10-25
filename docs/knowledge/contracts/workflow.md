@@ -957,8 +957,12 @@ value in both branches; the owned directory observed on the selected pool
 while a gated writer holds it, with a hard-linked pair counted once against
 the measured slot figure (16 MiB unique must stay below 24 MiB) and the held
 scratch untouched by `status --measure`; normal release removing it; an
-injected crash while the writer group survives keeping it, and positive
-dead-group recovery removing the slot whole and permitting reuse; `oxide
+injected crash whose writer group is observed closed from outside the way the
+product observes closure (`kill(-pgid, 0)` on the group the fixture reports),
+after which a later command neither adopts nor keeps the dead command's
+leftover — this slot's same-incarnation directory is reconciled by its next
+lease, or the untrusted slot is evicted whole, and both existing rules are
+accepted outcomes rather than one assumed mechanism; `oxide
 test`, `oxide exec -- <tool>` and `oxide run` each observing the chosen
 directory, with a **live** `run` program plus a competing `oxide check` in the
 same checkout proving the competing command takes another slot and the live

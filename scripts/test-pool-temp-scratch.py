@@ -38,8 +38,12 @@ Cases (each one is a real child, nothing is simulated):
    is inside it.
 7. normal release removes it; the released slot keeps none.
 8. a crash with a surviving writer group keeps the directory and the slot; the
-   positive dead-group recovery deletes the slot whole and the next command
-   reuses the pool.
+   proof observes that group's closure the way the product does (`kill(-pgid,
+   0)` on the pgid the fixture reports), then a later command must neither adopt
+   nor keep the dead command's leftover: this slot's same-incarnation directory
+   is reconciled by its next lease, or the untrusted slot is evicted whole —
+   both existing rules, and the case asserts the outcome without assuming
+   which one runs.
 9. `oxide test`, `oxide exec -- <tool>` and `oxide run` children each observe
    the chosen directory: a test binary asserts the prefix it was given, the
    fake exec tool records `$TMPDIR`, and the run program reports and writes
@@ -71,6 +75,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -242,6 +247,13 @@ def stage_subject(root: str) -> str:
 BUILD_SCRIPT = r'''
 use std::io::Write;
 
+extern "C" {
+    // The build script's own process group: Cargo's group, because Cargo is
+    // this command's group leader. The proof uses it to observe closure from
+    // outside, exactly as the product does.
+    fn getpgrp() -> i32;
+}
+
 fn main() {
     let dir = std::env::temp_dir();
     for name in ["TMPDIR", "TMP", "TEMP"] {
@@ -251,6 +263,17 @@ fn main() {
         );
     }
     println!("cargo:warning=OXIDE-TEMP dir={}", dir.display());
+    // SAFETY: getpgrp has no preconditions.
+    println!("cargo:warning=OXIDE-TEMP pgid={}", unsafe { getpgrp() });
+    if let Ok(target) = std::env::var("FIXTURE_CHDIR") {
+        // A child that changes directory must still use the directory it was
+        // given. A raw relative value would put this marker under the new
+        // working directory instead.
+        std::env::set_current_dir(&target).expect("chdir");
+        let after = std::env::temp_dir();
+        println!("cargo:warning=OXIDE-TEMP dir-after-chdir={}", after.display());
+        std::fs::write(after.join("after-chdir"), b"after").expect("after-chdir");
+    }
     if let Ok(gate) = std::env::var("FIXTURE_HOLD") {
         // A gated writer: it announces itself, writes into the temporary
         // directory and waits for the release file the proof creates.
@@ -265,6 +288,7 @@ fn main() {
         while !std::path::Path::new(&gate).exists() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        std::fs::write(dir.join("released-marker"), b"released").expect("released");
         println!("cargo:warning=OXIDE-TEMP released");
     }
 }
@@ -598,6 +622,33 @@ def relative_inherited(world: World, crate: str) -> None:
         "temp: inherited" in result.stderr,
         "the summary did not name the relative inherited directory",
     )
+    # The counterexample the rule exists for: the same relative `TMPDIR`, but
+    # the child changes its working directory before using it. The value it
+    # was given is absolute, so the write lands in the qualified directory and
+    # not under the new working directory.
+    chdir_target = private_dir(os.path.join(crate, "chdir-target"))
+    chdir_run = world.run(
+        ["check"],
+        cwd=crate,
+        env=world.env(
+            TMPDIR="rel-tmp",
+            TMP=None,
+            TEMP=None,
+            FIXTURE_CHDIR=chdir_target,
+        ),
+    )
+    expect(
+        reported(chdir_run.stderr, "dir-after-chdir").rstrip("/") == canonical(relative),
+        f"the child re-resolved the relative value after chdir: {chdir_run.stderr[-1500:]}",
+    )
+    expect(
+        os.path.isfile(os.path.join(relative, "after-chdir")),
+        "the child's post-chdir write did not land in the qualified directory",
+    )
+    expect(
+        not os.path.exists(os.path.join(chdir_target, "after-chdir")),
+        "the child's post-chdir write followed a relative value",
+    )
     # A relative value that does not resolve anywhere is replaced.
     replaced_run = world.run(
         ["check"],
@@ -742,6 +793,16 @@ def accounting(world: World, crate: str) -> None:
     )
 
 
+def group_is_empty(pgid: int) -> bool:
+    try:
+        os.kill(-pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
 def crash_and_recovery(world: World, crate: str) -> None:
     case(CASE_NAMES[7])
     gate = os.path.join(world.root, "crash-release")
@@ -759,6 +820,7 @@ def crash_and_recovery(world: World, crate: str) -> None:
     )
     scratch = ""
     slot = ""
+    pgid = 0
     try:
         expect(child.stderr is not None, "no stderr pipe")
         lines: list[str] = []
@@ -770,12 +832,15 @@ def crash_and_recovery(world: World, crate: str) -> None:
             lines.append(line)
             if "OXIDE-TEMP holding" in line:
                 break
-        scratch = reported("".join(lines), "dir").rstrip("/")
+        text = "".join(lines)
+        scratch = reported(text, "dir").rstrip("/")
         held_by_pool(world, scratch)
         expect(os.path.isdir(scratch), "no owned directory while holding")
         slot = os.path.dirname(scratch)
-        # Kill only Oxide itself: the writer group survives, so closure is
-        # unknown and the slot with its scratch must stay.
+        pgid = int(reported(text, "pgid"))
+        expect(pgid > 0, f"the fixture reported no process group: {text[-500:]}")
+        # Kill only Oxide itself: its writer group survives, so closure is
+        # unknown and the directory must stay with the held slot.
         child.kill()
         child.wait(timeout=min(work_left(), 30))
         expect(
@@ -783,25 +848,48 @@ def crash_and_recovery(world: World, crate: str) -> None:
             "the owned directory was removed while its writer survived",
         )
         expect(os.path.isdir(slot), "the held slot was deleted")
-        # Positive closure: release the writer and let the group end.
+        # A leftover this dead command could never reconcile itself.
+        leftover = os.path.join(scratch, "proof-leftover")
+        write_private(leftover, "left behind by the interrupted command")
+        # Positive closure of the writer group, observed the way the product
+        # observes it: the recorded group is gone. A dead `oxide` removes
+        # nothing, so nothing here waits for it to.
         write_private(gate, "")
-        deadline = time.monotonic() + min(work_left(), 120)
-        while time.monotonic() < deadline and os.path.isdir(scratch):
-            time.sleep(0.2)
-        recovered = world.run(
+        deadline = time.monotonic() + min(work_left(), 60)
+        while time.monotonic() < deadline and not group_is_empty(pgid):
+            time.sleep(0.1)
+        expect(
+            group_is_empty(pgid),
+            f"the interrupted command's group {pgid} did not close",
+        )
+        expect(
+            os.path.isdir(scratch) and os.path.isfile(leftover),
+            "the interrupted command's directory changed before any recovery",
+        )
+        # The next command succeeds and never adopts the dead command's
+        # leftover: either this slot's same-incarnation directory is
+        # reconciled by its new lease, or the untrusted slot is evicted whole.
+        # Both are the existing product rules; the assertion does not assume
+        # which one runs.
+        after = world.run(
             ["check"], cwd=crate, env=world.env(TMPDIR=None, TMP=None, TEMP=None)
         )
+        observed = reported(after.stderr, "dir").rstrip("/")
+        held_by_pool(world, observed)
         expect(
-            "OXIDE-TEMP dir=" in recovered.stderr,
-            f"the recovering command produced no observation: {recovered.stderr[-1500:]}",
+            not os.path.exists(leftover),
+            "the interrupted command's leftover survived the next command",
         )
+        if not os.path.isdir(slot):
+            say("the untrusted interrupted slot was evicted whole, leftover included")
+        else:
+            expect(
+                os.path.dirname(observed) == slot,
+                "the interrupted slot was neither reused nor evicted",
+            )
         expect(
-            not os.path.isdir(slot),
-            "the interrupted slot was not deleted whole after closure",
-        )
-        expect(
-            not os.path.exists(scratch),
-            "the owned directory survived the recovered slot",
+            not os.path.exists(observed),
+            "the next command kept an owned directory after its own release",
         )
     finally:
         write_private(gate, "")
@@ -1026,7 +1114,7 @@ def removable(world: World, crate: str) -> None:
     image = os.path.join(world.root, "dragontail.sparseimage")
     created = subprocess.run(
         [
-            "hdiutil",
+            "/usr/bin/hdiutil",
             "create",
             "-size",
             f"{IMAGE_MIB}m",
@@ -1044,20 +1132,39 @@ def removable(world: World, crate: str) -> None:
         timeout=work_left(),
     )
     expect(created.returncode == 0, f"image creation failed: {created.stderr}")
+    # The mount-root rule makes the drive root owner-only, so the owned image
+    # is attached with ownership enabled, exactly as the accepted account-home
+    # proof does, and that fact is confirmed before registration.
     attached = subprocess.run(
-        ["hdiutil", "attach", "-nobrowse", "-noautoopen", image],
+        ["/usr/bin/hdiutil", "attach", "-nobrowse", "-owners", "on", "-plist", image],
         capture_output=True,
-        text=True,
         timeout=work_left(),
     )
-    expect(attached.returncode == 0, f"image attach failed: {attached.stderr}")
+    expect(attached.returncode == 0, f"image attach failed: {attached.stderr!r}")
     mount = ""
     try:
-        for line in attached.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[-1].startswith("/Volumes/"):
-                mount = parts[-1]
-        expect(bool(mount), f"no mount point in {attached.stdout!r}")
+        entities = plistlib.loads(attached.stdout)["system-entities"]
+        mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
+        expect(
+            len(mounts) == 1,
+            f"expected one mounted volume for the owned image, got {mounts}",
+        )
+        mount = mounts[0]
+        expect(
+            mount.startswith("/Volumes/"),
+            f"the owned image did not mount under /Volumes: {mount}",
+        )
+        ownership = subprocess.run(
+            ["/usr/sbin/diskutil", "info", "-plist", mount],
+            capture_output=True,
+            timeout=work_left(),
+        )
+        expect(ownership.returncode == 0, "diskutil info failed for the mount")
+        expect(
+            plistlib.loads(ownership.stdout).get("GlobalPermissionsEnabled") is True,
+            "the owned image is mounted without ownership enabled",
+        )
+        say(f"owned scratch image mounted at {mount} with ownership enabled")
         world.run(
             [
                 "pool",
