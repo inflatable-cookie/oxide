@@ -106,13 +106,15 @@ before the command that needs it.
    the pool. Grammar: identity text; `cargo:warning=OXIDE-TEMP dir=<path>` on
    Cargo's stderr; then `oxide metadata`/`oxide fmt` create no slot.
 2. same-volume inherited TMPDIR (case 2): `oxide check` with an inherited
-   directory inside the pool. State: `private_dir(inherited)`, same device as
-   `world.pool`, no slot scratch. Grammar: build-script stderr and the
+   directory on the pool's device. State: `world.fixture("inherited-tmp")`, a
+   sibling of the pool directory inside the same monitored root (never inside
+   the pool, which the product refuses as an unexpected entry), no slot
+   scratch. Grammar: build-script stderr and the
    `temp: inherited <canonical>` summary fragment.
 3. unusable inherited TMPDIR (case 3): same command over absent/file/relative/
    unwritable/symlink values, plus a device-gated other-device value. State:
-   each bad value created in `replaced`; the pool device read from
-   `os.stat(canonical(world.pool))`. Grammar: `temp: oxide <path>` and the
+   each bad value created with `world.fixture(...)` beside the pool; the pool
+   device read from `os.stat(canonical(world.pool))`. Grammar: `temp: oxide <path>` and the
    scratch path under the pool payload.
 4. existing relative TMPDIR (case 4): `oxide check` from the crate with
    `TMPDIR=rel-tmp` and `FIXTURE_CHDIR`. State: `crate/rel-tmp` exists; the
@@ -120,7 +122,7 @@ before the command that needs it.
    `OXIDE-TEMP dir-after-chdir=` line and the `after-chdir` marker in the
    qualified directory.
 5. aliases (case 5): `oxide check` twice (inherited and owned branches). State:
-   an inherited directory on the pool device; conflicting TMP/TEMP. Grammar:
+   `world.fixture("alias-tmp")` on the pool device; conflicting TMP/TEMP. Grammar:
    the three `OXIDE-TEMP <NAME>=` lines.
 6. owned scratch observed while held (case 6): `oxide check` with a gated build
    script (`FIXTURE_HOLD`), then `oxide status --measure`. State: the gated
@@ -256,6 +258,23 @@ PRODUCT_FOLDER_CHARS = len(FIXTURE_NAME) + 1 + 8
 GUARD_LEAF_CHARS = len("/oxide-proof.") + 8
 PROOF_LEAVES_CHARS = len("/scratch") + len("/pt") + len("/p")
 PRODUCT_LEAVES_CHARS = len("/payload") + len("/slots") + len("/quick-1") + len("/scratch")
+
+
+def is_inside(path: str, root: str) -> bool:
+    """Component-aware containment, independent of trailing separators."""
+    path = os.path.normpath(path)
+    root = os.path.normpath(root)
+    return path == root or path.startswith(root + os.sep)
+
+
+def fixture_dir(root: str) -> str:
+    """This proof's fixture directory: a SIBLING of the pool directory.
+
+    Inherited-`TMPDIR` fixtures must be on the same device as the pool, but the
+    product refuses a directory-budget pool that holds unexpected entries, so
+    they can never live inside the pool directory itself.
+    """
+    return os.path.join(root, "fx")
 
 
 def longest_injected_path(mount_chars: int, folder_chars: int) -> int:
@@ -1037,6 +1056,13 @@ class World:
         self.home = private_dir(os.path.join(root, "home"))
         self.cargo_home = private_dir(os.path.join(root, "cargo-home"))
         self.pool = private_dir(os.path.join(root, "p"))
+        # Sibling of the pool directory, same device: inherited-TMPDIR fixtures
+        # belong here, never inside the pool.
+        self.fixtures = private_dir(fixture_dir(root))
+        expect(
+            os.stat(self.fixtures).st_dev == os.stat(self.pool).st_dev,
+            "the fixture directory must be on the pool's device",
+        )
         self.scratch = private_dir(os.path.join(root, "fixture-scratch"))
         self.base = fixture_environment(
             os.environ, toolchain_home, self.home, self.cargo_home
@@ -1084,6 +1110,15 @@ class World:
                 f"{result.stderr[-2000:]}"
             )
         return result
+
+    def fixture(self, name: str) -> str:
+        """One fixture path in the sibling directory, never inside the pool."""
+        path = os.path.join(self.fixtures, name)
+        expect(
+            not is_inside(canonical(path), canonical(self.pool)),
+            f"fixture {path} would be inside the pool directory",
+        )
+        return path
 
     def slot_roots(self) -> list[str]:
         slots = os.path.join(self.pool, "payload", "slots")
@@ -1199,7 +1234,7 @@ def measured_slot_bytes(text: str, slot_id: str) -> int:
 
 def inherited_kept(world: World, crate: str) -> None:
     case(CASE_NAMES[1])
-    inherited = private_dir(os.path.join(world.pool, "inherited-tmp"))
+    inherited = private_dir(world.fixture("inherited-tmp"))
     keep = os.path.join(inherited, "effigy-evidence")
     write_private(keep, "retained")
     result = world.run(
@@ -1235,10 +1270,10 @@ def inherited_kept(world: World, crate: str) -> None:
 
 def replaced(world: World, crate: str) -> None:
     case(CASE_NAMES[2])
-    missing = os.path.join(world.pool, "missing-tmp")
-    closed = private_dir(os.path.join(world.pool, "closed-tmp"))
+    missing = world.fixture("missing-tmp")
+    closed = private_dir(world.fixture("closed-tmp"))
     os.chmod(closed, 0o500)
-    file_path = os.path.join(world.pool, "not-a-dir")
+    file_path = world.fixture("not-a-dir")
     write_private(file_path, "file")
     escape = os.path.join(world.root, "escape-link")
     if os.path.lexists(escape):
@@ -1369,7 +1404,7 @@ def relative_inherited(world: World, crate: str) -> None:
 
 def aliases(world: World, crate: str) -> None:
     case(CASE_NAMES[4])
-    inherited = private_dir(os.path.join(world.pool, "alias-tmp"))
+    inherited = private_dir(world.fixture("alias-tmp"))
     env = world.env(
         TMPDIR=inherited,
         TMP=os.path.join(world.root, "elsewhere-tmp"),
@@ -1605,7 +1640,7 @@ def crash_and_recovery(world: World, crate: str) -> None:
 def spawns(world: World, crate: str) -> None:
     case(CASE_NAMES[8])
     # An inherited directory reaches every child and is never cleaned.
-    inherited = private_dir(os.path.join(world.pool, "spawn-tmp"))
+    inherited = private_dir(world.fixture("spawn-tmp"))
     env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
     tested = world.run(["test"], cwd=crate, env=dict(env, TEMP_EXPECT_PREFIX=inherited))
     results = tested.stdout + tested.stderr
@@ -1947,7 +1982,7 @@ def removable(world: World, crate: str) -> None:
         expect(not os.path.exists(mount), f"the fallback recreated {mount}")
         # With a same-device inherited TMPDIR the fallback keeps it and
         # creates nothing.
-        inherited = private_dir(os.path.join(world.pool, "keep-tmp"))
+        inherited = private_dir(world.fixture("keep-tmp"))
         kept = world.run(
             ["check"],
             cwd=crate,
@@ -2372,6 +2407,30 @@ def self_check() -> int:
         and any(
             entry["case"] == "b" for entry in ordering["secondary_faults"]
         ),
+    )
+
+    # 3h. Fixture placement: inherited-TMPDIR fixtures must be siblings of the
+    #     directory-budget pool (same device, outside the pool directory), never
+    #     children of it. The negative control is the exact defect the last
+    #     diagnostic receipt exposed.
+    property_true(
+        "the fixture directory is a sibling of the pool directory",
+        fixture_dir("/x/pt") == "/x/pt/fx"
+        and not is_inside(fixture_dir("/x/pt"), "/x/pt/p"),
+    )
+    property_true(
+        "the fixture directory stays inside the monitored root",
+        is_inside(fixture_dir("/x/pt"), "/x/pt"),
+    )
+    property_true(
+        "negative control: a fixture planted in the pool is detected",
+        is_inside("/x/pt/p/inherited-tmp", "/x/pt/p")
+        and is_inside("/x/pt/p/not-a-dir", "/x/pt/p"),
+    )
+    property_true(
+        "containment is component-aware, not a string prefix",
+        not is_inside("/x/pt/fx", "/x/pt/f")
+        and not is_inside("/x/pt/p2", "/x/pt/p"),
     )
 
     # 3i. Source fit for the two roots this proof actually uses, with the

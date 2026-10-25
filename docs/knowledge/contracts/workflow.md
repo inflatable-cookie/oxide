@@ -972,7 +972,10 @@ outcome, and writes a bounded receipt labelled `qualified: false`; the default
 run still fails fast. It is dispatched only through
 `effigy rust:pool-temp-scratch:diagnostic` (selectors do not forward
 passthrough arguments), is required before the next counted native run, and a
-source sweep complements it but never replaces it. The proof covers: a
+source sweep complements it but never replaces it. Inherited-`TMPDIR` fixtures are planted in a sibling fixture directory inside
+the same monitored root, never inside the directory-budget pool, because the
+product correctly refuses a pool directory that holds unexpected entries. The
+proof covers: a
 same-volume inherited `TMPDIR` kept canonically with no Oxide directory
 created and the inherited content untouched; absent, file, relative,
 unwritable, other-device and symlink-escaping values replaced by one owned
