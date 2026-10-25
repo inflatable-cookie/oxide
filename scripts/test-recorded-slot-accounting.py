@@ -198,37 +198,45 @@ def invoking_rustup_home() -> str:
     return os.path.realpath(resolved)
 
 
-def toolchain_pin_problems(rustup_home: str, entries: list[str]) -> list[str]:
-    """Why the invoking toolchain home does not carry the pinned toolchain.
+def toolchain_pin_problems(rustup_home: str, toolchain_entries: list[str]) -> list[str]:
+    """Why `<RUSTUP_HOME>/toolchains` does not carry the pinned toolchain.
 
-    Existence of the home is not evidence: the pin must be installed beneath
-    it. This reads the directory listing only, so `--self-check` can exercise
-    it without probing rustup, installing anything or touching a toolchain.
+    Existence of the home is not evidence: rustup installs each toolchain as
+    `<home>/toolchains/<pin>-<host>/`, so the pin is proven from that directory
+    naming scheme, never from the home alone. `--self-check` exercises this with
+    listings it supplies, so no rustup probe, install or toolchain is touched.
     """
     problems: list[str] = []
     if not rustup_home or not os.path.isabs(rustup_home):
         problems.append("toolchain_home_not_absolute")
-    installed = [entry for entry in entries if entry.startswith(BUILDER + "-")]
-    if not installed:
+        return problems
+    pinned = [entry for entry in toolchain_entries if entry.startswith(BUILDER + "-")]
+    if not pinned:
         problems.append("pinned_toolchain_absent")
-    if not any(os.path.isdir(os.path.join(rustup_home, entry)) for entry in installed):
+        return problems
+    installed = os.path.join(rustup_home, "toolchains")
+    if not os.path.isdir(installed):
+        problems.append("toolchains_directory_absent")
+        return problems
+    if not any(os.path.isdir(os.path.join(installed, entry)) for entry in pinned):
         problems.append("pinned_toolchain_not_a_directory")
     return problems
 
 
 def installed_toolchain(home: str) -> str:
-    """The installed `<pin>-<host>` directory name, refused if it is missing."""
+    """The installed `<pin>-<host>` name under `<home>/toolchains`."""
+    installed = os.path.join(home, "toolchains")
     try:
-        entries = sorted(os.listdir(home))
+        entries = sorted(os.listdir(installed))
     except OSError as error:
-        abort(f"cannot list the invoking toolchain home {home}: {error}")
+        abort(f"cannot list {installed}: {error}")
     problems = toolchain_pin_problems(home, entries)
     if problems:
         abort(f"the invoking toolchain home {home} is unusable for the pin: {problems}")
     for entry in entries:
         if entry.startswith(BUILDER + "-"):
             return entry
-    abort(f"no installed {BUILDER}-<host> toolchain beneath {home}")
+    abort(f"no installed {BUILDER}-<host> toolchain beneath {installed}")
     raise AssertionError("unreachable")
 
 
@@ -846,6 +854,27 @@ class Fixture:
         abort(f"slot {slot_id} is absent from the ledger")
 
 
+def replace_ledger_quiescent(fixture: Fixture, document: dict) -> None:
+    """Atomically replace an owned fixture's ledger while nothing holds it.
+
+    The product reads a private `ledger.json` with no digest or control
+    binding, and tolerates a crash-left `ledger.tmp-*` file, so an edit uses
+    exactly that temporary-name rule, mode 0600, one write, fsync and a
+    replace. Only a quiescent pool may be edited: no writer may hold a slot.
+    """
+    if fixture.held_slots():
+        abort(f"the fixture is not quiescent: held {fixture.held_slots()}")
+    payload = json.dumps(document).encode()
+    temp = os.path.join(fixture.pool, "ledger.tmp-146-edit")
+    descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temp, os.path.join(fixture.pool, "ledger.json"))
+
+
 def built(fixture: Fixture, subject: str, checkout: str) -> None:
     """A complete ungated command, used only where no phase claim is made."""
     result = fixture.run(subject, ["check"], checkout)
@@ -937,10 +966,13 @@ def case_a_all_recorded_admission_walks_nothing(root: str, subject: str) -> None
         expect(fx.recorded(new_slot) is None, "a held slot carries an idle observation")
         expect(len(fx.slot_ids()) == 2, f"the second project got no own slot: {fx.slot_ids()}")
     finally:
+        at_release = fx.walks()
         release_gated(fx, child, gate, output)
-    release = phase_slice(before, fx.walks())
-    expect(same_roots(release, [fx.slot_dir(new_slot)]), f"release walked {release}, not the closed slot")
-    expect(len(release) == 1, f"the release walked {len(release)} roots, not one slot")
+    release = phase_slice(at_release, fx.walks())
+    expect(
+        same_roots(release, [fx.slot_dir(new_slot)]) and len(release) == 1,
+        f"the release walk was not exactly the closed slot: {release}",
+    )
     expect(fx.recorded(new_slot) is not None, "the release published no observation")
     text = fx.status(subject)
     line = recorded_total_line(text)
@@ -971,9 +1003,7 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
     for slot in document["slots"]:
         if str(slot["id"]) == victim:
             slot.pop("recorded", None)
-    with open(os.path.join(fx.pool, "ledger.json"), "w", encoding="utf-8") as handle:
-        json.dump(document, handle)
-    os.chmod(os.path.join(fx.pool, "ledger.json"), 0o600)
+    replace_ledger_quiescent(fx, document)
 
     # The product must read exactly this legacy shape before the admission.
     read_back = fx.ledger()
@@ -997,11 +1027,12 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
         expect(fx.recorded(victim) is not None, "the completed walk was not published")
         expect(fx.recorded(keeper) is not None, "the untouched record was lost")
     finally:
+        at_release = fx.walks()
         release_gated(fx, child, gate, output)
-    release = phase_slice(before, fx.walks())
+    release = phase_slice(at_release, fx.walks())
     expect(
-        same_roots(release, [fx.slot_dir(victim), fx.slot_dir(new_slot)]) and len(release) == 2,
-        f"release walks were not the admission walk plus the closed slot: {release}",
+        same_roots(release, [fx.slot_dir(new_slot)]) and len(release) == 1,
+        f"the release walk was not exactly the closed slot: {release}",
     )
 
 
@@ -1034,11 +1065,12 @@ def case_c_release_publishes_and_reuse_clears(root: str, subject: str) -> None:
         )
         expect(fx.recorded(held) is None, "a held slot kept the idle record")
     finally:
+        at_release = fx.walks()
         provenance = release_gated(fx, child, gate, output)
-    release = phase_slice(before, fx.walks())
+    release = phase_slice(at_release, fx.walks())
     expect(
-        same_roots(release, [fx.slot_dir(idle[0])]) and len(release) == 2,
-        f"the reuse and its release did not each walk the one slot: {release}",
+        same_roots(release, [fx.slot_dir(idle[0])]) and len(release) == 1,
+        f"the release walk was not exactly the closed slot: {release}",
     )
     expect(fx.recorded(idle[0]) is not None, "the reuse release published no observation")
     expect(
@@ -1157,12 +1189,13 @@ def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> N
                 "the held slot gained an idle observation while still held",
             )
         finally:
+            pressure_at_release = fx.walks()
             pressure_release = release_gated(fx, pressure, pressure_gate, pressure_output)
-        pressure_release_walks = phase_slice(before, fx.walks())
+        pressure_release_walks = phase_slice(pressure_at_release, fx.walks())
         expect(
-            same_roots(pressure_release_walks, [held_dir, fx.slot_dir(new_slot)])
-            and len(pressure_release_walks) == 2,
-            f"the pressure command's release walks were {pressure_release_walks}",
+            same_roots(pressure_release_walks, [fx.slot_dir(new_slot)])
+            and len(pressure_release_walks) == 1,
+            f"the pressure command's release walk was {pressure_release_walks}",
         )
         expect(pressure_release != "", "the pressure writer wrote no result line")
     finally:
@@ -1248,8 +1281,9 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
         expect(len(survivors) == 1, f"neither or both idle slots were evicted: {ids}")
         expect(new_slot in ids, "the pressure command took no slot")
     finally:
+        at_release = fx.walks()
         release_gated(fx, child, gate, output)
-    release = phase_slice(before, fx.walks())
+    release = phase_slice(at_release, fx.walks())
     expect(
         same_roots(release, [fx.slot_dir(new_slot)]) and len(release) == 1,
         f"the release walk was not exactly the closed slot: {release}",
@@ -1270,9 +1304,13 @@ def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
     for slot in document["slots"]:
         slot.pop("recorded", None)
     document["capacity_policy"] = 1
-    with open(os.path.join(fx.pool, "ledger.json"), "w", encoding="utf-8") as handle:
-        json.dump(document, handle)
-    os.chmod(os.path.join(fx.pool, "ledger.json"), 0o600)
+    replace_ledger_quiescent(fx, document)
+    read_back = fx.ledger()
+    expect(
+        read_back["capacity_policy"] == 1
+        and all(slot.get("recorded") is None for slot in read_back["slots"]),
+        "the ledger edit did not produce the intended legacy shape",
+    )
 
     fx.reset_logs()
     before = fx.walks()
@@ -1318,10 +1356,10 @@ def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
         if attempt.returncode == 0:
             recovered = attempt
             break
-    expect(
-        recovered is not None,
-        f"no later command settled the crashed slot in {attempts} bounded attempts",
-    )
+    if recovered is None:
+        # An unsettled crash recovery is an unknown custody outcome, never a
+        # recoverable oracle failure: abort the whole collection.
+        abort(f"no later command settled the crashed slot in {attempts} bounded attempts")
     for slot in fx.ledger()["slots"]:
         if slot["state"] == "idle":
             expect(
@@ -1521,23 +1559,40 @@ def shared_inode_precondition(roots: list[str], key: tuple[int, int]) -> bool:
     return present == len(roots) and len(roots) > 1
 
 
-def evidence_dir(scratch: str) -> str:
-    """The guard's own evidence directory, refused if its provenance is unsafe.
+def evidence_dir_from(
+    environment: dict[str, str],
+    scratch: str,
+    exists=os.path.isdir,
+    resolve=os.path.realpath,
+    is_link=os.path.islink,
+) -> str:
+    """The guard's evidence directory, refused if its provenance is unsafe.
 
-    `bounded-test.py` exports `OXIDE_PROOF_EVIDENCE`; it is never inside the
-    removable scratch and cleanup never removes it. A missing, non-absolute or
-    out-of-tree value refuses before any effect, because writing the receipt
-    anywhere else could be deleted with the scratch it describes.
+    Only the guard's exact export counts: `OXIDE_PROOF_EVIDENCE`, never a
+    `_DIR` spelling, an inherited guess or a scratch-tree parent. A symlink is
+    resolved first and must still land on the guard's own sibling topology, so
+    a link that escapes the owned root refuses. The filesystem predicates are
+    injectable so the pure check drives this same decision with fakes and no
+    external effect.
     """
-    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
-    if not evidence:
+    if "OXIDE_PROOF_EVIDENCE" not in environment:
+        if "OXIDE_PROOF_EVIDENCE_DIR" in environment:
+            abort(
+                "the guard exported OXIDE_PROOF_EVIDENCE_DIR, which is not its"
+                " documented OXIDE_PROOF_EVIDENCE; refusing an unverified path"
+            )
         abort("the guard exported no OXIDE_PROOF_EVIDENCE directory")
+    evidence = environment["OXIDE_PROOF_EVIDENCE"]
+    if not evidence:
+        abort("the guard exported an empty OXIDE_PROOF_EVIDENCE")
     if not os.path.isabs(evidence):
         abort(f"OXIDE_PROOF_EVIDENCE {evidence!r} is not absolute")
-    if not os.path.isdir(evidence):
+    if not exists(evidence):
         abort(f"OXIDE_PROOF_EVIDENCE {evidence!r} is not a directory")
-    evidence_real = os.path.realpath(evidence)
-    scratch_real = os.path.realpath(scratch)
+    evidence_real = resolve(evidence)
+    if is_link(evidence) and not exists(evidence_real):
+        abort(f"OXIDE_PROOF_EVIDENCE {evidence!r} is a link to a non-directory")
+    scratch_real = resolve(scratch)
     problems = evidence_topology_problems(evidence_real, scratch_real)
     if problems:
         abort(
@@ -1545,6 +1600,11 @@ def evidence_dir(scratch: str) -> str:
             f" directory beside scratch {scratch_real}: {problems}"
         )
     return evidence_real
+
+
+def evidence_dir(scratch: str) -> str:
+    """The real environment's evidence directory."""
+    return evidence_dir_from(dict(os.environ), scratch)
 
 
 def bounded_excerpt(value: str) -> str:
@@ -1895,19 +1955,62 @@ def self_check() -> None:
         problems = evidence_topology_problems(bad, scratch)
         expect(expected in problems, f"{label} was accepted: {problems}")
 
-    # The toolchain pin predicate rejects a home without an installed pin.
+    # The pin is proven from `<home>/toolchains/<pin>-<host>`, never from the
+    # home alone: an absent pin, a relative home and a missing toolchains
+    # directory each refuse with their own reason.
     expect(
-        "pinned_toolchain_absent" in toolchain_pin_problems(REPO, ["stable-x86_64-unknown-linux-gnu"]),
-        "a home without the pinned toolchain was accepted",
+        "pinned_toolchain_absent"
+        in toolchain_pin_problems(REPO, ["stable-aarch64-apple-darwin"]),
+        "a toolchains listing without the pin was accepted",
     )
     expect(
-        "toolchain_home_not_absolute" in toolchain_pin_problems("relative/home", [BUILDER + "-host"]),
+        "toolchain_home_not_absolute"
+        in toolchain_pin_problems("relative/home", [BUILDER + "-aarch64-apple-darwin"]),
         "a relative toolchain home was accepted",
     )
     expect(
-        toolchain_pin_problems(REPO, [BUILDER + "-host", BUILDER + "-other"]) == []
-        or "pinned_toolchain_not_a_directory" in toolchain_pin_problems(REPO, [BUILDER + "-host"]),
-        "the pin predicate is not evaluated",
+        "toolchains_directory_absent"
+        in toolchain_pin_problems("/nonexistent-rustup-home", [BUILDER + "-host"]),
+        "a home without a toolchains directory was accepted",
+    )
+
+    # The evidence boundary refuses the wrong export name, a symlink that
+    # escapes, and a symlink to a non-directory — all through the real
+    # decision with injected filesystem predicates and no external effect.
+    guard_root = "/private/tmp/oxide-task.abc"
+    scratch_path = guard_root + "/scratch"
+    for environment, exists, resolve, is_link, expected, label in (
+        ({"OXIDE_PROOF_EVIDENCE_DIR": guard_root + "/evidence"}, lambda path: True,
+         lambda path: path, lambda path: False, "OXIDE_PROOF_EVIDENCE_DIR", "_DIR-only export"),
+        ({}, lambda path: True, lambda path: path, lambda path: False,
+         "no OXIDE_PROOF_EVIDENCE", "missing export"),
+        ({"OXIDE_PROOF_EVIDENCE": "relative/evidence"}, lambda path: True,
+         lambda path: path, lambda path: False, "is not absolute", "relative export"),
+        ({"OXIDE_PROOF_EVIDENCE": guard_root + "/evidence"}, lambda path: False,
+         lambda path: path, lambda path: False, "is not a directory", "absent directory"),
+        ({"OXIDE_PROOF_EVIDENCE": guard_root + "/evidence"}, lambda path: True,
+         lambda path: "/private/tmp/elsewhere/evidence", lambda path: True,
+         "not the guard's own evidence", "symlink escaping the owned root"),
+        ({"OXIDE_PROOF_EVIDENCE": guard_root + "/evidence"}, lambda path: "/target" not in path,
+         lambda path: "/target", lambda path: True, "link to a non-directory",
+         "symlink to a non-directory"),
+    ):
+        try:
+            evidence_dir_from(environment, scratch_path, exists=exists, resolve=resolve, is_link=is_link)
+            fail(f"an unsafe evidence provenance was accepted ({label})")
+        except CaseFailure as failure:
+            expect(failure.abort, f"{label} must abort before effects")
+            expect(expected in str(failure), f"{label} reported {failure!r}, not {expected!r}")
+    expect(
+        evidence_dir_from(
+            {"OXIDE_PROOF_EVIDENCE": guard_root + "/evidence"},
+            scratch_path,
+            exists=lambda path: True,
+            resolve=lambda path: path,
+            is_link=lambda path: False,
+        )
+        == guard_root + "/evidence",
+        "the guard's own evidence sibling was refused",
     )
     expect(
         not shared_inode_precondition(["/nonexistent-a"], (0, 0)),
