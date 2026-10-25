@@ -308,29 +308,38 @@ When every record is current that is O(slots) metadata work and **zero
 inventory walks**; only a slot without a current record is walked, once, under
 the same bounds as any slot walk and one cumulative 60 s admission deadline.
 
-**Removable-volume fallback (2026-10-25 hotfix, Tom's ruling).** A
-removable `apfs-volume-v1` payload walks for at most 5 s before a new slot
-or a count replacement (`VOLUME_WALK_MS`). If that walk is incomplete and
-its only gaps are `elapsed_deadline` or `entry_limit`, the open caches that
-result. Admission then uses the volume's own used bytes (capacity less
-available, from the verified binding), which include everything else on the
-volume and so never undercount. Under the budget it admits and the command
-prints one warning naming the entries walked and the used and budget bytes.
-Over the budget it evicts least-recently-used idle whole slots one at a
-time, re-reading the volume after each, at most 8 times, then refuses with
-the original scan. Count replacements (the per-project and pool slot caps)
-proceed on the same bound-only result. Any other gap (unreadable, missing
-or unusable metadata, mount boundary, depth limit, root problems) still
-refuses, and the internal `directory-budget-v1` pool keeps every gate in
-the table above unchanged. Reason: a 127-slot USB pool could not be walked
-within 60 s, so every new-slot admission refused. Faster recorded accounting
-replaced that whole-payload walk (oxide#146, [recorded per-slot
-accounting](#recorded-per-slot-accounting-oxide146-implemented-native-held)
-below): admission now sums closed per-slot records, so on a removable pool the
-5 s bound applies to the walks that are actually still needed. The fallback is
-therefore reachable only on a pool that still has unrecorded slots (legacy
-migration), and it is retired once records cover the pool; its arithmetic,
-limit of 8 evictions and refusal class are unchanged.
+**Removable unknown-size route (2026-10-25, superseding the volume-used
+fallback).** A removable `apfs-volume-v1` payload bounds the walks its own
+figure needs with `VOLUME_WALK_MS` (5 s) for a new slot or a count
+replacement. When those walks are incomplete with **only** `elapsed_deadline`
+or `entry_limit` gaps, the pool size is genuinely unknown and the reserve
+route decides — never the volume's used bytes, and never a fixed eviction
+count:
+
+- free space **above** the registered reserve **and** at or above the 10 GiB
+  hard floor: admit with one bounded note, nothing evicted, cap unverified;
+- otherwise, while an eligible idle whole slot remains: retire the
+  least-recently-used one whole, re-verify the binding and re-read free space,
+  and repeat (bounded by the remaining eligible slots and the caller's
+  deadline);
+- with nothing left to prune: free space at or above the floor admits with a
+  warning naming the free, reserve and floor figures, and below the floor it
+  refuses with the original incomplete scan.
+
+The floor wins over a lower legacy reserve, so nothing admits below it merely
+because free space is above the reserve. Any other gap (unreadable, missing or
+unusable metadata, mount boundary, depth limit, root problems), every
+incomplete pool figure on the internal `directory-budget-v1` pool, and every
+mixed or non-bound gap refuses before anything is deleted. The reason the
+bound exists at all is unchanged: a 127-slot USB pool could not be walked
+within 60 s. Recorded per-slot accounting ([below](#recorded-per-slot-accounting-oxide146-implemented-native-held))
+means this route is reached only while some slot still lacks a current record.
+
+**Count limits are count pressure.** A per-project or pool slot-cap
+replacement may proceed when the pool figure is complete **or** when a
+removable pool's figure is unknown for bound gaps only; an internal, mixed or
+non-bound incompleteness refuses before any deletion. Count replacement
+authorisation never leaks into a byte-pressure decision.
 
 **The admission figure (oxide#146).** `Pool::recorded_total()` is
 `pool_scope()` plus one figure per ledger slot: a held slot is always walked
@@ -349,8 +358,12 @@ holds for disjoint slots, and an idle slot may be evicted earlier than the
 union alone would require. A current record is a measurement at a closing
 transition, not proof of immutable bytes, writer closure or volume closure, and
 it is trusted until its generation changes or a held/recycle/evicting
-transition clears it. A removable pool's pressure is the larger of that sum and
-the verified volume's used bytes.
+transition clears it. The pressure figure is that sum for **both** backings:
+a shared removable volume's other occupants are not this pool's usage, so they
+never move a pool toward its cap and never evict its idle slots. Free space on
+a removable volume is a separate reserve signal; the below-reserve *selection*
+fallback and the running-build reserve watchdog keep their current behaviour,
+and widening them is the approved follow-up rather than part of this change.
 
 **How one walk reads (oxide#141).** The walk itself is unchanged in scope,
 bounds, policy and refusal classes. Each enumerated regular file or directory
@@ -664,14 +677,14 @@ author and independent reviewer natives remain outstanding.
 
 #### Problem and final shape
 
-Today one ordinary command pays at least one whole-payload walk: `allocate`
-calls `payload_check` before any eviction and `payload_accounting` again after
-it (`pool.rs:971-985`), a count replacement calls `payload_check`
-(`pool.rs:1269`), `evict_idle_until` calls it before each deletion
-(`pool.rs:1288`), and a removable payload too large to walk inside 5 s takes
-the `admit_by_volume_usage` fallback (`pool.rs:1310`). Measured cost is the
-one recorded in the hotfix: a 127-slot USB pool could not be walked within the
-60 s bound, so every new-slot admission refused.
+Before this change one ordinary command paid at least one whole-payload walk:
+`allocate` walked the payload before any eviction and again after it, a count
+replacement walked it before deleting, and `evict_idle_until` walked it before
+each deletion. A removable payload too large to walk inside 5 s then took the
+retired volume-used fallback, which compared the whole volume's used bytes with
+the pool cap. Measured cost is the one recorded for the outage: a 127-slot USB
+pool could not be walked within the 60 s bound, so every new-slot admission
+refused.
 
 After this design, admission and byte-pressure eviction are arithmetic over
 the ledger: **O(slots) metadata work, zero inventory walks when every slot's
@@ -900,11 +913,11 @@ below-reserve *selection* fallback and the running-build reserve watchdog keep
 their existing behaviour; widening them to prune and to use a registration floor
 field is the approved follow-up, not part of this change.
 
-**Fallback disposition.** `admit_by_volume_usage`, its
-`VolumeAdmission` decision and the bounded multi-eviction loop are **retired**:
-the whole-volume-used figure is no longer a budget input at all. What remains
-is one pure decision, `unknown_removable_step`, and the pool-side loop that
-prunes eligible idle whole slots while free space is at or below the reserve.
+**Fallback disposition.** The retired `admit_by_volume_usage` path, its
+decision type and its fixed eight-eviction loop are gone: the whole-volume-used
+figure is no longer a budget input anywhere. What remains is one pure decision,
+`unknown_removable_step`, and the pool-side loop that prunes eligible idle
+whole slots while free space is at or below the reserve or below the floor.
 The 5 s `VOLUME_WALK_MS` bound still applies to the walks a pool figure needs,
 so a huge removable pool reaches the unknown route rather than timing out
 mid-measurement.
@@ -1003,7 +1016,7 @@ reply as a size.
 | Eviction | `evict_idle_until_under_cap` (`:1368`), `evict_one_idle` (`:1395`), `retire_idle_slot` (`:1420`), `evict_idle_until` (`:1282`), `replace_idle_slot_for_admission` (`:1260`) |
 | Release/recover | `Pool::release_or_recover` (`:1057`) |
 | Status/audit | `Pool::accounted` (`:1102`), `managed::snapshot`, `managed::measure` (`:446-492`) |
-| Hotfix | `Payload::payload_check` (`:1336`), `admit_by_volume_usage` (`:1310`), `VolumeAdmission` (`:1882`), `VOLUME_WALK_MS` (`:1869`) |
+| Removable unknown route | `unknown_removable_step`, `admit_unknown_removable`, `bound_gaps_only`, `pressure_known_or_bounded_removable`, `UNKNOWN_REMOVABLE_FLOOR_BYTES` (`10 * 1024^3`), `VOLUME_WALK_MS` |
 | Front-door release order | `store.rs` `release` (`:1622`), `unshare` (`:1640`), `discard_scratch` (`:1674`), `flush_before_idle` (`:1689`) |
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |

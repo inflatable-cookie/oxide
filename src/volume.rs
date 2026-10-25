@@ -141,16 +141,17 @@ pub struct Binding {
     device: String,
 }
 
-/// Test-only verified-volume facts.
+/// Test-only *modelled* verified-volume facts.
 ///
-/// Unit tests cannot mount an APFS volume, and a fabricated `Facts` value alone
-/// would bypass the descriptor and path checks that protect production. This
-/// adapter therefore sits *inside* `Binding::verify()`: the real descriptor
-/// observation, mount rule, device comparison and path re-check all still run
-/// on the fixture directory, and only the volume capacity/available figures a
-/// mount would report are substituted. It is compiled only under `cfg(test)`,
-/// has no environment or public entry point, and models a verified volume — it
-/// is never evidence that a real volume was verified.
+/// Unit tests cannot mount an APFS volume, so this adapter models the outcome
+/// of a successful (or failed) verification rather than exercising it: when it
+/// is installed, `Binding::verify()` returns these fabricated facts and
+/// therefore **skips** `observe()`, the mount-root rule, the device comparison
+/// and the mount-point path re-check for that call. Production has no such
+/// path at all — every production `verify()` runs those checks against a real
+/// descriptor — and this module is compiled only under `cfg(test)` with no
+/// environment, public or debug-build entry point. It is never evidence that a
+/// real volume, mount or device was verified.
 #[cfg(test)]
 pub(crate) mod verified_facts {
     use std::cell::RefCell;
@@ -244,9 +245,11 @@ pub(crate) mod verified_facts {
 
 /// Build a `Binding` over an owned fixture directory.
 ///
-/// Test-only: the descriptor and mount point are real (so the structural
-/// checks in `verify()` still run), while the volume identity is the fixture's
-/// own. Production never constructs a binding this way.
+/// Test-only: the descriptor really opens the fixture directory, but the
+/// binding is only meaningful together with [`verified_facts`], which models
+/// the verification result; without that adapter `verify()` would (correctly)
+/// reject the directory as not being a mount root. Production never constructs
+/// a binding this way.
 #[cfg(test)]
 pub(crate) fn binding_for_test(root: &Path, uuid: &str) -> Result<Binding, String> {
     let fd = open_dir(None, root)?;
@@ -327,6 +330,10 @@ impl Binding {
     /// Recheck the held descriptor and the path: the descriptor is still the
     /// same volume's root, and the path still resolves to that root rather
     /// than a directory left behind after an unmount.
+    ///
+    /// Under `cfg(test)` only, an installed [`verified_facts`] adapter returns
+    /// modelled facts instead and the structural checks below are skipped for
+    /// that call; production always runs them.
     pub fn verify(&self) -> Result<Facts, String> {
         #[cfg(test)]
         if let Some(modelled) = verified_facts::modelled()? {

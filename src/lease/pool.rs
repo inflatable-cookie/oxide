@@ -3402,6 +3402,156 @@ mod removable_pool_path_tests {
     }
 
     #[test]
+    fn warning_admit_after_exhausting_every_victim_reports_what_it_deleted() {
+        let fixture = Fixture::new("warning-victims");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let first = idle_dir(&mut pool, 1, 1);
+        let second = idle_dir(&mut pool, 2, 2);
+        // Two victims cannot recover the reserve; the third reading reaches
+        // the floor, so the route warns and admits with nothing left.
+        verified_facts::with(recovering(&[FLOOR - GIB, FLOOR - GIB, FLOOR]), || {
+            pool.admit_unknown_removable(&bounds_scan())
+                .expect("at the floor with nothing left admits");
+        });
+        assert!(!first.exists(), "the first LRU victim was not retired");
+        assert!(!second.exists(), "the second LRU victim was not retired");
+        assert!(
+            slot_ids_for_test(&pool).is_empty(),
+            "a victim survived the loop"
+        );
+        let note = pool.admission_note.clone().unwrap_or_default();
+        assert!(note.contains("warning"), "{note}");
+        assert!(note.contains("no idle slot is left to prune"), "{note}");
+        assert!(
+            note.contains("GiB"),
+            "the figures must be binary GiB: {note}"
+        );
+    }
+
+    #[test]
+    fn the_global_count_cap_proceeds_on_a_removable_bound_only_unknown() {
+        let fixture = Fixture::new("global-count");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let victims = [
+            idle_dir(&mut pool, 1, 1),
+            idle_dir(&mut pool, 2, 2),
+            idle_dir(&mut pool, 3, 3),
+        ];
+        pool.limits = InventoryLimits {
+            max_entries: 1,
+            ..accounting_limits()
+        };
+        verified_facts::with(facts(10 * GIB), || {
+            // The pool ceiling path: three slots down to one is count pressure.
+            pool.evict_idle_until(1)
+                .expect("bounds-only removable count pressure is allowed");
+        });
+        assert_eq!(
+            slot_ids_for_test(&pool),
+            vec![3],
+            "the LRU victims were not retired"
+        );
+        assert!(
+            !victims[0].exists() && !victims[1].exists(),
+            "victims still on disk"
+        );
+        assert!(victims[2].exists(), "the newest slot was deleted");
+    }
+
+    #[test]
+    fn internal_incompleteness_refuses_before_deleting_anything() {
+        let fixture = Fixture::new("internal-refuses");
+        let pool_root = fixture.root.join("budget-pool");
+        fs::create_dir_all(&pool_root).expect("budget pool root");
+        fs::set_permissions(&pool_root, fs::Permissions::from_mode(0o700))
+            .expect("private pool root");
+        create_injected(&pool_root, 64 * 1024 * 1024).expect("budget pool");
+        let project = fixture.root.join("project");
+        let workspace = fixture.root.join("workspace");
+        for path in [&project, &workspace] {
+            fs::create_dir_all(path).expect("fixture directory");
+        }
+        let mut request = LeaseRequest {
+            pool: pool_root.clone(),
+            project,
+            workspace,
+            profile: Profile::Dev,
+            holder: "fixture".to_owned(),
+            budget_bytes: None,
+            reserve_bytes: None,
+            layout: None,
+            replace_slot: None,
+        };
+        let idle = lease_injected(request.clone()).expect("first slot");
+        release_injected(&pool_root, &idle.lease_id).expect("idle slot");
+        let slot_path = pool_root
+            .join("payload")
+            .join(SLOTS_NAME)
+            .join(&idle.slot_id);
+        // A count replacement on the internal pool must refuse before deletion
+        // when its own figure is incomplete.
+        request.replace_slot = Some(idle.slot_id.parse().expect("slot id"));
+        with_accounting_limits(1, 64, 60_000, || {
+            let refused = lease_injected(request.clone());
+            assert!(
+                matches!(refused, Err(LeaseError::AccountingIncomplete(_))),
+                "an internal incompleteness must refuse: {refused:?}"
+            );
+        });
+        assert!(slot_path.exists(), "an internal refusal deleted its victim");
+    }
+
+    #[test]
+    fn allocate_admits_on_pool_bytes_and_the_volume_total_would_not() {
+        let fixture = Fixture::new("allocate-path");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let idle = idle_dir(&mut pool, 1, 1);
+        let project = fixture.root.join("project");
+        let workspace = fixture.root.join("workspace");
+        for path in [&project, &workspace] {
+            fs::create_dir_all(path).expect("fixture directory");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("private directory");
+        }
+        let request = LeaseRequest {
+            pool: fixture.root.join("pool"),
+            project,
+            workspace,
+            profile: Profile::Dev,
+            holder: "fixture".to_owned(),
+            budget_bytes: None,
+            reserve_bytes: Some(RESERVE),
+            layout: None,
+            replace_slot: None,
+        };
+        // 1014 GiB of unrelated volume usage against a 64 MiB pool cap.
+        verified_facts::with(facts(10 * GIB), || {
+            let recorded = pool.recorded_total().expect("complete pool figure");
+            let volume_used = 1024 * GIB - 10 * GIB;
+            assert!(recorded < CAP, "the pool is not below its cap: {recorded}");
+            // Executable counterfactual: the retired rule would have taken the
+            // larger figure, which is far above the cap, and evicted.
+            assert!(
+                recorded.max(volume_used) >= CAP,
+                "the counterfactual cannot distinguish the two rules"
+            );
+            let granted = pool.lease(&request).expect("the real admission succeeds");
+            assert!(!granted.grant.reused_slot, "a new slot was expected");
+        });
+        assert!(
+            idle.exists(),
+            "a pool below its cap evicted an idle slot for foreign volume bytes"
+        );
+        assert!(pool.slot(1).is_some(), "the idle slot left the ledger");
+        assert!(
+            pool.slot(1)
+                .and_then(|slot| slot.recorded.as_ref())
+                .is_some(),
+            "the idle record was dropped"
+        );
+    }
+
+    #[test]
     fn a_failed_verification_after_a_prune_stops_the_route() {
         let fixture = Fixture::new("verify-fail");
         let mut pool = fixture.pool(Some(RESERVE));
