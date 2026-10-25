@@ -4,7 +4,7 @@
 One fixed script and the whole command of the qualified shared proof
 supervisor (`bounded-test.py`, guard sha256 5e5b6617..., oxide#147). That pin
 is checked against the actual runner file before any effect, so a branch that
-still carries an older guard refuses here instead of spending a run.
+still carries an older guard refuses here instead of spending a run. The
 approved recipe is an INTERNAL directory pool, so both heavy selectors pass
 `--root-parent /private/tmp` explicitly (Tom's internal-root exception): a
 pool inside a selected-volume root would be refused by the product itself.
@@ -23,6 +23,12 @@ is absent until the product creates it. Byte pressure is driven by the
 documented `OXIDE_POOL_CAP` soft byte budget (applied at pool creation), never
 by a proof-invented variable.
 
+The internal-pool fact is the product's own serialized `config.json`
+(`backend: "directory-budget-v1"`, and no `volume` entry), read through
+`recorded_backend()`; a missing, malformed, unknown or removable backend
+refuses by name. The ledger has no backend field at all, so a case may never
+read one from there.
+
 ## Fixed case map (command, cwd, prerequisite, observed phase)
 
 A release always measures the slot it closes (`measure_for_release`), so an
@@ -35,7 +41,7 @@ the release walk is asserted separately.
 | A all-recorded admission | `oxide check` (gated) | fixture crate B | slot A idle with a current record | admission (`Held`), then release |
 | B missing record | `oxide check` (gated) | fixture crate C | A and B idle, B's record dropped, `capacity_policy` 2 | admission, then release |
 | C release/reuse | `oxide check` (gated) | fixture crate A | A idle with a current record | admission (reuse), then release; stdout read after release |
-| D byte pressure | `oxide check` (gated) + held writer | pressure crate | one idle slot, one held slot, an out-of-slot stray, byte budget | admission, then releases |
+| D byte pressure | `oxide check` (gated) + held writer | pressure crate | one idle slot, one held slot, an out-of-slot stray, byte budget, internal backend recorded in `config.json` | admission, then releases |
 | E hard-link overcount | `oxide check` (gated) | pressure crate | two idle slots sharing one inode, budget between union and sum | admission, then release |
 | F legacy + crash | `oxide check` (gated, then killed) | third crate, then a fresh crate | every record dropped, `capacity_policy` 1 | admission, then release, then product recovery |
 | G status/audit | `oxide status`, `oxide status --measure` | fixture work dir | one idle slot with a record | no `oxide check`, so no release walk |
@@ -49,13 +55,18 @@ oracle failures, continues only into dependency-independent cases, skips
 tainted dependents with their reasons, aborts on any unknown child, writer,
 custody, protocol or receipt outcome, preserves the first fault and writes one
 bounded `qualified: false` receipt in the guard's evidence directory on every
-outcome. The default run stays fail-fast. Neither mode is a counted PASS
+outcome. A case that dies of an unexpected exception is recorded as that
+case's failure before any state is computed and aborts the collection, so a
+reached-but-crashed case is never a pass; every abort goes through one
+`mark_abort()` state, so the durable receipt and the console cannot disagree.
+The default run stays fail-fast. Neither mode is a counted PASS
 substitute, a benchmark, or an alias for full QA.
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -69,6 +80,12 @@ BUILDER = "1.97.1"
 # The qualified shared supervisor this proof's whole command runs under.
 GUARD_SHA256 = "5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
+
+# The product's serialized pool facts, bound to source by `--self-test`. The
+# backend lives in the pool's `config.json`, never in the ledger.
+CONFIG_NAME = "config.json"
+BUDGET_BACKEND = "directory-budget-v1"
+VOLUME_BACKEND = "apfs-volume-v1"
 MIB = 1024 * 1024
 # Staging recipe (oxide#140): 4 Cargo jobs, 16 codegen units, frozen profile.
 STAGE_JOBS = 4
@@ -148,6 +165,18 @@ def abort(message: str) -> None:
 def expect(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
+
+
+def mark_abort(reason: str = "") -> None:
+    """The ONE abort transition: module state, first fault, receipt and console.
+
+    An abort that were assigned to a local name would leave the durable receipt
+    disagreeing with the console, so every abort path goes through here.
+    """
+    global ABORTED
+    ABORTED = True
+    if reason:
+        note_fault(reason)
 
 
 def note_fault(message: str) -> None:
@@ -363,6 +392,28 @@ def source_identity() -> str:
     if result.returncode != 0 or len(head) != 40 or not all(c in "0123456789abcdef" for c in head):
         abort(f"the source head is not a commit id: {head!r} ({result.stderr.strip()[:200]})")
     return head
+
+
+def recorded_backend(config: object, where: str = "the pool config") -> str:
+    """The pool's recorded backend from its serialized `config.json`.
+
+    Only a positively recorded internal directory pool passes. A missing,
+    malformed, unknown or removable backend refuses by name: the fixture never
+    assumes its own placement, and it never reads a backend out of the ledger,
+    which has no such field.
+    """
+    if not isinstance(config, dict):
+        abort(f"{where} is not a JSON object")
+    backend = config.get("backend")
+    if not isinstance(backend, str) or not backend:
+        abort(f"{where} records no backend")
+    if backend == VOLUME_BACKEND:
+        abort(f"{where} records the removable backend {backend!r}, not an internal directory pool")
+    if backend != BUDGET_BACKEND:
+        abort(f"{where} records an unknown backend {backend!r}")
+    if "volume" in config:
+        abort(f"{where} carries a volume entry for the directory backend")
+    return backend
 
 
 def guard_identity(guard_path: str = "", expected: str = "") -> str:
@@ -833,6 +884,19 @@ class Fixture:
         expect(result.returncode == 0, f"status exit {result.returncode}: {result.stderr[-800:]}")
         return result.stdout
 
+    def pool_config(self) -> dict:
+        path = os.path.join(self.pool, CONFIG_NAME)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except OSError as error:
+            abort(f"the pool records no readable config at {path}: {error}")
+        except ValueError as error:
+            abort(f"the pool config at {path} is not JSON: {error}")
+
+    def require_internal_directory_backend(self) -> str:
+        return recorded_backend(self.pool_config(), f"the pool config at {self.pool}")
+
     def ledger(self) -> dict:
         with open(os.path.join(self.pool, "ledger.json"), encoding="utf-8") as handle:
             return json.load(handle)
@@ -1143,8 +1207,8 @@ def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> N
         f"the fixture did not get its byte budget: {fx.ledger()['cap_bytes']}",
     )
     expect(
-        fx.ledger()["backend"] == "directory-budget-v1",
-        f"the fixture is not the internal directory pool: {fx.ledger()['backend']}",
+        fx.require_internal_directory_backend() == BUDGET_BACKEND,
+        f"the fixture is not the internal directory pool: {fx.pool_config()}",
     )
     idle_record = fx.recorded(idle[0])
     expect(idle_record is not None, "the idle slot has no current record to count")
@@ -1538,21 +1602,29 @@ def dispatch(root: str, subject: str, cases, diagnostic: bool) -> None:
             TAINTED.add(name)
             note_fault(f"{name}: {failure}")
             if failure.abort:
-                ABORTED = True
+                mark_abort()
                 print(f"abort {name}: {failure}", flush=True)
                 return
             print(f"failed {name}: {failure}", flush=True)
         except subprocess.TimeoutExpired as timeout:
-            ABORTED = True
             FAILURES.append((name, f"child timed out: {timeout}"))
-            note_fault(f"{name}: child timed out")
+            mark_abort(f"{name}: child timed out")
             print(f"abort {name}: child timed out", flush=True)
             return
         except OSError as error:
-            ABORTED = True
             FAILURES.append((name, f"infrastructure error: {error}"))
-            note_fault(f"{name}: infrastructure error: {error}")
+            mark_abort(f"{name}: infrastructure error: {error}")
             print(f"abort {name}: {error}", flush=True)
+            return
+        except Exception as error:  # noqa: BLE001 - never an oracle continuation
+            # An unexpected exception is this case's failure, recorded before
+            # any state or receipt is computed, and it aborts the collection.
+            # A reached-but-crashed case is never a pass. Interrupts are
+            # BaseException and stay outside this handler.
+            FAILURES.append((name, f"unexpected {type(error).__name__}: {error}"))
+            TAINTED.add(name)
+            mark_abort(f"{name}: unexpected {type(error).__name__}: {error}")
+            print(f"abort {name}: unexpected {type(error).__name__}: {error}", flush=True)
             return
 
 
@@ -2219,6 +2291,124 @@ def self_test() -> None:
         expect(document["collection_complete"] is False, "an aborted receipt claimed completeness")
         expect(document["case_states"] == states, "the receipt states disagree with the run")
 
+        # F1: the internal-pool fact is the pool's serialized `config.json`
+        # backend, bound to product source. The ledger struct has no backend
+        # field, which is exactly what used to crash case D.
+        pool_source = open(os.path.join(REPO, "src", "lease", "pool.rs"), encoding="utf-8").read()
+        mod_source = open(os.path.join(REPO, "src", "lease", "mod.rs"), encoding="utf-8").read()
+        expect(f'const CONFIG_NAME: &str = "{CONFIG_NAME}";' in mod_source,
+               f"the config name {CONFIG_NAME!r} is not the product's")
+        expect(f'BUDGET_BACKEND_DIRECTORY_V1: &str = "{BUDGET_BACKEND}";' in mod_source,
+               f"the internal backend tag {BUDGET_BACKEND!r} is not the product's")
+        expect(f'VOLUME_BACKEND_APFS_V1: &str = "{VOLUME_BACKEND}";' in mod_source,
+               f"the removable backend tag {VOLUME_BACKEND!r} is not the product's")
+        ledger_struct = pool_source.split("struct Ledger {", 1)[1].split("\n}", 1)[0]
+        expect("backend" not in ledger_struct,
+               "the ledger now records a backend: rebind the F1 premise before trusting it again")
+        expect(
+            recorded_backend({"version": 5, "backend": BUDGET_BACKEND, "cap_bytes": 1}) == BUDGET_BACKEND,
+            "the real internal-pool config was not accepted",
+        )
+        for rejected in (
+            {"version": 5, "store_id": "x", "cap_bytes": 1, "next_slot": 1, "next_lease": 1, "slots": []},
+            {}, {"backend": ""}, {"backend": None},
+            {"backend": VOLUME_BACKEND, "volume": {"mount": "/Volumes/x"}},
+            {"backend": "apfs-sparse-image-v1"},
+            {"backend": BUDGET_BACKEND, "volume": {"mount": "/Volumes/x"}},
+            [], None, "backend",
+        ):
+            try:
+                recorded_backend(rejected)
+            except CaseFailure as failure:
+                expect(failure.abort, f"a wrong backend was treated as recoverable: {rejected!r}")
+            else:
+                fail(f"a pool without a recorded internal backend was accepted: {rejected!r}")
+
+        # F2: a case that dies of an unexpected exception is a failure, never a
+        # pass, and the remaining cases are explicitly not run after the abort.
+        middle = CASE_NAMES[3]
+
+        def middle_cases(failing, error):
+            made = []
+            for name in CASE_NAMES:
+                if name == failing:
+                    def explode(root, subject, error=error):
+                        raise error
+                    made.append((name, explode))
+                else:
+                    made.append((name, (lambda r, s: None)))
+            return made
+
+        for error, expected in ((KeyError("backend"), "KeyError"),
+                                (RuntimeError("a custom unexpected failure"), "RuntimeError")):
+            reset()
+            dispatch("stub", "stub", middle_cases(middle, error), True)
+            states = case_states()
+            expect(ABORTED, f"an unexpected {expected} did not abort the collection")
+            expect(states[middle] == "fail", f"a crashed case is not a fail: {states[middle]}")
+            expect(
+                sum(1 for state in states.values() if state == "pass")
+                == CASE_NAMES.index(middle),
+                f"the crashed case or a later one was counted as a pass: {states}",
+            )
+            expect(
+                all(states[name] == "not_run_aborted" for name in CASE_NAMES[CASE_NAMES.index(middle) + 1:]),
+                f"cases after the crash are not not_run_aborted: {states}",
+            )
+            expect(any(f"unexpected {expected}" in reason for _, reason in FAILURES),
+                   f"the crash is not recorded as a failure: {FAILURES}")
+            expect(PRIMARY and expected in PRIMARY[0],
+                   f"the crash is not the primary fault: {PRIMARY}")
+            document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+            expect(document["aborted"] is True, "the receipt hid an unexpected-exception abort")
+            expect(document["case_states"] == states, "the receipt states disagree with the crash")
+            expect(document["counts"]["fail"] == 1, f"the receipt miscounted the crash: {document['counts']}")
+            expect(document["collection_complete"] is False, "a crashed collection claimed completeness")
+
+        # F2, last planned case: no trailing case exists to hide the truth bug.
+        reset()
+        dispatch("stub", "stub", middle_cases(CASE_NAMES[-1], KeyError("backend")), True)
+        states = case_states()
+        expect(states[CASE_NAMES[-1]] == "fail", "a crash in the last case was reported as a pass")
+        expect(ABORTED, "a crash in the last case did not abort")
+        expect(
+            sum(1 for state in states.values() if state == "pass") == len(CASE_NAMES) - 1,
+            f"the last-case crash was counted as a pass: {states}",
+        )
+        document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+        expect(document["counts"]["not_run"] == 0 and document["aborted"] is True,
+               f"the last-case crash receipt is wrong: {document['counts']}")
+
+        # F2, setup failure before any case: every case is explicitly not run.
+        reset()
+        mark_abort("unknown outcome: the staged candidate could not be built")
+        states = case_states()
+        expect(all(state == "not_run_aborted" for state in states.values()),
+               f"a setup failure did not mark every case not_run_aborted: {states}")
+        document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+        expect(document["aborted"] is True and document["collection_complete"] is False,
+               "a setup failure produced a dishonest receipt")
+
+        # F3: one real abort state. The old bug was a shadowing local assignment
+        # in main, which left the durable receipt saying `aborted: false`.
+        reset()
+        def shadowing_local() -> bool:
+            ABORTED = True  # noqa: F841 - the bug shape: a local, not the shared state
+            return ABORTED
+        expect(shadowing_local() is True, "the counterfactual did not shadow a local")
+        expect(ABORTED is False, "a shadowing local silently changed the shared abort state")
+        mark_abort("unknown outcome: KeyError: 'backend'")
+        expect(ABORTED is True, "the shared abort transition did not set the state")
+        document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+        expect(document["aborted"] is True,
+               "the durable receipt disagrees with the console abort state")
+        expect("ABORTED =" not in inspect.getsource(main),
+               "main assigns a shadowing local ABORTED instead of using mark_abort")
+        expect("mark_abort(" in inspect.getsource(main),
+               "main does not use the shared abort transition")
+        expect("ABORTED =" not in inspect.getsource(dispatch),
+               "dispatch assigns ABORTED outside the shared transition")
+
         # R6: an unknown outcome is never downgraded by the teardown after it.
         reset()
         hanging = FakeChild(returncode=-9, hang=True)
@@ -2361,8 +2551,7 @@ def main() -> None:
             if any(state != "pass" for state in states.values()):
                 exit_code = 1
     except CaseFailure as failure:
-        ABORTED = True
-        note_fault(str(failure))
+        mark_abort(str(failure))
         if DIAGNOSTIC_MODE:
             exit_code = 1
         else:
@@ -2371,8 +2560,7 @@ def main() -> None:
     except BaseException as error:  # noqa: BLE001 - re-raised after the receipt
         # An unrecordable or unexpected outcome is never an oracle: record it,
         # then re-raise so the failure is not swallowed.
-        ABORTED = True
-        note_fault(f"unknown outcome: {type(error).__name__}: {error}")
+        mark_abort(f"unknown outcome: {type(error).__name__}: {error}")
         if DIAGNOSTIC_MODE:
             exit_code = 1
         else:

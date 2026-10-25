@@ -1106,7 +1106,12 @@ shared supervisor): tiny private fixtures only, debug staging with
 - C: release publishes a record and the next reuse clears it, with the result
   line's provenance text checked;
 - D: a non-vacuous byte-pressure eviction of one owned idle whole slot beside a
-  held slot and a foreign out-of-slot entry, both untouched byte-for-byte;
+  held slot and a foreign out-of-slot entry, both untouched byte-for-byte. D
+  first proves its own placement from the product's serialized `config.json`
+  (`backend: "directory-budget-v1"` and no `volume` entry) through
+  `recorded_backend()`, which refuses a missing, malformed, unknown or
+  removable backend by name; the ledger records no backend at all, so no case
+  may read one from there;
 - E: cross-slot hard-link overcount (sum ≥ union) plus a refusal case with
   untouched bytes/inodes;
 - F: legacy ledger convergence across two admissions and one crash replay;
@@ -1138,9 +1143,17 @@ incomplete counts at its bounds. Counted default stays fail-fast. Any unknown
 child/writer/device effect, pending custody, timeout, infrastructure or
 protocol failure aborts rather than continuing; nothing is repaired by
 assumption; a non-zero direct leader exit is never read as descendant closure.
-Pure counterfactuals drive the same dispatch/case logic for fail-fast
-unchanged, record-and-continue, dependency/taint skip, safety abort and
-first-fault precedence.
+A case that dies of an unexpected exception is recorded as that case's
+failure before any state or receipt is computed and then aborts the
+collection, so a reached-but-crashed case is never reported as a pass and its
+successors are `not_run_aborted`; interrupts stay outside that handler. Every
+abort goes through the one `mark_abort()` state, so the durable receipt and
+the console cannot disagree about `aborted` or `collection_complete`. Pure
+counterfactuals drive the same dispatch/case/receipt logic for fail-fast
+unchanged, record-and-continue, dependency/taint skip, safety abort, an
+unexpected exception in a middle and in the last planned case, a pre-case
+setup failure, the shadowing-local abort regression and first-fault
+precedence.
 
 #### Phase and resource estimate (UNMEASURED)
 
