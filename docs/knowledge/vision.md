@@ -168,9 +168,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   whole-target link moves only through an explicit `oxide outputs adopt` under
   a durable journal, a real nonempty profile directory is never moved or
   converted, and an undeclared opaque tool refuses instead of guessing. The
-  profile layout is implemented with a known fail-safe detach refusal for
-  host-triple member links and incomplete native coverage. The as-is acceptance,
-  contract, formats and evidence limits are owned by the
+  profile layout is implemented; `oxide outputs detach` recognises the host
+  triple and every other supported member link by its approved destination
+  and this checkout's root marker, so a `<triple>/debug` member no longer
+  refuses a safe detach, while an unowned, wrong-destination, dangling or
+  malformed link still refuses with nothing changed. Corrected native
+  coverage of detach, clean and prune is still unactivated. The as-is
+  acceptance, contract, formats and evidence limits are owned by the
   [workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides
@@ -185,14 +189,17 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   directory inside the slot, removed at release after writer closure; a `run`
   program that uses one keeps the lease until its own group closes
   ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It is
-  implemented on the oxide#136 branch; its counted native and uncounted
-  diagnostic are still unactivated. The separate proof and validation tooling
+  implemented on the oxide#136 branch but is not installed or qualified: its
+  counted native has not passed and both uncounted diagnostics were attempted
+  and failed. The separate proof and validation tooling
   default is implemented and qualified by oxide#145 (merged at `0520fc04`,
   guard `a6d73326`), which places and monitors proof scratch on the selected
   pool's own volume with a warned `/private/tmp` fallback
-  ([placement](contracts/workflow.md#temporary-scratch-placement)). Both cover
-  Oxide-owned scratch only: CI, Queue worktrees, containers and host settings
-  stay as they are.
+  ([placement](contracts/workflow.md#temporary-scratch-placement)). Internal-
+  placement proofs may declare an explicit internal root as the owner-accepted
+  narrow exception, with their fixtures beside the pool, never inside it. Both
+  cover Oxide-owned scratch only: CI, Queue worktrees, containers and host
+  settings stay as they are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per

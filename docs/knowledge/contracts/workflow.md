@@ -1404,18 +1404,19 @@ identity lines.
 
 ### Temporary scratch placement
 
-**Status.** The Oxide children rule is implemented on this branch (queue #136);
-its counted native and its required uncounted diagnostic are still
-unactivated. The proof and validation tooling default is implemented and
-qualified by oxide#145 (merged at `0520fc04`); the current qualified supervisor
-bytes are `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
-with `test_supervisor.py` `79031c195910175ef125f007edb39cbea75628a51bd12f511a4538ea1b87c7d0`
-and `qualify-supervisor.py` `736f0cf0610339b66345f32f8aafbe6edbf945c5122f4a14e74c8f631de73e45`.
-Neither is measured SSD-write savings.
+**Status.** The proof and validation tooling uses the selected-volume default
+described below, under the qualified supervisor bytes
+`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`; the owner
+accepted the narrow internal-root exception for genuine internal-placement
+proofs. The Oxide children rule is implemented on the oxide#136 branch but is
+not installed or qualified: its counted native has not passed, its required
+uncounted diagnostic has been attempted and failed, and the independent
+reviewer native is missing. Neither facility establishes measured SSD-write
+savings.
 
 Tom, 2026-10-25: "Test and proof temp folders definitely should move to the
-drive." This is direction for two separate Oxide facilities; it is not current
-behaviour. Effigy owns its own test/run temp
+drive." The two Oxide facilities have separate qualification boundaries.
+Effigy owns its own test/run temp
 placement and retention; Oxide changes no consumer or daemon configuration.
 
 - **Oxide children: implemented** ([contract](#child-temporary-files-oxide136)).
@@ -1433,7 +1434,7 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   the selected volume use owned temp too. Absent drive selection falls back
   internally without recreating a mount point. Bounded escaped summary/status
   labels distinguish `temp: inherited <path>` and `temp: oxide <path>`.
-- **Proof and validation tooling (oxide#145, qualified).** With no caller
+- **Proof and validation tooling (oxide#145).** With no caller
   scratch or root parent, `scripts/bounded-test.py` creates its owned root in a
   private area on the volume the effect-free pool selection names:
   - the recorded removable selection when the pool's `removable.json` names a
@@ -1457,37 +1458,55 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   product's verified build-time selection (no container/role check), and the
   narrow config reader understands only a simple `[pool] path` entry.
 
-**Qualified and merged (oxide#145).** Source head `4830c187` passed
-`proof:supervisor:qualify` with 175/175 cases for the author (2 runs) and
-175/175 for the independent reviewer (1 run), reviewed at event
-`50b6ba7105aac44f04634f9d9d25559bd033afea69351e4a5c446473ebdceb7a`, and merged
-at `0520fc04`. Those bytes are `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`;
-this task's future counted proof binds to them through normal source
-integration, not a retroactive migration of earlier runs. The previously
-qualified `961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052`
-stays qualified only at its old bytes, and every earlier recorded run keeps
-that guard as its historical pin.
+Supervisor SHA-256
+`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
+has independent exact-head source review and separate author and reviewer
+`proof:supervisor:qualify` receipts, each exercising all 175 cases with the
+selected-volume default and positive outer closure. Qualification is bound to
+those bytes and evidence; an older hash's receipts do not transfer to new bytes.
 
-**Internal-placement proofs (oxide#136, proposed exception).** A proof whose
-subject is the *internal* directory pool cannot run over the selected-volume
-default: the product correctly refuses a `directory-budget` internal pool on
-an external volume, and that refusal is not bendable (no debug-only exception).
-Such a proof may declare the internal root explicitly through the qualified
-guard's existing `--root-parent` option — for oxide#136,
-`--root-parent /private/tmp` in both its counted and diagnostic selectors. The
-guard still creates ONE fresh owned monitored root under that canonical
-internal directory and applies the unchanged 300 s, 512 MiB, 22 GiB reserve,
-custody, retention and cleanup rules to everything inside it, including
-staging, the fixture pool, temp and the single owned 128 MiB image. The
-selected-volume default is unchanged for every other caller: builds, tests and
-ordinary proofs keep the drive placement. The observed ~58 MiB peak in the
-oxide#136 diagnostic is a measurement, not a bound reduction or a guarantee for
-other work. Executing that recipe still awaits the owner's acceptance of the
-exception and a separate activation; this record is not an approval and does
-not preauthorise other internal-placement proofs.
+**Internal-placement proofs (oxide#136, accepted narrow exception).** A proof
+whose subject is the *internal* directory pool cannot run over the
+selected-volume default: the product correctly refuses a `directory-budget`
+internal pool on an external volume, and that refusal is not bendable (no
+debug-only exception). The owner accepted this narrow exception for genuine
+internal-placement proofs (decision `bd357a4c`, 2026-10-25). Such a proof may
+declare the internal root explicitly through the qualified guard's existing
+`--root-parent` option — for oxide#136, `--root-parent /private/tmp` in both its
+counted and diagnostic selectors. The guard still creates ONE fresh owned
+monitored root under that canonical internal directory and applies the
+unchanged 300 s, 512 MiB, 22 GiB reserve, custody, retention and cleanup rules
+to everything inside it, including staging, the fixture pool, temp and the
+single owned 128 MiB image. The selected-volume default is unchanged for every
+other caller: builds, tests and ordinary proofs keep the drive placement. The
+exception authorises placement only; each such proof still needs its own
+independent exact-head source confirmation and separate execution activation.
+Its fixtures must stay outside the directory-budget pool on the same device —
+inherited `TMPDIR` values under the pool directory are not valid, and the
+product's pool-membership refusal is never weakened. The observed ~58 MiB peak
+in an oxide#136 diagnostic is a measurement, not a bound reduction or a
+guarantee for other work.
 
-The implementation briefs and separate native activations live in Queue. No
-runtime scratch or host setting changes follow from this knowledge record.
+**Genuine internal-placement proofs (Tom, 2026-10-25).** Tom answered decision
+`bd357a4c-2e1d-4190-bafb-290d7c2ae244`: "Accept the internal-root exception for
+internal-placement proofs (#136 now, similar proofs later)". A proof that must
+exercise a genuine internal directory pool may fix the qualified supervisor's
+existing `--root-parent /private/tmp` option in its selector. Its selector and
+owning proof description must explain that requirement. One monitored owned
+root contains staging, temporary files, the internal fixture pool and any
+removable fixture image backing. The existing 512 MiB scratch budget,
+wall-clock bounds, custody, closure and retention rules remain unchanged;
+reserve sampling follows the filesystem actually holding that root. This
+exception grants no product pool-path bypass, extra unmonitored scratch root,
+new mount topology or host cleanup authority. Ordinary builds, tests and proofs
+continue to use the selected volume by default.
+
+Existing proof receipts remain bound to their activated recipe. Moving an
+internal-placement selector to this explicit root requires a short independent
+recipe review; already-passed evidence is not recounted solely for that selector
+migration unless its source changes. Separate ROOT activation still precedes
+each diagnostic or native submission. Briefs, activations and outcomes live in
+Queue; this knowledge record changes no runtime scratch or host setting.
 
 ## Proof-authoring premise checklist
 
@@ -1529,10 +1548,11 @@ and grants no native start, installation, clock extension or cleanup authority.
    consistently for staging and fixture commands. An inherited encoded value
    must not silently override the proof's declared flags or change the staged
    candidate's capabilities.
-8. **Temporary storage.** Once the child-temp and shared-proof defaults are
-   qualified and landed, use scratch and `TMPDIR` on the selected volume.
-   Until then, follow the exact qualified guard and activated recipe; this
-   checklist does not transfer qualification to an unpublished default.
+8. **Temporary storage.** Use scratch and `TMPDIR` on the selected volume
+   under the qualified defaults. A proof requiring a genuine internal pool
+   uses the documented internal-placement exception above, fixed in its
+   reviewed selector. Follow the exact qualified guard and activated recipe;
+   this checklist does not transfer qualification between supervisor bytes.
 9. **macOS mktemp.** `mktemp` without a template ignores `TMPDIR` on macOS.
    Supply a template under the intended owned scratch parent and verify that
    the executable fixture uses it.
@@ -3641,12 +3661,36 @@ become owned links. Cargo's top-level files (`CACHEDIR.TAG`,
 `.rustc_info.json`), `target/tmp` and tool directories such as `target/doc`
 stay real.
 
-**Known detach limitation.** `oxide outputs detach` currently refuses safely
-when an owned host-triple member such as `target/aarch64-apple-darwin/debug`
-is present: it classifies that nested link as foreign and leaves it untouched.
-Detach on non-target checkouts remains as before. Target-member detach and the
-remaining native cases need the separately scoped correction; do not remove
-links or weaken ownership checks to work around this refusal.
+**Detach and target-member links (oxide#144).** `oxide outputs detach`
+recognises the host-triple and every other supported member link
+(`debug`, `release`, `<triple>/debug`, `<triple>/release`): it removes each
+link whose destination is exactly that member's approved subpath beneath the
+root its placement selects, and restores a real empty directory there. The
+member suffix alone never grants ownership. A destination is classified by the
+shape of its link text — the plain `<root>/<profile>` and the nested
+`<root>/<triple>/<profile>` forms are both considered, most specific first —
+and only a candidate root that is a real directory carrying this checkout's
+owner marker makes the link owned. A wrong destination, an unmarked or
+another checkout's root, a missing destination (dangling) and a relative or
+otherwise malformed link text all keep the previous fail-safe refusal, with
+the link, every other member and the receipt bytes unchanged; there is no
+link traversal, no arbitrary removal and no force mode. A profile receipt
+places its members independently, so an unselected member is a real local
+directory (or one left unselected by a detach that a later adoption converts
+again); the detach keeps every placement as re-adoption authority, and
+re-adopting after a multi-member detach — including the host-triple member —
+is the same journaled per-member transition as any other adoption. **Evidence
+limit:** two uncounted diagnostics have run, both unqualified and neither a
+PASS. Diagnostic 1 at source `51fcb3d` completed cases 01–15 (case 15 — the
+previously refused host-triple detach — passed), failed case 16 on its
+auxiliary-pool premise and skipped 17–20. Diagnostic 2 at source `ee192f7`,
+after that premise was corrected, completed cases 01–17 (case 16 passed), failed
+case 18 and skipped 19–20. Case 18's own premise is corrected here: the
+unconverted first build cannot warm the adopted key, so the adopted real
+placement gets its own seed build and an actual repeat, asserted warm in that
+same parsed slot before the member is removed, re-adopted and re-keyed. Cases
+19–20 have still never executed, no counted native PASS exists, and counted
+author and reviewer native remain unactivated.
 
 - **Members and destinations.** A converted checkout's `target` is real and
   each linked member selects its own approved subpath beneath the shared root
@@ -3749,8 +3793,12 @@ links or weaken ownership checks to work around this refusal.
   host `debug`/`release` pair (and every member the receipt already places)
   into one root under the member ignore check, keeps a real nonempty member
   with a notice, is idempotent, and refuses a legacy whole-target link
-  untouched. `oxide outputs detach` restores real empty member directories,
-  keeps every root and marker, and leaves the receipt detached.
+  untouched. `oxide outputs detach` restores real empty member directories for
+  every owned member link — the plain `debug`/`release` pair and each
+  `<triple>/debug` or `<triple>/release` member alike — keeps every root,
+  marker and payload byte, and leaves the receipt detached with its placements
+  as re-adoption authority; an unowned member link refuses the whole detach
+  before any link is touched.
 - **Explicit migration and marker upgrade.** `oxide outputs adopt` on a
   committed whole-target receipt is the only path that rewrites a legacy
   placement. It is macOS-only (Linux remains compile-only), runs under the
@@ -3933,11 +3981,59 @@ starts from that failure packet and must exercise cases 15–20, without inherit
 a proof allowance or claiming they already passed. Historical UNCLOSED runs and
 retained unknown backing stay separate from this closed failure.
 
+**Source correction, oxide#144.** Two shipped defects were found behind that
+case-15 refusal and corrected in the source phase only (native cases 15–20
+remain unactivated for this task). First, the one `target`-relative ownership
+classifier derived a member link's candidate root from only the shallow
+`<root>/<profile>` shape, so a real `target/<triple>/debug` link — created
+correctly by a host `--target` build — was reported foreign and detached
+refused it. Ownership now considers both the `<root>/<profile>` and
+`<root>/<triple>/<profile>` shapes, most specific first, and still requires
+this checkout's marker at the candidate root (a wrong destination, an unmarked
+or another checkout's root, a missing destination or a malformed relative link
+all keep the fail-safe refusal with nothing changed). Second, re-adoption after
+a multi-member detach could not write its per-member write-ahead receipt: the
+receipt consistency rule demanded every profile placement be selected, while a
+detach deliberately leaves them all unselected. A profile receipt now requires
+at least one selected placement and allows the others unselected (a real local
+member, or one awaiting re-adoption); a whole-target receipt keeps the strict
+rule. The fixed proof's case-15 oracles were strengthened, not weakened: they
+now assert the pre-detach state (the host-triple link created by case 04's real
+build), that the first detach converts it to a real directory, and that
+re-adoption restores it — the exact accepted failure point. A pure/static
+premise sweep maps each case-15 to case-20 premise (and the private-`HOME`,
+automatic-adoption and Cargo-argv premises) to shipped source at this head. The
+uncounted diagnostic mode now exists and has run twice (see the evidence limit
+above): diagnostic 1 exposed the case-16 auxiliary-pool premise and diagnostic 2
+the case-18 missing post-adopt warm repeat, both corrected in the proof source
+rather than the product. Its slot-tree oracles resolve the numeric slot ID the
+build summary names at the owned depth — `slots/<label>-<short-id>/<profile>-<id>`
+— and compare `(path, dev, ino)` snapshots there, so a slot removed, re-created
+or replaced under an existing project folder is detected while a listing of
+project folder names would be vacuous; the mapping refuses symlinks, foreign
+child names, duplicate IDs and unknown topology instead of guessing.
+
 The script also has an explicitly opt-in `--diagnostic` collection mode. It
 records recoverable oracle failures and skips dependent or tainted premises,
 while unknown device/writer effects and infrastructure errors abort. Its bounded
 receipt is marked diagnostic and unqualified; it never supplies counted PASS
-or closure credit. The default counted mode remains fail-fast.
+or closure credit. The default counted mode remains fail-fast. Its case-16
+watched clean runs on the internal `directory-budget-v1` store under the pool's
+OWN recorded permanent registration: because drive mode comes only from that
+registration, and a second registration on the one owned image is impossible by
+production rule (a sub-directory is not `diskutil`'s mount point, the shared
+`<mount>/oxide-pool` payload is not empty, and `pool set-mode` refuses an absent
+registration), the fixture reuses the existing low-reserve pattern to raise the
+recorded reserve above the image's free space. Selection then falls back to the
+directory-budget store, whose watchdog is the reserve watchdog, while permanent
+mode still holds; the exact recorded bytes are restored before cases 17-20. Its
+oracles assert those prerequisites instead of assuming them, and a pure
+counterfactual control exercises the unregistered-refusal, forced-directory-
+budget and impossible-auxiliary-registration cases. The mode is
+routed by its own heavy selector, `effigy rust:profile-outputs:diagnostic`
+(the counted command below with `--diagnostic` appended), so the counted
+selector keeps its unchanged fail-fast command; both share the same
+supervisor, limit, scratch bound and activation holds.
 
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
 `scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same
@@ -4050,7 +4146,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 - **Nonces and keys.** Every root creation or recreation draws a fresh random 128-bit lowercase-hex nonce. The output destination key includes the nonce, root, volume UUID and recipe; legacy `outputs-1` keys stay distinct and no recreated root claims a warm legacy root. An existing root keeps its marker's nonce.
 - **Registry and overflow.** Rows are keyed by checkout, placement member and root; revision advances before every changed receipt, selection or root effect, and the registry is read as one bounded whole snapshot (8192 files, 64 MiB, 10 s). The live registry is capped at 4096 rows and 4 MiB. Before a cap-exceeding unindexed selection the registry records sticky incompleteness durably; that write failing refuses adoption before its effect, and prune then keeps every root with an explicit reason. The incomplete flag is never cleared by this tranche.
 - **Status.** Default `oxide status` reads only the bounded recorded `outputs/prune-observations.json` (`oxide.outputs.prune-observations/1`, at most 256 KiB and 512 roots) in the pool section. It performs no root walk, replay, lock or reconciliation. Coverage, source and time are explicit; a partial observation never becomes a global orphan total. `--measure` does not scan output roots for prune.
-- **Nonce reservation.** A building command reserves its future root's nonce after automatic adoption and before `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding lock (released before the slot wait) and the internal publication lock: the receipt's `target` placement records `reserved` (transaction ID, fresh random nonce, root, kind, volume UUID, generation) and the registry a pending row with the same transaction and nonce, in one write-ahead publication. An existing root keys its marker nonce; a future root keys only its reserved nonce, never a missing root's old one. Starters for the identical future root share one uncancelled reservation; the commit that creates the root consumes it. Binding validates the exact surviving reservation (receipt, keyed nonce, registry row with no cancellation) before Cargo and refuses a cancelled, replaced or absent one with no automatic retry. `oxide outputs cancel-reservation` (and `detach`, and a starter that needs a different future root) cancels only under the checkout's binding with every writer clear, the reserved root absent and no prune intent: the registry first records the cancellation (authority invalidated, revision advanced), then the receipt commits without it, then the abandoned row is removed; an interrupted cancellation is finished only for its exact recorded transaction. A cancelled nonce is never reused. `oxide outputs plan` stays read-only. The pre-lease reservation applies binding's P4 precondition exactly, so a command that binding will refuse for it changes no authority — no `reserved` field, no generation, no updated timestamp, no link text (oxide#133 case14). That precondition is per REQUESTED member and only for a profile-layout receipt: a requested member whose committed placement is external while this command's fresh selection is not. A member the receipt does not place, a whole-target receipt, and any command whose fresh selection is still external keep their reservation — a whole-target local fallback and a new member beside a committed external sibling both need it for `reservation_matches`. Every other refusal (an unmodelled command, an empty `exec` declaration) still decides after the reservation.
+- **Nonce reservation.** A building command reserves its future root's nonce after automatic adoption and before `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding lock (released before the slot wait) and the internal publication lock: the receipt's `target` placement records `reserved` (transaction ID, fresh random nonce, root, kind, volume UUID, generation) and the registry a pending row with the same transaction and nonce, in one write-ahead publication. An existing root keys its marker nonce; a future root keys only its reserved nonce, never a missing root's old one. Starters for the identical future root share one uncancelled reservation; the commit that creates the root consumes it. Binding validates the exact surviving reservation (receipt, keyed nonce, registry row with no cancellation) before Cargo and refuses a cancelled, replaced or absent one with no automatic retry. `oxide outputs cancel-reservation` (and `detach`, and a starter that needs a different future root) cancels only under the checkout's binding with every writer clear, the reserved root absent and no prune intent: the registry first records the cancellation (authority invalidated, revision advanced), then the receipt commits without it, then the abandoned row is removed; an interrupted cancellation is finished only for its exact recorded transaction. A cancelled nonce is never reused. `oxide outputs plan` stays read-only. The pre-lease reservation applies binding's P4 precondition exactly, so a command that binding will refuse for it changes no authority — no `reserved` field, no generation, no updated timestamp, no link text (oxide#133 case14). That precondition is per REQUESTED member and only for a profile-layout receipt: a requested member whose committed placement is external while this command's fresh selection is not. A member the receipt does not place, a whole-target receipt, and any command whose fresh selection is still external keep their reservation — a whole-target local fallback and a new member beside a committed external sibling both need it for `reservation_matches`. The ordering nit closed by oxide#133 is recorded here: in a profile checkout a command name whose profile outputs Oxide does not model is refused in the declaration step, BEFORE `reserve`, so it publishes no reservation at all. The remaining deferred nit is narrower: an `exec` that declares no member is still refused by `planned_destination`, i.e. after the reservation, and moving that refusal ahead of `reserve` (so it too changes nothing) is not part of oxide#144.
 - **Overflow.** When a reservation would exceed the live row cap, the registry durably records sticky incompleteness and the reservation is retried once with an explicit overflow tag (registry identity, transaction, nonce, revision as provenance) and no registry row. Binding validates that exact tag against the same sticky-incomplete registry and the overflow cancellation journal; an unrelated revision advance never refuses it. Prune keeps the whole batch while the registry is incomplete, and the flag is never cleared by this tranche.
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.
 - **Tombstones.** After a positive completion (both the registry terminal state and the receipt's terminal state committed), the completed row and the settled intent leave the live registry in one revision, and a diagnostic entry is appended best effort to `outputs/tombstones.json` (`oxide.outputs.tombstones/1`, at most 16,384 entries and 4 MiB, oldest compacted first). The ring is never a safety journal or a live cap; unfinished intents and reservations stay in the registry and are never compacted. A recreated root always gets a fresh nonce.
