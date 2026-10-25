@@ -2422,6 +2422,461 @@ class PureClosureDecision(unittest.TestCase):
                                                            "held": [], **mutation}), label)
 
 
+# Settlement observation (oxide#147) --------------------------------------------
+#
+# The supervisor records observation-only evidence of the 10 s settlement window
+# so a run that ends with no completed post-reap census round can be told apart
+# from one whose round was certain and empty. These helpers judge a record that
+# the REAL monitor/custodian paths produced; the mutations below prove each
+# check is load-bearing rather than a restatement of the constants.
+
+SETTLE_KEYS = {
+    "schema", "clock", "stopped_sent_ns", "stopped_received_ns", "stopped_seq",
+    "receive_latency_ns", "leader_bound", "thread_start_ns", "thread_start_latency_ns",
+    "census_built_ns", "first_round_ns", "first_round_latency_ns", "stop_requested_ns",
+    "loop_exit_ns", "rounds_started", "rounds_completed", "omitted", "phase", "rounds",
+}
+SETTLE_ROUND_KEYS = {
+    "index", "phase", "start_ns", "scanned_ns", "snapshot_ns", "scan_ns", "rows",
+    "esrch_rows", "zombie_rows", "confirm_reads", "pause_calls", "lock_wait_ns",
+    "lock_acquired_ns", "lock_released_ns", "sent_ns", "end_ns", "certain", "members",
+    "uncertain",
+}
+SETTLE_ROUND_STAMPS = ("start_ns", "lock_wait_ns", "lock_acquired_ns", "lock_released_ns",
+                       "sent_ns", "end_ns")
+
+
+def _stamp(value):
+    return value is None or (type(value) is int and 0 <= value <= bounded.U64MAX)
+
+
+def _count(value):
+    return value is None or (type(value) is int and 0 <= value <= bounded.U64MAX)
+
+
+def settlement_stamps(record):
+    """Every stamp in the record, in the order the real path writes them."""
+    stamps = [record.get("stopped_sent_ns"), record.get("stopped_received_ns"),
+              record.get("thread_start_ns"), record.get("first_round_ns")]
+    for entry in record.get("rounds") or []:
+        if isinstance(entry, dict):
+            stamps += [entry.get(name) for name in SETTLE_ROUND_STAMPS]
+    return [value for value in stamps if value is not None]
+
+
+def settlement_problems(record):
+    """Why an observed settlement record is not usable evidence, or []."""
+    if not isinstance(record, dict):
+        return ["not an object"]
+    problems = []
+    if set(record) != SETTLE_KEYS:
+        problems.append(f"schema keys differ: {sorted(set(record) ^ SETTLE_KEYS)}")
+    if record.get("schema") != 1 or record.get("clock") != "CLOCK_UPTIME_RAW":
+        problems.append("unknown schema or clock")
+    if record.get("phase") not in bounded.SETTLE_PHASES:
+        problems.append(f"unknown phase {record.get('phase')!r}")
+    if not isinstance(record.get("leader_bound"), (bool, type(None))):
+        problems.append("ill-typed leader_bound")
+    if not _count(record.get("stopped_seq")):
+        problems.append("ill-typed stopped_seq")
+    for name in ("stopped_sent_ns", "stopped_received_ns", "thread_start_ns", "census_built_ns",
+                 "first_round_ns", "receive_latency_ns", "thread_start_latency_ns",
+                 "first_round_latency_ns", "stop_requested_ns", "loop_exit_ns"):
+        if not _stamp(record.get(name)):
+            problems.append(f"ill-typed {name}")
+    for name in ("rounds_started", "rounds_completed", "omitted"):
+        if type(record.get(name)) is not int or record[name] < 0:
+            problems.append(f"bad counter {name}")
+    rounds = record.get("rounds")
+    if not isinstance(rounds, list) or len(rounds) > bounded.SETTLE_MAX_ROUNDS:
+        return problems + ["round list missing or over the cap"]
+    if type(record.get("rounds_started")) is int and type(record.get("omitted")) is int and \
+            record["rounds_started"] != len(rounds) + record["omitted"]:
+        problems.append("rounds_started does not equal kept plus omitted")
+    completed = 0
+    for index, entry in enumerate(rounds):
+        if not isinstance(entry, dict) or set(entry) != SETTLE_ROUND_KEYS:
+            problems.append(f"round {index} schema")
+            continue
+        if entry.get("phase") not in bounded.SETTLE_ROUND_STEPS:
+            problems.append(f"round {index} unknown phase {entry.get('phase')!r}")
+        if entry.get("index") != index:
+            problems.append(f"round {index} wrong index")
+        if not all(_stamp(entry.get(name)) for name in SETTLE_ROUND_STAMPS):
+            problems.append(f"round {index} ill-typed stamp")
+            continue
+        if not all(_count(entry.get(name)) for name in ("snapshot_ns", "scan_ns", "rows", "esrch_rows",
+                                                        "zombie_rows", "confirm_reads", "pause_calls",
+                                                        "members", "uncertain")):
+            problems.append(f"round {index} ill-typed count")
+        if not isinstance(entry.get("certain"), (bool, type(None))):
+            problems.append(f"round {index} ill-typed certain")
+        stamps = [entry[name] for name in SETTLE_ROUND_STAMPS if entry[name] is not None]
+        if any(later < earlier for earlier, later in zip(stamps, stamps[1:])):
+            problems.append(f"round {index} stamps not non-decreasing: {stamps}")
+        if entry.get("phase") == "complete":
+            completed += 1
+            if len(stamps) != len(SETTLE_ROUND_STAMPS):
+                problems.append(f"round {index} complete with a missing stamp")
+            if entry.get("scanned_ns") is None or entry.get("certain") is None:
+                problems.append(f"round {index} complete without its phases")
+            elif entry["scanned_ns"] < entry["start_ns"]:
+                problems.append(f"round {index} scanned before it started")
+    if type(record.get("rounds_completed")) is int and record.get("omitted") == 0 \
+            and completed != record["rounds_completed"]:
+        problems.append("rounds_completed does not match the complete records")
+    chain = [value for value in (record.get("stopped_sent_ns"), record.get("stopped_received_ns"),
+                                 record.get("thread_start_ns"), record.get("first_round_ns"),
+                                 rounds[0].get("start_ns") if rounds else None) if type(value) is int]
+    if any(later < earlier for earlier, later in zip(chain, chain[1:])):
+        problems.append(f"settlement stamps out of order: {chain}")
+    every = settlement_stamps(record)
+    if len(every) > 2 and len(set(every)) == 1:
+        problems.append("every stamp is one value: a frozen clock, not an observation")
+    try:
+        blob = json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        if len(blob) > bounded.SETTLE_MAX_BYTES:
+            problems.append(f"settlement over the byte ceiling: {len(blob)}")
+    except BaseException:
+        problems.append("settlement is not serializable")
+    return problems
+
+
+class FakeCensus:
+    """Stands in for the host snapshot in the pure settlement cases: it reads
+    no host process and spawns nothing."""
+
+    rounds = 0
+
+    def __init__(self, sid, terminal_allowed=False):
+        self.sid, self.terminal_allowed = sid, terminal_allowed
+        self.stats = {"rows": 3, "esrch_rows": 1, "zombie_rows": 1, "confirm_reads": 2,
+                      "pause_calls": 1, "terminal": 0, "snapshot_ns": 5, "scan_ns": 7,
+                      "snapshot_error": False}
+
+    def round(self):
+        FakeCensus.rounds += 1
+        return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                "uncertain_rows": [], "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+
+class OneShotStop:
+    """`census_stop` stand-in whose first wait ends the real loop after the
+    round it follows, so the loop body runs exactly once."""
+
+    def __init__(self, stopped=False):
+        self.stopped = stopped
+
+    def is_set(self):
+        return self.stopped
+
+    def wait(self, _timeout):
+        self.stopped = True
+        return True
+
+    def set(self):
+        self.stopped = True
+
+
+class PureSettlement(unittest.TestCase):
+    """Oxide#147: the settlement diagnostics the real monitor and custodian
+    write, and the oracles that must reject a missing, reordered, duplicated,
+    over-cap or frozen assertion instead of mirroring the constants."""
+
+    def monitor(self, leader=(4242, 77)):
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_r, out_r, err_r, ctl_w, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor({"run_id": "r", "inject": [],
+                                   "terminal_mode": {"mode": "strict"}},
+                                  ctl_w, cmd_r, out_r, err_r)
+        # The receipt setup() builds holds this same object, so a publish
+        # serializes the diagnostics without a second write path.
+        monitor.receipt = {"census": None, "census_rounds": 0, "settlement": monitor.settlement}
+        monitor.leader = None if leader is None else list(leader)
+        monitor.census_stop = OneShotStop()
+        return monitor, ctl_r
+
+    def run_loop(self, monitor, after=7):
+        saved = bounded.Census
+        bounded.Census = FakeCensus
+        try:
+            monitor.census_loop(after)
+        finally:
+            bounded.Census = saved
+
+    def custodian(self):
+        read_end, cmd_w = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, cmd_w)
+        custodian = bounded.Custodian(["true"])
+        custodian.run_id = "r"
+        custodian.cmd_w = cmd_w
+        custodian.guard = bounded.Guard(0)
+        custodian.leader = 4242
+        custodian.leader_status = 0
+        custodian.reaped_seq = 3
+        custodian.exit_at = 1  # the grace window is already past: a bounded decision
+        return custodian, read_end
+
+    def records(self, custodian, read_end):
+        blob = os.read(read_end, 1 << 20).decode()
+        out = []
+        for line in blob.splitlines():
+            message = json.loads(line)
+            if message.get("type") == "record":
+                out.append(message["record"])
+        return out
+
+    def message(self, custodian, kind, **fields):
+        return {"run": custodian.run_id, "seq": custodian.monitor_seq + 1, "leader": [4242, 77],
+                "type": kind, "at": 1, **fields}
+
+    # The real census thread and receipt path.
+
+    def test_census_loop_records_the_real_round_and_keeps_the_message(self):
+        monitor, ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS + 250_000)
+        self.run_loop(monitor)
+        record = monitor.settlement
+        self.assertEqual(settlement_problems(record), [])
+        self.assertEqual((record["rounds_started"], record["rounds_completed"]), (1, 1))
+        self.assertEqual((record["phase"], record["stopped_seq"], record["leader_bound"]),
+                         ("loop-exit", 7, True))
+        self.assertEqual(record["receive_latency_ns"], 250_000)
+        entry = record["rounds"][0]
+        self.assertEqual((entry["rows"], entry["confirm_reads"], entry["pause_calls"],
+                          entry["snapshot_ns"], entry["scan_ns"]), (3, 2, 1, 5, 7))
+        self.assertEqual((entry["certain"], entry["members"], entry["uncertain"]), (True, 0, 0))
+        self.assertEqual(entry["phase"], "complete")
+        self.assertIs(monitor.receipt["settlement"], record)
+        self.assertEqual(monitor.receipt["census_rounds"], 1)
+        blob = os.read(ctl_r, 1 << 20).decode().splitlines()
+        self.assertEqual(len(blob), 1)
+        message = json.loads(blob[0])
+        self.assertEqual(set(message), {"run", "leader", "seq", "at", "type", "after", "members",
+                                        "uncertain", "certain"})
+        self.assertEqual((message["after"], message["certain"]), (7, True))
+
+    def test_missing_completion_is_distinguishable_from_an_empty_census(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 9, "sent": 100}, 200)
+        monitor.census_stop = OneShotStop(stopped=True)  # the loop exits before a round
+        self.run_loop(monitor, after=9)
+        stalled = monitor.settlement
+        self.assertEqual((stalled["rounds_started"], stalled["rounds_completed"]), (0, 0))
+        self.assertIsNone(stalled["first_round_ns"])
+        self.assertIsNotNone(stalled["thread_start_ns"])
+        self.assertIsNone(monitor.receipt["census"])
+        self.assertEqual(settlement_problems(stalled), [])
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 9, "sent": 100}, 200)
+        self.run_loop(monitor, after=9)
+        finished = monitor.settlement
+        self.assertEqual((finished["rounds_started"], finished["rounds_completed"]), (1, 1))
+        self.assertEqual(monitor.receipt["census"]["certain"], True)
+        self.assertEqual(monitor.receipt["census"]["members"], 0)
+        self.assertNotEqual(stalled["rounds_completed"], finished["rounds_completed"])
+
+    def test_a_frozen_clock_is_rejected_not_mirrored(self):
+        monitor, _ctl_r = self.monitor()
+        saved = bounded.now_ns
+        bounded.now_ns = lambda: 1000 * NS
+        try:
+            monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS)
+            self.run_loop(monitor)
+        finally:
+            bounded.now_ns = saved
+        problems = settlement_problems(monitor.settlement)
+        self.assertTrue(problems)
+        self.assertTrue(any("frozen clock" in problem for problem in problems), problems)
+
+    def test_reordered_or_duplicated_stamps_are_rejected(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS + 250_000)
+        self.run_loop(monitor)
+        self.assertEqual(settlement_problems(monitor.settlement), [])
+        entry = monitor.settlement["rounds"][0]
+        good = dict(entry)
+        for label, mutation, needle in (
+                ("sent before the lock", {"sent_ns": good["lock_wait_ns"] - 1}, "non-decreasing"),
+                ("complete without a stamp", {"end_ns": None}, "missing stamp"),
+                ("duplicate under a new name", {"end_ns_copy": good["end_ns"]}, "schema"),
+                ("unknown phase", {"phase": "finished"}, "unknown phase"),
+                ("scanned before it started", {"scanned_ns": good["start_ns"] - 1}, "scanned"),
+                ("bool as a count", {"rows": True}, "ill-typed count"),
+                ("wrong index", {"index": 9}, "wrong index")):
+            with self.subTest(label):
+                entry.clear()
+                entry.update(good)
+                entry.update(mutation)
+                problems = settlement_problems(monitor.settlement)
+                self.assertTrue(any(needle in problem for problem in problems), problems)
+
+    def test_record_level_mutations_are_rejected(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.note_stopped({"seq": 7, "sent": 1000 * NS}, 1000 * NS + 250_000)
+        self.run_loop(monitor)
+        record = monitor.settlement
+        self.assertEqual(settlement_problems(record), [])
+        saved = dict(record)
+        for label, mutation, needle in (
+                ("extra field", {"settled_ns": 1}, "schema keys"),
+                ("unknown clock", {"clock": "mach_absolute"}, "unknown schema"),
+                ("unknown phase", {"phase": "idle"}, "unknown phase"),
+                ("completed without a record", {"rounds_completed": 2}, "rounds_completed"),
+                ("started without kept or omitted", {"rounds_started": 3}, "does not equal"),
+                ("receive before the send", {"stopped_received_ns": 1000 * NS - 1}, "out of order"),
+                ("string stamp", {"thread_start_ns": "now"}, "ill-typed"),
+                ("bool stamp", {"first_round_ns": True}, "ill-typed")):
+            with self.subTest(label):
+                record.clear()
+                record.update(saved)
+                record.update(mutation)
+                problems = settlement_problems(record)
+                self.assertTrue(any(needle in problem for problem in problems), problems)
+
+    def test_round_records_are_capped_and_the_remainder_counted(self):
+        monitor, _ctl_r = self.monitor()
+        entries = [monitor.note_round(index * NS) for index in range(bounded.SETTLE_MAX_ROUNDS + 5)]
+        record = monitor.settlement
+        self.assertEqual(len(record["rounds"]), bounded.SETTLE_MAX_ROUNDS)
+        self.assertEqual((record["omitted"], record["rounds_started"]),
+                         (5, bounded.SETTLE_MAX_ROUNDS + 5))
+        self.assertIsNone(entries[-1])
+        monitor.note(entries[-1], phase="complete", sent_ns=1)  # a capped round takes nothing
+        self.assertEqual(record["rounds"][-1]["phase"], "start")
+        self.assertEqual(settlement_problems(record), [])
+
+    def test_worst_case_record_stays_under_the_byte_ceiling(self):
+        monitor, _ctl_r = self.monitor()
+        base = NS
+        monitor.note(stopped_sent_ns=base - 3, stopped_received_ns=base - 2,
+                     thread_start_ns=base - 1, census_built_ns=base)
+        for index in range(bounded.SETTLE_MAX_ROUNDS):
+            start = base + index * 10
+            entry = monitor.note_round(start)
+            monitor.note(entry, phase="complete", scanned_ns=start + 1, snapshot_ns=bounded.U64MAX,
+                         scan_ns=bounded.U64MAX, rows=bounded.U64MAX, esrch_rows=bounded.U64MAX,
+                         zombie_rows=bounded.U64MAX, confirm_reads=bounded.U64MAX,
+                         pause_calls=bounded.U64MAX, lock_wait_ns=start + 2,
+                         lock_acquired_ns=start + 3, lock_released_ns=start + 4,
+                         sent_ns=start + 5, end_ns=bounded.U64MAX, certain=True,
+                         members=bounded.U64MAX, uncertain=bounded.U64MAX)
+        monitor.note(rounds_completed=bounded.SETTLE_MAX_ROUNDS, phase="loop-exit")
+        record = monitor.settlement
+        blob = json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        self.assertLessEqual(len(blob), bounded.SETTLE_MAX_BYTES)
+        self.assertEqual(settlement_problems(record), [])
+        record["rounds"][0]["rows"] = bounded.U64MAX + 1  # over the fixed integer width
+        self.assertTrue(any("ill-typed count" in problem for problem in settlement_problems(record)))
+
+    def test_missing_or_ill_typed_custodian_clock_is_unknown(self):
+        monitor, _ctl_r = self.monitor()
+        for command, expected in (
+                ({"seq": 5}, None), ({"seq": 5, "sent": "1000"}, None),
+                ({"seq": 5, "sent": True}, None), ({"seq": 5, "sent": -1}, None),
+                ({"seq": 5, "sent": 2000}, None),  # later than the receive: never a latency
+                ({"seq": 5, "sent": 1000}, 500)):
+            with self.subTest(command=command):
+                monitor.settlement.clear()
+                monitor.settlement.update(bounded.settlement_record())
+                monitor.note_stopped(command, 1500)
+                self.assertEqual(monitor.settlement["receive_latency_ns"], expected)
+                self.assertEqual(monitor.settlement["stopped_received_ns"], 1500)
+                self.assertEqual(monitor.settlement["stopped_seq"], 5)
+                self.assertEqual(monitor.settlement["phase"], "received")
+        monitor.settlement.clear()
+        monitor.settlement.update(bounded.settlement_record())
+        monitor.note_stopped(["not", "an", "object"], 1500)  # never raises
+        self.assertIsNone(monitor.settlement["receive_latency_ns"])
+
+    # The real census round's observation-only counters.
+
+    def test_census_counters_follow_the_real_reads_and_leave_classification_alone(self):
+        table = FakeTable([row(108, zombie=True)], {108: ProcessLookupError(3, "gone")},
+                          reread={108: lambda reads: row(108, zombie=True)})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
+        self.assertNotIn("stats", result)
+        stats = check.stats
+        self.assertEqual((stats["rows"], stats["zombie_rows"], stats["esrch_rows"]), (1, 1, 1))
+        self.assertEqual((stats["confirm_reads"], stats["pause_calls"]), (bounded.CONFIRM_TRIES,
+                                                                          bounded.CONFIRM_TRIES - 1))
+        self.assertGreaterEqual(stats["scan_ns"], 0)
+        self.assertGreaterEqual(stats["snapshot_ns"], 0)
+        table.rows, table.sessions, table.rereads = [], {}, {}
+        check.round()
+        self.assertEqual((check.stats["rows"], check.stats["confirm_reads"], check.stats["pause_calls"]),
+                         (0, 0, 0))  # counters reset per round
+
+    def test_failed_snapshot_is_recorded_without_changing_the_result(self):
+        def broken():
+            raise OSError(12, "injected")
+
+        check = bounded.Census(100, snapshot=broken)
+        result = check.round()
+        self.assertFalse(result["certain"])
+        self.assertTrue(check.stats["snapshot_error"])
+        self.assertEqual(check.stats["rows"], 0)
+        self.assertNotIn("stats", result)
+
+    # The real custodian decision-time snapshot.
+
+    def test_custodian_snapshot_names_the_decision_time_facts(self):
+        custodian, read_end = self.custodian()
+        for kind, fields in (("output_eof", {"stream": "stdout"}), ("output_eof", {"stream": "stderr"}),
+                             ("census", {"after": 2, "members": 4, "uncertain": 0, "certain": True}),
+                             ("census", {"after": 3, "members": 0, "uncertain": 0, "certain": True})):
+            custodian.accept(self.message(custodian, kind, **fields))
+        self.assertTrue(custodian.census_ok)
+        custodian.settle(True)
+        settlement = [record for record in self.records(custodian, read_end)
+                      if record["event"] == "settlement"]
+        self.assertEqual(len(settlement), 1)
+        snapshot = settlement[0]
+        self.assertEqual((snapshot["census_messages"], snapshot["census_eligible"]), (2, 1))
+        self.assertTrue(snapshot["census_ok"])
+        self.assertFalse(snapshot["census_uncertain"])
+        self.assertIsNone(snapshot["fault"])
+        self.assertIsNotNone(snapshot["stopped_sent_ns"])
+        self.assertEqual(snapshot["census_end_ns"], 1)  # bounded by exit_at, not a new clock
+        self.assertEqual(snapshot["wait_ns"], 0)
+        # Only the post-reap message is timed; the pre-reap one is counted but
+        # never mistaken for settlement evidence.
+        self.assertEqual(snapshot["first_census_ns"], snapshot["last_census_ns"])
+        self.assertEqual(snapshot["eof"], ["stderr", "stdout"])
+
+    def test_custodian_snapshot_records_an_absent_census_as_zero_messages(self):
+        custodian, read_end = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stderr"))
+        custodian.settle(True)
+        snapshot = [record for record in self.records(custodian, read_end)
+                    if record["event"] == "settlement"][0]
+        self.assertEqual(snapshot["census_messages"], 0)
+        self.assertIsNone(snapshot["first_census_ns"])
+        self.assertIsNone(snapshot["last_census_ns"])
+        self.assertFalse(snapshot["census_ok"])
+        self.assertEqual(snapshot["fault"], CENSUS_FAULT)
+
+    def test_a_failed_observation_write_can_never_latch_or_reopen_a_closure(self):
+        custodian, _read_end = self.custodian()
+        fd = os.open(os.devnull, os.O_WRONLY)
+        os.close(fd)
+        custodian.cmd_w = fd  # every write fails with EBADF
+        custodian.census_ok, custodian.eof = True, {"stdout", "stderr"}
+        custodian.observe_settlement(True, None)
+        self.assertIsNone(custodian.guard.fault)
+        self.assertTrue(custodian.closure(True))
+        custodian.observe_settlement(True, custodian.exit_at)
+        self.assertIsNone(custodian.guard.fault)
+
+
 # Real cases --------------------------------------------------------------------
 
 
@@ -3015,7 +3470,7 @@ def main():
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
                                            PureTraversal, PureDefaultScratch, PureQualificationTopology,
-                                           PureClosureDecision))
+                                           PureClosureDecision, PureSettlement))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

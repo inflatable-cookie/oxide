@@ -96,6 +96,18 @@ CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
+# Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
+# per census round up to a cap, explicit `None` for a phase never reached. They
+# never change classification, counts, faults, EOF, closure, deadlines or
+# cleanup, and never appear in a control message.
+SETTLE_MAX_ROUNDS = 20  # detailed round records kept; further rounds count as omitted
+SETTLE_MAX_BYTES = 16384  # structural compact-JSON ceiling for the whole object
+# The declared phase enums: the monitor writes only these values and the pure
+# oracle rejects anything else, so an unknown phase is never evidence.
+SETTLE_PHASES = ("none", "received", "thread-start", "round-start", "scanned", "lock-wait",
+                 "locked", "sent", "round-complete", "loop-exit")
+SETTLE_ROUND_STEPS = ("start", "scanned", "lock-wait", "locked", "sent", "complete")
+_SETTLE_TOP = object()  # sentinel: a note without a round record targets the settlement object
 TERMINAL_STATUS_VALUES = ("valid", "invalid", "overflow")
 TERMINAL_MODE_REASONS = ("allowlisted", "identity_read_error", "identity_malformed", "identity_mismatch")
 # One-shot exact-kernel allowlist for TERMINALNONWRITER acceptance (owner activation
@@ -140,6 +152,27 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
 
 def now_ns():
     return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+
+
+def settlement_record():
+    """The monitor's observation-only settlement diagnostics (oxide#147).
+
+    Fixed shape: every stamp is an int CLOCK_UPTIME_RAW value or `None` when
+    the step was never reached, so a run that ends with no completed census
+    round is distinguishable from one whose round was certain and empty. The
+    round list is capped at SETTLE_MAX_ROUNDS and the remaining rounds are
+    counted in `omitted`. Nothing here is read by classification, the fault,
+    the EOF witness, the deadline or the cleanup decision."""
+    return {
+        "schema": 1, "clock": "CLOCK_UPTIME_RAW",
+        "stopped_sent_ns": None, "stopped_received_ns": None, "stopped_seq": None,
+        "receive_latency_ns": None, "leader_bound": None,
+        "thread_start_ns": None, "thread_start_latency_ns": None, "census_built_ns": None,
+        "first_round_ns": None, "first_round_latency_ns": None,
+        "stop_requested_ns": None, "loop_exit_ns": None,
+        "rounds_started": 0, "rounds_completed": 0, "omitted": 0,
+        "phase": "none", "rounds": [],
+    }
 
 
 def report(text, fd=2):
@@ -712,6 +745,19 @@ class Census:
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
         self.tracked = {}
+        # Observation-only per-round counters (oxide#147). They are reset at the
+        # start of every round, are never added to the round's returned object
+        # and never influence a classification, count, read, pause or budget.
+        self.stats = {}
+
+    def reset_stats(self):
+        """Start this round's observation-only counters. Never raises."""
+        try:
+            self.stats = {"rows": 0, "esrch_rows": 0, "zombie_rows": 0, "confirm_reads": 0,
+                          "pause_calls": 0, "terminal": 0, "snapshot_ns": 0, "scan_ns": 0,
+                          "snapshot_error": False}
+        except BaseException:
+            self.stats = {}
 
     def confirm_gone_info(self, row):
         """Confirm absence, reporting how. Returns (gone, tries, outcome,
@@ -731,7 +777,15 @@ class Census:
         for attempt in range(CONFIRM_TRIES):
             if attempt:
                 self.pause(CONFIRM_PAUSE)
+                try:
+                    self.stats["pause_calls"] += 1  # observation only
+                except BaseException:
+                    pass
             tries += 1
+            try:
+                self.stats["confirm_reads"] += 1  # observation only
+            except BaseException:
+                pass
             try:
                 again = self.reread(row["pid"])
             except Exception as error:
@@ -772,12 +826,25 @@ class Census:
             return False
 
     def round(self):
+        self.reset_stats()
+        begun = now_ns()
         try:
             rows = self.snapshot()
         except Exception as error:
+            try:
+                self.stats["snapshot_ns"] = now_ns() - begun
+                self.stats["snapshot_error"] = True
+            except BaseException:
+                pass
             return {"certain": False, "members": len(self.tracked), "uncertain": 1,
                     "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": [],
                     "terminal_count_status": "invalid", "terminal_nonwriters": None}
+        try:
+            self.stats["snapshot_ns"] = now_ns() - begun  # observation only
+            self.stats["rows"] = len(rows)
+            self.stats["zombie_rows"] = sum(1 for row in rows if row.get("zombie") is True)
+        except BaseException:
+            pass
         present = {(row["pid"], row["start"]) for row in rows}
         for identity in list(self.tracked):
             if identity not in present:
@@ -906,6 +973,12 @@ class Census:
                 continue  # positively foreign
             else:
                 uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
+        try:
+            self.stats["scan_ns"] = now_ns() - begun - self.stats["snapshot_ns"]  # observation only
+            self.stats["esrch_rows"] = diag_attempted
+            self.stats["terminal"] = terminal_count
+        except BaseException:
+            pass
         try:
             status, value = _terminal_fields(terminal_count, terminal_tainted, False)
         except BaseException:
@@ -1420,6 +1493,63 @@ class Monitor:
         self.inject = set(ctx["inject"])
         self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
         self.receipt = None
+        # Observation-only settlement diagnostics; the receipt carries this
+        # same object, so publishing includes it without extra work.
+        self.settlement = settlement_record()
+
+    def note(self, entry=_SETTLE_TOP, **fields):
+        """One observation-only stamp, on the settlement object or on one
+        round record (a record beyond the cap is None and takes none). Never
+        raises, never blocks, takes no lock and is never consulted by a
+        decision."""
+        try:
+            target = self.settlement if entry is _SETTLE_TOP else entry
+            if target is None:
+                return
+            for name, value in fields.items():
+                target[name] = value
+        except BaseException:
+            pass
+
+    def note_stopped(self, command, received):
+        """Stamp when the monitor processed `stopped`. `sent` is the
+        custodian's own CLOCK_UPTIME_RAW value from the same system-wide
+        clock; anything missing, ill-typed, negative or later than the receive
+        is unknown (None), never guessed and never a fault."""
+        try:
+            sent = command.get("sent")
+            if type(sent) is not int or sent < 0 or sent > received:
+                sent = None
+            self.note(stopped_received_ns=received, stopped_seq=command.get("seq"),
+                      stopped_sent_ns=sent,
+                      receive_latency_ns=None if sent is None else received - sent,
+                      leader_bound=self.leader is not None, phase="received")
+        except BaseException:
+            pass
+
+    def note_round(self, start_ns):
+        """Count this round and keep one bounded record. Returns the record,
+        or None past the cap where only the counters move. Never raises."""
+        try:
+            field = self.settlement
+            field["rounds_started"] += 1
+            if field["first_round_ns"] is None:
+                field["first_round_ns"] = start_ns
+                if field["stopped_received_ns"] is not None:
+                    field["first_round_latency_ns"] = max(0, start_ns - field["stopped_received_ns"])
+            if len(field["rounds"]) >= SETTLE_MAX_ROUNDS:
+                field["omitted"] += 1
+                return None
+            entry = {"index": field["rounds_started"] - 1, "phase": "start", "start_ns": start_ns,
+                     "scanned_ns": None, "snapshot_ns": None, "scan_ns": None, "rows": None,
+                     "esrch_rows": None, "zombie_rows": None, "confirm_reads": None,
+                     "pause_calls": None, "lock_wait_ns": None, "lock_acquired_ns": None,
+                     "lock_released_ns": None, "sent_ns": None, "end_ns": None,
+                     "certain": None, "members": None, "uncertain": None}
+            field["rounds"].append(entry)
+            return entry
+        except BaseException:
+            return None
 
     def owned_root(self):
         """This run's owned root and the selection facts behind it. A caller's
@@ -1500,7 +1630,7 @@ class Monitor:
             "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None,
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
-            "output": {}, "census": None, "census_rounds": 0,
+            "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
         }
 
     def send(self, message_type, **fields):
@@ -1596,19 +1726,61 @@ class Monitor:
         self.send("output_eof", stream=name)
 
     def census_loop(self, after):
+        started = now_ns()
+        self.note(thread_start_ns=started, phase="thread-start")
+        try:  # observation only: how long after the stopped receive the thread ran
+            received = self.settlement["stopped_received_ns"]
+            if received is not None:
+                self.note(thread_start_latency_ns=max(0, started - received))
+        except BaseException:
+            pass
         census = Census(self.leader[0], terminal_allowed=(
             self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"))
+        self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
+            begin = now_ns()
+            entry = self.note_round(begin)
+            self.note(phase="round-start")
             result = census.round()
+            scanned = now_ns()
+            try:  # observation only: the round's measured phases and read counts
+                stats = census.stats
+                self.note(entry, phase="scanned", scanned_ns=scanned, snapshot_ns=stats["snapshot_ns"],
+                          scan_ns=stats["scan_ns"], rows=stats["rows"],
+                          esrch_rows=stats["esrch_rows"], zombie_rows=stats["zombie_rows"],
+                          confirm_reads=stats["confirm_reads"], pause_calls=stats["pause_calls"])
+                self.note(phase="scanned")
+            except BaseException:
+                pass
             if "census-uncertain" in self.inject or (
                     "census-uncertain-first" in self.inject and not self.receipt["census_rounds"]):
                 result = dict(result, certain=False, uncertain=max(1, result["uncertain"]))
+            waiting = now_ns()
+            self.note(entry, phase="lock-wait", lock_wait_ns=waiting)
+            self.note(phase="lock-wait")
             with self.lock:
+                acquired = now_ns()
                 self.receipt["census"] = result
                 self.receipt["census_rounds"] += 1
+            released = now_ns()
+            self.note(entry, phase="locked", lock_acquired_ns=acquired, lock_released_ns=released,
+                      certain=result["certain"], members=result["members"],
+                      uncertain=result["uncertain"])
+            self.note(phase="locked")
             self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
                       certain=result["certain"])
+            # `sent_ns` also covers the send's own lock acquisition and pipe write.
+            sent = now_ns()
+            self.note(entry, sent_ns=sent)
+            done = now_ns()
+            self.note(entry, end_ns=done, phase="complete")
+            self.note(rounds_completed=self.settlement["rounds_completed"] + 1, phase="round-complete")
             self.census_stop.wait(CENSUS_INTERVAL)
+        try:
+            self.settlement["loop_exit_ns"] = now_ns()
+            self.settlement["phase"] = "loop-exit"
+        except BaseException:
+            pass
 
     def commands(self):
         buffer = b""
@@ -1653,6 +1825,7 @@ class Monitor:
                 with self.lock:
                     self.receipt["custodian"].append(command["record"])
             elif kind == "stopped":
+                self.note_stopped(command, now_ns())
                 if "monitor-stall" in self.inject:
                     with self.lock:  # every sender blocks: readings go stale
                         time.sleep(LIMIT_S)
@@ -1663,6 +1836,7 @@ class Monitor:
                 with self.lock:
                     self.receipt["outcome"] = command.get("outcome")
                 break
+        self.note(stop_requested_ns=now_ns())
         self.census_stop.set()
         if decision == "cleanup":
             self.publish("closure_established: cleanup_pending")
@@ -1743,6 +1917,14 @@ class Custodian:
         self.eof = set()
         self.census_ok = False
         self.census_uncertain = False
+        # Observation-only settlement counters (oxide#147): what the custodian
+        # itself saw before its closure decision. They never change
+        # eligibility, closure or any fault.
+        self.stopped_at = None
+        self.census_messages = 0
+        self.census_eligible = 0
+        self.census_first_at = None
+        self.census_last_at = None
         self.reaped_seq = None
         self.monitor_complete = False
         self.deadline_hit = False
@@ -1912,6 +2094,16 @@ class Custodian:
         elif kind == "output_eof":
             self.eof.add(message["stream"])
         elif kind == "census":
+            try:  # observation only, before the unchanged eligibility rule
+                self.census_messages += 1
+                if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
+                    at = now_ns()
+                    self.census_eligible += 1
+                    self.census_last_at = at
+                    if self.census_first_at is None:
+                        self.census_first_at = at
+            except BaseException:
+                pass
             if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
                 if not message["certain"] or message["uncertain"]:
                     # Latched: a later certain empty census never clears it.
@@ -2170,10 +2362,35 @@ class Custodian:
             self.guard.latch("reap: leader not reaped by exit_at; pin kept, no further signal")
             self.deadline_hit = True
 
+    def observe_settlement(self, launched, census_end):
+        """Best-effort, observation-only decision-time snapshot of the
+        settlement window. A failed write is dropped and never latched, so this
+        can never turn a closed run into a fault, replace the first fault or
+        depend on the monitor's later activity. Never raises."""
+        try:
+            at = now_ns()
+            sent = self.stopped_at
+            record = {
+                "at": at, "event": "settlement", "launched": launched,
+                "stopped_sent_ns": sent, "census_end_ns": census_end,
+                "wait_ns": None if census_end is None or sent is None else max(0, min(at, census_end) - sent),
+                "census_messages": self.census_messages, "census_eligible": self.census_eligible,
+                "first_census_ns": self.census_first_at, "last_census_ns": self.census_last_at,                "census_ok": self.census_ok, "census_uncertain": self.census_uncertain,
+                "eof": sorted(self.eof), "fault": self.guard.fault,
+            }
+            self.seq += 1
+            data = (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",
+                                "record": record}) + "\n").encode()
+            os.write(self.cmd_w, data)
+        except BaseException:
+            pass
+
     def settle(self, launched):
-        self.tell("stopped")
+        self.stopped_at = now_ns()
+        self.tell("stopped", sent=self.stopped_at)
         self.reaped_seq = self.seq
         self.record("leader_reaped", status=self.leader_status)
+        census_end = None
         if launched:
             census_end = min(now_ns() + CENSUS_GRACE_S * NS, self.exit_at)
             while not (self.census_uncertain or (self.census_ok and len(self.eof) == 2)) and now_ns() < census_end:
@@ -2182,6 +2399,7 @@ class Custodian:
                 self.guard.latch("closure not established: no certain empty census after the leader was reaped")
             elif len(self.eof) != 2:
                 self.guard.latch("closure not established: output EOF witness missing")
+        self.observe_settlement(launched, census_end)
 
     def last_resort(self):
         """finish raised: KILL the pinned monitor if still held, one WNOHANG
