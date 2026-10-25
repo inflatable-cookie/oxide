@@ -138,6 +138,21 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   starts; nested calls never pause or reset an outer budget. Preserve signal
   forwarding and conservative group closure. Consumer adoption and installation
   remain separate gates; this is not an installed capability.
+- **Nested `oxide` joins the outer lease** (approved, not built; design first):
+  a leased command passes its children a lease token that cannot be forged and
+  is scoped to its own process subtree. A nested `oxide` for the same
+  workspace, recipe and toolchain joins that lease: no new slot or permit, and
+  the outer closure and custody apply. One for another workspace gets its own
+  slot but borrows the outer host permit, so nesting cannot deadlock the host
+  limit. A stale or foreign token is ignored and never grants deletion.
+  Today a nested call takes an independent lease.
+- **Idle exec sessions release their host permit** (approved, not built;
+  design first): `oxide exec` keeps its slot for the whole session but holds
+  the host active-build permit only while a compile runs in its group, taking
+  it back before the next compile, so open dev servers such as `tauri dev` do
+  not starve builds. Closure, crash custody and the reserve watchdog are
+  unchanged. Whether a compile can be detected before it starts is a design
+  question. Today an exec session holds its permit throughout.
 - **Paused:** the unchanged-source `oxide run` fast path. Its plan is preserved
   in #089's closed task and its committee contract.
 - **Deferred:** remote builds. The executor seam stays local-only.
