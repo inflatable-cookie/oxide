@@ -865,13 +865,28 @@ unchanged.
 
 #### Removable pools
 
-`apfs-volume-v1` admission uses the **larger** of the recorded sum and the
-verified volume's used bytes (`capacity - available` from
-`Binding::verify()`, `Pool::volume_used_bytes` at `pool.rs:1356-1366`):
+`apfs-volume-v1` admission uses the same **pool-scoped** figure as the
+directory backend: `recorded_total()` only. The bound volume's total used
+bytes are **not** pool usage — another tool's cache, scratch or Desktop files
+on the same volume are not this pool's bytes and can never push it over its cap
+or trigger an idle eviction (Tom, 2026-10-25, after a live outage where old
+byte accounting evicted warm slots for foreign growth). Free space on the
+volume is a separate signal: the existing below-reserve selection fallback and
+build-time reserve watchdog are unchanged.
 
-```
-pressure = max(recorded_total(), volume_used_bytes())
-```
+An unknown pool size is honest and never zero. When the pool's own walk stops
+at its own bounds (`ElapsedDeadline` or `EntryLimit` only), the reserve route
+applies: free space **above** the registered reserve admits with a bounded
+note and no eviction; at or below the reserve it prunes the eligible idle whole
+slots in the existing LRU order, re-reading free space after each; with nothing
+left to prune, free space **at or above the 10 GiB hard floor** admits with a
+warning and below it refuses with the original incomplete scan. The floor is a
+fixed product constant for this change — not a registration field, selection or
+watchdog setting — and it wins over any lower legacy reserve, so nothing
+admits below it. Every other incomplete shape, an unverifiable binding, unknown
+free or reserve facts, and the internal directory pool's own incompleteness
+refuse exactly as before; a partial scan is never published as a record and the
+cap stays stated as unverified on this route.
 
 Provenance is printed (`recorded n/m slots` plus `volume used X of Y`). The
 volume figure already includes everything else on the volume, so the maximum
@@ -880,17 +895,14 @@ governs eviction order. Unknown capacity or available bytes still refuse
 `unknown_accounting`, and an absent, mismatched or unverifiable backing still
 refuses before any effect.
 
-**Hotfix disposition.** The 5 s `VOLUME_WALK_MS` bound and
-`admit_by_volume_usage` stay, but only reachable on a pool that still has
-unrecorded slots whose walks hit the bound with `elapsed_deadline` /
-`entry_limit` gaps — i.e. the legacy migration path, byte-for-byte as today.
-They become unreachable once every slot carries a current record, because no
-whole-payload walk is attempted at all. That is the justification the ruling
-asked for: the fallback existed only because admission walked the whole
-payload, and this design removes that walk rather than tuning its timeout.
-The fallback is not repurposed as a second accounting engine and gains no new
-cases. When the removable pool's own admission becomes recorded it is
-retired; that removal is a later scoped edit, not part of Phase B.
+**Fallback disposition.** `admit_by_volume_usage`, its
+`VolumeAdmission` decision and the bounded multi-eviction loop are **retired**:
+the whole-volume-used figure is no longer a budget input at all. What remains
+is one pure decision, `unknown_removable_step`, and the pool-side loop that
+prunes eligible idle whole slots while free space is at or below the reserve.
+The 5 s `VOLUME_WALK_MS` bound still applies to the walks a pool figure needs,
+so a huge removable pool reaches the unknown route rather than timing out
+mid-measurement.
 
 #### Status, audit and provenance
 

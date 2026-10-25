@@ -39,6 +39,11 @@ pub struct LeaseRequest {
     /// at creation. It drives admission and whole-idle-slot eviction only;
     /// nothing enforces it while a build writes.
     pub budget_bytes: Option<u64>,
+    /// The registered removable volume's free-space reserve, when the caller
+    /// owns that fact. It is a **reserve** signal, never a pool-budget input:
+    /// an unknown pool size may admit only on positively measured free space
+    /// above this reserve, and that route never evicts a slot.
+    pub reserve_bytes: Option<u64>,
     /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
     pub layout: Option<SlotLayout>,
     /// A front-door count replacement, never byte pressure: retire this idle
@@ -274,9 +279,9 @@ pub(super) struct Pool {
     reconciliation_blocked: bool,
     /// Why this open admitted a new slot without a complete walk, if it did.
     admission_note: Option<String>,
-    /// A removable payload this open already found too large to walk within
-    /// `VOLUME_WALK_MS`, with only bound gaps: later checks reuse it.
-    unwalkable: Option<AccountingScan>,
+    /// The caller's registered free-space reserve for a removable payload.
+    /// Read only by the unknown-size admission route; never a cap input.
+    reserve: Option<u64>,
 }
 
 /// Entry points for the `oxide` front door. They open a budget-only
@@ -708,7 +713,7 @@ impl Pool {
             deadline: None,
             reconciliation_blocked: false,
             admission_note: None,
-            unwalkable: None,
+            reserve: None,
         };
         pool.reconcile_evicting()?;
         Ok(pool)
@@ -749,7 +754,7 @@ impl Pool {
             // unknown while a recorded deletion is pending.
             reconciliation_blocked: pending,
             admission_note: None,
-            unwalkable: None,
+            reserve: None,
         })
     }
 
@@ -845,6 +850,7 @@ impl Pool {
             }
             self.budget = budget;
         }
+        self.reserve = request.reserve_bytes;
         let project = canonical_existing_dir(&request.project, false)?;
         let workspace = canonical_existing_dir(&request.workspace, false)?;
         require_holder(&request.holder)?;
@@ -999,13 +1005,15 @@ impl Pool {
                 return Err(LeaseError::LedgerExhausted);
             }
         }
-        // New-slot admission needs the recorded pressure complete, before and
-        // after any eviction. Below both count ceilings and without byte
-        // pressure nothing is evicted. When every slot's record is current the
-        // figure costs O(slots) metadata work and no inventory walk at all;
-        // only a missing or invalid record is walked, once, bounded. A
-        // removable payload whose required walk cannot finish within its
-        // bounds keeps the legacy volume-used-bytes fallback.
+        // New-slot admission compares the pool's own recorded bytes with its
+        // soft cap, before and after any eviction. Below both count ceilings
+        // and without byte pressure nothing is evicted. When every slot's
+        // record is current the figure costs O(slots) metadata work and no
+        // inventory walk at all; only a missing or invalid record is walked,
+        // once, bounded.
+        //
+        // A removable pool whose pool figure is unknown for bound gaps only
+        // takes the reserve route instead: no cap comparison, no eviction.
         match self.pressure() {
             Ok(used) => {
                 if used >= self.budget {
@@ -1016,8 +1024,7 @@ impl Pool {
                 }
             }
             Err(LeaseError::AccountingIncomplete(scan)) if self.is_removable() => {
-                self.unwalkable = Some(*scan);
-                self.admit_by_volume_usage()?;
+                self.admit_unknown_removable(&scan)?;
             }
             Err(error) => return Err(error),
         }
@@ -1310,9 +1317,11 @@ impl Pool {
                 "replacement slot ID must be a positive integer",
             ));
         }
-        // The whole recorded pressure must be complete before any deletion; a
-        // removable payload too large to walk passes on bound gaps alone.
-        self.pressure()?;
+        // A count replacement is count pressure, not a byte-size decision: it
+        // needs a complete pool figure, or a removable pool whose figure is
+        // unknown for bound gaps only. An internal or mixed incompleteness
+        // still refuses before anything is deleted.
+        self.pressure_known_or_bounded_removable()?;
         let Some((incarnation, project, profile)) = self
             .slot(id)
             .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
@@ -1328,11 +1337,10 @@ impl Pool {
         // concurrent-looking state cannot extend the loop.
         let mut remaining = self.ledger.slots.len();
         while self.ledger.slots.len() > max_slots && remaining > 0 {
-            // A count replacement still needs complete recorded accounting
-            // first; an incomplete walk refuses instead of deleting blindly,
-            // except a removable payload whose only gaps are the walk's own
-            // bounds.
-            self.pressure()?;
+            // Count pressure only: a complete pool figure, or a removable
+            // pool whose figure is unknown for bound gaps only. It never
+            // authorises a byte-pressure deletion.
+            self.pressure_known_or_bounded_removable()?;
             let before = self.ledger.slots.len();
             if !self.evict_one_idle()? {
                 break;
@@ -1345,32 +1353,42 @@ impl Pool {
         Ok(())
     }
 
-    /// New-slot admission on a removable volume when the whole-payload walk
-    /// is incomplete: the volume's used bytes (capacity less available, from
-    /// the verified binding) stand in for the payload. They include
-    /// everything else on the volume, so they never undercount. Under the
-    /// budget, admit with a note; otherwise evict least-recently-used idle
-    /// whole slots, re-reading the volume after each, at most
-    /// `VolumeAdmission::EVICTION_LIMIT` times, then refuse with the original
-    /// incomplete scan. Any other walk failure keeps refusing; the internal
-    /// directory pool never takes this path.
-    fn admit_by_volume_usage(&mut self) -> Result<(), LeaseError> {
-        let scan = self
-            .unwalkable
-            .clone()
-            .ok_or(LeaseError::UnknownAccounting)?;
-        let mut decision = VolumeAdmission::new(scan, self.budget)?;
+    /// New-slot admission for a removable pool whose pool accounting could
+    /// not finish inside its bounds.
+    ///
+    /// Pool size is **unknown**, so this route never compares bytes against
+    /// the pool cap and never evicts: it admits only when the verified
+    /// volume's free space is positively above the caller's registered
+    /// reserve, and refuses with the original incomplete scan otherwise.
+    /// Everything else on the volume — caches, scratch, another tool's
+    /// Desktop — is irrelevant here, which is why the decision takes no
+    /// "volume used" figure at all.
+    fn admit_unknown_removable(&mut self, scan: &AccountingScan) -> Result<(), LeaseError> {
+        let mut idle_available = true;
         loop {
-            let used = self.volume_used_bytes()?;
-            match decision.step(used)? {
-                VolumeStep::Admit(note) => {
+            let available = self.volume_available_bytes()?;
+            match unknown_removable_step(
+                scan,
+                available,
+                self.reserve,
+                UNKNOWN_REMOVABLE_FLOOR_BYTES,
+                idle_available,
+            )? {
+                UnknownRemovableStep::Admit(note) | UnknownRemovableStep::AdmitAtFloor(note) => {
                     self.admission_note = Some(note);
                     return Ok(());
                 }
-                VolumeStep::Evict => {
-                    if !self.evict_one_idle()? {
-                        return Err(decision.refuse());
+                UnknownRemovableStep::Evict => {
+                    // The reserve is a prune trigger: retire one eligible idle
+                    // whole slot and re-read free space. When no eligible slot
+                    // is left, the floor decides.
+                    idle_available = self.evict_one_idle()?;
+                    if !idle_available {
+                        continue;
                     }
+                }
+                UnknownRemovableStep::Refuse(scan) => {
+                    return Err(LeaseError::AccountingIncomplete(Box::new(scan)))
                 }
             }
         }
@@ -1393,20 +1411,35 @@ impl Pool {
         limits
     }
 
-    /// The pool's byte-pressure figure (oxide#146).
+    /// The pool's byte-pressure figure: attributable pool bytes only.
     ///
-    /// An internal directory pool uses the recorded sum: `pool_scope()` plus
-    /// one figure per ledger slot, where a held slot is always walked fresh,
-    /// a current idle record is trusted, and a missing or invalid record is
-    /// walked once and published. A removable pool uses the larger of that sum
-    /// and the verified volume's own used bytes, which include everything else
-    /// on the volume and so never undercount. Non-reduction, unknown backing
-    /// and unknown facts still refuse.
+    /// Both backings use the recorded sum — `pool_scope()` plus one figure
+    /// per ledger slot, where a held slot is always walked fresh, a current
+    /// idle record is trusted, and a missing or invalid record is walked once
+    /// and published. A shared removable volume's other occupants (caches,
+    /// scratch, another tool's files) are **not** this pool's usage and can
+    /// never push it over its cap, so they are not part of this figure; the
+    /// volume's free space is a reserve signal, handled separately.
     fn pressure(&mut self) -> Result<u64, LeaseError> {
-        let recorded = self.recorded_total()?;
-        match &self.backing {
-            Payload::Volume { .. } => Ok(recorded.max(self.volume_used_bytes()?)),
-            Payload::Budget(_) => Ok(recorded),
+        self.recorded_total()
+    }
+
+    /// Count-limit preparation: a count replacement is count pressure, never a
+    /// byte-size decision, so it may proceed when the pool figure is complete
+    /// **or** when a removable pool's pool figure is genuinely unknown for
+    /// bound gaps only. An internal pool, a mixed or non-bound gap set, or any
+    /// other accounting failure still refuses before anything is deleted.
+    fn pressure_known_or_bounded_removable(&mut self) -> Result<(), LeaseError> {
+        match self.pressure() {
+            Ok(_) => Ok(()),
+            Err(LeaseError::AccountingIncomplete(scan)) if self.is_removable() => {
+                if bound_gaps_only(&scan) {
+                    Ok(())
+                } else {
+                    Err(LeaseError::AccountingIncomplete(scan))
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1619,16 +1652,16 @@ impl Pool {
         })
     }
 
-    /// Capacity less available bytes of the bound removable volume.
-    fn volume_used_bytes(&self) -> Result<u64, LeaseError> {
+    /// The bound removable volume's free bytes, when they are positively
+    /// known. This is the reserve signal only; it never becomes pool usage.
+    /// A volume that cannot be verified is a backing mismatch, not a refusal
+    /// to measure some other number.
+    fn volume_available_bytes(&self) -> Result<Option<u64>, LeaseError> {
         let Payload::Volume { binding, .. } = &self.backing else {
             return Err(LeaseError::UnknownAccounting);
         };
         let facts = binding.verify().map_err(|_| LeaseError::BackingMismatch)?;
-        match (facts.capacity_bytes, facts.available_bytes) {
-            (Some(capacity), Some(available)) => Ok(capacity.saturating_sub(available)),
-            _ => Err(LeaseError::UnknownAccounting),
-        }
+        Ok(facts.available_bytes)
     }
 
     fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
@@ -2165,70 +2198,91 @@ impl Sizes {
 /// bytes: a 127-slot USB pool cannot be walked within the 60 s bound.
 const VOLUME_WALK_MS: u64 = 5_000;
 
-/// The removable-volume admission decision, separated from its effects so
-/// it can be tested without a volume. `new` refuses any scan whose gaps are
-/// not only the elapsed-deadline or entry bounds: an unreadable or missing
-/// entry is never papered over by the volume's used bytes.
-struct VolumeAdmission {
-    scan: AccountingScan,
-    budget: u64,
-    evicted: usize,
+/// Is this scan incomplete for the walk's own bounds only?
+///
+/// `ElapsedDeadline` and `EntryLimit` are the two gaps that say "the pool is
+/// bigger than the walk could see", which is the only incomplete shape that
+/// may take the reserve route. A complete scan, an empty gap list, or any
+/// unreadable / missing / unsupported / mount-boundary gap is a real
+/// accounting failure and refuses unchanged.
+fn bound_gaps_only(scan: &AccountingScan) -> bool {
+    scan.coverage == AccountingCoverage::Partial
+        && !scan.gaps.is_empty()
+        && scan.gaps.iter().all(|gap| {
+            matches!(
+                gap.kind,
+                AccountingGapKind::ElapsedDeadline | AccountingGapKind::EntryLimit
+            )
+        })
 }
 
-enum VolumeStep {
+/// The hard floor for an unknown-size admission with nothing left to prune.
+///
+/// Tom's 2026-10-25 refinement: the registered reserve is a *prune* trigger,
+/// not a stop; only this floor is a stop. It is a fixed product constant for
+/// oxide#146 — not a registration field, a watchdog setting or a selection
+/// change.
+const UNKNOWN_REMOVABLE_FLOOR_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// What to do about a removable pool whose own size is unknown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UnknownRemovableStep {
+    /// Free space is above the reserve: admit, evict nothing.
     Admit(String),
+    /// Free space is at or below the reserve and some idle whole slot may be
+    /// pruned: retire the least-recently-used eligible one, then re-read.
     Evict,
+    /// Free space is below the reserve, nothing is left to prune, and it is at
+    /// or above the hard floor: admit with a warning and no further eviction.
+    AdmitAtFloor(String),
+    /// Free space is below the reserve, nothing is left to prune, and it is
+    /// below the hard floor: refuse with the original incomplete scan.
+    Refuse(AccountingScan),
 }
 
-impl VolumeAdmission {
-    const EVICTION_LIMIT: usize = 8;
-
-    fn new(scan: AccountingScan, budget: u64) -> Result<Self, LeaseError> {
-        let bounds_only = scan.coverage == AccountingCoverage::Partial
-            && !scan.gaps.is_empty()
-            && scan.gaps.iter().all(|gap| {
-                matches!(
-                    gap.kind,
-                    AccountingGapKind::ElapsedDeadline | AccountingGapKind::EntryLimit
-                )
-            });
-        if bounds_only {
-            Ok(Self {
-                scan,
-                budget,
-                evicted: 0,
-            })
-        } else {
-            Err(LeaseError::AccountingIncomplete(Box::new(scan)))
-        }
+/// Decide one step of a removable pool's unknown-size admission.
+///
+/// The pool figure is genuinely unknown here, so it is never treated as zero,
+/// never compared with the pool cap, and never replaced by the volume's total
+/// usage: only positively measured free space, the operator's reserve and the
+/// fixed hard floor participate. `available` and `reserve` must both be known;
+/// otherwise the honest answer is the original incomplete scan.
+fn unknown_removable_step(
+    scan: &AccountingScan,
+    available: Option<u64>,
+    reserve: Option<u64>,
+    floor: u64,
+    idle_available: bool,
+) -> Result<UnknownRemovableStep, LeaseError> {
+    if !bound_gaps_only(scan) {
+        return Err(LeaseError::AccountingIncomplete(Box::new(scan.clone())));
     }
-
-    /// One reading of the volume's used bytes: admit under the budget,
-    /// otherwise ask for one more idle eviction until the limit.
-    fn step(&mut self, used: u64) -> Result<VolumeStep, LeaseError> {
-        if used < self.budget {
-            return Ok(VolumeStep::Admit(format!(
-                "pool accounting could not finish ({} entries walked before its bound); admitted by the volume's used bytes ({} of a {} budget){}",
-                self.scan.entries_visited,
-                gigabytes(used),
-                gigabytes(self.budget),
-                if self.evicted > 0 {
-                    format!(" after evicting {} idle slot(s)", self.evicted)
-                } else {
-                    String::new()
-                }
-            )));
-        }
-        if self.evicted >= Self::EVICTION_LIMIT {
-            return Err(self.refuse());
-        }
-        self.evicted += 1;
-        Ok(VolumeStep::Evict)
+    let (Some(available), Some(reserve)) = (available, reserve) else {
+        return Err(LeaseError::AccountingIncomplete(Box::new(scan.clone())));
+    };
+    // The hard floor is a stop in every branch: below it nothing admits,
+    // even when a legacy registration's reserve is set lower than the floor.
+    if available < floor {
+        return Ok(UnknownRemovableStep::Refuse(scan.clone()));
     }
-
-    fn refuse(&self) -> LeaseError {
-        LeaseError::AccountingIncomplete(Box::new(self.scan.clone()))
+    if available > reserve {
+        return Ok(UnknownRemovableStep::Admit(format!(
+            "pool size unknown (the walk stopped at its bound after {} entries); admitted on {} free above the {} reserve; nothing was evicted and the pool cap is unverified",
+            scan.entries_visited,
+            gigabytes(available),
+            gigabytes(reserve)
+        )));
     }
+    if idle_available {
+        return Ok(UnknownRemovableStep::Evict);
+    }
+    Ok(UnknownRemovableStep::AdmitAtFloor(format!(
+        "pool size unknown (the walk stopped at its bound after {} entries); {} free is at or below the {} reserve, at or above the {} hard floor, and no idle slot is left to prune, so this admission proceeds with a warning; nothing was evicted and the pool cap is unverified",
+        scan.entries_visited,
+        gigabytes(available),
+        gigabytes(reserve),
+        gigabytes(floor)
+    )))
 }
 
 /// Decimal gigabytes with one place, for admission notes.
@@ -2816,12 +2870,12 @@ pub(super) fn with_stale_record_for_test(pool: &Path, slot_id: u64) -> Result<()
 }
 
 #[cfg(test)]
-mod volume_admission_tests {
+mod unknown_removable_tests {
     use super::*;
 
-    fn scan(gaps: &[AccountingGapKind]) -> AccountingScan {
+    fn scan(gaps: &[AccountingGapKind], coverage: AccountingCoverage) -> AccountingScan {
         AccountingScan {
-            coverage: AccountingCoverage::Partial,
+            coverage,
             gaps: gaps
                 .iter()
                 .map(|kind| AccountingGap {
@@ -2838,78 +2892,173 @@ mod volume_admission_tests {
         }
     }
 
+    fn bounds(gaps: &[AccountingGapKind]) -> AccountingScan {
+        scan(gaps, AccountingCoverage::Partial)
+    }
+
+    const RESERVE: u64 = 20 * 1024 * 1024 * 1024;
+    const FLOOR: u64 = 10 * 1024 * 1024 * 1024;
+
     #[test]
-    fn a_deadline_bound_walk_under_budget_admits_with_a_note() {
-        let mut decision =
-            VolumeAdmission::new(scan(&[AccountingGapKind::ElapsedDeadline]), 750_000_000_000)
-                .expect("bounds-only gaps qualify");
-        match decision.step(579_000_000_000).expect("step") {
-            VolumeStep::Admit(note) => {
-                assert!(note.contains("318620 entries"), "{note}");
-                assert!(note.contains("579.0 GB of a 750.0 GB budget"), "{note}");
-                assert!(!note.contains("evicting"), "{note}");
-            }
-            VolumeStep::Evict => panic!("under budget must not evict"),
+    fn free_above_the_reserve_admits_without_eviction_and_without_a_cap_claim() {
+        for gaps in [
+            &[AccountingGapKind::ElapsedDeadline][..],
+            &[AccountingGapKind::EntryLimit][..],
+            &[
+                AccountingGapKind::EntryLimit,
+                AccountingGapKind::ElapsedDeadline,
+            ][..],
+        ] {
+            let step = unknown_removable_step(
+                &bounds(gaps),
+                Some(RESERVE + 1),
+                Some(RESERVE),
+                FLOOR,
+                true,
+            )
+            .expect("bounds-only gaps qualify");
+            let UnknownRemovableStep::Admit(note) = step else {
+                panic!("free space above the reserve must admit: {step:?}");
+            };
+            assert!(note.contains("318620 entries"), "{note}");
+            assert!(note.contains("nothing was evicted"), "{note}");
+            assert!(note.contains("cap is unverified"), "{note}");
+            // No volume-usage input exists, so no foreign total can appear.
+            assert!(!note.contains("used"), "{note}");
         }
     }
 
     #[test]
-    fn over_budget_evicts_one_at_a_time_then_admits() {
-        let mut decision =
-            VolumeAdmission::new(scan(&[AccountingGapKind::EntryLimit]), 100).expect("qualifies");
-        assert!(matches!(
-            decision.step(150).expect("step"),
-            VolumeStep::Evict
-        ));
-        assert!(matches!(
-            decision.step(120).expect("step"),
-            VolumeStep::Evict
-        ));
-        match decision.step(90).expect("step") {
-            VolumeStep::Admit(note) => {
-                assert!(note.contains("after evicting 2 idle slot(s)"), "{note}")
-            }
-            VolumeStep::Evict => panic!("under budget after evictions must admit"),
+    fn at_or_below_the_reserve_prunes_an_idle_slot_first() {
+        // Equality at the reserve prunes; so does any free space between the
+        // reserve and the floor, while an eligible idle slot remains.
+        for available in [RESERVE, RESERVE - 1, FLOOR] {
+            let step = unknown_removable_step(
+                &bounds(&[AccountingGapKind::ElapsedDeadline]),
+                Some(available),
+                Some(RESERVE),
+                FLOOR,
+                true,
+            )
+            .expect("bounds-only gaps qualify");
+            assert_eq!(step, UnknownRemovableStep::Evict, "available {available}");
+        }
+        // Below the hard floor nothing prunes or admits, even with idle slots.
+        for available in [FLOOR - 1, 0] {
+            let step = unknown_removable_step(
+                &bounds(&[AccountingGapKind::ElapsedDeadline]),
+                Some(available),
+                Some(RESERVE),
+                FLOOR,
+                true,
+            )
+            .expect("bounds-only gaps qualify");
+            assert!(
+                matches!(step, UnknownRemovableStep::Refuse(_)),
+                "available {available}"
+            );
         }
     }
 
     #[test]
-    fn eviction_is_bounded_and_then_refuses_with_the_original_scan() {
-        let mut decision = VolumeAdmission::new(scan(&[AccountingGapKind::ElapsedDeadline]), 100)
-            .expect("qualifies");
-        for _ in 0..VolumeAdmission::EVICTION_LIMIT {
+    fn the_hard_floor_wins_over_a_lower_legacy_reserve() {
+        let original = bounds(&[AccountingGapKind::EntryLimit]);
+        // 5 GiB free, a legacy 2 GiB reserve: free is above the reserve, yet
+        // below the floor, so nothing admits and nothing is evicted.
+        let step = unknown_removable_step(
+            &original,
+            Some(5 * 1024 * 1024 * 1024),
+            Some(2 * 1024 * 1024 * 1024),
+            FLOOR,
+            false,
+        )
+        .expect("bounds-only gaps qualify");
+        match step {
+            UnknownRemovableStep::Refuse(scan) => assert_eq!(scan, original),
+            other => panic!("the floor must win over a lower reserve: {other:?}"),
+        }
+        // The same free space with idle slots available prunes rather than
+        // admitting below the floor.
+        let step = unknown_removable_step(
+            &original,
+            Some(5 * 1024 * 1024 * 1024),
+            Some(2 * 1024 * 1024 * 1024),
+            FLOOR,
+            true,
+        )
+        .expect("bounds-only gaps qualify");
+        match step {
+            UnknownRemovableStep::Refuse(scan) => assert_eq!(scan, original),
+            other => panic!("the floor must stop even with idle slots: {other:?}"),
+        }
+        // Equality at the floor admits with a warning when nothing is left.
+        let step = unknown_removable_step(&original, Some(FLOOR), Some(RESERVE), FLOOR, false)
+            .expect("bounds-only gaps qualify");
+        assert!(matches!(step, UnknownRemovableStep::AdmitAtFloor(_)));
+    }
+
+    #[test]
+    fn with_nothing_left_to_prune_the_hard_floor_decides() {
+        let original = bounds(&[AccountingGapKind::EntryLimit]);
+        for available in [RESERVE - 1, FLOOR, FLOOR + 1] {
+            let step =
+                unknown_removable_step(&original, Some(available), Some(RESERVE), FLOOR, false)
+                    .expect("bounds-only gaps qualify");
+            let UnknownRemovableStep::AdmitAtFloor(note) = step else {
+                panic!("{available} free with nothing to prune must admit at the floor: {step:?}");
+            };
+            assert!(note.contains("hard floor"), "{note}");
+            assert!(note.contains("warning"), "{note}");
+            assert!(note.contains("nothing was evicted"), "{note}");
+        }
+        for available in [FLOOR - 1, 0] {
+            let step =
+                unknown_removable_step(&original, Some(available), Some(RESERVE), FLOOR, false)
+                    .expect("bounds-only gaps qualify");
+            match step {
+                UnknownRemovableStep::Refuse(scan) => assert_eq!(scan, original),
+                other => panic!("{available} free is below the floor and must refuse: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_facts_never_become_zero_and_never_admit() {
+        let original = bounds(&[AccountingGapKind::EntryLimit]);
+        for (available, reserve) in [
+            (None, Some(RESERVE)),
+            (Some(RESERVE + 1), None),
+            (None, None),
+        ] {
             assert!(matches!(
-                decision.step(500).expect("step"),
-                VolumeStep::Evict
+                unknown_removable_step(&original, available, reserve, FLOOR, true),
+                Err(LeaseError::AccountingIncomplete(_))
             ));
         }
-        let error = decision.step(500).err().expect("refuses past the limit");
-        assert_eq!(error.reason(), "unknown_accounting");
-        assert!(
-            matches!(error, LeaseError::AccountingIncomplete(ref refused) if refused.entries_visited == 318_620)
-        );
     }
 
     #[test]
-    fn unreadable_or_missing_entries_never_fall_back_to_volume_bytes() {
-        for gaps in [
-            vec![AccountingGapKind::UnreadableEntry],
-            vec![
-                AccountingGapKind::ElapsedDeadline,
-                AccountingGapKind::MissingMetadata,
-            ],
-            vec![AccountingGapKind::RootMissing],
-            vec![AccountingGapKind::DepthLimit],
-            vec![],
+    fn only_bound_gaps_qualify() {
+        for refusing in [
+            scan(&[], AccountingCoverage::Complete),
+            scan(&[], AccountingCoverage::Partial),
+            scan(&[], AccountingCoverage::Unknown),
+            bounds(&[AccountingGapKind::UnreadableEntry]),
+            bounds(&[AccountingGapKind::MountBoundary]),
+            bounds(&[AccountingGapKind::MissingMetadata]),
+            bounds(&[
+                AccountingGapKind::EntryLimit,
+                AccountingGapKind::UnreadableEntry,
+            ]),
+            bounds(&[AccountingGapKind::RootMissing]),
         ] {
-            let error = VolumeAdmission::new(scan(&gaps), 100)
-                .err()
-                .expect("refused");
-            assert_eq!(error.reason(), "unknown_accounting", "{gaps:?}");
+            assert!(!bound_gaps_only(&refusing), "{refusing:?}");
+            assert!(matches!(
+                unknown_removable_step(&refusing, Some(RESERVE + 1), Some(RESERVE), FLOOR, true),
+                Err(LeaseError::AccountingIncomplete(_))
+            ));
         }
-        let mut complete = scan(&[AccountingGapKind::ElapsedDeadline]);
-        complete.coverage = AccountingCoverage::Unknown;
-        assert!(VolumeAdmission::new(complete, 100).is_err());
+        assert!(bound_gaps_only(&bounds(&[AccountingGapKind::EntryLimit])));
     }
 }
 

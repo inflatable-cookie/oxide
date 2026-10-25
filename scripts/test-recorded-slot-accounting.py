@@ -105,6 +105,10 @@ TAINTED: set[str] = set()
 PRIMARY: list[str] = []
 SECONDARY: list[str] = []
 ABORTED: bool = False
+# Set by `abort()`: an unknown outcome is in flight and stays unknown.
+PENDING_ABORT: bool = False
+# Set by the pure modes: a check there always raises, never exits the process.
+PURE_MODE: bool = False
 DIAGNOSTIC_MODE = DIAGNOSTIC in sys.argv
 
 
@@ -119,7 +123,11 @@ class CaseFailure(Exception):
 
 
 def fail(message: str) -> None:
-    if DIAGNOSTIC_MODE:
+    # Once an unknown outcome is in flight, no later check may reclassify it as
+    # a recoverable oracle failure: the unknown keeps the collection aborted.
+    if PENDING_ABORT:
+        raise CaseFailure(f"{message} (after an unknown outcome)", abort=True)
+    if DIAGNOSTIC_MODE or PURE_MODE:
         raise CaseFailure(message, abort=False)
     print(f"FAILED: {message}", flush=True)
     raise SystemExit(1)
@@ -127,6 +135,11 @@ def fail(message: str) -> None:
 
 def abort(message: str) -> None:
     """An outcome the diagnostic may never turn into an oracle continuation."""
+    global PENDING_ABORT
+    PENDING_ABORT = True
+    # Record the fault at the moment it happens, so a teardown that raises
+    # afterwards cannot replace it as the primary error.
+    note_fault(message)
     raise CaseFailure(message, abort=True)
 
 
@@ -158,7 +171,13 @@ def work_left() -> float:
 
 
 def child_timeout(limit: float = 120.0) -> float:
-    """Every child timeout is clipped to the guard's existing work cutoff."""
+    """Every child timeout is clipped to the guard's existing work cutoff.
+
+    Only a counted or diagnostic run under the supervisor exports that
+    deadline; a pure invocation has no guard clock and uses the fixed limit.
+    """
+    if "OXIDE_PROOF_DEADLINE_NS" not in os.environ:
+        return limit
     return min(limit, work_left())
 
 
@@ -921,17 +940,35 @@ def await_held(
     abort("the gated writer never reached a genuinely held slot")
 
 
-def release_gated(fixture: Fixture, child: subprocess.Popen, gate: str, output: str) -> str:
-    """Release one gated writer and return everything it wrote."""
-    with open(gate, "w", encoding="utf-8") as handle:
-        handle.write("release\n")
+def release_gated(
+    fixture: Fixture,
+    child,
+    gate: str,
+    output: str,
+    signal=None,
+) -> str:
+    """Release one gated writer and return everything it wrote.
+
+    A release that has to force its owned child, or that fails after any
+    unknown outcome is already in flight, is an unknown custody outcome: it
+    aborts and never downgrades the earlier fault. `signal` is the release
+    channel, injectable so the pure check can drive this decision without
+    touching the filesystem.
+    """
+    if signal is None:
+        def signal() -> None:
+            with open(gate, "w", encoding="utf-8") as handle:
+                handle.write("release\n")
+    signal()
     try:
         child.wait(timeout=child_timeout(90))
     except subprocess.TimeoutExpired:
         child.kill()
         child.wait()
-        abort("the gated writer did not exit on its release file")
-    expect(child.returncode == 0, f"the released writer exited {child.returncode}")
+        abort("the gated writer did not exit on its release file; forced teardown")
+    if child.returncode != 0:
+        # `fail` escalates to abort when an unknown outcome is already latched.
+        fail(f"the released writer exited {child.returncode}")
     return "\n".join(read_log(output))
 
 
@@ -1471,7 +1508,7 @@ def dispatch(root: str, subject: str, cases, diagnostic: bool) -> None:
     skips only cases whose declared prerequisites are now tainted, and stops
     the whole collection on any unknown outcome.
     """
-    global ABORTED
+    global ABORTED, PENDING_ABORT
     for name, function in cases:
         blocked = [dependency for dependency in DEPENDS[name] if dependency in TAINTED]
         if blocked:
@@ -1479,6 +1516,7 @@ def dispatch(root: str, subject: str, cases, diagnostic: bool) -> None:
             TAINTED.add(name)
             print(f"skip {name} (dependency failed: {', '.join(blocked)})", flush=True)
             continue
+        PENDING_ABORT = False
         REACHED.append(name)
         if not diagnostic:
             function(root, subject)
@@ -1735,6 +1773,8 @@ ALLOCATION = {
 
 def self_check() -> None:
     """Pure: real rendering, the recipe validator and the receipt rules."""
+    global PURE_MODE
+    PURE_MODE = True
     # R1 — the render functions the counted run actually calls.
     rendered = render_build_rs(SLOT_FILLER_BYTES)
     expect("__SLOT_FILLER_BYTES__" not in rendered, "the filler placeholder survived")
@@ -2040,12 +2080,15 @@ def self_check() -> None:
 
 def self_test() -> None:
     """Pure: the diagnostic decision machine, with no child, image or pool."""
-    global ABORTED
+    global ABORTED, PURE_MODE
+    PURE_MODE = True
     saved = (list(FAILURES), list(SKIPS), list(REACHED), set(TAINTED), list(PRIMARY),
              list(SECONDARY), ABORTED)
 
     def reset() -> None:
-        global ABORTED
+        global ABORTED, PENDING_ABORT
+        PENDING_ABORT = False
+        ABORTED = False
         FAILURES.clear()
         SKIPS.clear()
         REACHED.clear()
@@ -2053,6 +2096,24 @@ def self_test() -> None:
         PRIMARY.clear()
         SECONDARY.clear()
         ABORTED = False
+
+    class FakeChild:
+        """A child stand-in for the release/custody decision only."""
+
+        def __init__(self, returncode: int = 0, hang: bool = False) -> None:
+            self.returncode = returncode
+            self.hang = hang
+            self.killed = False
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self.hang:
+                raise subprocess.TimeoutExpired("fake-oxide", timeout or 0)
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.hang = False
+            self.returncode = -9
 
     def stubs(failing: str, aborting: bool, calls: list[str]) -> list[tuple[str, object]]:
         made = []
@@ -2124,6 +2185,73 @@ def self_test() -> None:
         expect(document["aborted"] is True, "the receipt hid the abort")
         expect(document["collection_complete"] is False, "an aborted receipt claimed completeness")
         expect(document["case_states"] == states, "the receipt states disagree with the run")
+
+        # R6: an unknown outcome is never downgraded by the teardown after it.
+        reset()
+        hanging = FakeChild(returncode=-9, hang=True)
+        try:
+            try:
+                abort("await_held timed out: the gated writer never reached a held slot")
+            finally:
+                release_gated("fixture", hanging, "/nonexistent-gate", "/nonexistent-out",
+                              signal=lambda: None)
+        except CaseFailure as failure:
+            expect(failure.abort, "the teardown downgraded the unknown outcome")
+        expect(PENDING_ABORT, "the abort latch was cleared by the teardown")
+        expect("timed out" in (PRIMARY[0] if PRIMARY else ""),
+               f"the original timeout was not the primary fault: {PRIMARY}")
+        expect(any("forced teardown" in entry for entry in SECONDARY),
+               f"the teardown failure is not a visible secondary fault: {SECONDARY}")
+        expect(hanging.killed, "the hanging writer was not torn down")
+
+        # A release that fails with nothing unknown in flight stays recoverable.
+        reset()
+        try:
+            release_gated("fixture", FakeChild(returncode=7), "/nonexistent-gate",
+                          "/nonexistent-out", signal=lambda: None)
+        except CaseFailure as failure:
+            expect(not failure.abort, "a plain release failure must stay recoverable")
+            expect("exited 7" in str(failure), f"the release failure lost its exit: {failure}")
+        else:
+            fail("a non-zero release exit was accepted")
+
+        # The same failure after a latched unknown aborts instead.
+        reset()
+        try:
+            try:
+                abort("await_held timed out")
+            finally:
+                release_gated("fixture", FakeChild(returncode=7), "/nonexistent-gate",
+                              "/nonexistent-out", signal=lambda: None)
+        except CaseFailure as failure:
+            expect(failure.abort, "a latched unknown was downgraded by a failed release")
+
+        # Through the real dispatcher: the latched abort keeps every later case
+        # explicitly not run, and the receipt tells the same story.
+        reset()
+        ordered: list[str] = []
+
+        def timed_out(root, subject):
+            ordered.append("a")
+            try:
+                abort("await_held timed out")
+            finally:
+                release_gated("fixture", FakeChild(returncode=7), "/nonexistent",
+                              "/nonexistent", signal=lambda: None)
+
+        stub_cases = [("a_all_recorded_admission_walks_nothing", timed_out)]
+        for name, _ in CASE_FUNCS[1:]:
+            stub_cases.append((name, (lambda label: lambda root, subject: ordered.append(label))(name)))
+        dispatch("stub", "stub", stub_cases, True)
+        states = case_states()
+        expect(ABORTED, "the collection did not abort")
+        expect(ordered == ["a"], f"a case ran after the unknown outcome: {ordered}")
+        expect(states["a_all_recorded_admission_walks_nothing"] == "fail", states)
+        expect(all(states[name] == "not_run_aborted" for name in CASE_NAMES[1:]), states)
+        document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+        expect(document["aborted"] is True, "the receipt hid the abort")
+        expect("timed out" in (document["primary_error"] or ""),
+               f"the receipt lost the original fault: {document['primary_error']}")
 
         # A receipt that cannot fit its bound with the caps applied aborts.
         reset()

@@ -3096,6 +3096,13 @@ impl Store {
             },
             holder: lease_holder,
             budget_bytes: self.budget,
+            // The registered removable volume's free-space reserve, when this
+            // pool is the removable one. It is a reserve/prune signal for an
+            // unknown-size admission, never a pool-budget input.
+            reserve_bytes: crate::removable::registration(self)
+                .ok()
+                .flatten()
+                .map(|registration| registration.reserve_bytes),
             layout: Some(SlotLayout {
                 folders,
                 same_repository,
