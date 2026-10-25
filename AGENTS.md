@@ -81,7 +81,7 @@ Every native-proof authoring or correction brief declares HIGH complexity, appli
 
 There is no product QA selector yet. Use the focused selectors above; they do not replace milestone QA.
 
-For Rust tests and proofs on macOS, validation scratch belongs on the volume the selected pool uses (the Builds drive when present), in a private area outside the pool payload: `scripts/bounded-test.py` now chooses that default itself and warns when it must fall back to `/private/tmp`, so do not hardcode a mount path or guess a private variable. A selector that needs its own root sets `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`, `TEMP` and any proof-specific variable to one fresh canonical short directory there; when no selected volume is available, the same directory under `/private/tmp` is the truthful fallback and the run must say so. The suite checks canonical paths and uses short socket paths, so the default `/var/folders` temp directory never qualifies.
+For Rust tests and proofs on macOS, validation scratch belongs on the volume the selected pool uses (the Builds drive when present), in a private area outside the pool payload: `scripts/bounded-test.py` now chooses that default itself and warns when it must fall back to `/private/tmp`, so do not hardcode a mount path or guess a private variable. Never create scratch at the drive root: on the selected volume it goes under `<mount>/scratch/` (the recipe below shows the mount lookup). A selector that needs its own root sets `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`, `TEMP` and any proof-specific variable to one fresh canonical short directory there; when no selected volume is available, the same directory under `/private/tmp` is the truthful fallback and the run must say so. The suite checks canonical paths and uses short socket paths, so the default `/var/folders` temp directory never qualifies.
 
 The Rust unit suite is the one recipe with an internal root, because it contains macOS fixtures whose premise is the internal boot Data volume rather than the pool's volume. Give the supervisor one fresh private root on the internal volume as `OXIDE_TASK_SCRATCH_ROOT` **and** `OXIDE_TEST_INTERNAL_ROOT`, so those fixtures stay inside the monitored root, and give `TMPDIR`, `TMP` and `TEMP` a separate fresh directory on the selected volume: the product keeps an inherited same-volume `TMPDIR`, so ordinary test temp still lands on the pool volume (its receipt says `temp: inherited <path>`). Both roots are yours to remove afterwards. For example:
 
@@ -89,8 +89,10 @@ The Rust unit suite is the one recipe with an internal root, because it contains
 scratch_base=$(python3 -c 'import importlib.util, os
 spec = importlib.util.spec_from_file_location("bounded_test", "scripts/bounded-test.py")
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-print(module.select_default_parent(os.environ)["root_parent"])')
-oxide_validation_temp=$(mktemp -d "$scratch_base/oxide-validation.XXXXXX")
+facts = module.select_default_parent(os.environ)
+print(os.path.join(facts["mount"], "scratch", "oxide-validation") if facts.get("mount") else facts["root_parent"])')
+mkdir -p "$scratch_base"
+oxide_validation_temp=$(mktemp -d "$scratch_base/run.XXXXXX")
 oxide_internal_scratch=$(mktemp -d /private/tmp/oxide-internal.XXXXXX)
 OXIDE_TASK_SCRATCH_ROOT="$oxide_internal_scratch" \
 OXIDE_TEST_INTERNAL_ROOT="$oxide_internal_scratch" \
