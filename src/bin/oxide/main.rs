@@ -7,6 +7,7 @@
 //! only through the freshness gate. Plain `cargo` behavior is untouched.
 
 mod adopt;
+mod budget;
 mod capacity;
 mod cargo_home;
 mod child_temp;
@@ -54,9 +55,9 @@ const USAGE: &str = "\
 oxide: Cargo with managed build storage and profiles
 
 USAGE:
-    oxide <check|test|clippy|build|run> [--profile quick|debug|release] [cargo args] [-- args]
+    oxide <check|test|clippy|build|run> [budget options] [--profile quick|debug|release] [cargo args] [-- args]
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
-    oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
+    oxide exec [budget options] [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
                                          run a tool that calls Cargo itself, leased
     oxide clean [--dry-run] [--include-foreign]
                                          remove <workspace>/target and slot affinity; slots stay
@@ -75,6 +76,19 @@ USAGE:
     oxide pool describe --json           the registered drive as read-only JSON
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
+
+Budget options (opt-in, leased commands only): --admission-budget <dur> bounds
+everything before a successful primary child start (preparation, slot waits,
+freshness); --execution-budget <dur> bounds compilation, Cargo locks, tests,
+drain and closeout from the observed start, and a bounded `run` keeps one
+cumulative window through build and program. Each is independently optional;
+an omitted axis is unbounded. dur is a positive whole number of
+milliseconds or seconds (30s, 1500ms); minutes and hours are refused.
+An expired admission window starts no child (exit 124); an expired execution
+window stops the owned group with the existing TERM/KILL escalation (exit
+125). --budget-events <fd> writes one bounded JSON record per line to an
+already-nonblocking writable pipe; a lost stream is reported once and a run
+without a complete terminal record is unknown, never a typed success.
 
 Profiles: quick (default, line tables) and debug (full debug info) tune Cargo's
 dev profile, so outputs land in target/debug as with plain Cargo; release is the
@@ -162,6 +176,24 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         _ => {}
     }
     let class = cli::classify(command);
+    // The budget prefix is Oxide's on leased commands only (oxide#140). Any
+    // other class refuses a reserved name by name instead of forwarding it.
+    let leased = matches!(class, Class::Modelled | Class::Building | Class::Exec);
+    if budget::reserved_prefix(rest) && !leased {
+        return Err(
+            "--admission-budget, --execution-budget and --budget-events are for leased commands (check, build, test, clippy, run, doc, bench, exec and external subcommands)"
+                .to_owned(),
+        );
+    }
+    let budgeted = leased && budget::reserved_prefix(rest);
+    if budgeted {
+        // Syntax and descriptor shape first, then the one monotonic owner:
+        // both precede the hand-off check, `run` selection and all other
+        // preparation (oxide#140 freeze 1).
+        let (options, _rest) = budget::scan(rest)?;
+        budget::install(options)?;
+    }
+    budget::refuse_absent_test_hook()?;
     // One pre-effect hand-off check (oxide#122), after help, version, list and
     // toolchain handling and before any arm opens a store. Plain passthrough,
     // usage-only `exec` and `status --launch-check` do no work of their own.
@@ -169,7 +201,7 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         || (class == Class::Exec && !matches!(cli::parse_exec(rest), Ok(Some(_))))
         || (class == Class::Status && matches!(rest, [flag] if flag == "--launch-check"));
     if !no_effect {
-        if let Some(code) = handoff::preflight() {
+        if let Some(code) = handoff::preflight(budgeted) {
             return Ok(code);
         }
     }
@@ -221,31 +253,51 @@ pub(crate) fn apply_storage(
 }
 
 fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
-    let mut invocation = cli::parse_leased(command, args)?;
-    if command == "run" && cli::run_selection(&invocation.cargo_args).is_none() {
-        // Build only what `cargo run` would run: `default-run`, else the
-        // package's only binary.
-        match identity::run_pick(
-            CARGO,
-            invocation.manifest_path.as_deref(),
-            cli::package_selection(args).as_deref(),
-        )? {
-            RunPick::Bin(name) => {
-                invocation
-                    .cargo_args
-                    .splice(1..1, [OsString::from("--bin"), OsString::from(name)]);
-            }
-            RunPick::Ambiguous(names) => {
-                eprintln!(
-                    "error: `cargo run` could not determine which binary to run. Use the `--bin` option to specify a binary, or the `default-run` manifest key.\navailable binaries: {}",
-                    names.join(", ")
-                );
-                return Ok(101);
-            }
-            RunPick::Unresolved => {}
-        }
+    run_invocation(cli::parse_leased(command, args)?)
+}
+
+/// `run` without a `--bin`/`--example` builds only what `cargo run` would run.
+/// This asks Cargo for metadata, so it happens after the budget clock exists
+/// and is bounded by the admission window.
+fn pick_run_target(invocation: &mut Invocation) -> Result<Option<u8>, String> {
+    if invocation.command != "run" || cli::run_selection(&invocation.cargo_args).is_some() {
+        return Ok(None);
     }
-    run_invocation(invocation)
+    match identity::run_pick(
+        CARGO,
+        invocation.manifest_path.as_deref(),
+        invocation.package.as_deref(),
+    )? {
+        RunPick::Bin(name) => {
+            invocation
+                .cargo_args
+                .splice(1..1, [OsString::from("--bin"), OsString::from(name)]);
+            Ok(None)
+        }
+        RunPick::Ambiguous(names) => {
+            eprintln!(
+                "error: `cargo run` could not determine which binary to run. Use the `--bin` option to specify a binary, or the `default-run` manifest key.\navailable binaries: {}",
+                names.join(", ")
+            );
+            Ok(Some(101))
+        }
+        RunPick::Unresolved => Ok(None),
+    }
+}
+
+/// Latch and report an admission-budget stop before any primary child starts.
+fn stop_for_admission() -> u8 {
+    budget::latch(budget::Origin::Admission);
+    budget::report_stop(budget::Origin::Admission);
+    budget::finished(
+        budget::Outcome::AdmissionDeadline,
+        None,
+        None,
+        budget::Drain::NotReached,
+        budget::Lease::Released,
+        124,
+    );
+    124
 }
 
 /// What `oxide status` shows as an exec holder: `exec <program>`, escaped
@@ -300,12 +352,44 @@ fn test_pause_with(point: &str, detail: &str) {
     let _ = (point, detail);
 }
 
-fn run_invocation(invocation: Invocation) -> Result<u8, String> {
+fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
+    // The clock was installed by `run` before the hand-off check; nothing here
+    // may re-arm it (oxide#140).
     let exec = invocation.command == "exec";
     process::install_signal_handlers()?;
-    let internal = Store::open_or_create()?;
+    // A preparation step stopped by the admission window is the admission
+    // deadline (124), never an internal error: the window is what refused it.
+    macro_rules! prep {
+        ($value:expr) => {
+            match $value {
+                Ok(value) => value,
+                Err(error) => {
+                    if budget::admission_expired() {
+                        return Ok(stop_for_admission());
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    }
+    if let Some(code) = prep!(pick_run_target(&mut invocation)) {
+        return Ok(code);
+    }
+    if budget::admission_expired() {
+        return Ok(stop_for_admission());
+    }
+    let internal = prep!(Store::open_or_create());
     let output_control = internal.control().to_path_buf();
-    let checkout = identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())?;
+    if budget::admission_expired() {
+        return Ok(stop_for_admission());
+    }
+    let checkout = prep!(identity::locate_workspace(
+        CARGO,
+        invocation.manifest_path.as_deref()
+    ));
+    if budget::admission_expired() {
+        return Ok(stop_for_admission());
+    }
     // The final-output destination is part of the slot's compatibility
     // identity: a slot's uplifted artifacts belong to one real root. The
     // destination is the one the binding below will select, so the key and the
@@ -314,7 +398,10 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // The intermediate pool is selected first: outputs select the external
     // root only when this command's slot comes from the removable pool, whose
     // watchdog supervises the drive's removal.
-    let selected = removable::select(internal)?;
+    let selected = prep!(removable::select(internal));
+    if budget::admission_expired() {
+        return Ok(stop_for_admission());
+    }
     let selection_mode = selected.mode;
     let fallback_reason = selected.fallback_reason.clone();
     let pool_fallback = (!selected.removable && selection_mode.is_some()).then(|| {
@@ -325,7 +412,10 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // A fresh checkout on the selected permanent drive converts its target
     // before the destination is planned and keyed (oxide#121). Its barrier is
     // released before this command takes a slot.
-    outputs::auto_adopt(&selected.store, &checkout, &selected)?;
+    prep!(outputs::auto_adopt(&selected.store, &checkout, &selected));
+    if budget::admission_expired() {
+        return Ok(stop_for_admission());
+    }
     let store = selected.store;
     // The declaration is pure parsing and is computed BEFORE the reservation:
     // the pre-lease reservation needs the same requested member set binding
@@ -366,28 +456,36 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
     // released again before this command waits for a slot.
-    outputs::reserve(
+    prep!(outputs::reserve(
         &store,
         Some(&output_control),
         &checkout,
         &declaration,
         pool_fallback.as_deref(),
-    )?;
+    ));
     test_pause("reserved");
-    let planned = outputs::planned_destination(
+    if budget::admission_expired() {
+        return Ok(stop_for_admission());
+    }
+    // #133 supplies the profile declaration; #140 keeps the admission window
+    // around the same preparation step.
+    let planned = prep!(outputs::planned_destination(
         Some(&output_control),
         &checkout,
         &declaration,
         pool_fallback.as_deref(),
-    )?;
+    ));
     let destination = outputs::destination_facts(planned.as_ref());
-    let key = SlotKey::resolve_in(
+    let key = prep!(SlotKey::resolve_in(
         &checkout,
         invocation.profile.recipe_key(),
         invocation.target.as_deref(),
         &destination,
-    )?;
+    ));
     test_pause_with("keyed", &destination);
+    if budget::admission_expired() {
+        return Ok(stop_for_admission());
+    }
     if !selected.removable {
         if selection_mode == Some(removable::DriveMode::Permanent) {
             if let Some(reason) = fallback_reason.as_deref() {
@@ -414,7 +512,13 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
         Err(Stop::Cargo(code)) => return Ok(code),
+        Err(Stop::Admission) => return Ok(stop_for_admission()),
     };
+    if budget::admission_expired() {
+        let origin = held.prior.unchanged();
+        store.release(held, origin)?;
+        return Ok(stop_for_admission());
+    }
     if let Some(signal) = process::received_signal() {
         let origin = held.prior.unchanged();
         store.release(held, origin)?;
@@ -439,10 +543,18 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         Err(reason) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
+            if budget::admission_expired() {
+                return Ok(stop_for_admission());
+            }
             return Err(reason);
         }
     };
     test_pause("bound");
+    if budget::admission_expired() {
+        let origin = held.prior.unchanged();
+        store.release(held, origin)?;
+        return Ok(stop_for_admission());
+    }
     for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
     }
@@ -515,6 +627,18 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         cargo.stdout(Stdio::piped());
     }
     waits.print_completion("slot ready");
+    // The last check before the launch attempt: an already-observed expiry
+    // forbids starting a primary child.
+    if budget::admission_expired() {
+        let origin = held.prior.unchanged();
+        store.release(held, origin)?;
+        return Ok(stop_for_admission());
+    }
+    if let Some(delay) = budget::spawn_delay() {
+        // Debug proof control: hold the last admission check open so the
+        // deadline can pass before the launch attempt (the in-flight case).
+        std::thread::sleep(delay);
+    }
     let started_group = store
         .mark_spawning(&held)
         .map_err(Unstarted::Record)
@@ -524,6 +648,14 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         Err(error) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
+            budget::finished(
+                budget::Outcome::SpawnFailure,
+                None,
+                None,
+                budget::Drain::NotReached,
+                budget::Lease::Released,
+                1,
+            );
             return match error {
                 Unstarted::Record(error) => Err(error),
                 Unstarted::Spawn(error) if exec => {
@@ -542,18 +674,31 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             };
         }
     };
+    // The execution window arms once here, at the observed start. A start
+    // after the admission deadline is recorded truthfully and stopped at
+    // once: it never receives a fresh usable interval.
+    let execution_started = Some(Instant::now());
+    budget::arm_execution(
+        execution_started.unwrap(),
+        if exec {
+            budget::Phase::ExecTool
+        } else {
+            budget::Phase::PrimaryCargo
+        },
+    );
+    let mut budget_stop = process::Stop::new();
     let mut watchdog = store.watchdog();
     // The binding mutex is released only once this command is recorded as
     // running, so no peer can repoint the link between the check and Cargo.
     let marked = store.mark_running(&held, group.id);
     drop(binding);
     let outcome = match marked {
-        Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut()),
+        Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut(), &mut budget_stop),
         Ok(()) => match watchdog.as_mut() {
-            Some(watchdog) => {
-                process::wait_leader_watched(&mut group, watchdog).map(|status| (status, None))
-            }
-            None => process::wait_leader(&mut group).map(|status| (Some(status), None)),
+            Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, &mut budget_stop)
+                .map(|status| (status, None, true)),
+            None => process::wait_leader_budgeted(&mut group, &mut budget_stop)
+                .map(|status| (status, None, true)),
         },
         Err(error) => {
             // SAFETY: the negative PID addresses the group this command created.
@@ -567,19 +712,35 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // Release only after positive closure. A watchdog that cannot confirm
     // the stopped group closed leaves the lease held and the record naming
     // the group, so a later command recovers it once the group is empty.
-    let closed = match (watchdog.as_mut(), &outcome) {
-        (Some(_), Ok((None, _))) => None,
-        (Some(watchdog), _) => process::wait_group_empty_watched(group.id, watchdog),
-        (None, _) => {
-            process::wait_group_empty(group.id);
-            Some(Instant::now())
+    let mut closed = match (watchdog.as_mut(), &outcome) {
+        (Some(_), Ok((None, _, _))) => None,
+        (Some(watchdog), _) => {
+            process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
         }
+        (None, _) => process::wait_group_empty_budgeted(group.id, &mut budget_stop),
     };
+    if budget::closure_stuck() {
+        // Debug proof control: report the group and drain as unconfirmed even
+        // though the kernel says otherwise, so the held-custody path is
+        // exercisable without a false custody claim.
+        closed = None;
+    }
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
         report_stop(watchdog, group.id, closed, &store.payload);
     }
     if closed.is_none() {
+        if let Some(origin) = budget::origin() {
+            budget::report_stop(origin);
+        }
+        budget::finished(
+            budget::Outcome::UnconfirmedClosure,
+            outcome.as_ref().ok().and_then(|(status, _, _)| *status),
+            execution_started,
+            budget::Drain::NotReached,
+            budget::Lease::Held,
+            1,
+        );
         if stopped.is_some_and(Watchdog::removal) {
             store.quarantine_lost(
                 &held,
@@ -588,7 +749,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             return Ok(1);
         }
         eprintln!(
-            "oxide: could not confirm Cargo group {} closed after the reserve stop; slot {} stays held, and a later oxide command recovers it once the group is empty",
+            "oxide: could not confirm Cargo group {} closed after the stop; slot {} stays held, and a later oxide command recovers it once the group is empty",
             group.id, held.slot_id
         );
         return Ok(1);
@@ -616,15 +777,27 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // it bound, under the same custody (a relink waits, a clean waits),
     // removal watchdog and positive group closure as Cargo, and the slot is
     // released only once that group is empty.
+    // A bounded `run` keeps the lease through the program with ONE cumulative
+    // execution deadline: no fresh clock at release or program launch. The
+    // unbudgeted path keeps today's release-then-exec hand-off.
+    let bounded_run = run && budget::has_execution();
     let owned_program = match (&outcome, &output_root) {
-        (Ok((Some(status), Some(Ok((program, manifest_dir))))), Some(root))
-            if run && status.success() && stopped.is_none() =>
+        (Ok((Some(status), Some(Ok((program, manifest_dir))), _drained)), root)
+            if run
+                && status.success()
+                && stopped.is_none()
+                && budget::origin().is_none()
+                && (root.is_some() || bounded_run) =>
         {
-            // Only a linked member maps beneath the owned root; a real member
-            // keeps Cargo's own executable path, and the mapped file must be a
-            // real executable before it is run under the held lease.
-            let program = outputs::program_target(&key.checkout, root, &program)
-                .unwrap_or_else(|| program.clone());
+            // #133 maps only a linked member beneath its owned root and
+            // requires the mapped file to be a real executable; #140 keeps the
+            // Cargo path when no root was bound (a bounded run without a
+            // converted checkout).
+            let program = match root {
+                Some(root) => outputs::program_target(&key.checkout, root, &program)
+                    .unwrap_or_else(|| program.clone()),
+                None => program.clone(),
+            };
             Some((program, manifest_dir.clone()))
         }
         _ => None,
@@ -640,6 +813,9 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             note.as_deref(),
             &waits,
         );
+        if let Some(origin) = budget::origin() {
+            budget::report_stop(origin);
+        }
         return run_owned_program(
             &store,
             held,
@@ -647,6 +823,8 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             &program,
             &manifest_dir,
             &invocation.program_args,
+            execution_started,
+            &mut budget_stop,
             &chosen_temp,
         );
     }
@@ -660,7 +838,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // the group is observed empty. A program with no owned directory to
     // protect keeps the plain release-then-exec path.
     let fenced_program = match (&outcome, chosen_temp.owned()) {
-        (Ok((Some(status), Some(Ok((program, manifest_dir))))), Some(_))
+        (Ok((Some(status), Some(Ok((program, manifest_dir))), _drained)), Some(_))
             if run && status.success() && stopped.is_none() =>
         {
             Some((program.clone(), manifest_dir.clone()))
@@ -685,11 +863,13 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             &program,
             &manifest_dir,
             &invocation.program_args,
+            execution_started,
+            &mut budget_stop,
             &chosen_temp,
         );
     }
     store.release(held, origin)?;
-    let (status, executable) = outcome?;
+    let (status, executable, drained) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
     print_summary(
         &store,
@@ -701,6 +881,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         note.as_deref(),
         &waits,
     );
+    let mut retired = false;
     if store.backend == Backend::ApfsVolume {
         match store.last_flush() {
             Some(flush) if flush.slot_id == slot => match flush.micros {
@@ -711,17 +892,54 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
                 None if flush.lost => eprintln!(
                     "oxide: slot {slot} was lost with the removable volume; the next command uses the internal pool until it returns"
                 ),
-                None => eprintln!("oxide: slot {slot} is retired: its flush failed"),
+                None => {
+                    retired = true;
+                    eprintln!("oxide: slot {slot} is retired: its flush failed");
+                }
             },
             _ => {}
         }
     }
+    if let Some(origin) = budget::origin() {
+        budget::report_stop(origin);
+    }
+    budget::finished(
+        if budget::origin() == Some(budget::Origin::Admission) {
+            budget::Outcome::AdmissionDeadline
+        } else if budget::origin() == Some(budget::Origin::Execution) {
+            budget::Outcome::ExecutionDeadline
+        } else if status.code() == Some(0) {
+            budget::Outcome::ChildExit
+        } else if std::os::unix::process::ExitStatusExt::signal(&status).is_some() {
+            budget::Outcome::ChildSignal
+        } else {
+            budget::Outcome::ChildExit
+        },
+        Some(status),
+        execution_started,
+        if drained {
+            budget::Drain::Complete
+        } else {
+            budget::Drain::Gapped
+        },
+        if retired {
+            budget::Lease::Retired
+        } else {
+            budget::Lease::Released
+        },
+        budget::exit_code(process::exit_code(status)),
+    );
     if stopped.is_some() {
         // A reserve stop is an ordinary failed command, never a success.
         return Ok(process::exit_code(status).max(1));
     }
     if !run || !status.success() {
-        return Ok(process::exit_code(status));
+        return Ok(budget::exit_code(process::exit_code(status)));
+    }
+    if budget::has_execution() && budget::origin().is_none() {
+        // A bounded `run` never reaches the release-then-exec hand-off.
+        eprintln!("oxide: error: no bounded run target was recorded");
+        return Ok(101);
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
@@ -749,6 +967,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
 /// the removable pool's removal watchdog polled, and the slot released only
 /// after the group is observed empty. A removal stop whose group cannot be
 /// confirmed closed quarantines the slot as unknown custody.
+#[allow(clippy::too_many_arguments)]
 fn run_owned_program(
     store: &Store,
     held: store::Lease,
@@ -756,6 +975,8 @@ fn run_owned_program(
     program: &Path,
     manifest_dir: &Path,
     args: &[OsString],
+    execution_started: Option<Instant>,
+    budget_stop: &mut process::Stop,
     child_temp: &child_temp::Chosen,
 ) -> Result<u8, String> {
     let mut command = Command::new(program);
@@ -772,6 +993,7 @@ fn run_owned_program(
             return Err(format!("could not execute {}: {error}", program.display()));
         }
     };
+    budget::program_started();
     // Only a removable slot is watched, and only for removal: a program on
     // the internal disk is never stopped for host free space.
     let mut watchdog = match store.backend {
@@ -787,26 +1009,47 @@ fn run_owned_program(
         process::wait_group_empty(group.id);
         drop(foreground);
         store.release(held, None)?;
+        budget::finished(
+            budget::Outcome::InternalError,
+            None,
+            execution_started,
+            budget::Drain::NotReached,
+            budget::Lease::Released,
+            1,
+        );
         return Err(error);
     }
     let status = match watchdog.as_mut() {
-        Some(watchdog) => process::wait_leader_watched(&mut group, watchdog)?,
-        None => Some(process::wait_leader(&mut group)?),
+        Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, budget_stop)?,
+        None => process::wait_leader_budgeted(&mut group, budget_stop)?,
     };
-    let closed = match (watchdog.as_mut(), status) {
+    let mut closed = match (watchdog.as_mut(), status) {
         (Some(_), None) => None,
-        (Some(watchdog), Some(_)) => process::wait_group_empty_watched(group.id, watchdog),
-        (None, _) => {
-            process::wait_group_empty(group.id);
-            Some(Instant::now())
+        (Some(watchdog), Some(_)) => {
+            process::wait_group_empty_watched(group.id, watchdog, budget_stop)
         }
+        (None, _) => process::wait_group_empty_budgeted(group.id, budget_stop),
     };
+    if budget::closure_stuck() {
+        closed = None;
+    }
     drop(foreground);
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
         report_stop(watchdog, group.id, closed, &store.payload);
     }
     if closed.is_none() {
+        if let Some(origin) = budget::origin() {
+            budget::report_stop(origin);
+        }
+        budget::finished(
+            budget::Outcome::UnconfirmedClosure,
+            status,
+            execution_started,
+            budget::Drain::NotReached,
+            budget::Lease::Held,
+            1,
+        );
         store.quarantine_lost(
             &held,
             &format!("run program group {} did not close after KILL", group.id),
@@ -814,8 +1057,29 @@ fn run_owned_program(
         return Ok(1);
     }
     store.release(held, origin)?;
+    if let Some(origin) = budget::origin() {
+        budget::report_stop(origin);
+    }
     let code = status.map_or(1, process::exit_code);
-    Ok(if stopped.is_some() { code.max(1) } else { code })
+    let code = if stopped.is_some() { code.max(1) } else { code };
+    let code = budget::exit_code(code);
+    budget::finished(
+        if budget::origin().is_some() {
+            budget::Outcome::ExecutionDeadline
+        } else if status
+            .is_some_and(|status| std::os::unix::process::ExitStatusExt::signal(&status).is_some())
+        {
+            budget::Outcome::ChildSignal
+        } else {
+            budget::Outcome::ChildExit
+        },
+        status,
+        execution_started,
+        budget::Drain::Complete,
+        budget::Lease::Released,
+        code,
+    );
+    Ok(code)
 }
 
 /// One reserve-stop line, then a read-only capacity diagnostic for the same
@@ -848,6 +1112,8 @@ enum Stop {
     /// The gate's metadata call hit the command's own lock refusal; Cargo's
     /// message is printed and this is its exit code.
     Cargo(u8),
+    /// The admission window closed before a slot was granted (oxide#140).
+    Admission,
 }
 
 /// Lease a slot and run the freshness gate. Cargo never runs on a slot the
@@ -873,6 +1139,7 @@ fn lease_with_gate(
         let mut held = match store.acquire(key, profile, share, label, waits)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
+            Acquired::AdmissionExpired => return Ok(Err(Stop::Admission)),
         };
         let refusal = freshness::prepare(&key.checkout, &held.prior, resolution);
         // Taken just now, or left on this checkout's record by a command
@@ -923,7 +1190,8 @@ fn collect_run(
     group: &mut process::Group,
     invocation: &Invocation,
     mut watchdog: Option<&mut Watchdog>,
-) -> Result<(Option<ExitStatus>, Option<RunTarget>), String> {
+    budget_stop: &mut process::Stop,
+) -> Result<(Option<ExitStatus>, Option<RunTarget>, bool), String> {
     let stdout = group
         .child
         .stdout
@@ -943,13 +1211,13 @@ fn collect_run(
     let mut status = None;
     let mut closed = false;
     while status.is_none() || !closed {
-        process::forward_pending(group.id);
-        if let Some(watchdog) = watchdog.as_deref_mut() {
-            watchdog.poll(group.id);
-            if status.is_none() && watchdog.gave_up() {
-                return Ok((None, None));
-            }
-        }
+        // Freeze A2 item 6 order, with the drain slice first: the line read is
+        // the only wait here, and the leader is harvested immediately after it
+        // and before any latch decision. A child that exited during the slice
+        // is this iteration's natural outcome, never a controlled stop. Once
+        // the child is reaped and its stream settled, the loop ends before the
+        // deadline is even looked at; a still-running leader or an open drain
+        // can still be stopped.
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => {
                 if invocation.json_messages {
@@ -970,7 +1238,25 @@ fn collect_run(
                 .try_wait()
                 .map_err(|error| format!("could not wait for Cargo: {error}"))?;
         }
+        process::forward_pending(group.id);
+        if status.is_some() && closed {
+            // The child exited and its stream settled in this iteration:
+            // nothing is left that a deadline could stop or a signal could end.
+            break;
+        }
+        if budget_stop.poll(group.id) {
+            // A stopped drain is reported as such, never as a settled stream.
+            return Ok((None, None, false));
+        }
+        if let Some(watchdog) = watchdog.as_deref_mut() {
+            watchdog.poll(group.id);
+            if status.is_none() && watchdog.gave_up() {
+                return Ok((None, None, false));
+            }
+        }
     }
+    // The reader reported end-of-file before the loop ended, so joining it is
+    // bounded; a stopped drain returned above without joining.
     let _ = reader.join();
     let _ = std::io::stdout().flush();
     let target = match found.len() {
@@ -987,7 +1273,7 @@ fn collect_run(
             ))
         }
     };
-    Ok((status, Some(target)))
+    Ok((status, Some(target), closed))
 }
 
 /// A bin or example artifact with an executable, matching any selection.
@@ -2167,5 +2453,57 @@ mod tests {
                 assert_eq!(profile.get(name), set(value).as_ref(), "{name}");
             }
         }
+    }
+
+    fn budget_invocation() -> Invocation {
+        Invocation {
+            command: "run".to_owned(),
+            profile: Profile::Quick,
+            cargo_args: Vec::new(),
+            program_args: Vec::new(),
+            json_messages: false,
+            manifest_path: None,
+            target: None,
+            targets: Vec::new(),
+            explicit_profile: false,
+            declared_outputs: Vec::new(),
+            tool: Vec::new(),
+            budget: budget::Options::default(),
+            package: None,
+        }
+    }
+
+    #[test]
+    fn collect_run_reports_a_natural_exit_that_lands_inside_the_drain_slice() {
+        budget::clear();
+        budget::install(budget::Options {
+            admission: None,
+            execution: Some(Duration::from_millis(1)),
+            events: None,
+        })
+        .expect("a budget clock");
+        budget::arm_execution(Instant::now(), budget::Phase::PrimaryCargo);
+        std::thread::sleep(Duration::from_millis(10));
+        // The deadline is already due when the drain starts. The child exits
+        // during the first bounded line-read slice, so only a harvest taken
+        // after that slice (and before any latch) can see the natural exit.
+        // Under an overloaded machine the child may not have exited by then;
+        // the product is then entitled to stop it, so the regression asserts
+        // the invariant exactly where it is observable: a natural exit status
+        // observed with a settled stream must not carry a latched deadline.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]).stdout(Stdio::piped());
+        let mut group = process::start_group(&mut command).expect("a child");
+        let mut stop = process::Stop::new();
+        let (status, _target, drained) =
+            collect_run(&mut group, &budget_invocation(), None, &mut stop).expect("a result");
+        if status.and_then(|status| status.code()) == Some(0) && drained {
+            assert_eq!(
+                budget::origin(),
+                None,
+                "a natural exit observed after the slice must not become a 125 stop"
+            );
+        }
+        budget::clear();
     }
 }

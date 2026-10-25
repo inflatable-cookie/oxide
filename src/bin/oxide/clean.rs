@@ -770,14 +770,17 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
             (Some(store), Some(guard)) => store.clean_running(guard, group.id),
             _ => Ok(()),
         };
+        // `clean` takes no budget options, so its stop object never fires;
+        // the space/volume watchdog remains its only stop source.
+        let mut budget_stop = process::Stop::new();
         let status = match watchdog.as_mut() {
-            Some(watchdog) => {
-                process::wait_leader_watched(&mut group, watchdog).map(|status| status)
-            }
+            Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, &mut budget_stop),
             None => process::wait_leader(&mut group).map(Some),
         };
         let closed = match watchdog.as_mut() {
-            Some(watchdog) => process::wait_group_empty_watched(group.id, watchdog),
+            Some(watchdog) => {
+                process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
+            }
             None => {
                 process::wait_group_empty(group.id);
                 Some(std::time::Instant::now())

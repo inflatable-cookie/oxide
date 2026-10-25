@@ -1,5 +1,6 @@
 //! Command classes, Oxide profiles and argument translation.
 
+use crate::budget;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -168,11 +169,22 @@ pub struct Invocation {
     pub declared_outputs: Vec<String>,
     /// `exec` only: the tool and its arguments, spawned as given.
     pub tool: Vec<OsString>,
+    /// Opt-in per-command admission and execution budgets (oxide#140).
+    pub budget: budget::Options,
+    /// `run` only: the caller's `-p`/`--package` selection, used to pick a
+    /// binary once the budget clock exists.
+    pub package: Option<String>,
 }
 
 pub const EXEC_USAGE: &str = "\
 USAGE:
-    oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
+    oxide exec [--admission-budget <dur>] [--execution-budget <dur>]
+               [--budget-events <fd>] [--manifest-path <Cargo.toml>]
+               [--profile quick|debug|release] -- <command> [args]
+
+A budget is opt-in and independently optional: --admission-budget bounds the
+time before the tool starts, --execution-budget the tool's whole group (its
+own Cargo included), and both remain in force until the command ends.
 
 Runs one tool that calls Cargo itself (a Tauri CLI, an npm or bun script) for
 one Cargo workspace, with Oxide's storage, profile recipe and rustc-wrapper
@@ -191,6 +203,8 @@ setsid escapes Oxide's storage and closure.
 /// Parse `oxide exec`. Oxide's options come before the mandatory `--`; the
 /// command after it is kept exactly. `Ok(None)` asks for help.
 pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
+    let (budget, args) = budget::scan(args)?;
+    let args = &args[..];
     let mut profile = None;
     let mut manifest_path = None;
     let mut declared_outputs = Vec::new();
@@ -273,12 +287,17 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
         explicit_profile: profile.is_some(),
         declared_outputs,
         tool,
+        budget,
+        package: None,
     }))
 }
 
 /// Parse a leased command (`Modelled` or `Building`).
 pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, String> {
+    let (budget, args) = budget::scan(args)?;
+    let args = &args[..];
     refuse_storage_overrides(args)?;
+    let package = package_selection(args);
     let manifest_path = flag_value(args, "--manifest-path").map(PathBuf::from);
     let targets = flag_values(args, "--target");
     let target = targets.first().cloned();
@@ -299,6 +318,8 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
             explicit_profile: false,
             declared_outputs: Vec::new(),
             tool: Vec::new(),
+            budget,
+            package,
         });
     }
 
@@ -397,6 +418,8 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
         explicit_profile: selected.is_some(),
         declared_outputs: Vec::new(),
         tool: Vec::new(),
+        budget,
+        package,
     })
 }
 

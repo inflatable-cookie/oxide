@@ -584,6 +584,8 @@ impl Lease {
 pub enum Acquired {
     Lease(Lease),
     Interrupted(i32),
+    /// The admission window closed while this command was waiting (oxide#140).
+    AdmissionExpired,
 }
 
 /// Exclusive clean of one checkout: no command for it holds or takes a slot
@@ -1617,6 +1619,11 @@ impl Store {
         let max_active = self.max_active;
         let ticket = self.register_ticket()?;
         loop {
+            if crate::budget::admission_expired() {
+                waits.stop(Instant::now());
+                self.remove_ticket(ticket.0)?;
+                return Ok(Acquired::AdmissionExpired);
+            }
             if let Some(signal) = process::received_signal() {
                 waits.stop(Instant::now());
                 self.remove_ticket(ticket.0)?;
@@ -1631,6 +1638,13 @@ impl Store {
                 Ok(Ok(lease)) => {
                     waits.stop(Instant::now());
                     self.remove_ticket(ticket.0)?;
+                    if crate::budget::admission_expired() {
+                        // The window closed while this attempt ran: the lease
+                        // goes straight back and no child starts.
+                        let origin = lease.prior.unchanged();
+                        self.release(lease, origin)?;
+                        return Ok(Acquired::AdmissionExpired);
+                    }
                     return Ok(Acquired::Lease(lease));
                 }
                 Ok(Err(wait)) => {
@@ -2388,7 +2402,7 @@ impl Store {
         let id = identity::digest(&checkout.to_string_lossy());
         let file = private_file(&directory.join(format!("{id}.lock")), true)?
             .ok_or("the checkout binding lock is missing")?;
-        flock(&file, libc::LOCK_EX)?;
+        crate::budget::lock(&file, "checkout binding")?;
         Ok(file)
     }
 
@@ -2463,7 +2477,7 @@ impl Store {
         };
         let file = private_file(&sibling.control.join("admission.lock"), true)?
             .ok_or("the internal admission lock is missing")?;
-        flock(&file, libc::LOCK_EX)?;
+        crate::budget::lock(&file, "internal admission")?;
         Ok(Some(file))
     }
 
@@ -2476,7 +2490,7 @@ impl Store {
         };
         let file = private_file(&sibling.control.join("admission.lock"), true)?
             .ok_or("the internal admission lock is missing")?;
-        flock(&file, libc::LOCK_EX)?;
+        crate::budget::lock(&file, "internal admission")?;
         let cleaning = match self.sibling_state() {
             None => false,
             Some(state) => {
@@ -4076,7 +4090,7 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
             control.join("admission.lock").display()
         ));
     }
-    flock(&file, libc::LOCK_EX)?;
+    crate::budget::lock(&file, "admission")?;
     Ok(file)
 }
 
@@ -4315,6 +4329,26 @@ fn probe_lock(path: &Path, create: bool) -> Result<Probe, String> {
         Ok(Probe::Held)
     } else {
         Err(format!("cannot lock {}: {error}", path.display()))
+    }
+}
+
+/// The existing blocking exclusive `flock`, unchanged for unbudgeted
+/// commands.
+pub(crate) fn flock_blocking(file: &File) -> Result<(), String> {
+    flock(file, libc::LOCK_EX)
+}
+
+/// One nonblocking exclusive `flock` attempt; `true` when the lock was taken.
+pub(crate) fn flock_nonblocking(file: &File) -> Result<bool, String> {
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(format!("cannot lock the control file: {error}"))
     }
 }
 

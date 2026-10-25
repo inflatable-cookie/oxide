@@ -846,6 +846,84 @@ mod tests {
         std::fs::canonicalize(path).unwrap()
     }
 
+    /// A fixture root on the internal boot Data volume, where a mount does not
+    /// set `MNT_IGNORE_OWNERSHIP`. The selected pool's volume does, and the
+    /// product routes a leased child's `TMPDIR` there, so a fixture that needs
+    /// real ownership facts cannot take its root from the test scratch. The
+    /// caller names one fresh private directory on the internal volume in
+    /// `OXIDE_TEST_INTERNAL_ROOT` (AGENTS.md, Rust test recipe); this checks the
+    /// premise instead of assuming it, then makes one unique owner-only
+    /// directory inside it. Dropping it removes only that directory.
+    #[cfg(target_os = "macos")]
+    struct InternalScratch(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl InternalScratch {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for InternalScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn internal_scratch(label: &str) -> InternalScratch {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let named = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT").unwrap_or_else(|| {
+            panic!(
+                "set OXIDE_TEST_INTERNAL_ROOT to a fresh private directory on the internal \
+                 volume before running this test (AGENTS.md, Rust test recipe), for example \
+                 `mktemp -d /private/tmp/oxide-internal.XXXXXX`"
+            )
+        });
+        let base = std::fs::canonicalize(&named).unwrap_or_else(|error| {
+            panic!(
+                "OXIDE_TEST_INTERNAL_ROOT {} is not a usable directory: {error}",
+                Path::new(&named).display()
+            )
+        });
+        let boot = observe_path(Path::new("/System/Volumes/Data")).unwrap();
+        let facts = observe_path(&base).unwrap();
+        assert_eq!(facts.fstype, "apfs", "{} is not APFS", base.display());
+        assert_eq!(
+            (facts.dev, facts.uuid.as_deref()),
+            (boot.dev, boot.uuid.as_deref()),
+            "{} is not on the boot Data volume",
+            base.display()
+        );
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let metadata = std::fs::metadata(&base).unwrap();
+        assert!(metadata.is_dir(), "{} is not a directory", base.display());
+        assert_eq!(
+            metadata.uid(),
+            euid,
+            "{} is not owned by this user",
+            base.display()
+        );
+        assert_eq!(
+            metadata.permissions().mode() & 0o077,
+            0,
+            "{} is not private to this user",
+            base.display()
+        );
+        let path = base.join(format!(
+            "oxide-volume-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        InternalScratch(std::fs::canonicalize(&path).unwrap())
+    }
+
     /// A plain directory standing in for a stale `/Volumes/<name>`: real
     /// kernel facts refuse it and nothing is written into it.
     #[cfg(target_os = "macos")]
@@ -974,15 +1052,15 @@ mod tests {
         );
     }
 
-    /// Real descriptor facts for a scratch directory this user owns: the
-    /// rule accepts an owner-only root and refuses a group-writable one.
-    /// No volume, image or media write is involved.
+    /// Real descriptor facts for an owner-only directory this user owns on the
+    /// internal boot Data volume: the rule accepts that root and refuses it
+    /// once it is group-writable. No volume, image or media write is involved.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_caller_owned_private_root_passes_and_a_writable_one_refuses() {
         use std::os::unix::fs::PermissionsExt;
-        let parent = scratch("root");
-        let root = parent.join("root");
+        let parent = internal_scratch("root");
+        let root = parent.path().join("root");
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let fd = open_dir(None, &root).unwrap();
@@ -996,7 +1074,6 @@ mod tests {
         let facts = observe_root(fd.as_fd_ref()).unwrap();
         let error = judge_root(&root, &facts).unwrap_err();
         assert!(error.contains("group or other write"), "{error}");
-        std::fs::remove_dir_all(parent).unwrap();
     }
 
     fn standard() -> ParentFacts {

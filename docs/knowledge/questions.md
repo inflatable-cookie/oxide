@@ -1,5 +1,21 @@
 # Open questions
 
+## Q-018 — How do per-command admission and execution budgets behave after freeze?
+
+Settled for implementation by Tom's 2026-10-24 decision (oxide#140): the two
+budgets are independently optional (an unset axis stays unbounded), admission
+expiry exits 124 before any primary child and execution expiry exits 125
+through the existing owned-group escalation, the event channel is a
+caller-created already-nonblocking pipe with fail-closed unknown semantics,
+budgeted commands poll the existing nonblocking locks and forgo FIFO fairness,
+and a bounded `run` keeps its lease for one cumulative window through build
+and program. Nested commands never inherit or reset a deadline. Owning
+contract: [workflow](contracts/workflow.md#command-time-budgets-oxide140).
+Still open, not implementation gaps: an inner-deadline inheritance interface,
+and whether a future event transport should carry more than the frozen v1
+start and terminal records.
+
+
 ## Q-001 — What implementation shape best supports durable exclusive ownership?
 
 Pointer, 2026-10-18: the daemon prototype and its protocol were retired ([retirements](retired.toml)). The kept same-user ledger is the [local lease CLI](contracts/local-lease.md); containment findings are in [qualification findings](qualification-readiness.md#process-containment). The text below is the original answer.

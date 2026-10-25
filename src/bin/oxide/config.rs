@@ -1143,11 +1143,12 @@ pub fn exclude_from_backup(pool: &Path) -> Backup {
     if !cfg!(target_os = "macos") {
         return Backup::NotApplicable;
     }
-    let added = std::process::Command::new("/usr/bin/tmutil")
+    let mut command = std::process::Command::new("/usr/bin/tmutil");
+    command
         .arg("addexclusion")
         .arg(pool)
-        .stdin(std::process::Stdio::null())
-        .output();
+        .stdin(std::process::Stdio::null());
+    let added = crate::budget::output(&mut command);
     match added {
         Ok(output) if output.status.success() => backup_state(pool),
         Ok(output) => Backup::NotExcluded(format!(
@@ -1163,11 +1164,12 @@ pub fn backup_state(pool: &Path) -> Backup {
     if !cfg!(target_os = "macos") {
         return Backup::NotApplicable;
     }
-    let checked = std::process::Command::new("/usr/bin/tmutil")
+    let mut command = std::process::Command::new("/usr/bin/tmutil");
+    command
         .arg("isexcluded")
         .arg(pool)
-        .stdin(std::process::Stdio::null())
-        .output();
+        .stdin(std::process::Stdio::null());
+    let checked = crate::budget::output(&mut command);
     match checked {
         Ok(output) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout);
