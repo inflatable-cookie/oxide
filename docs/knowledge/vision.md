@@ -246,25 +246,36 @@ the operating rules.
   closure, and removable media: adds an independent reviewer native session.
 - **Bounds:** wall-clock time and scratch budget. Resource figures are
   reported, not gated.
-- **Proof authoring guidance** (product architect, 2026-10-24): briefs that
-  author or correct a native proof script, its fixtures or its oracles declare
-  **HIGH** complexity. Queue still selects the models. Before a counted native,
-  the author runs the script's safe opt-in diagnostic keep-going mode as an
-  uncounted collection run, using an existing mode or adding one for a new
-  script. Where no safe diagnostic exists, use a documented source
-  premise/oracle sweep against current shipped behaviour instead. Every such
-  brief applies the fixed [proof-authoring premise checklist](contracts/workflow.md#proof-authoring-premise-checklist)
-  to the executable case bodies and helpers, recording each disposition or
-  reason it does not apply (product architect, 2026-10-25).
-  - Record diagnostic failures and dependent or tainted skips honestly;
-    unknown device/writer effects, infrastructure faults and uncertain custody
-    still abort. Keep the default counted path fail-fast and preserve the
-    qualified guard and cleanup bounds.
-  - The collection receipt is diagnostic only, never a counted PASS or closure
-    claim. It still needs its own scoped activation, exact source/input pins,
-    supported route, time and scratch bounds. This guidance grants no native
-    start, extra diagnostic allowance or clock reset. The counted run exercises
-    an already-swept script.
+- **Proof authoring guidance** (product architect, 2026-10-24; diagnostic
+  requirement strengthened 2026-10-25): briefs that author or correct a native
+  proof script, its fixtures or its oracles declare **HIGH** complexity. Queue
+  still selects the models. Before the first counted native, the author must
+  execute a separately activated, **uncounted diagnostic** of the fixed proof.
+  Use its existing safe keep-going mode; if none exists, add a minimal opt-in
+  `--diagnostic` that records oracle failures and continues through
+  dependency-independent safe cases. A source sweep alone no longer satisfies
+  this gate. Apply this before the next counted runs of #136 and #140 and to
+  every future proof.
+  - Keep the counted default fail-fast and preserve the qualified guard,
+    existing wall-clock and scratch bounds, custody and cleanup. Record
+    dependency or taint skips honestly; infrastructure faults, unknown device
+    or writer effects, uncertain custody and an unrecordable receipt abort.
+    Do not invent fixture repair or presume a reaped child proves closure.
+    If no safe diagnostic can fit these constraints, return the concrete
+    design issue to the owner before a counted run.
+  - Every brief also applies the fixed [proof-authoring premise checklist](contracts/workflow.md#proof-authoring-premise-checklist)
+    to the executable case bodies and helpers, recording each disposition or
+    reason it does not apply. This source sweep complements the execution;
+    it does not replace it.
+  - The diagnostic receipt is explicitly uncounted and never a native PASS,
+    closure claim or substitute for the counted proof. It records all reached,
+    completed, failed, skipped and unexecuted cases, reasons and first fault.
+    Its execution needs its own exact source/input pins, supported route,
+    resource basis and fixed activation window. This guidance grants no
+    automatic run, cap increase, clock reset or reuse of a spent allowance.
+    Earlier counted failures remain counted failures, never retrospectively
+    relabelled as diagnostics. Changed proof inputs need the applicable
+    diagnostic and review before their counted activation.
 - **Mechanical native-evidence gates** (Supervisor, 2026-10-23): every Oxide
   brief requiring counted native evidence encodes it in Queue before
   promotion. Use `reviewVerdicts: true` with a `reviewPassGate` subject such

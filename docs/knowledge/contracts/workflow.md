@@ -1289,7 +1289,7 @@ uses this fixed checklist before a counted native (product architect,
 2026-10-25). Record the executable source location and disposition of every
 item, or a concrete reason it does not apply. Check the actual case bodies
 and every child environment; plan text alone is not evidence. This supplements
-the diagnostic-or-source-sweep rule in the [validation policy](../vision.md#validation-policy)
+the required uncounted diagnostic rule in the [validation policy](../vision.md#validation-policy)
 and grants no native start, installation, clock extension or cleanup authority.
 
 1. **Private HOME and rustup.** Capture the invoking `RUSTUP_HOME`, or the
@@ -1331,10 +1331,12 @@ and grants no native start, installation, clock extension or cleanup authority.
    the executable fixture uses it.
 
 A source sweep must trace these premises through each case and its helpers.
-A safe keep-going diagnostic still records failures and dependent skips
-honestly; it does not replace the checklist or turn an unexercised case into
-PASS evidence. Any fixture correction needs the brief's covering checks and
-independent exact-head review before a separately activated counted run.
+It complements the required uncounted diagnostic execution; it cannot replace
+it. If a script lacks a safe keep-going mode, its author adds a minimal opt-in
+`--diagnostic` before the counted run. Record failures and dependent skips
+honestly: an unexercised case is not PASS evidence. Any fixture correction
+needs the brief's covering checks, independent exact-head review and the
+applicable separately activated diagnostic before a counted run.
 
 ## Shared proof supervisor
 
