@@ -412,14 +412,22 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
     let first = first.expect("first slot");
     let first_marker = first.env.cargo_build_build_dir.join("blob");
     fs::write(&first_marker, b"oldest idle slot").expect("oldest payload");
-    let extra = lease_injected(request(
-        &pool,
-        &fx.dir("project-extra"),
-        &workspace,
-        "extra",
-    ))
-    .expect("the 129th slot replaces the oldest idle one");
+    // Every record is current, so the 129th admission is a count replacement
+    // from records only: it walks no inventory at all (oxide#146).
+    let (extra, walks) = crate::inventory::walk_observer::observe(|| {
+        lease_injected(request(
+            &pool,
+            &fx.dir("project-extra"),
+            &workspace,
+            "extra",
+        ))
+    });
+    let extra = extra.expect("the 129th slot replaces the oldest idle one");
     assert!(!extra.reused_slot);
+    assert!(
+        walks.is_empty(),
+        "the count replacement walked inventory: {walks:?}"
+    );
     assert!(!first_marker.exists());
     let status = status_injected(&pool).expect("status");
     assert_eq!(status.slots.len(), super::MAX_SLOTS);
@@ -2288,6 +2296,9 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let path = format!("/{}", "\u{1}".repeat(1023));
     let holder = "\u{1}".repeat(MAX_HOLDER_BYTES);
     let lease_id = "\u{1}".repeat(MAX_LEASE_ID_BYTES);
+    // The worst valid ledger is the version-2 representation: every slot idle
+    // with a closed observation whose generation fence is at its own cap, so
+    // the bound covers the record (oxide#146).
     let mut slots = Vec::new();
     for id in 1..=super::MAX_SLOTS as u64 {
         let digits = id.to_string().len();
@@ -2295,15 +2306,22 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         slots.push(serde_json::json!({
             "id": id,
             "incarnation": id,
-            "state": "held",
+            "state": "idle",
             "project": path,
             "workspace": path,
             "profile": "full-debug",
             "holder": holder,
-            "lease_id": lease_id,
+            "lease_id": null,
             "last_lease_id": lease_id,
             "dir": format!("{}/{leaf}", "a".repeat(80)),
             "rank": 0,
+            "recorded": {
+                "for_lease": lease_id,
+                "unique_bytes": u64::MAX,
+                "logical_bytes": u64::MAX,
+                "entries": u64::MAX,
+                "at_ms": u64::MAX,
+            },
         }));
     }
     let ledger = serde_json::json!({
@@ -2312,7 +2330,7 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         "cap_bytes": 64 * 1024 * 1024,
         "next_slot": 129,
         "next_lease": 1_000_000,
-        "capacity_policy": 1,
+        "capacity_policy": 2,
         "next_rank": 1,
         "slots": slots,
     });
@@ -2358,6 +2376,27 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         fs::read(pool.join("ledger.json")).expect("untouched"),
         bytes,
         "an oversized legacy field was truncated or rewritten"
+    );
+    fs::write(pool.join("ledger.json"), &before).expect("restore");
+
+    // A record whose generation fence is over its cap refuses the revised
+    // write too, with the stored bytes untouched.
+    let before = fs::read(pool.join("ledger.json")).expect("stored ledger");
+    let mut oversized = ledger.clone();
+    let mut slot = ledger["slots"][0].clone();
+    slot["recorded"]["for_lease"] = serde_json::json!("x".repeat(MAX_LEASE_ID_BYTES + 1));
+    oversized["slots"] = serde_json::json!([slot]);
+    oversized["next_slot"] = serde_json::json!(2);
+    let bytes = serde_json::to_vec(&oversized).expect("oversized record ledger");
+    fs::write(pool.join("ledger.json"), &bytes).expect("oversized record field");
+    assert!(matches!(
+        lease_injected(request(&pool, &project, &workspace, "holder")),
+        Err(LeaseError::UnknownAccounting)
+    ));
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("untouched"),
+        bytes,
+        "an oversized record field was truncated or rewritten"
     );
     fs::write(pool.join("ledger.json"), &before).expect("restore");
 }

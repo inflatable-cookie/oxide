@@ -1041,11 +1041,16 @@ Native (`effigy rust:recorded-slot-accounting`, one fixed script
 shared supervisor): tiny private fixtures only, debug staging with
 `debug_assertions` on, private `HOME`/`CARGO_HOME`, explicit `OXIDE_POOL`:
 
-- A: all-recorded admission of a new slot and a count replacement with an empty
-  `OXIDE_TEST_WALK_LOG` and exactly one `OXIDE_TEST_SCOPE_LOG` line per
-  admission (zero payload/slot walks), on a pool whose idle slot is large enough
-  that a walk would be visible, with one legacy and one labelled slot root so
-  both classifier branches are live;
+- A: all-recorded new-slot admission with an empty `OXIDE_TEST_WALK_LOG` and
+  exactly one `OXIDE_TEST_SCOPE_LOG` line (zero payload/slot walks), on a pool
+  whose idle slot is large enough that a walk would be visible. The
+  count-replacement branch of the same `evict_one_idle` / `retire_idle_slot`
+  code is proved by the library regression
+  `pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count`, which now
+  asserts an empty walk log: neither the 128-slot pool ceiling nor the 8-slot
+  project cap has a cheap CLI fixture, and `OXIDE_POOL_CAP` is a byte budget,
+  not a slot count. Byte pressure in the CLI proof comes from that documented
+  budget at pool creation, never from a proof-invented variable;
 - B: one unrecorded idle slot → exactly one slot walk, published, and the
   second admission of the same shape walks nothing;
 - C: release publishes a record and the next reuse clears it, with the result

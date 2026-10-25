@@ -5504,8 +5504,11 @@ mod tests {
     #[test]
     fn worst_escaped_control_state_roundtrips_through_save_and_load() {
         let (root, store, _removable) = paired_controls("control-escaped");
+        // The current representation carries both forward fences, so this is
+        // the worst valid version-5 document and not an owned-outputs-only one.
         let mut state = State {
             owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
             ..State::default()
         };
         for id in 1..=MAX_RECORDS as u64 {
@@ -5666,11 +5669,40 @@ mod tests {
             .fence_owned_outputs()
             .expect("the forward fence saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
+        // The owned-outputs successor alone is version 4: version 5 belongs to
+        // the recorded-accounting fence (oxide#146), not to owned outputs.
+        assert_eq!(stored["version"], serde_json::json!(PREVIOUS_STATE_VERSION));
         assert_eq!(
             stored["owned_outputs"],
             serde_json::json!(OWNED_OUTPUTS_FENCE)
         );
+        // The recorded-accounting fence advances to version 5, and a second
+        // call is idempotent.
+        store
+            .fence_recorded_accounting()
+            .expect("the recorded-accounting fence saves");
+        let fenced: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(fenced["version"], serde_json::json!(STATE_VERSION));
+        assert_eq!(
+            fenced["recorded_accounting"],
+            serde_json::json!(RECORDED_ACCOUNTING_FENCE)
+        );
+        store
+            .fence_recorded_accounting()
+            .expect("a repeated fence is a no-op");
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, fenced, "a repeated fence rewrote the state");
+        // Version 5 without the fence, and an unknown fence, both refuse.
+        let mut unfenced = fenced.clone();
+        unfenced["recorded_accounting"] = serde_json::Value::Null;
+        write_private(&path, &serde_json::to_vec(&unfenced).unwrap());
+        let error = store.load().unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
+        let mut unknown = fenced.clone();
+        unknown["recorded_accounting"] = serde_json::json!("oxide.accounting/9");
+        write_private(&path, &serde_json::to_vec(&unknown).unwrap());
+        let error = store.load().unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 

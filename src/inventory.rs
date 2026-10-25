@@ -1933,6 +1933,65 @@ mod tests {
     /// The debug-only delay action is strictly bounded, scoped, one-shot and
     /// can drive a real walk deadline. It never exists outside debug builds.
     #[test]
+    fn scope_directory_hard_stops_at_named_subtrees_and_counts_everything_else() {
+        // A payload-shaped tree: `slots/` holds one legacy root and one
+        // labelled root, plus out-of-slot metadata, a stray file and a stray
+        // subtree that belongs to no slot. Logical bytes are exact file sizes,
+        // so they are the deterministic oracle here.
+        let fixture = Fixture::new("scope");
+        fixture.file("slots/3/build/blob", 40_000);
+        fixture.file("slots/oxide-ab/quick-7/build/blob", 50_000);
+        fixture.file("slots/.DS_Store", 1_000);
+        fixture.file("slots/stray.bin", 20_000);
+        fixture.file("slots/orphan/nested/blob", 30_000);
+        fixture.file(".DS_Store", 2_000);
+        let outside = 20_000 + 30_000 + 1_000 + 2_000;
+        let inside = 40_000 + 50_000;
+        let stops = [
+            PathBuf::from("slots/3"),
+            PathBuf::from("slots/oxide-ab/quick-7"),
+        ];
+
+        let scoped = scope_directory(fixture.path(), &stops, InventoryLimits::default())
+            .expect("the scope root is a directory");
+        assert!(scoped.coverage.complete, "{:?}", scoped.coverage.gaps);
+        assert_eq!(scoped.stopped, 2, "both stop predicates must be live");
+        assert_eq!(
+            scoped.total.logical_bytes_by_name, outside,
+            "the scope pass did not count exactly the out-of-slot files"
+        );
+        assert_eq!(
+            scoped.total.files, 4,
+            "the scope pass counted stopped content"
+        );
+
+        // Without the stops the same tree counts the slot content too, so the
+        // stop predicate is exactly what makes the two figures a partition.
+        let whole = scope_directory(fixture.path(), &[], InventoryLimits::default())
+            .expect("the scope root is a directory");
+        assert!(whole.coverage.complete);
+        assert_eq!(whole.stopped, 0);
+        assert_eq!(whole.total.logical_bytes_by_name, outside + inside);
+        assert_eq!(
+            whole.total.logical_bytes_by_name - scoped.total.logical_bytes_by_name,
+            inside,
+            "the stopped content is not exactly the difference"
+        );
+
+        // A stop that names a path which is not a directory stops nothing and
+        // changes no figure: it is walked as the ordinary pass walks it.
+        let absent = [PathBuf::from("slots/absent")];
+        let unchanged = scope_directory(fixture.path(), &absent, InventoryLimits::default())
+            .expect("the scope root is a directory");
+        assert!(unchanged.coverage.complete);
+        assert_eq!(unchanged.stopped, 0);
+        assert_eq!(
+            unchanged.total.logical_bytes_by_name,
+            whole.total.logical_bytes_by_name
+        );
+    }
+
+    #[test]
     fn debug_delay_injection_is_bounded_scoped_one_shot_and_reaches_the_deadline() {
         let fixture = Fixture::new("delay");
         fixture.file("debug/deps/pkg.rlib", 10);

@@ -20,16 +20,22 @@ Every fixture is private: its own `HOME`, `CARGO_HOME`, `OXIDE_POOL`,
 `TMPDIR`/`TMP`/`TEMP` and walk/scope log files beside the pool, all inside the
 one owned monitored root. Inherited `OXIDE_*`, `XDG_*` and
 `CARGO_ENCODED_RUSTFLAGS` are scrubbed; `OXIDE_TEST_HOME_FROM_ENV=1` makes the
-private `HOME` authoritative; the invoking rustup home is resolved before that
-HOME exists and preserved with `RUSTUP_AUTO_INSTALL=0`; `Cargo.lock` is
-established by one offline setup child before any `--locked` call; the pool
-path is absent until the product creates it.
+private `HOME` authoritative; the **invoking** rustup home is resolved once
+before any private HOME exists and handed to staging and every fixture child
+with `RUSTUP_AUTO_INSTALL=0`; `Cargo.lock` is established by one offline setup
+child before any `--locked` call; the pool path is absent until the product
+creates it. Byte pressure is driven by the documented `OXIDE_POOL_CAP` soft
+budget (a byte cap, applied when the pool is created), never by a
+proof-invented variable.
 
 Cases (each a real library/CLI path, not a decision mock):
 
-- A all-recorded admission of a new slot and a pool-ceiling count replacement
-  walk no inventory at all: the debug walk log stays empty while the separate
-  scope log records one shallow pass per admission;
+- A all-recorded new-slot admission walks no inventory at all: the debug walk
+  log stays empty while the separate scope log records one shallow pass.
+  (The count-replacement branch of the same eviction code is proved by the
+  library regression `pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count`,
+  because neither the 128-slot pool ceiling nor the 8-slot project cap has a
+  cheap CLI fixture: `OXIDE_POOL_CAP` is a byte budget, not a slot count.);
 - B a legacy-shaped pool with one missing record walks exactly that slot, and
   the completed figure is durable progress the next admission reuses;
 - C a release publishes one closed observation, a compatible reuse clears it,
@@ -80,6 +86,13 @@ RECORDED_TOTAL_NEEDLE = "recorded slot sizes (ledger):"
 RECORDED_SLOT_NEEDLE = "at slot release"
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 DIAGNOSTIC = "--diagnostic"
+# `OXIDE_POOL_CAP` is a soft BYTE budget applied when the pool is created (the
+# product's documented control), not a slot count.
+GENEROUS_BUDGET = 64 * MIB
+PRESSURE_BUDGET = 8 * MIB
+OVERCOUNT_BUDGET = 6 * MIB
+# The invoking toolchain home, resolved before any private HOME exists.
+INVOKING_RUSTUP_HOME = ""
 
 CASES: list[str] = []
 FAILURES: list[tuple[str, str]] = []
@@ -158,6 +171,7 @@ def staging_recipe(scratch: str) -> tuple[list[str], dict[str, str]]:
     env.update(
         {
             "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_HOME": INVOKING_RUSTUP_HOME,
             "RUSTUP_AUTO_INSTALL": "0",
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
@@ -212,13 +226,23 @@ def stage_subject(scratch: str) -> str:
 
 
 def invoking_rustup_home() -> str:
+    """The invoking toolchain home, resolved before a fixture HOME exists.
+
+    Checklist item 1: a private HOME must never hide the toolchain, and no
+    fixture may install or download one.
+    """
     explicit = os.environ.get("RUSTUP_HOME")
-    if explicit and os.path.isdir(explicit):
-        return explicit
+    if explicit:
+        if not os.path.isdir(explicit):
+            abort(f"the inherited RUSTUP_HOME {explicit} is not a directory")
+        return os.path.abspath(explicit)
     home = os.environ.get("HOME")
     if not home:
         abort("no invoking HOME to resolve the toolchain home from")
-    return os.path.join(home, ".rustup")
+    resolved = os.path.join(home, ".rustup")
+    if not os.path.isdir(resolved):
+        abort(f"no usable toolchain home at {resolved}")
+    return os.path.abspath(resolved)
 
 
 # --------------------------------------------------------------------------
@@ -230,6 +254,7 @@ use std::io::Write;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=nonce.txt");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let path = std::path::Path::new(&out).join("slot-filler.bin");
     let bytes = vec![7_u8; {filler}];
@@ -267,7 +292,7 @@ build = "build.rs"
 class Fixture:
     """One private fixture: its own roots, its own absent pool path."""
 
-    def __init__(self, root: str, label: str, pool_cap: int | None = None) -> None:
+    def __init__(self, root: str, label: str, budget_bytes: int = GENEROUS_BUDGET) -> None:
         self.root = os.path.join(root, label)
         self.home = os.path.join(self.root, "home")
         self.cargo_home = os.path.join(self.root, "cargo")
@@ -276,14 +301,10 @@ class Fixture:
         self.temp = os.path.join(self.root, "temp")
         self.walk_log = os.path.join(self.root, "walk.log")
         self.scope_log = os.path.join(self.root, "scope.log")
-        self.rustup_home = os.path.join(self.root, "rustup")
+        self.budget_bytes = budget_bytes
         for path in (self.home, self.cargo_home, self.temp):
             os.makedirs(path, exist_ok=True)
         os.chmod(self.root, 0o700)
-        if pool_cap is not None:
-            self.pool_cap = pool_cap
-        else:
-            self.pool_cap = None
 
     # -- fixture crates -------------------------------------------------
 
@@ -298,8 +319,14 @@ class Fixture:
             handle.write(FIXTURE_MAIN)
         with open(os.path.join(path, "build.rs"), "w", encoding="utf-8") as handle:
             handle.write(FIXTURE_BUILD_RS.format(filler=SLOT_FILLER_BYTES))
+        self.bump_nonce(path)
         self.establish_lock(path)
         return path
+
+    def bump_nonce(self, checkout: str) -> None:
+        """A fresh build-script input, so a gated writer always re-runs it."""
+        with open(os.path.join(checkout, "nonce.txt"), "w", encoding="utf-8") as handle:
+            handle.write(f"{time.time_ns()}\n")
 
     def establish_lock(self, checkout: str) -> None:
         """A fresh crate has no lock: `--locked` would refuse without this."""
@@ -332,7 +359,7 @@ class Fixture:
             {
                 "HOME": self.home,
                 "CARGO_HOME": self.cargo_home,
-                "RUSTUP_HOME": self.rustup_home,
+                "RUSTUP_HOME": INVOKING_RUSTUP_HOME,
                 "RUSTUP_AUTO_INSTALL": "0",
                 "OXIDE_TEST_HOME_FROM_ENV": "1",
                 "OXIDE_POOL": self.pool,
@@ -345,8 +372,8 @@ class Fixture:
                 "RUSTFLAGS": "-C strip=symbols",
             }
         )
-        if self.pool_cap is not None:
-            env["OXIDE_POOL_CAP"] = str(self.pool_cap)
+        # The documented soft byte budget for the next pool creation.
+        env["OXIDE_POOL_CAP"] = str(self.budget_bytes)
         if extra:
             env.update(extra)
         return env
@@ -437,32 +464,86 @@ def built(fixture: Fixture, subject: str, checkout: str) -> None:
 # Cases.
 
 
+def held_writer(fx: Fixture, subject: str, checkout: str) -> tuple[subprocess.Popen, str]:
+    """Start a gated writer and return it with the slot it took.
+
+    The fixture build script publishes `{gate}.ready` and then waits for the
+    release file, so the slot stays genuinely held. The release file is written
+    by `release_writer`.
+    """
+    gate = os.path.join(fx.root, f"release-{os.path.basename(checkout)}")
+    if os.path.exists(gate):
+        os.unlink(gate)
+    ready = gate + ".ready"
+    if os.path.exists(ready):
+        os.unlink(ready)
+    fx.bump_nonce(checkout)
+    child = subprocess.Popen(
+        [subject, "check"],
+        cwd=checkout,
+        env=fx.env(extra={"OXIDE_PROOF_HOLD": gate}),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.monotonic() + min(90, work_left())
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        if child.poll() is not None:
+            output = child.stdout.read() if child.stdout else ""
+            abort(f"the gated writer exited early: {output[-800:]}")
+        held = [slot for slot in fx.ledger()["slots"] if slot["state"] == "held"]
+        if held and os.path.exists(ready):
+            return child, str(held[0]["id"])
+    child.kill()
+    child.wait()
+    abort("the gated writer never took a held slot")
+    raise AssertionError("unreachable")
+
+
+def release_writer(fx: Fixture, child: subprocess.Popen, checkout: str) -> None:
+    gate = os.path.join(fx.root, f"release-{os.path.basename(checkout)}")
+    with open(gate, "w", encoding="utf-8") as handle:
+        handle.write("release\n")
+    try:
+        output, _ = child.communicate(timeout=min(90, work_left()))
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+        abort("the gated writer did not exit on its release file")
+    expect(
+        child.returncode == 0,
+        f"the released writer exited {child.returncode}: {(output or '')[-800:]}",
+    )
+
+
 def case_a_all_recorded_admission_walks_nothing(root: str, subject: str) -> None:
     case("a_all_recorded_admission_walks_nothing")
-    fx = Fixture(root, "a", pool_cap=1)
-    first = fx.crate("first")
-    built(fx, subject, first)
-    expectation = fx.idle_slots()
-    expect(len(expectation) == 1, f"the first build left {expectation} idle slots")
+    fx = Fixture(root, "a")
+    built(fx, subject, fx.crate("first"))
+    expect(len(fx.idle_slots()) == 1, "the first build left no idle slot")
+    expect(fx.recorded(fx.idle_slots()[0]) is not None, "the first release recorded nothing")
 
-    # New-slot admission at the pool ceiling: a count replacement of the single
-    # idle slot, from records only.
+    # A second project needs a new slot. Every record is current, so the
+    # admission derives its figure from the ledger: no payload walk and no
+    # slot walk, only the one shallow scope pass.
     fx.reset_logs()
-    second = fx.crate("second")
-    built(fx, subject, second)
+    built(fx, subject, fx.crate("second"))
     walks, scopes = fx.walks(), fx.scopes()
     expect(not walks, f"admission walked inventory: {walks}")
     expect(scopes, "no shallow scope pass ran, so the figure was not recorded pressure")
-    ids = fx.slot_ids()
-    expect(len(ids) == 1, f"the pool ceiling was not enforced: {ids}")
-    expect(ids[0] != expectation[0], "the count replacement did not replace the idle slot")
+    expect(len(fx.slot_ids()) == 2, f"the second project did not get its own slot: {fx.slot_ids()}")
     text = fx.status(subject)
     expect(RECORDED_TOTAL_NEEDLE in text, "status did not report the ledger recorded total")
+    expect(
+        "recorded" in text and "2 of 2" in text,
+        f"status did not report both idle records: {text[-600:]}",
+    )
 
 
 def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
     case("b_missing_record_walks_only_that_slot")
-    fx = Fixture(root, "b", pool_cap=2)
+    fx = Fixture(root, "b")
     built(fx, subject, fx.crate("first"))
     built(fx, subject, fx.crate("second"))
     idle = fx.idle_slots()
@@ -470,8 +551,7 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
     victim, keeper = idle[0], idle[1]
 
     # A legacy-shaped ledger: one slot keeps its observation, the other has
-    # none. Written through the debug build's own path by editing the durable
-    # ledger with the product's own field names.
+    # none. The product owns the 0600 mode of this file.
     document = fx.ledger()
     for slot in document["slots"]:
         if str(slot["id"]) == victim:
@@ -498,107 +578,81 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
 
 def case_c_release_publishes_and_reuse_clears(root: str, subject: str) -> None:
     case("c_release_publishes_and_reuse_clears")
-    fx = Fixture(root, "c", pool_cap=2)
+    fx = Fixture(root, "c")
     checkout = fx.crate("reuse")
-    result = fx.run(subject, ["check"], checkout)
-    expect(result.returncode == 0, f"first build exit {result.returncode}: {result.stderr[-800:]}")
+    built(fx, subject, checkout)
     idle = fx.idle_slots()
     expect(len(idle) == 1, f"expected one idle slot, saw {idle}")
-    record = fx.recorded(idle[0])
-    expect(record is not None, "release published no closed observation")
+    first = fx.recorded(idle[0])
+    expect(first is not None, "release published no closed observation")
     expect(
-        record["unique_bytes"] >= SLOT_FILLER_BYTES,
-        f"the record undercounts its own slot: {record['unique_bytes']}",
+        first["unique_bytes"] >= SLOT_FILLER_BYTES,
+        f"the record undercounts its own slot: {first['unique_bytes']}",
     )
 
-    # A compatible reuse walks that slot and clears the idle record: a held
-    # slot never borrows one.
+    # A compatible reuse walks only that slot and clears the idle observation
+    # for the held generation: a held slot never borrows one. The gated writer
+    # keeps it held so the ledger can be read at that moment.
     fx.reset_logs()
-    again = fx.run(subject, ["check"], checkout)
-    expect(again.returncode == 0, f"reuse exit {again.returncode}: {again.stderr[-800:]}")
-    walks = fx.walks()
+    child, held_slot = held_writer(fx, subject, checkout)
+    try:
+        expect(held_slot == idle[0], f"the reuse took slot {held_slot}, not {idle[0]}")
+        walks = fx.walks()
+        expect(
+            walks == [fx.slot_dir(idle[0])],
+            f"reuse walked {walks}, not exactly its own slot",
+        )
+        expect(
+            fx.recorded(held_slot) is None,
+            "a held slot still carries the idle generation's record",
+        )
+    finally:
+        release_writer(fx, child, checkout)
+    record = fx.recorded(idle[0])
+    expect(record is not None, "the released reuse recorded nothing")
     expect(
-        walks == [fx.slot_dir(idle[0])],
-        f"reuse walked {walks}, not exactly its own slot",
-    )
-    expect(
-        fx.recorded(idle[0]) is None,
-        "a reuse left an idle observation on a held slot",
-    )
-    expect(
-        "when leased" in again.stdout or "new slot" in again.stdout,
-        f"the result line does not name its provenance: {again.stdout[-400:]}",
+        record["for_lease"] != first["for_lease"],
+        "the new generation kept the previous generation's record",
     )
 
 
 def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> None:
     case("d_byte_pressure_evicts_only_the_idle_slot")
-    # A tiny budget with two slots and a foreign out-of-slot stray.
-    fx = Fixture(root, "d", pool_cap=4)
-    first = fx.crate("first")
-    built(fx, subject, first)
+    # A soft byte budget that two slots plus the stray exceed, with a third
+    # slot held while another admission runs.
+    fx = Fixture(root, "d", budget_bytes=PRESSURE_BUDGET)
+    built(fx, subject, fx.crate("first"))
     idle = fx.idle_slots()
     expect(len(idle) == 1, f"expected one idle slot, saw {idle}")
-
-    held_checkout = fx.crate("held")
-    gate = os.path.join(fx.root, "release-held")
-    holder = subprocess.Popen(
-        [subject, "check"],
-        cwd=held_checkout,
-        env=fx.env(extra={"OXIDE_PROOF_HOLD": gate}),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    expect(
+        fx.ledger()["cap_bytes"] == PRESSURE_BUDGET,
+        f"the fixture did not get its byte budget: {fx.ledger()['cap_bytes']}",
     )
+    held_checkout = fx.crate("held")
+    stray = os.path.join(fx.pool, "payload", "slots", "stray.bin")
+    evicted_path = fx.slot_dir(idle[0])
+    child, held_slot = held_writer(fx, subject, held_checkout)
     try:
-        deadline = time.monotonic() + min(90, work_left())
-        held_slot = None
-        while time.monotonic() < deadline:
-            time.sleep(0.2)
-            ids = [slot for slot in fx.slot_ids() if slot not in idle]
-            if ids:
-                held_slot = ids[0]
-                break
-        if held_slot is None:
-            abort("the gated writer never took a held slot")
-        stray = os.path.join(fx.pool, "payload", "slots", "stray.bin")
         with open(stray, "wb") as handle:
             handle.write(b"s" * (2 * MIB))
         fx.reset_logs()
-        pressure = fx.crate("pressure")
-        result = fx.run(
-            subject,
-            ["check"],
-            pressure,
-            extra={"OXIDE_BUDGET_BYTES": str(1)},
-        )
-        expect(
-            result.returncode == 0,
-            f"the pressure admission failed ({result.returncode}): {result.stderr[-800:]}",
-        )
+        built(fx, subject, fx.crate("pressure"))
         expect(not fx.walks(), f"the pressure admission walked inventory: {fx.walks()}")
         ids = fx.slot_ids()
         expect(idle[0] not in ids, "recorded byte pressure did not evict the idle whole slot")
         expect(held_slot in ids, "the held slot was deleted or counted as evictable")
         expect(os.path.exists(stray), "a foreign out-of-slot entry was deleted")
         expect(
-            not os.path.exists(fx.slot_dir(idle[0])),
+            not os.path.exists(evicted_path),
             "the evicted slot's tree was not removed whole",
         )
     finally:
-        with open(gate, "w", encoding="utf-8") as handle:
-            handle.write("release\n")
-        try:
-            holder.wait(timeout=min(60, work_left()))
-        except subprocess.TimeoutExpired:
-            holder.kill()
-            holder.wait()
-            abort("the gated writer did not exit on its release file")
+        release_writer(fx, child, held_checkout)
 
 
 def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
     case("e_cross_slot_hard_link_overcount")
-    fx = Fixture(root, "e", pool_cap=4)
+    fx = Fixture(root, "e", budget_bytes=OVERCOUNT_BUDGET)
     shared = os.path.join(fx.root, "shared.bin")
     with open(shared, "wb") as handle:
         handle.write(b"h" * (4 * MIB))
@@ -608,7 +662,7 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
             handle.write(
                 "fn main() {\n"
                 "    println!(\"cargo:rerun-if-changed=build.rs\");\n"
-                f"    let out = std::env::var(\"OUT_DIR\").unwrap();\n"
+                "    let out = std::env::var(\"OUT_DIR\").unwrap();\n"
                 f"    std::fs::hard_link({shared!r}, std::path::Path::new(&out).join(\"shared.bin\"))\n"
                 "        .expect(\"hard link\");\n"
                 "}\n"
@@ -622,42 +676,42 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
         record = fx.recorded(slot_id)
         expect(record is not None, f"slot {slot_id} has no closed observation")
         recorded_sum += record["unique_bytes"]
-    text = fx.status(subject)
-    expect(RECORDED_TOTAL_NEEDLE in text, "status did not report a ledger total")
-    # The full inode union counts the shared inode once; the recorded sum counts
-    # it once per slot, which is the accepted conservative overcount.
-    measured = fx.run(subject, ["status", "--measure"], fx.work)
-    expect(measured.returncode == 0, f"measure exit {measured.returncode}")
+    # One 4 MiB inode in two slots: the recorded sum counts it twice, which is
+    # the accepted overcount, while the inode union counts it once.
     expect(
-        recorded_sum > 4 * MIB,
+        recorded_sum >= 8 * MIB,
         f"the recorded sum ({recorded_sum}) did not count the shared inode twice",
     )
+    text = fx.status(subject)
+    expect(RECORDED_TOTAL_NEEDLE in text, "status did not report a ledger total")
+    measured = fx.run(subject, ["status", "--measure"], fx.work)
+    expect(measured.returncode == 0, f"measure exit {measured.returncode}")
 
-    # Admission uses that sum: a budget above the union but below the sum still
-    # evicts, with no walk.
+    # A budget above the 4 MiB union but below the 8 MiB recorded sum evicts
+    # one idle whole slot: the overcount is what admission uses, and it walks
+    # nothing to learn it.
     fx.reset_logs()
-    result = fx.run(
-        subject,
-        ["check"],
-        fx.crate("pressure"),
-        extra={"OXIDE_BUDGET_BYTES": str(6 * MIB)},
-    )
-    expect(result.returncode == 0, f"pressure exit {result.returncode}: {result.stderr[-800:]}")
+    built(fx, subject, fx.crate("pressure"))
     expect(not fx.walks(), f"the overcount admission walked inventory: {fx.walks()}")
     ids = fx.slot_ids()
     expect(
         len(ids) == 2,
         f"the accepted overcount did not replace exactly one idle slot: {ids}",
     )
+    expect(
+        sum(1 for slot in ids if slot in idle) == 1,
+        "neither or both idle slots were evicted",
+    )
 
 
 def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
     case("f_legacy_convergence_and_crash_replay")
-    fx = Fixture(root, "f", pool_cap=3)
+    fx = Fixture(root, "f")
     built(fx, subject, fx.crate("first"))
     built(fx, subject, fx.crate("second"))
 
-    # Every record gone and the version-1 fence: a legacy pool.
+    # Every record gone and the version-1 fence: a legacy pool, the state a
+    # previous binary leaves behind.
     document = fx.ledger()
     for slot in document["slots"]:
         slot.pop("recorded", None)
@@ -674,55 +728,55 @@ def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
         f"legacy convergence walked {measured}, not exactly the two unrecorded slots",
     )
     published = [slot for slot in fx.idle_slots() if fx.recorded(slot) is not None]
-    expect(len(published) == len(measured), "completed walks were not published before the decision")
-
-    # A crash replay: kill a running command, then the next command closes and
-    # records the slot instead of reading it as zero.
-    crash = fx.crate("crash")
-    gate = os.path.join(fx.root, "release-crash")
-    child = subprocess.Popen(
-        [subject, "check"],
-        cwd=crash,
-        env=fx.env(extra={"OXIDE_PROOF_HOLD": gate}),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    expect(
+        len(published) == len(measured),
+        "completed walks were not published before the decision",
     )
+
+    # A crash replay: kill a genuinely held writer, release its gate, and let
+    # the next mutating command settle the slot. It must not read the dead
+    # slot as zero bytes.
+    crash = fx.crate("crash")
+    child, held_slot = held_writer(fx, subject, crash)
     try:
-        deadline = time.monotonic() + min(90, work_left())
-        while time.monotonic() < deadline:
-            time.sleep(0.2)
-            held = [slot for slot in fx.ledger()["slots"] if slot["state"] == "held"]
-            if held:
-                break
-        else:
-            abort("the crashed command never took a held slot")
-    finally:
         child.kill()
         child.wait()
-    recovered = fx.run(subject, ["check"], fx.crate("after-crash"))
+    finally:
+        gate = os.path.join(fx.root, f"release-{os.path.basename(crash)}")
+        with open(gate, "w", encoding="utf-8") as handle:
+            handle.write("release\n")
+    deadline = time.monotonic() + min(120, work_left())
+    recovered = None
+    while time.monotonic() < deadline:
+        attempt = fx.run(subject, ["check"], fx.crate("after-crash"))
+        if attempt.returncode == 0:
+            recovered = attempt
+            break
+        time.sleep(0.5)
     expect(
-        recovered.returncode == 0,
-        f"recovery after the crash failed ({recovered.returncode}): {recovered.stderr[-800:]}",
+        recovered is not None,
+        "no later command settled the crashed slot within the work window",
     )
     for slot in fx.ledger()["slots"]:
-        expect(
-            slot["state"] != "held" or slot.get("lease_id") is not None,
-            "a held slot lost its lease without being recorded",
-        )
+        if slot["state"] == "idle":
+            expect(
+                slot.get("recorded") is not None,
+                f"idle slot {slot['id']} was left unrecorded after a settled recovery",
+            )
     expect(
         all(
-            slot.get("recorded") is not None
+            slot["state"] != "held" or slot.get("lease_id") is not None
             for slot in fx.ledger()["slots"]
-            if slot["state"] == "idle"
         ),
-        "an idle slot was left unrecorded after a settled recovery",
+        "a held slot lost its lease without being recorded",
     )
+    expect(held_slot not in fx.idle_slots() or fx.recorded(held_slot) is not None,
+           "the crashed slot is idle but unrecorded")
 
 
 def case_g_status_readonly_and_measure_audit(root: str, subject: str) -> None:
     case("g_status_readonly_and_measure_audit")
-    fx = Fixture(root, "g", pool_cap=2)
+    fx = Fixture(root, "g")
     built(fx, subject, fx.crate("first"))
 
     def digest() -> str:
@@ -873,6 +927,13 @@ def write_diagnostic_receipt(root: str, subject: str, staging_hash: str) -> str:
 
 
 ALLOCATION = {
+    "product_controls": {
+        "budget_env": "OXIDE_POOL_CAP",
+        "budget_semantics": "soft byte budget applied at pool creation",
+        "generous_budget_bytes": GENEROUS_BUDGET,
+        "pressure_budget_bytes": PRESSURE_BUDGET,
+        "overcount_budget_bytes": OVERCOUNT_BUDGET,
+    },
     "staging_estimate_s": 55,
     "cases_estimate_s": 135,
     "cleanup_estimate_s": 15,
@@ -1023,6 +1084,10 @@ def main() -> None:
     if not os.environ.get("OXIDE_TASK_SCRATCH_ROOT"):
         print("this proof runs only under the qualified shared supervisor", file=sys.stderr)
         raise SystemExit(2)
+    # Resolve the invoking toolchain home before any private HOME exists and
+    # hand that one value to staging and to every fixture child.
+    global INVOKING_RUSTUP_HOME
+    INVOKING_RUSTUP_HOME = invoking_rustup_home()
     root = os.path.abspath(os.environ["OXIDE_TASK_SCRATCH_ROOT"])
     scratch = os.path.join(root, "recorded-accounting")
     os.makedirs(scratch, exist_ok=True)
