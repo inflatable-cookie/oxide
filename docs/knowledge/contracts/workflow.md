@@ -1374,14 +1374,15 @@ identity lines.
   after the shared-budget correction). It is not a
   benchmark or an alias for full QA.
 
-### Temporary scratch placement (approved, not implemented)
+### Temporary scratch placement
 
 Tom, 2026-10-25: "Test and proof temp folders definitely should move to the
 drive." This is direction for two separate Oxide facilities; it is not current
 behaviour or measured SSD-write savings. Effigy owns its own test/run temp
 placement and retention; Oxide changes no consumer or daemon configuration.
 
-- **Oxide children.** The selected pool's actual volume decides temp placement
+- **Oxide children: implemented** ([contract](#child-temporary-files-oxide136)).
+  The selected pool's actual volume decides temp placement
   for Cargo and its tests/build scripts, run programs, modelled external
   subcommands and `oxide exec` tools. The product architect's same-day interface
   ruling keeps an inherited `TMPDIR` only if it resolves canonically to an
@@ -1395,7 +1396,8 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   the selected volume use owned temp too. Absent drive selection falls back
   internally without recreating a mount point. Bounded escaped summary/status
   labels distinguish `temp: inherited <path>` and `temp: oxide <path>`.
-- **Proof and validation tooling.** The shared supervisor's default root parent
+- **Proof and validation tooling: approved, not implemented.** The shared
+  supervisor's default root parent
   and documented validation scratch move to a private scratch area on the
   selected pool's volume, outside its managed payload. Reserve sampling uses
   the volume actually holding scratch. `/private/tmp` is the warned fallback.
