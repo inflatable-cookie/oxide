@@ -77,8 +77,8 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 240  # 200 pure + 40 real (oxide#151 added the routing, marker,
-                      # nested-window protection and bounded-sweep cases)
+EXPECTED_CASES = 242  # 202 pure + 40 real (oxide#151 added the routing, marker,
+                      # nested-window protection, bounded-sweep and qualify-entry cases)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -720,21 +720,23 @@ def qualify():
     env = {k: v for k, v in os.environ.items() if k not in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_SUPERVISOR_INJECT")}
     env["OXIDE_SUPERVISOR_CASES"] = os.path.join(base, "cases.json")
     env["OXIDE_SUPERVISOR_LAYOUT"] = os.path.join(base, "topology.json")
-    candidate = subprocess.Popen(
+    # The Popen handle is a local: its name must not shadow the module-level
+    # `candidate()` loader resolved above (diagnostic2 UnboundLocalError).
+    candidate_process = subprocess.Popen(
         [sys.executable, SOURCES["supervisor"], "--limit", str(CANDIDATE_LIMIT), "--scratch-budget-mib", "512",
          "--", sys.executable, SOURCES["suite"]], env=env)
     problems = []
     # Reaped only by `hold`, never by Popen, so the candidate stays pinned.
-    status = hold(candidate.pid, DEADLINE - 15 * NS, forward)
+    status = hold(candidate_process.pid, DEADLINE - 15 * NS, forward)
     if status is None:
         problems.append("candidate overran the bootstrap deadline")
         for number in (signal.SIGTERM, signal.SIGKILL):  # our own unreaped child only
             forward.append(number)
-            status = hold(candidate.pid, now_ns() + 3 * NS, forward)
+            status = hold(candidate_process.pid, now_ns() + 3 * NS, forward)
             if status is not None:
                 break
     code = None if status is None else code_of(status)
-    candidate.returncode = code
+    candidate_process.returncode = code
     if code != 0:
         problems.append(f"candidate exit {code}")
     closing = reserve_readings(expected["root_parent"], "/private/tmp", facts)

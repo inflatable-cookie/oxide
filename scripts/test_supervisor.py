@@ -21,8 +21,12 @@ UNCLOSED case's live fixtures and receipts are kept for the owner.
 """
 from __future__ import annotations
 
+import ast
+import contextlib
 import errno
 import importlib.util
+import inspect
+import io
 import json
 import os
 import secrets
@@ -34,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import textwrap
 import types
 import unittest
 from contextlib import contextmanager
@@ -3120,6 +3125,141 @@ class TopologyFacts:
             return json.load(handle)
 
 
+class QualifyEntry(unittest.TestCase):
+    """The bootstrap's `qualify()` entry seam (oxide#151 diagnostic2).
+
+    The real function body runs against in-memory mocks: platform, git,
+    selection, the module candidate loader and the preparation boundary are all
+    faked, and every host, filesystem, directory, sweep, marker and child seam
+    raises if it is reached. The regression proves the module loader is resolved
+    before anything else and that execution reaches the preparation boundary, so
+    a local binding that shadows the loader (the diagnostic2 UnboundLocalError)
+    fails here without any effect, and a negative counterfactual re-inserting
+    that binding is shown to fail the same entry."""
+
+    class Reached(Exception):
+        pass
+
+    def run_entry(self, source=None):
+        calls, forbidden = [], []
+
+        def forbid(name):
+            def fail(*_args, **_kwargs):
+                forbidden.append(name)
+                raise AssertionError(f"{name} must not be reached before the preparation boundary")
+            return fail
+
+        class Guard:
+            SelectionRefused = type("SelectionRefused", (Exception,), {})
+
+            @staticmethod
+            def DefaultProbe():
+                # Constructing the guard's probe is in-memory only; every fact it
+                # could read is forbidden, so no host effect can occur here.
+                calls.append(("probe", None))
+
+                class Probe:
+                    lstat = staticmethod(forbid("probe.lstat"))
+                    stat = staticmethod(forbid("probe.stat"))
+                    realpath = staticmethod(forbid("probe.realpath"))
+                    volume_uuid = staticmethod(forbid("probe.volume_uuid"))
+                    euid = staticmethod(forbid("probe.euid"))
+                    home = staticmethod(forbid("probe.home"))
+                    read = staticmethod(forbid("probe.read"))
+
+                return Probe()
+
+            @staticmethod
+            def prepare_scratch_parent(expected, _probe):
+                calls.append(("prepare", expected.get("root_parent")))
+                raise QualifyEntry.Reached("reached the preparation boundary")
+
+            @staticmethod
+            def sweep_concluded_roots(*_args, **_kwargs):
+                forbidden.append("sweep")
+                raise AssertionError("a sweep was attempted")
+
+            @staticmethod
+            def write_marker(*_args, **_kwargs):
+                forbidden.append("marker")
+                raise AssertionError("a marker write was attempted")
+
+        def loader():
+            calls.append(("candidate-loader", None))
+            return Guard
+
+        selection = {"source": "selected-volume", "root_parent": "/Volumes/Builds/scratch/oxide",
+                     "mount": "/Volumes/Builds", "device": 1, "reason": None, "pool": "/x",
+                     "pool_source": "account config", "registration": "/x/oxide-managed/removable.json",
+                     "volume_uuid": "a" * 8}
+        fakes = {
+            "signal": types.SimpleNamespace(SIGINT=2, SIGTERM=15,
+                                           signal=lambda *_a, **_k: calls.append(("signal", None))),
+            "git": lambda *args: "deadbeef\n" if tuple(args[:2]) == ("rev-parse", "HEAD") else "",
+            "selection": lambda: dict(selection),
+            "candidate": loader,
+            "subprocess": types.SimpleNamespace(Popen=forbid("subprocess.Popen")),
+            "tempfile": types.SimpleNamespace(mkdtemp=forbid("tempfile.mkdtemp")),
+            "reserve_readings": forbid("reserve_readings"),
+            "hold": forbid("hold"),
+        }
+        saved = {name: getattr(qualify, name) for name in fakes}
+        raised, result = None, None
+        stdout = io.StringIO()
+        try:
+            for name, value in fakes.items():
+                setattr(qualify, name, value)
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                if source is None:
+                    try:
+                        qualify.qualify()
+                        result = "returned"
+                    except BaseException as error:  # the entry's own outcome, recorded not raised
+                        raised = error
+                else:
+                    namespace = dict(qualify.__dict__)
+                    exec(compile(source, "<qualify-entry-counterfactual>", "exec"), namespace)
+                    try:
+                        namespace["qualify"]()
+                        result = "returned"
+                    except BaseException as error:
+                        raised = error
+        finally:
+            for name, value in saved.items():
+                setattr(qualify, name, value)
+        return {"calls": [name for name, _ in calls], "forbidden": forbidden, "raised": raised,
+                "result": result, "stdout": stdout.getvalue()}
+
+    def test_the_entry_resolves_the_candidate_loader_before_any_effect(self):
+        observed = self.run_entry()
+        self.assertIsInstance(observed["raised"], QualifyEntry.Reached,
+                              (observed["raised"], observed["forbidden"], observed["stdout"]))
+        self.assertEqual(observed["calls"], ["signal", "signal", "candidate-loader", "probe", "prepare"])
+        self.assertEqual(observed["forbidden"], [],
+                         "a host, filesystem, directory, sweep, marker or child effect was attempted")
+        # No local binding in the entry may shadow a module helper it calls.
+        body = ast.parse(inspect.getsource(qualify.qualify)).body[0]
+        bound = {node.id for node in ast.walk(body)
+                 if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+        called = {node.func.id for node in ast.walk(body)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        shadows = sorted(name for name in bound & called if callable(getattr(qualify, name, None)))
+        self.assertEqual(shadows, [], f"a local binding shadows these module helpers: {shadows}")
+
+    def test_the_counterfactual_local_binding_fails_this_entry(self):
+        # Restore the diagnostic2 shadow in memory only: the real body with its
+        # Popen local named `candidate` again. Nothing tracked is mutated.
+        source = textwrap.dedent(inspect.getsource(qualify.qualify))
+        rebroken = source.replace("candidate_process", "candidate")
+        self.assertNotEqual(rebroken, source, "the counterfactual did not reintroduce the local binding")
+        self.assertIn("candidate = subprocess.Popen(", rebroken)
+        observed = self.run_entry(source=rebroken)
+        self.assertIsInstance(observed["raised"], UnboundLocalError, observed["raised"])
+        self.assertEqual(observed["calls"], ["signal", "signal"],
+                         "the shadowed loader still ran, so the counterfactual proved nothing")
+        self.assertEqual(observed["forbidden"], [], "the broken entry attempted an effect")
+
+
 class PureQualificationTopology(unittest.TestCase):
     """The actual new-default qualification: nested case resources, evidence
     and reserve all on the selected volume inside the monitored owned root,
@@ -5524,8 +5664,9 @@ def main():
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
                                            PureMarker, PureSweep, PureExistingParent,
-                                           PureProtectionAndLifecycle, PureQualificationTopology,
-                                           PureClosureDecision, PureSettlement, PureInterleavedConfirmation))
+                                           PureProtectionAndLifecycle, QualifyEntry,
+                                           PureQualificationTopology, PureClosureDecision,
+                                           PureSettlement, PureInterleavedConfirmation))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

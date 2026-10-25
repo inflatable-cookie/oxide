@@ -1941,8 +1941,8 @@ bootstrap file changes with it for two concrete reasons and no others: its
 expected case count follows the suite's new total (160 pure + 40 real = 200)
 and it gains one limitation line describing this observation, so it adds no
 bound and no effect. Oxide#151 later raises the expected total to its own 200
-pure + 40 real = 240 with the routing, marker, nested-window protection and
-bounded-sweep cases below. Every quality fact here binds to the digests its own
+pure + 40 real = 242 with the routing, marker, nested-window protection,
+bounded-sweep and qualify-entry cases below. Every quality fact here binds to the digests its own
 receipt records, never to the `#145` digests above.
 
 - The monitor's receipt gains a `settlement` object with a fixed schema:
@@ -2339,7 +2339,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 200 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 202 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2477,6 +2477,16 @@ runs in order:
   disappearing child inside one eligible peer each become a bounded skip row
   with the peer's marker retained, a healthy peer beside it is still swept, and
   this run's own new root is still created on the selected parent;
+- the bootstrap's `qualify()` entry seam through the real function body with
+  in-memory mocks only: platform, git, selection, the module candidate loader
+  and the guard's probe are faked, every host, filesystem, directory, sweep,
+  marker, probe-read and child seam raises if reached, and the body must resolve
+  the loader and stop at the preparation boundary with no forbidden effect; a
+  static companion asserts no local binding in the entry shadows a module helper
+  it calls, and an in-memory negative counterfactual re-names the subprocess
+  handle back to the shadowing name and must fail with `UnboundLocalError`
+  without running the loader (the diagnostic2 bootstrap defect, caught without
+  any native run);
 - the qualification checks for this routing: a real owned tree whose parent is
   `<mount>/scratch/oxide` passes end to end, while the bare mount as parent, a
   root created directly at the drive root, a missing sweep summary, a sweep on
@@ -2579,7 +2589,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 240 cases;
+- all 242 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
