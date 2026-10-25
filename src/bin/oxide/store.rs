@@ -3004,7 +3004,12 @@ impl Store {
             .position(|entry| entry.id == record)
             .ok_or("Oxide slot record disappeared")?;
         let (grant, measured) = match outcome {
-            Ok(leased) => (leased.grant, leased.measured),
+            Ok(leased) => {
+                if let Some(note) = &leased.admission_note {
+                    eprintln!("oxide: warning: {note}");
+                }
+                (leased.grant, leased.measured)
+            }
             Err(error) => {
                 state.settle_idle(index);
                 if shared_from.is_some() {
