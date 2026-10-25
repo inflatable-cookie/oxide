@@ -1836,6 +1836,78 @@ guard bytes they ran under as history; the prior qualified
 `961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052` is qualified
 only at its old bytes and no old run is retroactively migrated.
 
+**Settlement observation (oxide#147, unqualified source).** The current
+`bounded-test.py` also carries observation-only settlement diagnostics, so a
+run that ends with no completed post-reap census round can be told apart from
+one whose round was certain and empty (oxide#140 diagnostic5 reported
+`census_rounds` 0 with every other case passing). These are observations, not
+acceptance gates and not a closure authority: the head that carries them is
+**unqualified** until its own measured-cause correction and its separate
+author and independent reviewer `proof:supervisor:qualify` receipts exist, and
+the `a6d73326` bytes above stay the qualified ones for their own runs. The
+bootstrap file changes with it for two concrete reasons and no others: its
+expected case count follows the suite's new total (160 pure + 40 real = 200)
+and it gains one limitation line describing this observation, so it adds no
+bound and no effect. Every quality fact here binds to the digests its own
+receipt records, never to the `#145` digests above.
+
+- The monitor's receipt gains a `settlement` object with a fixed schema:
+  every stamp is an int `CLOCK_UPTIME_RAW` value or `None` when that step was
+  never reached. It records the `stopped` send it was told about, when the
+  monitor processed it, the census thread start, the first round start, the
+  stop request and the loop exit, plus a bounded list of per-round records
+  (index, start, scan end, snapshot and scan durations, rows, `ESRCH` rows,
+  zombie rows, confirmation reads, the round's shared confirmation pauses, lock-wait entry, lock acquisition,
+  lock release, send return, round end, and the round's published
+  `certain`/`members`/`uncertain`). At most 20 round records are kept; further
+  rounds only move `rounds_started`, `rounds_completed` and `omitted`. The
+  whole object is structurally bounded to at most 16384 compact UTF-8 bytes,
+  verified by a pure case rather than by serializing every round.
+- The `stopped` command carries one informational field, the custodian's own
+  `CLOCK_UPTIME_RAW` send stamp. A missing, ill-typed, negative or
+  receive-later value is unknown (`None`), never a fault.
+- The census round's counters are observation only: they read the same
+  snapshot and the same confirmation reads and pauses the round already
+  makes, and they never enter the round's returned object, the control
+  message or a classification.
+- The custodian writes one best-effort `settlement` record into
+  `receipt.custodian` at its closure decision: the census messages it received
+  and how many were post-reap eligible, the first and last eligible stamp,
+  its `census_ok`/`census_uncertain`, the EOF set it had, and the fault. A
+  failed write is dropped and never latched, so this cannot turn a closed run
+  into a fault or replace the first fault. It is the decision-time view; the
+  receipt's `settlement` object keeps accumulating from later monitor activity,
+  so the two are never merged into one "measured" claim.
+- Diagnostics can only be missing: loss, truncation or a dropped observation
+  never changes an authoritative count, the fault, EOF, census certainty, the
+  deadline or cleanup. Neither object is read back by the supervisor.
+- **Measured correction (same task).** The uncounted diagnostic at `8849f99`
+  measured the settlement window on a real 188-case run: command-pipeline
+  receive, thread start, first round start and the receipt lock were
+  micro-seconds to a few milli-seconds, while a strict confirmation paid
+  `CONFIRM_PAUSE` once per identity per read and so cost about `0.95 s` per
+  persistent zombie row (worst observed round 4.25 s of scan, 89 % of it
+  pause). ESRCH confirmation is therefore interleaved: the first read for an
+  identity still follows its own `getsid` immediately, and every identity
+  still pending then takes one read per shared pass, each pass preceded by
+  one `CONFIRM_PAUSE`, for at most `CONFIRM_TRIES - 1` passes. An identity
+  keeps exactly its existing `1..CONFIRM_TRIES` reads with at least one full
+  pause between successive reads, its first-read pairing, its contradiction
+  tracking, its absent/replaced priority and its separate final read; a match
+  never short-circuits; the per-identity terminal/taint/count rules and all
+  bounds are unchanged. Published members, uncertain rows, diagnostics and
+  terminal witnesses are assembled in snapshot order from per-row records.
+  The serial algorithm paid its prescribed pause once per identity per read,
+  so its derived wait grew as about `0.95 s x N` for N persistent zombie rows;
+  the interleaved round shares at most `CONFIRM_TRIES - 1` = 19 pauses
+  whatever N is, while the same reads and CPU work remain. Those figures are
+  pause calls times the declared `CONFIRM_PAUSE`, not independently measured
+  sleep duration, and the historical #140 cause stays inferred rather than
+  reproduced. A tracked identity that fails its final read keeps its retained
+  member attribution, exactly as the pre-correction tail did. This source
+  remains **unqualified** until its own uncounted keep-going diagnostic and
+  separate author and reviewer `proof:supervisor:qualify` receipts exist.
+
 `scripts/bounded-test.py` is the shared proof supervisor. It implements the
 reviewed [pinned-leader correction design](proof-supervisor-correction.md)
 (revision 4, `29f0950e`) for oxide#109. It counts as qualified only once
@@ -2162,7 +2234,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 136 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 160 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2246,6 +2318,20 @@ runs in order:
   wrong pipe, no hold, uncertain or nonempty or missing census, census fault,
   deadline, not retained, suite signalled; released pair: an always-UNCLOSED
   oracle, a fault, a wrong exit);
+- the settlement observation through the real monitor and custodian paths,
+  judged by an oracle that the cases also falsify: a driven census loop writes
+  the round's stamps and counts and keeps the control message's exact existing
+  fields, a loop that exits before a round is told apart from a certain empty
+  round, a frozen clock is rejected as no observation, a missing stamp, a
+  reordered or duplicated field, an unknown phase, a wrong index, an invalid
+  integer, a completed round with no record and a round without its kept or
+  omitted count are each rejected, a round beyond the cap takes nothing while
+  `omitted` counts it, a maximum-width record stays under the byte ceiling, a
+  missing or ill-typed `stopped` stamp is unknown rather than a latency, the
+  census counters follow the round's real reads and pauses and reset per
+  round, and the custodian's decision-time snapshot names its message counts,
+  eligible stamps, EOF set and fault while a failed observation write never
+  latches or reopens a closure;
 - writers before and after a simulated staging step;
 - the escaped writer: it leaves the nested session, keeps the leader's
   stdout/stderr descriptors open, signals readiness and answers a fresh

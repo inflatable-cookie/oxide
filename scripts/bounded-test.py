@@ -96,6 +96,18 @@ CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
+# Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
+# per census round up to a cap, explicit `None` for a phase never reached. They
+# never change classification, counts, faults, EOF, closure, deadlines or
+# cleanup, and never appear in a control message.
+SETTLE_MAX_ROUNDS = 20  # detailed round records kept; further rounds count as omitted
+SETTLE_MAX_BYTES = 16384  # structural compact-JSON ceiling for the whole object
+# The declared phase enums: the monitor writes only these values and the pure
+# oracle rejects anything else, so an unknown phase is never evidence.
+SETTLE_PHASES = ("none", "received", "thread-start", "round-start", "scanned", "lock-wait",
+                 "locked", "sent", "round-complete", "loop-exit")
+SETTLE_ROUND_STEPS = ("start", "scanned", "lock-wait", "locked", "sent", "complete")
+_SETTLE_TOP = object()  # sentinel: a note without a round record targets the settlement object
 TERMINAL_STATUS_VALUES = ("valid", "invalid", "overflow")
 TERMINAL_MODE_REASONS = ("allowlisted", "identity_read_error", "identity_malformed", "identity_mismatch")
 # One-shot exact-kernel allowlist for TERMINALNONWRITER acceptance (owner activation
@@ -140,6 +152,27 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
 
 def now_ns():
     return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+
+
+def settlement_record():
+    """The monitor's observation-only settlement diagnostics (oxide#147).
+
+    Fixed shape: every stamp is an int CLOCK_UPTIME_RAW value or `None` when
+    the step was never reached, so a run that ends with no completed census
+    round is distinguishable from one whose round was certain and empty. The
+    round list is capped at SETTLE_MAX_ROUNDS and the remaining rounds are
+    counted in `omitted`. Nothing here is read by classification, the fault,
+    the EOF witness, the deadline or the cleanup decision."""
+    return {
+        "schema": 1, "clock": "CLOCK_UPTIME_RAW",
+        "stopped_sent_ns": None, "stopped_received_ns": None, "stopped_seq": None,
+        "receive_latency_ns": None, "leader_bound": None,
+        "thread_start_ns": None, "thread_start_latency_ns": None, "census_built_ns": None,
+        "first_round_ns": None, "first_round_latency_ns": None,
+        "stop_requested_ns": None, "loop_exit_ns": None,
+        "rounds_started": 0, "rounds_completed": 0, "omitted": 0,
+        "phase": "none", "rounds": [],
+    }
 
 
 def report(text, fd=2):
@@ -368,6 +401,21 @@ def _diag_row(row, tries, confirm, final, error, err_no):
     if type(err_no) is int and 0 <= err_no <= 4095:
         out["errno"] = err_no
     return out
+
+
+def _diag_attempt(row, tries, outcome, final, error=None, category="none"):
+    """One receipt-only diagnostic row, or None.
+
+    Classifying an optional error and building the row are wrapped together,
+    so a failure omits that single row exactly as before and can never change
+    a classification, a count, a fault or the round's result."""
+    try:
+        number = None
+        if error is not None:
+            category, number = _diag_classify(error)
+        return _diag_row(row, tries, outcome, final, category, number)
+    except BaseException:
+        return None
 
 
 def _diag_object(attempted, rows, saturated):
@@ -659,6 +707,23 @@ class Census:
     (PID, start) identity. A replacement identity is never declared foreign
     or member by inference. A failed read confirms nothing.
 
+    Confirmation scheduling (oxide#147 correction): the FIRST confirmation
+    read for an actual-ESRCH row runs immediately after that row's own getsid
+    and before the next row's, so the snapshot/first-read pairing terminal
+    eligibility depends on stays adjacent in time. Every identity still
+    pending then takes part in shared confirmation passes: each pass is ONE
+    `CONFIRM_PAUSE` followed by ONE reread of each pending identity in
+    snapshot order, for at most CONFIRM_TRIES - 1 passes. An identity
+    therefore still gets exactly its existing 1..CONFIRM_TRIES confirmation
+    reads with at least one full pause between successive reads, but a single
+    pause serves every identity in the pass, so the round's own wait no longer
+    grows with the number of zombie rows. Per-identity tries, first-read
+    pairing, contradiction tracking, absent/replaced priority, read-failure
+    termination and the separate final read are all unchanged, a match never
+    short-circuits, and members, uncertain rows, diagnostics and terminal
+    witnesses are still assembled in snapshot order from per-row records
+    rather than in resolution order.
+
     Terminal (allowlisted kernels only): an actual getsid ESRCH (errno-
     checked, not any ProcessLookupError) whose snapshot row and FIRST
     existing confirmation read show the same complete SZOMB identity
@@ -712,46 +777,67 @@ class Census:
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
         self.tracked = {}
+        # Observation-only per-round counters (oxide#147). They are reset at the
+        # start of every round, are never added to the round's returned object
+        # and never influence a classification, count, read, pause or budget.
+        self.stats = {}
 
-    def confirm_gone_info(self, row):
-        """Confirm absence, reporting how. Returns (gone, tries, outcome,
-        error, first_row, first_error, all_clean).
+    def reset_stats(self):
+        """Start this round's observation-only counters. Never raises."""
+        try:
+            self.stats = {"rows": 0, "esrch_rows": 0, "zombie_rows": 0, "confirm_reads": 0,
+                          "pause_calls": 0, "terminal": 0, "snapshot_ns": 0, "scan_ns": 0,
+                          "snapshot_error": False}
+        except BaseException:
+            self.stats = {}
 
-        `gone` follows the existing Gone rule (a successful read lacking the
-        identity); `tries` is the bounded 1..20 re-read count; `outcome` is
-        one of absent/replaced/matching_exhausted/read_failed; `error` is
-        the reread exception or None. `first_row`/`first_error` carry the
-        FIRST existing confirmation read (a dict, None when absent, or the
-        exception). `all_clean` reports whether every actually performed
-        non-terminal read showed the same complete SZOMB identity (a later
-        Gone still takes priority and ends the confirmation). The terminal
-        rule reuses all of this with no added reads. Same reads, pauses
-        and budget as confirm_gone; no early short-circuit."""
-        tries, first_row, first_error, all_clean = 0, "unset", None, True
-        for attempt in range(CONFIRM_TRIES):
-            if attempt:
-                self.pause(CONFIRM_PAUSE)
-            tries += 1
-            try:
-                again = self.reread(row["pid"])
-            except Exception as error:
-                if attempt == 0:
-                    first_error = error
-                return (False, tries, "read_failed", error, first_row, first_error, False)
-            if attempt == 0:
-                first_row, first_error = again, None
-            if again is None:
-                return (True, tries, "absent", None, first_row, first_error, all_clean)
-            if again["start"] != row["start"]:
-                return (True, tries, "replaced", None, first_row, first_error, all_clean)
-            if not _same_complete_zombie(row, again):
-                all_clean = False
-        return (False, tries, "matching_exhausted", None, first_row, first_error, all_clean)
+    def confirmation_attempt(self, row, state):
+        """Exactly one confirmation read for one pending ESRCH identity.
 
-    def confirm_gone(self, row):
-        """True only on a successful read that lacks the identity."""
-        gone, _t, _o, _e, _fr, _fe, _ac = self.confirm_gone_info(row)
-        return gone
+        Applies the same priority and bookkeeping as one attempt of the
+        serial loop it replaces: a successful read lacking the identity is
+        Gone (`absent`) and a successful read naming a different start token
+        is Gone (`replaced`); a failed read resolves the identity as
+        `read_failed` with `all_clean` false; anything else keeps it pending
+        and updates `all_clean` and the FIRST-read pairing the terminal rule
+        needs. `state` carries tries/outcome/error/first_row/first_error/
+        clean/gone across passes, so an identity's read count, first-read
+        pairing, contradiction tracking and resolution stay identical however
+        many other identities share its pass. Never pauses, never
+        short-circuits a match, and counts only the read it makes."""
+        state["tries"] += 1
+        try:
+            self.stats["confirm_reads"] += 1  # observation only
+        except BaseException:
+            pass
+        first = state["first_row"] == "unset"
+        try:
+            again = self.reread(row["pid"])
+        except Exception as error:
+            if first:
+                state["first_error"] = error
+            state.update(outcome="read_failed", error=error, clean=False)
+            return False
+        if first:
+            state["first_row"], state["first_error"] = again, None
+        if again is None:
+            state.update(outcome="absent", gone=True)
+            return False
+        if again["start"] != row["start"]:
+            state.update(outcome="replaced", gone=True)
+            return False
+        if not _same_complete_zombie(row, again):
+            state["clean"] = False
+        return True
+
+    def retains_member_attribution(self, identity):
+        """Whether an unresolved ESRCH identity keeps its retained member
+        attribution instead of being reported uncertain.
+
+        This is the serial tail rule at 8849f99: a tracked identity that is
+        neither positively Gone nor terminal-accepted stays a member. It is a
+        separate seam so the differential can falsify exactly this branch."""
+        return identity in self.tracked
 
     def terminal_eligible(self, row, first_row, first_error):
         """Whether an actual-ESRCH row qualifies as terminal nonwriter.
@@ -772,20 +858,40 @@ class Census:
             return False
 
     def round(self):
+        self.reset_stats()
+        begun = now_ns()
         try:
             rows = self.snapshot()
         except Exception as error:
+            try:
+                self.stats["snapshot_ns"] = now_ns() - begun
+                self.stats["snapshot_error"] = True
+            except BaseException:
+                pass
             return {"certain": False, "members": len(self.tracked), "uncertain": 1,
                     "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": [],
                     "terminal_count_status": "invalid", "terminal_nonwriters": None}
+        try:
+            self.stats["snapshot_ns"] = now_ns() - begun  # observation only
+            self.stats["rows"] = len(rows)
+            self.stats["zombie_rows"] = sum(1 for row in rows if row.get("zombie") is True)
+        except BaseException:
+            pass
         present = {(row["pid"], row["start"]) for row in rows}
         for identity in list(self.tracked):
             if identity not in present:
                 del self.tracked[identity]
         members, uncertain = [], []
-        diag_attempted, diag_saturated, diag_rows = 0, False, []
+        diag_attempted, diag_saturated = 0, False
         terminal_count, terminal_witnesses, terminal_tainted = 0, [], False
-        for row in rows:
+        # One outcome record per snapshot row. Confirmation reads are
+        # interleaved across identities, so every published list (members,
+        # uncertain, diagnostics, terminal witnesses) is assembled from these
+        # records in SNAPSHOT order at the end of the round, never in the
+        # order in which a pass happened to resolve an identity.
+        records = [None] * len(rows)
+        pending = []  # (index, row, identity, state) still being confirmed, snapshot order
+        for index, row in enumerate(rows):
             identity = (row["pid"], row["start"])
             failure, getsid_error = None, None
             try:
@@ -806,89 +912,22 @@ class Census:
                     diag_saturated = True
                 else:
                     diag_attempted += 1
-                gone, tries, confirm_outcome, _cerr, first_row, first_error, all_clean = self.confirm_gone_info(row)
-                if gone:
-                    self.tracked.pop(identity, None)
-                    try:
-                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "not_read", "none", None))
-                    except BaseException:
-                        pass
+                state = {"tries": 0, "outcome": None, "error": None, "first_row": "unset",
+                         "first_error": None, "clean": True, "gone": False, "getsid_error": getsid_error}
+                # The FIRST confirmation read for this identity runs here,
+                # immediately after its own getsid and before the next row's,
+                # so the snapshot/first-read pairing terminal eligibility
+                # depends on keeps its existing timing adjacency.
+                if self.confirmation_attempt(row, state):
+                    pending.append((index, row, identity, state))
                     continue
-                try:
-                    again = self.reread(row["pid"])
-                except Exception as error:
-                    again = None
-                    failure = f"reread: {error}" if failure in (None, "gone") else failure
-                    try:
-                        category, number = _diag_classify(error)
-                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "read_failed", category, number))
-                    except BaseException:
-                        pass
-                    try:
-                        if self.terminal_allowed is True and row.get("zombie") is True:
-                            terminal_tainted = True
-                    except BaseException:
-                        pass
-                    stable = False
-                else:
-                    if again is None:
-                        self.tracked.pop(identity, None)
-                        try:
-                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "absent", "none", None))
-                        except BaseException:
-                            pass
-                        continue
-                    if again["start"] != row["start"]:
-                        self.tracked.pop(identity, None)
-                        try:
-                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "replaced", "none", None))
-                        except BaseException:
-                            pass
-                        continue
-                    stable = True
-                    try:
-                        category, number = _diag_classify(getsid_error)
-                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "same_identity", category, number))
-                    except BaseException:
-                        pass
-                    try:
-                        terminal = (confirm_outcome == "matching_exhausted" and all_clean
-                                    and self.terminal_eligible(row, first_row, first_error)
-                                    and _same_complete_zombie(row, again))
-                    except BaseException:
-                        terminal = False
-                    if not terminal:
-                        # An actual-ESRCH row with a SZOMB snapshot that is
-                        # neither Gone nor terminal-accepted stays
-                        # unaccounted and taints the terminal count, but only
-                        # when terminal acceptance is possible at all. In
-                        # strict mode the count is accountably zero; rows that
-                        # were never terminal candidates (no SZOMB snapshot)
-                        # leave an accountable count alone.
-                        try:
-                            if self.terminal_allowed is True and row.get("zombie") is True:
-                                terminal_tainted = True
-                        except BaseException:
-                            pass
-                    if terminal:
-                        try:
-                            witness = _terminal_witness_row(row, identity in self.tracked)
-                        except BaseException:
-                            witness = None
-                        if witness is not None:
-                            terminal_witnesses.append(witness)
-                        terminal_count += 1
-                        continue  # kept tracked attribution; neither member nor uncertain
-                    failure = "getsid ESRCH, absence not confirmed"
-                if failure is None and stable and session == self.sid:
-                    self.tracked[identity] = row
-                    members.append(row)
-                elif identity in self.tracked:
-                    members.append(row)
-                elif failure is None and stable:
-                    continue  # positively foreign
-                else:
-                    uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
+                if state["gone"]:
+                    self.tracked.pop(identity, None)
+                    records[index] = {"diag": _diag_attempt(row, state["tries"], state["outcome"], "not_read")}
+                    continue
+                # A failed first read resolves the confirmation exactly as the
+                # serial loop did: the identity keeps the existing final read.
+                records[index] = {"esrch": True, "row": row, "identity": identity, "state": state}
                 continue
             try:
                 again = self.reread(row["pid"])
@@ -899,13 +938,130 @@ class Census:
                 failure = "getsid ESRCH, absence not confirmed"
             if failure is None and stable and session == self.sid:
                 self.tracked[identity] = row
-                members.append(row)
+                records[index] = {"member": row}
             elif identity in self.tracked:
-                members.append(row)
+                records[index] = {"member": row}
             elif failure is None and stable:
-                continue  # positively foreign
+                records[index] = {"skip": True}  # positively foreign
             else:
-                uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
+                records[index] = {"uncertain": dict(row, reason=failure or "identity changed across getsid")}
+        # Further confirmation passes: each is ONE shared CONFIRM_PAUSE and
+        # then ONE reread of every still-pending identity in snapshot order.
+        # One pause therefore serves every identity in the pass, while any two
+        # successive confirmation reads for one identity stay at least one
+        # full CONFIRM_PAUSE apart. Per-identity tries, all_clean, first-read
+        # pairing, absent/replaced priority and read-failure termination are
+        # unchanged, and a match never short-circuits.
+        further = 0
+        while pending and further < CONFIRM_TRIES - 1:
+            further += 1
+            self.pause(CONFIRM_PAUSE)
+            try:
+                self.stats["pause_calls"] += 1  # observation only: this round's shared pauses
+            except BaseException:
+                pass
+            survivors = []
+            for index, row, identity, state in pending:
+                if self.confirmation_attempt(row, state):
+                    survivors.append((index, row, identity, state))
+                elif state["gone"]:
+                    self.tracked.pop(identity, None)
+                    records[index] = {"diag": _diag_attempt(row, state["tries"], state["outcome"], "not_read")}
+                else:
+                    records[index] = {"esrch": True, "row": row, "identity": identity, "state": state}
+            pending = survivors
+        for index, row, identity, state in pending:  # 20 reads done, absence never shown
+            state["outcome"] = "matching_exhausted"
+            records[index] = {"esrch": True, "row": row, "identity": identity, "state": state}
+        # The existing final KERN_PROC_PID read and classification, once per
+        # surviving ESRCH identity, in snapshot order: 20 confirmation reads
+        # plus this distinct final read for a persistent row, while a Gone
+        # during confirmation skips it and a read failure keeps the old
+        # final-absence rule. No pause is added before it.
+        for record in records:
+            if not record or not record.get("esrch"):
+                continue
+            row, identity, state = record["row"], record["identity"], record["state"]
+            tries, confirm_outcome = state["tries"], state["outcome"]
+            failure = "getsid ESRCH, absence not confirmed"
+            try:
+                again = self.reread(row["pid"])
+            except Exception as error:
+                # The serial algorithm also reached its ordinary tail here, so
+                # a tracked identity keeps its retained attribution as a member
+                # and only an untracked one becomes uncertain. Marking every
+                # failed final read uncertain would change that result.
+                again = None
+                failure = f"reread: {error}"
+                record["diag"] = _diag_attempt(row, tries, confirm_outcome, "read_failed", error=error)
+                try:
+                    if self.terminal_allowed is True and row.get("zombie") is True:
+                        terminal_tainted = True
+                except BaseException:
+                    pass
+                if self.retains_member_attribution(identity):
+                    record["member"] = row  # retained attribution, exactly as the serial tail
+                else:
+                    record["uncertain"] = dict(row, reason=failure)
+                continue
+            if again is None:
+                self.tracked.pop(identity, None)
+                record["diag"] = _diag_attempt(row, tries, confirm_outcome, "absent")
+                continue
+            if again["start"] != row["start"]:
+                self.tracked.pop(identity, None)
+                record["diag"] = _diag_attempt(row, tries, confirm_outcome, "replaced")
+                continue
+            record["diag"] = _diag_attempt(row, tries, confirm_outcome, "same_identity",
+                                           error=state["getsid_error"])
+            try:
+                terminal = (confirm_outcome == "matching_exhausted" and state["clean"]
+                            and self.terminal_eligible(row, state["first_row"], state["first_error"])
+                            and _same_complete_zombie(row, again))
+            except BaseException:
+                terminal = False
+            if not terminal:
+                # An actual-ESRCH row with a SZOMB snapshot that is neither
+                # Gone nor terminal-accepted stays unaccounted and taints the
+                # terminal count, but only when terminal acceptance is
+                # possible at all. In strict mode the count is accountably
+                # zero; rows that were never terminal candidates (no SZOMB
+                # snapshot) leave an accountable count alone.
+                try:
+                    if self.terminal_allowed is True and row.get("zombie") is True:
+                        terminal_tainted = True
+                except BaseException:
+                    pass
+            if terminal:
+                try:
+                    witness = _terminal_witness_row(row, identity in self.tracked)
+                except BaseException:
+                    witness = None
+                if witness is not None:
+                    terminal_witnesses.append(witness)
+                terminal_count += 1
+                record["skip"] = True  # kept tracked attribution; neither member nor uncertain
+                continue
+            if self.retains_member_attribution(identity):
+                record["member"] = row  # tracked attribution kept
+            else:
+                record["uncertain"] = dict(row, reason=failure)
+        diag_rows = []
+        for record in records:  # SNAPSHOT order, including more than 20 rows
+            if not record:
+                continue
+            if record.get("member") is not None:
+                members.append(record["member"])
+            elif record.get("uncertain") is not None:
+                uncertain.append(record["uncertain"])
+            if record.get("diag") is not None:
+                diag_rows.append(record["diag"])
+        try:
+            self.stats["scan_ns"] = now_ns() - begun - self.stats["snapshot_ns"]  # observation only
+            self.stats["esrch_rows"] = diag_attempted
+            self.stats["terminal"] = terminal_count
+        except BaseException:
+            pass
         try:
             status, value = _terminal_fields(terminal_count, terminal_tainted, False)
         except BaseException:
@@ -1420,6 +1576,63 @@ class Monitor:
         self.inject = set(ctx["inject"])
         self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
         self.receipt = None
+        # Observation-only settlement diagnostics; the receipt carries this
+        # same object, so publishing includes it without extra work.
+        self.settlement = settlement_record()
+
+    def note(self, entry=_SETTLE_TOP, **fields):
+        """One observation-only stamp, on the settlement object or on one
+        round record (a record beyond the cap is None and takes none). Never
+        raises, never blocks, takes no lock and is never consulted by a
+        decision."""
+        try:
+            target = self.settlement if entry is _SETTLE_TOP else entry
+            if target is None:
+                return
+            for name, value in fields.items():
+                target[name] = value
+        except BaseException:
+            pass
+
+    def note_stopped(self, command, received):
+        """Stamp when the monitor processed `stopped`. `sent` is the
+        custodian's own CLOCK_UPTIME_RAW value from the same system-wide
+        clock; anything missing, ill-typed, negative or later than the receive
+        is unknown (None), never guessed and never a fault."""
+        try:
+            sent = command.get("sent")
+            if type(sent) is not int or sent < 0 or sent > received:
+                sent = None
+            self.note(stopped_received_ns=received, stopped_seq=command.get("seq"),
+                      stopped_sent_ns=sent,
+                      receive_latency_ns=None if sent is None else received - sent,
+                      leader_bound=self.leader is not None, phase="received")
+        except BaseException:
+            pass
+
+    def note_round(self, start_ns):
+        """Count this round and keep one bounded record. Returns the record,
+        or None past the cap where only the counters move. Never raises."""
+        try:
+            field = self.settlement
+            field["rounds_started"] += 1
+            if field["first_round_ns"] is None:
+                field["first_round_ns"] = start_ns
+                if field["stopped_received_ns"] is not None:
+                    field["first_round_latency_ns"] = max(0, start_ns - field["stopped_received_ns"])
+            if len(field["rounds"]) >= SETTLE_MAX_ROUNDS:
+                field["omitted"] += 1
+                return None
+            entry = {"index": field["rounds_started"] - 1, "phase": "start", "start_ns": start_ns,
+                     "scanned_ns": None, "snapshot_ns": None, "scan_ns": None, "rows": None,
+                     "esrch_rows": None, "zombie_rows": None, "confirm_reads": None,
+                     "pause_calls": None, "lock_wait_ns": None, "lock_acquired_ns": None,
+                     "lock_released_ns": None, "sent_ns": None, "end_ns": None,
+                     "certain": None, "members": None, "uncertain": None}
+            field["rounds"].append(entry)
+            return entry
+        except BaseException:
+            return None
 
     def owned_root(self):
         """This run's owned root and the selection facts behind it. A caller's
@@ -1500,7 +1713,7 @@ class Monitor:
             "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None,
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
-            "output": {}, "census": None, "census_rounds": 0,
+            "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
         }
 
     def send(self, message_type, **fields):
@@ -1596,19 +1809,61 @@ class Monitor:
         self.send("output_eof", stream=name)
 
     def census_loop(self, after):
+        started = now_ns()
+        self.note(thread_start_ns=started, phase="thread-start")
+        try:  # observation only: how long after the stopped receive the thread ran
+            received = self.settlement["stopped_received_ns"]
+            if received is not None:
+                self.note(thread_start_latency_ns=max(0, started - received))
+        except BaseException:
+            pass
         census = Census(self.leader[0], terminal_allowed=(
             self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"))
+        self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
+            begin = now_ns()
+            entry = self.note_round(begin)
+            self.note(phase="round-start")
             result = census.round()
+            scanned = now_ns()
+            try:  # observation only: the round's measured phases and read counts
+                stats = census.stats
+                self.note(entry, phase="scanned", scanned_ns=scanned, snapshot_ns=stats["snapshot_ns"],
+                          scan_ns=stats["scan_ns"], rows=stats["rows"],
+                          esrch_rows=stats["esrch_rows"], zombie_rows=stats["zombie_rows"],
+                          confirm_reads=stats["confirm_reads"], pause_calls=stats["pause_calls"])
+                self.note(phase="scanned")
+            except BaseException:
+                pass
             if "census-uncertain" in self.inject or (
                     "census-uncertain-first" in self.inject and not self.receipt["census_rounds"]):
                 result = dict(result, certain=False, uncertain=max(1, result["uncertain"]))
+            waiting = now_ns()
+            self.note(entry, phase="lock-wait", lock_wait_ns=waiting)
+            self.note(phase="lock-wait")
             with self.lock:
+                acquired = now_ns()
                 self.receipt["census"] = result
                 self.receipt["census_rounds"] += 1
+            released = now_ns()
+            self.note(entry, phase="locked", lock_acquired_ns=acquired, lock_released_ns=released,
+                      certain=result["certain"], members=result["members"],
+                      uncertain=result["uncertain"])
+            self.note(phase="locked")
             self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
                       certain=result["certain"])
+            # `sent_ns` also covers the send's own lock acquisition and pipe write.
+            sent = now_ns()
+            self.note(entry, sent_ns=sent)
+            done = now_ns()
+            self.note(entry, end_ns=done, phase="complete")
+            self.note(rounds_completed=self.settlement["rounds_completed"] + 1, phase="round-complete")
             self.census_stop.wait(CENSUS_INTERVAL)
+        try:
+            self.settlement["loop_exit_ns"] = now_ns()
+            self.settlement["phase"] = "loop-exit"
+        except BaseException:
+            pass
 
     def commands(self):
         buffer = b""
@@ -1653,6 +1908,7 @@ class Monitor:
                 with self.lock:
                     self.receipt["custodian"].append(command["record"])
             elif kind == "stopped":
+                self.note_stopped(command, now_ns())
                 if "monitor-stall" in self.inject:
                     with self.lock:  # every sender blocks: readings go stale
                         time.sleep(LIMIT_S)
@@ -1663,6 +1919,7 @@ class Monitor:
                 with self.lock:
                     self.receipt["outcome"] = command.get("outcome")
                 break
+        self.note(stop_requested_ns=now_ns())
         self.census_stop.set()
         if decision == "cleanup":
             self.publish("closure_established: cleanup_pending")
@@ -1743,6 +2000,14 @@ class Custodian:
         self.eof = set()
         self.census_ok = False
         self.census_uncertain = False
+        # Observation-only settlement counters (oxide#147): what the custodian
+        # itself saw before its closure decision. They never change
+        # eligibility, closure or any fault.
+        self.stopped_at = None
+        self.census_messages = 0
+        self.census_eligible = 0
+        self.census_first_at = None
+        self.census_last_at = None
         self.reaped_seq = None
         self.monitor_complete = False
         self.deadline_hit = False
@@ -1912,6 +2177,16 @@ class Custodian:
         elif kind == "output_eof":
             self.eof.add(message["stream"])
         elif kind == "census":
+            try:  # observation only, before the unchanged eligibility rule
+                self.census_messages += 1
+                if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
+                    at = now_ns()
+                    self.census_eligible += 1
+                    self.census_last_at = at
+                    if self.census_first_at is None:
+                        self.census_first_at = at
+            except BaseException:
+                pass
             if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
                 if not message["certain"] or message["uncertain"]:
                     # Latched: a later certain empty census never clears it.
@@ -2170,10 +2445,35 @@ class Custodian:
             self.guard.latch("reap: leader not reaped by exit_at; pin kept, no further signal")
             self.deadline_hit = True
 
+    def observe_settlement(self, launched, census_end):
+        """Best-effort, observation-only decision-time snapshot of the
+        settlement window. A failed write is dropped and never latched, so this
+        can never turn a closed run into a fault, replace the first fault or
+        depend on the monitor's later activity. Never raises."""
+        try:
+            at = now_ns()
+            sent = self.stopped_at
+            record = {
+                "at": at, "event": "settlement", "launched": launched,
+                "stopped_sent_ns": sent, "census_end_ns": census_end,
+                "wait_ns": None if census_end is None or sent is None else max(0, min(at, census_end) - sent),
+                "census_messages": self.census_messages, "census_eligible": self.census_eligible,
+                "first_census_ns": self.census_first_at, "last_census_ns": self.census_last_at,                "census_ok": self.census_ok, "census_uncertain": self.census_uncertain,
+                "eof": sorted(self.eof), "fault": self.guard.fault,
+            }
+            self.seq += 1
+            data = (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",
+                                "record": record}) + "\n").encode()
+            os.write(self.cmd_w, data)
+        except BaseException:
+            pass
+
     def settle(self, launched):
-        self.tell("stopped")
+        self.stopped_at = now_ns()
+        self.tell("stopped", sent=self.stopped_at)
         self.reaped_seq = self.seq
         self.record("leader_reaped", status=self.leader_status)
+        census_end = None
         if launched:
             census_end = min(now_ns() + CENSUS_GRACE_S * NS, self.exit_at)
             while not (self.census_uncertain or (self.census_ok and len(self.eof) == 2)) and now_ns() < census_end:
@@ -2182,6 +2482,7 @@ class Custodian:
                 self.guard.latch("closure not established: no certain empty census after the leader was reaped")
             elif len(self.eof) != 2:
                 self.guard.latch("closure not established: output EOF witness missing")
+        self.observe_settlement(launched, census_end)
 
     def last_resort(self):
         """finish raised: KILL the pinned monitor if still held, one WNOHANG
