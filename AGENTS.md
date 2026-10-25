@@ -80,16 +80,25 @@ Every native-proof authoring or correction brief declares HIGH complexity, appli
 
 There is no product QA selector yet. Use the focused selectors above; they do not replace milestone QA.
 
-For Rust tests and proofs on macOS, validation scratch belongs on the volume the selected pool uses (the Builds drive when present), in a private area outside the pool payload: `scripts/bounded-test.py` now chooses that default itself and warns when it must fall back to `/private/tmp`, so do not hardcode a mount path or guess a private variable. A selector that needs its own root sets `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` to one fresh canonical short directory there; when no selected volume is available, the same directory under `/private/tmp` is the truthful fallback and the run must say so. The suite checks canonical paths and uses short socket paths, so the default `/var/folders` temp directory never qualifies. For example:
+For Rust tests and proofs on macOS, validation scratch belongs on the volume the selected pool uses (the Builds drive when present), in a private area outside the pool payload: `scripts/bounded-test.py` now chooses that default itself and warns when it must fall back to `/private/tmp`, so do not hardcode a mount path or guess a private variable. A selector that needs its own root sets `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`, `TEMP` and any proof-specific variable to one fresh canonical short directory there; when no selected volume is available, the same directory under `/private/tmp` is the truthful fallback and the run must say so. The suite checks canonical paths and uses short socket paths, so the default `/var/folders` temp directory never qualifies.
+
+The Rust unit suite is the one recipe with an internal root, because it contains macOS fixtures whose premise is the internal boot Data volume rather than the pool's volume. Give the supervisor one fresh private root on the internal volume as `OXIDE_TASK_SCRATCH_ROOT` **and** `OXIDE_TEST_INTERNAL_ROOT`, so those fixtures stay inside the monitored root, and give `TMPDIR`, `TMP` and `TEMP` a separate fresh directory on the selected volume: the product keeps an inherited same-volume `TMPDIR`, so ordinary test temp still lands on the pool volume (its receipt says `temp: inherited <path>`). Both roots are yours to remove afterwards. For example:
 
 ```sh
 scratch_base=$(python3 -c 'import importlib.util, os
 spec = importlib.util.spec_from_file_location("bounded_test", "scripts/bounded-test.py")
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 print(module.select_default_parent(os.environ)["root_parent"])')
-oxide_validation_scratch=$(mktemp -d "$scratch_base/oxide-validation.XXXXXX")
-OXIDE_TASK_SCRATCH_ROOT="$oxide_validation_scratch" TMPDIR="$oxide_validation_scratch" TMP="$oxide_validation_scratch" TEMP="$oxide_validation_scratch" effigy test rust
+oxide_validation_temp=$(mktemp -d "$scratch_base/oxide-validation.XXXXXX")
+oxide_internal_scratch=$(mktemp -d /private/tmp/oxide-internal.XXXXXX)
+OXIDE_TASK_SCRATCH_ROOT="$oxide_internal_scratch" \
+OXIDE_TEST_INTERNAL_ROOT="$oxide_internal_scratch" \
+TMPDIR="$oxide_validation_temp" TMP="$oxide_validation_temp" TEMP="$oxide_validation_temp" \
+effigy test rust
+rm -rf "$oxide_validation_temp" "$oxide_internal_scratch"
 ```
+
+Two macOS unit tests take their fixtures from `OXIDE_TEST_INTERNAL_ROOT` because a leased child's `TMPDIR` is on the selected pool's volume, whose mount sets `MNT_IGNORE_OWNERSHIP`: `prune::tests::legacy_eligibility_is_proved_by_the_boot_data_volume` and `volume::tests::a_caller_owned_private_root_passes_and_a_writable_one_refuses`. Each checks that root is a canonical, owner-only directory of this user on the boot Data volume, then creates and removes only its own unique fixture inside it; the prune test still proves internal placement through the product's own `on_boot_data_volume`. A third fixture, `config::tests::git_work_trees_and_aliases_refuse`, takes its root from `OXIDE_TASK_SCRATCH_ROOT` and needs it off `/Volumes`, which the recipe's internal monitored root supplies. Without this recipe those fixtures fail and name the missing root or the external volume; they are never skipped. Ordinary test and proof scratch outside this suite keeps selected-volume placement.
 
 
 ## Documentation validation

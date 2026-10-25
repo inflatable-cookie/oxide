@@ -5425,9 +5425,52 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::at(&std::env::temp_dir())
+        }
+
+        /// A fixture inside the explicit internal root named by
+        /// `OXIDE_TEST_INTERNAL_ROOT` (AGENTS.md, Rust test recipe), for a test
+        /// that must run on the boot Data volume. The leased child's `TMPDIR`
+        /// is on the selected pool's volume instead, because the product routes
+        /// it there, so this checks the caller's root and creates one unique
+        /// owner-only fixture inside it rather than guessing from `TMPDIR`.
+        fn at_internal_root() -> Self {
+            let named = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT").unwrap_or_else(|| {
+                panic!(
+                    "set OXIDE_TEST_INTERNAL_ROOT to a fresh private directory on the internal \
+                     volume before running this test (AGENTS.md, Rust test recipe), for example \
+                     `mktemp -d /private/tmp/oxide-internal.XXXXXX`"
+                )
+            });
+            let base = fs::canonicalize(&named).unwrap_or_else(|error| {
+                panic!(
+                    "OXIDE_TEST_INTERNAL_ROOT {} is not a usable directory: {error}",
+                    Path::new(&named).display()
+                )
+            });
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: geteuid has no preconditions.
+            let euid = unsafe { libc::geteuid() };
+            let metadata = fs::metadata(&base).unwrap();
+            assert!(metadata.is_dir(), "{} is not a directory", base.display());
+            assert_eq!(
+                metadata.uid(),
+                euid,
+                "{} is not owned by this user",
+                base.display()
+            );
+            assert_eq!(
+                metadata.permissions().mode() & 0o077,
+                0,
+                "{} is not private to this user",
+                base.display()
+            );
+            Self::at(&base)
+        }
+
+        fn at(base: &Path) -> Self {
             let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let root =
-                std::env::temp_dir().join(format!("oxide-prune-{}-{id}", std::process::id()));
+            let root = base.join(format!("oxide-prune-{}-{id}", std::process::id()));
             fs::create_dir(&root).unwrap();
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -6474,11 +6517,15 @@ mod tests {
     /// The legacy exception is volume-based: a checkout whose nearest
     /// existing ancestor is on the boot Data volume qualifies (scratch under
     /// /private/tmp is), and a missing ancestry chain is walked up, never
-    /// followed. The EACCES fixture is inert without its proof environment.
+    /// followed. The fixture comes from the explicit internal root
+    /// (`OXIDE_TEST_INTERNAL_ROOT`, AGENTS.md's Rust test recipe) because a
+    /// leased child's `TMPDIR` is on the selected pool's volume; the product's
+    /// own check proves that root qualifies, so a wrong root fails here. The
+    /// EACCES fixture is inert without its proof environment.
     #[cfg(target_os = "macos")]
     #[test]
     fn legacy_eligibility_is_proved_by_the_boot_data_volume() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::at_internal_root();
         on_boot_data_volume(&fixture.root.join("gone/deeper/checkout")).unwrap();
         assert!(!injected_eacces(&fixture.root));
     }
