@@ -958,7 +958,18 @@ failed exactly there). Fixture children carry the debug build's
 `OXIDE_TEST_HOME_FROM_ENV=1` account-home control, a freshly built environment
 that imports no ambient `OXIDE_*`/`XDG_*`/`CARGO_ENCODED_RUSTFLAGS`, and one
 frozen `RUSTFLAGS` shared with staging; the script's `--self-check` is a pure,
-pre-scratch 21-property regression of that construction. The proof covers: a
+pre-scratch 38-property regression of that construction. Before any
+`--locked` invocation, the fixture constructor establishes the crate's lock
+precondition with one bounded offline `cargo generate-lockfile` setup child in
+the fixture's private Cargo home (the package has no dependencies, so nothing
+is resolved and no network is used), and a pure predicate requires the lock to
+be manifest-consistent — a missing, header-less, mismatched or extra-package
+lock is refused rather than treated as valid. A source-only `--diagnostic`
+mode (not yet activated) records a recoverable oracle failure and continues
+only with cases whose declared dependencies are intact, skips every later case
+after a shared-state failure, aborts on any unknown child/device/writer outcome,
+and writes a bounded receipt labelled `qualified: false`; the default run still
+fails fast. The proof covers: a
 same-volume inherited `TMPDIR` kept canonically with no Oxide directory
 created and the inherited content untouched; absent, file, relative,
 unwritable, other-device and symlink-escaping values replaced by one owned

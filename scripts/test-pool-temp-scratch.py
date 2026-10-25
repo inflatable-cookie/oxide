@@ -69,6 +69,100 @@ Cases (each one is a real child, nothing is simulated):
     91-byte socket bound.
 
 
+
+
+Diagnostic mode (`--diagnostic`, source only in this phase; never executed
+here). The default proof still fails fast: the first failure stops it exactly
+as before. `--diagnostic` records a recoverable oracle failure and continues
+only with cases whose declared dependencies are all intact; a failure in a case
+that mutates shared state skips every later case, because that shared state is
+no longer positively known; and an unknown child, device, writer or
+infrastructure outcome aborts in both modes rather than being recorded as an
+oracle mismatch. It runs under the same qualified supervisor, the same 300 s
+and 512 MiB bounds and the same custody and cleanup rules, and it writes a
+bounded, distinct receipt labelled `qualified: false` with the per-case
+outcome, first fault, at most eight secondary faults and every truthful skip
+reason. A diagnostic receipt is never counted native evidence and never claims
+a PASS. No diagnostic run was made in this source phase; ROOT activates it
+separately after independent source review.
+
+Command/state premise walkthrough for all twelve executable cases. Each line
+names the executable commands, their working directory, the state the case
+needs, where that state is established in this file, and the output grammar the
+oracle reads. This is the source-level sweep used instead of a keep-going
+native run: the proof mutates one shared pool, account and image, so a
+mid-run snapshot cannot be re-entered safely without spending a counted
+native; every precondition below is therefore established by explicit code
+before the command that needs it.
+
+1. premise and oracle sweep (case 1): `oxide --version` and plain
+   `cargo check --offline --locked` in the fixture crate. State: crate files and
+   the manifest-consistent lock (`new_fixture` -> `make_fixture` +
+   `ensure_fixture_lock`, re-checked by `require_lock_precondition`), private
+   HOME/CARGO_HOME, resolved absolute toolchain home, `world.scratch` outside
+   the pool. Grammar: identity text; `cargo:warning=OXIDE-TEMP dir=<path>` on
+   Cargo's stderr; then `oxide metadata`/`oxide fmt` create no slot.
+2. same-volume inherited TMPDIR (case 2): `oxide check` with an inherited
+   directory inside the pool. State: `private_dir(inherited)`, same device as
+   `world.pool`, no slot scratch. Grammar: build-script stderr and the
+   `temp: inherited <canonical>` summary fragment.
+3. unusable inherited TMPDIR (case 3): same command over absent/file/relative/
+   unwritable/symlink values, plus a device-gated other-device value. State:
+   each bad value created in `replaced`; the pool device read from
+   `os.stat(canonical(world.pool))`. Grammar: `temp: oxide <path>` and the
+   scratch path under the pool payload.
+4. existing relative TMPDIR (case 4): `oxide check` from the crate with
+   `TMPDIR=rel-tmp` and `FIXTURE_CHDIR`. State: `crate/rel-tmp` exists; the
+   chdir target exists; manifest/lock as in case 1. Grammar: the post-chdir
+   `OXIDE-TEMP dir-after-chdir=` line and the `after-chdir` marker in the
+   qualified directory.
+5. aliases (case 5): `oxide check` twice (inherited and owned branches). State:
+   an inherited directory on the pool device; conflicting TMP/TEMP. Grammar:
+   the three `OXIDE-TEMP <NAME>=` lines.
+6. owned scratch observed while held (case 6): `oxide check` with a gated build
+   script (`FIXTURE_HOLD`), then `oxide status --measure`. State: the gated
+   writer announces `OXIDE-TEMP holding` and writes the 1 MiB marker, symlink
+   and hard link; the slot is held while the measurement runs. Grammar:
+   `OXIDE-TEMP dir=`, the measured `slot <id> ... allocated` line, and
+   `temp: oxide` in the measured status.
+7. normal release (case 7): no command; the assertion after case 6. State: the
+   released slot's `scratch_dirs()` must be gone.
+8. crash with a surviving group (case 8): gated `oxide check` killed by PID,
+   then `kill(-pgid, 0)` on the group the fixture reports, then `oxide check`.
+   State: the crate already built once (case 1); the gate file exists only when
+   the proof writes it; the leftover file is planted while the group is alive.
+   Grammar: `OXIDE-TEMP holding`/`dir=`/`pgid=`, then the recovery command's
+   `OXIDE-TEMP dir=`.
+9. test, exec and run children (case 9): `oxide test`, `oxide exec -- /bin/sh`,
+   `oxide run` with and without `RUN_HOLD`, then a competing `oxide check`.
+   State: manifest/lock from case 1; one binary so `default-run` resolves
+   without ambiguity; the test target writes into its temporary directory.
+   Grammar: Cargo's test result on **stdout** (checked in stdout+stderr), the
+   exec tool's `$TMPDIR/$TMP/$TEMP` on stdout, the run program's
+   `OXIDE-TEMP run=` line, and the competing command's own `temp:` line.
+10. refusals (case 10): `oxide check` against a link and a foreign directory in
+    the owned position, then against an over-bound pool. State: the crate built
+    once so a slot exists (`world.slot_roots()[0]`); the link and foreign entry
+    planted by the proof; the over-bound pool nested under the guard scratch.
+    Grammar: non-zero exit with `real directory`, `marker` and `Unix-socket
+    bound` on stderr, and no `OXIDE-TEMP dir=` line (no child ran).
+11. removable image and fallback (case 11): `hdiutil create|attach -owners on`,
+    `diskutil info -plist`, `oxide pool register-removable`, `oxide check`,
+    `hdiutil detach`, then `oxide check` again. State: one owned 128 MiB sparse
+    image in the guard scratch; ownership enabled before registration; the
+    internal `world.pool` already exists for the fallback. Grammar: the attach
+    plist's mount point, `GlobalPermissionsEnabled`, the build's `temp: oxide`
+    path under `<mount>/oxide-pool`, and the fallback path under
+    `world.pool/payload`.
+12. socket bound (case 12): `oxide check` with no inherited TMPDIR. State: the
+    pool and crate from earlier cases. Grammar: the build-script
+    `OXIDE-TEMP dir=` path, required to end in `scratch` and fit 91 bytes.
+
+Two analogous state/grammar errors found by this walkthrough and corrected in
+the same batch as the lock fix: (a) the `--locked` oracle ran without the lock
+precondition (the native-2 failure), and (b) case 9 read `test result: ok` from
+stderr, where Cargo never writes it.
+
 Fixed proof-authoring checklist sweep (Supervisor b18d0552), each item either
 an executable-body fact or an explicit not-applicable reason. `--self-check`
 is a pure, pre-scratch regression of items 1, 2, 3, 5 and 7; it creates no
@@ -119,7 +213,10 @@ supervisor's scratch.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
+import json
 import os
 import plistlib
 import re
@@ -137,6 +234,9 @@ FROZEN_RUSTFLAGS = "-C strip=symbols"
 # argv, which the pure self-check asserts.
 CARGO_BUILD_ARGV = ("cargo", "build", "-j", "1", "--locked", "--offline", "--bin", "oxide")
 CARGO_ORACLE_ARGV = ("cargo", "check", "--offline", "--locked")
+# Fixture setup, not an oracle: the pinned Cargo writes the fixture crate's own
+# lock offline in the fixture's private Cargo home before any `--locked` call.
+LOCK_ARGV = ("cargo", "generate-lockfile", "--offline")
 # macOS `sun_path`, including the NUL, less `/` and an eleven-byte socket name.
 SOCKET_PATH_BOUND = 91
 MIB = 1024 * 1024
@@ -178,14 +278,177 @@ CASE_NAMES = [
 ]
 
 
+MODE = {"diagnostic": False}
+# Bound on recorded faults in a diagnostic receipt (bytes and count).
+MAX_DIAGNOSTIC_FAULTS = 8
+MAX_DIAGNOSTIC_RECEIPT_BYTES = 64 * 1024
+
+
+class Recoverable(Exception):
+    """A declared oracle mismatch: the child state is known and closed."""
+
+
+class UnknownOutcome(Exception):
+    """A child, device, writer or infrastructure outcome this proof cannot
+    classify. Both modes stop; diagnostic mode never continues past it."""
+
+
 def fail(message: str) -> None:
-    print(f"pool-temp-scratch proof failed: {message}", file=sys.stderr)
-    sys.exit(1)
+    """A declared failure. `drive` stops on it by default and records it in
+    diagnostic mode; `main` turns an uncaught one into exit 1 with the message."""
+    raise Recoverable(message)
 
 
 def expect(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
+
+
+def abort(message: str) -> None:
+    """Stop in both modes: an unknown state is never recorded as an oracle
+    failure, never skipped over and never turned into a partial pass."""
+    raise UnknownOutcome(message)
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        abort(message)
+
+
+class ProofCase:
+    """One executable case, its own dependencies and its shared-state effect."""
+
+    def __init__(self, index: int, body, depends=(), mutates=False, label=None):
+        self.index = index
+        self.body = body
+        self.depends = tuple(depends)
+        self.mutates = mutates
+        self.name = label or CASE_NAMES[index]
+
+
+def diagnostic_receipt_path(root: str) -> str:
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+    base = evidence if evidence and os.path.isdir(evidence) else root
+    return os.path.join(base, "diagnostic-receipt.json")
+
+
+def diagnostic_record(outcomes, faults, skips, aborted) -> str:
+    """Bounded, distinct, explicitly unqualified diagnostic record.
+
+    It records what actually ran, the first fault, at most
+    `MAX_DIAGNOSTIC_FAULTS` secondary faults, every truthful skip reason and
+    whether the run aborted on an unknown outcome. It never claims
+    qualification and never invents a PASS.
+    """
+    record = {
+        "mode": "diagnostic",
+        "qualified": False,
+        "evidence_kind": "diagnostic-only, not counted native evidence",
+        "cases": [
+            {"case": case.name, "outcome": outcome, "detail": detail[:600]}
+            for case, outcome, detail in outcomes
+        ],
+        "first_fault": (
+            {"case": faults[0][0], "detail": faults[0][1][:1200]} if faults else None
+        ),
+        "secondary_faults": [
+            {"case": name, "detail": detail[:600]} for name, detail in faults[1:MAX_DIAGNOSTIC_FAULTS]
+        ],
+        "faults_recorded": min(len(faults), MAX_DIAGNOSTIC_FAULTS),
+        "faults_seen": len(faults),
+        "skips": [{"case": name, "reason": reason[:600]} for name, reason in skips],
+        "aborted_on_unknown_outcome": aborted,
+    }
+    text = json.dumps(record, indent=1, sort_keys=True)
+    if len(text.encode()) > MAX_DIAGNOSTIC_RECEIPT_BYTES:
+        text = text.encode()[:MAX_DIAGNOSTIC_RECEIPT_BYTES].decode(errors="ignore")
+    return text
+
+
+def write_diagnostic_receipt(path: str, outcomes, faults, skips, aborted) -> str:
+    with open(path, "wb") as handle:
+        handle.write(diagnostic_record(outcomes, faults, skips, aborted).encode())
+    return path
+
+
+def drive(cases, root, receipt=True) -> int:
+    """Run the cases, failing fast by default, or diagnosing when asked.
+
+    Default: the first failure stops the proof exactly as before. Diagnostic:
+    a declared oracle failure is recorded and the run continues only with cases
+    whose declared dependencies are all intact; a failure in a case that
+    mutates shared state skips every later case, because that shared state is
+    not positively known; an unknown child/device/writer/infrastructure
+    outcome aborts in both modes. Returns 0 only when every case passed.
+    """
+    outcomes = []
+    faults = []
+    skips = []
+    failed = set()
+    shared_state_unknown = None
+    aborted = False
+    for case in cases:
+        if shared_state_unknown is not None:
+            outcomes.append((case, "skipped", shared_state_unknown))
+            skips.append((case.name, shared_state_unknown))
+            continue
+        blocked = [dep for dep in case.depends if dep in failed]
+        if blocked:
+            reason = "depends on failed case(s) " + ", ".join(
+                str(dep + 1) for dep in blocked
+            )
+            outcomes.append((case, "skipped", reason))
+            skips.append((case.name, reason))
+            continue
+        try:
+            case.body()
+        except UnknownOutcome as error:
+            aborted = True
+            outcomes.append((case, "unknown", str(error)))
+            faults.append((case.name, str(error)))
+            break
+        except Recoverable as error:
+            failed.add(case.index)
+            outcomes.append((case, "fail", str(error)))
+            faults.append((case.name, str(error)))
+            if not MODE["diagnostic"]:
+                for remaining in cases[case.index + 1 :]:
+                    outcomes.append(
+                        (remaining, "not_run", "default mode stops at the first failure")
+                    )
+                break
+            if case.mutates:
+                shared_state_unknown = (
+                    f"case {case.index + 1} failed after mutating shared state"
+                )
+            continue
+        except Exception as error:  # noqa: BLE001 - an unclassified outcome stops
+            aborted = True
+            outcomes.append((case, "unknown", f"{type(error).__name__}: {error}"))
+            faults.append((case.name, f"{type(error).__name__}: {error}"))
+            break
+        outcomes.append((case, "pass", ""))
+    if MODE["diagnostic"] and receipt:
+        path = write_diagnostic_receipt(
+            diagnostic_receipt_path(root), outcomes, faults, skips, aborted
+        )
+        say(f"diagnostic receipt {path} (qualified: false)")
+        for case, outcome, detail in outcomes:
+            say(f"diagnostic {outcome}: {case.name}{(' - ' + detail) if detail else ''}")
+    if aborted:
+        print(
+            "pool-temp-scratch proof stopped on an unknown outcome: "
+            + (faults[-1][1] if faults else "unclassified"),
+            file=sys.stderr,
+        )
+        return 1
+    if faults:
+        print(
+            f"pool-temp-scratch proof failed: {faults[0][0]}: {faults[0][1]}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def say(message: str) -> None:
@@ -383,9 +646,9 @@ def stage_subject(root: str, toolchain_home: str) -> str:
         )
     if build.returncode:
         with open(log, encoding="utf-8") as handle:
-            fail(f"staging exit {build.returncode}: {handle.read()[-2000:]}")
+            abort(f"staging exit {build.returncode}: {handle.read()[-2000:]}")
     built = os.path.join(stage, "target", "debug", "oxide")
-    expect(os.path.isfile(built), f"staging produced no binary at {built}")
+    require(os.path.isfile(built), f"staging produced no binary at {built}")
     subject = os.path.join(root, "subject-oxide")
     shutil.copy2(built, subject)
     os.chmod(subject, 0o755)
@@ -506,6 +769,112 @@ def make_fixture(root: str, name: str) -> str:
     return crate
 
 
+def manifest_identity(manifest_text: str) -> tuple:
+    """The fixture manifest's own `[package]` name and version.
+
+    The fixture manifest is this script's own text, and the lock precondition
+    below is compared against it rather than against a copied constant.
+    """
+    name = re.search(r'^name\s*=\s*"([^"]+)"', manifest_text, re.MULTILINE)
+    version = re.search(r'^version\s*=\s*"([^"]+)"', manifest_text, re.MULTILINE)
+    expect(
+        name is not None and version is not None,
+        "the fixture manifest has no package name/version",
+    )
+    return name.group(1), version.group(1)
+
+
+def lock_precondition(manifest_text: str, lock_text: str) -> tuple:
+    """Whether a lock file is a valid, manifest-consistent precondition.
+
+    A dependency-free fixture crate's lock must carry a lock version header and
+    exactly the root package, with the manifest's name and version. A missing
+    lock, a missing header, a different package, a different version or an
+    extra package is not silently accepted: Cargo would either refuse the
+    `--locked` call or rebuild against a state this proof did not establish.
+    Returns `(ok, reason)` so the caller can say why.
+    """
+    name, version = manifest_identity(manifest_text)
+    if not lock_text.strip():
+        return False, "no lock file"
+    header = re.search(r"^version\s*=\s*(\d+)\s*$", lock_text, re.MULTILINE)
+    if header is None:
+        return False, "no lock version header"
+    if int(header.group(1)) < 3:
+        return False, f"unsupported lock version {header.group(1)}"
+    packages = re.findall(
+        r'^\[\[package\]\]\s*$\nname\s*=\s*"([^"]+)"\s*$\nversion\s*=\s*"([^"]+)"',
+        lock_text,
+        re.MULTILINE,
+    )
+    if len(packages) != 1:
+        return False, f"{len(packages)} package records for a dependency-free crate"
+    if packages[0] != (name, version):
+        return False, f"lock package {packages[0]} does not match manifest {(name, version)}"
+    return True, "manifest-consistent lock"
+
+
+def read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def require_lock_precondition(crate: str) -> None:
+    """Refuse unless the crate's lock is a valid precondition right now."""
+    ok, reason = lock_precondition(
+        read_text(os.path.join(crate, "Cargo.toml")),
+        read_text(os.path.join(crate, "Cargo.lock")),
+    )
+    expect(ok, f"the fixture crate's lock precondition is not met: {reason}")
+
+
+def ensure_fixture_lock(world: "World", crate: str) -> None:
+    """Establish the lock precondition with the pinned Cargo, offline.
+
+    This is a fixture-setup child of the future guarded proof, not an oracle:
+    it runs in the fixture's private Cargo home with the pinned toolchain and
+    `--offline`, on a dependency-free package, so it resolves nothing and
+    touches no network. Generating the lock here rather than hand-writing one
+    keeps its lockfile version the one this Cargo actually accepts, which a
+    hand-written lock could contradict under `--locked`.
+    """
+    ok, reason = lock_precondition(
+        read_text(os.path.join(crate, "Cargo.toml")),
+        read_text(os.path.join(crate, "Cargo.lock")),
+    )
+    expect(
+        not ok,
+        f"the fresh fixture crate already carries a lock precondition: {reason}",
+    )
+    setup = subprocess.run(
+        list(LOCK_ARGV),
+        cwd=crate,
+        env=world.env(),
+        capture_output=True,
+        text=True,
+        timeout=work_left(),
+    )
+    require(
+        setup.returncode == 0,
+        f"the fixture lock setup failed: {setup.stderr[-2000:]}",
+    )
+    require_lock_precondition(crate)
+
+
+def new_fixture(world: "World", name: str) -> str:
+    """The one constructor every fresh fixture crate goes through.
+
+    Crate files first, then the lock precondition, so no `--locked` invocation
+    can reach a crate whose lock state was never established.
+    """
+    crate = make_fixture(world.root, name)
+    ensure_fixture_lock(world, crate)
+    return crate
+
+
 class World:
     """The private account, pool, Cargo home and checkout of one proof run."""
 
@@ -620,6 +989,10 @@ def premise_sweep(world: World, crate: str) -> None:
         "oxide" in version.stdout + version.stderr,
         f"`oxide --version` printed no identity: {version.stdout}{version.stderr}",
     )
+    # The `--locked` oracle below requires the lock precondition to hold. It is
+    # established by the fixture constructor, and re-checked here so a missing
+    # or stale lock fails as a state fact rather than as Cargo's refusal.
+    require_lock_precondition(crate)
     # Oracle: plain Cargo's build script reports the inherited directory, so
     # the observation method really sees the child environment.
     plain_env = world.env()
@@ -1037,7 +1410,7 @@ def crash_and_recovery(world: World, crate: str) -> None:
         deadline = time.monotonic() + min(work_left(), 60)
         while time.monotonic() < deadline and not group_is_empty(pgid):
             time.sleep(0.1)
-        expect(
+        require(
             group_is_empty(pgid),
             f"the interrupted command's group {pgid} did not close",
         )
@@ -1083,9 +1456,10 @@ def spawns(world: World, crate: str) -> None:
     inherited = private_dir(os.path.join(world.pool, "spawn-tmp"))
     env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
     tested = world.run(["test"], cwd=crate, env=dict(env, TEMP_EXPECT_PREFIX=inherited))
+    results = tested.stdout + tested.stderr
     expect(
-        "test result: ok" in tested.stderr,
-        f"oxide test did not pass: {tested.stderr[-1500:]}",
+        "test result: ok" in results and "0 failed" in results,
+        f"oxide test did not pass: {results[-1500:]}",
     )
     tool = world.run(
         ["exec", "--", "/bin/sh", "-c", 'printf "%s\\n%s\\n%s" "$TMPDIR" "$TMP" "$TEMP"'],
@@ -1157,7 +1531,7 @@ def spawns(world: World, crate: str) -> None:
             if live_dir or live.poll() is not None:
                 break
             time.sleep(0.1)
-        expect(
+        require(
             bool(live_dir),
             "the live run program never announced itself in its owned directory",
         )
@@ -1186,7 +1560,7 @@ def spawns(world: World, crate: str) -> None:
         except subprocess.TimeoutExpired:
             live.kill()
             live.wait(timeout=10)
-            fail("the released run program did not exit")
+            abort("the released run program did not exit after its release")
         expect(live.returncode == 0, f"the run program exited {live.returncode}")
         expect(
             not os.path.exists(live_dir),
@@ -1310,7 +1684,7 @@ def removable(world: World, crate: str) -> None:
         text=True,
         timeout=work_left(),
     )
-    expect(created.returncode == 0, f"image creation failed: {created.stderr}")
+    require(created.returncode == 0, f"image creation failed: {created.stderr}")
     # The mount-root rule makes the drive root owner-only, so the owned image
     # is attached with ownership enabled, exactly as the accepted account-home
     # proof does, and that fact is confirmed before registration.
@@ -1319,17 +1693,20 @@ def removable(world: World, crate: str) -> None:
         capture_output=True,
         timeout=work_left(),
     )
-    expect(attached.returncode == 0, f"image attach failed: {attached.stderr!r}")
+    require(attached.returncode == 0, f"image attach failed: {attached.stderr!r}")
     mount = ""
     try:
-        entities = plistlib.loads(attached.stdout)["system-entities"]
-        mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
-        expect(
+        try:
+            entities = plistlib.loads(attached.stdout)["system-entities"]
+            mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
+        except (ValueError, KeyError, TypeError) as error:
+            abort(f"the attach output is unclassifiable: {error}")
+        require(
             len(mounts) == 1,
             f"expected one mounted volume for the owned image, got {mounts}",
         )
         mount = mounts[0]
-        expect(
+        require(
             mount.startswith("/Volumes/"),
             f"the owned image did not mount under /Volumes: {mount}",
         )
@@ -1338,9 +1715,13 @@ def removable(world: World, crate: str) -> None:
             capture_output=True,
             timeout=work_left(),
         )
-        expect(ownership.returncode == 0, "diskutil info failed for the mount")
-        expect(
-            plistlib.loads(ownership.stdout).get("GlobalPermissionsEnabled") is True,
+        require(ownership.returncode == 0, "diskutil info failed for the mount")
+        try:
+            enabled = plistlib.loads(ownership.stdout).get("GlobalPermissionsEnabled")
+        except ValueError as error:
+            abort(f"the diskutil output is unclassifiable: {error}")
+        require(
+            enabled is True,
             "the owned image is mounted without ownership enabled",
         )
         say(f"owned scratch image mounted at {mount} with ownership enabled")
@@ -1386,10 +1767,10 @@ def removable(world: World, crate: str) -> None:
         detached = subprocess.run(
             ["hdiutil", "detach", mount], capture_output=True, text=True
         )
-        expect(
+        require(
             detached.returncode == 0, f"ordinary detach failed: {detached.stderr}"
         )
-        expect(not os.path.exists(mount), f"the mount point {mount} was recreated")
+        require(not os.path.exists(mount), f"the mount point {mount} was recreated")
         # The registration still exists and its volume is gone, so this build
         # must go through the product's own fallback selection on the
         # original pool; it is not pointed at a fresh pool.
@@ -1575,6 +1956,146 @@ def self_check() -> int:
             argv[0] == "cargo" and argv[1] in {"build", "check"} and len(argv) > 2,
         )
 
+    # 3d. The fixture lock is a real state precondition, not just an argv
+    #     shape: a manifest-consistent lock passes; the pre-fix constructor
+    #     state (no lock), a missing header, a different package/version and an
+    #     undeclared extra package are all refused rather than treated as valid.
+    valid_lock = (
+        "# This file is automatically @generated by Cargo.\n"
+        "version = 4\n\n"
+        '[[package]]\nname = "tempcheck"\nversion = "0.1.0"\n'
+    )
+    ok, _reason = lock_precondition(MANIFEST, valid_lock)
+    property_true("manifest-consistent lock is a valid precondition", ok)
+    for label, text in (
+        ("missing lock", ""),
+        ("no lock version header", '[[package]]\nname = "tempcheck"\nversion = "0.1.0"\n'),
+        ("mismatched package name", valid_lock.replace('"tempcheck"', '"other"')),
+        ("mismatched version", valid_lock.replace('"0.1.0"', '"9.9.9"')),
+        (
+            "undeclared extra package",
+            valid_lock + '\n[[package]]\nname = "dep"\nversion = "1.0.0"\n',
+        ),
+    ):
+        ok, _reason = lock_precondition(MANIFEST, text)
+        property_true(f"refuses {label}", not ok)
+    property_true(
+        "negative parent breaks the lock precondition",
+        not lock_precondition(MANIFEST, "")[0],
+    )
+
+    # 3e. The diagnostic driver's semantics, with fake cases only: default mode
+    #     stops at the first failure; diagnostic mode records it, skips only
+    #     cases that declare a dependency on it, still runs independent cases,
+    #     skips every later case after a shared-state mutation failed, aborts on
+    #     an unknown outcome in both modes, and its receipt is bounded and
+    #     explicitly unqualified.
+    ran = []
+
+    def body(tag, action=None):
+        def run():
+            ran.append(tag)
+            if action is not None:
+                action()
+        return run
+
+    def fail_body(tag, message="declared mismatch"):
+        def run():
+            ran.append(tag)
+            fail(message)
+        return run
+
+    def unknown_body(tag):
+        def run():
+            ran.append(tag)
+            abort("unknown child state")
+        return run
+
+    def scenarios(diagnostic: bool, cases):
+        saved = MODE["diagnostic"]
+        MODE["diagnostic"] = diagnostic
+        ran.clear()
+        try:
+            # The expected-failure scenarios keep the proof's own stderr clean.
+            with contextlib.redirect_stderr(io.StringIO()):
+                status = drive(cases, "/nonexistent", receipt=False)
+        finally:
+            MODE["diagnostic"] = saved
+        return status, list(ran)
+
+    failfast_cases = [
+        ProofCase(0, body("a"), label="a"),
+        ProofCase(1, fail_body("b"), depends=(0,), label="b"),
+        ProofCase(2, body("c"), depends=(0,), label="c"),
+    ]
+    status, ran_cases = scenarios(False, failfast_cases)
+    property_true(
+        "default mode stops at the first failure", status == 1 and ran_cases == ["a", "b"]
+    )
+
+    diagnostic_cases = [
+        ProofCase(0, body("a"), label="a"),
+        ProofCase(1, fail_body("b"), label="b"),
+        ProofCase(2, body("c"), depends=(1,), label="c"),
+        ProofCase(3, body("d"), depends=(0,), label="d"),
+    ]
+    status, ran_cases = scenarios(True, diagnostic_cases)
+    property_true(
+        "diagnostic records a failure and still runs independent cases",
+        status == 1 and ran_cases == ["a", "b", "d"],
+    )
+
+    mutating_cases = [
+        ProofCase(0, fail_body("a"), mutates=True, label="a"),
+        ProofCase(1, body("b"), label="b"),
+        ProofCase(2, body("c"), label="c"),
+    ]
+    status, ran_cases = scenarios(True, mutating_cases)
+    property_true(
+        "diagnostic skips every later case after a shared-state failure",
+        status == 1 and ran_cases == ["a"],
+    )
+
+    unknown_cases = [
+        ProofCase(0, body("a"), label="a"),
+        ProofCase(1, unknown_body("b"), label="b"),
+        ProofCase(2, body("c"), label="c"),
+    ]
+    for diagnostic in (False, True):
+        status, ran_cases = scenarios(diagnostic, unknown_cases)
+        property_true(
+            f"unknown outcome aborts in {'diagnostic' if diagnostic else 'default'} mode",
+            status == 1 and ran_cases == ["a", "b"],
+        )
+
+    outcomes = [
+        (ProofCase(0, body("a"), label="a"), "pass", ""),
+        (ProofCase(1, body("b"), label="b"), "fail", "declared mismatch"),
+        (ProofCase(2, body("c"), depends=(1,), label="c"), "skipped", "depends on 2"),
+    ]
+    record = diagnostic_record(
+        outcomes, [("b", "declared mismatch")], [("c", "depends on 2")], False
+    )
+    property_true(
+        "diagnostic receipt is explicitly unqualified",
+        '"qualified": false' in record and "diagnostic-only" in record,
+    )
+    property_true(
+        "diagnostic receipt records the first fault and the skip",
+        '"first_fault"' in record and "declared mismatch" in record and "depends on 2" in record,
+    )
+    property_true(
+        "diagnostic receipt never claims a pass",
+        '"passed"' not in record and "qualified: true" not in record,
+    )
+    many = [(ProofCase(i, body(str(i)), label=str(i)), "fail", "x" * 900) for i in range(40)]
+    bounded = diagnostic_record(many, [("0", "x" * 900)] * 40, [], False)
+    property_true(
+        "diagnostic receipt is bounded",
+        len(bounded.encode()) <= MAX_DIAGNOSTIC_RECEIPT_BYTES
+        and json.loads(bounded)["faults_recorded"] == MAX_DIAGNOSTIC_FAULTS,
+    )
+
     # 4. Missing or unusable provenance refuses instead of hiding the toolchain
     #    behind a fake HOME, and it refuses for every shape.
     for label, environ in (
@@ -1616,15 +2137,77 @@ def self_check() -> int:
     return 0
 
 
+def release_removed(world: "World") -> None:
+    """Case 7: a released slot keeps no owned directory."""
+    case(CASE_NAMES[6])
+    expect(
+        not any(os.path.exists(path) for path in world.scratch_dirs()),
+        "a released slot kept an owned directory",
+    )
+
+
+def proof_cases(world: "World", crate: str) -> list:
+    """The twelve default cases with their declared dependencies.
+
+    `mutates` marks a case that changes shared state (the pool's slots, the
+    removable registration or the fixture checkout). A diagnostic failure in
+    such a case skips every later case, because that shared state is no longer
+    positively known; a failure in a read-only case skips only its declared
+    dependents.
+    """
+    return [
+        ProofCase(0, lambda: premise_sweep(world, crate)),
+        ProofCase(1, lambda: inherited_kept(world, crate), depends=(0,)),
+        ProofCase(2, lambda: replaced(world, crate), depends=(0,), mutates=True),
+        ProofCase(3, lambda: relative_inherited(world, crate), depends=(0,), mutates=True),
+        ProofCase(4, lambda: aliases(world, crate), depends=(0,), mutates=True),
+        ProofCase(5, lambda: accounting(world, crate), depends=(0,), mutates=True),
+        ProofCase(6, lambda: release_removed(world), depends=(5,)),
+        ProofCase(7, lambda: crash_and_recovery(world, crate), depends=(0,), mutates=True),
+        ProofCase(8, lambda: spawns(world, crate), depends=(0,), mutates=True),
+        ProofCase(9, lambda: refusals(world, crate), depends=(0,), mutates=True),
+        ProofCase(10, lambda: removable(world, crate), depends=(0,), mutates=True),
+        ProofCase(11, lambda: path_bound(world, crate), depends=(0, 10), mutates=True),
+    ]
+
+
 def main(argv: list[str]) -> int:
+    try:
+        return run_session(argv)
+    except Recoverable as error:
+        print(f"pool-temp-scratch proof failed: {error}", file=sys.stderr)
+        return 1
+    except UnknownOutcome as error:
+        print(
+            f"pool-temp-scratch proof stopped on an unknown outcome: {error}",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def run_session(argv: list[str]) -> int:
     if argv and argv[0] == "--self-check":
         # Pure, before any scratch, toolchain subprocess or staging.
         return self_check()
     if argv and argv[0] == "--plan":
         plan()
         return 0
-    if argv:
-        fail(f"unknown argument {argv[0]!r}; use --plan or --self-check")
+    diagnostic = bool(argv) and argv[0] == "--diagnostic"
+    if diagnostic and len(argv) != 1:
+        fail(f"unknown argument {argv[1]!r}; --diagnostic takes no argument")
+    if argv and not diagnostic:
+        fail(f"unknown argument {argv[0]!r}; use --plan, --self-check or --diagnostic")
+    if diagnostic:
+        # Same qualified guard, same bounds: the supervisor's deadline and
+        # scratch root are required exactly as in the default proof, and the
+        # mode only changes failure handling, never custody or cleanup.
+        require(
+            os.environ.get("OXIDE_PROOF_DEADLINE_NS") is not None,
+            "the diagnostic mode runs only under the qualified supervisor "
+            "(OXIDE_PROOF_DEADLINE_NS is absent)",
+        )
+        MODE["diagnostic"] = True
+        say("diagnostic mode: record recoverable oracle failures, abort on unknown outcomes")
     # The toolchain provenance is decided from the caller's real account before
     # any private fixture HOME exists; an unusable one refuses here, before
     # scratch or staging effects.
@@ -1639,23 +2222,10 @@ def main(argv: list[str]) -> int:
     subject = stage_subject(world_root, toolchain_home)
     say(f"staged {subject} sha256={sha256_file(subject)}")
     world = World(world_root, subject, toolchain_home)
-    crate = make_fixture(world_root, "tempcheck")
-    premise_sweep(world, crate)
-    inherited_kept(world, crate)
-    replaced(world, crate)
-    relative_inherited(world, crate)
-    aliases(world, crate)
-    accounting(world, crate)
-    case(CASE_NAMES[6])
-    expect(
-        not any(os.path.exists(path) for path in world.scratch_dirs()),
-        "a released slot kept an owned directory",
-    )
-    crash_and_recovery(world, crate)
-    spawns(world, crate)
-    refusals(world, crate)
-    removable(world, crate)
-    path_bound(world, crate)
+    crate = new_fixture(world, "tempcheck")
+    status = drive(proof_cases(world, crate), root)
+    if status:
+        return status
     print(
         f"pool-temp-scratch proof passed: {len(CASES)} cases, "
         f"{time.perf_counter() - STARTED:.1f}s"
