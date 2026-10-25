@@ -3594,7 +3594,19 @@ The script also has an explicitly opt-in `--diagnostic` collection mode. It
 records recoverable oracle failures and skips dependent or tainted premises,
 while unknown device/writer effects and infrastructure errors abort. Its bounded
 receipt is marked diagnostic and unqualified; it never supplies counted PASS
-or closure credit. The default counted mode remains fail-fast. The mode is
+or closure credit. The default counted mode remains fail-fast. Its case-16
+watched clean runs on the internal `directory-budget-v1` store under the pool's
+OWN recorded permanent registration: because drive mode comes only from that
+registration, and a second registration on the one owned image is impossible by
+production rule (a sub-directory is not `diskutil`'s mount point, the shared
+`<mount>/oxide-pool` payload is not empty, and `pool set-mode` refuses an absent
+registration), the fixture reuses the existing low-reserve pattern to raise the
+recorded reserve above the image's free space. Selection then falls back to the
+directory-budget store, whose watchdog is the reserve watchdog, while permanent
+mode still holds; the exact recorded bytes are restored before cases 17-20. Its
+oracles assert those prerequisites instead of assuming them, and a pure
+counterfactual control exercises the unregistered-refusal, forced-directory-
+budget and impossible-auxiliary-registration cases. The mode is
 routed by its own heavy selector, `effigy rust:profile-outputs:diagnostic`
 (the counted command below with `--diagnostic` appended), so the counted
 selector keeps its unchanged fail-fast command; both share the same

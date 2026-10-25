@@ -38,9 +38,17 @@ oracle. The fixture `.gitignore` uses `/target` (valid for a whole-target link
 and as a member parent rule) and a separate `/target/` parent-ignore control
 proves a directory-only rule refuses the legacy link but accepts profile member
 links. The top-level preservation control lives on its own checkout so the
-cleaned checkout carries no foreign entry. The selected-clean reserve stop uses
-a positively created directory-budget pool and a gated delegating fake cargo;
-the removable watchdog is removal-only and is never claimed as a reserve stop.
+cleaned checkout carries no foreign entry. The selected-clean reserve stop runs
+on the internal directory-budget store while the pool's OWN recorded permanent
+registration still grants drive mode: the existing low-reserve pattern raises
+that recorded reserve above the image's free space, so selection falls back to
+the directory-budget store (reserve watchdog) and a dedicated seeded checkout
+with its own receipt, links and root is cleaned under a gated delegating fake
+cargo. A second registration on the same image is impossible by production rule
+(a sub-directory is not a mount point, the shared payload is not empty, and
+`pool set-mode` refuses an absent registration), so no auxiliary pool, second
+image or hand-written registration is created; the removable watchdog is
+removal-only and is never claimed as a reserve stop.
 A SEPARATE deliberate low-reserve control temporarily raises this
 private pool's recorded registration reserve to 200 MiB (above the image's free
 space), asserts the honest checkout-local fallback and its warning, then
@@ -259,7 +267,7 @@ def plan_only() -> int:
     print("  time estimate   two sequential 6-job stagings ~45-80 s each, 25 s setup,")
     print("                  150-240 s cases (base control, p0/parent races, unknown")
     print("                  custody, prune oracles), plus the controls added in this phase:")
-    print("                  a seeded directory-budget adopt+build for the watched clean,")
+    print("                  a seeded directory-budget fallback adopt+build for the watched clean,")
     print("                  three extra fixture builds/adopts (mixed run, second eligible")
     print("                  gone root, cleared-target parent-ignore), settled-background")
     print("                  waits and additional dry runs (~60-90 s), 30 s cleanup")
@@ -299,8 +307,9 @@ def plan_only() -> int:
     print("                  rows (SYNTHETIC INJECTED AUTHORITY, not a bind-produced")
     print("                  receipt) keeps that root; a second, distinct eligible gone")
     print("                  root is a candidate in the SAME preview")
-    print("  clean           the reserve stop uses a positively created directory-budget")
-    print("                  pool with a gated delegating fake cargo; the removable")
+    print("  clean           the reserve stop runs on the internal directory-budget store")
+    print("                  under the pool's own permanent registration (low-reserve")
+    print("                  fallback) with a gated delegating fake cargo; the removable")
     print("                  watchdog is removal-only and is not claimed as a reserve stop")
     print("  environment     one private HOME, CARGO_HOME and directory pool per session")
     print("  diagnostic      ONE opt-in --diagnostic run records every oracle failure,")
@@ -849,6 +858,98 @@ def pure_reserve_stop_control() -> None:
             continue
         raise AssertionError(f"the reserve-stop parser accepted {why}")
     print("pure reserve-stop control: ok", flush=True)
+
+
+def watched_clean_premise_sequence(registration, free_bytes: int) -> dict:
+    """Model ONE case-16 fixture-setup sequence over the recorded registration.
+
+    `registration` is the pool's recorded `removable.json` (or None), exactly what
+    `removable::read_registration` returns. The model mirrors the production rules
+    the watched-clean fixture depends on:
+
+    * `outputs::Context::mode` reads the drive mode from that one document, so an
+      unregistered pool has no mode and `outputs plan`/`adopt` refuse it.
+    * `removable::select` keeps the registration's mode but selects the internal
+      store when the registration is unusable (available <= reserve), which is
+      the directory-budget store whose watchdog is the reserve watchdog.
+    """
+    mode = registration.get("mode") if registration else None
+    refused = mode != "permanent"
+    usable = not refused and free_bytes > registration["reserve_bytes"]
+    return {
+        "mode": mode,
+        "adopt_refused": refused,
+        "selected_store": "external" if usable else "internal-directory-budget",
+        "reserve_watchdog": (not refused) and not usable,
+    }
+
+
+def auxiliary_registration_possible(
+    diskutil_mount_point: str, given_path: str, payload_entries: int, set_mode_registered: bool
+) -> dict:
+    """Whether production could register a SECOND provider on the same image.
+
+    `removable::register` requires `diskutil info <path>` to report `MountPoint`
+    equal to the given path (a sub-directory of a volume is not a mount point),
+    `init_volume_pool` refuses a non-empty `<mount>/oxide-pool`, and `set_mode`
+    refuses an absent registration without creating one.
+    """
+    return {
+        "register_refused": diskutil_mount_point != given_path or payload_entries != 0,
+        "set_mode_refused": not set_mode_registered,
+    }
+
+
+def pure_watched_clean_premise_control() -> None:
+    """Pure counterfactual of the ACTUAL case-16 fixture preconditions.
+
+    No subprocess, no fixture, no device: it exercises the three registration
+    states the fixture used to assume, and the production rules that make an
+    auxiliary registration on the one owned image impossible.
+    """
+    image_free = 120 * 1024 * 1024
+    recorded = {"version": 2, "mode": "permanent", "reserve_bytes": 16 * 1024 * 1024}
+    raised = dict(recorded, reserve_bytes=LOW_RESERVE_MIB * 1024 * 1024)
+    # (a) The premise that failed diagnostic 1: an auxiliary pool control with no
+    # registration has no drive mode, so adopt refuses and no watchdog is claimed.
+    absent = watched_clean_premise_sequence(None, image_free)
+    expect(absent["mode"] is None, "a pool without a registration reported a drive mode")
+    expect(absent["adopt_refused"], "an unregistered pool did not refuse adopt")
+    expect(not absent["reserve_watchdog"], "an unregistered pool claimed a reserve watchdog")
+    # (b) The corrected sequence: the pool's OWN recorded permanent registration
+    # still grants the mode, and the low-reserve pattern forces the internal
+    # directory-budget store with the reserve watchdog at the same time.
+    forced = watched_clean_premise_sequence(raised, image_free)
+    expect(forced["mode"] == "permanent", "the corrected premise lost permanent mode")
+    expect(not forced["adopt_refused"], "the corrected premise still refused adopt")
+    expect(
+        forced["selected_store"] == "internal-directory-budget",
+        f"the corrected premise selected {forced['selected_store']}",
+    )
+    expect(forced["reserve_watchdog"], "the corrected premise did not select the reserve watchdog")
+    # (c) A registration that is still usable selects the external store: the
+    # low-reserve pattern is what forces the internal store, and it is restored.
+    usable = watched_clean_premise_sequence(recorded, image_free)
+    expect(usable["selected_store"] == "external", "a usable registration lost the external store")
+    expect(not usable["reserve_watchdog"], "a usable registration claimed a reserve watchdog")
+    expect(
+        json.loads(json.dumps(recorded, indent=2) + "\n") == recorded,
+        "the restored registration document does not round-trip",
+    )
+    # (d) A second provider for the same image is impossible: a sub-directory is
+    # not a mount point, the shared payload is not empty, and set-mode has no
+    # registration to update. This is why the fixture reuses the known registration.
+    subdirectory = auxiliary_registration_possible("/Volumes/Owned", "/Volumes/Owned/aux", 6, False)
+    expect(subdirectory["register_refused"], "a sub-directory mount point was registerable")
+    expect(subdirectory["set_mode_refused"], "set-mode accepted an absent registration")
+    same_mount = auxiliary_registration_possible("/Volumes/Owned", "/Volumes/Owned", 6, False)
+    expect(same_mount["register_refused"], "a non-empty payload directory was registerable")
+    fresh = auxiliary_registration_possible("/Volumes/Owned", "/Volumes/Owned", 0, True)
+    expect(
+        not fresh["register_refused"] and not fresh["set_mode_refused"],
+        "a fresh payload with a present registration became unreachable",
+    )
+    print("pure watched-clean premise control: ok", flush=True)
 
 
 class _FakeCustodyChild:
@@ -2363,6 +2464,7 @@ def run(proof: Proof, repo: str) -> None:
     pure_attachment_facts_control()
     pure_slot_state_control()
     pure_reserve_stop_control()
+    pure_watched_clean_premise_control()
     pure_child_custody_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
@@ -3543,11 +3645,24 @@ def run(proof: Proof, repo: str) -> None:
             expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
             # The selected clean runs the existing pool watchdog. The REMOVABLE
             # watchdog is removal-only (its reserve trigger is disabled), so the
-            # reserve stop is exercised through a positively created directory-budget
-            # pool: a gated fake cargo that delegates `locate-project` and every other
-            # non-clean command to the real cargo starts the recorded group FIRST, then
-            # a below-reserve reading stops it and the stop is reported.
-            dirpool = os.path.join(proof.root, "clean-pool")
+            # reserve stop must be exercised on the internal directory-budget store
+            # while the pool still grants permanent drive mode. Production authority
+            # for that mode is the pool's own recorded registration
+            # (`removable::read_registration` -> `Context::mode`), and no second
+            # provider can be created on this one owned image: an auxiliary
+            # directory-budget pool can neither register the same image
+            # (`init_volume_pool` refuses a non-empty `<mount>/oxide-pool`, and
+            # `register` requires `diskutil`'s MountPoint to equal the given path, so
+            # a sub-directory is not a mount point) nor `pool set-mode` an absent
+            # registration. So this fixture reuses the ONE owned image and its known
+            # registration with the existing low-reserve pattern: a recorded reserve
+            # above the image's free space makes selection fall back to the internal
+            # directory-budget store (Statfs watchdog) with the mode still permanent.
+            # A dedicated checkout is adopted, seeded and cleaned here with its OWN
+            # receipt, member links and root in this pool; no receipt or registry
+            # authority is copied, no second pool, image or hand-written registration
+            # is created, and `first` is never cleaned under another context. The
+            # exact registration bytes are restored after the stop, before 17-20.
             real_cargo = shutil.which("cargo")
             expect(real_cargo is not None, "16: no real cargo on PATH for the fake to delegate to")
             binaries = os.path.join(proof.root, "fake-bin")
@@ -3574,59 +3689,104 @@ def run(proof: Proof, repo: str) -> None:
                 handle.write(str(23 * 1024 * 1024 * 1024))
             env = {
                 **proof.env,
-                "OXIDE_POOL": dirpool,
-                "OXIDE_POOL_BACKEND": "directory-budget",
                 "PATH": binaries + os.pathsep + proof.env.get("PATH", ""),
                 "OXIDE_CLEAN_GATE": gate,
                 "OXIDE_TEST_WATCHDOG_READINGS": readings,
             }
-            # A5: the watched clean runs in the checkout whose OWN receipt and custody
-            # live in this directory-budget pool. It is adopted and built here, so no
-            # receipt authority is copied across pools and `first` (a primary-pool
-            # checkout) is never cleaned under this pool's context.
-            seeded = make_checkout(proof, "clean-pool-fixture")
-            os.makedirs(os.path.join(seeded, "target"))
-            code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "16 clean pool adopt", seeded, env)
-            expect(code == 0, f"16: creating the directory-budget pool failed: {stderr}")
-            code, _, stderr = perm.oxide_env(proof, ["build"], "16 clean pool seed", seeded, env)
-            expect(code == 0, f"16: seeding the directory-budget pool failed: {stderr}")
-            seeded_root = root_of(dirpool, seeded)
-            expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
-            seeded_receipt = perm.read_bytes(receipt_file(dirpool, seeded))
-            child = perm.start_child(proof, [proof.binary, "clean", "-p", "profileapp"], seeded, env)
-            CUSTODY.track(child, gate, "16 watched clean")
-            perm.wait_for(os.path.join(gate, "started"), "16 watched clean writer start")
-            with open(readings, "w", encoding="utf-8") as handle:
-                handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
-            code, _, stderr = perm.finish_child(proof, child, "16 watched clean")
-            CUSTODY.finished(child)
-            # A11: the stop is judged by the source-defined report, not by a word
-            # match. watchdog.rs::report emits the injected reason, the reading and
-            # trigger, a concrete Cargo group, the sampled minimum, the overshoot and
-            # a confirmed closure latency; the clean command then returns the child's
-            # SIGNAL-derived status (process::exit_code), TERM -> 143 and 137 only if
-            # the stop escalated to KILL. An unrelated nonzero or a bare 1 fails here.
-            stop_trigger = 22 * 1024 * 1024 * 1024
-            facts = reserve_stop_facts(stderr, stop_trigger)
+            registration_file = perm.registration_path(pool)
+            recorded_registration = perm.read_bytes(registration_file)
+            registration = json.loads(recorded_registration)
+            # Prerequisite 1, asserted rather than assumed (the premise that failed
+            # diagnostic 1): this pool's recorded registration grants permanent mode.
             expect(
-                facts["reading"] == stop_trigger - 4096,
-                f"16: the reported reading is {facts['reading']}, not the injected trigger-4096: {facts['line']}",
+                registration.get("mode") == "permanent",
+                f"16: the fixture pool is not registered in permanent mode: {registration.get('mode')}",
             )
+            registration["reserve_bytes"] = LOW_RESERVE_MIB * 1024 * 1024
+            with open(registration_file, "w", encoding="utf-8") as handle:
+                json.dump(registration, handle, indent=2)
+                handle.write("\n")
+            os.chmod(registration_file, 0o600)
+            try:
+                seeded = make_checkout(proof, "watched-clean-fixture")
+                os.makedirs(os.path.join(seeded, "target"))
+                code, _, stderr = perm.oxide_env(
+                    proof, ["outputs", "adopt"], "16 watched clean adopt", seeded, env
+                )
+                expect(code == 0, f"16: adopting the watched-clean checkout failed: {stderr}")
+                # Prerequisite 2: the adopt is permanent-mode and selects the
+                # checkout-local fallback root, never an external placement.
+                expect(
+                    "local fallback root" in stderr,
+                    f"16: the watched-clean adopt did not select the local fallback root: {stderr}",
+                )
+                code, _, stderr = perm.oxide_env(
+                    proof, ["build"], "16 watched clean seed", seeded, env
+                )
+                expect(code == 0, f"16: seeding the watched-clean checkout failed: {stderr}")
+                # Prerequisite 3: selection really is the internal directory-budget
+                # store (the reserve watchdog) while permanent mode stays in force.
+                expect(
+                    "permanent removable mode fell back to the internal pool" in stderr,
+                    f"16: the seeded build did not report the honest permanent-mode fallback: {stderr}",
+                )
+                expect(
+                    "directory-budget-v1" in stderr,
+                    f"16: the seeded build did not use the directory-budget store: {stderr}",
+                )
+                seeded_root = root_of(pool, seeded)
+                expect(
+                    seeded_root.startswith(seeded + os.sep + ".oxide-outputs" + os.sep),
+                    f"16: the watched-clean root {seeded_root} is not the checkout-local fallback",
+                )
+                expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
+                seeded_receipt = perm.read_bytes(receipt_file(pool, seeded))
+                child = perm.start_child(
+                    proof, [proof.binary, "clean", "-p", "profileapp"], seeded, env
+                )
+                CUSTODY.track(child, gate, "16 watched clean")
+                perm.wait_for(os.path.join(gate, "started"), "16 watched clean writer start")
+                with open(readings, "w", encoding="utf-8") as handle:
+                    handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
+                code, _, stderr = perm.finish_child(proof, child, "16 watched clean")
+                CUSTODY.finished(child)
+                # A11: the stop is judged by the source-defined report, not by a word
+                # match. watchdog.rs::report emits the injected reason, the reading and
+                # trigger, a concrete Cargo group, the sampled minimum, the overshoot and
+                # a confirmed closure latency; the clean command then returns the child's
+                # SIGNAL-derived status (process::exit_code), TERM -> 143 and 137 only if
+                # the stop escalated to KILL. An unrelated nonzero or a bare 1 fails here.
+                stop_trigger = 22 * 1024 * 1024 * 1024
+                facts = reserve_stop_facts(stderr, stop_trigger)
+                expect(
+                    facts["reading"] == stop_trigger - 4096,
+                    f"16: the reported reading is {facts['reading']}, not the injected trigger-4096: {facts['line']}",
+                )
+                expect(
+                    code in reserve_stop_status(facts),
+                    f"16: the clean exited {code}, which the reported stop does not permit "
+                    f"({'TERM or KILL' if facts['escalated'] else 'TERM only'}): {facts['line']}",
+                )
+                # The stopped clean keeps the seeded checkout's own authority: same
+                # links, same receipt bytes, root still present.
+                expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
+                expect(
+                    perm.read_bytes(receipt_file(pool, seeded)) == seeded_receipt,
+                    "16: the stopped clean changed the seeded receipt bytes",
+                )
+                expect(os.path.isdir(seeded_root), "16: the stopped clean removed the seeded root")
+                with open(os.path.join(gate, "release"), "wb") as handle:
+                    handle.write(b"release")
+            finally:
+                # Restore the exact recorded registration bytes this fixture changed
+                # (cases 17-20 depend on the unchanged permanent registration).
+                with open(registration_file, "wb") as handle:
+                    handle.write(recorded_registration)
+                os.chmod(registration_file, 0o600)
             expect(
-                code in reserve_stop_status(facts),
-                f"16: the clean exited {code}, which the reported stop does not permit "
-                f"({'TERM or KILL' if facts['escalated'] else 'TERM only'}): {facts['line']}",
+                perm.read_bytes(registration_file) == recorded_registration,
+                "16: the watched-clean fixture did not restore the recorded registration",
             )
-            # The stopped clean keeps the seeded checkout's own authority: same links,
-            # same receipt bytes, root still present.
-            expect_layout(seeded, {"debug": f"link:{seeded_root}", "release": f"link:{seeded_root}"})
-            expect(
-                perm.read_bytes(receipt_file(dirpool, seeded)) == seeded_receipt,
-                "16: the stopped clean changed the seeded receipt bytes",
-            )
-            expect(os.path.isdir(seeded_root), "16: the stopped clean removed the seeded root")
-            with open(os.path.join(gate, "release"), "wb") as handle:
-                handle.write(b"release")
             DIAG.finished("16.1")
         except BaseException as error:
             DIAG.failed_step(proof, "16.1", error)
@@ -4304,6 +4464,7 @@ def main() -> int:
         pure_attachment_facts_control()
         pure_slot_state_control()
         pure_reserve_stop_control()
+        pure_watched_clean_premise_control()
         pure_child_custody_control()
         return 0
     if arguments == [DIAGNOSTIC_ARGUMENT]:
