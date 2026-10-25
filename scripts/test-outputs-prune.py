@@ -3,9 +3,11 @@
 
 Run only as an Effigy heavy task under the qualified shared supervisor
 (`scripts/bounded-test.py`, SHA-256
-5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2, the
-oxide#147 qualification; an earlier declaration named d89115f1, which is
-historical):
+bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924, the
+oxide#151 supervisor merged from main af08749c with its exact qualification
+files — bootstrap `scripts/qualify-supervisor.py` 585e33956b0e9b0cce2d45bc85726e1202952c1b500d64da6fa630ade78e4a95
+and suite `scripts/test_supervisor.py` 37ea34f049341b28d7ca2ba4e87dd666527a0146d249e307f5c78b3461ccc9c7;
+earlier declarations named 5e5b6617 and d89115f1, which are historical):
 
   rust:outputs-prune             the counted proof (fail-fast)
   rust:outputs-prune:diagnostic  the same script with `--diagnostic`
@@ -270,7 +272,7 @@ def _load(name: str, file: str):
     return module
 
 
-SUPERVISOR = "5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2"
+SUPERVISOR = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 22

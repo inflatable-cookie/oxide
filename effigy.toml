@@ -30,6 +30,12 @@ minimum_effigy_version = "0.14.0"
 # The shared session supervisor's pure cases (oxide#109): fake clock, process
 # table, signals and readings; spawns nothing. Not the qualification.
 "proof:supervisor:test" = "python3 scripts/test_supervisor.py --pure"
+# Effect-free readiness for the selected host (oxide#151): path, mode, owner and
+# device metadata only. Creates nothing (an absent private leaf is reported as
+# planned), never sweeps, marks, forks the deadline actor or launches the
+# candidate. Point-in-time readiness, not a reservation, admission or
+# qualification; the invoked proof re-checks everything in its own setup.
+"proof:supervisor:preflight" = "python3 scripts/qualify-supervisor.py --preflight"
 # Builds the unpublished oxide-storage-inventory binary and proves the
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
@@ -298,8 +304,9 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the qualified shared supervisor (`scripts/bounded-test.py` SHA-256
-# 5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2,
-# oxide#147): 360 s, 512 MiB monitored scratch, 30 s work shutdown margin, one
+# bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924,
+# the merged oxide#151 supervisor): 360 s, 512 MiB monitored scratch, 30 s work
+# shutdown margin, one
 # owned 128 MiB scratch image, ordinary detach. Fence and initialization, root
 # nonces, shared and cancelled reservations, snapshot, overflow, eligibility,
 # receiptless legacy roots, custody, containment, four crash boundaries,
