@@ -183,9 +183,21 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # reports the longest injected path in bytes and characters against the
 # 91-byte socket bound. No live pool, registered drive, install or consumer is
 # touched. Not a benchmark and not an alias for full QA.
+# PROPOSED POLICY EXCEPTION, NOT YET ACCEPTED. The oxide#136 proof needs a
+# genuine *internal* directory pool, and the product correctly refuses a
+# directory-budget internal pool on an external volume, so this one recipe
+# declares the internal root explicitly (`--root-parent /private/tmp`) instead
+# of the qualified supervisor's selected-volume default. The guard still owns
+# ONE fresh monitored root under the canonical internal directory, and the
+# unchanged 300 s / 512 MiB / 22 GiB reserve / custody / cleanup rules apply to
+# everything inside it, including staging, the fixture pool, temp and the single
+# owned 128 MiB image. Builds, tests and ordinary proofs keep the drive default.
+# Execution of this recipe awaits the owner's acceptance plus a separate
+# activation; it is not an approval and does not preauthorise other
+# internal-placement proofs.
 [tasks."rust:pool-temp-scratch"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
 
 # The uncounted diagnostic of the same proof (architect 1841baa1). It is
 # REQUIRED before the next counted rust:pool-temp-scratch run, keeps the same
@@ -195,7 +207,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # receipt is explicitly unqualified and is never counted native evidence.
 [tasks."rust:pool-temp-scratch:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py --diagnostic"
 
 # Final outputs on the permanent drive (oxide#117), under the qualified
 # shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored scratch,

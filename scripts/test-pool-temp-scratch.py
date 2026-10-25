@@ -241,10 +241,13 @@ CARGO_ORACLE_ARGV = ("cargo", "check", "--offline", "--locked")
 # lock offline in the fixture's private Cargo home before any `--locked` call.
 LOCK_ARGV = ("cargo", "generate-lockfile", "--offline")
 # The fixture's checkout/package label. It becomes part of the product's slot
-# folder, so it is deliberately one character: under the oxide#145 default the
-# guard root sits on the selected volume and the injected product scratch path
-# must still fit `MAX_SCRATCH_PATH_BYTES`.
+# folder, so it is deliberately one character: the injected product scratch
+# path must still fit `MAX_SCRATCH_PATH_BYTES` under either root this proof
+# uses.
 FIXTURE_NAME = "t"
+# The product's slot folder for this fixture is `<label>-<8 hex>`, so the
+# folder component is the label plus nine characters, not the label alone.
+PRODUCT_FOLDER_CHARS = len(FIXTURE_NAME) + 1 + 8
 # Fixed parts of the longest injected product scratch path this proof builds:
 #   <mount>/oxide-proof.<8>/scratch/pt/p/payload/slots/<folder>/quick-1/scratch
 # `/oxide-proof.` plus mkdtemp's eight random characters, then the proof's own
@@ -256,7 +259,11 @@ PRODUCT_LEAVES_CHARS = len("/payload") + len("/slots") + len("/quick-1") + len("
 
 
 def longest_injected_path(mount_chars: int, folder_chars: int) -> int:
-    """The longest product scratch path this proof's layout can construct."""
+    """The longest product scratch path this proof's layout can construct.
+
+    `folder_chars` is the product's real folder component (`<label>-<8 hex>`),
+    not the bare label; the earlier helper under-modelled that width.
+    """
     return (
         mount_chars
         + GUARD_LEAF_CHARS
@@ -2367,24 +2374,36 @@ def self_check() -> int:
         ),
     )
 
-    # 3i. Source fit under the selected-volume supervisor default: the guard
-    #     root now sits on the pool's volume, so the proof's own leaf labels
-    #     plus the product's slot tail must still fit the 91-byte bound for any
-    #     plausible mount width. The negative control uses the earlier longer
-    #     labels to show the shortening was necessary, not cosmetic.
+    # 3i. Source fit for the two roots this proof actually uses, with the
+    #     product's real folder width (`t-<8 hex>`, ten characters). The
+    #     selected-volume root is the ordinary #145 default; the internal root
+    #     is this proof's declared `--root-parent /private/tmp` recipe. No
+    #     claim is made for arbitrary mounts: a mount two characters longer
+    #     than the observed selected-volume one would exceed the bound, which
+    #     is why both figures are asserted exactly.
+    selected_mount = len("/Volumes/Builds")
+    internal_mount = len("/private/tmp")
     property_true(
-        "injected scratch path fits 91 bytes for mounts up to 24 characters",
-        all(
-            longest_injected_path(mount_chars, len(FIXTURE_NAME)) <= 91
-            for mount_chars in range(1, 25)
-        )
-        and longest_injected_path(0, len(FIXTURE_NAME)) == 66,
+        "the selected-volume layout measures 90 bytes",
+        longest_injected_path(selected_mount, PRODUCT_FOLDER_CHARS) == 90,
     )
     property_true(
-        "the longer earlier labels would not have fitted",
+        "the internal-root layout measures 87 bytes",
+        longest_injected_path(internal_mount, PRODUCT_FOLDER_CHARS) == 87,
+    )
+    property_true(
+        "both layouts fit the 91-byte bound",
+        longest_injected_path(selected_mount, PRODUCT_FOLDER_CHARS) <= 91
+        and longest_injected_path(internal_mount, PRODUCT_FOLDER_CHARS) <= 91,
+    )
+    property_true(
+        "a mount two characters longer would exceed the bound",
+        longest_injected_path(selected_mount + 2, PRODUCT_FOLDER_CHARS) > 91,
+    )
+    property_true(
+        "the earlier long labels would not have fitted",
         longest_injected_path(
-            len("/Volumes/Builds"),
-            len("tempcheck"),
+            selected_mount, len("tempcheck") + 1 + 8
         )
         + (len("/pool-temp") - len("/pt") + len("/pool") - len("/p"))
         > 91,

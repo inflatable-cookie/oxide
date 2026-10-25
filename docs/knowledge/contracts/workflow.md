@@ -1465,6 +1465,24 @@ qualified `961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052`
 stays qualified only at its old bytes, and every earlier recorded run keeps
 that guard as its historical pin.
 
+**Internal-placement proofs (oxide#136, proposed exception).** A proof whose
+subject is the *internal* directory pool cannot run over the selected-volume
+default: the product correctly refuses a `directory-budget` internal pool on
+an external volume, and that refusal is not bendable (no debug-only exception).
+Such a proof may declare the internal root explicitly through the qualified
+guard's existing `--root-parent` option — for oxide#136,
+`--root-parent /private/tmp` in both its counted and diagnostic selectors. The
+guard still creates ONE fresh owned monitored root under that canonical
+internal directory and applies the unchanged 300 s, 512 MiB, 22 GiB reserve,
+custody, retention and cleanup rules to everything inside it, including
+staging, the fixture pool, temp and the single owned 128 MiB image. The
+selected-volume default is unchanged for every other caller: builds, tests and
+ordinary proofs keep the drive placement. The observed ~58 MiB peak in the
+oxide#136 diagnostic is a measurement, not a bound reduction or a guarantee for
+other work. Executing that recipe still awaits the owner's acceptance of the
+exception and a separate activation; this record is not an approval and does
+not preauthorise other internal-placement proofs.
+
 The implementation briefs and separate native activations live in Queue. No
 runtime scratch or host setting changes follow from this knowledge record.
 
