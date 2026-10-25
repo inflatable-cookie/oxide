@@ -808,6 +808,14 @@ fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
             "refusing to delete a foreign directory",
         ));
     }
+    // An owned directory a build or test left read-only (Effigy fixtures make
+    // `.effigy/state/objects/<hash>` read-only under a slot's child scratch)
+    // cannot have its entries removed. Restore the owner's own access first;
+    // it is already verified as an owned real directory inside the slot.
+    let mode = metadata.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700)).map_err(io_error)?;
+    }
     for entry in fs::read_dir(path).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         remove_tree_owned(root, &entry.path())?;
