@@ -958,7 +958,7 @@ failed exactly there). Fixture children carry the debug build's
 `OXIDE_TEST_HOME_FROM_ENV=1` account-home control, a freshly built environment
 that imports no ambient `OXIDE_*`/`XDG_*`/`CARGO_ENCODED_RUSTFLAGS`, and one
 frozen `RUSTFLAGS` shared with staging; the script's `--self-check` is a pure,
-pre-scratch 38-property regression of that construction. Before any
+pre-scratch pure regression of that construction (`--self-check`). Before any
 `--locked` invocation, the fixture constructor establishes the crate's lock
 precondition with one bounded offline `cargo generate-lockfile` setup child in
 the fixture's private Cargo home (the package has no dependencies, so nothing

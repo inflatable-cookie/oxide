@@ -335,36 +335,142 @@ def diagnostic_receipt_path(root: str) -> str:
     return os.path.join(base, "diagnostic-receipt.json")
 
 
-def diagnostic_record(outcomes, faults, skips, aborted) -> str:
-    """Bounded, distinct, explicitly unqualified diagnostic record.
+def _excerpt(text: str, limit: int) -> tuple:
+    """A bounded excerpt and its explicit truncation metadata."""
+    raw = text.encode()
+    if len(raw) <= limit:
+        return text, False, len(raw)
+    return raw[:limit].decode(errors="ignore"), True, len(raw)
 
-    It records what actually ran, the first fault, at most
-    `MAX_DIAGNOSTIC_FAULTS` secondary faults, every truthful skip reason and
-    whether the run aborted on an unknown outcome. It never claims
-    qualification and never invents a PASS.
+
+def diagnostic_record(outcomes, faults, skips, aborted) -> str:
+    """Bounded, valid-JSON, explicitly unqualified diagnostic record.
+
+    The record is never byte-sliced: an oversized record is rebuilt in a
+    leaner shape and declares `collection: "incomplete"` with explicit
+    omitted counts and the reasons, so a reader can tell a complete record from
+    a bounded one. Every excerpt carries truncation metadata. The first fault
+    and the abort flag are preserved in every shape, and the record never
+    claims qualification, a PASS or complete collection when it is not.
     """
-    record = {
+
+    def build(case_limit, detail_limit, fault_limit, skip_limit):
+        reasons = []
+        cases = []
+        for case, outcome, detail in outcomes[:case_limit]:
+            entry = {"case": case.name, "outcome": outcome}
+            if detail:
+                text, truncated, size = _excerpt(detail, detail_limit)
+                entry.update(
+                    {
+                        "detail": text,
+                        "detail_truncated": truncated,
+                        "detail_bytes": size,
+                    }
+                )
+            cases.append(entry)
+        if len(outcomes) > case_limit:
+            reasons.append(f"cases: kept {case_limit} of {len(outcomes)}")
+        first = None
+        if faults:
+            text, truncated, size = _excerpt(faults[0][1], max(detail_limit, 600))
+            first = {
+                "case": faults[0][0],
+                "detail": text,
+                "detail_truncated": truncated,
+                "detail_bytes": size,
+            }
+        secondary = []
+        for name, detail in faults[1:fault_limit]:
+            text, truncated, size = _excerpt(detail, detail_limit)
+            secondary.append(
+                {
+                    "case": name,
+                    "detail": text,
+                    "detail_truncated": truncated,
+                    "detail_bytes": size,
+                }
+            )
+        recorded = (1 if first else 0) + len(secondary)
+        if recorded < len(faults):
+            reasons.append(f"faults: kept {recorded} of {len(faults)}")
+        skip_entries = []
+        for name, reason in skips[:skip_limit]:
+            text, truncated, size = _excerpt(reason, detail_limit)
+            skip_entries.append(
+                {
+                    "case": name,
+                    "reason": text,
+                    "reason_truncated": truncated,
+                    "reason_bytes": size,
+                }
+            )
+        if len(skip_entries) < len(skips):
+            reasons.append(f"skips: kept {len(skip_entries)} of {len(skips)}")
+        return {
+            "mode": "diagnostic",
+            "qualified": False,
+            "evidence_kind": "diagnostic-only, not counted native evidence",
+            "collection": "incomplete" if reasons else "complete",
+            "incomplete_reasons": reasons,
+            "cases_total": len(outcomes),
+            "cases_included": len(cases),
+            "cases_omitted": len(outcomes) - len(cases),
+            "cases": cases,
+            "first_fault": first,
+            "secondary_faults": secondary,
+            "faults_seen": len(faults),
+            "faults_recorded": recorded,
+            "faults_omitted": len(faults) - recorded,
+            "skips_seen": len(skips),
+            "skips_recorded": len(skip_entries),
+            "skips_omitted": len(skips) - len(skip_entries),
+            "skips": skip_entries,
+            "aborted_on_unknown_outcome": aborted,
+            "receipt_budget_bytes": MAX_DIAGNOSTIC_RECEIPT_BYTES,
+        }
+
+    shapes = [
+        (len(outcomes), 600, MAX_DIAGNOSTIC_FAULTS, len(skips)),
+        (64, 200, MAX_DIAGNOSTIC_FAULTS, 16),
+        (32, 80, 4, 8),
+        (8, 0, 2, 4),
+    ]
+    for case_limit, detail_limit, fault_limit, skip_limit in shapes:
+        record = build(case_limit, detail_limit, fault_limit, skip_limit)
+        for _ in range(2):
+            text = json.dumps(record, indent=1, sort_keys=True)
+            record["receipt_bytes"] = len(text.encode())
+        if len(text.encode()) <= MAX_DIAGNOSTIC_RECEIPT_BYTES:
+            return text
+    minimal = {
         "mode": "diagnostic",
         "qualified": False,
         "evidence_kind": "diagnostic-only, not counted native evidence",
-        "cases": [
-            {"case": case.name, "outcome": outcome, "detail": detail[:600]}
-            for case, outcome, detail in outcomes
+        "collection": "incomplete",
+        "incomplete_reasons": [
+            "receipt could not be recorded within its byte budget",
+            f"cases: kept 0 of {len(outcomes)}",
+            f"faults: kept 0 of {len(faults)}",
+            f"skips: kept 0 of {len(skips)}",
         ],
-        "first_fault": (
-            {"case": faults[0][0], "detail": faults[0][1][:1200]} if faults else None
-        ),
-        "secondary_faults": [
-            {"case": name, "detail": detail[:600]} for name, detail in faults[1:MAX_DIAGNOSTIC_FAULTS]
-        ],
-        "faults_recorded": min(len(faults), MAX_DIAGNOSTIC_FAULTS),
+        "cases_total": len(outcomes),
+        "cases_included": 0,
+        "cases_omitted": len(outcomes),
+        "cases": [],
+        "first_fault": None,
+        "secondary_faults": [],
         "faults_seen": len(faults),
-        "skips": [{"case": name, "reason": reason[:600]} for name, reason in skips],
+        "faults_recorded": 0,
+        "faults_omitted": len(faults),
+        "skips_seen": len(skips),
+        "skips_recorded": 0,
+        "skips_omitted": len(skips),
+        "skips": [],
         "aborted_on_unknown_outcome": aborted,
+        "receipt_budget_bytes": MAX_DIAGNOSTIC_RECEIPT_BYTES,
     }
-    text = json.dumps(record, indent=1, sort_keys=True)
-    if len(text.encode()) > MAX_DIAGNOSTIC_RECEIPT_BYTES:
-        text = text.encode()[:MAX_DIAGNOSTIC_RECEIPT_BYTES].decode(errors="ignore")
+    text = json.dumps(minimal, indent=1, sort_keys=True)
     return text
 
 
@@ -463,13 +569,24 @@ def case(name: str) -> None:
     say(f"case {name}")
 
 
-def work_left() -> float:
-    deadline = int(os.environ["OXIDE_PROOF_DEADLINE_NS"])
-    left = (
-        deadline - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
-    ) / 1e9 - SHUTDOWN_MARGIN_S
+def work_left(now_ns=None, deadline_ns=None, margin_s=None) -> float:
+    """Seconds left before the supervisor's shutdown margin.
+
+    `now_ns`/`deadline_ns`/`margin_s` are injectable so the pure self-check can
+    exercise the real deadline decision with no clock or environment. An
+    exhausted deadline is an infrastructure condition, not an oracle mismatch:
+    it aborts through `UnknownOutcome`, so the default run stops and the
+    diagnostic records the abort instead of continuing into another case.
+    """
+    if deadline_ns is None:
+        deadline_ns = int(os.environ["OXIDE_PROOF_DEADLINE_NS"])
+    if now_ns is None:
+        now_ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+    if margin_s is None:
+        margin_s = SHUTDOWN_MARGIN_S
+    left = (deadline_ns - now_ns) / 1e9 - margin_s
     if left <= 5:
-        fail("work deadline reached before the supervisor's shutdown margin")
+        abort("work deadline reached before the supervisor's shutdown margin")
     return left
 
 
@@ -2020,7 +2137,9 @@ def self_check() -> int:
         ran.clear()
         try:
             # The expected-failure scenarios keep the proof's own stderr clean.
-            with contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
                 status = drive(cases, "/nonexistent", receipt=False)
         finally:
             MODE["diagnostic"] = saved
@@ -2091,12 +2210,136 @@ def self_check() -> int:
         "diagnostic receipt never claims a pass",
         '"passed"' not in record and "qualified: true" not in record,
     )
-    many = [(ProofCase(i, body(str(i)), label=str(i)), "fail", "x" * 900) for i in range(40)]
-    bounded = diagnostic_record(many, [("0", "x" * 900)] * 40, [], False)
     property_true(
-        "diagnostic receipt is bounded",
-        len(bounded.encode()) <= MAX_DIAGNOSTIC_RECEIPT_BYTES
-        and json.loads(bounded)["faults_recorded"] == MAX_DIAGNOSTIC_FAULTS,
+        "a complete diagnostic record declares complete collection",
+        json.loads(record)["collection"] == "complete",
+    )
+    # Forced overflow: a genuinely oversized outcome/fault/skip set must yield
+    # valid JSON within the budget that declares itself incomplete with
+    # explicit omitted counts, and must keep the first fault and abort flag.
+    many = [
+        (ProofCase(i, body(str(i)), label=f"case-{i}"), "fail", "d" * 4000)
+        for i in range(300)
+    ]
+    many_faults = [(f"case-{i}", "e" * 4000) for i in range(300)]
+    many_skips = [(f"case-{i}", "s" * 2000) for i in range(300)]
+    bounded = diagnostic_record(many, many_faults, many_skips, True)
+    parsed = json.loads(bounded)
+    property_true(
+        "forced overflow yields valid JSON within the budget",
+        isinstance(parsed, dict) and len(bounded.encode()) <= MAX_DIAGNOSTIC_RECEIPT_BYTES,
+    )
+    property_true(
+        "forced overflow declares incomplete collection with omitted counts",
+        parsed["collection"] == "incomplete"
+        and parsed["cases_omitted"] > 0
+        and bool(parsed["incomplete_reasons"]),
+    )
+    property_true(
+        "forced overflow keeps truthful counts",
+        parsed["cases_total"] == 300
+        and parsed["cases_included"] + parsed["cases_omitted"] == 300
+        and parsed["faults_recorded"] + parsed["faults_omitted"] == 300
+        and parsed["skips_recorded"] + parsed["skips_omitted"] == 300,
+    )
+    property_true(
+        "forced overflow keeps the first fault and the abort",
+        parsed["first_fault"] is not None
+        and parsed["first_fault"]["case"] == "case-0"
+        and parsed["aborted_on_unknown_outcome"] is True
+        and parsed["qualified"] is False,
+    )
+    property_true(
+        "forced overflow carries truncation metadata",
+        any(
+            entry.get("detail_truncated") is True
+            for entry in [parsed["first_fault"]] + parsed["secondary_faults"]
+            if entry
+        ),
+    )
+
+    # 3f. The guard deadline is an infrastructure abort, exercised through the
+    #     real driver and the real work_left with fake clock/environment seams.
+    def deadline_body(tag):
+        def run():
+            ran.append(tag)
+            work_left(now_ns=2_000_000_000, deadline_ns=1_000_000_000, margin_s=30)
+        return run
+
+    for diagnostic in (False, True):
+        deadline_cases = [
+            ProofCase(0, body("a"), label="a"),
+            ProofCase(1, deadline_body("b"), label="b"),
+            ProofCase(2, body("c"), label="c"),
+        ]
+        status, ran_cases = scenarios(diagnostic, deadline_cases)
+        property_true(
+            "deadline exhaustion aborts before another case in "
+            + ("diagnostic" if diagnostic else "default")
+            + " mode",
+            status == 1 and ran_cases == ["a", "b"],
+        )
+        # Positive control on the same seams: with time to spare the real
+        # work_left returns a positive budget instead of aborting.
+        property_true(
+            "the same seams return a positive budget when time remains",
+            work_left(now_ns=0, deadline_ns=100_000_000_000, margin_s=30) > 5,
+        )
+
+    # 3g. Negative control: if the deadline used the oracle path instead of the
+    #     abort path, diagnostic mode would continue into the next independent
+    #     case. The property above therefore is not vacuous.
+    def recoverable_deadline_body(tag):
+        def run():
+            ran.append(tag)
+            fail("work deadline reached (recoverable variant)")
+        return run
+
+    negative_cases = [
+        ProofCase(0, body("a"), label="a"),
+        ProofCase(1, recoverable_deadline_body("b"), label="b"),
+        ProofCase(2, body("c"), label="c"),
+    ]
+    status, ran_cases = scenarios(True, negative_cases)
+    property_true(
+        "negative control: a recoverable deadline failure would continue",
+        status == 1 and ran_cases == ["a", "b", "c"],
+    )
+
+    # 3h. First-fault ordering: an oracle failure before the deadline abort
+    #     stays the first fault, and the abort remains visible in the record.
+    ordering_cases = [
+        ProofCase(0, fail_body("a", "earlier oracle mismatch"), label="a"),
+        ProofCase(1, deadline_body("b"), label="b"),
+    ]
+    captured = {}
+
+    def capture(path, outcomes, faults, skips, aborted):
+        captured["text"] = diagnostic_record(outcomes, faults, skips, aborted)
+        return path
+
+    saved_writer = globals()["write_diagnostic_receipt"]
+    globals()["write_diagnostic_receipt"] = capture
+    saved_mode = MODE["diagnostic"]
+    MODE["diagnostic"] = True
+    try:
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            ordering_status = drive(ordering_cases, "/nonexistent")
+    finally:
+        MODE["diagnostic"] = saved_mode
+        globals()["write_diagnostic_receipt"] = saved_writer
+    ordering = json.loads(captured["text"])
+    property_true(
+        "first fault precedes a later deadline abort",
+        ordering_status == 1
+        and ordering["first_fault"]["case"] == "a"
+        and "earlier oracle mismatch" in ordering["first_fault"]["detail"]
+        and ordering["aborted_on_unknown_outcome"] is True
+        and any(
+            entry["case"] == "b" for entry in ordering["secondary_faults"]
+        ),
     )
 
     # 4. Missing or unusable provenance refuses instead of hiding the toolchain
