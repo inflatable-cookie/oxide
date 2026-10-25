@@ -1282,6 +1282,56 @@ placement and retention; Oxide changes no consumer or daemon configuration.
 The implementation briefs and separate native activations live in Queue. No
 runtime scratch or host setting changes follow from this knowledge record.
 
+## Proof-authoring premise checklist
+
+Every brief that authors or corrects a native proof script, fixture or oracle
+uses this fixed checklist before a counted native (product architect,
+2026-10-25). Record the executable source location and disposition of every
+item, or a concrete reason it does not apply. Check the actual case bodies
+and every child environment; plan text alone is not evidence. This supplements
+the diagnostic-or-source-sweep rule in the [validation policy](../vision.md#validation-policy)
+and grants no native start, installation, clock extension or cleanup authority.
+
+1. **Private HOME and rustup.** Capture the invoking `RUSTUP_HOME`, or the
+   invoking `HOME/.rustup` when it is unset, before replacing `HOME`. Preserve
+   that toolchain home in fixture children, keep the pinned toolchain and set
+   `RUSTUP_AUTO_INSTALL=0`. Private `HOME` and `CARGO_HOME` stay private; never
+   repair a fixture by downloading or installing a toolchain.
+2. **Account-home control.** Set `OXIDE_TEST_HOME_FROM_ENV=1` wherever a private
+   `HOME` is meant to be honoured. Without that explicit test control, Oxide
+   deliberately uses the account home rather than a caller's `HOME`.
+3. **Environment isolation.** Scrub inherited `OXIDE_POOL`, `OXIDE_CONFIG`,
+   `OXIDE_TEST_*` and `XDG_*` before setting only the fixture's explicit
+   configuration and controls. Do not copy host pool or account provenance
+   into a private fixture by accident.
+4. **Automatic adoption.** In permanent mode, a fresh checkout with no target
+   can be automatically adopted on its first build, including a build that
+   fails. An oracle requiring an unconverted checkout must positively create
+   that premise and check its receipt state.
+5. **Cargo external argv.** Cargo passes the external subcommand name as the
+   tool's first argument: a fake `cargo-nextest` invoked by
+   `cargo nextest run --help` sees `nextest run --help`.
+6. **Owned images.** Use `hdiutil attach -owners on` for an owned image whose
+   proof depends on ownership being enabled. Preserve the existing attachment
+   identity, ordinary-detach and uncertain-custody rules.
+7. **Compiler flags.** Freeze `CARGO_ENCODED_RUSTFLAGS` and `RUSTFLAGS`
+   consistently for staging and fixture commands. An inherited encoded value
+   must not silently override the proof's declared flags or change the staged
+   candidate's capabilities.
+8. **Temporary storage.** Once the child-temp and shared-proof defaults are
+   qualified and landed, use scratch and `TMPDIR` on the selected volume.
+   Until then, follow the exact qualified guard and activated recipe; this
+   checklist does not transfer qualification to an unpublished default.
+9. **macOS mktemp.** `mktemp` without a template ignores `TMPDIR` on macOS.
+   Supply a template under the intended owned scratch parent and verify that
+   the executable fixture uses it.
+
+A source sweep must trace these premises through each case and its helpers.
+A safe keep-going diagnostic still records failures and dependent skips
+honestly; it does not replace the checklist or turn an unexercised case into
+PASS evidence. Any fixture correction needs the brief's covering checks and
+independent exact-head review before a separately activated counted run.
+
 ## Shared proof supervisor
 
 **Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's

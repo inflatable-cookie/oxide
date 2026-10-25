@@ -19,6 +19,7 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 ## Validate
 
 Tom approved risk-proportionate verification on 2026-10-20 ([vision](docs/knowledge/vision.md#validation-policy)). Every product brief names its tier, covering Effigy selectors, wall-clock limit and scratch-disk budget.
+Every native-proof authoring or correction brief declares HIGH complexity and applies the fixed [premise checklist](docs/knowledge/contracts/workflow.md#proof-authoring-premise-checklist) to its executable cases before a counted native.
 
 - **Standard, the default:** the author runs covering compile, format when applicable, unit/regression tests, docs checks when docs change, and the focused native proof. An independent reviewer reviews the exact published source, regressions and the author's evidence. The reviewer does not repeat the native proof or covering selectors; missing or inadequate evidence is reported honestly.
 - **Elevated:** add an independent reviewer native session for changes that delete or recycle storage, decide crash recovery or writer closure, or write to removable media. The brief states the trigger and focused selector. Fixture isolation does not by itself remove a product's elevated trigger.
