@@ -181,8 +181,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   files on the selected pool. An inherited `TMPDIR` is kept, as its canonical
   directory, only when it is a writable directory on the pool's own device;
   otherwise Oxide owns one short per-command directory inside the slot,
-  removed at release after writer closure (a released `run` program's own
-  directory is reconciled by the next command)
+  removed at release after writer closure; a `run` program that uses one
+  keeps the lease until its own group closes
   ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It
   covers child launches only: CI, Effigy's own run scratch, Queue worktrees
   and host settings stay as they are.

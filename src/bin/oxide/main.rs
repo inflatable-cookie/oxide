@@ -650,18 +650,43 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             &chosen_temp,
         );
     }
-    // An unconverted `run` releases its lease and then replaces this process
-    // with the program, which is still an Oxide-launched child. It gets the
-    // same chosen temporary directory: an inherited one outlives the lease,
-    // and an owned one still has a live writer (the program), so it is kept
-    // rather than removed here. A later lease of this slot incarnation
-    // reconciles it, and whole-slot eviction removes it with the slot.
-    let program_temp = run
-        && stopped.is_none()
-        && matches!(&outcome, Ok((Some(status), Some(Ok(_)))) if status.success());
-    let kept_scratch = program_temp && chosen_temp.owned().is_some();
-    if kept_scratch {
-        held.scratch = None;
+    // An unconverted `run` program is an Oxide-launched child too, and when
+    // this command owns a temporary directory the program is still its
+    // writer. The lease is the only fence that keeps a competing lease or
+    // whole-slot eviction from reconciling that directory, so such a program
+    // runs under the same custody as a converted checkout's program
+    // (`run_owned_program`): its own group, the record naming it, forwarded
+    // signals, and release — which removes the owned directory — only after
+    // the group is observed empty. A program with no owned directory to
+    // protect keeps the plain release-then-exec path.
+    let fenced_program = match (&outcome, chosen_temp.owned()) {
+        (Ok((Some(status), Some(Ok((program, manifest_dir))))), Some(_))
+            if run && status.success() && stopped.is_none() =>
+        {
+            Some((program.clone(), manifest_dir.clone()))
+        }
+        _ => None,
+    };
+    if let Some((program, manifest_dir)) = fenced_program {
+        print_summary(
+            &store,
+            &invocation,
+            &slot,
+            warm,
+            measured.as_ref(),
+            started,
+            note.as_deref(),
+            &waits,
+        );
+        return run_owned_program(
+            &store,
+            held,
+            origin,
+            &program,
+            &manifest_dir,
+            &invocation.program_args,
+            &chosen_temp,
+        );
     }
     store.release(held, origin)?;
     let (status, executable) = outcome?;
@@ -698,15 +723,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     if !run || !status.success() {
         return Ok(process::exit_code(status));
     }
-    if kept_scratch {
-        eprintln!(
-            "oxide: the run program keeps this command's temporary directory; the next command in this slot reconciles it"
-        );
-    }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
-            // Lease released: the program runs from the private target dir,
-            // with the same chosen temporary directory as Cargo had.
+            // Lease released and this command owns no temporary directory,
+            // so the program runs from the private target dir with the kept
+            // inherited directory.
             let mut command = Command::new(&program);
             command
                 .args(&invocation.program_args)

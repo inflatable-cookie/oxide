@@ -172,10 +172,10 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # relative/unwritable/other-device/symlink-escaping values are replaced by one
 # short owned directory inside the held slot, that the aliases follow the
 # chosen value, that `oxide test`/`exec`/`run` children observe it, that the
-# owned directory is accounted once while held and removed at release (a
-# released `run` program's directory at the next command), that a crash with a
-# surviving writer keeps it and the positive dead-group recovery deletes the
-# slot whole, that a foreign entry, a link or an over-bound path refuses
+# owned directory is accounted once while held and removed at release, that a
+# live `run` program's lease fences it from a competing command until its group
+# closes, that a crash with a surviving writer keeps it and the positive
+# dead-group recovery deletes the slot whole, that a foreign entry, a link or an over-bound path refuses
 # without spawning, and that one owned 128 MiB
 # scratch APFS image puts the child's temporary files on the image with an
 # internal fallback after an ordinary detach and no stale mount point. It

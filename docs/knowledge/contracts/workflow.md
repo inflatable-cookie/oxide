@@ -884,13 +884,17 @@ it is not final output, final-output placement or a claim of saved writes.
   subcommands through it), `oxide exec`'s tool, and a converted checkout's
   owned `run` program under its held lease all receive it; descendants — test
   binaries, build scripts, `run` programs, tools' own Cargo calls — inherit
-  it. An unconverted `run` releases the lease and then replaces the `oxide`
-  process with the program: that program is still a child Oxide launched, so
-  it gets the same chosen directory. An inherited one simply outlives the
-  lease. An owned one still has a live writer (the program), so it is **not**
-  removed at that release; the command says so, and the next lease of that
-  slot incarnation reconciles it (whole-slot eviction removes it with the
-  slot, and a lost slot keeps it).
+  it. An unconverted `run` whose children use an **owned** directory keeps
+  the `oxide` lease for the program, because the program is still that
+  directory's writer: it runs under the existing owned-program custody — its
+  own process group named in the record, signals forwarded, the removable
+  pool's removal watchdog, and release only after the group is observed
+  empty, which is also the one point where the directory is removed. A
+  released-lease `exec` is used only when no owned directory exists (the
+  kept inherited one, which outlives the lease and is nobody's to clean).
+  Ownership markers and the slot incarnation prove *whose* directory it is,
+  never that a writer has closed, so nothing is reconciled merely because a
+  lease is available.
 - **Not covered, deliberately.** Effect-free work keeps the inherited
   environment and creates nothing: plain passthrough (no lease), `--version`,
   probes, `status`, `oxide clean`/`init`/`new`'s own Cargo calls, and the
@@ -914,9 +918,12 @@ it is not final output, final-output placement or a claim of saved writes.
   process group empty and before the slot can go idle; a removable slot is
   flushed after that removal. A removal that cannot be positively completed
   keeps the slot held and reported, exactly like an unconfirmed closure, and
-  a later command recovers it. An `oxide exec` tool, a kept rustc wrapper or
-  an interrupted command obeys the existing custody rules unchanged; a crash
-  leaves the directory with the held slot.
+  a later command recovers it. A `run` program with an owned directory is
+  inside that same lease (previous bullet), so a competing command cannot
+  take the slot, reconcile the directory or have it evicted while the
+  program lives. An `oxide exec` tool, a kept rustc wrapper or an interrupted
+  command obeys the existing custody rules unchanged; a crash leaves the
+  directory with the held slot.
 - **Length is a limit, not a preference.** Unix-domain sockets need a short
   path. The injected path is the held slot plus `scratch`; a path over 91
   bytes (macOS `sun_path` is 104 bytes including the NUL, less `/` and an
@@ -953,8 +960,10 @@ scratch untouched by `status --measure`; normal release removing it; an
 injected crash while the writer group survives keeping it, and positive
 dead-group recovery removing the slot whole and permitting reuse; `oxide
 test`, `oxide exec -- <tool>` and `oxide run` each observing the chosen
-directory, including a released `run` program's owned directory kept until
-the next command reconciles it; a foreign entry, a link and an over-bound
+directory, with a **live** `run` program plus a competing `oxide check` in the
+same checkout proving the competing command takes another slot and the live
+directory and its bytes stay intact until that program's own release after its
+group closes; a foreign entry, a link and an over-bound
 derived path each refusing the command without spawning, deleting or
 following anything; and one owned 128 MiB scratch APFS image used as the
 removable pool, where a build's temporary files land on the image, then an

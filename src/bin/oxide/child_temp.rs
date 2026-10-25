@@ -23,7 +23,12 @@
 //!
 //! The owned directory is bound to pool identity, slot and incarnation by a
 //! marker file written before any writer starts, so a later lease of the same
-//! incarnation may reconcile it and no other shape is ever deleted. It lives
+//! incarnation may reconcile it and no other shape is ever deleted. The
+//! marker says whose directory it is, never that a writer closed: the
+//! exclusive lease is the fence, so a competing command can only run after
+//! the previous holder released (which the product does only after positive
+//! group closure), and a `run` program using an owned directory keeps that
+//! lease until its own group is empty. It lives
 //! inside the slot, so the existing whole-slot accounting counts it once and
 //! whole-slot eviction, crash recovery and lost-volume retirement remove or
 //! keep it with the slot they already own.

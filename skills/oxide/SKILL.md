@@ -233,8 +233,9 @@ fails, Oxide reports that the wait duration is unavailable.
 - A leased command's children put temporary files on the selected pool: an
   inherited `TMPDIR` is kept, as its canonical path, when it is a writable
   directory on the pool's device, and otherwise Oxide owns one short
-  directory inside the held slot and removes it at release (a released `run`
-  program's directory is reconciled by the next command). The summary says
+  directory inside the held slot and removes it at release; a `run` program
+  that uses one keeps the lease until it exits, so a competing command cannot
+  delete its temporary files. The summary says
   `temp: inherited <path>` or `temp: oxide <path>`. Oxide never writes to or
   cleans an inherited directory; `TMPDIR`, `TMP` and `TEMP` are all set to
   the chosen value for children only, and a command that can provide neither

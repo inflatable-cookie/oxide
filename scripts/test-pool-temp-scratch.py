@@ -43,8 +43,11 @@ Cases (each one is a real child, nothing is simulated):
 9. `oxide test`, `oxide exec -- <tool>` and `oxide run` children each observe
    the chosen directory: a test binary asserts the prefix it was given, the
    fake exec tool records `$TMPDIR`, and the run program reports and writes
-   into it. An owned directory a released `run` program is still using is kept
-   until the next command in that slot incarnation reconciles it.
+   into it. A run program using an owned directory runs under the existing
+   held-lease custody, so its directory is removed only after its group has
+   closed; a **live** program plus a competing lease in the same checkout is
+   the counterexample case: the competing command takes another slot and the
+   live directory and its bytes stay intact until the program ends.
 10. a foreign entry and a link in the scratch position refuse the command
     without following, deleting or spawning anything, and the entry is kept;
     an over-bound derived path refuses the command rather than leaving the
@@ -269,8 +272,18 @@ fn main() {
 
 MAIN_RS = r'''
 fn main() {
-    println!("OXIDE-TEMP run={}", std::env::temp_dir().display());
-    let _ = std::fs::write(std::env::temp_dir().join("run-marker"), b"run");
+    let dir = std::env::temp_dir();
+    println!("OXIDE-TEMP run={}", dir.display());
+    let _ = std::fs::write(dir.join("run-marker"), b"run");
+    if let Ok(gate) = std::env::var("RUN_HOLD") {
+        // A live program: it announces itself inside its chosen temporary
+        // directory and stays a writer until the proof releases it.
+        std::fs::write(dir.join("program-holding"), b"live").expect("holding");
+        while !std::path::Path::new(&gate).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::fs::write(dir.join("program-released"), b"closed").expect("released");
+    }
 }
 '''
 
@@ -799,7 +812,7 @@ def crash_and_recovery(world: World, crate: str) -> None:
 
 def spawns(world: World, crate: str) -> None:
     case(CASE_NAMES[8])
-    # An inherited directory reaches every child.
+    # An inherited directory reaches every child and is never cleaned.
     inherited = private_dir(os.path.join(world.pool, "spawn-tmp"))
     env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
     tested = world.run(["test"], cwd=crate, env=dict(env, TEMP_EXPECT_PREFIX=inherited))
@@ -822,8 +835,18 @@ def spawns(world: World, crate: str) -> None:
         reported(ran.stdout, "run").rstrip("/") == canonical(inherited),
         f"the run program did not inherit the chosen directory: {ran.stdout[-1000:]}",
     )
-    # The owned branch reaches the same children, and a released run program
-    # keeps its directory until the next command reconciles it.
+    expect(
+        os.path.isdir(inherited),
+        "the inherited directory was removed after a run program",
+    )
+    expect(
+        not any(os.path.exists(path) for path in world.scratch_dirs()),
+        "an inherited-only child tree still created an owned directory",
+    )
+
+    # The owned branch reaches the same children. The program is still the
+    # directory's writer, so it runs under the held lease and the directory is
+    # removed only after its group has closed.
     owned_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
     prefix = os.path.join(os.path.realpath(world.pool), "payload")
     world.run(["test"], cwd=crate, env=dict(owned_env, TEMP_EXPECT_PREFIX=prefix))
@@ -837,23 +860,76 @@ def spawns(world: World, crate: str) -> None:
     observed = reported(ran.stdout, "run").rstrip("/")
     held_by_pool(world, observed)
     expect(
-        os.path.isdir(observed),
-        "the run program's owned directory was removed before it ran",
-    )
-    expect(
-        os.path.isfile(os.path.join(observed, "run-marker")),
-        "the run program did not write into its owned directory",
-    )
-    expect(
-        "keeps this command's temporary directory" in ran.stderr,
-        f"the kept directory was not reported: {ran.stderr[-1000:]}",
-    )
-    # The next command in that slot incarnation reconciles it.
-    world.run(["check"], cwd=crate, env=owned_env)
-    expect(
         not os.path.exists(observed),
-        "the released run program's directory was not reconciled",
+        "the run program's owned directory survived its own release",
     )
+
+    # A live program plus a competing lease: the lease fences the owned
+    # directory from reconciliation and eviction, so a further command in the
+    # same checkout must take another slot and leave the live directory and
+    # its bytes intact. Same-incarnation ownership alone is not closure.
+    gate = os.path.join(world.root, "run-release")
+    if os.path.exists(gate):
+        os.unlink(gate)
+    live = subprocess.Popen(
+        [world.subject, "run"],
+        cwd=crate,
+        env=dict(owned_env, RUN_HOLD=gate),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    live_dir = ""
+    try:
+        deadline = time.monotonic() + min(work_left(), 120)
+        while time.monotonic() < deadline:
+            for candidate in world.scratch_dirs():
+                if os.path.isfile(os.path.join(candidate, "program-holding")):
+                    live_dir = candidate
+                    break
+            if live_dir or live.poll() is not None:
+                break
+            time.sleep(0.1)
+        expect(
+            bool(live_dir),
+            "the live run program never announced itself in its owned directory",
+        )
+        held_by_pool(world, live_dir)
+        holding = os.path.join(live_dir, "program-holding")
+        before = os.path.getsize(holding)
+        competing = world.run(["check"], cwd=crate, env=owned_env)
+        competing_dir = reported(competing.stderr, "dir").rstrip("/")
+        expect(
+            competing_dir != live_dir,
+            "the competing command reused the live program's slot",
+        )
+        expect(
+            os.path.isdir(live_dir),
+            "a competing lease removed the live program's owned directory",
+        )
+        expect(
+            os.path.getsize(holding) >= before,
+            "the live program's bytes changed",
+        )
+        # Positive closure: the program ends, its group is observed empty, and
+        # only then is the directory removed.
+        write_private(gate, "")
+        try:
+            live.wait(timeout=min(work_left(), 120))
+        except subprocess.TimeoutExpired:
+            live.kill()
+            live.wait(timeout=10)
+            fail("the released run program did not exit")
+        expect(live.returncode == 0, f"the run program exited {live.returncode}")
+        expect(
+            not os.path.exists(live_dir),
+            "the owned directory survived the program's positive closure",
+        )
+    finally:
+        write_private(gate, "")
+        if live.poll() is None:
+            live.kill()
+            live.wait(timeout=10)
 
 
 def refusals(world: World, crate: str) -> None:
