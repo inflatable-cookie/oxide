@@ -1558,6 +1558,35 @@ migration unless its source changes. Separate ROOT activation still precedes
 each diagnostic or native submission. Briefs, activations and outcomes live in
 Queue; this knowledge record changes no runtime scratch or host setting.
 
+**Internal unit fixtures (oxide#149).** The selected-volume default leaves two
+macOS unit tests without their premise: the product routes a leased child's
+`TMPDIR` to the selected pool's volume (`MNT_IGNORE_OWNERSHIP` there), so
+`prune::tests::legacy_eligibility_is_proved_by_the_boot_data_volume` cannot
+prove a boot Data volume ancestry and
+`volume::tests::a_caller_owned_private_root_passes_and_a_writable_one_refuses`
+cannot observe real ownership facts. Both take an explicit owned internal root
+instead of the test scratch: the caller names one fresh private directory on
+the internal volume in `OXIDE_TEST_INTERNAL_ROOT`, each test checks that root is
+a canonical real directory this user owns, owner-only, APFS, with the boot Data
+volume's device and volume UUID, then creates one unique owner-only fixture
+inside it and removes only that fixture. The prune test still proves internal
+placement through the product's own `on_boot_data_volume`, so a root on another
+volume fails rather than passing or skipping. The Rust test recipe in `AGENTS.md`
+provides that root as the qualified supervisor's adopted
+`OXIDE_TASK_SCRATCH_ROOT` as well, so the internal fixtures stay inside the one
+monitored owned root (the same shape oxide#136 uses), and keeps ordinary test
+temp on the selected volume through a separate `TMPDIR`, `TMP` and `TEMP`
+directory there, which the product keeps as inherited child temp. A third suite
+fixture, `config::tests::git_work_trees_and_aliases_refuse`, takes its root from
+`OXIDE_TASK_SCRATCH_ROOT` and needs it off `/Volumes`, which that monitored
+root supplies. This is a test-fixture and recipe placement only: no product
+pool, refusal, ownership, prune, child-temp or eviction behaviour changes, the
+supervisor's 300 s, 512 MiB, reserve, custody, closure and retention rules are
+unchanged, no new selector or script exists, and ordinary test and proof
+scratch outside this suite keeps selected-volume placement. The same narrow
+exception shape as `bd357a4c` applies; it grants no blanket internal scratch
+fallback for other work.
+
 ## Proof-authoring premise checklist
 
 Every brief that authors or corrects a native proof script, fixture or oracle
