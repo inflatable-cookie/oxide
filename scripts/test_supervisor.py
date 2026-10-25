@@ -1926,6 +1926,52 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertTrue(any("did not use the selected volume" in p for p in
                             qualify.default_scratch(fallback, expected, record, facts)))
 
+    def test_volume_identity_matches_across_uuid_spellings(self):
+        # The product writes the registered UUID uppercase (volume.rs) and the
+        # kernel reports ATTR_VOL_UUID lowercase, exactly as the live host
+        # registration does. The same identity must match: this failed at
+        # 40b3a3aa, which compared the raw recorded text.
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        for registered, observed in ((DRIVE_UUID.upper(), DRIVE_UUID),
+                                     (DRIVE_UUID, DRIVE_UUID.upper()),
+                                     (DRIVE_UUID.upper(), DRIVE_UUID.upper())):
+            with self.subTest(registered=registered, observed=observed):
+                with open(registration, "w") as handle:
+                    json.dump({"version": 2, "mount_point": VOLUME, "volume_uuid": registered}, handle)
+                receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+                receipt["scratch_default"]["volume_uuid"] = observed
+                self.assertEqual(qualify.default_scratch(receipt, expected, record, facts), [])
+        self.assertEqual(qualify.canonical_uuid(DRIVE_UUID.upper()), DRIVE_UUID)
+        self.assertEqual(qualify.canonical_uuid(DRIVE_UUID), DRIVE_UUID)
+
+    def test_missing_malformed_or_different_volume_identity_is_refused(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        other = "b6ac3ed7-33ea-46b4-8082-7254cf291ed2"
+        for label, registered, observed, marks in (
+                ("mismatched spelling-normalised", other.upper(), DRIVE_UUID, "is not the recorded"),
+                ("missing registered", None, DRIVE_UUID, "missing or malformed"),
+                ("non-string registered", 12345, DRIVE_UUID, "missing or malformed"),
+                ("short registered", DRIVE_UUID[:-1], DRIVE_UUID, "missing or malformed"),
+                ("non-hex registered", "zzzzzzzz-33ea-46b4-8082-7254cf291ed2", DRIVE_UUID,
+                 "missing or malformed"),
+                ("missing observed", DRIVE_UUID.upper(), None, "missing or malformed"),
+                ("non-string observed", DRIVE_UUID.upper(), 42, "missing or malformed"),
+                ("both missing", None, None, "missing or malformed")):
+            with self.subTest(label):
+                document = {"version": 2, "mount_point": VOLUME}
+                if registered is not None:
+                    document["volume_uuid"] = registered
+                with open(registration, "w") as handle:
+                    json.dump(document, handle)
+                receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+                receipt["scratch_default"]["volume_uuid"] = observed
+                problems = qualify.default_scratch(receipt, expected, record, facts)
+                self.assertTrue(any(marks in problem for problem in problems), problems)
+
     def test_reserve_readings_identify_the_scratch_volume_and_the_boot_volume_separately(self):
         sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
         readings = qualify.reserve_readings(parent, "/private/tmp", facts)

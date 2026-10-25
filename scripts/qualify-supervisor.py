@@ -65,7 +65,7 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 158
+EXPECTED_CASES = 160
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -224,6 +224,25 @@ def registration(path):
         return json.loads(handle.read(65536).decode("utf-8"))
 
 
+def canonical_uuid(value):
+    """A volume UUID in either spelling the system uses, lowercased for
+    comparison, or None when it is missing, not a string or not a UUID.
+
+    The product writes the registered UUID uppercase and the kernel reports
+    `ATTR_VOL_UUID` lowercase; the supervisor's own selector lowercases the
+    recorded value before comparing. This independent check must accept the
+    same identity in either spelling and still refuse a missing, malformed or
+    different one."""
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    pieces = value.split("-")
+    if [len(piece) for piece in pieces] != [8, 4, 4, 4, 12]:
+        return None
+    if any(character not in "0123456789abcdefABCDEF" for piece in pieces for character in piece):
+        return None
+    return value.lower()
+
+
 def topology(base, expected, facts=None):
     """The suite's own record of the layout it ran in: the candidate's owned
     root, its scratch and its evidence directory. Every nested real-case
@@ -323,7 +342,12 @@ def default_scratch(receipt, expected, record=None, facts=None):
         problems.append("the candidate scratch is on the boot volume")
     if device != mount_device:
         problems.append(f"candidate scratch device {device} is not the selected volume's {mount_device}")
-    if selection.get("volume_uuid") != recorded.get("volume_uuid"):
+    observed, registered = canonical_uuid(selection.get("volume_uuid")), canonical_uuid(
+        recorded.get("volume_uuid"))
+    if observed is None or registered is None:
+        problems.append("the observed or registered volume UUID is missing or malformed:"
+                        f" {selection.get('volume_uuid')!r} {recorded.get('volume_uuid')!r}")
+    elif observed != registered:
         problems.append(f"candidate volume UUID {selection.get('volume_uuid')} is not the recorded"
                         f" {recorded.get('volume_uuid')}")
     if selection.get("mount") != recorded.get("mount_point"):
