@@ -1446,12 +1446,12 @@ or global Cargo configuration is involved.
   `test rust` call `oxide`. With the default `quick` profile, check and test
   use line tables rather than `dev`'s full debug info. Focused proof, profile
   and install selectors call Cargo, because they test or build Oxide itself.
-- **Escapes.** `rust:compile:cargo`, `rust:compile-linux:cargo`,
-  `rust:format:cargo` and `test rust-cargo` keep the plain-Cargo commands.
-  Use them when `oxide` itself is broken. They build into the checkout's
-  `target/` unless `CARGO_TARGET_DIR` points elsewhere, and `oxide init`
-  readiness lists them as plain-Cargo lines by design.
-- **Test supervisor.** `test rust`, `test rust-cargo` and `rust:pool-scale`
+- **Escapes.** There are no `:cargo` sibling selectors (removed oxide#153
+  with Tom's explicit approval; the prior sibling rule is superseded). The
+  outage escape is Effigy's machine-wide per-program `oxide` fallback
+  (see [Switching an existing project](#switching-an-existing-project)):
+  `force = true` while `oxide` is broken, or `cargo` by hand.
+- **Test supervisor.** `test rust` and `rust:pool-scale`
   run under the [shared proof supervisor](#shared-proof-supervisor).
 - **Fixtures.** `effigy dogfood:scripts:test` proves the installer's refusals
   (linked or foreign directories, an existing destination, a destination
@@ -2648,7 +2648,7 @@ marker states, the scratch-volume and boot-volume reserve readings, the kept
 base and `UNCLOSED` case directories, and the limitations. Admission waits fall outside its 300 s. `effigy
 proof:supervisor:test` runs the pure cases alone.
 
-`test rust`, `test rust-cargo`, the profile proofs, `rust:pool-scale`,
+`test rust`, the profile proofs, `rust:pool-scale`,
 `rust:oxide-exec` and `rust:front-door-accounting` keep their invocation and
 get this supervisor once oxide#109 merges. Their recorded evidence ran under
 the old guard at `3d947a9` and stays historical; none has run under the new
@@ -2745,9 +2745,9 @@ proof never copies the host registry whole.
 
 Do not rehearse these steps; they remove the dogfood artifacts.
 
-1. Stop starting Oxide work: switch selectors to the `:cargo` escapes or
-   revert the adoption commit, which restores the plain-Cargo selectors and
-   removes the marked `AGENTS.md` block.
+1. Stop starting Oxide work: revert the adoption commit, which restores the
+   plain-Cargo selectors and removes the marked `AGENTS.md` block, or run
+   `cargo` by hand.
 2. Unlink the binary only if it still matches the newest receipt:
    `shasum -a 256 ~/.local/bin/oxide` equals its `installed.sha256`. Keep the
    receipts. A mismatch means an unknown file: leave it and report.
