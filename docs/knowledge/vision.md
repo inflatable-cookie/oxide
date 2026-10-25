@@ -155,6 +155,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Drive mode:** the Builds drive is registered as permanent or ephemeral,
   with a loud warning when a build falls back to the internal pool.
   `oxide pool describe --json` reports it to other tools.
+- **Low space on the Builds drive** (approved, not built): the pool cap counts
+  pool bytes only; caches, scratch and other data on the drive never count
+  against it. Below the drive's free-space reserve, Oxide evicts the
+  least-recently-used idle whole slots on the drive until it is back above the
+  reserve. If no idle slot is left and the drive is still below it, the build
+  refuses with a clear message; low space never sends a build to the internal
+  pool.
 - **Final outputs** stay checkout-local by default. Permanent drive mode adds
   owned output links: a fresh checkout with no `target` gets its first
   conversion on build, others by explicit adoption. Existing whole-target
