@@ -1026,6 +1026,84 @@ def pure_case18_transition_control() -> None:
     print("pure case-18 transition control: ok", flush=True)
 
 
+def pure_slot_identity_control() -> None:
+    """Pure counterfactuals of the owned slot mapping and identity snapshot.
+
+    Exercises the SAME `slot_index`/`slot_snapshot` the native cases 18 and 19
+    call, on a private temp tree shaped exactly like the backend
+    (`slots/<label>-<short-id>/<profile>-<id>`). No subprocess, no proof pool and
+    no device: this reproduces diagnostic 3's wrong top-level lookup and proves
+    the corrected retention/no-effect checks detect what they must.
+    """
+    root = tempfile.mkdtemp(prefix="oxide-slot-control.")
+
+    def slot_path(project: str, profile: str, slot: int) -> str:
+        path = os.path.join(root, project)
+        os.makedirs(path, exist_ok=True)
+        child = os.path.join(path, f"{profile}-{slot}")
+        os.makedirs(child, exist_ok=True)
+        return child
+
+    def refuses(action, why: str) -> None:
+        try:
+            action()
+        except OracleFailure:
+            return
+        raise AssertionError(f"the slot helper accepted {why}")
+
+    try:
+        # (a) Nested project/quick-32 maps to exactly slot 32 ... while the
+        # diagnostic-3 expectation of a TOP-LEVEL "32" is false: the negative
+        # control reproduces that failure without weakening the mapping.
+        exact = slot_path("oxide-3fa2c1d4", "quick", 32)
+        index = slot_index(root, "control")
+        expect(index.get("32") == exact, f"nested project/quick-32 mapped to {index.get('32')}, not {exact}")
+        expect("32" not in os.listdir(root), "the top-level listing unexpectedly held a numeric slot name")
+        expect(slot_snapshot(root, "control")["32"][0] == exact, "the snapshot lost the exact slot path")
+        # (h) An unchanged tree passes the no-effect comparison.
+        expect(slot_snapshot(root, "control") == slot_snapshot(root, "control"), "an unchanged tree did not compare equal")
+        # (f) A child slot added under an EXISTING project folder changes it.
+        before = slot_snapshot(root, "control")
+        slot_path("oxide-3fa2c1d4", "debug", 33)
+        expect(slot_snapshot(root, "control") != before, "a new child slot under an existing project folder was not detected")
+        os.rmdir(os.path.join(root, "oxide-3fa2c1d4", "debug-33"))
+        # (e) Removing slot 32 while its parent project folder stays behind must
+        # fail the retained-slot oracle.
+        identity = slot_snapshot(root, "control")["32"]
+        os.rmdir(exact)
+        expect(os.path.isdir(os.path.join(root, "oxide-3fa2c1d4")), "the parent project folder disappeared")
+        expect(
+            slot_snapshot(root, "control").get("32") != identity,
+            "deleting slot 32 while keeping its project folder passed the retained-slot oracle",
+        )
+        # (g) Replacing the slot directory - same name, new identity - is detected.
+        os.makedirs(exact)
+        expect(
+            slot_snapshot(root, "control").get("32") != identity,
+            "a re-created slot directory with a new identity compared equal to the old one",
+        )
+        # (d) An ambiguous duplicate slot id across two project folders refuses.
+        slot_path("other-1111aaaa", "quick", 32)
+        refuses(lambda: slot_index(root, "control"), "an ambiguous duplicate slot id")
+        os.rmdir(os.path.join(root, "other-1111aaaa", "quick-32"))
+        # (b) A foreign child name is not an owned slot directory.
+        os.makedirs(os.path.join(root, "oxide-3fa2c1d4", "payload"))
+        refuses(lambda: slot_index(root, "control"), "a foreign child name in the slot tree")
+        os.rmdir(os.path.join(root, "oxide-3fa2c1d4", "payload"))
+        # (c) A symlinked project folder or slot directory is refused, never followed.
+        outside = os.path.join(root, "outside-project")
+        os.makedirs(os.path.join(outside, "quick-9"))
+        os.symlink(outside, os.path.join(root, "linked-2222bbbb"))
+        refuses(lambda: slot_index(root, "control"), "a symlinked project folder")
+        os.unlink(os.path.join(root, "linked-2222bbbb"))
+        os.symlink(outside, os.path.join(root, "oxide-3fa2c1d4", "quick-9"))
+        refuses(lambda: slot_index(root, "control"), "a symlinked slot directory")
+        os.unlink(os.path.join(root, "oxide-3fa2c1d4", "quick-9"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("pure slot-identity control: ok", flush=True)
+
+
 class _FakeCustodyChild:
     """A child stand-in: no process, no subprocess, no signal."""
 
@@ -1790,6 +1868,63 @@ def selected_backend_slots(proof: Proof, pool: str, label: str) -> str:
     return slots
 
 
+# One owned slot directory below `slots/`: `<profile>-<id>` (oxide#104 layout).
+SLOT_CHILD = re.compile(r"^(quick|debug|release)-([0-9]+)$")
+
+
+def slot_index(slots_dir: str, label: str = "") -> dict:
+    """`{slot id: exact owned slot directory}` for ONE backend's `slots/` tree.
+
+    The build summary names the numeric slot ID; the backend stores that slot at
+    `slots/<label>-<short-id>/<profile>-<id>` (owned layout: `<n>` is the slot
+    ID). This reads exactly those two bounded levels and nothing else, so the
+    summary ID resolves to a UNIQUE owned path rather than to a project folder
+    name or a substring. Symlinks, non-directories, foreign child names and
+    duplicate IDs refuse with a clear message instead of being guessed.
+    """
+    index = {}
+    if not os.path.isdir(slots_dir):
+        return index
+    for project in sorted(os.listdir(slots_dir)):
+        project_path = os.path.join(slots_dir, project)
+        expect(
+            os.path.isdir(project_path) and not os.path.islink(project_path),
+            f"{label}: {project_path} is not a real project folder in the slot tree",
+        )
+        for child in sorted(os.listdir(project_path)):
+            child_path = os.path.join(project_path, child)
+            match = SLOT_CHILD.match(child)
+            expect(
+                match is not None,
+                f"{label}: {child_path} is not an owned <profile>-<id> slot directory",
+            )
+            expect(
+                os.path.isdir(child_path) and not os.path.islink(child_path),
+                f"{label}: {child_path} is not a real slot directory",
+            )
+            slot = match.group(2)
+            expect(
+                slot not in index,
+                f"{label}: slot id {slot} is ambiguous between {index.get(slot)} and {child_path}",
+            )
+            index[slot] = child_path
+    return index
+
+
+def slot_snapshot(slots_dir: str, label: str = "") -> dict:
+    """`{slot id: (path, dev, ino)}` for the backend's owned slots.
+
+    Identity, not names: a slot removed, re-created or replaced under the same
+    project folder changes this snapshot, and comparing it before/after a
+    command detects exactly that instead of a vacuous listing of project names.
+    """
+    snapshot = {}
+    for slot, path in slot_index(slots_dir, label).items():
+        info = os.lstat(path)
+        snapshot[slot] = (path, info.st_dev, info.st_ino)
+    return snapshot
+
+
 def custody_snapshot(pool: str, checkout: str) -> dict:
     """Bounded observable state of one checkout's output authority: receipt
     bytes, member link texts, the root marker's bytes, the checkout's own
@@ -2540,6 +2675,7 @@ def run(proof: Proof, repo: str) -> None:
     pure_reserve_stop_control()
     pure_watched_clean_premise_control()
     pure_case18_transition_control()
+    pure_slot_identity_control()
     pure_child_custody_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
@@ -3991,15 +4127,19 @@ def run(proof: Proof, repo: str) -> None:
                 f"18: the repeat used slot {real_slot}, not the adopted seed slot {seed_slot}",
             )
             # A8: the selected removable backend's own slot root, plus the internal
-            # pool's authority for a no-effect comparison.
+            # pool's authority for a no-effect comparison. The summary names the
+            # numeric slot ID; resolve it at the real owned depth
+            # (`slots/<project>/<profile>-<id>`) and keep its identity.
             slots_dir = selected_backend_slots(proof, pool, "18")
-            slots_before = sorted(os.listdir(slots_dir))
-            internal_slots = os.path.join(pool, "payload", "slots")
-            internal_before = sorted(os.listdir(internal_slots)) if os.path.isdir(internal_slots) else []
+            slots_before = slot_snapshot(slots_dir, "18")
             expect(
                 real_slot in slots_before,
-                f"18: the real placement's slot {real_slot} is not in the selected backend tree {slots_dir}",
+                f"18: the real placement's slot {real_slot} is not an owned slot directory under {slots_dir}: "
+                f"{sorted(slots_before)}",
             )
+            real_identity = slots_before[real_slot]
+            internal_slots = os.path.join(pool, "payload", "slots")
+            internal_before = slot_snapshot(internal_slots, "18") if os.path.isdir(internal_slots) else None
             shutil.rmtree(os.path.join(cold, "target", "debug"))
             adopt(proof, cold, "18 relink")
             expect_layout(cold, {"debug": f"link:{cold_root}", "release": f"link:{cold_root}"})
@@ -4027,18 +4167,28 @@ def run(proof: Proof, repo: str) -> None:
                 linked_slot != real_slot,
                 f"18: the placement change reused slot {real_slot} ({real_state}); a distinct key needs its own slot",
             )
-            slots_after = sorted(os.listdir(slots_dir))
+            slots_after = slot_snapshot(slots_dir, "18")
+            expect(
+                linked_slot in slots_after,
+                f"18: the linked build's slot {linked_slot} is not an owned slot directory under {slots_dir}: "
+                f"{sorted(slots_after)}",
+            )
+            expect(
+                linked_slot not in slots_before,
+                f"18: the linked placement reused an existing slot id {linked_slot} ({slots_before.get(linked_slot)})",
+            )
             expect(
                 set(slots_before).issubset(set(slots_after)),
-                f"18: the real placement's slot was evicted instead of remaining available: {slots_before} -> {slots_after}",
+                f"18: an older slot was evicted instead of remaining available: {sorted(slots_before)} -> {sorted(slots_after)}",
             )
             expect(
-                real_slot in slots_after,
-                f"18: the real placement's slot {real_slot} left the selected backend tree",
+                slots_after.get(real_slot) == real_identity,
+                f"18: the real placement's slot {real_slot} was removed or replaced: "
+                f"{real_identity} -> {slots_after.get(real_slot)}",
             )
-            if os.path.isdir(internal_slots):
+            if internal_before is not None:
                 expect(
-                    sorted(os.listdir(internal_slots)) == internal_before,
+                    slot_snapshot(internal_slots, "18") == internal_before,
                     "18: the internal pool's slot authority changed during external builds",
                 )
             facts_linked = perm.plan(proof, cold, "18 linked plan")["members"]
@@ -4057,9 +4207,12 @@ def run(proof: Proof, repo: str) -> None:
             snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
             receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
             slots_dir = selected_backend_slots(proof, pool, "19")
-            slots_before = sorted(os.listdir(slots_dir))
+            # Identity snapshots at the owned slot depth, so creating, removing or
+            # replacing a slot inside an EXISTING project folder is detected; a
+            # listing of project folder names would be vacuous.
+            slots_before = slot_snapshot(slots_dir, "19")
             internal_slots = os.path.join(pool, "payload", "slots")
-            internal_before = sorted(os.listdir(internal_slots)) if os.path.isdir(internal_slots) else []
+            internal_before = slot_snapshot(internal_slots, "19") if os.path.isdir(internal_slots) else None
             # Working base control immediately before the refusal: the same base
             # binary serves a fresh private pool normally.
             control = proof.run([base, "--version"], cwd=migrated, env=proof.env, timeout=60)
@@ -4089,12 +4242,12 @@ def run(proof: Proof, repo: str) -> None:
                 expect(os.readlink(member_link(migrated, member)) == target, "19: the refusal changed a member link")
             expect(perm.sha256_file(perm.receipt_path(pool, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
             expect(
-                sorted(os.listdir(slots_dir)) == slots_before,
-                "19: the refused state-3 run created or changed a slot in the selected backend",
+                slot_snapshot(slots_dir, "19") == slots_before,
+                "19: the refused state-3 run created, removed or replaced an owned slot in the selected backend",
             )
-            if os.path.isdir(internal_slots):
+            if internal_before is not None:
                 expect(
-                    sorted(os.listdir(internal_slots)) == internal_before,
+                    slot_snapshot(internal_slots, "19") == internal_before,
                     "19: the refused state-3 run changed the internal pool authority",
                 )
             DIAG.finished("19.1")
@@ -4572,6 +4725,7 @@ def main() -> int:
         pure_reserve_stop_control()
         pure_watched_clean_premise_control()
         pure_case18_transition_control()
+        pure_slot_identity_control()
         pure_child_custody_control()
         return 0
     if arguments == [DIAGNOSTIC_ARGUMENT]:

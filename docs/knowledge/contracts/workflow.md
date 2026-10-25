@@ -3597,7 +3597,12 @@ automatic-adoption and Cargo-argv premises) to shipped source at this head. The
 uncounted diagnostic mode now exists and has run twice (see the evidence limit
 above): diagnostic 1 exposed the case-16 auxiliary-pool premise and diagnostic 2
 the case-18 missing post-adopt warm repeat, both corrected in the proof source
-rather than the product.
+rather than the product. Its slot-tree oracles resolve the numeric slot ID the
+build summary names at the owned depth — `slots/<label>-<short-id>/<profile>-<id>`
+— and compare `(path, dev, ino)` snapshots there, so a slot removed, re-created
+or replaced under an existing project folder is detected while a listing of
+project folder names would be vacuous; the mapping refuses symlinks, foreign
+child names, duplicate IDs and unknown topology instead of guessing.
 
 The script also has an explicitly opt-in `--diagnostic` collection mode. It
 records recoverable oracle failures and skips dependent or tainted premises,
