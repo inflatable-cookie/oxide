@@ -56,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -93,6 +94,8 @@ MAX_RECEIPT_ENTRIES = 64
 MAX_RECEIPT_EXCERPT = 600
 # The invoking toolchain home, resolved once before any private HOME exists.
 INVOKING_RUSTUP_HOME = ""
+# The installed `<pin>-<host>` directory proven beneath that home before use.
+TOOLCHAIN_INSTALLED = ""
 
 CASES: list[str] = []
 FAILURES: list[tuple[str, str]] = []
@@ -193,6 +196,40 @@ def invoking_rustup_home() -> str:
     if not os.path.isdir(resolved):
         abort(f"no usable toolchain home at {resolved}")
     return os.path.realpath(resolved)
+
+
+def toolchain_pin_problems(rustup_home: str, entries: list[str]) -> list[str]:
+    """Why the invoking toolchain home does not carry the pinned toolchain.
+
+    Existence of the home is not evidence: the pin must be installed beneath
+    it. This reads the directory listing only, so `--self-check` can exercise
+    it without probing rustup, installing anything or touching a toolchain.
+    """
+    problems: list[str] = []
+    if not rustup_home or not os.path.isabs(rustup_home):
+        problems.append("toolchain_home_not_absolute")
+    installed = [entry for entry in entries if entry.startswith(BUILDER + "-")]
+    if not installed:
+        problems.append("pinned_toolchain_absent")
+    if not any(os.path.isdir(os.path.join(rustup_home, entry)) for entry in installed):
+        problems.append("pinned_toolchain_not_a_directory")
+    return problems
+
+
+def installed_toolchain(home: str) -> str:
+    """The installed `<pin>-<host>` directory name, refused if it is missing."""
+    try:
+        entries = sorted(os.listdir(home))
+    except OSError as error:
+        abort(f"cannot list the invoking toolchain home {home}: {error}")
+    problems = toolchain_pin_problems(home, entries)
+    if problems:
+        abort(f"the invoking toolchain home {home} is unusable for the pin: {problems}")
+    for entry in entries:
+        if entry.startswith(BUILDER + "-"):
+            return entry
+    abort(f"no installed {BUILDER}-<host> toolchain beneath {home}")
+    raise AssertionError("unreachable")
 
 
 def toolchain_env(rustup_home: str) -> dict[str, str]:
@@ -493,6 +530,101 @@ def distinct(roots: list[str]) -> list[str]:
     return sorted(set(roots))
 
 
+def canon(roots: list[str]) -> list[str]:
+    """Compare paths by canonical real path on both sides.
+
+    `/tmp` and `/private/tmp`, or any other alias, are the same slot root; a
+    substring or suffix test would misattribute a walk.
+    """
+    return sorted({os.path.realpath(root) for root in roots})
+
+
+def same_roots(observed: list[str], expected: list[str]) -> bool:
+    return canon(observed) == canon(expected)
+
+
+def tree_facts(root: str) -> tuple[int, int, int]:
+    """Bounded own-fixture facts: (bytes, distinct inodes, largest size).
+
+    Used only to establish a premise about the proof's own small fixture; it is
+    not a second accounting engine and never replaces a product figure.
+    """
+    total = 0
+    inodes: set[tuple[int, int]] = set()
+    largest = 0
+    for base, directories, files in os.walk(root):
+        directories.sort()
+        for name in sorted(files):
+            path = os.path.join(base, name)
+            try:
+                info = os.lstat(path)
+            except OSError as error:
+                raise CaseFailure(f"cannot stat own fixture {path}: {error}", abort=True)
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            key = (info.st_dev, info.st_ino)
+            if key in inodes:
+                continue
+            inodes.add(key)
+            total += info.st_blocks * 512
+            largest = max(largest, info.st_size)
+    return total, len(inodes), largest
+
+
+def union_allocated(roots: list[str]) -> tuple[int, int]:
+    """Exact allocated bytes over the union of these fixture trees."""
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for root in roots:
+        for base, directories, files in os.walk(root):
+            directories.sort()
+            for name in sorted(files):
+                path = os.path.join(base, name)
+                info = os.lstat(path)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                key = (info.st_dev, info.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+                total += info.st_blocks * 512
+    return total, len(seen)
+
+
+def file_identity(path: str) -> tuple[int, int, int, int]:
+    """(device, inode, size, allocated) of one owned fixture file."""
+    info = os.lstat(path)
+    return info.st_dev, info.st_ino, info.st_size, info.st_blocks * 512
+
+
+def recorded_total_line(output: str) -> str:
+    """The exact rendered ledger-total line, or an empty string."""
+    for line in output.splitlines():
+        if RECORDED_TOTAL_NEEDLE in line:
+            return line.strip()
+    return ""
+
+
+def recorded_total_grammar(line: str) -> bool:
+    """`recorded slot sizes (ledger): <size> across <n> of <m> idle slots`.
+
+    The rendered grammar is `main.rs`'s; the proof binds the exact shape rather
+    than a loose substring, so a missing or reworded total cannot pass.
+    """
+    pattern = (
+        re.escape(RECORDED_TOTAL_NEEDLE)
+        + r" \S+(?: \S+)*? across (\d+) of (\d+) idle slots"
+    )
+    return re.search(pattern, line) is not None
+
+
+def recorded_total_counts(line: str) -> tuple[int, int] | None:
+    match = re.search(r"across (\d+) of (\d+) idle slots", line)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 # --------------------------------------------------------------------------
 # Fixtures.
 
@@ -680,6 +812,21 @@ class Fixture:
                 return slot.get("recorded")
         return None
 
+    def current_records(self) -> list[str]:
+        """Idle slots whose recorded observation still matches its generation."""
+        current = []
+        for slot in self.ledger()["slots"]:
+            record = slot.get("recorded")
+            if record is None:
+                continue
+            if slot["state"] == "idle" and slot.get("lease_id") in (None, ""):
+                if record.get("for_lease") == slot.get("last_lease_id"):
+                    current.append(str(slot["id"]))
+        return current
+
+    def payload_root(self) -> str:
+        return os.path.join(self.pool, "payload")
+
     def idle_slots(self) -> list[str]:
         return [
             str(slot["id"])
@@ -706,15 +853,39 @@ def built(fixture: Fixture, subject: str, checkout: str) -> None:
         abort(f"fixture build failed ({result.returncode}): {result.stderr[-1200:]}")
 
 
-def await_held(fixture: Fixture, child: subprocess.Popen, ready: str, output: str) -> str:
-    """Wait for a fresh readiness marker and the true held lease."""
-    deadline = time.monotonic() + min(90, work_left())
+def select_new_held(held: list[str], before: set[str]) -> str:
+    """The one held lease this launch created, excluding pre-existing holders.
+
+    A fresh readiness marker alone cannot associate an arbitrary held row with
+    this launch: with another writer already holding a slot, `held[0]` may be
+    the wrong one. Exactly one new held lease must appear.
+    """
+    fresh = [slot for slot in held if slot not in before]
+    if not fresh:
+        raise CaseFailure(
+            f"no new held lease appeared; already held before the launch: {sorted(before)}",
+            abort=True,
+        )
+    if len(fresh) > 1:
+        raise CaseFailure(f"several new held leases appeared at once: {sorted(fresh)}", abort=True)
+    return fresh[0]
+
+
+def await_held(
+    fixture: Fixture,
+    child: subprocess.Popen,
+    ready: str,
+    output: str,
+    before: set[str],
+) -> str:
+    """Wait for this launch's own readiness marker and its own new held lease."""
+    deadline = time.monotonic() + child_timeout(90)
     while time.monotonic() < deadline:
         if child.poll() is not None:
             abort(f"the gated writer exited early: {read_log(output)[-6:]}")
         held = fixture.held_slots()
         if held and os.path.exists(ready):
-            return held[0]
+            return select_new_held(held, before)
         time.sleep(0.2)
     child.kill()
     child.wait()
@@ -753,27 +924,36 @@ def case_a_all_recorded_admission_walks_nothing(root: str, subject: str) -> None
     fx.reset_logs()
     before = fx.walks()
     scopes_before = fx.scopes()
+    held_before = set(fx.held_slots())
     child, gate, ready, output = fx.run_gated(subject, fx.crate("second"), "a")
     new_slot = ""
     try:
-        new_slot = await_held(fx, child, ready, output)
+        new_slot = await_held(fx, child, ready, output, held_before)
         admission = phase_slice(before, fx.walks())
         expect(admission == [], f"admission walked inventory: {admission}")
         phases = phase_slice(scopes_before, fx.scopes())
         expect(len(phases) == 1, f"expected exactly one shallow scope pass: {phases}")
+        expect(same_roots(phases, [fx.payload_root()]), f"the scope pass was not the payload: {phases}")
         expect(fx.recorded(new_slot) is None, "a held slot carries an idle observation")
         expect(len(fx.slot_ids()) == 2, f"the second project got no own slot: {fx.slot_ids()}")
     finally:
         release_gated(fx, child, gate, output)
     release = phase_slice(before, fx.walks())
-    expect(
-        release == [fx.slot_dir(new_slot)],
-        f"the release walk was not exactly the closed slot: {release}",
-    )
+    expect(same_roots(release, [fx.slot_dir(new_slot)]), f"release walked {release}, not the closed slot")
+    expect(len(release) == 1, f"the release walked {len(release)} roots, not one slot")
     expect(fx.recorded(new_slot) is not None, "the release published no observation")
     text = fx.status(subject)
-    expect(RECORDED_TOTAL_NEEDLE in text, "status did not report the ledger recorded total")
-    expect("2 of 2" in text, f"status did not report both idle records: {text[-600:]}")
+    line = recorded_total_line(text)
+    expect(line != "", "status did not report the ledger recorded total")
+    expect(recorded_total_grammar(line), f"the recorded total line lost its grammar: {line!r}")
+    expect(
+        recorded_total_counts(line) == (2, 2),
+        f"status did not report both idle records: {line!r}",
+    )
+    expect(
+        len(fx.current_records()) == 2,
+        f"the ledger does not hold two current idle records: {fx.current_records()}",
+    )
 
 
 def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
@@ -795,17 +975,24 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
         json.dump(document, handle)
     os.chmod(os.path.join(fx.pool, "ledger.json"), 0o600)
 
+    # The product must read exactly this legacy shape before the admission.
+    read_back = fx.ledger()
+    expect(
+        read_back["capacity_policy"] == 2
+        and all(str(slot["id"]) != victim or slot.get("recorded") is None for slot in read_back["slots"]),
+        "the ledger edit did not produce the intended missing-record shape",
+    )
     fx.reset_logs()
     before = fx.walks()
+    held_before = set(fx.held_slots())
     child, gate, ready, output = fx.run_gated(subject, fx.crate("third"), "b")
     new_slot = ""
     try:
-        new_slot = await_held(fx, child, ready, output)
+        new_slot = await_held(fx, child, ready, output, held_before)
         admission = phase_slice(before, fx.walks())
-        expected = fx.slot_dir(victim)
         expect(
-            admission == [expected],
-            f"admission walked {admission}, not exactly the unrecorded slot {expected}",
+            same_roots(admission, [fx.slot_dir(victim)]) and len(admission) == 1,
+            f"admission walked {admission}, not exactly the unrecorded slot",
         )
         expect(fx.recorded(victim) is not None, "the completed walk was not published")
         expect(fx.recorded(keeper) is not None, "the untouched record was lost")
@@ -813,7 +1000,7 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
         release_gated(fx, child, gate, output)
     release = phase_slice(before, fx.walks())
     expect(
-        release == [fx.slot_dir(victim), fx.slot_dir(new_slot)],
+        same_roots(release, [fx.slot_dir(victim), fx.slot_dir(new_slot)]) and len(release) == 2,
         f"release walks were not the admission walk plus the closed slot: {release}",
     )
 
@@ -834,14 +1021,15 @@ def case_c_release_publishes_and_reuse_clears(root: str, subject: str) -> None:
 
     fx.reset_logs()
     before = fx.walks()
+    held_before = set(fx.held_slots())
     child, gate, ready, output = fx.run_gated(subject, checkout, "c")
     provenance = ""
     try:
-        held = await_held(fx, child, ready, output)
+        held = await_held(fx, child, ready, output, held_before)
         expect(held == idle[0], f"the reuse took slot {held}, not {idle[0]}")
         admission = phase_slice(before, fx.walks())
         expect(
-            admission == [fx.slot_dir(idle[0])],
+            same_roots(admission, [fx.slot_dir(idle[0])]) and len(admission) == 1,
             f"reuse walked {admission}, not exactly its own slot",
         )
         expect(fx.recorded(held) is None, "a held slot kept the idle record")
@@ -849,9 +1037,10 @@ def case_c_release_publishes_and_reuse_clears(root: str, subject: str) -> None:
         provenance = release_gated(fx, child, gate, output)
     release = phase_slice(before, fx.walks())
     expect(
-        release == [fx.slot_dir(idle[0]), fx.slot_dir(idle[0])],
+        same_roots(release, [fx.slot_dir(idle[0])]) and len(release) == 2,
         f"the reuse and its release did not each walk the one slot: {release}",
     )
+    expect(fx.recorded(idle[0]) is not None, "the reuse release published no observation")
     expect(
         f"slot {idle[0]} was " in provenance and "MiB when leased" in provenance,
         f"the reuse result line lost its provenance: {provenance[-600:]}",
@@ -874,54 +1063,116 @@ def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> N
         fx.ledger()["cap_bytes"] == PRESSURE_BUDGET,
         f"the fixture did not get its byte budget: {fx.ledger()['cap_bytes']}",
     )
+    expect(
+        fx.ledger()["backend"] == "directory-budget-v1",
+        f"the fixture is not the internal directory pool: {fx.ledger()['backend']}",
+    )
+    idle_record = fx.recorded(idle[0])
+    expect(idle_record is not None, "the idle slot has no current record to count")
     evicted_path = fx.slot_dir(idle[0])
     held_checkout = fx.crate("held")
-    stray = os.path.join(fx.pool, "payload", "slots", "stray.bin")
+    stray = os.path.join(fx.payload_root(), "slots", "stray.bin")
     stray_bytes = 2 * MIB
+
+    writer_before = set(fx.held_slots())
     writer, gate, ready, writer_output = fx.run_gated(subject, held_checkout, "d-held")
+    held_slot = ""
     pressure_gate = ""
     pressure_output = ""
     try:
-        held_slot = await_held(fx, writer, ready, writer_output)
+        held_slot = await_held(fx, writer, ready, writer_output, writer_before)
+        expect(
+            fx.recorded(held_slot) is None,
+            "a held slot still carried an idle observation",
+        )
+        held_dir = fx.slot_dir(held_slot)
+        # The stray is the supported out-of-slot path: inside `payload/slots`,
+        # counted by the scope pass and owned by nobody.
         with open(stray, "wb") as handle:
             handle.write(b"s" * stray_bytes)
-        # The idle record and the stray were settled before this phase.
+        stray_identity = file_identity(stray)
+        held_bytes = tree_facts(held_dir)[0]
+
+        # Before the pressure command: the product's own current figure is the
+        # idle record plus the fresh held walk plus the scope's stray.
+        before_used = idle_record["unique_bytes"] + held_bytes + stray_identity[3]
+        after_victim = held_bytes + stray_identity[3]
+        print(
+            f"  case d premise: before={before_used} cap={PRESSURE_BUDGET}"
+            f" after-victim={after_victim} (idle record {idle_record['unique_bytes']},"
+            f" held {held_bytes}, stray {stray_identity[3]})",
+            flush=True,
+        )
+        expect(
+            before_used >= PRESSURE_BUDGET,
+            f"the premise is not non-vacuous: before {before_used} < cap {PRESSURE_BUDGET}",
+        )
+        expect(
+            after_victim < PRESSURE_BUDGET,
+            f"removing the victim does not relieve pressure: {after_victim} >= {PRESSURE_BUDGET}",
+        )
+
         fx.reset_logs()
         before = fx.walks()
+        pressure_before = set(fx.held_slots())
         pressure, pressure_gate, pressure_ready, pressure_output = fx.run_gated(
             subject, fx.crate("pressure"), "d-pressure"
         )
         try:
-            new_slot = await_held(fx, pressure, pressure_ready, pressure_output)
+            new_slot = await_held(fx, pressure, pressure_ready, pressure_output, pressure_before)
             admission = phase_slice(before, fx.walks())
-            # The frozen design requires a fresh walk of a held slot and never
-            # borrows its idle record, so exactly that slot is walked.
+            # Eviction pressure may re-walk the held slot several times (the
+            # initial figure, each loop iteration and the post-decision check).
+            # Repeated identical held roots are the required rechecks; no idle
+            # root and no whole-payload root may appear.
+            expect(admission, "the pressure admission walked no held slot at all")
             expect(
-                distinct(admission) == [fx.slot_dir(held_slot)],
-                f"the held-slot pressure admission walked {distinct(admission)},"
-                f" not exactly the held slot {fx.slot_dir(held_slot)}",
+                same_roots(admission, [held_dir]),
+                f"the pressure admission walked {distinct(admission)},"
+                f" not only the held slot {held_dir}",
             )
             expect(
-                fx.slot_dir(idle[0]) not in admission,
+                not any(os.path.realpath(root) == os.path.realpath(evicted_path) for root in admission),
                 "an idle slot with a current record was walked",
+            )
+            expect(
+                not any(os.path.realpath(root) == os.path.realpath(fx.payload_root()) for root in admission),
+                "the whole payload was walked during admission",
             )
             ids = fx.slot_ids()
             expect(idle[0] not in ids, "recorded byte pressure did not evict the idle whole slot")
             expect(held_slot in ids, "the held slot was deleted or treated as evictable")
             expect(new_slot in ids, "the pressure command took no slot")
-            expect(os.path.exists(stray), "a foreign out-of-slot entry was deleted")
+            expect(os.path.exists(stray), "the foreign out-of-slot entry was deleted")
+            expect(
+                file_identity(stray) == stray_identity,
+                "the foreign out-of-slot entry changed bytes, inode or size",
+            )
             expect(
                 not os.path.exists(evicted_path),
                 "the evicted slot's tree was not removed whole",
             )
+            expect(
+                fx.recorded(held_slot) is None,
+                "the held slot gained an idle observation while still held",
+            )
         finally:
-            release_gated(fx, pressure, pressure_gate, pressure_output)
+            pressure_release = release_gated(fx, pressure, pressure_gate, pressure_output)
+        pressure_release_walks = phase_slice(before, fx.walks())
         expect(
-            fx.recorded(held_slot) is not None,
-            "the held writer's release recorded nothing",
+            same_roots(pressure_release_walks, [held_dir, fx.slot_dir(new_slot)])
+            and len(pressure_release_walks) == 2,
+            f"the pressure command's release walks were {pressure_release_walks}",
         )
+        expect(pressure_release != "", "the pressure writer wrote no result line")
     finally:
-        release_gated(fx, writer, gate, writer_output)
+        writer_release = release_gated(fx, writer, gate, writer_output)
+    # After the original writer's release its observation must exist.
+    expect(writer_release != "", "the held writer wrote no result line")
+    expect(
+        fx.recorded(held_slot) is not None,
+        "the released held writer published no observation",
+    )
 
 
 def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
@@ -930,6 +1181,8 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
     shared = os.path.join(fx.root, "shared inode.bin")
     with open(shared, "wb") as handle:
         handle.write(b"h" * SHARED_INODE_BYTES)
+    shared_info = os.lstat(shared)
+    shared_key = (shared_info.st_dev, shared_info.st_ino)
     for name in ("one", "two"):
         built(fx, subject, fx.crate(name, hard_link=shared))
 
@@ -940,28 +1193,50 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
         record = fx.recorded(slot_id)
         expect(record is not None, f"slot {slot_id} has no closed observation")
         recorded_sum += record["unique_bytes"]
+    root_a, root_b = (fx.slot_dir(slot) for slot in idle)
+    expect(
+        os.lstat(root_a).st_dev == os.lstat(root_b).st_dev,
+        "the two fixture slots are not on one device, so a union is meaningless",
+    )
+    expect(
+        shared_inode_precondition([root_a, root_b], shared_key),
+        "the shared inode is not present in both slot trees",
+    )
+    # The union is the *fixture's own* device/inode union, not a product
+    # measurement claim: it exists only to prove the 6 MiB budget sits between
+    # the two figures the design distinguishes.
+    union_bytes, union_inodes = union_allocated([root_a, root_b])
+    survivor_record = min(fx.recorded(slot)["unique_bytes"] for slot in idle)
+    print(
+        f"  case e premise: fixture union={union_bytes} ({union_inodes} inodes)"
+        f" recorded sum={recorded_sum} survivor record={survivor_record}"
+        f" (budget {OVERCOUNT_BUDGET})",
+        flush=True,
+    )
     expect(
         recorded_sum >= 2 * SHARED_INODE_BYTES,
         f"the recorded sum ({recorded_sum}) did not count the shared inode twice",
     )
-    # The full payload union counts the shared inode once. The 6 MiB budget is
-    # only meaningful between the two figures, so prove that premise with the
-    # product's own measurement instead of assuming it.
-    measured = fx.run(subject, ["status", "--measure"], fx.work)
-    expect(measured.returncode == 0, f"measure exit {measured.returncode}")
-    union = payload_union(measured.stdout)
     expect(
-        union < OVERCOUNT_BUDGET < recorded_sum,
-        f"the budget is not between the union ({union}) and the recorded sum"
-        f" ({recorded_sum}); the overcount cannot be isolated at {OVERCOUNT_BUDGET}",
+        recorded_sum >= OVERCOUNT_BUDGET,
+        f"the recorded sum ({recorded_sum}) is not at or above the budget",
+    )
+    expect(
+        union_bytes < OVERCOUNT_BUDGET,
+        f"the fixture union ({union_bytes}) is already at or above the budget",
+    )
+    expect(
+        survivor_record < OVERCOUNT_BUDGET,
+        f"one surviving record ({survivor_record}) is at or above the budget",
     )
 
     fx.reset_logs()
     before = fx.walks()
+    held_before = set(fx.held_slots())
     child, gate, ready, output = fx.run_gated(subject, fx.crate("pressure"), "e")
     new_slot = ""
     try:
-        new_slot = await_held(fx, child, ready, output)
+        new_slot = await_held(fx, child, ready, output, held_before)
         admission = phase_slice(before, fx.walks())
         expect(admission == [], f"the overcount admission walked inventory: {admission}")
         ids = fx.slot_ids()
@@ -976,26 +1251,9 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
         release_gated(fx, child, gate, output)
     release = phase_slice(before, fx.walks())
     expect(
-        release == [fx.slot_dir(new_slot)],
+        same_roots(release, [fx.slot_dir(new_slot)]) and len(release) == 1,
         f"the release walk was not exactly the closed slot: {release}",
     )
-
-
-def payload_union(status_output: str) -> int:
-    """The measured whole-payload unique allocated bytes, in bytes."""
-    for line in status_output.splitlines():
-        if "payload" in line and "unique" in line:
-            numbers = [token for token in line.replace(",", " ").split() if token.isdigit()]
-            if numbers:
-                return int(numbers[-1])
-    for line in status_output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("payload unique allocated bytes:"):
-            numbers = [token for token in stripped.replace(",", " ").split() if token.isdigit()]
-            if numbers:
-                return int(numbers[-1])
-    abort(f"the measured status carried no payload union: {status_output[-600:]}")
-    raise AssertionError("unreachable")
 
 
 def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
@@ -1018,13 +1276,14 @@ def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
 
     fx.reset_logs()
     before = fx.walks()
+    held_before = set(fx.held_slots())
     child, gate, ready, output = fx.run_gated(subject, fx.crate("third"), "f")
     new_slot = ""
     try:
-        new_slot = await_held(fx, child, ready, output)
+        new_slot = await_held(fx, child, ready, output, held_before)
         admission = phase_slice(before, fx.walks())
         expect(
-            sorted(admission) == sorted(unrecorded),
+            same_roots(admission, unrecorded) and len(admission) == len(unrecorded),
             f"legacy convergence walked {admission}, not exactly {sorted(unrecorded)}",
         )
         published = [slot for slot in fx.idle_slots() if fx.recorded(slot) is not None]
@@ -1037,24 +1296,28 @@ def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
 
     # A crash replay: kill a genuinely held writer, release its gate, and let
     # the product's own recovery settle the slot. The proof decides nothing
-    # about closure itself.
+    # about closure itself, and it creates the recovery checkout once so no
+    # attempt changes the command's inputs.
     crash_checkout = fx.crate("crash")
+    crash_before = set(fx.held_slots())
     crashed, crash_gate, crash_ready, crash_output = fx.run_gated(subject, crash_checkout, "f-crash")
-    crashed_slot = await_held(fx, crashed, crash_ready, crash_output)
+    crashed_slot = await_held(fx, crashed, crash_ready, crash_output, crash_before)
+    crashed_record_before = fx.recorded(crashed_slot)
+    expect(crashed_record_before is None, "the crashed slot was already recorded while Held")
     crashed.kill()
     crashed.wait()
     with open(crash_gate, "w", encoding="utf-8") as handle:
         handle.write("release\n")
-    deadline = time.monotonic() + min(150, work_left())
+    recovery = fx.crate("recovery")
+    deadline = time.monotonic() + work_left()
     recovered = None
     attempts = 0
     while time.monotonic() < deadline:
         attempts += 1
-        attempt = fx.run(subject, ["check"], fx.crate(f"after-crash-{attempts}"))
+        attempt = fx.run(subject, ["check"], recovery)
         if attempt.returncode == 0:
             recovered = attempt
             break
-        time.sleep(0.5)
     expect(
         recovered is not None,
         f"no later command settled the crashed slot in {attempts} bounded attempts",
@@ -1070,10 +1333,21 @@ def case_f_legacy_convergence_and_crash_replay(root: str, subject: str) -> None:
                 slot.get("lease_id") is not None,
                 "a held slot lost its lease without being recorded",
             )
-    expect(
-        crashed_slot not in fx.idle_slots() or fx.recorded(crashed_slot) is not None,
-        "the crashed slot is idle but unrecorded",
-    )
+    # Both settled outcomes are expected and named: the product either idled
+    # the dead slot with a fresh record, or retired it whole.
+    if crashed_slot in fx.idle_slots():
+        expect(
+            fx.recorded(crashed_slot) is not None,
+            "the crashed slot was idled without a published observation",
+        )
+        recovery_outcome = f"idled slot {crashed_slot} with a record after {attempts} attempt(s)"
+    else:
+        expect(
+            crashed_slot not in fx.slot_ids(),
+            f"the crashed slot is neither idle-with-record nor retired: {fx.slot_ids()}",
+        )
+        recovery_outcome = f"retired slot {crashed_slot} whole after {attempts} attempt(s)"
+    print(f"  case f recovery: {recovery_outcome}", flush=True)
     expect(new_slot in fx.slot_ids(), "the convergence slot disappeared during recovery")
 
 
@@ -1201,6 +1475,52 @@ def dispatch(root: str, subject: str, cases, diagnostic: bool) -> None:
 # on every outcome, with bounded truth and explicit omissions.
 
 
+def evidence_topology_problems(evidence_real: str, scratch_real: str) -> list[str]:
+    """Why this evidence directory is not the guard's own sibling of scratch.
+
+    The guard creates one owned root holding `scratch/` and `evidence/` as
+    siblings and exports that evidence path. Evidence inside the scratch tree
+    would be deleted with the scratch it describes, a scratch tree inside the
+    evidence directory is the same mistake reversed, a different parent or `/`
+    is not one owned root, and a path that only shares characters is not
+    contained. Pure, so both directions are falsifiable without any effect.
+    """
+    problems: list[str] = []
+    if evidence_real == scratch_real:
+        problems.append("evidence_is_scratch")
+    if evidence_real.startswith(scratch_real + os.sep):
+        problems.append("evidence_inside_scratch")
+    if scratch_real.startswith(evidence_real + os.sep):
+        problems.append("scratch_inside_evidence")
+    if os.path.dirname(evidence_real) != os.path.dirname(scratch_real):
+        problems.append("not_siblings")
+    if os.path.dirname(evidence_real) in ("", os.sep):
+        problems.append("no_owned_root")
+    return problems
+
+
+def shared_inode_precondition(roots: list[str], key: tuple[int, int]) -> bool:
+    """Is this exact (device, inode) present in every one of these trees?
+
+    The fixture's union figure is only meaningful when the trees really do
+    share one inode and sit on one device.
+    """
+    present = 0
+    for root in roots:
+        found = False
+        for base, directories, files in os.walk(root):
+            directories.sort()
+            for name in sorted(files):
+                info = os.lstat(os.path.join(base, name))
+                if not os.path.islink(os.path.join(base, name)) and (info.st_dev, info.st_ino) == key:
+                    found = True
+                    break
+            if found:
+                break
+        present += 1 if found else 0
+    return present == len(roots) and len(roots) > 1
+
+
 def evidence_dir(scratch: str) -> str:
     """The guard's own evidence directory, refused if its provenance is unsafe.
 
@@ -1218,12 +1538,11 @@ def evidence_dir(scratch: str) -> str:
         abort(f"OXIDE_PROOF_EVIDENCE {evidence!r} is not a directory")
     evidence_real = os.path.realpath(evidence)
     scratch_real = os.path.realpath(scratch)
-    guard_root = os.path.dirname(scratch_real)
-    contained = evidence_real == scratch_real or evidence_real.startswith(guard_root + os.sep)
-    if not contained:
+    problems = evidence_topology_problems(evidence_real, scratch_real)
+    if problems:
         abort(
-            f"OXIDE_PROOF_EVIDENCE {evidence_real} is outside the guard root {guard_root}"
-            f" that owns scratch {scratch_real}"
+            f"OXIDE_PROOF_EVIDENCE {evidence_real} is not the guard's own evidence"
+            f" directory beside scratch {scratch_real}: {problems}"
         )
     return evidence_real
 
@@ -1272,6 +1591,8 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
         "script_sha256": script_hash,
         "guard_sha256": guard_hash,
         "staged_subject_sha256": subject_hash,
+        "toolchain": {"home": bounded_excerpt(os.path.dirname(os.path.dirname(GUARD_PATH))),
+                      "installed": TOOLCHAIN_INSTALLED},
         "premises": PREMISES,
         "premise_checklist": PREMISE_CHECKLIST,
         "dependencies": DEPENDS,
@@ -1519,6 +1840,80 @@ def self_check() -> None:
         else:
             os.environ["OXIDE_PROOF_EVIDENCE"] = saved_evidence
 
+    # ROOT observation 1 — a fresh readiness marker cannot bind an arbitrary
+    # held row: exactly one new lease must appear, whatever the row order.
+    expect(select_new_held(["7", "9"], {"7"}) == "9", "the new held lease was not selected")
+    expect(select_new_held(["9", "7"], {"7"}) == "9", "the selection depends on row order")
+    expect(select_new_held(["2"], set()) == "2", "a single new held lease was not selected")
+    for held, before, label in (
+        (["7"], {"7"}, "no new lease"),
+        (["7", "8"], set(), "two new leases"),
+        ([], set(), "no leases at all"),
+    ):
+        try:
+            select_new_held(held, before)
+            fail(f"an ambiguous held selection was accepted ({label})")
+        except CaseFailure as failure:
+            expect(failure.abort, f"{label} must abort, not continue")
+
+    # ROOT observation 3 — the rendered recorded-total grammar, exactly.
+    good = (
+        "  recorded slot sizes (ledger): 42.0 MiB across 2 of 2 idle slots;"
+        " the admission basis, not free space"
+    )
+    expect(recorded_total_grammar(good), "a realistic recorded-total line was rejected")
+    expect(recorded_total_counts(good) == (2, 2), "the counts were not parsed from the line")
+    expect(recorded_total_line("junk\n" + good + "\nmore") == good.strip(), "the line was not found")
+    for bad, label in (
+        ("  recorded slot sizes (ledger): 42.0 MiB across 2 of 3 idle slots", "partial counts"),
+        ("  recorded slot sizes (ledger): 42.0 MiB", "missing counts"),
+        ("  recorded slot sizes (ledger): 42.0 MiB across two of two idle slots", "words not digits"),
+        ("  payload unique allocated bytes: 42", "unrelated payload line"),
+        ("  recorded slot sizes (ledger): none recorded yet", "the absent-total label"),
+        ("", "an empty status"),
+    ):
+        if label == "partial counts":
+            expect(
+                recorded_total_counts(bad) == (2, 3) and recorded_total_grammar(bad),
+                "a partial-counts line was not parsed as such",
+            )
+            continue
+        expect(not recorded_total_grammar(bad), f"{label} was accepted as a recorded total")
+
+    # ROOT evidence boundary — the sibling topology, both directions.
+    root = "/private/tmp/oxide-task.abc"
+    scratch = root + "/scratch"
+    expect(evidence_topology_problems(root + "/evidence", scratch) == [], "the guard layout was refused")
+    for bad, expected, label in (
+        (scratch, "evidence_is_scratch", "evidence equals scratch"),
+        (scratch + "/evidence", "evidence_inside_scratch", "evidence inside the scratch tree"),
+        (root, "scratch_inside_evidence", "scratch inside evidence"),
+        ("/private/tmp/other/evidence", "not_siblings", "another root"),
+        ("/evidence", "no_owned_root", "a filesystem-root parent"),
+        ("/private/tmp/oxide-task.abc-evil/evidence", "not_siblings", "a shared-prefix decoy"),
+    ):
+        problems = evidence_topology_problems(bad, scratch)
+        expect(expected in problems, f"{label} was accepted: {problems}")
+
+    # The toolchain pin predicate rejects a home without an installed pin.
+    expect(
+        "pinned_toolchain_absent" in toolchain_pin_problems(REPO, ["stable-x86_64-unknown-linux-gnu"]),
+        "a home without the pinned toolchain was accepted",
+    )
+    expect(
+        "toolchain_home_not_absolute" in toolchain_pin_problems("relative/home", [BUILDER + "-host"]),
+        "a relative toolchain home was accepted",
+    )
+    expect(
+        toolchain_pin_problems(REPO, [BUILDER + "-host", BUILDER + "-other"]) == []
+        or "pinned_toolchain_not_a_directory" in toolchain_pin_problems(REPO, [BUILDER + "-host"]),
+        "the pin predicate is not evaluated",
+    )
+    expect(
+        not shared_inode_precondition(["/nonexistent-a"], (0, 0)),
+        "a single tree cannot satisfy the shared-inode precondition",
+    )
+
     # The map, the case set and the fixed premises.
     expect(len(PREMISE_CHECKLIST) == 9, "the premise checklist is incomplete")
     expect(set(NA_PREMISES) <= set(PREMISE_CHECKLIST), "a not-applicable premise is missing")
@@ -1679,8 +2074,9 @@ def main() -> None:
         head = source_identity()
         guard_hash = guard_identity()
         evidence = evidence_dir(root)
-        global INVOKING_RUSTUP_HOME
+        global INVOKING_RUSTUP_HOME, TOOLCHAIN_INSTALLED
         INVOKING_RUSTUP_HOME = invoking_rustup_home()
+        TOOLCHAIN_INSTALLED = installed_toolchain(INVOKING_RUSTUP_HOME)
         scratch = os.path.join(root, "recorded-accounting")
         os.makedirs(scratch, exist_ok=True)
         os.chmod(scratch, 0o700)
