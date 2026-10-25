@@ -1047,9 +1047,13 @@ Native (`effigy rust:recorded-slot-accounting`, one fixed script
 shared supervisor): tiny private fixtures only, debug staging with
 `debug_assertions` on, private `HOME`/`CARGO_HOME`, explicit `OXIDE_POOL`:
 
-- A: all-recorded new-slot admission with an empty `OXIDE_TEST_WALK_LOG` and
-  exactly one `OXIDE_TEST_SCOPE_LOG` line (zero payload/slot walks), on a pool
-  whose idle slot is large enough that a walk would be visible. The
+- A: all-recorded new-slot admission with an empty `OXIDE_TEST_WALK_LOG` over
+  the admission phase and exactly one `OXIDE_TEST_SCOPE_LOG` line (zero
+  payload/slot walks), on a pool whose idle slot is large enough that a walk
+  would be visible. Every admission oracle in the proof is read while the
+  gated command is still `Held`, because a release always measures the slot it
+  closes; the release walk is then asserted separately, so neither claim can
+  be satisfied by the other phase. The
   count-replacement branch of the same `evict_one_idle` / `retire_idle_slot`
   code is proved by the library regression
   `pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count`, which now
