@@ -973,6 +973,59 @@ def pure_watched_clean_premise_control() -> None:
     print("pure watched-clean premise control: ok", flush=True)
 
 
+def case18_transition(seed, repeat, linked) -> dict:
+    """The case-18 placement transition as ONE executable rule.
+
+    Each argument is a `(slot, state)` pair exactly as `perm.slot_state` parses it
+    from a build summary. The rule the native case and its pure control share:
+
+    * the ADOPTED real placement positively keys a fresh (`cold`) slot;
+    * an ACTUAL repeat at that same adopted layout is `warm` in that same parsed
+      slot (the unconverted pre-adopt build cannot warm it: adoption changes the
+      members and destination identity);
+    * after the real member directory is removed and `outputs adopt` relinks the
+      member, the linked build is `cold` in a DIFFERENT parsed slot.
+    """
+    return {
+        "seed_cold": seed[1] == "cold",
+        "repeat_warm": repeat[1] == "warm",
+        "repeat_same_slot": repeat[0] == seed[0],
+        "linked_cold": linked[1] == "cold",
+        "linked_distinct_slot": linked[0] != seed[0],
+    }
+
+
+def pure_case18_transition_control() -> None:
+    """No-subprocess counterfactuals of the executable case-18 transition.
+
+    Exercises the same `case18_transition` the native case calls, so the fixture
+    cannot drift back to accepting a cold build as the warm repeat or a linked
+    build that reuses the real placement's slot.
+    """
+    seed = ("31", "cold")
+    # (a) No post-adopt repeat at all: the seed's own cold result must not pass.
+    missing = case18_transition(seed, seed, ("32", "cold"))
+    expect(not missing["repeat_warm"], "a missing warm repeat was accepted as warm")
+    expect(missing["repeat_same_slot"], "the missing-repeat control used a foreign slot")
+    # (b) A warm repeat from a DIFFERENT slot does not satisfy the same-slot rule.
+    elsewhere = case18_transition(seed, ("99", "warm"), ("32", "cold"))
+    expect(elsewhere["repeat_warm"], "a warm repeat from another slot was not warm")
+    expect(
+        not elsewhere["repeat_same_slot"],
+        "a warm repeat from another slot passed the same-slot rule",
+    )
+    # (c) The real sequence: same-slot warm, then a cold linked build in a new slot.
+    correct = case18_transition(seed, ("31", "warm"), ("32", "cold"))
+    expect(all(correct.values()), f"the correct case-18 transition was rejected: {correct}")
+    # (d) A linked build that reuses the real placement's slot is rejected.
+    reused = case18_transition(seed, ("31", "warm"), ("31", "cold"))
+    expect(
+        not reused["linked_distinct_slot"],
+        "a linked build reusing the real placement's slot was accepted",
+    )
+    print("pure case-18 transition control: ok", flush=True)
+
+
 class _FakeCustodyChild:
     """A child stand-in: no process, no subprocess, no signal."""
 
@@ -2486,6 +2539,7 @@ def run(proof: Proof, repo: str) -> None:
     pure_slot_state_control()
     pure_reserve_stop_control()
     pure_watched_clean_premise_control()
+    pure_case18_transition_control()
     pure_child_custody_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
@@ -3913,13 +3967,29 @@ def run(proof: Proof, repo: str) -> None:
             cold_root = root_of(pool, cold)
             expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
             facts_real = perm.plan(proof, cold, "18 real plan")["members"]
-            code, _, stderr = oxide(proof, ["build"], "18 real build again", cold)
-            expect(code == 0, f"18: second real-member build failed: {stderr}")
+            # The UNCONVERTED first build did not warm the adopted key: adoption
+            # changed the members/destination identity. Establish the ADOPTED real
+            # placement with its own first build, then repeat at that same layout.
+            code, _, stderr = oxide(proof, ["build"], "18 real placement seed", cold)
+            expect(code == 0, f"18: post-adopt real-placement build failed: {stderr}")
             expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
-            # A8: the real placement's slot is read from the parsed summary, and the
-            # repeat is required to be WARM in that exact slot - not a substring test.
+            seed_slot, seed_state = perm.slot_state(stderr)
+            expect(
+                seed_state == "cold",
+                f"18: the adopted real placement did not key a fresh slot: {summary(stderr)}",
+            )
+            code, _, stderr = oxide(proof, ["build"], "18 real placement repeat", cold)
+            expect(code == 0, f"18: second post-adopt real-placement build failed: {stderr}")
+            expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
+            # A8: the repeat is required to be WARM in the seed slot the adopted
+            # layout positively keyed - a parsed comparison of both facts, never a
+            # substring test and never an assumed warmth.
             real_slot, real_state = perm.slot_state(stderr)
             expect(real_state == "warm", f"18: the real placement's repeat was not warm: {summary(stderr)}")
+            expect(
+                real_slot == seed_slot,
+                f"18: the repeat used slot {real_slot}, not the adopted seed slot {seed_slot}",
+            )
             # A8: the selected removable backend's own slot root, plus the internal
             # pool's authority for a no-effect comparison.
             slots_dir = selected_backend_slots(proof, pool, "18")
@@ -3936,6 +4006,19 @@ def run(proof: Proof, repo: str) -> None:
             code, _, stderr = oxide(proof, ["build"], "18 linked debug", cold)
             expect(code == 0, f"18: linked build failed: {stderr}")
             linked_slot, linked_state = perm.slot_state(stderr)
+            transition = case18_transition(
+                (seed_slot, seed_state),
+                (real_slot, real_state),
+                (linked_slot, linked_state),
+            )
+            expect(
+                transition["linked_distinct_slot"],
+                f"18: the linked build reused the real placement's slot: {transition} {summary(stderr)}",
+            )
+            expect(
+                transition["linked_cold"],
+                f"18: the linked build was not cold: {transition} {summary(stderr)}",
+            )
             expect(
                 linked_state == "cold",
                 f"18: the linked placement reused the real placement's slot: {summary(stderr)}",
@@ -4488,6 +4571,7 @@ def main() -> int:
         pure_slot_state_control()
         pure_reserve_stop_control()
         pure_watched_clean_premise_control()
+        pure_case18_transition_control()
         pure_child_custody_control()
         return 0
     if arguments == [DIAGNOSTIC_ARGUMENT]:

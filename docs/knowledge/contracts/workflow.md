@@ -3271,11 +3271,17 @@ directory (or one left unselected by a detach that a later adoption converts
 again); the detach keeps every placement as re-adoption authority, and
 re-adopting after a multi-member detach — including the host-triple member —
 is the same journaled per-member transition as any other adoption. **Evidence
-limit:** this correction and its unit counterexamples are source-reviewed;
-the corrected cases15–20 native run is not activated. The accepted
-oxide#133 run's cases 01–14 stand, its case 15 refused safely (the
-host-triple limitation above), cases 16–20 did not execute, and no
-diagnostic run or full-20 PASS exists.
+limit:** two uncounted diagnostics have run, both unqualified and neither a
+PASS. Diagnostic 1 at source `51fcb3d` completed cases 01–15 (case 15 — the
+previously refused host-triple detach — passed), failed case 16 on its
+auxiliary-pool premise and skipped 17–20. Diagnostic 2 at source `ee192f7`,
+after that premise was corrected, completed cases 01–17 (case 16 passed), failed
+case 18 and skipped 19–20. Case 18's own premise is corrected here: the
+unconverted first build cannot warm the adopted key, so the adopted real
+placement gets its own seed build and an actual repeat, asserted warm in that
+same parsed slot before the member is removed, re-adopted and re-keyed. Cases
+19–20 have still never executed, no counted native PASS exists, and counted
+author and reviewer native remain unactivated.
 
 - **Members and destinations.** A converted checkout's `target` is real and
   each linked member selects its own approved subpath beneath the shared root
@@ -3587,8 +3593,11 @@ now assert the pre-detach state (the host-triple link created by case 04's real
 build), that the first detach converts it to a real directory, and that
 re-adoption restores it — the exact accepted failure point. A pure/static
 premise sweep maps each case-15 to case-20 premise (and the private-`HOME`,
-automatic-adoption and Cargo-argv premises) to shipped source at this head; no
-diagnostic or native run was made.
+automatic-adoption and Cargo-argv premises) to shipped source at this head. The
+uncounted diagnostic mode now exists and has run twice (see the evidence limit
+above): diagnostic 1 exposed the case-16 auxiliary-pool premise and diagnostic 2
+the case-18 missing post-adopt warm repeat, both corrected in the proof source
+rather than the product.
 
 The script also has an explicitly opt-in `--diagnostic` collection mode. It
 records recoverable oracle failures and skips dependent or tainted premises,
