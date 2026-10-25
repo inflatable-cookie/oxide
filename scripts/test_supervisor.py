@@ -25,8 +25,10 @@ import errno
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -79,6 +81,237 @@ def spawn_line(code, setsid=False):
     pre = "os.setsid()" if setsid else "os.setpgid(0, 0)"
     return (f"import subprocess, sys\nchild = subprocess.Popen([sys.executable, '-c', {code!r}],"
             f" preexec_fn=lambda: {pre})\nopen(os.environ['CASE_DIR'] + '/child.pid', 'w').write(str(child.pid))\n")
+
+
+# Closure-oracle helpers (test-only) ----------------------------------------------
+#
+# The supervisor keeps two independent closure vetoes: a certain empty census
+# after the leader was reaped, then an output-EOF witness for both streams. The
+# oracles below judge observed facts instead of one fault string, so a case can
+# prove its own property (an escaped live writer, or a held pipe) without
+# claiming which veto the guard reached first. They never decide closure.
+
+CENSUS_FAULT = "closure not established: no certain empty census after the leader was reaped"
+EOF_FAULT = "closure not established: output EOF witness missing"
+SETTLE_REFUSALS = (CENSUS_FAULT, EOF_FAULT)
+FD_SOCKET_NAME = "fdsock"
+FD_ACK_TIMEOUT_S = 10
+NONCE_TIMEOUT_S = 10
+
+# An escaped writer: it leaves the nested session with setsid, keeps the nested
+# leader's stdout/stderr write descriptors open (the pipe therefore never
+# reaches EOF) and answers one fresh nonce after the verdict, which shows it was
+# alive then rather than inferred from an old PID. Its own finite
+# fixture-deadline alarm still bounds it.
+ESCAPED_WRITER = fixture("""
+import os, time
+case = os.environ["CASE_DIR"]
+with open(os.path.join(case, "escaped.ready.tmp"), "w") as handle:
+    handle.write(str(os.getpid()))
+os.replace(os.path.join(case, "escaped.ready.tmp"), os.path.join(case, "escaped.ready"))
+while True:
+    try:
+        with open(os.path.join(case, "nonce")) as handle:
+            token = handle.read().strip()
+    except OSError:
+        token = ""
+    if token:
+        with open(os.path.join(case, "nonce.reply.tmp"), "w") as handle:
+            handle.write(token)
+        os.replace(os.path.join(case, "nonce.reply.tmp"), os.path.join(case, "nonce.reply"))
+        break
+    time.sleep(0.02)
+""")
+
+# Sends duplicates of its own actual stdout/stderr write descriptors to the
+# already-running suite process and exits only after the receiver's ACK.
+FD_HANDOFF = fixture("""
+import os, socket
+cwd = os.getcwd()
+socket_dir, name = os.environ["FD_SOCKET_DIR"], os.environ["FD_SOCKET_NAME"]
+streams = [item for item in os.environ["FD_STREAMS"].split(",") if item]
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(float(os.environ["FD_ACK_TIMEOUT_S"]))
+try:
+    os.chdir(socket_dir)
+    try:
+        sock.connect(name)
+    finally:
+        os.chdir(cwd)
+    socket.send_fds(sock, [b"d"], [1 if item == "stdout" else 2 for item in streams])
+    ack = sock.recv(16)
+    if ack != b"ack":
+        raise SystemExit(3)
+    with open(os.environ["CASE_DIR"] + "/handoff.done", "w") as handle:
+        handle.write(",".join(streams))
+finally:
+    sock.close()
+""")
+
+
+class FdReceiver:
+    """One short AF_UNIX listener inside the case's owned directory. It runs in
+    the suite process, which is never a member of the nested session, so holding
+    a received writer descriptor cannot disturb that session's census. The
+    socket is bound by a relative name after chdir (macOS sun_path is short) and
+    the caller's working directory is restored either way."""
+
+    def __init__(self, directory):
+        self.directory = os.path.realpath(directory)
+        self.received = []
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.directory)
+            self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener.bind(FD_SOCKET_NAME)
+            self.listener.listen(1)
+        finally:
+            os.chdir(cwd)
+
+    @property
+    def path(self):
+        return os.path.join(self.directory, FD_SOCKET_NAME)
+
+    def accept(self, count, timeout):
+        # Receive exactly `count` descriptors, refuse a truncated or short
+        # control message, take custody (close-on-exec) and only then ACK.
+        self.listener.settimeout(timeout)
+        connection, _ = self.listener.accept()
+        fds = []
+        try:
+            connection.settimeout(timeout)
+            message, fds, flags, _address = socket.recv_fds(connection, 1, count + 2)
+            if flags & socket.MSG_CTRUNC:
+                raise AssertionError("descriptor control message was truncated")
+            if not message or len(fds) != count:
+                raise AssertionError(f"descriptor handoff delivered {len(fds)} of {count} descriptors")
+            for fd in fds:
+                os.set_inheritable(fd, False)
+            self.received.extend(fds)
+            connection.sendall(b"ack")
+        except BaseException:
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            connection.close()
+        return list(self.received)
+
+    def close(self):
+        for fd in self.received:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.received = []
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+
+
+def escaped_writer_problems(facts):
+    # The retained native escaped-writer proof, judged from observed facts.
+    problems = []
+    if facts.get("leader_status") != 0:
+        problems.append(f"the nested leader did not exit 0: {facts.get('leader_status')}")
+    if facts.get("exit") != 125:
+        problems.append(f"the nested guardian exit {facts.get('exit')} is not 125")
+    if facts.get("closure") != "UNCLOSED":
+        problems.append(f"closure {facts.get('closure')} is not UNCLOSED")
+    if facts.get("fault") not in SETTLE_REFUSALS:
+        problems.append(f"the fault {facts.get('fault')!r} is not one of the two settle refusals")
+    if facts.get("deadline"):
+        problems.append("the run hit its deadline")
+    if not facts.get("ready"):
+        problems.append("the escaped writer never signalled readiness before the verdict")
+    if not facts.get("nonce_ok"):
+        problems.append("the escaped writer did not answer the fresh post-verdict nonce")
+    child, suite = facts.get("child_pid"), facts.get("suite_pid")
+    if child is None or suite is None:
+        problems.append("the escaped child or suite identity was not observed")
+    for target in facts.get("signal_targets") or []:
+        if target in (child, suite):
+            problems.append(f"a signal targeted the escaped writer or the suite: {target}")
+    for pin in facts.get("signal_pins") or []:
+        if pin not in ("leader", "monitor"):
+            problems.append(f"a signal targeted an unexpected pin: {pin}")
+    if not facts.get("retained"):
+        problems.append("the case resources were not retained")
+    return problems
+
+
+def eof_veto_problems(facts):
+    # A held actual writer descriptor must produce exactly the EOF veto after a
+    # real certain empty census, with the leader's own status kept.
+    problems = []
+    if facts.get("leader_status") != 0:
+        problems.append(f"the nested leader did not exit 0: {facts.get('leader_status')}")
+    if facts.get("exit") != 125:
+        problems.append(f"the nested guardian exit {facts.get('exit')} is not 125")
+    if facts.get("closure") != "UNCLOSED":
+        problems.append(f"closure {facts.get('closure')} is not UNCLOSED")
+    if facts.get("deadline"):
+        problems.append("the run hit its deadline")
+    if facts.get("fault") != EOF_FAULT:
+        problems.append(f"the EOF veto did not latch: {facts.get('fault')!r}")
+    census = facts.get("census") or {}
+    if not (census.get("certain") is True and census.get("members") == 0 and census.get("uncertain") == 0):
+        problems.append(f"the census was not certainly empty, so this is not an EOF-only proof: {census}")
+    if facts.get("held") != facts.get("expected_held"):
+        problems.append(f"held streams {facts.get('held')} are not the expected {facts.get('expected_held')}")
+    for target in facts.get("signal_targets") or []:
+        if target == facts.get("suite_pid"):
+            problems.append("a signal targeted the suite")
+    if not facts.get("retained"):
+        problems.append("the case resources were not retained")
+    return problems
+
+
+def released_streams_problems(facts):
+    # The paired control: releasing both descriptors must close normally.
+    problems = []
+    if facts.get("exit") != 0:
+        problems.append(f"the paired control exit {facts.get('exit')} is not 0")
+    if facts.get("closure") != "closed":
+        problems.append(f"the paired control closure {facts.get('closure')} is not closed")
+    if facts.get("fault") is not None:
+        problems.append(f"the paired control latched a fault: {facts.get('fault')!r}")
+    if facts.get("held"):
+        problems.append(f"the paired control still held descriptors: {facts.get('held')}")
+    return problems
+
+
+def wait_for(path, timeout):
+    # Bounded wait for one owned fixture artifact; never an OS-liveness probe.
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{path} did not appear within {timeout} s")
+        time.sleep(0.02)
+
+
+class _ReleasedReceiver:
+    # Takes custody of the descriptors through the real receiver and releases
+    # them at once, so the paired control can prove normal closure.
+    def __init__(self, receiver):
+        self.receiver = receiver
+        self.released = False
+        self.held_names = []
+
+    def accept(self, count, timeout):
+        fds = self.receiver.accept(count, timeout)
+        for fd in fds:
+            os.close(fd)
+        self.receiver.received = []
+        self.released = True
+        return []
+
+    def still_held(self):
+        return [] if self.released else ["pending"]
 
 
 # Pure cases --------------------------------------------------------------------
@@ -1468,7 +1701,729 @@ class PureTraversal(unittest.TestCase):
         self.assertGreater(len(seam.opened), 0, "the seam never observed an open")
 
 
+# Default scratch parent (oxide#145) --------------------------------------------
+
+BOOT, DRIVE = 1000, 2000
+DRIVE_UUID = "a6ac3ed7-33ea-46b4-8082-7254cf291ed2"
+OTHER_UUID = "11111111-2222-3333-4444-555555555555"
+CONFIG = "/Users/owner/Library/Application Support/oxide/config/config.toml"
+
+
+class FakeProbe:
+    """Injected default-selection facts: no kernel read, no real lookup."""
+
+    def __init__(self, nodes, documents=None, uuids=None, home="/Users/owner", euid=501,
+                 realpaths=None):
+        self.nodes = dict(nodes)  # path -> (device, mode, uid)
+        self.documents = dict(documents or {})
+        self.uuids = dict(uuids or {})
+        self.home_dir = home
+        self.uid = euid
+        self.realpaths = dict(realpaths or {})
+
+    def _node(self, path):
+        try:
+            return self.nodes[path]
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+
+    def stat(self, path):
+        device, mode, uid = self._node(path)
+        return types.SimpleNamespace(st_dev=device, st_mode=mode, st_uid=uid, st_size=0)
+
+    def lstat(self, path):
+        return self.stat(path)
+
+    def realpath(self, path):
+        return self.realpaths.get(path, path)
+
+    def volume_uuid(self, path):
+        self._node(path)
+        return self.uuids.get(path)
+
+    def euid(self):
+        return self.uid
+
+    def home(self):
+        return self.home_dir
+
+    def read(self, path, limit):
+        if path not in self.documents:
+            self._node(path)
+        data = self.documents[path]
+        if len(data) > limit:
+            raise bounded.SelectionRefused(f"{path} is larger than {limit} bytes")
+        return data
+
+
+def registration_document(mount="/Volumes/Builds", uuid=DRIVE_UUID):
+    return json.dumps({"version": 2, "mount_point": mount, "volume_uuid": uuid,
+                       "container_uuid": OTHER_UUID, "reserve_bytes": 1024, "cap_bytes": 2048,
+                       "quota_bytes": None, "capacity_bytes": 4096, "registered_ms": 17,
+                       "mode": "permanent"}, indent=2).encode()
+
+
+def default_world(pool="/Users/owner/Dev/oxide", registration=True, config=True, drive=True,
+                  drive_device=DRIVE, drive_uuid=DRIVE_UUID, drive_mode=0o755, volumes_mode=0o755,
+                  pool_device=BOOT, documents=None):
+    """One fake machine: the boot volume, the drive and the pool's registration."""
+    nodes = {"/": (BOOT, stat.S_IFDIR | 0o755, 0),
+             "/Volumes": (BOOT, stat.S_IFDIR | volumes_mode, 0),
+             "/private/tmp": (BOOT, stat.S_IFDIR | 0o777, 0),
+             "/Users": (BOOT, stat.S_IFDIR | 0o755, 0),
+             "/Users/owner": (BOOT, stat.S_IFDIR | 0o700, 501),
+             "/Users/owner/Dev": (BOOT, stat.S_IFDIR | 0o755, 501),
+             "/Users/owner/Dev/oxide": (pool_device, stat.S_IFDIR | 0o700, 501),
+             pool: (pool_device, stat.S_IFDIR | 0o700, 501)}
+    uuids = {"/": OTHER_UUID, "/Volumes": OTHER_UUID}
+    if drive:
+        nodes["/Volumes/Builds"] = (drive_device, stat.S_IFDIR | drive_mode, 501)
+        uuids["/Volumes/Builds"] = drive_uuid
+    documents = dict(documents or {})
+    if config:
+        documents[CONFIG] = b'[pool]\npath = "~/Dev/oxide"\nbudget = "100GB"\n'
+    if registration:
+        documents[os.path.join(pool, "oxide-managed", "removable.json")] = registration_document()
+    return FakeProbe(nodes, documents, uuids)
+
+
+class PureDefaultScratch(unittest.TestCase):
+    """The default scratch parent: the selected volume when eligible, one
+    bounded warned fallback otherwise, and the caller's own contexts kept."""
+
+    def select(self, world, env=None):
+        return bounded.select_default_parent(dict(env or {}), world)
+
+    # Selected volume
+
+    def test_registered_drive_is_the_default(self):
+        facts = self.select(default_world())
+        self.assertEqual(facts["source"], "selected-volume")
+        self.assertEqual(facts["root_parent"], "/Volumes/Builds")
+        self.assertEqual(facts["mount"], "/Volumes/Builds")
+        self.assertEqual(facts["volume_uuid"], DRIVE_UUID)
+        self.assertEqual(facts["device"], DRIVE)
+        self.assertEqual(facts["pool"], "/Users/owner/Dev/oxide")
+        self.assertEqual(facts["pool_source"], "account config")
+        self.assertEqual(facts["registration"], "/Users/owner/Dev/oxide/oxide-managed/removable.json")
+        self.assertIsNone(facts["reason"])
+
+    def test_pool_on_the_drive_uses_its_mount_root(self):
+        world = default_world(pool="/Volumes/Builds/oxide-pool", registration=False, pool_device=DRIVE)
+        facts = self.select(world, {"OXIDE_POOL": "/Volumes/Builds/oxide-pool"})
+        self.assertEqual(facts["source"], "selected-volume")
+        self.assertEqual(facts["root_parent"], "/Volumes/Builds")
+        self.assertEqual(facts["registration"], None)
+        self.assertEqual(facts["pool_source"], "OXIDE_POOL")
+
+    def test_registration_beats_an_internal_pool(self):
+        facts = self.select(default_world(pool_device=BOOT))
+        self.assertEqual(facts["source"], "selected-volume")
+        self.assertEqual(facts["root_parent"], "/Volumes/Builds")
+
+    # Fallback with a bounded warning
+
+    def test_internal_pool_without_registration_falls_back(self):
+        facts = self.select(default_world(registration=False))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertEqual(facts["root_parent"], bounded.FALLBACK_PARENT)
+        self.assertIn("boot volume", facts["reason"])
+        warning = bounded.fallback_warning(facts)
+        self.assertLessEqual(len(warning.encode()), 512, "the warning is not bounded")
+        self.assertEqual(warning.count("\n"), 1, "the warning is more than one line")
+        self.assertIn(bounded.FALLBACK_PARENT, warning)
+        self.assertIn(facts["reason"][:40], warning)
+
+    def test_absent_drive_falls_back_without_creating_a_mount_path(self):
+        facts = self.select(default_world(drive=False))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("FileNotFoundError", facts["reason"])
+        self.assertIn("/Volumes/Builds", facts["reason"])
+        self.assertIsNone(facts["mount"])
+
+    def test_stale_mount_point_on_the_boot_volume_is_refused(self):
+        facts = self.select(default_world(drive_device=BOOT))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("boot volume", facts["reason"])
+
+    def test_a_different_volume_under_the_registered_name_is_refused(self):
+        facts = self.select(default_world(drive_uuid=OTHER_UUID))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn(DRIVE_UUID, facts["reason"])
+        self.assertIn(OTHER_UUID, facts["reason"])
+
+    def test_symlinked_mount_point_is_refused(self):
+        world = default_world()
+        world.nodes["/Volumes/Builds"] = (DRIVE, stat.S_IFLNK | 0o777, 501)
+        facts = self.select(world)
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("symlink", facts["reason"])
+
+    def test_uncanonical_mount_point_is_refused(self):
+        world = default_world()
+        world.realpaths["/Volumes/Builds"] = "/private/tmp/Builds"
+        facts = self.select(world)
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("not canonical", facts["reason"])
+
+    def test_unreadable_volume_identity_is_refused(self):
+        facts = self.select(default_world(drive_uuid=None))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("no readable UUID", facts["reason"])
+
+    def test_writable_mount_parent_is_refused(self):
+        facts = self.select(default_world(volumes_mode=0o777))
+        self.assertEqual(facts["source"], "fallback")
+        self.assertIn("mount parent", facts["reason"])
+
+    # Registration and config refusals
+
+    def test_unreadable_registration_falls_back(self):
+        for document, marks in ((b"{", "not JSON"), (b"[]", "not an object"),
+                                (json.dumps({"version": 2}).encode(), "no recorded mount point"),
+                                (b"x" * (64 * 1024 + 1), "larger than")):
+            with self.subTest(document=document[:16]):
+                world = default_world()
+                world.documents["/Users/owner/Dev/oxide/oxide-managed/removable.json"] = document
+                facts = self.select(world)
+                self.assertEqual(facts["source"], "fallback")
+                self.assertIn(marks, facts["reason"])
+
+    def test_config_pool_path_forms(self):
+        world = default_world(registration=False)
+        for text, expected in ((b'[other]\npath = "/nowhere"\n', "/Users/owner/Library/Caches/oxide/build-pool"),
+                               (b'[pool]\npath = \'~/Dev/oxide\'\n', "/Users/owner/Dev/oxide"),
+                               (b'# note\n[pool]\npath = "~/Dev/oxide"\n', "/Users/owner/Dev/oxide")):
+            with self.subTest(text=text):
+                world.documents[CONFIG] = text
+                facts = self.select(world)
+                self.assertEqual(facts["pool"], expected)
+        for text, marks in ((b'[pool]\npath = "~/Dev/oxi\\u0078de"\n', "unsupported escape"),
+                            (b'[pool]\npath = 12\n', "unsupported pool path value"),
+                            (b'[pool\npath = "~/Dev/oxide"\n', "unsupported table header"),
+                            (b'[pool]\npath = "~/a"\npath = "~/b"\n', "repeated pool path")):
+            with self.subTest(text=text):
+                world.documents[CONFIG] = text
+                facts = self.select(world)
+                self.assertEqual(facts["source"], "fallback")
+                self.assertIn(marks, facts["reason"])
+
+    def test_an_absent_config_uses_the_built_in_pool(self):
+        world = default_world(registration=False, config=False)
+        facts = self.select(world)
+        self.assertEqual(facts["pool"], "/Users/owner/Library/Caches/oxide/build-pool")
+        self.assertEqual(facts["pool_source"], "built-in default pool")
+        self.assertEqual(facts["source"], "fallback")  # that pool does not exist here
+
+    # Caller contexts keep their own contracts
+
+    def test_explicit_root_parent_and_adopted_scratch_are_not_defaults(self):
+        self.assertIsNone(bounded.parse(["command"])[1]["root_parent"])
+        self.assertEqual(bounded.parse(["--root-parent", "/x", "command"])[1]["root_parent"], "/x")
+        self.assertEqual(
+            bounded.parse(["--root-parent", "/x", "--evidence", "/e", "--limit", "40", "command"])[1],
+            {"limit": 40.0, "budget": bounded.SCRATCH_BUDGET, "evidence": "/e", "root_parent": "/x"})
+        self.assertIsNone(bounded.Custodian(["command"]).root_parent)
+
+    def test_bootstrap_still_exercises_the_default(self):
+        # The qualification must not mask default selection with --root-parent;
+        # it finds the candidate receipt through --evidence instead.
+        text = BOOTSTRAP.read_text()
+        self.assertNotIn('"--root-parent"', text, "the bootstrap would mask default selection")
+        self.assertNotIn('"--evidence"', text, "external evidence would sit outside the monitored root")
+        self.assertIn('"OXIDE_SUPERVISOR_LAYOUT"', text, "the suite layout record is not wired")
+
+    # The owned leaf
+
+    def leaf_world(self, **facts):
+        sandbox = Path(tempfile.mkdtemp(prefix="leaf.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        parent, leaf = str(sandbox), str(sandbox / "leaf")
+        mode = facts.get("mode", stat.S_IFDIR | 0o700)
+        nodes = {parent: (BOOT, stat.S_IFDIR | 0o700, 501),
+                 leaf: (facts.get("device", BOOT), mode, facts.get("uid", 501))}
+        probe = FakeProbe(nodes, euid=501, realpaths={leaf: facts.get("realpath", leaf)})
+
+        def make_dir(prefix, dir):
+            os.mkdir(leaf, 0o700)
+            return leaf
+
+        return parent, leaf, probe, make_dir
+
+    def test_owned_leaf_is_private_canonical_and_on_the_parent_device(self):
+        parent, leaf, probe, make_dir = self.leaf_world()
+        self.assertEqual(bounded.create_owned_root(parent, probe, make_dir), leaf)
+        self.assertTrue(os.path.isdir(leaf))
+        info = os.lstat(leaf)
+        self.assertEqual(info.st_uid, os.geteuid())
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+
+    def test_unusable_owned_leaf_is_refused_and_removed(self):
+        cases = {"not private": {"mode": stat.S_IFDIR | 0o755},
+                 "not private to this user": {"uid": 0},
+                 "not on the parent's device": {"device": DRIVE},
+                 "not canonical under": {"realpath": "/private/tmp/leaf"},
+                 "not a real directory": {"mode": stat.S_IFLNK | 0o777}}
+        for marks, facts in cases.items():
+            with self.subTest(marks):
+                parent, leaf, probe, make_dir = self.leaf_world(**facts)
+                with self.assertRaises(bounded.SelectionRefused) as caught:
+                    bounded.create_owned_root(parent, probe, make_dir)
+                self.assertIn(marks, str(caught.exception))
+                self.assertFalse(os.path.lexists(leaf), "the refused leaf was kept")
+
+    def test_a_symlinked_root_parent_is_refused(self):
+        parent, leaf, probe, make_dir = self.leaf_world()
+        probe.nodes[parent] = (BOOT, stat.S_IFLNK | 0o777, 501)
+        with self.assertRaises(bounded.SelectionRefused) as caught:
+            bounded.create_owned_root(parent, probe, make_dir)
+        self.assertIn("not a real directory", str(caught.exception))
+        self.assertFalse(os.path.lexists(leaf))
+
+
+
+# Qualification layout (oxide#145) ------------------------------------------------
+
+qspec = importlib.util.spec_from_file_location("qualify_supervisor", BOOTSTRAP)
+qualify = importlib.util.module_from_spec(qspec)
+qspec.loader.exec_module(qualify)
+
+VOLUME = "/Volumes/Builds"
+DRIVE_DEVICE = 2000
+
+
+class TopologyFacts:
+    """Injected device, canonical-path, free-space and document facts for the
+    qualification's pass checks; real documents may also be read."""
+
+    def __init__(self, nodes, documents=None, boot=1, realpaths=None, free=None):
+        self.nodes, self.documents, self.boot = dict(nodes), dict(documents or {}), boot
+        self.realpaths, self.free_bytes = dict(realpaths or {}), dict(free or {})
+
+    def device(self, path):
+        try:
+            return self.nodes[path]
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+
+    def realpath(self, path):
+        return self.realpaths.get(path, path)
+
+    def boot_device(self):
+        return self.boot
+
+    def free(self, path):
+        try:
+            return self.free_bytes[path]
+        except KeyError:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+
+    def document(self, path):
+        if path in self.documents:
+            return self.documents[path]
+        with open(path) as handle:
+            return json.load(handle)
+
+
+class PureQualificationTopology(unittest.TestCase):
+    """The actual new-default qualification: nested case resources, evidence
+    and reserve all on the selected volume inside the monitored owned root,
+    with a separately labelled boot reserve."""
+
+    def layout(self):
+        """A real owned-root tree inside the suite's scratch, with the
+        selected volume's device facts injected (no drive is touched)."""
+        sandbox = Path(tempfile.mkdtemp(prefix="qualify.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        parent = str(sandbox)
+        root = os.path.join(parent, "oxide-proof.abc123")
+        evidence, scratch = os.path.join(root, "evidence"), os.path.join(root, "scratch")
+        for path in (evidence, scratch):
+            os.makedirs(path)
+        case = os.path.join(evidence, "nested", "test_exit_zero_closed.1")
+        os.makedirs(os.path.join(case, "evidence"))
+        (Path(case) / "evidence" / "receipt.json").write_text("{}")
+        registration = os.path.join(parent, "registration.json")
+        with open(registration, "w") as handle:
+            json.dump({"version": 2, "mount_point": VOLUME, "volume_uuid": DRIVE_UUID}, handle)
+        facts = TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, evidence: DRIVE_DEVICE,
+                               scratch: DRIVE_DEVICE, "/private/tmp": 1,
+                               os.path.join(parent, "pool"): DRIVE_DEVICE},
+                              documents={os.path.join(parent, "topology.json"):
+                                         {"scratch": scratch, "evidence": evidence}},
+                              boot=1, free={parent: 500 * 1024 ** 3, VOLUME: 500 * 1024 ** 3,
+                                          "/private/tmp": 30 * 1024 ** 3})
+        return sandbox, parent, root, evidence, scratch, case, registration, facts
+
+    def receipt(self, parent, root, evidence, scratch, registration, case):
+        return {
+            "phase": "monitor_complete: pending_custodian",
+            "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False},
+            "root": root, "scratch": scratch, "evidence": evidence,
+            "scratch_default": {"source": "selected-volume", "root_parent": parent, "pool":
+                                os.path.join(parent, "pool"), "pool_source": "account config",
+                                "registration": registration, "mount": VOLUME,
+                                "volume_uuid": DRIVE_UUID, "reason": None},
+            "reserve": {"samples": 4, "minimum": 400 * 1024 ** 3, "max_gap_ns": 10, "first_ns": 1,
+                        "last_ns": 2, "path": root, "device": DRIVE_DEVICE},
+            "owned_bytes": {"maximum": 8 * 1024 ** 2, "budget": 512 * 1024 ** 2},
+            "custodian": [{"event": "gate_open", "at": 5}],
+        }
+
+    def control_records(self, parent, root, kept):
+        return [
+            {"case": "bootstrap_deadline_blocked_stdout", "exit": 124, "wall_s": 2.197},
+            {"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139, "kept": kept},
+            {"case": "fixture_deadline", "exit": [-14, -14]},
+        ]
+
+    def kept_world(self, parent, root):
+        kept = os.path.join(root, "evidence", "nested", "test_direct_runner_setup_blocked_in_filesystem.062")
+        os.makedirs(kept)
+        facts = TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, kept: DRIVE_DEVICE},
+                              documents={}, boot=1, free={})
+        return kept, facts
+
+    def test_the_suites_three_controls_are_validated_by_shape(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        kept, guard_facts = self.kept_world(parent, root)
+        ordinary = {"case": "zero", "dir": case, "exit": 0,
+                    "phase": "monitor_complete: pending_custodian", "retained_unclosed": False,
+                    "outcome": {}, "census": 0, "wall_s": 1.0, "signals": []}
+        results = {"cases": [ordinary] + self.control_records(parent, root, kept)}
+        self.assertEqual(qualify.nested_cases(results, record, guard_facts), [])
+        # A control that claims a receipt although setup was refused is wrong.
+        os.makedirs(os.path.join(kept, "evidence"))
+        open(os.path.join(kept, "evidence", "receipt.json"), "w").write("{}")
+        problems = qualify.nested_cases(results, record, guard_facts)
+        self.assertTrue(any("claims a receipt" in p for p in problems), problems)
+
+    def test_control_record_mutations_are_refused(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        kept, guard_facts = self.kept_world(parent, root)
+
+        def check(records, marks, guard=guard_facts):
+            problems = qualify.nested_cases({"cases": records}, record, guard)
+            self.assertTrue(any(marks in p for p in problems), (marks, problems))
+
+        controls = self.control_records(parent, root, kept)
+        # An ordinary case with no dir, or with no receipt, is never exempt.
+        check([{"case": "zero", "exit": 0}], "ran outside the monitored root")
+        bare = os.path.join(evidence, "nested", "no-receipt.1")
+        os.makedirs(bare)
+        check([{"case": "zero", "dir": bare, "exit": 0}], "evidence missing after cleanup")
+        # An unknown control, an unmodelled field and a wrong exit are refused.
+        check([{"case": "unknown_control", "exit": 0}], "ran outside the monitored root")
+        check([dict(controls[0], dir=case)], "unmodelled field")
+        check([dict(controls[1], dir=kept)], "unmodelled field")
+        check([dict(controls[2], exit=[0, 0])], "is not the recorded")
+        check([dict(controls[1], wall_s=1.0) and {"case": "direct_runner_setup_blocked", "exit": 125,
+                                                  "kept": kept}], "missing a field")
+        # A retained path that escapes, is not canonical or is on another
+        # device is refused rather than treated as kept containment.
+        check([{"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139,
+                "kept": "/private/tmp/elsewhere"}], "outside the monitored root")
+        check([{"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139, "kept": kept}],
+              "not canonical", TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, kept: DRIVE_DEVICE},
+                                             documents={}, boot=1, realpaths={kept: "/private/tmp/x"}))
+        check([{"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139, "kept": kept}],
+              "not on the monitored root's device",
+              TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, kept: 1}, documents={}, boot=1))
+
+    def test_nested_cases_and_evidence_stay_inside_the_monitored_root(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, problems = qualify.topology(str(sandbox), expected, facts)
+        self.assertEqual(problems, [])
+        self.assertEqual(record["root"], root)
+        self.assertEqual(qualify.nested_cases({"cases": [{"case": "zero", "dir": case}]}, record), [])
+        receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": case}]}
+        problems = qualify.check(receipt, results, expected, record, facts)
+        self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
+
+    def test_a_case_outside_the_monitored_root_fails(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        outside = "/private/tmp/nested/elsewhere.1"
+        problems = qualify.nested_cases({"cases": [{"case": "zero", "dir": outside}]}, record)
+        self.assertTrue(any("outside the monitored root" in p for p in problems), problems)
+        self.assertTrue(any("no nested case directory" in p for p in
+                            qualify.nested_cases({"cases": []}, record)))
+
+    def test_receipt_evidence_must_be_the_suite_recorded_layout(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+        receipt["evidence"] = "/private/tmp/evidence"
+        problems = qualify.default_scratch(receipt, expected, record, facts)
+        self.assertTrue(any("is not the suite's recorded" in p for p in problems), problems)
+
+    def test_topology_refusals(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        cases = {
+            "not directly on the selected volume": dict(record={"scratch": os.path.join(parent, "sub",
+                                                                                     "oxide-proof.x", "scratch"),
+                                                               "evidence": os.path.join(parent, "sub",
+                                                                                        "oxide-proof.x",
+                                                                                        "evidence")},
+                                                        nodes={}),
+            "not members of one owned root": dict(record={"scratch": scratch, "evidence": parent},
+                                                  nodes={}),
+            "not canonical": dict(record={"scratch": scratch, "evidence": evidence},
+                                  realpaths={scratch: "/private/tmp/elsewhere"}),
+            "not on the selected volume's device": dict(record={"scratch": scratch, "evidence": evidence},
+                                                       nodes={root: 1}),
+        }
+        for marks, override in cases.items():
+            with self.subTest(marks):
+                probe = TopologyFacts(dict(facts.nodes, **override.get("nodes", {})),
+                                      documents={os.path.join(str(sandbox), "topology.json"):
+                                                 override["record"]},
+                                      boot=facts.boot, realpaths=override.get("realpaths"), free=facts.free_bytes)
+                _, problems = qualify.topology(str(sandbox), expected, probe)
+                self.assertTrue(any(marks in p for p in problems), problems)
+        for label, document in (("missing", None), ("not an object", [1]),
+                                ("no scratch and evidence", {"root": root})):
+            with self.subTest(label):
+                probe = TopologyFacts(facts.nodes, documents={}, boot=facts.boot, free=facts.free_bytes)
+                if document is not None:
+                    probe.documents[os.path.join(str(sandbox), "topology.json")] = document
+                record, problems = qualify.topology(str(sandbox), expected, probe)
+                self.assertIsNone(record)
+                self.assertTrue(problems)
+
+    def test_default_scratch_facts_are_rechecked(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+        self.assertEqual(qualify.default_scratch(receipt, expected, record, facts), [])
+        booted = TopologyFacts(facts.nodes, documents={}, boot=DRIVE_DEVICE, free=facts.free_bytes)
+        self.assertTrue(any("boot volume" in p for p in qualify.default_scratch(receipt, expected, record, booted)))
+        reserve = dict(receipt, reserve=dict(receipt["reserve"], device=1))
+        self.assertTrue(any("reserve is not sampled" in p for p in
+                            qualify.default_scratch(reserve, expected, record, facts)))
+        payload_root = os.path.join(parent, "pool", "oxide-proof.abc")
+        payload_nodes = dict(facts.nodes)
+        payload_nodes[payload_root] = DRIVE_DEVICE
+        payload_facts = TopologyFacts(payload_nodes, documents={}, boot=1, free=facts.free_bytes)
+        in_pool = dict(receipt, root=payload_root)
+        record_in_pool = dict(record, root=payload_root)
+        self.assertTrue(any("inside the pool payload" in p for p in
+                            qualify.default_scratch(in_pool, expected, record_in_pool, payload_facts)))
+        fallback = dict(receipt, scratch_default=dict(receipt["scratch_default"], source="fallback"))
+        self.assertTrue(any("did not use the selected volume" in p for p in
+                            qualify.default_scratch(fallback, expected, record, facts)))
+
+    def test_volume_identity_matches_across_uuid_spellings(self):
+        # The product writes the registered UUID uppercase (volume.rs) and the
+        # kernel reports ATTR_VOL_UUID lowercase, exactly as the live host
+        # registration does. The same identity must match: this failed at
+        # 40b3a3aa, which compared the raw recorded text.
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        for registered, observed in ((DRIVE_UUID.upper(), DRIVE_UUID),
+                                     (DRIVE_UUID, DRIVE_UUID.upper()),
+                                     (DRIVE_UUID.upper(), DRIVE_UUID.upper())):
+            with self.subTest(registered=registered, observed=observed):
+                with open(registration, "w") as handle:
+                    json.dump({"version": 2, "mount_point": VOLUME, "volume_uuid": registered}, handle)
+                receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+                receipt["scratch_default"]["volume_uuid"] = observed
+                self.assertEqual(qualify.default_scratch(receipt, expected, record, facts), [])
+        self.assertEqual(qualify.canonical_uuid(DRIVE_UUID.upper()), DRIVE_UUID)
+        self.assertEqual(qualify.canonical_uuid(DRIVE_UUID), DRIVE_UUID)
+
+    def test_missing_malformed_or_different_volume_identity_is_refused(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        other = "b6ac3ed7-33ea-46b4-8082-7254cf291ed2"
+        for label, registered, observed, marks in (
+                ("mismatched spelling-normalised", other.upper(), DRIVE_UUID, "is not the recorded"),
+                ("missing registered", None, DRIVE_UUID, "missing or malformed"),
+                ("non-string registered", 12345, DRIVE_UUID, "missing or malformed"),
+                ("short registered", DRIVE_UUID[:-1], DRIVE_UUID, "missing or malformed"),
+                ("non-hex registered", "zzzzzzzz-33ea-46b4-8082-7254cf291ed2", DRIVE_UUID,
+                 "missing or malformed"),
+                ("missing observed", DRIVE_UUID.upper(), None, "missing or malformed"),
+                ("non-string observed", DRIVE_UUID.upper(), 42, "missing or malformed"),
+                ("both missing", None, None, "missing or malformed")):
+            with self.subTest(label):
+                document = {"version": 2, "mount_point": VOLUME}
+                if registered is not None:
+                    document["volume_uuid"] = registered
+                with open(registration, "w") as handle:
+                    json.dump(document, handle)
+                receipt = self.receipt(parent, root, evidence, scratch, registration, case)
+                receipt["scratch_default"]["volume_uuid"] = observed
+                problems = qualify.default_scratch(receipt, expected, record, facts)
+                self.assertTrue(any(marks in problem for problem in problems), problems)
+
+    def test_reserve_readings_identify_the_scratch_volume_and_the_boot_volume_separately(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        readings = qualify.reserve_readings(parent, "/private/tmp", facts)
+        self.assertEqual(readings["scratch_volume"]["path"], parent)
+        self.assertEqual(readings["scratch_volume"]["free"], 500 * 1024 ** 3)
+        self.assertEqual(readings["boot_volume"]["path"], "/private/tmp")
+        self.assertEqual(readings["boot_volume"]["free"], 30 * 1024 ** 3)
+        self.assertEqual(readings["scratch_volume"]["threshold"], qualify.THRESHOLD)
+        self.assertEqual(readings["boot_volume"]["threshold"], qualify.THRESHOLD)
+
+
+
+class PureClosureDecision(unittest.TestCase):
+    """Drive the guard's actual settle()/closure() acceptance with fake events:
+    the EOF veto needs both DISTINCT stream witnesses after a certain empty
+    census, in either order of refusal, and first fault is preserved. Nothing
+    here substitutes for the native fixtures; it pins the decision path they
+    depend on."""
+
+    def custodian(self):
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        custodian = bounded.Custodian(["command"], limit_s=60.0)
+        custodian.run_id = "r"
+        custodian.start = 1000 * NS
+        custodian.absolute = custodian.start + 60 * NS
+        custodian.stop_at = custodian.absolute - bounded.STOP_RESERVE_S * NS
+        custodian.exit_at = custodian.absolute - bounded.EXIT_MARGIN_S * NS
+        custodian.guard = bounded.Guard(start_ns=custodian.start)
+        custodian.leader = 4242
+        custodian.leader_status = 0
+        custodian.reaped_seq = 3
+        custodian.cmd_w = cmd_w
+        custodian.monitor = 4243
+        custodian.monitor_complete = True
+        custodian.monitor_reaped = True
+        return custodian
+
+    def message(self, custodian, kind, **fields):
+        return {"run": custodian.run_id, "seq": custodian.monitor_seq + 1, "leader": [4242, 77],
+                "type": kind, "at": 1, **fields}
+
+    def settle(self, custodian, census_ok, uncertain, eof):
+        custodian.census_ok, custodian.census_uncertain = census_ok, uncertain
+        custodian.eof = set(eof)
+        custodian.exit_at = 1  # the grace window is already past: a bounded decision
+        custodian.settle(True)
+        return custodian.guard.fault
+
+    def test_both_distinct_witnesses_may_close_without_fault(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stderr"))
+        self.assertEqual(custodian.eof, {"stdout", "stderr"})
+        self.assertIsNone(self.settle(custodian, True, False, custodian.eof))
+        self.assertTrue(custodian.closure(True))
+
+    def test_one_or_no_witness_refuses(self):
+        for eof in (set(), {"stdout"}, {"stderr"}):
+            with self.subTest(eof=sorted(eof)):
+                custodian = self.custodian()
+                self.assertEqual(self.settle(custodian, True, False, eof), EOF_FAULT)
+                self.assertFalse(custodian.closure(True))
+
+    def test_duplicate_stdout_witness_never_counts_as_two(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        self.assertEqual(custodian.eof, {"stdout"})
+        self.assertEqual(self.settle(custodian, True, False, custodian.eof), EOF_FAULT)
+
+    def test_uncertain_census_refuses_before_any_eof_question(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "census", after=3, certain=False, members=0, uncertain=1))
+        custodian.accept(self.message(custodian, "census", after=3, certain=True, members=0, uncertain=0))
+        custodian.accept(self.message(custodian, "output_eof", stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", stream="stderr"))
+        self.assertIn("census uncertain", custodian.guard.fault)
+        self.assertFalse(custodian.closure(True))
+        self.assertEqual(self.settle(custodian, False, True, {"stdout", "stderr"}),
+                         custodian.guard.fault, "an earlier fault must be preserved")
+        self.assertFalse(custodian.closure(True))
+
+    def test_missing_witness_is_named_after_a_certain_census_only(self):
+        custodian = self.custodian()
+        self.assertEqual(self.settle(custodian, True, False, {"stdout"}), EOF_FAULT)
+        custodian = self.custodian()
+        self.assertEqual(self.settle(custodian, False, False, set()), CENSUS_FAULT)
+
+    def test_pre_stop_census_does_not_qualify(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "census", after=2, certain=True, members=0, uncertain=0))
+        self.assertFalse(custodian.census_ok)
+        self.assertFalse(custodian.closure(True))
+
+    def test_fd_transport_api_is_available(self):
+        # The held-stream fixtures need real descriptor transport; assert the
+        # runtime API rather than assuming it.
+        self.assertTrue(callable(getattr(socket, "send_fds", None)))
+        self.assertTrue(callable(getattr(socket, "recv_fds", None)))
+        self.assertTrue(hasattr(socket, "MSG_CTRUNC"))
+
+    # Negative mutations: each must falsify the oracle it belongs to.
+
+    def test_escaped_writer_oracle_rejects_its_mutations(self):
+        good = {"leader_status": 0, "exit": 125, "closure": "UNCLOSED", "fault": CENSUS_FAULT,
+                "deadline": False, "ready": True, "nonce_ok": True, "child_pid": 5000,
+                "suite_pid": 4000, "signal_targets": [4242], "signal_pins": ["leader", "leader"],
+                "retained": True}
+        self.assertEqual(escaped_writer_problems(good), [])
+        also_eof = dict(good, fault=EOF_FAULT)
+        self.assertEqual(escaped_writer_problems(also_eof), [])
+        for label, mutation in (("absent child", {"child_pid": None}), ("no readiness", {"ready": False}),
+                                ("no escape", {"signal_targets": [5000]}), ("stale nonce", {"nonce_ok": False}),
+                                ("no response", {"nonce_ok": False, "error": "missing nonce.reply"}),
+                                ("deadline", {"deadline": True}), ("resource fault", {"fault": "reserve readings stale"}),
+                                ("unrelated fault", {"fault": "monitor did not complete"}),
+                                ("not retained", {"retained": False}),
+                                ("suite signalled", {"signal_targets": [4000]}),
+                                ("signal outside the pins", {"signal_pins": ["foreign"]}),
+                                ("leader failed", {"leader_status": 1}), ("guardian exit", {"exit": 124}),
+                                ("closed", {"closure": "closed"})):
+            with self.subTest(label):
+                self.assertTrue(escaped_writer_problems(dict(good, **mutation)), label)
+
+    def test_eof_veto_oracle_rejects_its_mutations(self):
+        good = {"leader_status": 0, "exit": 125, "closure": "UNCLOSED", "fault": EOF_FAULT,
+                "deadline": False, "census": {"certain": True, "members": 0, "uncertain": 0},
+                "held": ["stdout"], "expected_held": ["stdout"], "suite_pid": 4000,
+                "signal_targets": [4242], "retained": True}
+        self.assertEqual(eof_veto_problems(good), [])
+        for label, mutation in (("wrong pipe", {"held": ["stderr"], "expected_held": ["stdout"]}),
+                                ("no hold", {"held": []}), ("uncertain census", {"census": {"certain": False, "members": 0,
+                                                                                            "uncertain": 1}}),
+                                ("nonempty census", {"census": {"certain": True, "members": 1, "uncertain": 0}}),
+                                ("missing census", {"census": None}), ("census fault", {"fault": CENSUS_FAULT}),
+                                ("deadline", {"deadline": True}), ("not retained", {"retained": False}),
+                                ("leader failed", {"leader_status": 1}), ("suite signalled", {"signal_targets": [4000]})):
+            with self.subTest(label):
+                self.assertTrue(eof_veto_problems(dict(good, **mutation)), label)
+
+    def test_released_streams_oracle_rejects_an_always_unclosed_oracle(self):
+        self.assertEqual(released_streams_problems({"exit": 0, "closure": "closed", "fault": None, "held": []}), [])
+        for label, mutation in (("held anyway", {"held": ["stdout"]}), ("unclosed", {"closure": "UNCLOSED"}),
+                                ("fault", {"fault": EOF_FAULT}), ("exit", {"exit": 125})):
+            with self.subTest(label):
+                self.assertTrue(released_streams_problems({"exit": 0, "closure": "closed", "fault": None,
+                                                           "held": [], **mutation}), label)
+
+
 # Real cases --------------------------------------------------------------------
+
 
 
 def alive(pid):
@@ -1488,14 +2443,32 @@ def nested_root():
     return root.resolve()
 
 
+def record_layout():
+    """Record the layout this suite ran in for the qualification bootstrap
+    (oxide#145): the candidate's owned root, scratch and evidence. Nested
+    real-case directories are created in OXIDE_PROOF_EVIDENCE, so recording
+    and verifying this record is what proves the nested resources stayed
+    inside the candidate's monitored root on the selected volume."""
+    path = os.environ.get("OXIDE_SUPERVISOR_LAYOUT")
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+    if not path or not scratch or not OUTER_EVIDENCE:
+        return
+    record = {"scratch": os.path.realpath(scratch), "evidence": os.path.realpath(OUTER_EVIDENCE),
+              "suite_pid": os.getpid()}
+    with open(path, "w") as handle:
+        json.dump(record, handle)
+
+
 class Real(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix=self.id().rsplit(".", 1)[-1] + ".", dir=nested_root())).resolve()
         self.started = now_ns()
 
-    def guardian(self, code, inject=(), owned=False, limit=35, signal_after=None, signal_number=None, command=None):
+    def guardian(self, code, inject=(), owned=False, limit=35, signal_after=None, signal_number=None,
+                 command=None, extra_env=None, receiver=None, receiver_count=0):
         env = dict(os.environ, CASE_DIR=str(self.dir), FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS),
                    OXIDE_SUPERVISOR_INJECT=",".join(inject))
+        env.update(extra_env or {})
         args = [sys.executable, str(SUPERVISOR), "--limit", str(limit), "--evidence", str(self.dir / "evidence")]
         if owned:
             env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
@@ -1506,6 +2479,8 @@ class Real(unittest.TestCase):
             guardian = subprocess.Popen(args + ["--"] + (command or [sys.executable, "-c", code]), env=env,
                                         stdout=subprocess.DEVNULL, stderr=log)
             try:
+                if receiver is not None:  # actual descriptor handoff, then ACK, then the wait
+                    receiver.accept(receiver_count, FD_ACK_TIMEOUT_S)
                 if signal_after is not None:
                     deadline = time.monotonic() + 10
                     while not (self.dir / signal_after).exists() and time.monotonic() < deadline:
@@ -1526,7 +2501,8 @@ class Real(unittest.TestCase):
                       "outcome": self.receipt["outcome"], "census": (self.receipt["census"] or {}).get("members"),
                       "wall_s": round((self.verdict_ns - self.started) / NS, 3),
                       "signals": [[s["signal"], s["pin"], s["killpg"], s["held_unreaped"], s["result"]]
-                                  for s in signals]})
+                                  for s in signals],
+                      "held_streams": sorted(getattr(receiver, "held_names", []))})
         for entry in signals:  # custody at every signal
             self.assertTrue(entry["held_unreaped"], entry)
             self.assertIn(entry["pin"], ("leader", "monitor"))
@@ -1611,11 +2587,78 @@ class Real(unittest.TestCase):
         self.assert_kept_outside_outer_cleanup()
 
     def test_escaped_pipe_holder_unclosed(self):
-        code = fixture("import os\n" + spawn_line(SLEEPER, setsid=True))
-        self.assertEqual(self.guardian(code), 125)
-        self.assertIn("EOF", self.outcome()["fault"])
-        self.assertTrue(alive(self.child()))
+        # The escaped writer leaves the nested session, keeps the leader's
+        # stdout/stderr write descriptors open, and proves it is still alive
+        # after the verdict by answering a fresh nonce. Which closure veto
+        # latched is not claimed: both settle refusals are accepted, and every
+        # other outcome is refused.
+        code = fixture("import os\n" + spawn_line(ESCAPED_WRITER, setsid=True))
+        exit_code = self.guardian(code)
+        wait_for(os.path.join(str(self.dir), "escaped.ready"), NONCE_TIMEOUT_S)
+        child_pid = int((self.dir / "child.pid").read_text())
+        token = secrets.token_hex(16)
+        (self.dir / "nonce").write_text(token)
+        wait_for(os.path.join(str(self.dir), "nonce.reply"), NONCE_TIMEOUT_S)
+        reply = (self.dir / "nonce.reply").read_text().strip()
+        signals = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
+        facts = {"leader_status": self.outcome().get("status"), "exit": exit_code,
+                 "closure": self.outcome().get("closure"), "fault": self.outcome().get("fault"),
+                 "deadline": self.outcome().get("deadline"), "ready": True,
+                 "nonce_ok": reply == token, "child_pid": child_pid, "suite_pid": os.getpid(),
+                 "signal_targets": [r["target"] for r in signals], "signal_pins": [r["pin"] for r in signals],
+                 "retained": (self.dir / "evidence" / "receipt.json").exists()}
+        CASES[-1]["nonce_ok"] = facts["nonce_ok"]
+        self.assertEqual(escaped_writer_problems(facts), [], facts)
         self.assert_kept_outside_outer_cleanup()
+
+    def held_stream_case(self, streams):
+        # The nested leader's own command sends duplicates of its actual
+        # stdout/stderr write descriptors to this suite process, which is not a
+        # member of the nested session; the suite holds them through the
+        # verdict and closes them in cleanups. A released pair must close.
+        receiver = FdReceiver(str(self.dir))
+        receiver.held_names = list(streams)
+        self.addCleanup(receiver.close)
+        extra = {"FD_SOCKET_DIR": receiver.directory, "FD_SOCKET_NAME": FD_SOCKET_NAME,
+                 "FD_STREAMS": ",".join(streams), "FD_ACK_TIMEOUT_S": str(FD_ACK_TIMEOUT_S)}
+        exit_code = self.guardian(FD_HANDOFF, extra_env=extra, receiver=receiver,
+                                  receiver_count=len(streams))
+        self.assertTrue((self.dir / "handoff.done").exists(), "the ACK never reached the fixture")
+        held = [name for name in streams] if receiver.received else []
+        signals = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
+        facts = {"leader_status": self.outcome().get("status"), "exit": exit_code,
+                 "closure": self.outcome().get("closure"), "fault": self.outcome().get("fault"),
+                 "deadline": self.outcome().get("deadline"), "census": self.receipt.get("census"),
+                 "held": held, "expected_held": list(streams), "suite_pid": os.getpid(),
+                 "signal_targets": [r["target"] for r in signals],
+                 "retained": (self.dir / "evidence" / "receipt.json").exists()}
+        return facts
+
+    def test_held_stdout_descriptor_keeps_the_eof_veto(self):
+        facts = self.held_stream_case(["stdout"])
+        self.assertEqual(eof_veto_problems(facts), [], facts)
+        self.assert_kept_outside_outer_cleanup()
+
+    def test_held_stderr_descriptor_keeps_the_eof_veto(self):
+        facts = self.held_stream_case(["stderr"])
+        self.assertEqual(eof_veto_problems(facts), [], facts)
+        self.assert_kept_outside_outer_cleanup()
+
+    def test_released_descriptors_close_normally(self):
+        # The paired control: both descriptors transferred and both released by
+        # the suite before the verdict, so the same fixture and handoff must
+        # close with status 0 and no fault. This refuses an always-UNCLOSED oracle.
+        receiver = FdReceiver(str(self.dir))
+        self.addCleanup(receiver.close)
+        extra = {"FD_SOCKET_DIR": receiver.directory, "FD_SOCKET_NAME": FD_SOCKET_NAME,
+                 "FD_STREAMS": "stdout,stderr", "FD_ACK_TIMEOUT_S": str(FD_ACK_TIMEOUT_S)}
+        stream = _ReleasedReceiver(receiver)
+        exit_code = self.guardian(FD_HANDOFF, extra_env=extra, receiver=stream, receiver_count=2)
+        facts = {"exit": exit_code, "closure": self.outcome().get("closure"),
+                 "fault": self.outcome().get("fault"), "held": stream.still_held()}
+        self.assertEqual(released_streams_problems(facts), [], facts)
+
+
 
     def test_terminal_zombie_witness_closed(self):
         # Positive TERMINALNONWRITER fixture: this suite process forks one
@@ -1965,12 +3008,14 @@ def write(name, size):
 
 def main():
     signal.alarm(250)  # secondary bound; the supervisor's deadline is primary
+    record_layout()
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
-                                           PureTraversal))
+                                           PureTraversal, PureDefaultScratch, PureQualificationTopology,
+                                           PureClosureDecision))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

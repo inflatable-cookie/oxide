@@ -48,6 +48,14 @@ writers are outside the promise. Host free space is a sampled abort
 threshold; the owned-byte budget is monitored, not a hard ceiling. macOS
 only.
 
+Default scratch (oxide#145): with no caller `OXIDE_TASK_SCRATCH_ROOT` and no
+`--root-parent`, the owned root is created under a private area on the volume
+the effect-free pool selection names, outside the pool payload; a selected
+volume must not be the boot volume, and an absent, unreadable, malformed or
+unsafe selection falls back to /private/tmp with one bounded warning.
+Reserve sampling reads the filesystem that actually holds the scratch, and
+the receipt records the selection source and the reserve path and device.
+
 OXIDE_SUPERVISOR_INJECT (comma list from INJECTIONS) is a test-only
 fault-injection hook used by scripts/test_supervisor.py.
 """
@@ -57,6 +65,7 @@ import ctypes
 import errno
 import json
 import os
+import pwd
 import secrets
 import select
 import shutil
@@ -101,6 +110,15 @@ CONFIRM_VALUES = ("absent", "replaced", "matching_exhausted", "read_failed")
 FINAL_VALUES = ("not_read", "absent", "replaced", "same_identity", "read_failed")
 DIAG_ERROR_VALUES = ("none", "permission", "not_found", "io", "other")
 MAX_LINE = 64 * 1024
+# Default scratch parent (oxide#145): a private area on the volume the passive
+# pool selection names, outside its managed payload, else the warned fallback.
+FALLBACK_PARENT = "/private/tmp"
+VOLUMES = "/Volumes"
+DEFAULT_POOL_LEAF = "build-pool"
+CONFIG_MAX_BYTES = 64 * 1024
+REGISTRATION_MAX_BYTES = 64 * 1024
+SCRATCH_LEAF = "oxide-proof."
+REGISTRATION = ("oxide-managed", "removable.json")
 INJECTIONS = {
     "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
@@ -1104,6 +1122,293 @@ def tree_bytes(root):
     return total
 
 
+class SelectionRefused(Exception):
+    """The default scratch parent cannot be used; the caller falls back."""
+
+
+class DefaultProbe:
+    """The facts the default selection reads: kernel metadata, two bounded
+    documents and the account home. Tests substitute their own."""
+
+    def stat(self, path):
+        return os.stat(path)
+
+    def lstat(self, path):
+        return os.lstat(path)
+
+    def realpath(self, path):
+        return os.path.realpath(path)
+
+    def volume_uuid(self, path):
+        return volume_uuid(path)
+
+    def euid(self):
+        return os.geteuid()
+
+    def home(self):
+        """The account home, never `$HOME` (the product's rule)."""
+        try:
+            return pwd.getpwuid(self.euid()).pw_dir
+        except KeyError:
+            raise SelectionRefused("the account home is unavailable")
+
+    def read(self, path, limit):
+        info = self.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SelectionRefused(f"{path} is not a regular file")
+        if info.st_size > limit:
+            raise SelectionRefused(f"{path} is larger than {limit} bytes")
+        with open(path, "rb") as handle:
+            return handle.read(limit + 1)
+
+
+_ATTR_BIT_MAP_COUNT = 5
+_ATTR_VOL_UUID = 0x00040000  # sys/attr.h
+_LIBC = [None]
+
+
+class _AttrList(ctypes.Structure):
+    """struct attrlist (sys/attr.h), for one getattrlist volume read."""
+
+    _fields_ = [("bitmapcount", ctypes.c_uint16), ("reserved", ctypes.c_uint16),
+                ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
+                ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                ("forkattr", ctypes.c_uint32)]
+
+
+def volume_uuid(path):
+    """The `ATTR_VOL_UUID` of the volume holding `path`, lowercase hyphenated,
+    or None when it cannot be read. The product's own identity primitive: a
+    non-root directory answers its containing volume's UUID, so a stale
+    directory on the internal disk is never mistaken for the drive."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        if _LIBC[0] is None:
+            _LIBC[0] = ctypes.CDLL(None, use_errno=True)
+        attrs = _AttrList(_ATTR_BIT_MAP_COUNT, 0, 0, _ATTR_VOL_UUID, 0, 0, 0)
+        buffer = ctypes.create_string_buffer(32)
+        code = _LIBC[0].getattrlist(os.fsencode(path), ctypes.byref(attrs), buffer,
+                                    ctypes.c_size_t(len(buffer)), 0)
+        if code != 0:
+            return None
+        raw = buffer.raw
+    except (OSError, AttributeError, ValueError):
+        return None
+    length = struct.unpack_from("<I", raw, 0)[0]
+    if length != 20:  # the 4-byte length field plus exactly one 16-byte UUID
+        return None
+    data = raw[4:20]
+    return "-".join((data[0:4].hex(), data[4:6].hex(), data[6:8].hex(), data[8:10].hex(), data[10:16].hex()))
+
+
+def config_pool_path(text):
+    """`[pool] path` from a user config, or None when it sets none.
+
+    Only that one entry is read: other lines and tables are ignored. A pool
+    table or pool path this narrow reader does not understand refuses, so an
+    unknown selection is never guessed from a partly understood file."""
+    table, value = None, None
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("["):
+            if not stripped.endswith("]"):
+                raise SelectionRefused(f"config line {number}: unsupported table header")
+            table = stripped[1:-1].strip()
+            continue
+        if table != "pool":
+            continue
+        key, separator, rest = stripped.partition("=")
+        if not separator:
+            raise SelectionRefused(f"config line {number}: unsupported entry in the pool table")
+        if key.strip() != "path":
+            continue
+        rest = rest.strip()
+        if value is not None:
+            raise SelectionRefused(f"config line {number}: repeated pool path")
+        if len(rest) < 2 or rest[0] != rest[-1] or rest[0] not in "'\"":
+            raise SelectionRefused(f"config line {number}: unsupported pool path value")
+        body = rest[1:-1]
+        if (rest[0] == "\"" and "\\" in body) or (rest[0] == "'" and "'" in body):
+            raise SelectionRefused(f"config line {number}: unsupported escape in the pool path")
+        value = body
+    return value
+
+
+def configured_pool(env, probe):
+    """The configured pool path and the fact that named it, effect-free and
+    in the product's precedence: `OXIDE_POOL`, then the user config file's
+    `[pool] path`, then the built-in default pool. `~` is the account home."""
+    explicit = env.get("OXIDE_POOL")
+    if explicit:
+        return explicit, "OXIDE_POOL"
+    home = probe.home()
+    config = env.get("OXIDE_CONFIG") or os.path.join(
+        home, "Library", "Application Support", "oxide", "config", "config.toml")
+    source = "OXIDE_CONFIG" if env.get("OXIDE_CONFIG") else "account config"
+    default = os.path.join(home, "Library", "Caches", "oxide", DEFAULT_POOL_LEAF)
+    try:
+        text = probe.read(config, CONFIG_MAX_BYTES)
+    except FileNotFoundError:
+        return default, "built-in default pool"
+    except SelectionRefused as refusal:
+        raise SelectionRefused(f"config {config}: {refusal}")
+    except OSError as error:
+        raise SelectionRefused(f"config {config}: {type_name(error)}")
+    try:
+        text = text.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SelectionRefused(f"config {config}: not UTF-8")
+    value = config_pool_path(text)
+    if value is None:
+        return default, "built-in default pool"
+    if not value.startswith("~"):
+        return value, source
+    if value == "~" or value.startswith("~/"):
+        return home + value[1:], source
+    raise SelectionRefused(f"config {config}: unsupported home form {value!r}")
+
+
+def registered_mount(path, probe):
+    """The recorded passive selection of the pool's removable registration as
+    (mount point, volume UUID), or None when nothing is registered. A present
+    but unreadable, oversized or malformed document refuses: an unknown
+    selection is never guessed."""
+    try:
+        raw = probe.read(path, REGISTRATION_MAX_BYTES)
+    except FileNotFoundError:
+        return None
+    except SelectionRefused as refusal:
+        raise SelectionRefused(f"registration {path}: {refusal}")
+    except OSError as error:
+        raise SelectionRefused(f"registration {path}: {type_name(error)}")
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise SelectionRefused(f"registration {path}: not JSON")
+    if not isinstance(document, dict):
+        raise SelectionRefused(f"registration {path}: not an object")
+    mount, identifier = document.get("mount_point"), document.get("volume_uuid")
+    if not isinstance(mount, str) or not isinstance(identifier, str):
+        raise SelectionRefused(f"registration {path}: no recorded mount point and volume UUID")
+    return mount, identifier.lower()
+
+
+def checked_volume(path, probe, boot, parent=None, expected_uuid=None):
+    """The mount root and volume UUID of `path` when it is a positively
+    existing, eligible scratch volume: an absolute canonical real directory,
+    directly under `parent` when one is required, on a device other than the
+    boot volume's, with a readable volume UUID that is the recorded one when
+    `expected_uuid` is given."""
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise SelectionRefused(f"selected path {path!r} is not an absolute canonical path")
+    if parent is not None:
+        if os.path.dirname(path) != parent:
+            raise SelectionRefused(f"selected mount {path} is not directly under {parent}")
+        guard = probe.lstat(parent)
+        if (stat.S_ISLNK(guard.st_mode) or not stat.S_ISDIR(guard.st_mode)
+                or guard.st_uid != 0 or guard.st_mode & 0o022):
+            raise SelectionRefused(f"{parent} is not a root-owned, non-writable mount parent")
+    info = probe.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise SelectionRefused(f"selected mount {path} is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        raise SelectionRefused(f"selected mount {path} is not a directory")
+    if probe.realpath(path) != path:
+        raise SelectionRefused(f"selected mount {path} is not canonical")
+    if info.st_dev == boot:
+        raise SelectionRefused(f"the volume holding {path} is the boot volume")
+    identifier = probe.volume_uuid(path)
+    if identifier is None:
+        raise SelectionRefused(f"the volume holding {path} has no readable UUID")
+    if expected_uuid is not None and identifier != expected_uuid:
+        raise SelectionRefused(f"the volume holding {path} is {identifier}, not the registered {expected_uuid}")
+    return path, identifier
+
+
+def mount_root(path, probe):
+    """The highest ancestor of `path` on its own device: its mount root."""
+    current = probe.realpath(path)
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current or probe.stat(parent).st_dev != probe.stat(current).st_dev:
+            return current
+        current = parent
+
+
+def select_default_parent(env, probe=None):
+    """The default root parent for proof scratch (oxide#145).
+
+    When no caller scratch or root parent is supplied, scratch belongs to a
+    private area on the volume the effect-free pool selection names: the
+    registered removable volume when the registration and a cheap presence
+    and identity check pass, otherwise the configured pool's own volume. A
+    volume is eligible only when it is not the boot volume. Anything absent,
+    unreadable, malformed or unsafe falls back to /private/tmp with a bounded
+    warning; nothing is created here."""
+    probe = probe if probe is not None else DefaultProbe()
+    facts = {"source": "fallback", "root_parent": FALLBACK_PARENT, "reason": None,
+             "pool": None, "pool_source": None, "registration": None, "mount": None,
+             "volume_uuid": None, "device": None}
+    try:
+        boot = probe.stat("/").st_dev
+        facts["pool"], facts["pool_source"] = configured_pool(env, probe)
+        registration = os.path.join(facts["pool"], *REGISTRATION)
+        recorded = registered_mount(registration, probe)
+        if recorded is None:
+            volume = mount_root(facts["pool"], probe)
+            mount, identifier = checked_volume(volume, probe, boot)
+        else:
+            facts["registration"] = registration
+            mount, identifier = checked_volume(recorded[0], probe, boot, VOLUMES, recorded[1])
+        facts.update(source="selected-volume", root_parent=mount, mount=mount,
+                     volume_uuid=identifier, device=probe.stat(mount).st_dev)
+    except SelectionRefused as refusal:
+        facts["reason"] = str(refusal)
+    except OSError as error:
+        name = getattr(error, "filename", None)
+        facts["reason"] = (f"selection facts unavailable: {type_name(error)}"
+                           + (f" at {name}" if isinstance(name, str) else ""))
+    return facts
+
+
+def fallback_warning(selection):
+    """One bounded line naming where scratch went and why; `report` caps it."""
+    reason = selection.get("reason") or "no eligible selected volume"
+    return (f"bounded-test.py: warning: proof scratch defaults to {FALLBACK_PARENT}, not the selected volume:"
+            f" {reason}")[:400] + "\n"
+
+
+def create_owned_root(parent, probe, make_dir=None):
+    """Create this run's owned scratch root directly under `parent` and verify
+    it before use: a real canonical directory, private to this user and on the
+    parent's own device. A refusal removes the directory it just created."""
+    make_dir = make_dir or tempfile.mkdtemp
+    info = probe.lstat(parent)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SelectionRefused(f"root parent {parent} is not a real directory")
+    root = make_dir(prefix=SCRATCH_LEAF, dir=parent)
+    try:
+        info = probe.lstat(root)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise SelectionRefused(f"scratch root {root} is not a real directory")
+        if info.st_uid != probe.euid() or info.st_mode & 0o077:
+            raise SelectionRefused(f"scratch root {root} is not private to this user")
+        if probe.stat(root).st_dev != probe.stat(parent).st_dev:
+            raise SelectionRefused(f"scratch root {root} is not on the parent's device")
+        if probe.realpath(root) != root or os.path.dirname(root) != parent:
+            raise SelectionRefused(f"scratch root {root} is not canonical under {parent}")
+    except BaseException:
+        try:
+            shutil.rmtree(root, ignore_errors=True)
+        except BaseException:
+            pass
+        raise
+    return root
+
+
 class Monitor:
     def __init__(self, ctx, ctl_w, cmd_r, out_r, err_r):
         self.ctx, self.ctl_w, self.cmd_r = ctx, ctl_w, cmd_r
@@ -1115,6 +1420,30 @@ class Monitor:
         self.inject = set(ctx["inject"])
         self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
         self.receipt = None
+
+    def owned_root(self):
+        """This run's owned root and the selection facts behind it. A caller's
+        `--root-parent` keeps its existing semantics; the default is the
+        source-owned selected-volume choice, with a warned fallback."""
+        ctx = self.ctx
+        if ctx["root_parent"] is not None:
+            parent = ctx["root_parent"]
+            root = os.path.realpath(tempfile.mkdtemp(prefix=SCRATCH_LEAF, dir=parent))
+            return {"source": "explicit-root-parent", "root_parent": parent, "reason": None,
+                    "pool": None, "pool_source": None, "registration": None,
+                    "mount": None, "volume_uuid": None, "device": None}, root
+        probe = DefaultProbe()
+        selection = select_default_parent(os.environ, probe)
+        try:
+            return selection, create_owned_root(selection["root_parent"], probe)
+        except (SelectionRefused, OSError) as error:
+            reason = str(error) if isinstance(error, SelectionRefused) else type_name(error)
+            fallback = {"source": "fallback", "root_parent": FALLBACK_PARENT,
+                        "reason": f"{selection['root_parent']}: {reason}",
+                        "pool": selection.get("pool"), "pool_source": selection.get("pool_source"),
+                        "registration": selection.get("registration"), "mount": None,
+                        "volume_uuid": None, "device": None}
+            return fallback, create_owned_root(FALLBACK_PARENT, probe)
 
     def setup(self):
         """All blocking setup, inside the custodian's setup deadline: the
@@ -1132,13 +1461,24 @@ class Monitor:
                 raise SetupRefused(f"OXIDE_TASK_SCRATCH_ROOT {scratch} is not a directory")
             root, owned, reserve_path = scratch, False, scratch
             evidence = ctx["evidence_arg"] or tempfile.mkdtemp(prefix="supervisor-evidence.", dir=scratch)
+            selection = {"source": "adopted-scratch-root", "root_parent": None, "reason": None,
+                         "pool": None, "pool_source": None, "registration": None,
+                         "mount": None, "volume_uuid": None, "device": None}
         else:
-            root = os.path.realpath(tempfile.mkdtemp(prefix="oxide-proof.", dir=ctx["root_parent"]))
-            scratch, owned, reserve_path = os.path.join(root, "scratch"), True, os.path.realpath(ctx["root_parent"])
+            selection, root = self.owned_root()
+            scratch, owned = os.path.join(root, "scratch"), True
+            reserve_path = root
             os.mkdir(scratch)
             evidence = ctx["evidence_arg"] or os.path.join(root, "evidence")
+        if selection["source"] == "fallback":
+            report(fallback_warning(selection))
+        try:
+            reserve_device = os.stat(reserve_path).st_dev
+        except OSError as error:
+            raise SetupRefused(f"reserve path {reserve_path}: {type_name(error)}")
+        selection["device"] = selection["device"] if selection["device"] is not None else reserve_device
         ctx.update(root=root, scratch=scratch, evidence=os.path.realpath(evidence), owned=owned,
-                   reserve_path=reserve_path)
+                   reserve_path=reserve_path, reserve_device=reserve_device, selection=selection)
         try:
             terminal_mode = _decide_terminal_mode()
         except BaseException:
@@ -1155,8 +1495,10 @@ class Monitor:
             "root": ctx["root"], "scratch": ctx["scratch"], "evidence": ctx["evidence"],
             "scratch_owned": ctx["owned"], "start_ns": ctx["start_ns"], "abort_threshold": THRESHOLD,
             "terminal_mode": dict(terminal_mode),
+            "scratch_default": dict(ctx["selection"]),
             "phase": None, "leader": None, "custodian": [], "outcome": None,
-            "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None},
+            "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None,
+                        "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
             "output": {}, "census": None, "census_rounds": 0,
         }
@@ -1348,16 +1690,17 @@ class Monitor:
         lines = [
             f"supervisor: {outcome.get('closure', 'UNCLOSED')}; command status {outcome.get('status')};"
             f" fault {outcome.get('fault')}; deadline {outcome.get('deadline')}",
+            f"supervisor: scratch default {receipt['scratch_default']['source']} at"
+            f" {receipt['scratch_default']['root_parent']}; reserve sampled on {reserve['path']}"
+            f" (device {reserve['device']})",
             f"supervisor: host free sampled {reserve['samples']} times every {RESERVE_INTERVAL} s (largest gap"
             f" {reserve['max_gap_ns'] / NS:.3f} s), minimum {minimum}, abort threshold 22 GiB; sampled, not an"
             " instantaneous guarantee",
             f"supervisor: owned bytes peak {peak / MIB:.1f} MiB of {receipt['owned_bytes']['budget'] // MIB} MiB"
             f" monitored budget; evidence {receipt['evidence']}",
         ]
-        try:
-            os.write(2, ("\n".join(lines) + "\n").encode())
-        except OSError:
-            pass
+        for line in lines:  # one bounded write per line, so none truncates the rest
+            report(line + "\n")
 
 
 class SetupRefused(Exception):
@@ -1382,7 +1725,7 @@ def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
 
 
 class Custodian:
-    def __init__(self, command, limit_s=LIMIT_S, budget=SCRATCH_BUDGET, evidence=None, root_parent="/private/tmp"):
+    def __init__(self, command, limit_s=LIMIT_S, budget=SCRATCH_BUDGET, evidence=None, root_parent=None):
         self.command, self.limit_s, self.budget, self.evidence_arg = command, limit_s, budget, evidence
         self.root_parent = root_parent
         self.inject = {item for item in os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",") if item}
@@ -1899,7 +2242,7 @@ class BrokenQueue:
 
 
 def parse(argv):
-    options = {"limit": LIMIT_S, "budget": SCRATCH_BUDGET, "evidence": None, "root_parent": "/private/tmp"}
+    options = {"limit": LIMIT_S, "budget": SCRATCH_BUDGET, "evidence": None, "root_parent": None}
     while argv and argv[0].startswith("--"):
         flag = argv.pop(0)
         if flag == "--":
