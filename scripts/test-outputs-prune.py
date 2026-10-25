@@ -255,6 +255,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import ast
 import glob
 import hashlib
 import inspect
@@ -2110,6 +2111,26 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
     # never replays it.
 
 
+def assert_assigned_before_use(function, name: str) -> None:
+    """Pure static guard for a defect class the review found once: a name that
+    a function only reads (for example in a success summary) but never assigns,
+    which would NameError on the path a pure selector never executes."""
+    tree = ast.parse(inspect.getsource(function))
+    stores = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store)
+    ]
+    loads = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)
+    ]
+    assert stores, f"{function.__name__} never assigns {name}"
+    assert loads, f"{function.__name__} never reads {name}"
+    assert min(stores) < min(loads), (function.__name__, name, stores, loads)
+
+
 def case_matrix_text() -> str:
     """The dependency matrix, generated from CASE_PLAN. The module docstring
     embeds exactly this text, and `--self-test` fails if the two drift, so the
@@ -2752,6 +2773,19 @@ def self_test() -> int:
 
     check("image custody", image_custody)
 
+    def success_path_names() -> None:
+        # The clean-finish summaries and the failure record must only read
+        # names their function assigns; a dropped assignment once NameError'd
+        # a clean collection after the detach (review of b58542).
+        for name in ("elapsed", "custody", "disposition", "failure", "proof", "root", "receipt"):
+            assert_assigned_before_use(main, name)
+        main_source = inspect.getsource(main)
+        assert "elapsed = time.monotonic() - permanent.layout.runner.STARTED" in main_source
+        assert main_source.count("return 0") >= 2, main_source
+        assert "raise failure" in main_source
+
+    check("success-path names", success_path_names)
+
     def starters() -> None:
         released: list[str] = []
 
@@ -2803,14 +2837,12 @@ def self_test() -> int:
             raise AssertionError("an unproven starter was accepted on a successful case")
         finally:
             _START_WORLD = None
-        # The production cases use the tracked helper for every keyed pause.
+        # The production cases use the tracked helper for every keyed pause and
+        # never call the untracked starter path directly.
         case_source = inspect.getsource(run)
-        assert "starters.pause(" in case_source and "world.paused(" not in case_source.replace(
-            "starters.pause(", ""
-        ).replace("world.paused(", "", 1) or True
-        assert "starters.finish(" in case_source
-        diag = Diagnostics(enabled=True)
-        assert diag.notes == []
+        assert "starters.pause(" in case_source, case_source
+        assert "starters.finish(" in case_source, case_source
+        assert "world.paused(" not in case_source, case_source
 
     check("keyed starter custody", starters)
 
@@ -3037,6 +3069,7 @@ def main(argv: list[str]) -> int:
         )
         print(f"outputs-prune proof failed; scratch {root} kept", file=sys.stderr)
         raise failure
+    elapsed = time.monotonic() - permanent.layout.runner.STARTED
     if DIAG.enabled:
         receipt = write_diagnostic_receipt()
         unreached = [row["id"] for row in DIAG.results() if row["state"] == "unexecuted"]
