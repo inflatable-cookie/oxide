@@ -1837,6 +1837,70 @@ class PureQualificationTopology(unittest.TestCase):
             "custodian": [{"event": "gate_open", "at": 5}],
         }
 
+    def control_records(self, parent, root, kept):
+        return [
+            {"case": "bootstrap_deadline_blocked_stdout", "exit": 124, "wall_s": 2.197},
+            {"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139, "kept": kept},
+            {"case": "fixture_deadline", "exit": [-14, -14]},
+        ]
+
+    def kept_world(self, parent, root):
+        kept = os.path.join(root, "evidence", "nested", "test_direct_runner_setup_blocked_in_filesystem.062")
+        os.makedirs(kept)
+        facts = TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, kept: DRIVE_DEVICE},
+                              documents={}, boot=1, free={})
+        return kept, facts
+
+    def test_the_suites_three_controls_are_validated_by_shape(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        kept, guard_facts = self.kept_world(parent, root)
+        ordinary = {"case": "zero", "dir": case, "exit": 0,
+                    "phase": "monitor_complete: pending_custodian", "retained_unclosed": False,
+                    "outcome": {}, "census": 0, "wall_s": 1.0, "signals": []}
+        results = {"cases": [ordinary] + self.control_records(parent, root, kept)}
+        self.assertEqual(qualify.nested_cases(results, record, guard_facts), [])
+        # A control that claims a receipt although setup was refused is wrong.
+        os.makedirs(os.path.join(kept, "evidence"))
+        open(os.path.join(kept, "evidence", "receipt.json"), "w").write("{}")
+        problems = qualify.nested_cases(results, record, guard_facts)
+        self.assertTrue(any("claims a receipt" in p for p in problems), problems)
+
+    def test_control_record_mutations_are_refused(self):
+        sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
+        expected = {"source": "selected-volume", "root_parent": parent}
+        record, _ = qualify.topology(str(sandbox), expected, facts)
+        kept, guard_facts = self.kept_world(parent, root)
+
+        def check(records, marks, guard=guard_facts):
+            problems = qualify.nested_cases({"cases": records}, record, guard)
+            self.assertTrue(any(marks in p for p in problems), (marks, problems))
+
+        controls = self.control_records(parent, root, kept)
+        # An ordinary case with no dir, or with no receipt, is never exempt.
+        check([{"case": "zero", "exit": 0}], "ran outside the monitored root")
+        bare = os.path.join(evidence, "nested", "no-receipt.1")
+        os.makedirs(bare)
+        check([{"case": "zero", "dir": bare, "exit": 0}], "evidence missing after cleanup")
+        # An unknown control, an unmodelled field and a wrong exit are refused.
+        check([{"case": "unknown_control", "exit": 0}], "ran outside the monitored root")
+        check([dict(controls[0], dir=case)], "unmodelled field")
+        check([dict(controls[1], dir=kept)], "unmodelled field")
+        check([dict(controls[2], exit=[0, 0])], "is not the recorded")
+        check([dict(controls[1], wall_s=1.0) and {"case": "direct_runner_setup_blocked", "exit": 125,
+                                                  "kept": kept}], "missing a field")
+        # A retained path that escapes, is not canonical or is on another
+        # device is refused rather than treated as kept containment.
+        check([{"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139,
+                "kept": "/private/tmp/elsewhere"}], "outside the monitored root")
+        check([{"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139, "kept": kept}],
+              "not canonical", TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, kept: DRIVE_DEVICE},
+                                             documents={}, boot=1, realpaths={kept: "/private/tmp/x"}))
+        check([{"case": "direct_runner_setup_blocked", "exit": 125, "wall_s": 1.139, "kept": kept}],
+              "not on the monitored root's device",
+              TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, kept: 1}, documents={}, boot=1))
+
     def test_nested_cases_and_evidence_stay_inside_the_monitored_root(self):
         sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
         expected = {"source": "selected-volume", "root_parent": parent}

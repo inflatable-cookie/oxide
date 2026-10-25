@@ -1644,7 +1644,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 122 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 126 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1772,7 +1772,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 158 cases;
+- all 162 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 

@@ -65,7 +65,7 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 160
+EXPECTED_CASES = 162
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -281,24 +281,86 @@ def topology(base, expected, facts=None):
     return {"root": root, "scratch": scratch, "evidence": evidence}, problems
 
 
-def nested_cases(results, record):
-    """Every nested case directory must be inside the monitored owned root and
-    retain its own receipt after the candidate's cleanup: the evidence
-    directory is never removed, so an UNCLOSED case's resources stay kept
-    under the candidate's accounting rather than escaping to the internal
-    disk."""
+# The suite also records three controls that never run a nested supervisor, so
+# they carry no case directory and no receipt. Each shape is fixed here: an
+# unrecognised control, an extra field (such as a dir it does not have) or a
+# different exit is a problem, never an exemption.
+CONTROL_CASES = {
+    "bootstrap_deadline_blocked_stdout": {"exit": 124, "keys": {"case", "exit", "wall_s"}},
+    "direct_runner_setup_blocked": {"exit": 125,
+                                    "keys": {"case", "exit", "wall_s", "kept"},
+                                    "kept": True, "receipt": False},
+    "fixture_deadline": {"exit": [-14, -14], "keys": {"case", "exit"}},
+}
+ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome", "census", "wall_s",
+                 "signals", "stale_latency_ns"}
+
+
+def control_case(case, name, root, facts):
+    """One of the suite's own controls: exact shape, exact exit, and for the
+    direct setup refusal one retained path with no receipt, since a setup
+    blockage must never claim one."""
+    problems, spec = [], CONTROL_CASES[name]
+    extra = set(case) - spec["keys"]
+    missing = spec["keys"] - set(case)
+    if extra:
+        problems.append(f"control {name} recorded an unmodelled field: {sorted(extra)}")
+    if missing:
+        problems.append(f"control {name} is missing a field: {sorted(missing)}")
+    if case.get("exit") != spec["exit"]:
+        problems.append(f"control {name} exit {case.get('exit')} is not the recorded {spec['exit']}")
+    if not spec.get("kept"):
+        return problems
+    kept = case.get("kept")
+    if not isinstance(kept, str) or root is None:
+        return problems + [f"control {name} has no retained path inside the monitored root: {kept}"]
+    if not kept.startswith(root + "/"):
+        problems.append(f"control {name} retained path is outside the monitored root: {kept}")
+    try:
+        canonical = facts.realpath(kept) == kept
+        device, root_device = facts.device(kept), facts.device(root)
+    except OSError as error:
+        return problems + [f"control {name} retained path is unreadable: {error!r}"]
+    if not canonical:
+        problems.append(f"control {name} retained path is not canonical: {kept}")
+    if device != root_device:
+        problems.append(f"control {name} retained path is not on the monitored root's device: {kept}")
+    if spec.get("receipt") is False:
+        receipt = os.path.join(kept, "evidence", "receipt.json")
+        if os.path.lexists(receipt):
+            problems.append(f"control {name} claims a receipt although setup was refused: {receipt}")
+    return problems
+
+
+def nested_cases(results, record, facts=None):
+    """Every nested real case must run inside the monitored owned root and keep
+    its receipt there after the candidate's cleanup; the evidence directory is
+    never removed, so an UNCLOSED case's resources stay kept under the
+    candidate's accounting rather than escaping to the internal disk. The
+    suite's three controls are validated by exact recorded shape instead of
+    being exempted: an ordinary case without a dir or receipt, an unknown
+    control, an unmodelled field, or a retained path that escapes, is
+    non-canonical or on another device is a problem."""
+    facts = facts if facts is not None else KernelFacts()
     problems = []
     cases = results.get("cases") or []
     root = (record or {}).get("root")
     if not cases:
         problems.append("no nested case directory was recorded")
     for case in cases:
+        name = case.get("case")
+        if name in CONTROL_CASES:
+            problems += control_case(case, name, root, facts)
+            continue
+        unexpected = set(case) - ORDINARY_KEYS
+        if unexpected:
+            problems.append(f"nested case {name} recorded an unmodelled field: {sorted(unexpected)}")
         directory = case.get("dir")
         if not isinstance(directory, str) or root is None or not directory.startswith(root + "/"):
-            problems.append(f"nested case {case.get('case')} ran outside the monitored root: {directory}")
+            problems.append(f"nested case {name} ran outside the monitored root: {directory}")
             continue
         if not os.path.exists(os.path.join(directory, "evidence", "receipt.json")):
-            problems.append(f"nested case evidence missing after cleanup: {case['case']} {directory}")
+            problems.append(f"nested case evidence missing after cleanup: {name} {directory}")
     return problems
 
 
@@ -380,7 +442,7 @@ def check(receipt, results, expected, record=None, facts=None):
     if reserve["max_gap_ns"] > NS:
         problems.append(f"reserve sample gap {reserve['max_gap_ns']} ns over 1 s")
     problems += default_scratch(receipt, expected, record, facts)
-    problems += nested_cases(results, record)
+    problems += nested_cases(results, record, facts)
     owned = receipt["owned_bytes"]
     if owned["maximum"] is None or not 5 * MIB <= owned["maximum"] <= owned["budget"]:
         problems.append(f"owned-byte peak {owned['maximum']} does not show the fixture writers within budget")
