@@ -68,6 +68,49 @@ Cases (each one is a real child, nothing is simulated):
 12. the longest injected path is reported in bytes and characters against the
     91-byte socket bound.
 
+
+Fixed proof-authoring checklist sweep (Supervisor b18d0552), each item either
+an executable-body fact or an explicit not-applicable reason. `--self-check`
+is a pure, pre-scratch regression of items 1, 2, 3, 5 and 7; it creates no
+scratch, no child process and no toolchain, and it dispatches before the
+scratch root, the toolchain decision or staging.
+
+1. Toolchain provenance: `resolve_toolchain_home` honours an absolute, usable
+   inherited `RUSTUP_HOME`, else resolves the account default `<HOME>/.rustup`
+   from the *original* HOME before any private fixture HOME exists, and
+   `toolchain_environment` publishes that absolute path to staging and every
+   fixture child with `RUSTUP_TOOLCHAIN=1.97.1` and `RUSTUP_AUTO_INSTALL=0`.
+   A missing, relative or absent toolchain home refuses before scratch or
+   staging instead of hiding behind a fake HOME. (The first authorised author
+   native failed exactly here: the fixture HOME hid the installed 1.97.1.)
+2. Private account home: every fixture child carries the debug build's
+   `OXIDE_TEST_HOME_FROM_ENV=1`, so the private fixture HOME is the account home
+   and the real account's config, pool record and status are untouched.
+3. No imported ambient controls: the fixture environment is built fresh (it can
+   carry only `OXIDE_TEST_HOME_FROM_ENV` plus the proof's own explicit pool
+   controls), and the staging environment scrubs `OXIDE_*`, `XDG_*` and
+   `CARGO_ENCODED_RUSTFLAGS`; the self-check rejects a hostile parent that
+   would import any of them.
+4. Auto-adopt premise: `make_fixture` asserts the fresh checkout has no
+   `target/`, and the internal pool has no permanent registration, so the first
+   build cannot mistake a converted root for fresh work.
+5. External Cargo argv: the only external Cargo invocations are the recorded
+   `CARGO_BUILD_ARGV` (staging) and `CARGO_ORACLE_ARGV` (premise oracle), both
+   with the subcommand name in argv, which the self-check asserts.
+6. Owned removable image: case 11 attaches it with `-owners on`, parses the
+   mount point from the plist and confirms `GlobalPermissionsEnabled` through
+   `diskutil` before registration (the mount-root rule).
+7. Frozen build flags: `FROZEN_RUSTFLAGS` is shared by staging and every
+   fixture child, and an inherited `CARGO_ENCODED_RUSTFLAGS` (which outranks
+   RUSTFLAGS in Cargo) is scrubbed, so the recipe cannot drift.
+8. TMPDIR/scratch selection on the selected volume: not applicable inside this
+   proof, which *is* the oxide#136 source under test; its fixture TMPDIR is the
+   proof's own private scratch, and no oxide#145 default or unqualified temp
+   root is borrowed.
+9. `mktemp` without a template ignores TMPDIR: not applicable, this proof calls
+   no `mktemp`; every scratch directory is an explicit `private_dir(...)` under
+   `OXIDE_TASK_SCRATCH_ROOT` inside the qualified guard.
+
 `--plan` prints the allocation and cases and touches nothing. No live pool,
 registered drive, install receipt, host setting or consumer is touched; the
 fixture image is created, attached and ordinarily detached inside the
@@ -88,6 +131,12 @@ from typing import Optional
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
+# The one flag set the staging build and every fixture child share.
+FROZEN_RUSTFLAGS = "-C strip=symbols"
+# External Cargo argv used by this proof. The subcommand name is part of the
+# argv, which the pure self-check asserts.
+CARGO_BUILD_ARGV = ("cargo", "build", "-j", "1", "--locked", "--offline", "--bin", "oxide")
+CARGO_ORACLE_ARGV = ("cargo", "check", "--offline", "--locked")
 # macOS `sun_path`, including the NUL, less `/` and an eleven-byte socket name.
 SOCKET_PATH_BOUND = 91
 MIB = 1024 * 1024
@@ -196,22 +245,123 @@ def children_bytes(path: str) -> int:
     return total
 
 
-def stage_subject(root: str) -> str:
-    """Stage this HEAD's debug `oxide` offline, then delete the target."""
-    stage = os.path.join(root, "stage")
-    log = os.path.join(root, "stage.log")
+class ToolchainError(Exception):
+    """The pinned toolchain cannot be reached, so the run must refuse."""
+
+
+def resolve_toolchain_home(environ, is_dir=os.path.isdir) -> str:
+    """The absolute toolchain home every child of this proof must use.
+
+    Called once, before any private fixture HOME exists, so the choice is made
+    from the caller's real account provenance. An explicit `RUSTUP_HOME` is
+    honoured when it is absolute and usable; otherwise the account default
+    `<HOME>/.rustup` is resolved from that same original HOME. `is_dir` is
+    injectable so the pure self-check can exercise the decision with no
+    filesystem, child process or toolchain.
+    """
+    explicit = environ.get("RUSTUP_HOME")
+    if explicit:
+        if not os.path.isabs(explicit):
+            raise ToolchainError(
+                f"the inherited RUSTUP_HOME is not an absolute path: {explicit!r}"
+            )
+        if not is_dir(explicit):
+            raise ToolchainError(
+                f"the inherited RUSTUP_HOME is not a directory: {explicit}"
+            )
+        return explicit
+    home = environ.get("HOME")
+    if not home:
+        raise ToolchainError(
+            "neither RUSTUP_HOME nor HOME is set, so the pinned toolchain home "
+            f"for {BUILDER} cannot be resolved"
+        )
+    if not os.path.isabs(home):
+        raise ToolchainError(f"the inherited HOME is not an absolute path: {home!r}")
+    candidate = os.path.join(home, ".rustup")
+    if not is_dir(candidate):
+        raise ToolchainError(
+            f"no usable toolchain home at {candidate}: the pinned {BUILDER} "
+            "toolchain would be hidden behind the private fixture HOME"
+        )
+    return candidate
+
+
+def toolchain_environment(toolchain_home: str) -> dict:
+    """The toolchain facts shared by staging and every fixture child.
+
+    Both call sites build their environment through this one function, so the
+    absolute toolchain home, the pinned toolchain, the no-auto-install rule and
+    offline Cargo cannot drift apart.
+    """
+    return {
+        "RUSTUP_HOME": toolchain_home,
+        "RUSTUP_TOOLCHAIN": BUILDER,
+        "RUSTUP_AUTO_INSTALL": "0",
+        "CARGO_NET_OFFLINE": "true",
+        # Frozen once and shared, so staging and every fixture child compile
+        # with the same flags. `CARGO_ENCODED_RUSTFLAGS` outranks RUSTFLAGS in
+        # Cargo, so an inherited encoded value is scrubbed rather than mixed.
+        "RUSTFLAGS": FROZEN_RUSTFLAGS,
+    }
+
+
+def staging_environment(environ, toolchain_home: str) -> dict:
+    """The staging child's environment: the caller's own, minus Cargo/target
+    and wrapper overrides, plus the shared toolchain facts."""
     env = {
         key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_"))
-        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+        for key, value in environ.items()
+        if not key.startswith(
+            ("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_", "XDG_")
+        )
+        and key
+        not in (
+            "CARGO",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_ENCODED_RUSTFLAGS",
+        )
     }
+    env.update(toolchain_environment(toolchain_home))
     env.update(
         {
-            "RUSTUP_TOOLCHAIN": BUILDER,
-            "RUSTUP_AUTO_INSTALL": "0",
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
+        }
+    )
+    return env
+
+
+def fixture_environment(environ, toolchain_home: str, home: str, cargo_home: str) -> dict:
+    """One fixture child's environment: private account and Cargo homes, the
+    same absolute toolchain home the staging child used."""
+    # Built fresh, never inherited: no ambient OXIDE_*/XDG_* control can leak
+    # in. `OXIDE_TEST_HOME_FROM_ENV=1` is the debug build's account-home
+    # control, so this private HOME is the account home and the real account's
+    # config, pool record and status are untouched.
+    env = {
+        "PATH": environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": home,
+        "CARGO_HOME": cargo_home,
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
+    }
+    env.update(toolchain_environment(toolchain_home))
+    return env
+
+
+def stage_subject(root: str, toolchain_home: str) -> str:
+    """Stage this HEAD's debug `oxide` offline, then delete the target.
+
+    The staging child gets the same absolute toolchain home as every fixture
+    child, so the toolchain the proof stages with is the one its children use.
+    """
+    stage = os.path.join(root, "stage")
+    log = os.path.join(root, "stage.log")
+    env = staging_environment(os.environ, toolchain_home)
+    env.update(
+        {
             "CARGO_TARGET_DIR": os.path.join(stage, "target"),
             "CARGO_BUILD_BUILD_DIR": os.path.join(stage, "build"),
             "CARGO_PROFILE_DEV_DEBUG": "0",
@@ -224,7 +374,7 @@ def stage_subject(root: str) -> str:
     )
     with open(log, "w", encoding="utf-8") as handle:
         build = subprocess.run(
-            ["cargo", "build", "-j", "1", "--locked", "--offline", "--bin", "oxide"],
+            list(CARGO_BUILD_ARGV),
             cwd=REPO,
             env=env,
             stdout=handle,
@@ -347,32 +497,38 @@ def make_fixture(root: str, name: str) -> str:
     write_private(os.path.join(crate, "src", "main.rs"), MAIN_RS)
     write_private(os.path.join(crate, "src", "lib.rs"), "")
     write_private(os.path.join(crate, "tests", "temp.rs"), TEST_RS)
+    # Auto-adopt premise: a fresh checkout with no `target/`, so the first
+    # build cannot mistake a converted or converted-ready root for fresh work.
+    expect(
+        not os.path.exists(os.path.join(crate, "target")),
+        "the fixture checkout already has a target directory",
+    )
     return crate
 
 
 class World:
     """The private account, pool, Cargo home and checkout of one proof run."""
 
-    def __init__(self, root: str, subject: str) -> None:
+    def __init__(self, root: str, subject: str, toolchain_home: str) -> None:
         self.root = root
         self.subject = subject
+        self.toolchain_home = toolchain_home
         self.home = private_dir(os.path.join(root, "home"))
         self.cargo_home = private_dir(os.path.join(root, "cargo-home"))
         self.pool = private_dir(os.path.join(root, "pool"))
         self.scratch = private_dir(os.path.join(root, "fixture-scratch"))
-        self.base = {
-            "PATH": os.environ["PATH"],
-            "HOME": self.home,
-            "CARGO_HOME": self.cargo_home,
-            "CARGO_NET_OFFLINE": "true",
-            "RUSTUP_TOOLCHAIN": BUILDER,
-            "RUSTUP_AUTO_INSTALL": "0",
-            "TMPDIR": self.scratch,
-            "TMP": self.scratch,
-            "TEMP": self.scratch,
-            "OXIDE_POOL": self.pool,
-            "OXIDE_POOL_CAP": "64MiB",
-        }
+        self.base = fixture_environment(
+            os.environ, toolchain_home, self.home, self.cargo_home
+        )
+        self.base.update(
+            {
+                "TMPDIR": self.scratch,
+                "TMP": self.scratch,
+                "TEMP": self.scratch,
+                "OXIDE_POOL": self.pool,
+                "OXIDE_POOL_CAP": "64MiB",
+            }
+        )
 
     def env(self, **overrides: Optional[str]) -> dict:
         env = dict(self.base)
@@ -469,7 +625,7 @@ def premise_sweep(world: World, crate: str) -> None:
     plain_env = world.env()
     plain_env.pop("OXIDE_POOL", None)
     plain = subprocess.run(
-        ["cargo", "check", "--offline", "--locked"],
+        list(CARGO_ORACLE_ARGV),
         cwd=crate,
         env=plain_env,
         capture_output=True,
@@ -1302,18 +1458,187 @@ def path_bound(world: World, crate: str) -> None:
     expect(leaf == "scratch", f"the injected path does not end in scratch: {observed}")
 
 
+def self_check() -> int:
+    """Pure regression of the fixture environment construction.
+
+    No filesystem, no scratch, no child process and no toolchain: the toolchain
+    home decision takes an injected `is_dir`, and the two environment builders
+    are pure functions. The negative parent reproduces the defect the first
+    authorised author native hit — a private fixture HOME with no explicit
+    toolchain home — and the property must reject it.
+    """
+    existing = {"/real/rustup", "/home/tom/.rustup", "/opt/toolchains/1.97.1"}
+    is_dir = existing.__contains__
+    checks: list[str] = []
+
+    def property_true(name: str, condition: bool) -> None:
+        expect(bool(condition), f"self-check property failed: {name}")
+        checks.append(name)
+
+    # 1. An explicit, absolute, usable inherited RUSTUP_HOME is honoured as is.
+    inherited = resolve_toolchain_home(
+        {"RUSTUP_HOME": "/opt/toolchains/1.97.1", "HOME": "/home/tom"}, is_dir
+    )
+    property_true("inherited RUSTUP_HOME honoured", inherited == "/opt/toolchains/1.97.1")
+
+    # 2. Unset RUSTUP_HOME: the account default resolves from the ORIGINAL
+    #    HOME, before any private fixture HOME is involved.
+    resolved = resolve_toolchain_home({"HOME": "/home/tom"}, is_dir)
+    property_true("account default from original HOME", resolved == "/home/tom/.rustup")
+
+    # 3. The staging and fixture environments carry the same absolute path, and
+    #    the fixture HOME/CARGO_HOME stay private and different from it.
+    staging = staging_environment(
+        {"PATH": "/usr/bin", "HOME": "/home/tom", "CARGO_HOME": "/home/tom/.cargo"},
+        resolved,
+    )
+    fixture = fixture_environment(
+        {"PATH": "/usr/bin", "HOME": "/home/tom"},
+        resolved,
+        "/scratch/fixture/home",
+        "/scratch/fixture/cargo-home",
+    )
+    for env in (staging, fixture):
+        property_true(
+            "absolute toolchain home in every child", env["RUSTUP_HOME"] == resolved
+        )
+        property_true(
+            "toolchain home never the fixture HOME",
+            env["RUSTUP_HOME"] != env.get("HOME")
+            and not env["RUSTUP_HOME"].startswith("/scratch/fixture/"),
+        )
+        property_true("pinned toolchain", env["RUSTUP_TOOLCHAIN"] == BUILDER == "1.97.1")
+        property_true("no auto-install", env["RUSTUP_AUTO_INSTALL"] == "0")
+        property_true("offline Cargo", env["CARGO_NET_OFFLINE"] == "true")
+    property_true(
+        "staging and fixtures agree on the toolchain facts",
+        toolchain_environment(resolved)
+        == {name: staging[name] for name in toolchain_environment(resolved)}
+        == {name: fixture[name] for name in toolchain_environment(resolved)},
+    )
+    property_true(
+        "debug account-home control for the private fixture HOME",
+        fixture["OXIDE_TEST_HOME_FROM_ENV"] == "1",
+    )
+    property_true("private fixture HOME retained", fixture["HOME"] == "/scratch/fixture/home")
+    property_true(
+        "private fixture CARGO_HOME retained",
+        fixture["CARGO_HOME"] == "/scratch/fixture/cargo-home",
+    )
+
+    # 3b. Ambient project/override controls never reach a child: the fixture
+    #     environment is built fresh, and the staging environment scrubs
+    #     OXIDE_*/XDG_*/CARGO_ENCODED_RUSTFLAGS and freezes RUSTFLAGS once.
+    hostile = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/tom",
+        "RUSTUP_HOME": "/home/tom/.rustup",
+        "RUSTFLAGS": "-C target-cpu=native",
+        "CARGO_ENCODED_RUSTFLAGS": "-Ctarget-cpu=native",
+        "OXIDE_POOL": "/Volumes/Builds/oxide-pool",
+        "OXIDE_CONFIG": "/home/tom/.config/oxide/config.toml",
+        "OXIDE_TEST_BUDGET_BYTES": "1",
+        "OXIDE_TEST_WALK_LOG": "/tmp/walk",
+        "XDG_CONFIG_HOME": "/home/tom/.config",
+        "XDG_CACHE_HOME": "/home/tom/.cache",
+    }
+    scrubbed_fixture = fixture_environment(
+        hostile, "/home/tom/.rustup", "/scratch/fixture/home", "/scratch/fixture/cargo-home"
+    )
+    scrubbed_staging = staging_environment(hostile, "/home/tom/.rustup")
+    for label, env in (("fixture", scrubbed_fixture), ("staging", scrubbed_staging)):
+        property_true(
+            f"{label} env imports no ambient OXIDE_/XDG_ control",
+            not [key for key in env if key.startswith(("OXIDE_", "XDG_"))]
+            or label == "fixture"
+            and set(key for key in env if key.startswith("OXIDE_"))
+            == {"OXIDE_TEST_HOME_FROM_ENV"},
+        )
+        property_true(
+            f"{label} env has no encoded rustflags",
+            "CARGO_ENCODED_RUSTFLAGS" not in env,
+        )
+        property_true(
+            f"{label} env freezes RUSTFLAGS",
+            env["RUSTFLAGS"] == FROZEN_RUSTFLAGS == "-C strip=symbols",
+        )
+    property_true(
+        "explicit fixture controls are the only OXIDE_* the fixture env carries",
+        {key for key in scrubbed_fixture if key.startswith("OXIDE_")}
+        == {"OXIDE_TEST_HOME_FROM_ENV"},
+    )
+
+    # 3c. Every external Cargo argv keeps the subcommand name.
+    for argv in (CARGO_BUILD_ARGV, CARGO_ORACLE_ARGV):
+        property_true(
+            f"cargo argv names its subcommand: {argv[0]} {argv[1]}",
+            argv[0] == "cargo" and argv[1] in {"build", "check"} and len(argv) > 2,
+        )
+
+    # 4. Missing or unusable provenance refuses instead of hiding the toolchain
+    #    behind a fake HOME, and it refuses for every shape.
+    for label, environ in (
+        ("no RUSTUP_HOME and no HOME", {}),
+        ("relative RUSTUP_HOME", {"RUSTUP_HOME": "rustup", "HOME": "/home/tom"}),
+        (
+            "missing RUSTUP_HOME directory",
+            {"RUSTUP_HOME": "/opt/toolchains/absent", "HOME": "/home/tom"},
+        ),
+        ("relative HOME", {"HOME": "home/tom"}),
+        ("missing account toolchain", {"HOME": "/home/absent-home"}),
+    ):
+        try:
+            resolve_toolchain_home(environ, is_dir)
+        except ToolchainError:
+            checks.append(f"refuses {label}")
+        else:
+            fail(f"self-check property failed: {label} must refuse")
+
+    # 5. Negative parent: the pre-fix environment (private fixture HOME, no
+    #    explicit toolchain home) must violate the preservation property, so
+    #    the property above is not vacuous.
+    regressed = {
+        "HOME": "/scratch/fixture/home",
+        "CARGO_HOME": "/scratch/fixture/cargo-home",
+        "RUSTUP_TOOLCHAIN": BUILDER,
+        "RUSTUP_AUTO_INSTALL": "0",
+        "CARGO_NET_OFFLINE": "true",
+    }
+    preserved = (
+        regressed.get("RUSTUP_HOME") == resolved
+        and not regressed["HOME"].startswith("/scratch/fixture/")
+    )
+    property_true("negative parent breaks preservation", not preserved)
+
+    print(f"self-check ok: {len(checks)} properties, pure (no scratch, child or toolchain)")
+    for name in checks:
+        print(f"  ok {name}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "--self-check":
+        # Pure, before any scratch, toolchain subprocess or staging.
+        return self_check()
     if argv and argv[0] == "--plan":
         plan()
         return 0
     if argv:
-        fail(f"unknown argument {argv[0]!r}; use --plan")
+        fail(f"unknown argument {argv[0]!r}; use --plan or --self-check")
+    # The toolchain provenance is decided from the caller's real account before
+    # any private fixture HOME exists; an unusable one refuses here, before
+    # scratch or staging effects.
+    try:
+        toolchain_home = resolve_toolchain_home(os.environ)
+    except ToolchainError as error:
+        fail(f"toolchain provenance refused before staging: {error}")
     root = scratch_root()
     world_root = private_dir(os.path.join(root, "pool-temp"))
     say(f"scratch root {root}")
-    subject = stage_subject(world_root)
+    say(f"toolchain home {toolchain_home} (pinned {BUILDER}, no auto-install)")
+    subject = stage_subject(world_root, toolchain_home)
     say(f"staged {subject} sha256={sha256_file(subject)}")
-    world = World(world_root, subject)
+    world = World(world_root, subject, toolchain_home)
     crate = make_fixture(world_root, "tempcheck")
     premise_sweep(world, crate)
     inherited_kept(world, crate)

@@ -947,7 +947,18 @@ shared proof supervisor (`bounded-test.py --limit 300
 --scratch-budget-mib 512`; an ELEVATED trigger: it deletes owned scratch, decides
 writer closure and writes to an owned removable fixture volume). It stages
 this clean HEAD's debug `oxide` offline with 1.97.1 and covers, on tiny
-fixtures with a private `HOME`, `CARGO_HOME` and directory pool: a
+fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Staging and
+every fixture child share one resolved absolute toolchain home — an inherited
+`RUSTUP_HOME` when it is absolute and usable, else the account default
+`$HOME/.rustup` resolved from the original HOME *before* the private fixture
+HOME exists — with the pinned 1.97.1, `RUSTUP_AUTO_INSTALL=0` and offline
+Cargo; an unusable toolchain home refuses before scratch or staging rather than
+hiding the toolchain behind a fake HOME (the first authorised author native
+failed exactly there). Fixture children carry the debug build's
+`OXIDE_TEST_HOME_FROM_ENV=1` account-home control, a freshly built environment
+that imports no ambient `OXIDE_*`/`XDG_*`/`CARGO_ENCODED_RUSTFLAGS`, and one
+frozen `RUSTFLAGS` shared with staging; the script's `--self-check` is a pure,
+pre-scratch 21-property regression of that construction. The proof covers: a
 same-volume inherited `TMPDIR` kept canonically with no Oxide directory
 created and the inherited content untouched; absent, file, relative,
 unwritable, other-device and symlink-escaping values replaced by one owned
