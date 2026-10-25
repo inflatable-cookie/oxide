@@ -6,10 +6,11 @@ use super::{
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
     remove_tree_owned, unexpected_entry, AccountingCoverage, AccountingGap, AccountingGapKind,
     AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView,
-    MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedVolume, ReleaseReceipt,
-    ReuseMeasurement, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
-    ACCOUNTING_MAX_ENTRIES, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
-    LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact, RecordedVolume,
+    ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH,
+    ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CAPACITY_POLICY_VERSION, CONFIG_NAME,
+    LEASE_VERSION, LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LOCK_NAME, MAX_HOLDER_BYTES,
+    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
@@ -187,6 +188,27 @@ struct SlotRecord {
     /// records keep 0 and sort oldest.
     #[serde(default, skip_serializing_if = "is_zero_rank")]
     rank: u64,
+    /// The closed size observation of the generation that last went idle
+    /// (oxide#146). Written only by the atomic `Held -> Idle` replacement and
+    /// cleared by every transition out of `Idle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded: Option<RecordedSize>,
+}
+
+/// One closed size observation. It is a measurement at a closing transition,
+/// not proof that the slot's bytes are immutable, that its writer closed or
+/// that a volume is closed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedSize {
+    /// The `last_lease_id` of the generation this figure measured. Every
+    /// `Held` transition mints a new one, so a leftover record can never
+    /// match a later generation.
+    for_lease: String,
+    unique_bytes: u64,
+    logical_bytes: u64,
+    entries: u64,
+    at_ms: u64,
 }
 
 fn is_zero_rank(rank: &u64) -> bool {
@@ -639,6 +661,8 @@ pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), Le
         return Err(LeaseError::UnknownAccounting);
     }
     slot.state = SlotPersistState::Evicting;
+    // The product clears a record in the same write that records `Evicting`.
+    slot.recorded = None;
     opened.persist()
 }
 
@@ -777,6 +801,13 @@ impl Pool {
                 .ok_or(LeaseError::LedgerExhausted)?;
             self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
             self.ledger.next_rank = Some(next.max(1));
+        }
+        // A version-1 fence (oxide#118) stays readable and is upgraded by this
+        // revised write, atomically with whatever needed it. The step is
+        // one-way: an older binary refuses a version-2 ledger before any
+        // mutation, which is why the front door writes its control fence first.
+        if self.ledger.capacity_policy == Some(LEGACY_CAPACITY_POLICY_VERSION) {
+            self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
         }
         if self.ledger.capacity_policy != Some(CAPACITY_POLICY_VERSION) {
             return Err(LeaseError::UnknownAccounting);
@@ -941,6 +972,8 @@ impl Pool {
             slot.holder = request.holder.clone();
             slot.lease_id = Some(lease_id.clone());
             slot.last_lease_id = lease_id;
+            // A held slot never borrows or keeps an idle observation.
+            slot.recorded = None;
         }
         self.stamp_rank(slot_id)?;
         self.persist_revised()?;
@@ -966,21 +999,27 @@ impl Pool {
                 return Err(LeaseError::LedgerExhausted);
             }
         }
-        // New-slot admission needs the whole-payload walk complete, before
-        // and after any eviction. Below both count ceilings and without byte
-        // pressure nothing is evicted. A removable volume whose payload is
-        // too large to walk within the bounds is admitted by the volume's
-        // own used bytes instead (see `admit_by_volume_usage`).
-        match self.payload_check()? {
-            Some(used) => {
+        // New-slot admission needs the recorded pressure complete, before and
+        // after any eviction. Below both count ceilings and without byte
+        // pressure nothing is evicted. When every slot's record is current the
+        // figure costs O(slots) metadata work and no inventory walk at all;
+        // only a missing or invalid record is walked, once, bounded. A
+        // removable payload whose required walk cannot finish within its
+        // bounds keeps the legacy volume-used-bytes fallback.
+        match self.pressure() {
+            Ok(used) => {
                 if used >= self.budget {
                     self.evict_idle_until_under_cap()?;
-                    if self.payload_accounting().require_complete()? >= self.budget {
+                    if self.pressure()? >= self.budget {
                         return Err(LeaseError::Full);
                     }
                 }
             }
-            None => self.admit_by_volume_usage()?,
+            Err(LeaseError::AccountingIncomplete(scan)) if self.is_removable() => {
+                self.unwalkable = Some(*scan);
+                self.admit_by_volume_usage()?;
+            }
+            Err(error) => return Err(error),
         }
         let slot_id = self.ledger.next_slot;
         if slot_id == 0 {
@@ -1046,6 +1085,7 @@ impl Pool {
             last_lease_id: lease_id,
             dir,
             rank: 0,
+            recorded: None,
         });
         self.ledger.next_slot = slot_id.checked_add(1).ok_or(LeaseError::LedgerExhausted)?;
         self.stamp_rank(slot_id)?;
@@ -1085,8 +1125,14 @@ impl Pool {
         // returns without writing, so read-only use never migrates.
         self.ensure_capacity_policy()?;
         self.next_rank()?;
+        // After the front door's writer closure, owned-scratch removal and
+        // removable flush: one bounded walk of this slot while its metadata is
+        // warm. A failure leaves the slot honestly unrecorded and never fails
+        // an otherwise successful release.
+        let recorded = self.measure_for_release(index);
         self.ledger.slots[index].state = SlotPersistState::Idle;
         self.ledger.slots[index].lease_id = None;
+        self.ledger.slots[index].recorded = recorded;
         let released = self.ledger.slots[index].id;
         self.stamp_rank(released)?;
         self.persist_revised()?;
@@ -1264,9 +1310,9 @@ impl Pool {
                 "replacement slot ID must be a positive integer",
             ));
         }
-        // The whole-payload walk must be complete before any deletion; a
+        // The whole recorded pressure must be complete before any deletion; a
         // removable payload too large to walk passes on bound gaps alone.
-        self.payload_check()?;
+        self.pressure()?;
         let Some((incarnation, project, profile)) = self
             .slot(id)
             .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
@@ -1282,10 +1328,11 @@ impl Pool {
         // concurrent-looking state cannot extend the loop.
         let mut remaining = self.ledger.slots.len();
         while self.ledger.slots.len() > max_slots && remaining > 0 {
-            // A count replacement still needs complete accounting first; an
-            // incomplete walk refuses instead of deleting blindly, except a
-            // removable payload whose only gaps are the walk's own bounds.
-            self.payload_check()?;
+            // A count replacement still needs complete recorded accounting
+            // first; an incomplete walk refuses instead of deleting blindly,
+            // except a removable payload whose only gaps are the walk's own
+            // bounds.
+            self.pressure()?;
             let before = self.ledger.slots.len();
             if !self.evict_one_idle()? {
                 break;
@@ -1329,28 +1376,247 @@ impl Pool {
         }
     }
 
-    /// The whole payload's unique allocated bytes, or `None` for a removable
-    /// payload too large to walk within `VOLUME_WALK_MS` whose only gaps
-    /// are the walk's bounds (cached for this open). Any other gap, and any
-    /// incomplete walk of the internal directory pool, refuses as before.
-    fn payload_check(&mut self) -> Result<Option<u64>, LeaseError> {
-        if self.unwalkable.is_some() {
-            return Ok(None);
-        }
-        if !matches!(self.backing, Payload::Volume { .. }) {
-            return self.payload_accounting().require_complete().map(Some);
-        }
+    fn is_removable(&self) -> bool {
+        matches!(self.backing, Payload::Volume { .. })
+    }
+
+    /// The bounds an admission's own walks use. A removable pool keeps the
+    /// legacy `VOLUME_WALK_MS` bound on the walks a pressure figure needs, so
+    /// a payload too large to measure in 5 s still reaches the legacy
+    /// volume-used-bytes fallback; an internal directory pool keeps the full
+    /// accounting bound.
+    fn pressure_limits(&self) -> InventoryLimits {
         let mut limits = self.walk_limits();
-        limits.max_elapsed_ms = limits.max_elapsed_ms.min(VOLUME_WALK_MS);
-        match inventory_sizes_with(self.backing.payload_root(), 2, limits).require_complete() {
-            Ok(used) => Ok(Some(used)),
-            Err(LeaseError::AccountingIncomplete(scan)) => {
-                let admission = VolumeAdmission::new(*scan, self.budget)?;
-                self.unwalkable = Some(admission.scan);
-                Ok(None)
-            }
-            Err(error) => Err(error),
+        if self.is_removable() {
+            limits.max_elapsed_ms = limits.max_elapsed_ms.min(VOLUME_WALK_MS);
         }
+        limits
+    }
+
+    /// The pool's byte-pressure figure (oxide#146).
+    ///
+    /// An internal directory pool uses the recorded sum: `pool_scope()` plus
+    /// one figure per ledger slot, where a held slot is always walked fresh,
+    /// a current idle record is trusted, and a missing or invalid record is
+    /// walked once and published. A removable pool uses the larger of that sum
+    /// and the verified volume's own used bytes, which include everything else
+    /// on the volume and so never undercount. Non-reduction, unknown backing
+    /// and unknown facts still refuse.
+    fn pressure(&mut self) -> Result<u64, LeaseError> {
+        let recorded = self.recorded_total()?;
+        match &self.backing {
+            Payload::Volume { .. } => Ok(recorded.max(self.volume_used_bytes()?)),
+            Payload::Budget(_) => Ok(recorded),
+        }
+    }
+
+    /// The recorded sum over the payload: the shallow scope pass plus every
+    /// slot's figure. It walks no payload or slot inventory when every record
+    /// is current, and only the exact slots that need one otherwise.
+    ///
+    /// Completed walks are published in **one** revised write before the
+    /// caller decides anything, so progress survives a refusal. Any slot that
+    /// stays unmeasured keeps today's refusal: its figure is never zero and
+    /// never free space.
+    fn recorded_total(&mut self) -> Result<u64, LeaseError> {
+        if self.reconciliation_blocked
+            || self
+                .ledger
+                .slots
+                .iter()
+                .any(|slot| slot.state == SlotPersistState::Evicting)
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let mut total = self.pool_scope().require_complete()?;
+        let mut pending: Vec<(u64, RecordedSize)> = Vec::new();
+        for index in 0..self.ledger.slots.len() {
+            let figure = self.slot_figure(index, &mut pending)?;
+            total = total
+                .checked_add(figure)
+                .ok_or(LeaseError::UnknownAccounting)?;
+        }
+        if !pending.is_empty() {
+            for (id, record) in pending {
+                if let Some(slot) = self.slot_mut(id) {
+                    if slot.state == SlotPersistState::Idle && slot.lease_id.is_none() {
+                        slot.recorded = Some(record);
+                    }
+                }
+            }
+            self.persist_revised()?;
+        }
+        Ok(total)
+    }
+
+    /// One slot's contribution. The index is re-read after the walk, and the
+    /// completion recheck refuses to publish a figure for a generation that
+    /// changed while it was measured.
+    fn slot_figure(
+        &self,
+        index: usize,
+        pending: &mut Vec<(u64, RecordedSize)>,
+    ) -> Result<u64, LeaseError> {
+        let Some(slot) = self.ledger.slots.get(index) else {
+            return Err(LeaseError::UnknownAccounting);
+        };
+        if slot.state == SlotPersistState::Evicting {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let id = slot.id;
+        let last_lease_id = slot.last_lease_id.clone();
+        let idle = slot.state == SlotPersistState::Idle && slot.lease_id.is_none();
+        let current = idle
+            && slot
+                .recorded
+                .as_ref()
+                .is_some_and(|record| record.for_lease == last_lease_id);
+        let Some(path) = self.recorded_slot_root(id)? else {
+            // A missing or non-directory recorded root has no observation. The
+            // scope pass counts it exactly as the whole-payload walk counted
+            // it, so this slot contributes nothing on top.
+            return Ok(0);
+        };
+        if current {
+            return Ok(slot
+                .recorded
+                .as_ref()
+                .map_or(0, |record| record.unique_bytes));
+        }
+        let sizes = self.inventory_slot_with(&path, self.pressure_limits())?;
+        let unique = sizes.require_complete()?;
+        if idle {
+            pending.push((
+                id,
+                RecordedSize {
+                    for_lease: last_lease_id,
+                    unique_bytes: unique,
+                    logical_bytes: sizes.logical.unwrap_or(0),
+                    entries: sizes.scan.entries_visited,
+                    at_ms: now_ms(),
+                },
+            ));
+        }
+        Ok(unique)
+    }
+
+    /// The shallow scope pass over the payload root (oxide#146). It counts
+    /// every regular file exactly once by hard-stopping at each recorded slot
+    /// root, which owns its own subtree's figures. Out-of-slot metadata,
+    /// strays and orphan regions are counted here and attribute to no slot.
+    fn pool_scope(&self) -> Sizes {
+        let stops = match self.scope_stops() {
+            Ok(stops) => stops,
+            Err(LeaseError::UnknownAccounting) => {
+                return Sizes {
+                    logical: None,
+                    unique: None,
+                    scan: root_failure_with(
+                        self.pressure_limits(),
+                        AccountingGapKind::UnsupportedMetadata,
+                        0,
+                    ),
+                }
+            }
+            Err(_) => {
+                return Sizes {
+                    logical: None,
+                    unique: None,
+                    scan: root_failure_with(
+                        self.pressure_limits(),
+                        AccountingGapKind::RootUnreadable,
+                        0,
+                    ),
+                }
+            }
+        };
+        scope_sizes_with(self.backing.payload_root(), &stops, self.pressure_limits())
+    }
+
+    /// The stop predicate: every recorded slot root that is still a real
+    /// directory, as a path relative to the payload root. Membership comes
+    /// from the **ledger**, not from record validity, so an idle slot is never
+    /// walked twice; a root that is missing or another kind is not stopped, so
+    /// the scope pass counts it exactly as the whole-payload walk counts it.
+    fn scope_stops(&self) -> Result<Vec<PathBuf>, LeaseError> {
+        let mut stops = Vec::with_capacity(self.ledger.slots.len());
+        for slot in &self.ledger.slots {
+            if self.recorded_slot_root(slot.id)?.is_some() {
+                stops.push(self.slot_relative(slot)?);
+            }
+        }
+        Ok(stops)
+    }
+
+    /// A slot's recorded directory relative to the payload root: `slots/<id>`
+    /// (legacy) or `slots/<folder>/<profile>-<id>`.
+    fn slot_relative(&self, slot: &SlotRecord) -> Result<PathBuf, LeaseError> {
+        let mut relative = PathBuf::from(SLOTS_NAME);
+        match slot.dir.as_deref() {
+            None => relative.push(slot.id.to_string()),
+            Some(dir) => {
+                let (folder, leaf) =
+                    split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
+                relative.push(folder);
+                relative.push(leaf);
+            }
+        }
+        Ok(relative)
+    }
+
+    /// A slot's recorded root, verified as a real directory (no follow).
+    /// `None` when the root is missing or another kind.
+    fn recorded_slot_root(&self, id: u64) -> Result<Option<PathBuf>, LeaseError> {
+        let (path, metadata) = self.slot_root(id)?;
+        Ok(metadata.filter(std::fs::Metadata::is_dir).map(|_| path))
+    }
+
+    /// One slot's own bounded walk, the same call `slot_accounting` makes.
+    fn inventory_slot(&self, path: &Path) -> Result<Sizes, LeaseError> {
+        Ok(inventory_sizes_with(path, 0, self.walk_limits()))
+    }
+
+    /// One slot's bounded walk under explicit bounds.
+    fn inventory_slot_with(
+        &self,
+        path: &Path,
+        limits: InventoryLimits,
+    ) -> Result<Sizes, LeaseError> {
+        Ok(inventory_sizes_with(path, 0, limits))
+    }
+
+    /// One bounded walk of the slot this transition closes, after the front
+    /// door's positive writer closure, owned-scratch removal and removable
+    /// flush, and before the `Held -> Idle` replacement. `None` for any doubt:
+    /// the transition still succeeds and the slot is honestly unrecorded.
+    fn measure_for_release(&self, index: usize) -> Option<RecordedSize> {
+        let slot = self.ledger.slots.get(index)?;
+        if slot.state != SlotPersistState::Held || slot.lease_id.is_none() {
+            return None;
+        }
+        let id = slot.id;
+        let incarnation = slot.incarnation;
+        let last_lease_id = slot.last_lease_id.clone();
+        let path = self.recorded_slot_root(id).ok()??;
+        let sizes = self.inventory_slot(&path).ok()?;
+        let unique = sizes.require_complete().ok()?;
+        // Conditional publication: the generation this figure measured must
+        // still be the one about to become idle.
+        let slot = self.ledger.slots.get(index)?;
+        if slot.state != SlotPersistState::Held
+            || slot.id != id
+            || slot.incarnation != incarnation
+            || slot.last_lease_id != last_lease_id
+        {
+            return None;
+        }
+        Some(RecordedSize {
+            for_lease: last_lease_id,
+            unique_bytes: unique,
+            logical_bytes: sizes.logical.unwrap_or(0),
+            entries: sizes.scan.entries_visited,
+            at_ms: now_ms(),
+        })
     }
 
     /// Capacity less available bytes of the bound removable volume.
@@ -1368,10 +1634,10 @@ impl Pool {
     fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
         let mut remaining = self.ledger.slots.len();
         loop {
-            // Byte pressure remeasures the whole payload union after each
-            // deletion and stops when it is under budget or no safe idle
-            // whole slot remains.
-            if self.payload_accounting().require_complete()? < self.budget {
+            // Byte pressure remeasures the recorded figure after each deletion
+            // and stops when it is under budget or no safe idle whole slot
+            // remains.
+            if self.pressure()? < self.budget {
                 return Ok(());
             }
             if remaining == 0 {
@@ -1431,6 +1697,10 @@ impl Pool {
         {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
             slot.state = SlotPersistState::Evicting;
+            // A pending deletion holds no size observation: the record is
+            // cleared in the same atomic write that records `Evicting`, so no
+            // reader can pair a figure with a slot being deleted.
+            slot.recorded = None;
         }
         self.persist_revised()?;
         self.remove_owned_slot(&path)?;
@@ -1626,12 +1896,39 @@ fn snapshot_of(
     payload: PathBuf,
     volume: Option<RecordedVolume>,
 ) -> PassiveSnapshot {
+    let recorded: Vec<&RecordedSize> = ledger
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+        .filter_map(|slot| {
+            slot.recorded
+                .as_ref()
+                .filter(|record| record.for_lease == slot.last_lease_id)
+        })
+        .collect();
+    let idle = ledger
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+        .count();
+    let recorded_total = if recorded.is_empty() {
+        None
+    } else {
+        Some(
+            recorded
+                .iter()
+                .fold(0u64, |sum, record| sum.saturating_add(record.unique_bytes)),
+        )
+    };
     PassiveSnapshot {
         store_id: config.store_id.clone(),
         backend: config.backend.clone(),
         cap_bytes: config.cap_bytes,
         payload,
         volume,
+        recorded_slots: recorded.len(),
+        unrecorded_slots: idle.saturating_sub(recorded.len()),
+        recorded_total,
         slots: ledger.slots.iter().map(ledger_slot).collect(),
         evicting_slot_ids: ledger
             .slots
@@ -1952,6 +2249,15 @@ fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
         lease_id: slot.lease_id.clone(),
         dir: slot.dir.clone(),
         rank: slot.rank,
+        recorded: slot.recorded.as_ref().map(|record| RecordedFact {
+            unique_allocated_bytes: record.unique_bytes,
+            logical_bytes: record.logical_bytes,
+            entries: record.entries,
+            at_ms: record.at_ms,
+            current: slot.state == SlotPersistState::Idle
+                && slot.lease_id.is_none()
+                && record.for_lease == slot.last_lease_id,
+        }),
     }
 }
 
@@ -2060,6 +2366,68 @@ fn gap_kind(kind: GapKind) -> AccountingGapKind {
 /// walk are a lower bound for status only.
 fn inventory_sizes(path: &Path) -> Sizes {
     inventory_sizes_deeper(path, 0)
+}
+
+/// [`inventory_sizes`] for the shallow pool scope pass: the same bounds and
+/// the same gap mapping, over a walk that hard-stops at the recorded slot
+/// roots it is given. It is a different entry point from the payload walk, so
+/// a scope pass never registers as an inventory walk of the payload.
+fn scope_sizes_with(root: &Path, stops: &[PathBuf], base: InventoryLimits) -> Sizes {
+    let started = std::time::Instant::now();
+    match crate::inventory::scope_directory(root, stops, base) {
+        Ok(report) => {
+            let coverage = if report.coverage.complete {
+                AccountingCoverage::Complete
+            } else {
+                AccountingCoverage::Partial
+            };
+            let gaps = report
+                .coverage
+                .gaps
+                .iter()
+                .map(|gap| AccountingGap {
+                    kind: gap_kind(gap.kind),
+                    occurrences: gap.occurrences,
+                })
+                .collect();
+            Sizes {
+                logical: Some(report.total.logical_bytes_by_name),
+                unique: Some(report.total.allocated_bytes),
+                scan: scan_with(
+                    base,
+                    coverage,
+                    gaps,
+                    report.entries_visited,
+                    report.elapsed_ms,
+                    report.vanished,
+                ),
+            }
+        }
+        Err(error) => {
+            let kind = match error {
+                InventoryError::RootMissing(_) => AccountingGapKind::RootMissing,
+                InventoryError::RootNotDirectory(_) => AccountingGapKind::RootNotDirectory,
+                InventoryError::RootUnreadable { .. } | InventoryError::InvalidLimits(_) => {
+                    AccountingGapKind::RootUnreadable
+                }
+            };
+            let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Sizes {
+                logical: None,
+                unique: None,
+                scan: root_failure_with(base, kind, elapsed),
+            }
+        }
+    }
+}
+
+/// Wall-clock milliseconds. A recorded observation's age, never a validity
+/// input: validity is the slot's generation.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// [`inventory_sizes`] with the depth bound raised by `extra_depth`, for a
@@ -2262,12 +2630,24 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
             if ledger.slots.iter().any(|slot| slot.rank != 0) {
                 return Err(LeaseError::UnknownAccounting);
             }
+            if ledger.slots.iter().any(|slot| slot.recorded.is_some()) {
+                return Err(LeaseError::UnknownAccounting);
+            }
         }
         (Some(policy), Some(next)) => {
-            if policy != CAPACITY_POLICY_VERSION || next == 0 {
+            if (policy != LEGACY_CAPACITY_POLICY_VERSION && policy != CAPACITY_POLICY_VERSION)
+                || next == 0
+            {
                 return Err(LeaseError::UnknownAccounting);
             }
             if ledger.slots.iter().any(|slot| slot.rank >= next) {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            // Only the version-2 representation writes records: a version-1
+            // ledger holding one is a state no writer can produce.
+            if policy == LEGACY_CAPACITY_POLICY_VERSION
+                && ledger.slots.iter().any(|slot| slot.recorded.is_some())
+            {
                 return Err(LeaseError::UnknownAccounting);
             }
         }
@@ -2279,6 +2659,9 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         }
         if let Some(dir) = &slot.dir {
             split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
+        }
+        if slot.recorded.is_some() && slot.state != SlotPersistState::Idle {
+            return Err(LeaseError::UnknownAccounting);
         }
     }
     Ok(())
@@ -2308,6 +2691,9 @@ fn validate_ledger_write(ledger: &Ledger) -> Result<(), LeaseError> {
             || slot.holder.len() > MAX_HOLDER_BYTES
             || slot.last_lease_id.is_empty()
             || slot.last_lease_id.len() > MAX_LEASE_ID_BYTES
+            || slot.recorded.as_ref().is_some_and(|record| {
+                record.for_lease.is_empty() || record.for_lease.len() > MAX_LEASE_ID_BYTES
+            })
             || slot
                 .lease_id
                 .as_ref()
@@ -2398,6 +2784,35 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
         }
     }
     Ok(())
+}
+
+/// Test-only: drop one idle slot's closed observation, producing the
+/// legacy-shaped state a pool that never released under this version has.
+#[cfg(test)]
+pub(super) fn drop_record_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
+    let mut opened = Pool::open(pool)?;
+    let slot = opened
+        .slot_mut(slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    slot.recorded = None;
+    opened.persist()
+}
+
+/// Test-only: leave a record whose generation fence no longer matches, with an
+/// absurd figure so a borrowed one would be visible.
+#[cfg(test)]
+pub(super) fn with_stale_record_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
+    let mut opened = Pool::open(pool)?;
+    let slot = opened
+        .slot_mut(slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    let record = slot
+        .recorded
+        .as_mut()
+        .ok_or(LeaseError::UnknownAccounting)?;
+    record.for_lease = "v1.stale.0.0.0".to_owned();
+    record.unique_bytes = record.unique_bytes.saturating_add(9 * 1024 * 1024 * 1024);
+    opened.persist()
 }
 
 #[cfg(test)]
@@ -2495,5 +2910,98 @@ mod volume_admission_tests {
         let mut complete = scan(&[AccountingGapKind::ElapsedDeadline]);
         complete.coverage = AccountingCoverage::Unknown;
         assert!(VolumeAdmission::new(complete, 100).is_err());
+    }
+}
+
+/// The recorded-accounting fence and record representation (oxide#146), tested
+/// on the real validators rather than through a decision mock.
+#[cfg(test)]
+mod recorded_ledger_tests {
+    use super::{validate_ledger_read, Ledger, RecordedSize, SlotPersistState};
+    use crate::lease::{
+        Profile, CAPACITY_POLICY_VERSION, LEASE_VERSION, LEGACY_CAPACITY_POLICY_VERSION,
+    };
+    use std::path::PathBuf;
+
+    fn record(for_lease: &str) -> Option<RecordedSize> {
+        Some(RecordedSize {
+            for_lease: for_lease.to_owned(),
+            unique_bytes: 4096,
+            logical_bytes: 4096,
+            entries: 1,
+            at_ms: 1,
+        })
+    }
+
+    fn ledger(policy: Option<u32>, rank: u64, state: SlotPersistState, recorded: bool) -> Ledger {
+        Ledger {
+            version: LEASE_VERSION,
+            store_id: "a".repeat(32),
+            cap_bytes: 1024 * 1024,
+            next_slot: 2,
+            next_lease: 2,
+            capacity_policy: policy,
+            next_rank: Some(rank + 1),
+            slots: vec![super::SlotRecord {
+                id: 1,
+                incarnation: 1,
+                state,
+                project: PathBuf::from("/p"),
+                workspace: PathBuf::from("/w"),
+                profile: Profile::Dev,
+                holder: "h".to_owned(),
+                lease_id: None,
+                last_lease_id: "v1.a.1.1.1".to_owned(),
+                dir: None,
+                rank,
+                recorded: recorded.then(|| record("v1.a.1.1.1").expect("record")),
+            }],
+        }
+    }
+
+    #[test]
+    fn the_fence_value_and_record_placement_are_enforced() {
+        // Version 1 without a record reads; with one it is a state no writer
+        // produces and refuses.
+        assert!(validate_ledger_read(&ledger(
+            Some(LEGACY_CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Idle,
+            false
+        ))
+        .is_ok());
+        assert!(validate_ledger_read(&ledger(
+            Some(LEGACY_CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Idle,
+            true
+        ))
+        .is_err());
+        // Version 2 carries records on an idle slot only.
+        assert!(validate_ledger_read(&ledger(
+            Some(CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Idle,
+            true
+        ))
+        .is_ok());
+        assert!(validate_ledger_read(&ledger(
+            Some(CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Held,
+            true
+        ))
+        .is_err());
+        assert!(validate_ledger_read(&ledger(
+            Some(CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Evicting,
+            true
+        ))
+        .is_err());
+        // An unknown fence value refuses, and a legacy ledger holding a record
+        // refuses too.
+        assert!(validate_ledger_read(&ledger(Some(3), 1, SlotPersistState::Idle, false)).is_err());
+        assert!(validate_ledger_read(&ledger(None, 0, SlotPersistState::Idle, true)).is_err());
     }
 }

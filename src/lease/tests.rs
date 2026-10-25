@@ -464,7 +464,7 @@ fn legacy_ledger_reads_without_migrating_and_the_first_revised_write_fences_it()
         .expect("first revised grant");
     let after_grant = fs::read(pool.join("ledger.json")).expect("fenced ledger");
     let stored: serde_json::Value = serde_json::from_slice(&after_grant).expect("json");
-    assert_eq!(stored["capacity_policy"], serde_json::json!(1));
+    assert_eq!(stored["capacity_policy"], serde_json::json!(2));
     assert_eq!(stored["next_rank"], serde_json::json!(2));
     assert_eq!(stored["slots"][0]["rank"], serde_json::json!(1));
     status_injected(&pool).expect("fenced ledger reads");
@@ -1384,8 +1384,13 @@ fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admi
         assert!(warm.reused_slot);
         assert_eq!(warm.slot_id, slots[1].slot_id);
         managed::release(&pool, &warm.lease_id).expect("release warm");
-        let scan = incomplete(managed::lease(request(&pool, &fresh, &workspace, "new")));
-        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::EntryLimit]);
+        // A new slot needs no whole-payload walk any more (oxide#146): every
+        // record is current, so admission is arithmetic and succeeds even
+        // under an entry bound that no payload walk could finish.
+        let admitted =
+            managed::lease(request(&pool, &fresh, &workspace, "new")).expect("recorded admission");
+        assert!(!admitted.reused_slot);
+        managed::release(&pool, &admitted.lease_id).expect("release the recorded admission");
         // Status reports each walk's own cause; nothing changed.
         let status = managed::status(&pool).expect("status under the bound");
         assert_eq!(
@@ -1401,7 +1406,8 @@ fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admi
         };
         assert_eq!(own(&slots[0].slot_id), Some(AccountingCoverage::Partial));
         assert_eq!(own(&slots[1].slot_id), Some(AccountingCoverage::Complete));
-        assert_eq!(status.slots.len(), before.slots.len());
+        // The recorded admission above is a new member; nothing was removed.
+        assert_eq!(status.slots.len(), before.slots.len() + 1);
     });
     // The pool bounds cover the same tree: the big slot is reused as the
     // same generation and a new slot is admitted.
@@ -1411,8 +1417,10 @@ fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admi
         (reused.slot_id.as_str(), reused.incarnation.as_str()),
         (slots[0].slot_id.as_str(), slots[0].incarnation.as_str())
     );
-    let admitted = managed::lease(request(&pool, &fresh, &workspace, "new")).expect("new slot");
-    assert!(!admitted.reused_slot);
+    // The `fresh` slot the recorded admission above created is reused here,
+    // under the generous pool bounds and with its own complete walk.
+    let admitted = managed::lease(request(&pool, &fresh, &workspace, "new")).expect("reuse");
+    assert!(admitted.reused_slot);
     let status = managed::status(&pool).expect("status");
     assert_eq!(status.coverage, AccountingCoverage::Complete);
     assert_eq!(status.payload_accounting.gaps, Vec::new());
@@ -1464,29 +1472,25 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     managed::release(&pool, &grant.lease_id).expect("release");
     let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
     let reuse = managed::lease(request(&pool, &project, &workspace, "b"));
-    // Over the tiny budget with the only idle slot unmeasurable: no eviction.
+    // Over the tiny budget the recorded idle slot is byte pressure. The
+    // accepted stale-idle policy trusts a current record, so a new-slot
+    // admission does not re-walk that slot: it evicts the whole idle slot it
+    // owns instead of refusing on an entry only a fresh walk would notice.
     let admit = managed::lease(request(&pool, &fx.dir("other"), &workspace, "c"));
     let status = managed::status(&pool);
     assert!(denied.hits() >= 1, "permission injection was not reached");
     drop(denied);
-    for scan in [incomplete(reuse), incomplete(admit)] {
-        assert_eq!(scan.coverage, AccountingCoverage::Partial);
-        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
-    }
-    let status = status.expect("status");
-    assert_eq!(status.slots.len(), 1);
-    assert_eq!(status.slots[0].state, SlotOccupancy::Idle);
-    assert_eq!(status.full, None);
-    assert_eq!(
-        gap_kinds(&status.slots[0].accounting),
-        vec![AccountingGapKind::UnreadableEntry]
-    );
-    assert!(grant.env.cargo_build_build_dir.join("blob").exists());
-    // Measurable again, the idle slot is evicted whole at admission.
-    let admitted =
-        managed::lease(request(&pool, &fx.dir("third"), &workspace, "d")).expect("admitted");
+    let scan = incomplete(reuse);
+    assert_eq!(scan.coverage, AccountingCoverage::Partial);
+    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
+    let admitted = admit.expect("the trusted record admits and the idle slot is evicted whole");
     assert_ne!(admitted.slot_id, grant.slot_id);
     assert!(!grant.env.cargo_build_build_dir.exists());
+    let status = status.expect("status");
+    assert_eq!(status.slots.len(), 1);
+    assert_eq!(status.slots[0].slot_id, admitted.slot_id);
+    // The evicted slot is gone, so no walk of it remains to report a gap.
+    assert!(!gap_kinds(&status.slots[0].accounting).contains(&AccountingGapKind::UnreadableEntry));
 }
 
 #[test]
@@ -1756,8 +1760,12 @@ fn ledger_view_is_status_membership_without_walks() {
             format!("slots/{}", held.slot_id),
         ]
     );
-    let members: Vec<super::LedgerSlot> = status.slots.iter().map(Into::into).collect();
-    assert_eq!(view.slots, members);
+    let shown: Vec<super::LedgerSlot> = status.slots.iter().map(Into::into).collect();
+    assert_eq!(
+        membership(&view),
+        shown,
+        "the view and status disagree on membership"
+    );
     assert_eq!(
         (&view.store_id, &view.backend, view.cap_bytes),
         (&status.store_id, &status.backend, status.cap_bytes)
@@ -1804,7 +1812,9 @@ fn reuse_walks_only_its_slot_and_returns_that_measurement() {
     let first = first.expect("new slot");
     assert_eq!(first.measured, None);
     assert!(!first.grant.reused_slot);
-    assert_eq!(first_walks, vec!["payload".to_owned()]);
+    // A new slot's admission derives its figure from the ledger: the only
+    // shallow pass is the scope walk, which is not an inventory walk.
+    assert!(first_walks.is_empty(), "{first_walks:?}");
     fs::write(
         first.grant.env.cargo_build_build_dir.join("blob"),
         vec![7_u8; 256 * 1024],
@@ -1914,8 +1924,12 @@ fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
     let status = status.expect("status stays readable");
     let view = view.expect("view stays readable");
     assert_eq!(status.coverage, AccountingCoverage::Unknown);
-    let members: Vec<super::LedgerSlot> = status.slots.iter().map(Into::into).collect();
-    assert_eq!(view.slots, members);
+    let shown: Vec<super::LedgerSlot> = status.slots.iter().map(Into::into).collect();
+    assert_eq!(
+        membership(&view),
+        shown,
+        "the view and status disagree on membership"
+    );
     let held = view
         .slots
         .iter()
@@ -2744,4 +2758,374 @@ fn a_symlink_inside_a_read_only_directory_is_unlinked_not_followed() {
     // The owned symlink is unlinked as a leaf; its target is never touched.
     remove_tree_owned(fixture.path(), &slot).expect("owned symlink leaf removed");
     assert!(outside.exists(), "symlink target untouched");
+}
+
+// ---------------------------------------------------------------------------
+// Recorded per-slot accounting (oxide#146)
+// ---------------------------------------------------------------------------
+
+/// Ledger membership with the size observation removed: a status walk reports no
+/// record, so membership is what the two views must agree on.
+fn membership(view: &super::LedgerView) -> Vec<super::LedgerSlot> {
+    view.slots
+        .iter()
+        .map(|slot| {
+            let mut shown = slot.clone();
+            shown.recorded = None;
+            shown
+        })
+        .collect()
+}
+
+/// The recorded figure the ledger holds for one slot, and whether it is current.
+fn recorded_of(view: &super::LedgerView, slot_id: &str) -> Option<(u64, bool)> {
+    view.slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_id)
+        .and_then(|slot| slot.recorded)
+        .map(|fact| (fact.unique_allocated_bytes, fact.current))
+}
+
+#[test]
+fn release_records_the_slot_and_all_recorded_admission_walks_nothing() {
+    use crate::inventory::walk_observer;
+
+    let fx = Fixture::new("recorded-release");
+    let pool = fx.dir("pool");
+    let cap = 64 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let workspace = fx.dir("workspace");
+
+    let first = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    let payload = first.env.cargo_build_build_dir.join("generated.bin");
+    fs::write(&payload, vec![b'x'; 2 * 1024 * 1024]).expect("payload");
+    release_injected(&pool, &first.lease_id).expect("release a");
+
+    // Release published one closed observation, bound to this generation.
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    let (recorded, current) = recorded_of(&view, &first.slot_id).expect("recorded size");
+    assert!(current, "the released slot's record is not current");
+    assert!(
+        recorded >= 2 * 1024 * 1024,
+        "the record undercounts its own payload: {recorded}"
+    );
+
+    // A new-slot admission with every record current walks no inventory at
+    // all: no payload walk, no slot walk. It does make one shallow scope pass.
+    let (second, walks) = walk_observer::observe(|| {
+        lease_injected(request(&pool, &fx.dir("project-b"), &workspace, "b"))
+    });
+    let second = second.expect("second admission");
+    assert!(walks.is_empty(), "admission walked inventory: {walks:?}");
+    assert!(!second.reused_slot);
+
+    let (walked, scopes) = walk_observer::observe_scopes(|| {
+        lease_injected(request(&pool, &fx.dir("project-c"), &workspace, "c")).expect("c")
+    });
+    assert!(!walked.reused_slot);
+    assert_eq!(
+        scopes.len(),
+        1,
+        "expected one shallow scope pass: {scopes:?}"
+    );
+
+    // A held slot never reports an idle observation.
+    let held = managed::ledger_view(&pool).expect("ledger view");
+    let held_fact = held
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == walked.slot_id)
+        .and_then(|slot| slot.recorded);
+    assert!(held_fact.is_none(), "a held slot published an idle record");
+}
+
+#[test]
+fn missing_records_walk_only_the_unrecorded_slot_and_publish_progress() {
+    use crate::inventory::walk_observer;
+
+    let fx = Fixture::new("recorded-missing");
+    let pool = fx.dir("pool");
+    let cap = 64 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let workspace = fx.dir("workspace");
+
+    let a = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    fs::write(
+        a.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 1024 * 1024],
+    )
+    .expect("a blob");
+    release_injected(&pool, &a.lease_id).expect("release a");
+    let b = lease_injected(request(&pool, &fx.dir("project-b"), &workspace, "b")).expect("b");
+    fs::write(
+        b.env.cargo_build_build_dir.join("blob"),
+        vec![b'b'; 1024 * 1024],
+    )
+    .expect("b blob");
+    release_injected(&pool, &b.lease_id).expect("release b");
+
+    // A legacy-shaped ledger: one slot keeps its record, the other has none.
+    super::pool::drop_record_for_test(&pool, b.slot_id.parse().expect("numeric slot id"))
+        .expect("drop one record");
+
+    let b_path = pool.join("payload").join("slots").join(&b.slot_id);
+    let (third, walks) = walk_observer::observe(|| {
+        lease_injected(request(&pool, &fx.dir("project-c"), &workspace, "c"))
+    });
+    let third = third.expect("admission with one missing record");
+    assert!(!third.reused_slot);
+    assert_eq!(
+        walks,
+        vec![b_path.clone()],
+        "admission walked something other than exactly the unrecorded slot"
+    );
+
+    release_injected(&pool, &third.lease_id).expect("release the recorded admission");
+    // The completed walk is durable progress: the next admission walks nothing.
+    let (_, again) = walk_observer::observe(|| {
+        lease_injected(request(&pool, &fx.dir("project-d"), &workspace, "d"))
+    });
+    assert!(
+        again.is_empty(),
+        "the published record was not reused: {again:?}"
+    );
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(
+        recorded_of(&view, &b.slot_id)
+            .is_some_and(|(bytes, current)| current && bytes >= 1024 * 1024),
+        "the missing record was not published with its measured figure"
+    );
+}
+
+#[test]
+fn a_stale_record_is_never_current_and_is_remeasured_instead() {
+    use crate::inventory::walk_observer;
+
+    let fx = Fixture::new("recorded-stale");
+    let pool = fx.dir("pool");
+    let cap = 64 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let workspace = fx.dir("workspace");
+    let a = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    fs::write(
+        a.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 1024 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &a.lease_id).expect("release a");
+
+    // A record for a different lease generation: never current, never zero.
+    // The absurd figure would be visible if a stale record were borrowed.
+    super::pool::with_stale_record_for_test(&pool, a.slot_id.parse().expect("numeric slot id"))
+        .expect("stale record");
+
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(
+        recorded_of(&view, &a.slot_id).is_some_and(|(_, current)| !current),
+        "a stale record read as current"
+    );
+    let slot_path = pool.join("payload").join("slots").join(&a.slot_id);
+    let (b, walks) = walk_observer::observe(|| {
+        lease_injected(request(&pool, &fx.dir("project-b"), &workspace, "b"))
+    });
+    let b = b.expect("admission");
+    assert!(!b.reused_slot);
+    assert_eq!(walks, vec![slot_path], "the stale slot was not remeasured");
+}
+
+#[test]
+fn the_recorded_sum_counts_cross_slot_hard_links_once_per_slot() {
+    use crate::inventory::walk_observer;
+
+    let fx = Fixture::new("recorded-hardlink");
+    let pool = fx.dir("pool");
+    let cap = 64 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let workspace = fx.dir("workspace");
+
+    let a = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    let a_blob = a.env.cargo_build_build_dir.join("blob");
+    fs::write(&a_blob, vec![b'h'; 3 * 1024 * 1024]).expect("a blob");
+    release_injected(&pool, &a.lease_id).expect("release a");
+
+    let b = lease_injected(request(&pool, &fx.dir("project-b"), &workspace, "b")).expect("b");
+    // The same inode, linked into the second slot: one inode, two slots.
+    fs::hard_link(&a_blob, b.env.cargo_build_build_dir.join("blob")).expect("hard link");
+    release_injected(&pool, &b.lease_id).expect("release b");
+
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    let sum: u64 = view
+        .slots
+        .iter()
+        .filter_map(|slot| slot.recorded.filter(|fact| fact.current))
+        .map(|fact| fact.unique_allocated_bytes)
+        .sum();
+    let union = status_injected(&pool)
+        .expect("status")
+        .payload_unique_allocated_bytes
+        .expect("complete union walk");
+    assert!(
+        sum >= union,
+        "the recorded sum ({sum}) is below the inode union ({union})"
+    );
+    assert!(
+        sum > union,
+        "the accepted cross-slot overcount did not happen: sum {sum}, union {union}"
+    );
+
+    // The overcount is what admission uses: a budget between the union and the
+    // sum evicts one idle whole slot, and it does so without any walk.
+    let budget = union + 1024 * 1024;
+    let mut small = request(&pool, &fx.dir("project-c"), &workspace, "c");
+    small.budget_bytes = Some(budget);
+    let (third, walks) = walk_observer::observe(|| lease_injected(small));
+    let third = third.expect("admission under recorded byte pressure");
+    assert!(!third.reused_slot);
+    assert!(
+        walks.is_empty(),
+        "byte pressure walked inventory: {walks:?}"
+    );
+    let after = managed::ledger_view(&pool).expect("ledger view");
+    let ids: Vec<&str> = after
+        .slots
+        .iter()
+        .map(|slot| slot.slot_id.as_str())
+        .collect();
+    assert!(
+        !(ids.contains(&a.slot_id.as_str()) && ids.contains(&b.slot_id.as_str())),
+        "the accepted overcount did not cause the earlier idle eviction"
+    );
+}
+
+#[test]
+fn disjoint_recorded_slots_are_not_double_counted_by_the_scope_pass() {
+    let fx = Fixture::new("recorded-disjoint");
+    let pool = fx.dir("pool");
+    let cap = 64 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let workspace = fx.dir("workspace");
+
+    // One labelled slot and one legacy `<id>` slot, so both stop-predicate
+    // branches are live: a scope pass that failed to stop would add their
+    // content a second time and evict.
+    let mut labelled = request(&pool, &fx.dir("project-a"), &workspace, "a");
+    labelled.layout = Some(SlotLayout {
+        folders: vec!["oxide-aa".to_owned()],
+        profile: "quick".to_owned(),
+        same_repository: Vec::new(),
+    });
+    let a = lease_injected(labelled).expect("labelled slot");
+    fs::write(
+        a.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 2 * 1024 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &a.lease_id).expect("release a");
+
+    let b = lease_injected(request(&pool, &fx.dir("project-b"), &workspace, "b")).expect("legacy");
+    fs::write(
+        b.env.cargo_build_build_dir.join("blob"),
+        vec![b'b'; 2 * 1024 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &b.lease_id).expect("release b");
+
+    let union = status_injected(&pool)
+        .expect("status")
+        .payload_unique_allocated_bytes
+        .expect("complete union");
+    // A budget one MiB above the union is above the recorded sum too, unless
+    // the scope pass counted slot content again.
+    let mut third = request(&pool, &fx.dir("project-c"), &workspace, "c");
+    third.budget_bytes = Some(union + 1024 * 1024);
+    let third = lease_injected(third).expect("admission");
+    assert!(!third.reused_slot);
+    let after = managed::ledger_view(&pool).expect("ledger view");
+    assert_eq!(
+        after.slots.len(),
+        3,
+        "a slot was evicted under a budget above the union, so slot content was counted twice"
+    );
+}
+
+#[test]
+fn an_out_of_slot_stray_counts_and_grants_no_ownership() {
+    let fx = Fixture::new("recorded-stray");
+    let pool = fx.dir("pool");
+    let cap = 64 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let workspace = fx.dir("workspace");
+    let a = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    fs::write(
+        a.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 1024 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &a.lease_id).expect("release a");
+
+    // A stray file directly under `slots/`, plus tolerated Finder metadata.
+    let slots_root = pool.join("payload").join("slots");
+    fs::write(slots_root.join("stray.bin"), vec![b's'; 3 * 1024 * 1024]).expect("stray");
+    fs::write(slots_root.join(".DS_Store"), vec![b'd'; 4096]).expect("finder metadata");
+
+    let union = status_injected(&pool)
+        .expect("status")
+        .payload_unique_allocated_bytes
+        .expect("complete union");
+    // The stray is counted by the scope pass, so a budget just under the union
+    // puts admission under byte pressure and it evicts the only idle slot.
+    let mut second = request(&pool, &fx.dir("project-b"), &workspace, "b");
+    second.budget_bytes = Some(union.saturating_sub(512 * 1024));
+    let second = lease_injected(second).expect("admission");
+    assert!(!second.reused_slot);
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(
+        !view.slots.iter().any(|slot| slot.slot_id == a.slot_id),
+        "out-of-slot bytes were not counted, so no pressure evicted the idle slot"
+    );
+    assert!(
+        slots_root.join("stray.bin").exists(),
+        "the stray is not owned and must survive"
+    );
+}
+
+#[test]
+fn an_incomplete_release_walk_records_nothing_and_never_zero() {
+    let fx = Fixture::new("recorded-incomplete");
+    let pool = fx.dir("pool");
+    let cap = 64 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let workspace = fx.dir("workspace");
+    let a = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    fs::write(
+        a.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 1024 * 1024],
+    )
+    .expect("blob");
+
+    // An entry bound of 1 cannot complete the slot's own walk.
+    with_accounting_limits(1, 64, 60_000, || {
+        release_injected(&pool, &a.lease_id).expect("release still succeeds")
+    });
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(
+        recorded_of(&view, &a.slot_id).is_none(),
+        "an incomplete release walk published a figure"
+    );
+
+    // The next admission must refuse, never read the slot as zero bytes.
+    let scan = with_accounting_limits(1, 64, 60_000, || {
+        incomplete(lease_injected(request(
+            &pool,
+            &fx.dir("project-b"),
+            &workspace,
+            "b",
+        )))
+    });
+    assert!(gap_kinds(&scan).contains(&AccountingGapKind::EntryLimit));
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(
+        recorded_of(&view, &a.slot_id).is_none(),
+        "a refused admission published a figure"
+    );
 }

@@ -793,10 +793,14 @@ explicit `recover` unless they adopt it.
   clean marks, latest use and flushes, and the registration's drive mode. It
   takes no pool lock, creates no lock, reconciles no recorded deletion, runs
   no accounting walk, invokes no Cargo, `tmutil` or `diskutil`, and writes
-  nothing. A slot's size is a recorded observation from the reuse walk of a
-  previous acquiring command, labelled with its age, source and lease, or
-  `not measured`; recorded facts are never summed into a pool total and never
-  establish free space or admission. A recorded `Evicting` slot is reported
+  nothing. It reports two **separately labelled** recorded sources that are
+  never added together: the ledger's closed per-slot observations
+  (oxide#146), shown as one `recorded slot sizes (ledger)` total over
+  `recorded n of m idle slots` with its unrecorded count as a stated lower
+  bound — this one *is* the admission basis — and, per slot, an oxide#128
+  sidecar fact from a previous acquiring command's reuse walk, labelled with
+  its age, source and lease, or `not measured`. Neither is free space, and a
+  recorded figure never itself establishes admission. A recorded `Evicting` slot is reported
   as a pending reconciliation, distinct from idle and held, and is left in
   place. Cargo-home and stray-output lines say not measured.
 - `oxide status --measure` runs the existing bounded walks once: the

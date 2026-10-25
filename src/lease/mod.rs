@@ -43,8 +43,13 @@ pub const MAX_SLOTS: usize = 128;
 pub const MAX_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
 /// Permanent capacity-policy fence in the library ledger (oxide#118). Its
 /// presence tells an older binary that this ledger uses ranked idle
-/// replacement; the fence is never removed.
-pub const CAPACITY_POLICY_VERSION: u32 = 1;
+/// replacement; the fence is never removed. Version 2 (oxide#146) adds the
+/// closed per-slot size record, so a version-2 ledger also refuses an older
+/// binary's `deny_unknown_fields` parse.
+pub const CAPACITY_POLICY_VERSION: u32 = 2;
+/// The version-1 fence (oxide#118) stays readable and is upgraded by the next
+/// revised write; a version-1 ledger never carries a record.
+pub const LEGACY_CAPACITY_POLICY_VERSION: u32 = 1;
 /// Finite holder identity.
 pub const MAX_HOLDER_BYTES: usize = 128;
 /// Finite canonical path.
@@ -356,6 +361,16 @@ pub struct PassiveSnapshot {
     /// reconciliation. They are neither idle nor held, and this snapshot
     /// never infers that their recorded deletion can finish.
     pub evicting_slot_ids: Vec<String>,
+    /// The sum of the *current* recorded per-slot observations (oxide#146), or
+    /// `None` when no idle slot carries a current one. This is the recorded
+    /// admission basis, never free space; the oxide#128 sidecar facts are a
+    /// separate diagnostic source and are never added to it.
+    pub recorded_total: Option<u64>,
+    /// Idle slots whose record is current.
+    pub recorded_slots: usize,
+    /// Idle slots with no current record: they make `recorded_total` a stated
+    /// lower bound and are walked by the next admission that needs them.
+    pub unrecorded_slots: usize,
 }
 
 /// The volume a removable pool's config records. Recorded facts only.
@@ -377,6 +392,20 @@ pub struct MeasuredPool {
     pub status: PoolStatus,
 }
 
+/// A closed per-slot size observation, as recorded in the ledger. It is a
+/// measurement taken at a closing transition, not a claim that the slot's
+/// bytes are immutable, that its writer closed or that a volume is closed.
+/// `current` says only whether it still matches its idle slot generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedFact {
+    pub unique_allocated_bytes: u64,
+    pub logical_bytes: u64,
+    pub entries: u64,
+    pub at_ms: u64,
+    /// This record still matches its idle slot generation.
+    pub current: bool,
+}
+
 /// One ledger record: [`SlotStatus`] without its accounting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerSlot {
@@ -392,6 +421,8 @@ pub struct LedgerSlot {
     pub dir: Option<String>,
     /// As [`SlotStatus::rank`].
     pub rank: u64,
+    /// The closed size observation this record holds, if any.
+    pub recorded: Option<RecordedFact>,
 }
 
 impl From<&SlotStatus> for LedgerSlot {
@@ -407,6 +438,10 @@ impl From<&SlotStatus> for LedgerSlot {
             lease_id: slot.lease_id.clone(),
             dir: slot.dir.clone(),
             rank: slot.rank,
+            // A walked status report shows its own figures; the recorded
+            // observation is reported by the ledger view that default status
+            // reads.
+            recorded: None,
         }
     }
 }

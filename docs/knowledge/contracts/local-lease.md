@@ -297,9 +297,16 @@ defaults, which are unchanged. The callers:
 | Walk | Gate |
 | --- | --- |
 | The matching idle slot's own walk before reuse | Must be complete, or the lease refuses |
-| The whole-payload walk before a new slot, and again after eviction | Must be complete, or the lease refuses |
-| The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
+| The one slot a release or recovery closes (oxide#146) | Best effort: an incomplete walk publishes no record and never fails the release |
+| A slot with no current record, and every held slot, at admission | Must be complete, or the lease refuses (`unknown_accounting`) |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
+
+Admission itself no longer walks the payload: it sums the closed per-slot
+records plus one shallow scope pass over everything outside the slot roots
+([recorded per-slot accounting](#recorded-per-slot-accounting-oxide146-implemented-native-held)).
+When every record is current that is O(slots) metadata work and **zero
+inventory walks**; only a slot without a current record is walked, once, under
+the same bounds as any slot walk and one cumulative 60 s admission deadline.
 
 **Removable-volume fallback (2026-10-25 hotfix, Tom's ruling).** A
 removable `apfs-volume-v1` payload walks for at most 5 s before a new slot
@@ -316,12 +323,34 @@ proceed on the same bound-only result. Any other gap (unreadable, missing
 or unusable metadata, mount boundary, depth limit, root problems) still
 refuses, and the internal `directory-budget-v1` pool keeps every gate in
 the table above unchanged. Reason: a 127-slot USB pool could not be walked
-within 60 s, so every new-slot admission refused. Faster recorded
-accounting is the planned replacement: its reviewed design is
-[recorded per-slot accounting](#recorded-per-slot-accounting-oxide146-reviewed-design-not-implemented)
-below, where this fallback becomes reachable only on a pool that still has
-unrecorded slots (legacy migration) and is retired once records cover the
-pool. Nothing above changes until that implementation lands.
+within 60 s, so every new-slot admission refused. Faster recorded accounting
+replaced that whole-payload walk (oxide#146, [recorded per-slot
+accounting](#recorded-per-slot-accounting-oxide146-implemented-native-held)
+below): admission now sums closed per-slot records, so on a removable pool the
+5 s bound applies to the walks that are actually still needed. The fallback is
+therefore reachable only on a pool that still has unrecorded slots (legacy
+migration), and it is retired once records cover the pool; its arithmetic,
+limit of 8 evictions and refusal class are unchanged.
+
+**The admission figure (oxide#146).** `Pool::recorded_total()` is
+`pool_scope()` plus one figure per ledger slot: a held slot is always walked
+fresh, a current idle record is used as it stands, and an idle slot with no
+current record is walked once and its figure published in one revised write
+*before* the admission decision, so progress survives a refusal. `pool_scope()`
+is a separate walker (`inventory::scope_directory`) that hard-stops at every
+recorded slot root — by ledger membership, for both the legacy `<id>` and the
+labelled `<folder>/<profile>-<id>` layouts — so each regular file is counted
+exactly once and out-of-slot metadata, strays and orphan regions are counted
+without granting ownership. Its debug-only observation is
+`OXIDE_TEST_SCOPE_LOG`, separate from the walk log, so "zero inventory walks"
+stays a checkable claim. Cross-slot hard links are counted once per slot: that
+overcount is accepted, so the sum is never below the inode union, equality
+holds for disjoint slots, and an idle slot may be evicted earlier than the
+union alone would require. A current record is a measurement at a closing
+transition, not proof of immutable bytes, writer closure or volume closure, and
+it is trusted until its generation changes or a held/recycle/evicting
+transition clears it. A removable pool's pressure is the larger of that sum and
+the verified volume's used bytes.
 
 **How one walk reads (oxide#141).** The walk itself is unchanged in scope,
 bounds, policy and refusal classes. Each enumerated regular file or directory
@@ -586,18 +615,51 @@ are unit tests in `effigy test rust`. Not covered natively: the nine-grant
 freshness bound is a bounded-loop inspection, and no large live inventory or
 physical multi-million-entry performance is claimed.
 
-### Recorded per-slot accounting (oxide#146: reviewed design, not implemented)
+### Recorded per-slot accounting (oxide#146: implemented, native held)
 
 Tom's 2026-10-25 ruling, "We need a much faster way to do the accounting
 too" (Queue decision `8c6b8319-b20e-4a78-b987-c09dee69886c`), approves a
-different policy from the exact-cache proposal below. This section is the
-detailed design the ruling asked for, written against this tree (`7d6e992`,
-immediately after the landed oxide#136 work). **Nothing here is implemented:
-the removable-volume hotfix and the whole-payload admission walks remain the
-shipped behaviour until a separately activated Phase B lands.** The parked
-exact-union design below stays history and is not resurrected: the accepted
-policy is the opposite one, cross-slot hard-link **overcount** and trust of a
-recorded idle slot until its generation changes.
+different policy from the exact-cache proposal below. The sections below are
+both the reviewed design (frozen at `c4b6447`) and the implemented behaviour;
+where the implementation had to correct the design, it says so. The parked
+exact-union design further down stays history and is not resurrected: the
+accepted policy is the opposite one, cross-slot hard-link **overcount** and
+trust of a recorded idle slot until its generation changes.
+
+**What shipped.** `SlotRecord.recorded` carries one closed observation, the
+`capacity_policy` fence is now **2** (version 1 stays readable and is upgraded
+by the next revised write), and the front door's control `STATE_VERSION` is
+**5** with the `oxide.accounting/1` fence written durably by the first
+mutating command's admission gate, before any library write can fence the
+ledger. `Pool::recorded_total()` replaces the whole-payload admission walk
+with `pool_scope()` (a new `inventory::scope_directory` entry point with a
+ledger-membership hard stop, observed on its own debug-only
+`OXIDE_TEST_SCOPE_LOG`) plus one figure per slot; `Pool::pressure()` adds the
+verified volume's used bytes for a removable pool. `release_or_recover`
+measures the one slot it closes and publishes the record in the same atomic
+`Held -> Idle` replacement; every transition out of `Idle` clears it. Default
+`oxide status` reports the ledger's recorded total and per-slot record as the
+admission basis, separately from the oxide#128 sidecar, and `--measure` stays
+the full-walk audit.
+
+**Corrections the implementation made to this design.** (1) A *current* record
+is trusted at admission, so an entry that only a fresh walk would find
+unreadable no longer blocks a new-slot admission; the whole-idle-slot deletion
+then either succeeds or fails honestly and leaves a recorded `Evicting` slot
+for reconciliation. Reuse of that same idle slot still walks it and still
+refuses. (2) `pool_scope()` needed its own walker: `extra_depth` only raises
+`max_depth` and files at the bound are still counted, so any depth bound would
+either descend into legacy `slots/<id>` roots or report a `DepthLimit` gap at
+labelled `slots/<folder>/<profile>-<id>` roots. (3) The legacy 5 s
+`VOLUME_WALK_MS` bound now applies to the *required* walk of a removable pool,
+so the volume-used-bytes fallback stays reachable exactly where it was: a pool
+that still has unrecorded slots.
+
+**Evidence state.** Source and unit regressions are in this change. The
+focused proof `scripts/test-recorded-slot-accounting.py` and its three
+selectors are **held**: no counted native has run, its fit is unmeasured, and
+the required uncounted diagnostic is separately activated. The ELEVATED
+author and independent reviewer natives remain outstanding.
 
 #### Problem and final shape
 
@@ -1025,7 +1087,7 @@ first-fault precedence.
 | Phase | Work | Wall (est.) | Scratch peak (est.) |
 | --- | --- | --- | --- |
 | P0 | premise self-check, fixture construction | 5 s | 5 MiB |
-| P1 | offline debug `oxide` staging with 1.97.1 (constrained recipe: `debug-assertions` on, `debug = 0`, `-j2`, one codegen unit, inside owned scratch) | 55 s | 90 MiB |
+| P1 | offline debug `oxide` staging with 1.97.1 using the reviewed oxide#140 recipe (4 Cargo jobs, 16 codegen units, `debug-assertions` on, `debug = 0`, opt-level `s`, incremental off, symbol-stripped, inside owned scratch) | 55 s | 90 MiB |
 | P2 | A/B/C/F/G cases | 90 s | 30 MiB |
 | P3 | D/E pressure, hard-link and refusal cases | 45 s | 30 MiB |
 | P4 | evidence write, cleanup | 15 s | 5 MiB |
@@ -1042,12 +1104,23 @@ historical and is not used. That retarget is the exact-head review direction
 (comment `6398168416`) against the verified file hash here, and it supersedes
 the brief's older pin under its own "explicitly rebound with review" clause.
 These figures
-are planning arithmetic, not measurements: Phase B re-measures at its own
-activation and reports a **fit blocker** rather than raising either bound. Both
-debug-only observation hooks — the existing walk log and the new scope log —
-are `debug_assertions`-gated, which P1's recipe keeps on and the fixture checks
-before any case asserts a count, and a release build must refuse control
-presence at any value.
+are planning arithmetic, not measurements: the proof's own `--plan` prints them
+and any activation re-measures and reports a **fit blocker** rather than
+raising either bound. Both debug-only observation hooks — the existing walk log
+and the new scope log — are `debug_assertions`-gated, which the staging recipe
+keeps on and the fixture checks through the built-in capability probe before
+any case asserts a count, and a release build must refuse control presence at
+any value.
+
+**Recipe binding.** The proof needs a genuine internal `directory-budget-v1`
+pool, so both heavy commands pass `--root-parent /private/tmp` explicitly
+(Tom's answered internal-root exception); a pool under a selected volume would
+be refused by the product itself. Staging is one function with the real argv
+and environment, and `--self-check` mutates it (one job, one codegen unit,
+profile drift, a leaked encoded-flags value, a build directory outside the
+stage) so the pure check fails if the recipe regresses. Fixtures keep one Cargo
+job and run sequentially; the configured jobs are build parallelism, never a
+CPU cap or an admission-demand claim.
 
 #### Phase B envelope
 
@@ -1060,12 +1133,16 @@ log), `src/bin/oxide/store.rs` (control `STATE_VERSION` and release ordering),
 sentence, and the `AGENTS.md` selector map. Covering
 selectors: `rust:compile`, `rust:compile-linux`, `rust:format`, `test rust`,
 `docs:check`, the re-run `rust:installed-handoff`, and the new
-`rust:recorded-slot-accounting`. Validation is **ELEVATED** because byte
-pressure decides a deletion: one author native and one distinct independent
-reviewer native, each separately ROOT activated on exact clean published
-source, no shared allowance. Failure or an unknown launch stops; no refund and
-no automatic re-run. No live-pool migration, cleanup, installation, release or
-consumer change follows from this design.
+`rust:recorded-slot-accounting` / `:diagnostic` / `proof:recorded-slot-accounting:test`.
+Validation is **ELEVATED** because byte pressure decides a deletion: one author
+native and one distinct independent reviewer native, each separately ROOT
+activated on exact clean published source, no shared allowance, and the
+uncounted diagnostic required before the first counted native. Failure or an
+unknown launch stops; no refund and no automatic re-run. The hand-off proof's
+version inputs moved to this tree's fence (control 5, newer-than-self 6, an
+equal 5 deliberately not a trigger) and it needs its own safe diagnostic before
+a counted rerun. No live-pool migration, cleanup, installation, release or
+consumer change follows from this implementation.
 
 ### Historical parked exact cache (lead `cbb2824d`)
 

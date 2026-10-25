@@ -45,7 +45,11 @@ import time
 MIB = 1024 * 1024
 NOTICE = "oxide: handing off to the installed binary (state is newer than this one).\n"
 REFUSAL = "oxide: oxide was upgraded during this command; re-run.\n"
-STATE_VERSION = 3
+# This tree's control-state version: version 5 is the recorded per-slot
+# accounting fence (oxide#146). Hand-off triggers only on a numeric
+# version GREATER than this one, so the newer-than-self case is 6 and an
+# equal 5 is deliberately not a trigger.
+STATE_VERSION = 5
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
@@ -93,17 +97,24 @@ def write(path: str, contents: str, mode: int) -> None:
     os.chmod(path, mode)
 
 
+RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
+
+
 def current_state(version: int = STATE_VERSION) -> str:
-    return json.dumps(
-        {
-            "version": version,
-            "next_id": 1,
-            "next_use": 1,
-            "tickets": [],
-            "cleans": [],
-            "records": [],
-        }
-    )
+    document = {
+        "version": version,
+        "next_id": 1,
+        "next_use": 1,
+        "tickets": [],
+        "cleans": [],
+        "records": [],
+    }
+    # Version 5 is the recorded-accounting fence (oxide#146) and must carry it;
+    # the versions below it never do. A version-4 document is the old-binary
+    # side this proof keeps readable.
+    if version >= STATE_VERSION:
+        document["recorded_accounting"] = RECORDED_ACCOUNTING_FENCE
+    return json.dumps(document)
 
 
 STUB_SOURCE = r"""
