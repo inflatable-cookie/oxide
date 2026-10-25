@@ -78,10 +78,19 @@ Cases (each one is a real child, nothing is simulated):
     ordinary detach the same registration's selection falls back to the
     internal pool, whose own scratch is used with no stale `/Volumes/<name>`
     directory created. With an inherited same-device `TMPDIR`, the fallback
-    keeps it and creates nothing. The backing image and its intent/attachment
-    records live in a dedicated subtree of the existing supervisor evidence
-    directory; the backing is deleted only after a positively successful
-    ordinary detach, and any ambiguous attach or detach keeps it and aborts.
+    keeps it and creates nothing. The custody directory is derived from the
+    supervisor's own published `OXIDE_TASK_SCRATCH_ROOT`/`OXIDE_PROOF_EVIDENCE`
+    pair: both must be the `scratch` and `evidence` siblings of one non-shared,
+    non-group-writable owned root, this proof's workspace must be inside the
+    published scratch, and the custody target must stay inside that evidence
+    directory — verified before the directory, the image or the intent record
+    exists, with no fallback to the workspace root. The intent, attachment and
+    detach-attempt records live in that custody directory. The ONE planned
+    ordinary detach records its attempt before the call and is never replayed;
+    the backing is deleted only after a positively successful detach and its
+    matching post-state; any failed, timed-out or unclassifiable attach, detach
+    or cleanup keeps the backing and records and aborts as an unknown outcome,
+    with the case's own fault kept as the primary cause.
 12. the longest injected path is reported in bytes and characters against the
     91-byte socket bound.
 
@@ -485,6 +494,103 @@ def image_custody_decision(mounted_after: bool, detach_ok: bool, mount: str) -> 
     return "keep"
 
 
+# The qualified supervisor's published layout: one unique owned root holding
+# its `scratch` and its retained `evidence` directory as siblings. These names
+# are that supervisor's contract, not a guess about part of a path.
+GUARD_SCRATCH_MEMBER = "scratch"
+GUARD_EVIDENCE_MEMBER = "evidence"
+CUSTODY_MEMBER = "removable-image"
+# Shared parents are never "the monitored owned root": accepting one would put
+# the fixture image somewhere this proof does not own.
+SHARED_PARENTS = frozenset(
+    {
+        "/",
+        "/private",
+        "/private/tmp",
+        "/private/var",
+        "/tmp",
+        "/var",
+        "/Volumes",
+        "/Users",
+        os.path.expanduser("~"),
+    }
+)
+
+
+def custody_layout(
+    published_scratch: Optional[str],
+    published_evidence: Optional[str],
+    world_root: str,
+    *,
+    realpath=os.path.realpath,
+    is_dir=os.path.isdir,
+    mode_of=lambda path: os.stat(path).st_mode,
+) -> dict:
+    """The monitored owned root, its published members and the custody target.
+
+    The qualified supervisor publishes `OXIDE_TASK_SCRATCH_ROOT` and
+    `OXIDE_PROOF_EVIDENCE` as two existing siblings under the one unique owned
+    root it created (`<owned>/scratch` and `<owned>/evidence`). The image
+    custody directory belongs inside that evidence directory, so the
+    containment question is about that owned root, not about this proof's
+    private workspace (`<owned>/scratch/pt`) or its parent. Every requirement
+    is checked before any effect: a missing or unusable published pair, a
+    non-sibling, a broad shared parent, a symlinked escape or a workspace
+    outside the published scratch refuses here. There is deliberately no
+    fallback to the workspace root.
+    """
+    require(
+        bool(published_scratch) and bool(published_evidence),
+        "the supervisor published no OXIDE_TASK_SCRATCH_ROOT/OXIDE_PROOF_EVIDENCE "
+        "pair, so the image custody topology cannot be established",
+    )
+    scratch = realpath(published_scratch)
+    evidence = realpath(published_evidence)
+    workspace = realpath(world_root)
+    require(
+        is_dir(scratch) and is_dir(evidence),
+        f"the published scratch {scratch} and evidence {evidence} must both exist",
+    )
+    require(
+        os.path.basename(scratch) == GUARD_SCRATCH_MEMBER
+        and os.path.basename(evidence) == GUARD_EVIDENCE_MEMBER,
+        f"the published members are not the guard's "
+        f"{GUARD_SCRATCH_MEMBER!r}/{GUARD_EVIDENCE_MEMBER!r} siblings: "
+        f"{scratch}, {evidence}",
+    )
+    owned = os.path.dirname(scratch)
+    require(
+        os.path.dirname(evidence) == owned,
+        f"the evidence directory {evidence} is not a sibling of the published "
+        f"scratch directory {scratch} under one owned root",
+    )
+    require(
+        owned not in SHARED_PARENTS and owned != os.path.dirname(owned),
+        f"the owned root {owned} is a shared parent, not the guard's unique root",
+    )
+    require(
+        mode_of(owned) & 0o022 == 0,
+        f"the owned root {owned} is group- or world-writable",
+    )
+    require(
+        is_inside(workspace, scratch) and workspace != scratch,
+        f"this proof's workspace {workspace} is not inside the published "
+        f"scratch directory {scratch}",
+    )
+    custody = os.path.join(evidence, CUSTODY_MEMBER)
+    require(
+        is_inside(custody, evidence) and is_inside(custody, owned),
+        f"the image custody directory {custody} is outside the monitored owned root",
+    )
+    return {
+        "owned_root": owned,
+        "scratch": scratch,
+        "evidence": evidence,
+        "workspace": workspace,
+        "custody": custody,
+    }
+
+
 def longest_injected_path(mount_chars: int, folder_chars: int) -> int:
     """The longest product scratch path this proof's layout can construct.
 
@@ -521,7 +627,11 @@ def plan() -> None:
     )
     for index, name in enumerate(CASE_NAMES, start=1):
         print(f"    {index}. {name}")
-    print("  writes only inside OXIDE_TASK_SCRATCH_ROOT; no live pool is touched")
+    print(
+        "  writes: ordinary fixtures in OXIDE_TASK_SCRATCH_ROOT; the owned "
+        "image's intent, attachment and backing in OXIDE_PROOF_EVIDENCE, both "
+        "members of the same monitored owned root; no live pool is touched"
+    )
 
 
 CASE_NAMES = [
@@ -2365,76 +2475,245 @@ def refusals(world: World, crate: str) -> None:
     )
 
 
-def removable(world: World, crate: str) -> None:
+class SystemEffects:
+    """The removable case's OS effects, in one seam the pure tests replace."""
+
+    def canonical(self, path: str) -> str:
+        return canonical(path)
+
+    def is_dir(self, path: str) -> bool:
+        return os.path.isdir(path)
+
+    def mode_of(self, path: str) -> int:
+        return os.stat(path).st_mode
+
+    def ismount(self, path: str) -> bool:
+        return os.path.ismount(path)
+
+    def exists(self, path: str) -> bool:
+        return os.path.exists(path)
+
+    def lexists(self, path: str) -> bool:
+        return os.path.lexists(path)
+
+    def unlink(self, path: str) -> None:
+        os.unlink(path)
+
+    def make_private(self, path: str) -> str:
+        return private_dir(path)
+
+    def write_private(self, path: str, data: str) -> None:
+        write_private(path, data)
+
+    def slot_tree(self, root: str) -> list:
+        return [path for path, _, _ in os.walk(root)]
+
+    def work_left(self) -> float:
+        return work_left()
+
+    def run(self, argv: list, *, timeout: float, text: bool = True):
+        return subprocess.run(argv, capture_output=True, text=text, timeout=timeout)
+
+
+def custody_cleanup(effects, state: dict, image: str, custody: str) -> dict:
+    """One custody decision for one exit of the removable case.
+
+    Nothing is deleted unless the ONE planned ordinary detach was positively
+    established: exit 0, not mounted and the mount point not recreated. After
+    any other exit the backing image and its intent, attachment and attempt
+    records are kept. A bounded cleanup detach runs only when the planned
+    detach was never attempted and the attachment is positively bound to this
+    fixture; its own post-state is verified, and a failure, timeout or
+    unclassifiable result leaves custody unknown rather than being reported as
+    recovered. The unknown is never downgraded to the case's own fault.
+    """
+    if not state["intent"]:
+        return {"uncertain": False, "detail": "", "action": "none"}
+    if state["detached_ok"]:
+        if effects.exists(image):
+            effects.unlink(image)
+        return {"uncertain": False, "detail": "", "action": "deleted"}
+    if state["detach_attempted"]:
+        return {
+            "uncertain": True,
+            "detail": "the planned ordinary detach was already attempted and is "
+            f"not positively established; backing and records kept at {custody}",
+            "action": "kept",
+        }
+    mount = state["mount"]
+    if not (state["attached"] and state["bound"] and mount and effects.ismount(mount)):
+        return {
+            "uncertain": bool(state["attached"]),
+            "detail": "the attachment is not positively bound to this fixture; "
+            f"backing and records kept at {custody}",
+            "action": "kept",
+        }
+    try:
+        cleanup = effects.run(
+            ["hdiutil", "detach", mount], timeout=min(effects.work_left(), 60)
+        )
+    except Exception as error:  # noqa: BLE001 - an unclassified cleanup stop
+        return {
+            "uncertain": True,
+            "detail": f"the bounded cleanup detach failed: {error}",
+            "action": "kept",
+        }
+    if cleanup.returncode == 0 and not effects.ismount(mount):
+        say(
+            f"cleanup ordinary detach of {mount}: exit 0; backing and records kept "
+            f"at {custody}"
+        )
+        return {"uncertain": False, "detail": "", "action": "kept"}
+    return {
+        "uncertain": True,
+        "detail": "the bounded cleanup detach is not positively established "
+        f"(exit {cleanup.returncode}); backing and records kept at {custody}",
+        "action": "kept",
+    }
+
+
+def removable(
+    world: World,
+    crate: str,
+    *,
+    effects=None,
+    published_scratch=None,
+    published_evidence=None,
+) -> None:
+    """Case 11: one owned removable fixture, from topology to custody.
+
+    The topology is derived from the supervisor's own published members, so
+    the custody directory lives in the evidence directory of the ONE monitored
+    owned root rather than in this proof's private workspace. The whole flow is
+    one seam-injectable function so the pure self-check exercises the real
+    custody decisions.
+    """
     case(CASE_NAMES[10])
     if sys.platform != "darwin":
         say("not macOS: no removable fixture, the internal pool stands")
         return
-    # The backing image and its custody record live in a dedicated subtree of
-    # the supervisor's existing evidence directory, inside the same monitored
-    # owned root; the intent is recorded before any attach effect.
-    custody = private_dir(os.path.join(world.evidence, "removable-image"))
-    monitored = (canonical(world.root), canonical(os.path.dirname(world.root)))
-    require(
-        any(is_inside(canonical(custody), root) for root in monitored),
-        f"the image custody directory {custody} is outside the monitored root",
+    removable_flow(
+        world,
+        crate,
+        effects if effects is not None else SystemEffects(),
+        published_scratch=(
+            published_scratch
+            if published_scratch is not None
+            else os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+        ),
+        published_evidence=(
+            published_evidence
+            if published_evidence is not None
+            else os.environ.get("OXIDE_PROOF_EVIDENCE")
+        ),
     )
+
+
+def removable_flow(
+    world, crate: str, effects, *, published_scratch: Optional[str],
+    published_evidence: Optional[str],
+) -> None:
+    """The twenty-step removable case, with every effect behind `effects`.
+
+    Order matters and is asserted by the pure self-check: the topology and its
+    containment are verified BEFORE the custody directory, the image, the
+    intent record or any attach exists; the intent is recorded before the
+    create/attach effects; the returned device, mount, UUID and owners-on fact
+    are bound before registration; the ONE planned ordinary detach records its
+    attempt before the call and is accepted only with its matching post-state;
+    and every exit runs the custody decision, where an unknown detach keeps the
+    backing and aborts instead of being downgraded to an oracle failure.
+    """
+    layout = custody_layout(
+        published_scratch,
+        published_evidence,
+        world.root,
+        realpath=effects.canonical,
+        is_dir=effects.is_dir,
+        mode_of=effects.mode_of,
+    )
+    custody = layout["custody"]
     image = os.path.join(custody, "dragontail.sparseimage")
     intent_path = os.path.join(custody, "intent.json")
     attach_path = os.path.join(custody, "attachment.json")
+    attempt_path = os.path.join(custody, "detach-attempt.json")
     require(
-        not os.path.lexists(image),
+        not effects.lexists(image),
         f"an image already exists in this run's custody directory: {image}",
     )
-    write_private(
-        intent_path,
-        json.dumps(
-            {
-                "image": image,
-                "size_mib": IMAGE_MIB,
-                "volname": "oxide-temp-proof",
-                "intent": "one owned APFS fixture image, ordinary detach only",
-            },
-            indent=1,
-            sort_keys=True,
-        ),
-    )
-    created = subprocess.run(
-        [
-            "/usr/bin/hdiutil",
-            "create",
-            "-size",
-            f"{IMAGE_MIB}m",
-            "-fs",
-            "APFS",
-            "-volname",
-            "oxide-temp-proof",
-            "-type",
-            "SPARSE",
-            "-quiet",
-            image,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=work_left(),
-    )
-    require(created.returncode == 0, f"image creation failed: {created.stderr}")
-    # The mount-root rule makes the drive root owner-only, so the owned image
-    # is attached with ownership enabled, exactly as the accepted account-home
-    # proof does, and that fact is confirmed before registration.
-    attached = subprocess.run(
-        ["/usr/bin/hdiutil", "attach", "-nobrowse", "-owners", "on", "-plist", image],
-        capture_output=True,
-        timeout=work_left(),
-    )
-    require(attached.returncode == 0, f"image attach failed: {attached.stderr!r}")
-    mount = ""
-    detached_ok = False
+    state = {
+        "intent": True,
+        "attached": False,
+        "bound": False,
+        "mount": "",
+        "detach_attempted": False,
+        "detached_ok": False,
+    }
+    primary = None
     try:
+        # Every topology check passed, so this is the first effect. The intent
+        # is durable before the image exists.
+        effects.make_private(custody)
+        effects.write_private(
+            intent_path,
+            json.dumps(
+                {
+                    "image": image,
+                    "size_mib": IMAGE_MIB,
+                    "volname": "oxide-temp-proof",
+                    "owned_root": layout["owned_root"],
+                    "evidence": layout["evidence"],
+                    "intent": "one owned APFS fixture image, ordinary detach only",
+                },
+                indent=1,
+                sort_keys=True,
+            ),
+        )
+        created = effects.run(
+            [
+                "/usr/bin/hdiutil",
+                "create",
+                "-size",
+                f"{IMAGE_MIB}m",
+                "-fs",
+                "APFS",
+                "-volname",
+                "oxide-temp-proof",
+                "-type",
+                "SPARSE",
+                "-quiet",
+                image,
+            ],
+            timeout=effects.work_left(),
+        )
+        require(created.returncode == 0, f"image creation failed: {created.stderr}")
+        # The mount-root rule makes the drive root owner-only, so the owned
+        # image is attached with ownership enabled, exactly as the accepted
+        # account-home proof does, and that fact is confirmed before
+        # registration.
+        attached = effects.run(
+            [
+                "/usr/bin/hdiutil",
+                "attach",
+                "-nobrowse",
+                "-owners",
+                "on",
+                "-plist",
+                image,
+            ],
+            timeout=effects.work_left(),
+            text=False,
+        )
+        require(attached.returncode == 0, f"image attach failed: {attached.stderr!r}")
+        state["attached"] = True
         try:
             entities = plistlib.loads(attached.stdout)["system-entities"]
-            mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
-            devices = [entity["dev-entry"] for entity in entities if entity.get("dev-entry")]
+            mounts = [
+                entity["mount-point"] for entity in entities if entity.get("mount-point")
+            ]
+            devices = [
+                entity["dev-entry"] for entity in entities if entity.get("dev-entry")
+            ]
         except (ValueError, KeyError, TypeError) as error:
             abort(f"the attach output is unclassifiable: {error}")
         require(
@@ -2442,14 +2721,15 @@ def removable(world: World, crate: str) -> None:
             f"expected one mounted volume for the owned image, got {mounts}",
         )
         mount = mounts[0]
+        state["mount"] = mount
         require(
             mount.startswith("/Volumes/"),
             f"the owned image did not mount under /Volumes: {mount}",
         )
-        ownership = subprocess.run(
+        ownership = effects.run(
             ["/usr/sbin/diskutil", "info", "-plist", mount],
-            capture_output=True,
-            timeout=work_left(),
+            timeout=effects.work_left(),
+            text=False,
         )
         require(ownership.returncode == 0, "diskutil info failed for the mount")
         try:
@@ -2460,9 +2740,17 @@ def removable(world: World, crate: str) -> None:
             info.get("GlobalPermissionsEnabled") is True,
             "the owned image is mounted without ownership enabled",
         )
+        require(
+            bool(devices) and devices[0],
+            "the attach output bound no device entry for the owned image",
+        )
+        require(
+            bool(info.get("VolumeUUID")),
+            "the mounted volume has no volume UUID to bind the attachment to",
+        )
         # Bind the returned identity before any further effect, so a detach can
         # be checked against the attachment this run actually made.
-        write_private(
+        effects.write_private(
             attach_path,
             json.dumps(
                 {
@@ -2476,6 +2764,7 @@ def removable(world: World, crate: str) -> None:
                 sort_keys=True,
             ),
         )
+        state["bound"] = True
         say(f"owned scratch image mounted at {mount} with ownership enabled")
         world.run(
             [
@@ -2490,20 +2779,19 @@ def removable(world: World, crate: str) -> None:
             cwd=crate,
             env=world.env(),
         )
-        # The inherited fixture scratch is on another device, so the
-        # removable build's children must get the owned directory on the
-        # image instead.
+        # The inherited fixture scratch is on another device, so the removable
+        # build's children must get the owned directory on the image instead.
         removable_env = world.env()
         result = world.run(["check"], cwd=crate, env=removable_env)
         observed = world.observe(result.stderr, "dir", removable_env)
         expect(
-            os.path.realpath(observed).startswith(
-                os.path.realpath(os.path.join(mount, "oxide-pool")) + os.sep
+            effects.canonical(observed).startswith(
+                effects.canonical(os.path.join(mount, "oxide-pool")) + os.sep
             ),
             f"the removable build's temporary files are not on the image: {observed}",
         )
         expect(
-            os.path.realpath(observed).startswith(os.path.realpath(mount) + os.sep),
+            effects.canonical(observed).startswith(effects.canonical(mount) + os.sep),
             f"the inherited other-device directory was not replaced: {observed}",
         )
         expect(
@@ -2511,33 +2799,42 @@ def removable(world: World, crate: str) -> None:
             "the removable build did not report the owned scratch",
         )
         expect(
-            not os.path.lexists(observed.rstrip("/")),
+            not effects.lexists(observed.rstrip("/")),
             "the removable build's owned directory survived release",
         )
-        # Ordinary detach, bounded by the existing deadline, then the internal
-        # fallback: no inherited TMPDIR, so the internal pool's own scratch is
-        # used and no stale mount point is created.
-        detached = subprocess.run(
-            ["hdiutil", "detach", mount],
-            capture_output=True,
-            text=True,
-            timeout=min(work_left(), 60),
+        # The attempt is recorded BEFORE the ONE planned ordinary detach, so a
+        # second attempt can never be made blindly against a possibly reused
+        # mount point.
+        effects.write_private(
+            attempt_path,
+            json.dumps(
+                {"mount": mount, "device": devices[0] if devices else "",
+                 "planned": "one ordinary detach"},
+                indent=1,
+                sort_keys=True,
+            ),
+        )
+        state["detach_attempted"] = True
+        detached = effects.run(
+            ["hdiutil", "detach", mount], timeout=min(effects.work_left(), 60)
         )
         require(
             detached.returncode == 0, f"ordinary detach failed: {detached.stderr}"
         )
-        require(not os.path.ismount(mount), f"{mount} is still mounted after detach")
-        require(not os.path.exists(mount), f"the mount point {mount} was recreated")
-        detached_ok = True
+        require(
+            not effects.ismount(mount), f"{mount} is still mounted after detach"
+        )
+        require(not effects.exists(mount), f"the mount point {mount} was recreated")
+        state["detached_ok"] = True
         # The registration still exists and its volume is gone, so this build
-        # must go through the product's own fallback selection on the
-        # original pool; it is not pointed at a fresh pool.
+        # must go through the product's own fallback selection on the original
+        # pool; it is not pointed at a fresh pool.
         fallback_env = world.env(TMPDIR=None, TMP=None, TEMP=None)
         fallback = world.run(["check"], cwd=crate, env=fallback_env)
         observed = world.observe(fallback.stderr, "dir", fallback_env).rstrip("/")
         expect(
-            os.path.realpath(observed).startswith(
-                os.path.realpath(os.path.join(world.pool, "payload")) + os.sep
+            effects.canonical(observed).startswith(
+                effects.canonical(os.path.join(world.pool, "payload")) + os.sep
             ),
             f"the fallback did not use the internal pool's scratch: {observed}",
         )
@@ -2549,51 +2846,40 @@ def removable(world: World, crate: str) -> None:
                 if "select" in line or "removable" in line
             )[:400]
         )
-        expect(not os.path.exists(mount), f"the fallback recreated {mount}")
+        expect(not effects.exists(mount), f"the fallback recreated {mount}")
         # With a same-device inherited TMPDIR the fallback keeps it and
         # creates nothing.
-        inherited = private_dir(world.fixture("keep-tmp"))
+        inherited = effects.make_private(world.fixture("keep-tmp"))
         kept_env = world.env(TMPDIR=inherited, TMP=None, TEMP=None)
         kept = world.run(["check"], cwd=crate, env=kept_env)
         expect(
             world.observe(kept.stderr, "dir", kept_env).rstrip("/")
-            == canonical(inherited),
-            f"the fallback did not keep the same-device inherited directory: "
+            == effects.canonical(inherited),
+            "the fallback did not keep the same-device inherited directory: "
             f"{kept.stderr[-1500:]}",
         )
-        slots = os.path.join(world.pool, "payload", "slots")
-        for root, _, _ in os.walk(slots):
+        for root in effects.slot_tree(os.path.join(world.pool, "payload", "slots")):
             expect(
-                not os.path.lexists(os.path.join(root, "scratch")),
+                not effects.lexists(os.path.join(root, "scratch")),
                 "the fallback created an owned directory it did not need",
             )
-    finally:
-        mounted = bool(mount) and os.path.ismount(mount)
-        if not detached_ok and mounted:
-            # One bounded ordinary detach for host hygiene (never a force
-            # detach). The backing image, its intent and its attachment record
-            # stay for the owner either way: an unresolved attachment is not
-            # evidence that the fixture volume is gone.
-            cleanup = subprocess.run(
-                ["hdiutil", "detach", mount],
-                capture_output=True,
-                text=True,
-                timeout=min(work_left(), 60),
-            )
-            say(
-                f"cleanup ordinary detach of {mount}: exit {cleanup.returncode}; "
-                "backing and records kept"
-            )
-        elif image_custody_decision(mounted, detached_ok, mount) == "delete":
-            if os.path.exists(image):
-                os.unlink(image)
-        elif os.path.exists(image):
-            say(f"the owned image backing is kept at {image} with its records")
-    if not detached_ok:
-        abort(
-            "the owned image was not positively detached, so its custody is "
-            f"unknown; backing kept at {image}"
+    except BaseException as error:  # noqa: BLE001 - custody is decided on every exit
+        # The case's own outcome is kept and re-raised after the custody
+        # decision; nothing here turns an unknown into an oracle failure.
+        primary = error
+    cleanup = custody_cleanup(effects, state, image, custody)
+    if cleanup["uncertain"]:
+        beyond = (
+            f"; the earlier {'unknown outcome' if isinstance(primary, UnknownOutcome) else 'oracle failure'} "
+            f"stays the primary fault: {primary}"
+            if primary is not None
+            else ""
         )
+        abort(f"image custody is unknown: {cleanup['detail']}{beyond}")
+    if primary is not None:
+        raise primary
+    if cleanup["action"] == "kept":
+        say(f"the owned image backing is kept at {image} with its records")
 
 
 def path_bound(world: World, crate: str) -> None:
@@ -3386,6 +3672,421 @@ def self_check() -> int:
         and abort_record["cases_total"] == 12
         and sum(1 for entry in abort_record["cases"] if entry["outcome"] == "not_run") == 10
         and abort_record["aborted_on_unknown_outcome"] is True,
+    )
+
+    # 13. Case 11's monitored-root topology and image custody, exercised
+    #     through the real custody_layout, custody_cleanup and removable_flow
+    #     with fake canonical/filesystem/process/product seams. No image, child
+    #     or device is created here.
+    norm = os.path.normpath
+    owned_scratch = "/owned/root/scratch"
+    owned_evidence = "/owned/root/evidence"
+    custody_dir = "/owned/root/evidence/removable-image"
+    layout = custody_layout(
+        owned_scratch,
+        owned_evidence,
+        "/owned/root/scratch/pt",
+        realpath=norm,
+        is_dir=lambda path: True,
+        mode_of=lambda path: 0o700,
+    )
+    property_true(
+        "the published scratch and evidence resolve to one owned root",
+        layout["owned_root"] == "/owned/root" and layout["custody"] == custody_dir,
+    )
+    property_true(
+        "negative control: the old workspace/parent pair rejects that custody",
+        not any(
+            is_inside(norm(custody_dir), root)
+            for root in (norm("/owned/root/scratch/pt"), norm("/owned/root/scratch"))
+        ),
+    )
+
+    class Proc:
+        def __init__(self, returncode: int = 0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class FakeEffects:
+        """The removable flow's effects, in memory, recording every call."""
+
+        def __init__(self, **options):
+            self.calls = []
+            self.dirs = set()
+            self.files = {}
+            self.mounted = set()
+            self.mount = options.get("mount", "/Volumes/oxide-temp-proof")
+            self.attach_exit = options.get("attach_exit", 0)
+            self.attach_plist = options.get("attach_plist")
+            self.owners = options.get("owners", True)
+            self.volume_uuid = options.get("volume_uuid", "UUID-1")
+            self.detach_exit = options.get("detach_exit", 0)
+            self.detach_raise = options.get("detach_raise")
+            self.cleanup_exit = options.get("cleanup_exit", 0)
+            self.cleanup_raise = options.get("cleanup_raise")
+            self.mode = options.get("mode", 0o700)
+            self.dirs_ok = options.get("dirs_ok", True)
+            self.canonical_map = options.get("canonical_map", {})
+            self.detach_calls = 0
+
+        def canonical(self, path):
+            return self.canonical_map.get(norm(path), norm(path))
+
+        def is_dir(self, path):
+            return self.dirs_ok
+
+        def mode_of(self, path):
+            return self.mode
+
+        def ismount(self, path):
+            return path in self.mounted
+
+        def exists(self, path):
+            return path in self.files or path in self.dirs
+
+        def lexists(self, path):
+            return self.exists(path)
+
+        def unlink(self, path):
+            self.calls.append(("unlink", path))
+            self.files.pop(path, None)
+
+        def make_private(self, path):
+            self.calls.append(("mkdir", path))
+            self.dirs.add(path)
+            return path
+
+        def write_private(self, path, data):
+            self.calls.append(("write", path))
+            self.files[path] = data
+
+        def slot_tree(self, root):
+            return []
+
+        def work_left(self):
+            return 60.0
+
+        def run(self, argv, *, timeout, text=True):
+            self.calls.append(("run", tuple(argv)))
+            if "create" in argv:
+                self.files[argv[-1]] = "backing"
+                return Proc()
+            if "attach" in argv:
+                if self.attach_plist is not None:
+                    return Proc(self.attach_exit, self.attach_plist)
+                payload = plistlib.dumps(
+                    {
+                        "system-entities": [
+                            {"mount-point": self.mount, "dev-entry": "/dev/disk9s1"},
+                            {"dev-entry": "/dev/disk9"},
+                        ]
+                    }
+                )
+                if self.attach_exit == 0:
+                    self.mounted.add(self.mount)
+                return Proc(self.attach_exit, payload)
+            if "info" in argv:
+                return Proc(
+                    0,
+                    plistlib.dumps(
+                        {
+                            "GlobalPermissionsEnabled": self.owners,
+                            "VolumeUUID": self.volume_uuid,
+                        }
+                    ),
+                )
+            if "detach" in argv:
+                self.detach_calls += 1
+                # The planned detach is the one whose attempt record the flow
+                # wrote first; anything else is the bounded cleanup detach.
+                planned = any(
+                    path.endswith("detach-attempt.json") for path in self.files
+                )
+                failure = self.detach_raise if planned else self.cleanup_raise
+                exit_code = self.detach_exit if planned else self.cleanup_exit
+                if failure is not None:
+                    raise failure
+                if exit_code == 0:
+                    self.mounted.discard(argv[-1])
+                return Proc(exit_code, "", "" if exit_code == 0 else "detach refused")
+            return Proc(1, "", f"unexpected command {argv}")
+
+    class FakeWorld:
+        """The product side of the removable case, with fake observations."""
+
+        def __init__(
+            self, mount="/Volumes/oxide-temp-proof", observed=None,
+            root="/owned/root/scratch/pt",
+        ):
+            self.root = root
+            self.pool = os.path.join(root, "p")
+            self.mount = mount
+            self.runs = []
+            self.pending = list(
+                observed
+                if observed is not None
+                else [
+                    f"{mount}/oxide-pool/payload/slots/t-1/quick-1/scratch",
+                    "/owned/root/scratch/pt/p/payload/slots/t-1/quick-1/scratch",
+                    "/owned/root/scratch/pt/fx/keep-tmp",
+                ]
+            )
+            self.stderr = "temp: oxide /owned/scratch\n"
+
+        def fixture(self, name):
+            return os.path.join(self.root, "fx", name)
+
+        def env(self, **overrides):
+            env = {"OXIDE_PROOF_NONCE": "n"}
+            for key, value in overrides.items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
+            return env
+
+        def run(self, args, *, cwd, env, check=True):
+            self.runs.append(tuple(args))
+            return Proc(0, "", self.stderr)
+
+        def observe(self, text, kind, env):
+            return self.pending.pop(0)
+
+    def run_flow(**options):
+        effects = FakeEffects(**options)
+        world = FakeWorld(
+            effects.mount, options.get("observed"), options.get("world_root", "/owned/root/scratch/pt")
+        )
+        caught = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                removable_flow(
+                    world,
+                    "/owned/root/scratch/pt/crate",
+                    effects,
+                    published_scratch=options.get("published_scratch", owned_scratch),
+                    published_evidence=options.get("published_evidence", owned_evidence),
+                )
+        except BaseException as error:  # noqa: BLE001 - the oracle asserts on it
+            caught = error
+        return caught, effects, world
+
+    image_path = os.path.join(custody_dir, "dragontail.sparseimage")
+    caught, effects, _world = run_flow()
+    property_true(
+        "the owned image success flow completes with one planned ordinary detach",
+        caught is None and effects.detach_calls == 1 and not effects.mounted,
+    )
+    property_true(
+        "a positive ordinary detach alone deletes the owned backing",
+        image_path not in effects.files
+        and ("unlink", image_path) in effects.calls,
+    )
+    property_true(
+        "the custody records are written inside the published evidence directory",
+        all(
+            os.path.dirname(path) == custody_dir
+            for path in effects.files
+        )
+        and os.path.join(custody_dir, "attachment.json") in effects.files
+        and os.path.join(custody_dir, "intent.json") in effects.files
+        and os.path.join(custody_dir, "detach-attempt.json") in effects.files,
+    )
+    property_true(
+        "no effect precedes the verified topology",
+        effects.calls[0][0] == "mkdir" and effects.calls[0][1] == custody_dir,
+    )
+
+    for label, options, fragment in (
+        ("no published scratch", {"published_scratch": ""}, "published no"),
+        ("no published evidence", {"published_evidence": None}, "published no"),
+        (
+            "evidence on another owned root",
+            {"published_evidence": "/elsewhere/evidence"},
+            "not a sibling",
+        ),
+        (
+            "members that are not the guard's names",
+            {"published_scratch": "/owned/root/tmp-a", "published_evidence": "/owned/root/tmp-b"},
+            "not the guard's",
+        ),
+        (
+            "a broad shared parent",
+            {"published_scratch": "/private/tmp/scratch", "published_evidence": "/private/tmp/evidence"},
+            "shared parent",
+        ),
+        (
+            "a workspace outside the published scratch",
+            {"world_root": "/owned/root/scratch2/pt"},
+            "inside the published scratch",
+        ),
+        (
+            "a missing published member",
+            {"dirs_ok": False},
+            "must both exist",
+        ),
+        (
+            "a symlink escaping the owned root",
+            {"canonical_map": {owned_evidence: "/elsewhere/evidence"}},
+            "not a sibling",
+        ),
+        (
+            "a group-writable owned root",
+            {"mode": 0o770},
+            "group- or world-writable",
+        ),
+    ):
+        caught, effects, _world = run_flow(**options)
+        property_true(
+            f"refuses {label} before any effect",
+            isinstance(caught, UnknownOutcome)
+            and fragment in str(caught)
+            and effects.calls == [],
+        )
+
+    caught, effects, _world = run_flow(
+        observed=[
+            "/owned/root/scratch/pt/fixture-scratch/inherited-kept",
+            "/owned/root/scratch/pt/p/payload/slots/t-1/quick-1/scratch",
+            "/owned/root/scratch/pt/fx/keep-tmp",
+        ]
+    )
+    property_true(
+        "a build that kept the inherited directory fails the image oracle",
+        isinstance(caught, Recoverable) and "not on the image" in str(caught),
+    )
+    property_true(
+        "a failed case after attach still runs one bounded cleanup detach and keeps the backing",
+        effects.detach_calls == 1
+        and image_path in effects.files
+        and ("unlink", image_path) not in effects.calls,
+    )
+    property_true(
+        "the failed case's cleanup keeps intent and attachment records",
+        os.path.join(custody_dir, "attachment.json") in effects.files
+        and os.path.join(custody_dir, "detach-attempt.json") not in effects.files,
+    )
+
+    timeout = subprocess.TimeoutExpired("hdiutil", 60)
+    wrong_scratch = [
+        "/owned/root/scratch/pt/fixture-scratch/inherited-kept",
+        "/owned/root/scratch/pt/p/payload/slots/t-1/quick-1/scratch",
+        "/owned/root/scratch/pt/fx/keep-tmp",
+    ]
+    for label, options in (
+        ("a cleanup detach that exits nonzero", {"cleanup_exit": 5}),
+        ("a cleanup detach that times out", {"cleanup_raise": timeout}),
+    ):
+        caught, effects, _world = run_flow(observed=wrong_scratch, **options)
+        property_true(
+            f"{label} keeps custody unknown and the backing",
+            isinstance(caught, UnknownOutcome)
+            and "image custody is unknown" in str(caught)
+            and "not on the image" in str(caught)
+            and image_path in effects.files,
+        )
+
+    # Mutants of the fixture's own binding premises must fail, and a mutant
+    # with an unknown cleanup keeps the first cause visible while aborting.
+    for label, options, _expected in (
+        ("a mount outside /Volumes", {"mount": "/tmp/not-volumes"}, (UnknownOutcome,)),
+        ("ownership disabled", {"owners": False}, (UnknownOutcome,)),
+        ("no volume UUID", {"volume_uuid": ""}, (UnknownOutcome,)),
+        (
+            "an unclassifiable attach record",
+            {"attach_plist": b"not a plist"},
+            (UnknownOutcome,),
+        ),
+        ("a failed attach", {"attach_exit": 1}, (UnknownOutcome,)),
+        ("a failed planned detach", {"detach_exit": 1}, (UnknownOutcome,)),
+        (
+            "a failed planned detach with a replayed cleanup",
+            {"detach_exit": 1, "cleanup_exit": 0},
+            (UnknownOutcome,),
+        ),
+    ):
+        caught, effects, _world = run_flow(**options)
+        property_true(
+            f"{label} aborts with unknown custody and keeps the backing",
+            isinstance(caught, UnknownOutcome)
+            and ("unlink", image_path) not in effects.calls
+            and effects.detach_calls <= 1,
+        )
+    caught, effects, _world = run_flow(detach_exit=1, cleanup_exit=0)
+    property_true(
+        "a planned detach that was already attempted is never replayed",
+        effects.detach_calls == 1 and "already attempted" in str(caught),
+    )
+    caught, effects, _world = run_flow(
+        cleanup_exit=5, observed=wrong_scratch
+    )
+    property_true(
+        "an unknown cleanup keeps the original case fault visible as primary",
+        isinstance(caught, UnknownOutcome)
+        and "custody is unknown" in str(caught)
+        and "not on the image" in str(caught)
+        and "primary fault" in str(caught),
+    )
+
+    # An abort inside case 11 still records case 12 as not run, through the
+    # real dispatcher and the real receipt writer.
+    class AbortRemovable:
+        root = "/owned/root/scratch/pt"
+
+        def __init__(self):
+            self.calls = []
+
+        def canonical(self, path):
+            return norm(path)
+
+        def is_dir(self, path):
+            return True
+
+    def topology_abort_case():
+        removable_flow(
+            AbortRemovable(),
+            "/crate",
+            FakeEffects(),
+            published_scratch=None,
+            published_evidence=None,
+        )
+
+    abort_chain = [
+        ProofCase(i, body(f"pre{i}"), label=f"pre{i}") for i in range(10)
+    ] + [
+        ProofCase(10, topology_abort_case, mutates=True, label="removable"),
+        ProofCase(11, body("after"), depends=(10,), label="bound"),
+    ]
+    captured_chain = {}
+
+    def capture_chain(path, outcomes, faults, skips, aborted):
+        captured_chain["text"] = diagnostic_record(outcomes, faults, skips, aborted)
+        return path
+
+    saved_writer = globals()["write_diagnostic_receipt"]
+    globals()["write_diagnostic_receipt"] = capture_chain
+    saved_mode = MODE["diagnostic"]
+    MODE["diagnostic"] = True
+    try:
+        ran.clear()
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            chain_status = drive(abort_chain, "/nonexistent")
+    finally:
+        MODE["diagnostic"] = saved_mode
+        globals()["write_diagnostic_receipt"] = saved_writer
+    chain_record = json.loads(captured_chain["text"])
+    property_true(
+        "a case 11 custody abort records case 12 as not run",
+        chain_status == 1
+        and "after" not in ran
+        and chain_record["cases_total"] == 12
+        and chain_record["cases"][11]["outcome"] == "not_run"
+        and chain_record["aborted_on_unknown_outcome"] is True,
     )
 
     print(f"self-check ok: {len(checks)} properties, pure (no scratch, child or toolchain)")

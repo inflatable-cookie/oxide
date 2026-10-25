@@ -1022,9 +1022,18 @@ held-slot accounting oracle measures a baseline and a delta around the planted
 hard-linked pair, the measured status query uses the same unset aliases as the
 held child, the refusal target slot comes from the preceding fresh observation
 rather than directory order, the crash fixture stays in the supervisor session
-and kills only `oxide`, and the one owned image's backing and attachment record
-live under the existing supervisor evidence directory, with the backing deleted
-only after a positively successful ordinary detach. Diagnostic dependency
+and kills only `oxide`, and the one owned image's custody is derived from the
+supervisor's own published pair: the canonical `OXIDE_TASK_SCRATCH_ROOT` and
+`OXIDE_PROOF_EVIDENCE` must be the `scratch` and `evidence` siblings of one
+non-shared, non-group-writable owned root, this proof's scratch workspace must
+be inside the published scratch, and the custody directory must stay inside
+that evidence directory — all verified before the custody directory, the image
+or an intent record exists, with no fallback to the workspace root. The backing
+is deleted only after a positively successful ordinary detach and its matching
+post-state; the planned detach records its attempt before the call and is never
+replayed, and any failed, timed-out or unclassifiable detach or cleanup keeps
+the backing and records and aborts as an unknown outcome instead of being
+downgraded to the case's own oracle failure. Diagnostic dependency
 handling requires a *passed* predecessor (a skipped one is not passed), and an
 unknown-outcome abort records every remaining planned case as not run, so a
 reached prefix is never reported as a complete collection. Its native author and
@@ -1033,11 +1042,16 @@ Author natives 1 and 2 and diagnostics 1, 2 and 3 at earlier heads are spent
 failures: the first two hid the toolchain behind the fixture HOME and used
 `--locked` without a lock, and the diagnostics were refused in turn by an
 external-volume internal pool, inherited-temp fixtures placed inside the pool
-directory, and a pre-created empty pool directory. The pure self-check
-(`effigy proof:pool-temp:test`, 107 properties) covers the constructor layout,
+directory, and a pre-created empty pool directory. Diagnostic 4 then reached
+cases 1-10 and aborted at the removable case, whose containment check compared
+the custody directory against the workspace and its parent instead of the
+supervisor's published owned root; that topology and its custody decision are
+corrected here, and the run stays a spent failure. The pure self-check
+(`effigy proof:pool-temp:test`, 137 properties) covers the constructor layout,
 rerun completeness, observation freshness, readiness parsing, refusal
-targeting, accounting deltas, image custody and the diagnostic dependency and
-abort rules with no scratch, child or toolchain.
+targeting, accounting deltas, the published-root containment refusals, the
+removable flow's custody decisions and first-fault precedence, and the
+diagnostic dependency and abort rules with no scratch, child or toolchain.
 
 ## Execution location
 
@@ -1665,7 +1679,10 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
 - **Future proofs.** A proof is one short fixed script that is the whole
   supervised command, run as an Effigy `heavy` task:
   `python3 scripts/bounded-test.py python3 scripts/<proof>.py`.
-  - It writes only inside `OXIDE_TASK_SCRATCH_ROOT`.
+  - It writes only inside `OXIDE_TASK_SCRATCH_ROOT` for its ordinary fixtures;
+    a retained fixture image's intent, attachment and backing live in
+    `OXIDE_PROOF_EVIDENCE`, the sibling evidence directory of the same
+    monitored owned root, and an owned mounted image writes bind that backing.
   - It may read `OXIDE_PROOF_DEADLINE_NS`, the absolute `CLOCK_UPTIME_RAW`
     deadline, and write evidence to keep under `OXIDE_PROOF_EVIDENCE`, the
     evidence directory: counted in owned bytes, never removed by cleanup.
