@@ -1962,7 +1962,7 @@ the `a6d73326` bytes above stay the qualified ones for their own runs. The
 bootstrap file changes with it for two concrete reasons and no others: its
 expected case count follows the suite's new total (160 pure + 40 real = 200)
 and it gains one limitation line describing this observation, so it adds no
-bound and no effect. Oxide#151 later raises the expected total to its own 202
+bound and no effect. Oxide#151 later raises the expected total to its own 209
 pure + 40 real = 249 with the routing, marker, nested-window protection,
 bounded-sweep, qualify-entry and shared-ancestor/readiness cases below. Every quality fact here binds to the digests its own
 receipt records, never to the `#145` digests above.
@@ -2439,14 +2439,14 @@ runs in order:
   that a selected volume reports `<mount>/scratch/oxide` without creating it, and the
   owned leaf's privacy, ownership, device and canonical refusals with the
   refused leaf removed;
-- the owned scratch parent preparation on real owned fixtures: missing
-  `scratch`/`oxide` components created 0700 with nothing else created, already
-  safe components kept byte- and inode-identical, a concurrent creator's
-  component validated rather than adopted (including its 0755 refusal without
-  a chmod), and symlink, non-directory, non-private, foreign-owner,
-  other-device, unreadable, non-canonical, wrong-parent, wrong-mount and
-  non-selected-volume refusals that leave the component in place and create no
-  sibling;
+- the preparation seam's other invariants on real owned fixtures: an existing
+  safe private leaf kept byte- and inode-identical, a concurrent creator's leaf
+  validated rather than adopted (including its 0755 refusal without a chmod),
+  and symlink, non-directory, non-private, foreign-owner, other-device,
+  unreadable, non-canonical, wrong-parent, wrong-mount and non-selected-volume
+  refusals that leave the component in place and create no sibling. The shared
+  `<mount>/scratch` ancestor is never created: a missing one refuses with no
+  mkdir, and only the private `oxide` leaf is ever created (0700);
 - the owner marker through its real write and read seams: an initial marker
   round-trips privately (0600, no temporary file, null conclusion, running
   outcome), and every schema divergence fails closed — extra or missing field,
