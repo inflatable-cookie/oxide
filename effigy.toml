@@ -296,16 +296,42 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py ignore-safety"
 
-# Owned-output prune (oxide#129): one fixed 21-case native proof under the
-# qualified shared supervisor (360 s, 512 MiB monitored scratch, 30 s work
-# shutdown margin, one owned 128 MiB scratch image, ordinary detach). Fence and
-# initialization, root nonces, shared and cancelled reservations, snapshot,
-# overflow, eligibility, receiptless legacy roots, custody, containment, four
-# crash boundaries, completion diagnostics and resolve-intent. Each side's run
-# is a separately counted owner activation; `--plan` alone touches nothing.
+# Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
+# under the qualified shared supervisor (`scripts/bounded-test.py` SHA-256
+# 5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2,
+# oxide#147): 360 s, 512 MiB monitored scratch, 30 s work shutdown margin, one
+# owned 128 MiB scratch image, ordinary detach. Fence and initialization, root
+# nonces, shared and cancelled reservations, snapshot, overflow, eligibility,
+# receiptless legacy roots, custody, containment, four crash boundaries,
+# completion diagnostics, resolve-intent and the version-1 receipt scenario.
+# `--root-parent /private/tmp` is the owner-accepted internal-placement
+# exception (decision bd357a4c v4): cases 12 and 22 prove checkout absence on
+# the boot Data volume, and the fixture's internal directory pool is a genuine
+# internal pool the product correctly refuses on an external volume. The
+# supervisor monitors that same root. Each side's run is a separately counted
+# owner activation; `--plan` alone touches nothing.
 [tasks."rust:outputs-prune"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py"
+
+# The same fixed script in its opt-in keep-going diagnostic mode (oxide#152):
+# the same guard, internal root, limits, image and ordinary detach, with
+# `--diagnostic` appended. It records a bounded `qualified: false` receipt of
+# reached/completed/failed/dependent-skipped/unexecuted cases and the latched
+# first fault, continues only into dependency-independent cases, and aborts on
+# an unknown writer, device, custody, protocol, infrastructure, deadline or
+# receipt outcome. It is UNCOUNTED, never a PASS, and owner-activated only.
+[tasks."rust:outputs-prune:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py --diagnostic"
+
+# Pure, effect-free apparatus check for that proof: the same fixed script's
+# `--self-test` mode, which stages nothing, starts no child and touches no
+# fixture, pool or image. It drives the real case table, the counted
+# fail-fast dispatcher, the keep-going/taint/abort precedence and the bounded
+# unqualified receipt with synthetic bodies.
+[tasks."proof:outputs-prune:test"]
+run = "python3 scripts/test-outputs-prune.py --self-test"
 
 # Removable drive modes (oxide#116): under the qualified shared supervisor,
 # stages oxide offline and exercises versioned registration metadata,

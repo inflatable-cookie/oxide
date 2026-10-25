@@ -1,18 +1,31 @@
 #!/usr/bin/env python3
-"""Owned-output prune proof (oxide#129): the fixed 21-case native script.
+"""Owned-output prune proof (oxide#129, oxide#152): the fixed 22-case script.
 
-Run only as the Effigy heavy task `rust:outputs-prune`, whose whole command is
-`python3 scripts/bounded-test.py --limit 360 --scratch-budget-mib 512 --
-python3 scripts/test-outputs-prune.py` under the qualified shared supervisor
+Run only as an Effigy heavy task under the qualified shared supervisor
 (`scripts/bounded-test.py`, SHA-256
-d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e). The
-supervisor owns the 360 s deadline (root-approved one larger bound before
-any activation; the historical 300 s estimate is retained), the 512 MiB
-monitored scratch, process closure and cleanup; work stops 30 s before its
-exported deadline, and every case start and the ordinary detach check the
-remaining work window first. Activation
-is a separate counted owner gate for the author and for the Elevated
-reviewer; `--plan` prints the allocation and case list and touches nothing.
+5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2, the
+oxide#147 qualification; an earlier declaration named d89115f1, which is
+historical):
+
+  rust:outputs-prune             the counted proof (fail-fast)
+  rust:outputs-prune:diagnostic  the same script with `--diagnostic`
+  proof:outputs-prune:test       this script's pure `--self-test` mode
+
+Both heavy selectors are
+`python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360
+--scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py
+[--diagnostic]`. `--root-parent /private/tmp` is the owner-accepted
+internal-placement exception (decision bd357a4c v4): cases 12 and 22 prove
+checkout absence on the boot Data volume, and the fixture's directory pool is
+a genuine internal pool that the product correctly refuses on an external
+volume. The supervisor monitors that same root, owns the 360 s deadline
+(root-approved one larger bound; the historical 300 s estimate is retained),
+the 512 MiB monitored scratch, process closure and cleanup; work stops 30 s
+before its exported deadline, and every case start and the ordinary detach
+check the remaining work window first. `--diagnostic` is an UNCOUNTED
+keep-going collection that writes a bounded `qualified: false` receipt and is
+never a PASS; only ROOT activates it, and only after it does ROOT activate
+one counted author run. `--plan` and `--self-test` touch nothing.
 
 Static allocation (one 128 MiB owned APFS sparse image, private HOME,
 CARGO_HOME and directory pool; no real Builds drive, consumer, Windows,
@@ -157,8 +170,23 @@ exit codes and state assertions:
        supervisor scratch is not on the boot Data volume the legacy root stays
        kept and this case fails loudly rather than asserting a false pass.
 
-Not run here: an older binary refusing state version 3 (rust:installed-handoff
-covers the numeric peek), real-drive qualification, live inventory or cleanup.
+Nine-premise sweep (source fit, UNMEASURED): private `HOME`/`CARGO_HOME` with
+the invoking `RUSTUP_HOME`, `RUSTUP_AUTO_INSTALL=0` and `OXIDE_TEST_HOME_FROM_ENV=1`;
+`OXIDE_*`/`XDG_*`/`CARGO_*`/`GIT_*` scrubbed by `proof_env`; `CARGO_ENCODED_RUSTFLAGS`
+removed so the declared `RUSTFLAGS` are the only ones in force; the owned image
+attached with `hdiutil -owners on`; one ordinary detach with unknown custody
+left ambiguous; `mktemp` always with a template under owned scratch. Automatic
+adoption is not assumed: every converted checkout is adopted explicitly and
+each receipt state is asserted. No fake Cargo subcommand is used.
+
+Not run here: real-drive qualification, live inventory or cleanup. Case 01's
+older-binary fence control needs a preserved copy of binary sha256 bd52cb42…
+(pin d246d400, control state 2). At this head the pinned *receipt* exists at
+/Users/tom/.local/state/oxide/install/20261023T095314Z-d246d400f5cc.json but
+/Users/tom/.local/bin/oxide is now the 4df3dfd artifact, so that prerequisite
+is UNAVAILABLE: the case aborts naming it and must not be retargeted, stubbed
+or rebuilt. ROOT supplies the artifact or authorises the bounded pure-fence
+alternative.
 """
 
 from __future__ import annotations
@@ -169,6 +197,7 @@ sys.dont_write_bytecode = True
 
 import glob
 import hashlib
+import inspect
 import importlib.util
 import json
 import os
@@ -190,7 +219,7 @@ def _load(name: str, file: str):
     return module
 
 
-SUPERVISOR = "d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e"
+SUPERVISOR = "5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 22
@@ -228,6 +257,17 @@ OLD_SHA = "bd52cb42842c06451b0f8a9bc364ba7de74cfe6f014d33804890c4adbc51fc2b"
 OLD_BINARY_CAP = 8 * 1024 * 1024
 OLD_RECEIPT_CAP = 64 * 1024
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
+# The control state and fence this proof's head writes (src/bin/oxide/store.rs
+# STATE_VERSION / OWNED_OUTPUTS_FENCE) and the exact capability probe the staged
+# candidate must report. A bump is a deliberate proof correction, never a
+# silently accepted drift.
+CONTROL_STATE_VERSION = 4
+OWNED_OUTPUTS_FENCE = "oxide.outputs/3"
+CANDIDATE_CAPABILITY = {
+    "control_state_version": CONTROL_STATE_VERSION,
+    "registration_version": 2,
+    "test_controls": True,
+}
 HANDOFF_NOTICE = "handing off to the installed binary"
 # A build script that holds Cargo running until its gate releases it
 # (bounded at 60 s), so a writer is positively Running, not pre-launch.
@@ -261,6 +301,8 @@ def plan() -> int:
         print(f"  {count:>2}  {label}")
     assert sum(count for _, count in CASE_ALLOCATION) == CASES
     assert total == SCRATCH_MIB
+    print(f"diagnostic selector: rust:outputs-prune:diagnostic (uncounted, qualified=false)")
+    print("pure apparatus selector: proof:outputs-prune:test (--self-test, no child)")
     print("activation: separate counted owner gate per side; --plan touches nothing")
     return 0
 
@@ -271,11 +313,268 @@ handoff = None
 expect = fail = None
 
 
-def case(name: str) -> None:
-    # Every case starts inside the exported work window (fails otherwise).
-    permanent.work_left()
-    DONE.append(name)
-    print(f"===== case {len(DONE):02d}: {name} =====", flush=True)
+# ---------------------------------------------------------------------------
+# Case dispatch: counted fail-fast (the default) or the opt-in keep-going
+# diagnostic (`--diagnostic`, an uncounted collection that is never a PASS).
+# Both modes share this one table and dispatcher, so the diagnostic cannot
+# drift from the counted case order. The dispatcher adds no second supervisor,
+# session, process group or accounting harness: it only decides whether the
+# next case body inside this one run is executed, skipped or abandoned.
+# ---------------------------------------------------------------------------
+
+# (case id, dependency ids, failure leaves fixture state uncertain). A case
+# that moves the registry aside, leaves a reservation, writer or journal
+# behind, or rewrites the control documents taints the fixture, so a
+# keep-going run skips every later case rather than trusting it.
+CASE_PLAN = [
+    ("01", (), False),
+    ("02", ("01",), True),
+    ("03", ("01",), False),
+    ("04", ("01", "02"), True),
+    ("05", ("01", "04"), True),
+    ("06", ("01",), False),
+    ("07", ("01", "06"), True),
+    ("08", ("01", "07"), False),
+    ("09", ("01", "08"), False),
+    ("10", ("01", "09"), True),
+    ("11", ("01", "10"), True),
+    ("12", ("01", "10"), True),
+    ("13", ("01", "12"), True),
+    ("14", ("01", "12"), True),
+    ("15", ("01", "12"), True),
+    ("16", ("01", "12"), True),
+    ("17", ("01", "12", "16"), True),
+    ("18", ("01", "17"), False),
+    ("19", ("01", "18"), True),
+    ("20", ("01", "19"), True),
+    ("21", ("01", "20"), True),
+    ("22", ("01", "21"), True),
+]
+# The four crash boundaries run from one loop; each iteration is its own case.
+CRASH_CASES = {"intent": "13", "renamed": "14", "deleting": "15", "terminal": "16"}
+CASE_NAMES = [
+    "init: forward fence and ready registry",
+    "missing ready registry refuses and is never rebuilt",
+    "root nonce in marker, receipt and registry",
+    "identical starters share one reserved future-root nonce",
+    "cancelled reservation: the stale starter refuses before Cargo",
+    "dry run: canonical preview, digest, no mutation",
+    "malformed receipt keeps the whole batch",
+    "live checkout and live detached root kept",
+    "injected EACCES ancestor kept; genuine absence is a candidate; bad lists refuse",
+    "receiptless legacy root: exclusive pruning receipt, deleted",
+    "active writer keeps a vanished checkout's root",
+    "symlink root kept; symlink descendant stops deletion",
+    "crash after intent: pending, then exact replay",
+    "crash after rename: pending, then exact replay",
+    "crash during delete: pending, then exact replay",
+    "crash after registry terminal: pending, then exact replay",
+    "completion: terminal state, tombstone, observations, status",
+    "recreated checkout adopts a fresh root nonce",
+    "resolve-intent: both leaves absent",
+    "resolve-intent refuses while the quarantine is present",
+    "version-1 whole-target receipts: read for prune, never migrated",
+    "overflow: keep every root; tagged reservation binds with no row",
+]
+CASE_INDEX = {entry[0]: entry for entry in CASE_PLAN}
+assert len(CASE_PLAN) == len(CASE_NAMES) == CASES
+assert [entry[0] for entry in CASE_PLAN] == [f"{index:02d}" for index in range(1, CASES + 1)]
+for _id, _deps, _taints in CASE_PLAN:
+    assert all(dep in CASE_INDEX and dep < _id for dep in _deps), (_id, _deps)
+DIAGNOSTIC_RECEIPT_VERSION = "oxide.outputs-prune-diagnostic/1"
+MAX_DIAGNOSTIC_RECEIPT_BYTES = 32 * 1024
+MAX_FAULT_TEXT = 400
+
+
+class Aborted(Exception):
+    """A non-continuable outcome: custody, device, protocol, deadline or a
+    receipt/registry outcome that is not a case's own oracle."""
+
+
+class Skipped(Exception):
+    """The case body was not executed because a dependency failed or the
+    fixture is tainted; recorded, never counted as a pass."""
+
+
+def aborting(label: str, call):
+    """Run one custody/device/protocol/receipt seam so that its failure
+    aborts a keep-going run instead of being read as an oracle failure."""
+    try:
+        return call()
+    except Aborted:
+        raise
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as error:
+        raise Aborted(f"{label}: {type(error).__name__}: {error}") from error
+
+
+class Diagnostics:
+    """The case outcomes of one run, the latched first fault and the bounded
+    unqualified receipt of a diagnostic collection."""
+
+    def __init__(self, enabled: bool, source: str = "") -> None:
+        self.enabled = enabled
+        self.source = source
+        self.states: dict[str, str] = {}
+        self.details: dict[str, str] = {}
+        self.first_fault: str | None = None
+        self.aborted: str | None = None
+        self.taint: str | None = None
+        self.notes: list[str] = []
+
+    def name(self, case_id: str) -> str:
+        return CASE_NAMES[int(case_id) - 1]
+
+    def begin(self, case_id: str) -> None:
+        self.states[case_id] = "reached"
+        print(f"===== case {case_id}: {self.name(case_id)} =====", flush=True)
+
+    def blocked(self, case_id: str) -> str | None:
+        if self.taint is not None:
+            return f"{self.taint}, so the fixture is not trusted"
+        for dep in CASE_INDEX[case_id][1]:
+            if self.states.get(dep) != "completed":
+                return f"dependency {dep} did not complete ({self.states.get(dep, 'unreached')})"
+        return None
+
+    def completed(self, case_id: str) -> None:
+        self.states[case_id] = "completed"
+        DONE.append(self.name(case_id))
+
+    def skipped(self, case_id: str, reason: str) -> None:
+        self.states[case_id] = "skipped"
+        self.details[case_id] = reason[:MAX_FAULT_TEXT]
+
+    def failed(self, case_id: str, message: str) -> None:
+        text = f"case {case_id}: {message}"[:MAX_FAULT_TEXT]
+        self.states[case_id] = "failed"
+        self.details[case_id] = text
+        if self.first_fault is None:
+            self.first_fault = text
+        if CASE_INDEX[case_id][2]:
+            self.taint = f"case {case_id} left uncertain fixture, registry, writer or journal state"
+
+    def abort(self, case_id: str, message: str) -> None:
+        text = f"case {case_id}: {message}"[:MAX_FAULT_TEXT]
+        self.states[case_id] = "aborted"
+        self.details[case_id] = text
+        if self.first_fault is None:
+            self.first_fault = text
+        if self.aborted is None:
+            self.aborted = text
+
+    def exit(self, case_id: str, kind, value) -> bool:
+        """One case's outcome. Suppression is the ONLY keep-going mechanism:
+        the counted run never suppresses anything, so it stays fail-fast."""
+        if kind is None:
+            self.completed(case_id)
+            return False
+        if kind is Skipped:
+            return True
+        if kind is Aborted:
+            self.abort(case_id, str(value))
+            return False
+        message = str(value)
+        # The exported deadline is never an oracle failure.
+        if kind is RuntimeError and not message.startswith("work deadline"):
+            self.failed(case_id, message)
+            return self.enabled
+        self.abort(case_id, f"{type(value).__name__}: {message}")
+        return False
+
+    def results(self) -> list[dict]:
+        rows = []
+        for case_id, _deps, _taints in CASE_PLAN:
+            state = self.states.get(case_id, "unexecuted")
+            row = {"id": case_id, "name": self.name(case_id), "state": state}
+            if case_id in self.details:
+                row["detail"] = self.details[case_id]
+            rows.append(row)
+        return rows
+
+    def receipt(self) -> dict:
+        by_state: dict[str, list[str]] = {}
+        for row in self.results():
+            by_state.setdefault(row["state"], []).append(row["id"])
+        return {
+            "version": DIAGNOSTIC_RECEIPT_VERSION,
+            "qualified": False,
+            "mode": "diagnostic",
+            "source": self.source,
+            "declared_supervisor": SUPERVISOR,
+            "limits": {
+                "seconds": LIMIT_SECONDS,
+                "scratch_mib": SCRATCH_MIB,
+                "shutdown_margin_s": permanent_margin(),
+            },
+            "cases": self.results(),
+            "completed": by_state.get("completed", []),
+            "failed": by_state.get("failed", []),
+            "skipped": by_state.get("skipped", []),
+            "aborted": by_state.get("aborted", []),
+            "unexecuted": by_state.get("unexecuted", []),
+            "dependencies": {cid: list(deps) for cid, deps, _ in CASE_PLAN},
+            "first_fault": self.first_fault,
+            "abort_reason": self.aborted,
+            "taint": self.taint,
+            "notes": self.notes,
+            "observed_ms": int(time.time() * 1000),
+        }
+
+
+DIAG = Diagnostics(enabled=False)
+
+
+def permanent_margin() -> int:
+    """The recipe's declared cleanup margin, as the selectors declare it."""
+    return 30
+
+
+class _Case:
+    """`with case("07") as scope, scope.run():` runs one case body, or records
+    why it did not run. The inner `scope.run()` context manager raises
+    `Skipped` from its own `__enter__`, which this outer manager swallows, so
+    the next case in the same run is still reached."""
+
+    def __init__(self, case_id: str) -> None:
+        assert case_id in CASE_INDEX, case_id
+        self.case_id = case_id
+
+    def __enter__(self):
+        DIAG.begin(self.case_id)
+        try:
+            # Every case starts inside the exported work window.
+            permanent.work_left()
+        except RuntimeError as error:
+            DIAG.abort(self.case_id, str(error))
+            raise Aborted(str(error)) from error
+        return self
+
+    def run(self):
+        return _Skippable(self.case_id)
+
+    def __exit__(self, kind, value, tb) -> bool:
+        return DIAG.exit(self.case_id, kind, value)
+
+
+class _Skippable:
+    def __init__(self, case_id: str) -> None:
+        self.case_id = case_id
+
+    def __enter__(self):
+        reason = DIAG.blocked(self.case_id)
+        if reason is not None:
+            DIAG.skipped(self.case_id, reason)
+            raise Skipped(reason)
+        return self
+
+    def __exit__(self, kind, value, tb) -> bool:
+        return False
+
+
+def case(case_id: str) -> _Case:
+    return _Case(case_id)
 
 
 class World:
@@ -317,7 +616,13 @@ class World:
         return self.receipt(checkout)
 
     def receipt(self, checkout: str) -> dict:
-        return permanent.read_json(permanent.receipt_path(self.pool, checkout))
+        # A receipt outcome that cannot be read or parsed is never an oracle
+        # failure of the case that happens to read it: it aborts a keep-going
+        # diagnostic instead of being read as a pass or a plain fault.
+        return aborting(
+            f"receipt outcome for {checkout}",
+            lambda: permanent.read_json(permanent.receipt_path(self.pool, checkout)),
+        )
 
     def selected(self, checkout: str) -> dict:
         receipt = self.receipt(checkout)
@@ -339,7 +644,21 @@ class World:
         os.rename(away, checkout)
 
     def registry_doc(self) -> dict:
-        return permanent.read_json(self.registry)
+        return aborting("registry outcome", lambda: permanent.read_json(self.registry))
+
+    def finish(self, child, label: str) -> tuple:
+        """Finish one owned child: its custody is never an oracle failure."""
+        return aborting(f"child custody ({label})", lambda: permanent.finish_child(self.proof, child, label))
+
+    def attach(self, name: str) -> str:
+        """Attach this proof's one owned 128 MiB image, with ownership enabled
+        (premise 6) so the fixture's own roots and markers are read under the
+        same ownership rules as the product's removable pool."""
+        self.mount = aborting(
+            "image attach",
+            lambda: permanent.attach_image(self.proof, self.proof.root, name, owners=True),
+        )
+        return self.mount
 
     def version_one_fixture(self) -> dict:
         """Two whole-target `oxide.outputs.transition/1` receipts and their
@@ -481,11 +800,14 @@ class World:
         os.makedirs(self.gate, exist_ok=True)
         env = dict(self.proof.env)
         env["OXIDE_TEST_PAUSE"] = f"{point}:{gate}"
-        child = permanent.start_child(self.proof, [self.proof.binary, "check"], checkout, env)
+        child = aborting(
+            f"child custody ({label})",
+            lambda: permanent.start_child(self.proof, [self.proof.binary, "check"], checkout, env),
+        )
         deadline = time.monotonic() + min(60, permanent.work_left())
         while not glob.glob(f"{gate}.{point}-*"):
             if child.poll() is not None or time.monotonic() >= deadline:
-                code, out, err = permanent.finish_child(self.proof, child, label)
+                code, out, err = self.finish(child, label)
                 fail(f"{label}: never reached {point} (exit {code}): {err}")
             time.sleep(0.05)
         return child, gate
@@ -557,6 +879,26 @@ def copy_old_artifact(root: str) -> str:
     """Verify the exact receipt and installed binary, copy the binary into
     owned scratch and return the copy. Any mismatch fails; nothing is
     reinstalled, skipped or substituted."""
+    # An unavailable or substituted artifact is a PREREQUISITE failure, never
+    # an oracle outcome: it aborts a keep-going diagnostic and it is never
+    # skipped, stubbed or retargeted to whatever happens to be installed now.
+    try:
+        return _copy_old_artifact(root)
+    except Aborted:
+        raise
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as error:
+        raise Aborted(
+            "older-binary fence control: the exact pinned control-2 artifact is unavailable "
+            f"({type(error).__name__}: {error}); it needs a preserved copy of binary "
+            f"sha256 {OLD_SHA} (pin {OLD_PIN}) plus its receipt at a known audit path. "
+            "Nothing was substituted: ROOT must supply that artifact or authorise the "
+            "bounded pure-fence alternative"
+        ) from error
+
+
+def _copy_old_artifact(root: str) -> str:
     receipt_bytes, receipt_id = read_nofollow(OLD_RECEIPT, OLD_RECEIPT_CAP)
     receipt = json.loads(receipt_bytes)
     installed = receipt.get("installed", {})
@@ -621,13 +963,18 @@ def run(proof, repo: str) -> None:
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    DIAG.source = source
     name = "OxPr" + secrets.token_hex(4)
     mount = f"/Volumes/{name}"
     expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
     print(f"outputs-prune proof {os.getpid()} source {source} mount {mount}", flush=True)
     proof.phase("start")
 
-    proof.binary = handoff.stage_subject(proof.root)
+    # The staged candidate's compiled capabilities, pinned exactly for THIS
+    # head: state version 4 and the `oxide.outputs/3` owned-outputs fence,
+    # debug-only proof controls. The shared helper's default stays unchanged
+    # for its other caller.
+    proof.binary = handoff.stage_subject(proof.root, capability=CANDIDATE_CAPABILITY)
     proof.phase("after staging")
 
     world = World(proof, proof.root)
@@ -636,6 +983,9 @@ def run(proof, repo: str) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = permanent.proof_env(world.pool, home, cargo_home)
+    # Premise 7: the declared flags are the only ones in force. An inherited
+    # encoded value would silently override them in every fixture Cargo call.
+    proof.env.pop("CARGO_ENCODED_RUSTFLAGS", None)
 
     # The pre-registration first build runs in a distinct bootstrap checkout
     # (its real ephemeral target is expected); alpha is created only after
@@ -643,7 +993,7 @@ def run(proof, repo: str) -> None:
     bootstrap = world.checkout("bootstrap")
     code, _, stderr = world.oxide(["check"], "first build creates the internal pool", bootstrap)
     expect(code == 0, stderr)
-    world.mount = permanent.attach_image(proof, proof.root, name)
+    world.mount = world.attach(name)
     expect(world.mount == mount, f"mounted at {world.mount}, not {mount}")
     code, stdout, stderr = world.oxide(
         ["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB", "--mode", "permanent"],
@@ -657,342 +1007,348 @@ def run(proof, repo: str) -> None:
     proof.phase("after registration")
 
     # ---- fence / init ------------------------------------------------------
-    case("init: forward fence and ready registry")
-    # The version-1 fixture (case 22) must exist before the registry does, so
-    # the product's own bounded receipt seed records its legacy rows. No
-    # registry or row is written by hand.
-    world.version_one = world.version_one_fixture()
-    world.adopt(alpha)
-    for control in (world.control, os.path.join(world.control, "removable", "oxide-managed")):
-        state_file = os.path.join(control, "state.json")
-        expect(os.path.isfile(state_file), f"paired control state {state_file} is missing")
-        state = permanent.read_json(state_file)
-        expect(state["version"] == 3, f"{control}: state version {state['version']}")
-        expect(state.get("owned_outputs") == "oxide.outputs/2", f"{control}: {state.get('owned_outputs')}")
-        expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
-    registry = world.registry_doc()
-    expect(registry["version"] == "oxide.outputs.registry/1" and registry.get("schema") == 1 and registry["complete"], registry)
-    # Older-binary fence control: the exact d246d400 artifact's copy reports
-    # control state 2, then its `check` and `outputs adopt` in this fixture
-    # (private HOME without any install receipt, private CARGO_HOME, pool and
-    # registration) both refuse before any effect.
-    old = copy_old_artifact(proof.root)
-    probe = proof.run([old, CAPABILITIES_PROBE], cwd=alpha, env=proof.env, timeout=30)
-    expect(probe.returncode == 0, f"old capability probe exit {probe.returncode}")
-    expect(json.loads(probe.stdout).get("control_state_version") == 2, f"old probe {probe.stdout!r}")
-    watched = [world.pool, os.path.join(mount, "oxide-outputs"), alpha]
-    before = [tree_snapshot(path) for path in watched]
-    for args in (["check"], ["outputs", "adopt"]):
-        result = proof.run([old, *args], cwd=alpha, env=proof.env, timeout=30)
-        stderr = result.stderr.decode(errors="replace")
-        print(f"----- old binary {args}: exit {result.returncode} -----\n{stderr}", flush=True)
-        expect(result.returncode != 0, f"the older binary's {args} did not refuse")
-        expect(HANDOFF_NOTICE not in stderr, f"the older binary's {args} selected a handoff; STOP")
-        expect(OLD_BINARY not in stderr and "/.local/state/oxide" not in stderr, f"a host path appeared: {stderr}")
-        expect([tree_snapshot(path) for path in watched] == before, f"the older binary's {args} changed fixture state")
+    with case("01") as scope, scope.run():
+        # The version-1 fixture (case 22) must exist before the registry does, so
+        # the product's own bounded receipt seed records its legacy rows. No
+        # registry or row is written by hand.
+        world.version_one = world.version_one_fixture()
+        world.adopt(alpha)
+        for control in (world.control, os.path.join(world.control, "removable", "oxide-managed")):
+            state_file = os.path.join(control, "state.json")
+            expect(os.path.isfile(state_file), f"paired control state {state_file} is missing")
+            state = permanent.read_json(state_file)
+            # The current control format at this head (store.rs STATE_VERSION and
+            # OWNED_OUTPUTS_FENCE): a bump fails this proof loudly instead of
+            # letting it check a stale format.
+            expect(state["version"] == CONTROL_STATE_VERSION, f"{control}: state version {state['version']}")
+            expect(
+                state.get("owned_outputs") == OWNED_OUTPUTS_FENCE,
+                f"{control}: {state.get('owned_outputs')}",
+            )
+            expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
+        registry = world.registry_doc()
+        expect(registry["version"] == "oxide.outputs.registry/1" and registry.get("schema") == 1 and registry["complete"], registry)
+        # Older-binary fence control: the exact d246d400 artifact's copy reports
+        # control state 2, then its `check` and `outputs adopt` in this fixture
+        # (private HOME without any install receipt, private CARGO_HOME, pool and
+        # registration) both refuse before any effect.
+        old = copy_old_artifact(proof.root)
+        probe = proof.run([old, CAPABILITIES_PROBE], cwd=alpha, env=proof.env, timeout=30)
+        expect(probe.returncode == 0, f"old capability probe exit {probe.returncode}")
+        expect(json.loads(probe.stdout).get("control_state_version") == 2, f"old probe {probe.stdout!r}")
+        watched = [world.pool, os.path.join(mount, "oxide-outputs"), alpha]
+        before = [tree_snapshot(path) for path in watched]
+        for args in (["check"], ["outputs", "adopt"]):
+            result = proof.run([old, *args], cwd=alpha, env=proof.env, timeout=30)
+            stderr = result.stderr.decode(errors="replace")
+            print(f"----- old binary {args}: exit {result.returncode} -----\n{stderr}", flush=True)
+            expect(result.returncode != 0, f"the older binary's {args} did not refuse")
+            expect(HANDOFF_NOTICE not in stderr, f"the older binary's {args} selected a handoff; STOP")
+            expect(OLD_BINARY not in stderr and "/.local/state/oxide" not in stderr, f"a host path appeared: {stderr}")
+            expect([tree_snapshot(path) for path in watched] == before, f"the older binary's {args} changed fixture state")
 
-    case("missing ready registry refuses and is never rebuilt")
-    saved = permanent.read_bytes(world.registry)
-    os.rename(world.registry, world.registry + ".aside")
-    code, _, stderr = world.dry_run("dry run without the registry", alpha)
-    expect(code == 2, f"dry run without the registry exited {code}")
-    beta = world.checkout("beta")
-    code, _, stderr = world.oxide(["outputs", "adopt"], "adopt without the registry", beta)
-    expect(code != 0, "adopt succeeded without the registry")
-    expect(not os.path.exists(world.registry), "the registry was rebuilt")
-    os.rename(world.registry + ".aside", world.registry)
-    expect(permanent.read_bytes(world.registry) == saved, "registry bytes changed")
-    proof.phase("after fence cases")
+    with case("02") as scope, scope.run():
+        saved = permanent.read_bytes(world.registry)
+        os.rename(world.registry, world.registry + ".aside")
+        code, _, stderr = world.dry_run("dry run without the registry", alpha)
+        expect(code == 2, f"dry run without the registry exited {code}")
+        beta = world.checkout("beta")
+        code, _, stderr = world.oxide(["outputs", "adopt"], "adopt without the registry", beta)
+        expect(code != 0, "adopt succeeded without the registry")
+        expect(not os.path.exists(world.registry), "the registry was rebuilt")
+        os.rename(world.registry + ".aside", world.registry)
+        expect(permanent.read_bytes(world.registry) == saved, "registry bytes changed")
+        proof.phase("after fence cases")
 
     # ---- nonce / reservation ----------------------------------------------
-    case("root nonce in marker, receipt and registry")
-    selected = world.selected(alpha)
-    root_marker = marker(selected["root"])
-    expect(root_marker["version"] == "oxide.outputs.root/2", root_marker)
-    nonce = root_marker["nonce"]
-    expect(len(nonce) == 32 and all(c in "0123456789abcdef" for c in nonce), nonce)
-    expect(selected.get("nonce") == nonce, f"receipt nonce {selected.get('nonce')} != {nonce}")
-    rows = [row for row in world.registry_doc()["rows"] if row["root"] == selected["root"]]
-    expect(len(rows) == 1 and rows[0]["nonce"] == nonce and rows[0]["selected"], rows)
+    with case("03") as scope, scope.run():
+        selected = world.selected(alpha)
+        root_marker = marker(selected["root"])
+        expect(root_marker["version"] == "oxide.outputs.root/2", root_marker)
+        nonce = root_marker["nonce"]
+        expect(len(nonce) == 32 and all(c in "0123456789abcdef" for c in nonce), nonce)
+        expect(selected.get("nonce") == nonce, f"receipt nonce {selected.get('nonce')} != {nonce}")
+        rows = [row for row in world.registry_doc()["rows"] if row["root"] == selected["root"]]
+        expect(len(rows) == 1 and rows[0]["nonce"] == nonce and rows[0]["selected"], rows)
 
-    case("identical starters share one reserved future-root nonce")
-    world.adopt(beta)
-    permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
-    first, first_gate = world.paused(beta, "keyed", "starter one")
-    second, second_gate = world.paused(beta, "keyed", "starter two")
-    reserved = world.receipt(beta)["links"][0].get("reserved")
-    expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
-    expect(reserved["kind"] == "local", reserved)
-    # Both starters keyed the same reserved nonce, before either proceeds.
-    first_key, second_key = keyed_destination(first_gate), keyed_destination(second_gate)
-    expect(first_key == second_key and reserved["nonce"] in first_key, f"keys {first_key!r} / {second_key!r}")
-    release(first_gate)
-    release(second_gate)
-    for child, label in ((first, "starter one"), (second, "starter two")):
-        code, _, stderr = permanent.finish_child(proof, child, label)
-        expect(code == 0, f"{label} failed: {stderr}")
-    local_root = reserved["root"]
-    expect(marker(local_root)["nonce"] == reserved["nonce"], "the created root does not carry the reserved nonce")
-    expect(world.receipt(beta)["links"][0].get("reserved") is None, "the reservation was not consumed")
-    permanent.set_recorded_uuid(world.pool, good)
+    with case("04") as scope, scope.run():
+        world.adopt(beta)
+        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+        first, first_gate = world.paused(beta, "keyed", "starter one")
+        second, second_gate = world.paused(beta, "keyed", "starter two")
+        reserved = world.receipt(beta)["links"][0].get("reserved")
+        expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
+        expect(reserved["kind"] == "local", reserved)
+        # Both starters keyed the same reserved nonce, before either proceeds.
+        first_key, second_key = keyed_destination(first_gate), keyed_destination(second_gate)
+        expect(first_key == second_key and reserved["nonce"] in first_key, f"keys {first_key!r} / {second_key!r}")
+        release(first_gate)
+        release(second_gate)
+        for child, label in ((first, "starter one"), (second, "starter two")):
+            code, _, stderr = world.finish(child, label)
+            expect(code == 0, f"{label} failed: {stderr}")
+        local_root = reserved["root"]
+        expect(marker(local_root)["nonce"] == reserved["nonce"], "the created root does not carry the reserved nonce")
+        expect(world.receipt(beta)["links"][0].get("reserved") is None, "the reservation was not consumed")
+        permanent.set_recorded_uuid(world.pool, good)
 
-    case("cancelled reservation: the stale starter refuses before Cargo")
-    gamma = world.checkout("gamma")
-    world.adopt(gamma)
-    permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
-    stale, stale_gate = world.paused(gamma, "keyed", "stale starter")
-    reserved = world.receipt(gamma)["links"][0]["reserved"]
-    expect(reserved["nonce"] in keyed_destination(stale_gate), "the stale starter did not key the reserved nonce")
-    code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
-    expect(code == 0 and "cancelled" in stdout, stdout + stderr)
-    expect(world.receipt(gamma)["links"][0].get("reserved") is None, "the receipt kept the reservation")
-    expect(
-        not any(row.get("reservation") == reserved["id"] or row.get("cancelling") for row in world.registry_doc()["rows"]),
-        "the cancelled reservation's row remains",
-    )
-    release(stale_gate)
-    code, _, stderr = permanent.finish_child(proof, stale, "stale starter")
-    expect(code != 0 and "cancelled or replaced" in stderr, f"stale starter exit {code}: {stderr}")
-    expect(not os.path.lexists(reserved["root"]), "the cancelled root was created")
-    permanent.set_recorded_uuid(world.pool, good)
-    proof.phase("after reservation cases")
+    with case("05") as scope, scope.run():
+        gamma = world.checkout("gamma")
+        world.adopt(gamma)
+        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+        stale, stale_gate = world.paused(gamma, "keyed", "stale starter")
+        reserved = world.receipt(gamma)["links"][0]["reserved"]
+        expect(reserved["nonce"] in keyed_destination(stale_gate), "the stale starter did not key the reserved nonce")
+        code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
+        expect(code == 0 and "cancelled" in stdout, stdout + stderr)
+        expect(world.receipt(gamma)["links"][0].get("reserved") is None, "the receipt kept the reservation")
+        expect(
+            not any(row.get("reservation") == reserved["id"] or row.get("cancelling") for row in world.registry_doc()["rows"]),
+            "the cancelled reservation's row remains",
+        )
+        release(stale_gate)
+        code, _, stderr = world.finish(stale, "stale starter")
+        expect(code != 0 and "cancelled or replaced" in stderr, f"stale starter exit {code}: {stderr}")
+        expect(not os.path.lexists(reserved["root"]), "the cancelled root was created")
+        permanent.set_recorded_uuid(world.pool, good)
+        proof.phase("after reservation cases")
 
     # ---- registry / snapshot ----------------------------------------------
-    case("dry run: canonical preview, digest, no mutation")
-    before = tree_bytes(world.control)
-    volume_before = tree_bytes(os.path.join(mount, "oxide-outputs"))
-    expect("outputs/registry.json" in before and len(volume_before) > 0, "the byte oracle saw nothing")
-    path, sha, preview = world.plan_file("dry run", alpha)
-    expect(preview["version"] == "oxide.outputs.prune-preview/1", preview["version"])
-    expect(tree_bytes(world.control) == before, "a dry run changed control bytes")
-    expect(tree_bytes(os.path.join(mount, "oxide-outputs")) == volume_before, "a dry run changed volume bytes")
+    with case("06") as scope, scope.run():
+        before = tree_bytes(world.control)
+        volume_before = tree_bytes(os.path.join(mount, "oxide-outputs"))
+        expect("outputs/registry.json" in before and len(volume_before) > 0, "the byte oracle saw nothing")
+        path, sha, preview = world.plan_file("dry run", alpha)
+        expect(preview["version"] == "oxide.outputs.prune-preview/1", preview["version"])
+        expect(tree_bytes(world.control) == before, "a dry run changed control bytes")
+        expect(tree_bytes(os.path.join(mount, "oxide-outputs")) == volume_before, "a dry run changed volume bytes")
 
-    case("malformed receipt keeps the whole batch")
-    delta = world.checkout("delta")
-    world.adopt(delta)
-    delta_root = world.selected(delta)["root"]
-    delta_away = world.vanish(delta)
-    gamma_receipt = permanent.receipt_path(world.pool, gamma)
-    saved_receipt = permanent.read_bytes(gamma_receipt)
-    with open(gamma_receipt, "wb") as handle:
-        handle.write(b"{corrupt")
-    code, stdout, _ = world.dry_run("dry run with a corrupt receipt", alpha)
-    preview = json.loads(stdout)
-    expect(code == 0 and not preview["candidates"], f"candidates despite a corrupt receipt: {preview['candidates']}")
-    expect("whole batch" in world.kept(preview, delta_root), world.kept(preview, delta_root))
-    with open(gamma_receipt, "wb") as handle:
-        handle.write(saved_receipt)
+    with case("07") as scope, scope.run():
+        delta = world.checkout("delta")
+        world.adopt(delta)
+        delta_root = world.selected(delta)["root"]
+        delta_away = world.vanish(delta)
+        gamma_receipt = permanent.receipt_path(world.pool, gamma)
+        saved_receipt = permanent.read_bytes(gamma_receipt)
+        with open(gamma_receipt, "wb") as handle:
+            handle.write(b"{corrupt")
+        code, stdout, _ = world.dry_run("dry run with a corrupt receipt", alpha)
+        preview = json.loads(stdout)
+        expect(code == 0 and not preview["candidates"], f"candidates despite a corrupt receipt: {preview['candidates']}")
+        expect("whole batch" in world.kept(preview, delta_root), world.kept(preview, delta_root))
+        with open(gamma_receipt, "wb") as handle:
+            handle.write(saved_receipt)
 
     # ---- eligibility --------------------------------------------------------
-    case("live checkout and live detached root kept")
-    _, _, preview = world.plan_file("eligibility dry run", alpha)
-    expect(world.candidates(preview) == {delta_root}, f"candidates {world.candidates(preview)}")
-    expect("present" in world.kept(preview, world.selected(alpha)["root"]), "alpha not kept as present")
-    epsilon = world.checkout("epsilon")
-    epsilon_root = world.adopt(epsilon)["links"][0]["selected"]["root"]
-    code, _, stderr = world.oxide(["outputs", "detach"], "detach epsilon", epsilon)
-    expect(code == 0, stderr)
-    _, _, preview = world.plan_file("live detached dry run", alpha)
-    expect(epsilon_root not in world.candidates(preview), "a live detached root became a candidate")
-    expect("present" in world.kept(preview, epsilon_root), world.kept(preview, epsilon_root))
-    # The same released root becomes eligible once its checkout is gone.
-    epsilon_away = world.vanish(epsilon)
-    _, _, preview = world.plan_file("released vanished dry run", alpha)
-    expect(epsilon_root in world.candidates(preview), f"a released vanished root was kept: {world.kept(preview, epsilon_root)}")
-    world.restore(epsilon, epsilon_away)
+    with case("08") as scope, scope.run():
+        _, _, preview = world.plan_file("eligibility dry run", alpha)
+        expect(world.candidates(preview) == {delta_root}, f"candidates {world.candidates(preview)}")
+        expect("present" in world.kept(preview, world.selected(alpha)["root"]), "alpha not kept as present")
+        epsilon = world.checkout("epsilon")
+        epsilon_root = world.adopt(epsilon)["links"][0]["selected"]["root"]
+        code, _, stderr = world.oxide(["outputs", "detach"], "detach epsilon", epsilon)
+        expect(code == 0, stderr)
+        _, _, preview = world.plan_file("live detached dry run", alpha)
+        expect(epsilon_root not in world.candidates(preview), "a live detached root became a candidate")
+        expect("present" in world.kept(preview, epsilon_root), world.kept(preview, epsilon_root))
+        # The same released root becomes eligible once its checkout is gone.
+        epsilon_away = world.vanish(epsilon)
+        _, _, preview = world.plan_file("released vanished dry run", alpha)
+        expect(epsilon_root in world.candidates(preview), f"a released vanished root was kept: {world.kept(preview, epsilon_root)}")
+        world.restore(epsilon, epsilon_away)
 
-    # A registered checkout on the attached image: absence is proved through
-    # the verified mount and its recorded volume UUID (the /Volumes branch).
-    omega = world.checkout("omega", base=mount)
-    omega_root = world.adopt(omega)["links"][0]["selected"]["root"]
-    omega_away = world.vanish(omega)
-    _, _, preview = world.plan_file("registered image checkout dry run", alpha)
-    expect(omega_root in world.candidates(preview), f"a registered /Volumes checkout was kept: {world.kept(preview, omega_root)}")
-    world.restore(omega, omega_away)
+        # A registered checkout on the attached image: absence is proved through
+        # the verified mount and its recorded volume UUID (the /Volumes branch).
+        omega = world.checkout("omega", base=mount)
+        omega_root = world.adopt(omega)["links"][0]["selected"]["root"]
+        omega_away = world.vanish(omega)
+        _, _, preview = world.plan_file("registered image checkout dry run", alpha)
+        expect(omega_root in world.candidates(preview), f"a registered /Volumes checkout was kept: {world.kept(preview, omega_root)}")
+        world.restore(omega, omega_away)
 
-    case("injected EACCES ancestor kept; genuine absence is a candidate; bad lists refuse")
-    # No real unreadable directory: a debug-only EACCES is injected inside the
-    # supervisor-owned scratch, its firing is recorded in the evidence
-    # directory, and the same fixture without injection is genuine absence.
-    locked = os.path.realpath(os.path.join(proof.root, "locked"))
-    os.makedirs(locked)
-    eta = os.path.join(locked, "eta")
-    shutil.move(world.checkout("eta-src"), eta)
-    eta_root = world.adopt(eta)["links"][0]["selected"]["root"]
-    eta_away = world.vanish(eta)
-    fired = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "prune-eacces-fired")
-    expect(not os.path.exists(fired), "the EACCES marker exists before injection")
-    _, _, preview = world.plan_file("injected EACCES dry run", alpha, extra={"OXIDE_TEST_PRUNE_EACCES": locked})
-    expect(eta_root not in world.candidates(preview), "an injected unreadable ancestor became absence")
-    reason = world.kept(preview, eta_root)
-    expect("unknown" in reason and "Permission denied" in reason, reason)
-    expect(os.path.isfile(fired) and locked in permanent.read_bytes(fired).decode(), "the EACCES injection did not fire")
-    _, _, preview = world.plan_file("genuine absence control dry run", alpha)
-    expect(eta_root in world.candidates(preview), f"genuine absence not a candidate: {world.kept(preview, eta_root)}")
-    world.restore(eta, eta_away)
-    for label, body in (("relative", '["relative/root"]'), ("duplicate", json.dumps([delta_root, delta_root]))):
-        listed = os.path.join(proof.root, f"list-{label}.json")
+    with case("09") as scope, scope.run():
+        # No real unreadable directory: a debug-only EACCES is injected inside the
+        # supervisor-owned scratch, its firing is recorded in the evidence
+        # directory, and the same fixture without injection is genuine absence.
+        locked = os.path.realpath(os.path.join(proof.root, "locked"))
+        os.makedirs(locked)
+        eta = os.path.join(locked, "eta")
+        shutil.move(world.checkout("eta-src"), eta)
+        eta_root = world.adopt(eta)["links"][0]["selected"]["root"]
+        eta_away = world.vanish(eta)
+        fired = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "prune-eacces-fired")
+        expect(not os.path.exists(fired), "the EACCES marker exists before injection")
+        _, _, preview = world.plan_file("injected EACCES dry run", alpha, extra={"OXIDE_TEST_PRUNE_EACCES": locked})
+        expect(eta_root not in world.candidates(preview), "an injected unreadable ancestor became absence")
+        reason = world.kept(preview, eta_root)
+        expect("unknown" in reason and "Permission denied" in reason, reason)
+        expect(os.path.isfile(fired) and locked in permanent.read_bytes(fired).decode(), "the EACCES injection did not fire")
+        _, _, preview = world.plan_file("genuine absence control dry run", alpha)
+        expect(eta_root in world.candidates(preview), f"genuine absence not a candidate: {world.kept(preview, eta_root)}")
+        world.restore(eta, eta_away)
+        for label, body in (("relative", '["relative/root"]'), ("duplicate", json.dumps([delta_root, delta_root]))):
+            listed = os.path.join(proof.root, f"list-{label}.json")
+            with open(listed, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            code, _, _ = world.dry_run(f"{label} operator list", alpha, listed)
+            expect(code == 2, f"{label} operator list exited {code}")
+
+    with case("10") as scope, scope.run():
+        legacy_checkout = os.path.join(proof.root, "never", "legacy-app")
+        os.makedirs(os.path.dirname(legacy_checkout))
+        legacy_id = hashlib.sha256(legacy_checkout.encode()).hexdigest()
+        legacy_root = os.path.join(mount, "oxide-outputs", "legacy-" + legacy_id[:8])
+        os.makedirs(legacy_root, mode=0o700)
+        os.chmod(legacy_root, 0o700)
+        legacy_marker = dict(marker(world.selected(alpha)["root"]))
+        legacy_marker.pop("nonce", None)
+        legacy_marker.pop("checkout_volume_uuid", None)
+        legacy_marker.update({"version": "oxide.outputs.root/1", "checkout": legacy_checkout, "checkout_id": legacy_id, "generation": 1})
+        with open(os.path.join(legacy_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
+            json.dump(legacy_marker, handle)
+        with open(os.path.join(legacy_root, "artifact"), "wb") as handle:
+            handle.write(b"x" * 4096)
+        # A second legacy root whose recorded checkout is on the separately
+        # attached scratch image (not the boot Data volume): kept.
+        image_checkout = os.path.join(mount, "never", "image-app")
+        image_id = hashlib.sha256(image_checkout.encode()).hexdigest()
+        image_root = os.path.join(mount, "oxide-outputs", "legacy-" + image_id[:8])
+        os.makedirs(image_root, mode=0o700)
+        os.chmod(image_root, 0o700)
+        image_marker = dict(legacy_marker)
+        image_marker.update({"checkout": image_checkout, "checkout_id": image_id})
+        with open(os.path.join(image_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
+            json.dump(image_marker, handle)
+        # A foreign directory (no marker) and a marker whose checkout identity
+        # is not the digest of its checkout path: both kept, bytes unchanged.
+        foreign_root = os.path.join(mount, "oxide-outputs", "foreign-dir")
+        os.makedirs(foreign_root, mode=0o700)
+        with open(os.path.join(foreign_root, "data"), "wb") as handle:
+            handle.write(b"foreign")
+        forged_root = os.path.join(mount, "oxide-outputs", "legacy-forged")
+        os.makedirs(forged_root, mode=0o700)
+        os.chmod(forged_root, 0o700)
+        forged_marker = dict(legacy_marker)
+        forged_marker.update({"checkout": os.path.join(proof.root, "never", "forged"), "checkout_id": "f" * 64})
+        with open(os.path.join(forged_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
+            json.dump(forged_marker, handle)
+        kept_before = {root: tree_bytes(root) for root in (foreign_root, forged_root, image_root)}
+        listed = os.path.join(proof.root, "list-legacy.json")
         with open(listed, "w", encoding="utf-8") as handle:
-            handle.write(body)
-        code, _, _ = world.dry_run(f"{label} operator list", alpha, listed)
-        expect(code == 2, f"{label} operator list exited {code}")
-
-    case("receiptless legacy root: exclusive pruning receipt, deleted")
-    legacy_checkout = os.path.join(proof.root, "never", "legacy-app")
-    os.makedirs(os.path.dirname(legacy_checkout))
-    legacy_id = hashlib.sha256(legacy_checkout.encode()).hexdigest()
-    legacy_root = os.path.join(mount, "oxide-outputs", "legacy-" + legacy_id[:8])
-    os.makedirs(legacy_root, mode=0o700)
-    os.chmod(legacy_root, 0o700)
-    legacy_marker = dict(marker(world.selected(alpha)["root"]))
-    legacy_marker.pop("nonce", None)
-    legacy_marker.pop("checkout_volume_uuid", None)
-    legacy_marker.update({"version": "oxide.outputs.root/1", "checkout": legacy_checkout, "checkout_id": legacy_id, "generation": 1})
-    with open(os.path.join(legacy_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
-        json.dump(legacy_marker, handle)
-    with open(os.path.join(legacy_root, "artifact"), "wb") as handle:
-        handle.write(b"x" * 4096)
-    # A second legacy root whose recorded checkout is on the separately
-    # attached scratch image (not the boot Data volume): kept.
-    image_checkout = os.path.join(mount, "never", "image-app")
-    image_id = hashlib.sha256(image_checkout.encode()).hexdigest()
-    image_root = os.path.join(mount, "oxide-outputs", "legacy-" + image_id[:8])
-    os.makedirs(image_root, mode=0o700)
-    os.chmod(image_root, 0o700)
-    image_marker = dict(legacy_marker)
-    image_marker.update({"checkout": image_checkout, "checkout_id": image_id})
-    with open(os.path.join(image_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
-        json.dump(image_marker, handle)
-    # A foreign directory (no marker) and a marker whose checkout identity
-    # is not the digest of its checkout path: both kept, bytes unchanged.
-    foreign_root = os.path.join(mount, "oxide-outputs", "foreign-dir")
-    os.makedirs(foreign_root, mode=0o700)
-    with open(os.path.join(foreign_root, "data"), "wb") as handle:
-        handle.write(b"foreign")
-    forged_root = os.path.join(mount, "oxide-outputs", "legacy-forged")
-    os.makedirs(forged_root, mode=0o700)
-    os.chmod(forged_root, 0o700)
-    forged_marker = dict(legacy_marker)
-    forged_marker.update({"checkout": os.path.join(proof.root, "never", "forged"), "checkout_id": "f" * 64})
-    with open(os.path.join(forged_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
-        json.dump(forged_marker, handle)
-    kept_before = {root: tree_bytes(root) for root in (foreign_root, forged_root, image_root)}
-    listed = os.path.join(proof.root, "list-legacy.json")
-    with open(listed, "w", encoding="utf-8") as handle:
-        json.dump([legacy_root, image_root, foreign_root, forged_root], handle)
-    # Delta (an ordinary eligible root) is present for this run so only the
-    # listed legacy roots are candidates; it vanishes again afterwards.
-    world.restore(delta, delta_away)
-    plan, sha, preview = world.plan_file("legacy dry run", alpha, listed)
-    expect(legacy_root in world.candidates(preview), f"legacy root not a candidate: {world.kept(preview, legacy_root)}")
-    expect(image_root not in world.candidates(preview), "a legacy root of an image checkout became a candidate")
-    expect("volume" in world.kept(preview, image_root), world.kept(preview, image_root))
-    expect(foreign_root not in world.candidates(preview), "a foreign directory became a candidate")
-    expect("digest" in world.kept(preview, forged_root), world.kept(preview, forged_root))
-    code, stdout, stderr = world.real_run("legacy real run", alpha, plan, sha, listed)
-    expect(code == 0, f"legacy real run exited {code}: {stderr}")
-    expect(not os.path.lexists(legacy_root), "the legacy root remains")
-    expect(os.path.isdir(image_root), "the kept image-checkout legacy root was deleted")
-    delta_away = world.vanish(delta)
-    for root, digest in kept_before.items():
-        expect(tree_bytes(root) == digest, f"kept listed root {root} changed")
-    legacy_receipt = permanent.read_json(permanent.receipt_file(world.pool, legacy_checkout))
-    expect(legacy_receipt["state"] == "pruned" and legacy_receipt["pruned"]["outcome"] == "deleted", legacy_receipt)
-    proof.phase("after eligibility cases")
+            json.dump([legacy_root, image_root, foreign_root, forged_root], handle)
+        # Delta (an ordinary eligible root) is present for this run so only the
+        # listed legacy roots are candidates; it vanishes again afterwards.
+        world.restore(delta, delta_away)
+        plan, sha, preview = world.plan_file("legacy dry run", alpha, listed)
+        expect(legacy_root in world.candidates(preview), f"legacy root not a candidate: {world.kept(preview, legacy_root)}")
+        expect(image_root not in world.candidates(preview), "a legacy root of an image checkout became a candidate")
+        expect("volume" in world.kept(preview, image_root), world.kept(preview, image_root))
+        expect(foreign_root not in world.candidates(preview), "a foreign directory became a candidate")
+        expect("digest" in world.kept(preview, forged_root), world.kept(preview, forged_root))
+        code, stdout, stderr = world.real_run("legacy real run", alpha, plan, sha, listed)
+        expect(code == 0, f"legacy real run exited {code}: {stderr}")
+        expect(not os.path.lexists(legacy_root), "the legacy root remains")
+        expect(os.path.isdir(image_root), "the kept image-checkout legacy root was deleted")
+        delta_away = world.vanish(delta)
+        for root, digest in kept_before.items():
+            expect(tree_bytes(root) == digest, f"kept listed root {root} changed")
+        legacy_receipt = permanent.read_json(permanent.receipt_file(world.pool, legacy_checkout))
+        expect(legacy_receipt["state"] == "pruned" and legacy_receipt["pruned"]["outcome"] == "deleted", legacy_receipt)
+        proof.phase("after eligibility cases")
 
     # ---- custody / containment -------------------------------------------
-    case("active writer keeps a vanished checkout's root")
-    theta = world.checkout("theta")
-    with open(os.path.join(theta, "build.rs"), "w", encoding="utf-8") as handle:
-        handle.write(GATED_BUILD)
-    theta_root = world.adopt(theta)["links"][0]["selected"]["root"]
-    writer_gate = os.path.join(proof.root, "writer-gate")
-    os.makedirs(writer_gate)
-    writer_env = dict(proof.env)
-    writer_env["PRUNE_GATE"] = writer_gate
-    writer = permanent.start_child(proof, [proof.binary, "check"], theta, writer_env)
-    permanent.wait_for(os.path.join(writer_gate, "started"), "running writer")
-    theta_away = world.vanish(theta)
-    _, _, preview = world.plan_file("running writer dry run", alpha)
-    expect(theta_root not in world.candidates(preview), "a running writer's root became a candidate")
-    expect("writer" in world.kept(preview, theta_root), world.kept(preview, theta_root))
-    world.restore(theta, theta_away)
-    with open(os.path.join(writer_gate, "release"), "wb") as handle:
-        handle.write(b"go")
-    code, _, stderr = permanent.finish_child(proof, writer, "running writer")
-    expect(code == 0, f"the gated writer failed: {stderr}")
+    with case("11") as scope, scope.run():
+        theta = world.checkout("theta")
+        with open(os.path.join(theta, "build.rs"), "w", encoding="utf-8") as handle:
+            handle.write(GATED_BUILD)
+        theta_root = world.adopt(theta)["links"][0]["selected"]["root"]
+        writer_gate = os.path.join(proof.root, "writer-gate")
+        os.makedirs(writer_gate)
+        writer_env = dict(proof.env)
+        writer_env["PRUNE_GATE"] = writer_gate
+        writer = permanent.start_child(proof, [proof.binary, "check"], theta, writer_env)
+        permanent.wait_for(os.path.join(writer_gate, "started"), "running writer")
+        theta_away = world.vanish(theta)
+        _, _, preview = world.plan_file("running writer dry run", alpha)
+        expect(theta_root not in world.candidates(preview), "a running writer's root became a candidate")
+        expect("writer" in world.kept(preview, theta_root), world.kept(preview, theta_root))
+        world.restore(theta, theta_away)
+        with open(os.path.join(writer_gate, "release"), "wb") as handle:
+            handle.write(b"go")
+        code, _, stderr = world.finish(writer, "running writer")
+        expect(code == 0, f"the gated writer failed: {stderr}")
 
-    case("symlink root kept; symlink descendant stops deletion")
-    iota = world.checkout("iota")
-    iota_root = world.adopt(iota)["links"][0]["selected"]["root"]
-    outside = os.path.join(proof.root, "outside")
-    os.makedirs(outside)
-    with open(os.path.join(outside, "keep"), "wb") as handle:
-        handle.write(b"keep")
-    os.symlink(outside, os.path.join(iota_root, "escape"))
-    world.vanish(iota)
-    plan, sha, preview = world.plan_file("symlink descendant dry run", alpha)
-    expect(iota_root in world.candidates(preview), world.kept(preview, iota_root))
-    expect(delta_root in world.candidates(preview), "delta dropped out")
-    code, _, stderr = world.real_run("symlink descendant real run", alpha, plan, sha)
-    expect(code == 3, f"a symlink descendant did not stop deletion (exit {code})")
-    expect(os.path.exists(os.path.join(outside, "keep")), "the symlink target was touched")
-    quarantined = [path for path in world.quarantines() if os.path.lexists(os.path.join(path, "escape"))]
-    expect(len(quarantined) == 1, f"quarantines {world.quarantines()}")
-    os.unlink(os.path.join(quarantined[0], "escape"))
-    code, _, stderr = world.real_run("replay after the link is removed", alpha, plan, sha)
-    expect(code == 0, f"replay exited {code}: {stderr}")
-    expect(not world.quarantines(), f"quarantine left: {world.quarantines()}")
-    expect(not os.path.lexists(delta_root), "delta remains")
-    kappa = world.checkout("kappa")
-    kappa_selected = world.adopt(kappa)["links"][0]["selected"]
-    kappa_root = kappa_selected["root"]
-    kappa_nonce = kappa_selected.get("nonce")
-    expect(kappa_nonce and len(kappa_nonce) == 32, f"kappa has no root nonce: {kappa_selected}")
-    code, _, stderr = world.oxide(["check"], "kappa build before prune", kappa)
-    expect(code == 0, stderr)
-    kappa_slot, _ = permanent.slot_state(stderr)
-    kappa_pool = "removable pool:" if "removable" in permanent.summary(stderr) else "internal pool:"
-    kappa_away = world.vanish(kappa)
-    os.rename(kappa_root, kappa_root + ".real")
-    os.symlink(kappa_root + ".real", kappa_root)
-    _, _, preview = world.plan_file("symlink root dry run", alpha)
-    expect(kappa_root not in world.candidates(preview), "a symlink root became a candidate")
-    os.unlink(kappa_root)
-    os.rename(kappa_root + ".real", kappa_root)
-    world.restore(kappa, kappa_away)
-    # Reserve: a low reserve at the check before the rename refuses with the
-    # root unchanged (exit 2); a low reserve between delete batches of a
-    # root with more than one batch of entries stops deletion (exit 3) and
-    # exact replay completes. Each injection's firing is recorded.
-    lam = world.checkout("lambda")
-    lam_root = world.adopt(lam)["links"][0]["selected"]["root"]
-    bulk = os.path.join(lam_root, "bulk")
-    os.makedirs(bulk)
-    for index in range(600):
-        with open(os.path.join(bulk, f"f{index:04d}"), "wb") as handle:
-            handle.write(b"x")
-    world.vanish(lam)
-    fired = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "prune-low-reserve-fired")
-    plan, sha, preview = world.plan_file("reserve dry run", alpha)
-    expect(world.candidates(preview) == {lam_root}, f"candidates {world.candidates(preview)}")
-    before = tree_bytes(lam_root)
-    code, _, stderr = world.real_run("low reserve before rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AT": "1"})
-    expect(code == 2 and "reserve" in stderr, f"low reserve before rename exited {code}")
-    expect(tree_bytes(lam_root) == before and not world.intents(), "a refused reserve changed the root or journaled")
-    expect(os.path.isfile(fired), "the low-reserve injection did not fire")
-    os.unlink(fired)
-    code, _, stderr = world.real_run("low reserve mid-batch", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES": "1"})
-    expect(code == 3 and "reserve" in stderr, f"low reserve mid-batch exited {code}")
-    expect(os.path.isfile(fired) and world.intents() and world.quarantines(), "no pending mid-batch stop")
-    expect("entries:" in permanent.read_bytes(fired).decode(), "the entry-count injection did not fire")
-    # The entry-count trigger fires at the first check after one entry was
-    # actually deleted: some entries are gone, none after the stop.
-    remaining = sum(len(files) for _, _, files in os.walk(world.quarantines()[0]))
-    expect(0 < remaining < 601, f"the reserve stop was not mid-batch ({remaining} entries left)")
-    code, _, stderr = world.real_run("replay after the reserve stop", alpha, plan, sha)
-    expect(code == 0 and not world.quarantines() and not world.intents(), f"reserve replay exited {code}: {stderr}")
-    proof.phase("after custody cases")
+    with case("12") as scope, scope.run():
+        iota = world.checkout("iota")
+        iota_root = world.adopt(iota)["links"][0]["selected"]["root"]
+        outside = os.path.join(proof.root, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "keep"), "wb") as handle:
+            handle.write(b"keep")
+        os.symlink(outside, os.path.join(iota_root, "escape"))
+        world.vanish(iota)
+        plan, sha, preview = world.plan_file("symlink descendant dry run", alpha)
+        expect(iota_root in world.candidates(preview), world.kept(preview, iota_root))
+        expect(delta_root in world.candidates(preview), "delta dropped out")
+        code, _, stderr = world.real_run("symlink descendant real run", alpha, plan, sha)
+        expect(code == 3, f"a symlink descendant did not stop deletion (exit {code})")
+        expect(os.path.exists(os.path.join(outside, "keep")), "the symlink target was touched")
+        quarantined = [path for path in world.quarantines() if os.path.lexists(os.path.join(path, "escape"))]
+        expect(len(quarantined) == 1, f"quarantines {world.quarantines()}")
+        os.unlink(os.path.join(quarantined[0], "escape"))
+        code, _, stderr = world.real_run("replay after the link is removed", alpha, plan, sha)
+        expect(code == 0, f"replay exited {code}: {stderr}")
+        expect(not world.quarantines(), f"quarantine left: {world.quarantines()}")
+        expect(not os.path.lexists(delta_root), "delta remains")
+        kappa = world.checkout("kappa")
+        kappa_selected = world.adopt(kappa)["links"][0]["selected"]
+        kappa_root = kappa_selected["root"]
+        kappa_nonce = kappa_selected.get("nonce")
+        expect(kappa_nonce and len(kappa_nonce) == 32, f"kappa has no root nonce: {kappa_selected}")
+        code, _, stderr = world.oxide(["check"], "kappa build before prune", kappa)
+        expect(code == 0, stderr)
+        kappa_slot, _ = permanent.slot_state(stderr)
+        kappa_pool = "removable pool:" if "removable" in permanent.summary(stderr) else "internal pool:"
+        kappa_away = world.vanish(kappa)
+        os.rename(kappa_root, kappa_root + ".real")
+        os.symlink(kappa_root + ".real", kappa_root)
+        _, _, preview = world.plan_file("symlink root dry run", alpha)
+        expect(kappa_root not in world.candidates(preview), "a symlink root became a candidate")
+        os.unlink(kappa_root)
+        os.rename(kappa_root + ".real", kappa_root)
+        world.restore(kappa, kappa_away)
+        # Reserve: a low reserve at the check before the rename refuses with the
+        # root unchanged (exit 2); a low reserve between delete batches of a
+        # root with more than one batch of entries stops deletion (exit 3) and
+        # exact replay completes. Each injection's firing is recorded.
+        lam = world.checkout("lambda")
+        lam_root = world.adopt(lam)["links"][0]["selected"]["root"]
+        bulk = os.path.join(lam_root, "bulk")
+        os.makedirs(bulk)
+        for index in range(600):
+            with open(os.path.join(bulk, f"f{index:04d}"), "wb") as handle:
+                handle.write(b"x")
+        world.vanish(lam)
+        fired = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "prune-low-reserve-fired")
+        plan, sha, preview = world.plan_file("reserve dry run", alpha)
+        expect(world.candidates(preview) == {lam_root}, f"candidates {world.candidates(preview)}")
+        before = tree_bytes(lam_root)
+        code, _, stderr = world.real_run("low reserve before rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AT": "1"})
+        expect(code == 2 and "reserve" in stderr, f"low reserve before rename exited {code}")
+        expect(tree_bytes(lam_root) == before and not world.intents(), "a refused reserve changed the root or journaled")
+        expect(os.path.isfile(fired), "the low-reserve injection did not fire")
+        os.unlink(fired)
+        code, _, stderr = world.real_run("low reserve mid-batch", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES": "1"})
+        expect(code == 3 and "reserve" in stderr, f"low reserve mid-batch exited {code}")
+        expect(os.path.isfile(fired) and world.intents() and world.quarantines(), "no pending mid-batch stop")
+        expect("entries:" in permanent.read_bytes(fired).decode(), "the entry-count injection did not fire")
+        # The entry-count trigger fires at the first check after one entry was
+        # actually deleted: some entries are gone, none after the stop.
+        remaining = sum(len(files) for _, _, files in os.walk(world.quarantines()[0]))
+        expect(0 < remaining < 601, f"the reserve stop was not mid-batch ({remaining} entries left)")
+        code, _, stderr = world.real_run("replay after the reserve stop", alpha, plan, sha)
+        expect(code == 0 and not world.quarantines() and not world.intents(), f"reserve replay exited {code}: {stderr}")
+        proof.phase("after custody cases")
 
     # ---- crash boundaries -------------------------------------------------
     for point, label in (
@@ -1001,218 +1357,218 @@ def run(proof, repo: str) -> None:
         ("deleting", "during delete"),
         ("terminal", "after registry terminal"),
     ):
-        case(f"crash {label}: pending, then exact replay")
-        checkout = world.checkout("crash-" + point)
-        root = world.adopt(checkout)["links"][0]["selected"]["root"]
-        world.vanish(checkout)
-        plan, sha, preview = world.plan_file(f"crash {point} dry run", alpha)
-        expect(root in world.candidates(preview), world.kept(preview, root))
-        code, _, stderr = world.real_run(f"crash {point}", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": point})
-        expect(code == 3, f"crash at {point} exited {code}")
-        pending = [intent for intent in world.intents() if intent["identity"]["root"] == root]
-        expect(len(pending) == 1, f"no pending intent after {point}: {world.intents()}")
-        if point == "intent":
-            expect(os.path.isdir(root), "the root moved before its rename")
-        if point == "renamed":
-            expect(not os.path.lexists(root) and world.quarantines(), "no quarantine after the rename")
-            # A recreated checkout cannot bind while the intent is pending.
-            os.makedirs(os.path.join(checkout, "src"))
-            with open(os.path.join(checkout, "Cargo.toml"), "w", encoding="utf-8") as handle:
-                handle.write(PLAIN)
-            with open(os.path.join(checkout, "src", "lib.rs"), "w", encoding="utf-8") as handle:
-                handle.write("pub fn v() -> u32 { 1 }\n")
-            code, _, stderr = world.oxide(["check"], "recreated checkout during a pending intent", checkout)
-            expect(code != 0 and "unsettled" in stderr, f"recreated checkout exit {code}: {stderr}")
-            expect(not os.path.lexists(root), "the pending root was recreated")
-            shutil.rmtree(checkout)
-        if point == "terminal":
-            expect(not os.path.lexists(root), "the root remains after its registry terminal state")
-            expect(world.receipt(checkout)["state"] == "committed", "the receipt settled before its replay")
-        code, _, stderr = world.real_run(f"replay {point}", alpha, plan, sha)
-        expect(code == 0, f"replay after {point} exited {code}: {stderr}")
-        expect(not os.path.lexists(root) and not world.quarantines(), f"{point}: root or quarantine left")
-        expect(not world.intents(), f"{point}: intents left {world.intents()}")
+        with case(CRASH_CASES[point]) as scope, scope.run():
+            checkout = world.checkout("crash-" + point)
+            root = world.adopt(checkout)["links"][0]["selected"]["root"]
+            world.vanish(checkout)
+            plan, sha, preview = world.plan_file(f"crash {point} dry run", alpha)
+            expect(root in world.candidates(preview), world.kept(preview, root))
+            code, _, stderr = world.real_run(f"crash {point}", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": point})
+            expect(code == 3, f"crash at {point} exited {code}")
+            pending = [intent for intent in world.intents() if intent["identity"]["root"] == root]
+            expect(len(pending) == 1, f"no pending intent after {point}: {world.intents()}")
+            if point == "intent":
+                expect(os.path.isdir(root), "the root moved before its rename")
+            if point == "renamed":
+                expect(not os.path.lexists(root) and world.quarantines(), "no quarantine after the rename")
+                # A recreated checkout cannot bind while the intent is pending.
+                os.makedirs(os.path.join(checkout, "src"))
+                with open(os.path.join(checkout, "Cargo.toml"), "w", encoding="utf-8") as handle:
+                    handle.write(PLAIN)
+                with open(os.path.join(checkout, "src", "lib.rs"), "w", encoding="utf-8") as handle:
+                    handle.write("pub fn v() -> u32 { 1 }\n")
+                code, _, stderr = world.oxide(["check"], "recreated checkout during a pending intent", checkout)
+                expect(code != 0 and "unsettled" in stderr, f"recreated checkout exit {code}: {stderr}")
+                expect(not os.path.lexists(root), "the pending root was recreated")
+                shutil.rmtree(checkout)
+            if point == "terminal":
+                expect(not os.path.lexists(root), "the root remains after its registry terminal state")
+                expect(world.receipt(checkout)["state"] == "committed", "the receipt settled before its replay")
+            code, _, stderr = world.real_run(f"replay {point}", alpha, plan, sha)
+            expect(code == 0, f"replay after {point} exited {code}: {stderr}")
+            expect(not os.path.lexists(root) and not world.quarantines(), f"{point}: root or quarantine left")
+            expect(not world.intents(), f"{point}: intents left {world.intents()}")
     proof.phase("after crash cases")
 
     # ---- completion / diagnostics ----------------------------------------
-    case("completion: terminal state, tombstone, observations, status")
-    # Hard-link control: one 64 KiB inode under two names counts twice by
-    # name and once allocated.
-    with open(os.path.join(kappa_root, "payload"), "wb") as handle:
-        handle.write(os.urandom(64 * 1024))
-    os.link(os.path.join(kappa_root, "payload"), os.path.join(kappa_root, "payload-link"))
-    expected_logical, expected_allocated = accounting_oracle(kappa_root)
-    world.vanish(kappa)
-    plan, sha, preview = world.plan_file("completion dry run", alpha)
-    expect(kappa_root in world.candidates(preview), world.kept(preview, kappa_root))
-    [observed] = [candidate for candidate in preview["candidates"] if candidate["root"] == kappa_root]
-    expect(observed["accounting_complete"], observed)
-    expect(observed["logical_bytes"] == expected_logical, f"logical {observed['logical_bytes']} != oracle {expected_logical}")
-    # Inventory counts regular files only, allocated once per inode: the
-    # oracle is exact, and the hard-linked inode is not allocated twice.
-    expect(observed["allocated_bytes"] == expected_allocated, f"allocated {observed['allocated_bytes']} != oracle {expected_allocated}")
-    expect(preview["coverage"]["source"] and preview["coverage"]["observed_ms"] > 0, preview["coverage"])
-    code, stdout, stderr = world.real_run("completion real run", alpha, plan, sha)
-    expect(code == 0 and "deleted" in stdout, f"completion exited {code}: {stderr}")
-    expect(not os.path.lexists(kappa_root), "kappa remains")
-    expect(all(row["root"] != kappa_root for row in world.registry_doc()["rows"]), "kappa's row remains")
-    tombstones = permanent.read_json(os.path.join(world.outputs, "tombstones.json"))
-    expect(any(entry["root"] == kappa_root for entry in tombstones["entries"]), "no tombstone for kappa")
-    observations = permanent.read_json(os.path.join(world.outputs, "prune-observations.json"))
-    expect(observations["version"] == "oxide.outputs.prune-observations/1", observations["version"])
-    code, stdout, _ = world.oxide(["status"], "status shows the recorded observation", alpha)
-    expect(code == 0 and "prune" in stdout, stdout)
+    with case("17") as scope, scope.run():
+        # Hard-link control: one 64 KiB inode under two names counts twice by
+        # name and once allocated.
+        with open(os.path.join(kappa_root, "payload"), "wb") as handle:
+            handle.write(os.urandom(64 * 1024))
+        os.link(os.path.join(kappa_root, "payload"), os.path.join(kappa_root, "payload-link"))
+        expected_logical, expected_allocated = accounting_oracle(kappa_root)
+        world.vanish(kappa)
+        plan, sha, preview = world.plan_file("completion dry run", alpha)
+        expect(kappa_root in world.candidates(preview), world.kept(preview, kappa_root))
+        [observed] = [candidate for candidate in preview["candidates"] if candidate["root"] == kappa_root]
+        expect(observed["accounting_complete"], observed)
+        expect(observed["logical_bytes"] == expected_logical, f"logical {observed['logical_bytes']} != oracle {expected_logical}")
+        # Inventory counts regular files only, allocated once per inode: the
+        # oracle is exact, and the hard-linked inode is not allocated twice.
+        expect(observed["allocated_bytes"] == expected_allocated, f"allocated {observed['allocated_bytes']} != oracle {expected_allocated}")
+        expect(preview["coverage"]["source"] and preview["coverage"]["observed_ms"] > 0, preview["coverage"])
+        code, stdout, stderr = world.real_run("completion real run", alpha, plan, sha)
+        expect(code == 0 and "deleted" in stdout, f"completion exited {code}: {stderr}")
+        expect(not os.path.lexists(kappa_root), "kappa remains")
+        expect(all(row["root"] != kappa_root for row in world.registry_doc()["rows"]), "kappa's row remains")
+        tombstones = permanent.read_json(os.path.join(world.outputs, "tombstones.json"))
+        expect(any(entry["root"] == kappa_root for entry in tombstones["entries"]), "no tombstone for kappa")
+        observations = permanent.read_json(os.path.join(world.outputs, "prune-observations.json"))
+        expect(observations["version"] == "oxide.outputs.prune-observations/1", observations["version"])
+        code, stdout, _ = world.oxide(["status"], "status shows the recorded observation", alpha)
+        expect(code == 0 and "prune" in stdout, stdout)
 
-    case("recreated checkout adopts a fresh root nonce")
-    old_nonce = kappa_nonce
-    os.makedirs(kappa)
-    shutil.copytree(world.checkout("kappa-src"), kappa, dirs_exist_ok=True)
-    code, _, stderr = world.oxide(["outputs", "adopt"], "re-adopt the recreated checkout", kappa)
-    expect(code == 0, stderr)
-    # The old root's slot is still present and idle (read-only status), so a
-    # cold, different slot below proves key separation, not eviction.
-    code, stdout, _ = world.oxide(["status"], "old kappa slot still idle", alpha)
-    expect(code == 0, "status failed")
-    section, idle = None, False
-    for line in stdout.splitlines():
-        if line.startswith(("internal pool:", "removable pool:")):
-            section = line.split(":")[0] + ":"
-        elif section == kappa_pool and line.split()[:3] == ["slot", kappa_slot, "idle"] and kappa in line:
-            idle = True
-    expect(idle, f"the old kappa slot {kappa_slot} ({kappa_pool} {kappa}) is not present and idle before the recreated build")
-    new_nonce = world.selected(kappa)["nonce"]
-    expect(new_nonce and new_nonce != old_nonce, f"recreated root nonce {new_nonce} reused {old_nonce}")
-    code, _, stderr = world.oxide(["check"], "recreated root build", kappa)
-    expect(code == 0, stderr)
-    slot, state = permanent.slot_state(stderr)
-    expect(state == "cold" and slot != kappa_slot, f"the recreated root reused slot {slot} ({state}); key not separated")
-    proof.phase("after completion")
+    with case("18") as scope, scope.run():
+        old_nonce = kappa_nonce
+        os.makedirs(kappa)
+        shutil.copytree(world.checkout("kappa-src"), kappa, dirs_exist_ok=True)
+        code, _, stderr = world.oxide(["outputs", "adopt"], "re-adopt the recreated checkout", kappa)
+        expect(code == 0, stderr)
+        # The old root's slot is still present and idle (read-only status), so a
+        # cold, different slot below proves key separation, not eviction.
+        code, stdout, _ = world.oxide(["status"], "old kappa slot still idle", alpha)
+        expect(code == 0, "status failed")
+        section, idle = None, False
+        for line in stdout.splitlines():
+            if line.startswith(("internal pool:", "removable pool:")):
+                section = line.split(":")[0] + ":"
+            elif section == kappa_pool and line.split()[:3] == ["slot", kappa_slot, "idle"] and kappa in line:
+                idle = True
+        expect(idle, f"the old kappa slot {kappa_slot} ({kappa_pool} {kappa}) is not present and idle before the recreated build")
+        new_nonce = world.selected(kappa)["nonce"]
+        expect(new_nonce and new_nonce != old_nonce, f"recreated root nonce {new_nonce} reused {old_nonce}")
+        code, _, stderr = world.oxide(["check"], "recreated root build", kappa)
+        expect(code == 0, stderr)
+        slot, state = permanent.slot_state(stderr)
+        expect(state == "cold" and slot != kappa_slot, f"the recreated root reused slot {slot} ({state}); key not separated")
+        proof.phase("after completion")
 
     # ---- resolve-intent ---------------------------------------------------
-    case("resolve-intent: both leaves absent")
-    rho = world.checkout("rho")
-    rho_root = world.adopt(rho)["links"][0]["selected"]["root"]
-    world.vanish(rho)
-    plan, sha, _ = world.plan_file("rho dry run", alpha)
-    code, _, _ = world.real_run("rho crash after rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": "renamed"})
-    expect(code == 3, f"rho crash exited {code}")
-    [intent] = [intent for intent in world.intents() if intent["identity"]["root"] == rho_root]
-    for quarantine in world.quarantines():
-        shutil.rmtree(quarantine)
-    code, stdout, stderr = world.oxide(["outputs", "resolve-intent", intent["id"]], "resolve rho", alpha)
-    expect(code == 0 and "resolved by operator" in stdout, stdout + stderr)
-    rho_receipt = permanent.read_json(permanent.receipt_file(world.pool, rho))
-    expect(rho_receipt["pruned"]["outcome"] == "resolved-by-operator", rho_receipt)
-    expect(os.path.isfile(os.path.join(world.outputs, "prune-resolutions", intent["id"] + ".json")), "no resolution receipt")
+    with case("19") as scope, scope.run():
+        rho = world.checkout("rho")
+        rho_root = world.adopt(rho)["links"][0]["selected"]["root"]
+        world.vanish(rho)
+        plan, sha, _ = world.plan_file("rho dry run", alpha)
+        code, _, _ = world.real_run("rho crash after rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": "renamed"})
+        expect(code == 3, f"rho crash exited {code}")
+        [intent] = [intent for intent in world.intents() if intent["identity"]["root"] == rho_root]
+        for quarantine in world.quarantines():
+            shutil.rmtree(quarantine)
+        code, stdout, stderr = world.oxide(["outputs", "resolve-intent", intent["id"]], "resolve rho", alpha)
+        expect(code == 0 and "resolved by operator" in stdout, stdout + stderr)
+        rho_receipt = permanent.read_json(permanent.receipt_file(world.pool, rho))
+        expect(rho_receipt["pruned"]["outcome"] == "resolved-by-operator", rho_receipt)
+        expect(os.path.isfile(os.path.join(world.outputs, "prune-resolutions", intent["id"] + ".json")), "no resolution receipt")
 
-    case("resolve-intent refuses while the quarantine is present")
-    sigma = world.checkout("sigma")
-    sigma_root = world.adopt(sigma)["links"][0]["selected"]["root"]
-    world.vanish(sigma)
-    plan, sha, _ = world.plan_file("sigma dry run", alpha)
-    code, _, _ = world.real_run("sigma crash after rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": "renamed"})
-    expect(code == 3, f"sigma crash exited {code}")
-    [intent] = [intent for intent in world.intents() if intent["identity"]["root"] == sigma_root]
-    before = json.dumps(intent, sort_keys=True)
-    code, _, stderr = world.oxide(["outputs", "resolve-intent", intent["id"]], "resolve sigma", alpha)
-    expect(code == 2, f"resolve with a present quarantine exited {code}")
-    [after] = [record for record in world.intents() if record["id"] == intent["id"]]
-    expect(json.dumps(after, sort_keys=True) == before, "a refused resolution changed the intent")
-    code, _, stderr = world.real_run("sigma replay", alpha, plan, sha)
-    expect(code == 0, f"sigma replay exited {code}: {stderr}")
-    proof.phase("after resolve cases")
+    with case("20") as scope, scope.run():
+        sigma = world.checkout("sigma")
+        sigma_root = world.adopt(sigma)["links"][0]["selected"]["root"]
+        world.vanish(sigma)
+        plan, sha, _ = world.plan_file("sigma dry run", alpha)
+        code, _, _ = world.real_run("sigma crash after rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": "renamed"})
+        expect(code == 3, f"sigma crash exited {code}")
+        [intent] = [intent for intent in world.intents() if intent["identity"]["root"] == sigma_root]
+        before = json.dumps(intent, sort_keys=True)
+        code, _, stderr = world.oxide(["outputs", "resolve-intent", intent["id"]], "resolve sigma", alpha)
+        expect(code == 2, f"resolve with a present quarantine exited {code}")
+        [after] = [record for record in world.intents() if record["id"] == intent["id"]]
+        expect(json.dumps(after, sort_keys=True) == before, "a refused resolution changed the intent")
+        code, _, stderr = world.real_run("sigma replay", alpha, plan, sha)
+        expect(code == 0, f"sigma replay exited {code}: {stderr}")
+        proof.phase("after resolve cases")
 
     # ---- version-1 whole-target receipts (oxide#152) -----------------------
-    case("version-1 whole-target receipts: read for prune, never migrated")
-    # Both receipts were seeded from the product's own receipt seed in case 01:
-    # the committed one has a legacy row (no nonce), the prepared one has a
-    # selected row and a pending row. Any positive prune of a legacy identity
-    # still needs the explicit operator list and the boot-Data-volume absence
-    # proof (the same precondition case 12 uses).
-    v1_checkout, v1_root = world.version_one["committed"]
-    prepared_checkout, prepared_root = world.version_one["prepared"]
-    v1_receipt = world.version_one["committed_receipt"]
-    prepared_receipt = world.version_one["prepared_receipt"]
-    rows = [row for row in world.registry_doc()["rows"] if row["root"] == v1_root]
-    expect(len(rows) == 1 and rows[0]["selected"], rows)
-    expect("nonce" not in rows[0], f"the receipt seed invented a nonce: {rows}")
-    expect(world.registry_doc()["complete"], "the receipt seed is incomplete")
-    expect(permanent.read_bytes(v1_receipt)[:1] == b"{", "the receipt is not JSON")
-    expect(b"oxide.outputs.transition/1" in permanent.read_bytes(v1_receipt), "the receipt was not version 1")
-    listed = os.path.join(proof.root, "list-version-one.json")
-    with open(listed, "w", encoding="utf-8") as handle:
-        json.dump([v1_root, prepared_root], handle)
-    # A live checkout keeps its legacy root.
-    _, _, preview = world.plan_file("version-1 live dry run", alpha, listed)
-    expect(v1_root not in world.candidates(preview), "a live checkout's legacy root became a candidate")
-    expect("present" in world.kept(preview, v1_root), world.kept(preview, v1_root))
-    receipt_before = permanent.read_bytes(v1_receipt)
-    prepared_before = permanent.read_bytes(prepared_receipt)
-    root_before = tree_bytes(v1_root)
-    prepared_root_before = tree_bytes(prepared_root)
-    control_before = tree_bytes(world.control)
-    world.vanish(v1_checkout)
-    prepared_away = world.vanish(prepared_checkout)
-    plan, sha, preview = world.plan_file("version-1 vanished dry run", alpha, listed)
-    expect(v1_root in world.candidates(preview), f"a version-1 root was kept: {world.kept(preview, v1_root)}")
-    expect(preview["operator_list_sha256"] == hashlib.sha256(permanent.read_bytes(listed)).hexdigest(), "the preview does not bind the operator list")
-    # The valid noncommitted version-1 receipt keeps its own reference group.
-    expect(prepared_root not in world.candidates(preview), "a prepared version-1 root became a candidate")
-    reason = world.kept(preview, prepared_root)
-    expect("not committed" in reason, reason)
-    pending_root = world.version_one["prepared_next"]
-    expect(pending_root not in world.candidates(preview), "a pending version-1 root became a candidate")
-    reason = world.kept(preview, pending_root)
-    expect("prepared transition" in reason, reason)
-    # Reading and the dry run are not a migration: no receipt or root byte moved.
-    expect(permanent.read_bytes(v1_receipt) == receipt_before, "the dry run rewrote the version-1 receipt")
-    expect(permanent.read_bytes(prepared_receipt) == prepared_before, "the dry run rewrote the noncommitted receipt")
-    expect(tree_bytes(v1_root) == root_before, "the dry run changed the version-1 root")
-    expect(tree_bytes(prepared_root) == prepared_root_before, "the dry run changed the kept root")
-    expect(tree_bytes(world.control) == control_before, "the dry run changed control bytes")
-    # The exact preview bytes and the same operator list are the real run.
-    code, stdout, stderr = world.real_run("version-1 real run", alpha, plan, sha, listed)
-    expect(code == 0 and "deleted" in stdout, f"version-1 real run exited {code}: {stderr}")
-    expect(not os.path.lexists(v1_root), "the version-1 root remains")
-    # The kept namespace is untouched, including its version-1 receipt bytes.
-    expect(permanent.read_bytes(prepared_receipt) == prepared_before, "the kept version-1 receipt was rewritten")
-    expect(tree_bytes(prepared_root) == prepared_root_before, "the kept root changed")
-    world.restore(prepared_checkout, prepared_away)
-    # The pruned root's receipt is the current shape and the exact image its
-    # intent pinned; version 1 cannot express a prune state.
-    published = permanent.read_json(v1_receipt)
-    expect(published["version"] == "oxide.outputs.transition/2", published)
-    expect(published["state"] == "pruned" and published["pruned"]["outcome"] == "deleted", published)
-    expect(published["roots"][0]["root"] == v1_root, published)
-    # A fresh dry run offers nothing further and still binds the same list.
-    _, _, preview = world.plan_file("version-1 follow-up dry run", alpha, listed)
-    expect(v1_root not in world.candidates(preview), "a pruned root returned as a candidate")
+    with case("21") as scope, scope.run():
+        # Both receipts were seeded from the product's own receipt seed in case 01:
+        # the committed one has a legacy row (no nonce), the prepared one has a
+        # selected row and a pending row. Any positive prune of a legacy identity
+        # still needs the explicit operator list and the boot-Data-volume absence
+        # proof (the same precondition case 12 uses).
+        v1_checkout, v1_root = world.version_one["committed"]
+        prepared_checkout, prepared_root = world.version_one["prepared"]
+        v1_receipt = world.version_one["committed_receipt"]
+        prepared_receipt = world.version_one["prepared_receipt"]
+        rows = [row for row in world.registry_doc()["rows"] if row["root"] == v1_root]
+        expect(len(rows) == 1 and rows[0]["selected"], rows)
+        expect("nonce" not in rows[0], f"the receipt seed invented a nonce: {rows}")
+        expect(world.registry_doc()["complete"], "the receipt seed is incomplete")
+        expect(permanent.read_bytes(v1_receipt)[:1] == b"{", "the receipt is not JSON")
+        expect(b"oxide.outputs.transition/1" in permanent.read_bytes(v1_receipt), "the receipt was not version 1")
+        listed = os.path.join(proof.root, "list-version-one.json")
+        with open(listed, "w", encoding="utf-8") as handle:
+            json.dump([v1_root, prepared_root], handle)
+        # A live checkout keeps its legacy root.
+        _, _, preview = world.plan_file("version-1 live dry run", alpha, listed)
+        expect(v1_root not in world.candidates(preview), "a live checkout's legacy root became a candidate")
+        expect("present" in world.kept(preview, v1_root), world.kept(preview, v1_root))
+        receipt_before = permanent.read_bytes(v1_receipt)
+        prepared_before = permanent.read_bytes(prepared_receipt)
+        root_before = tree_bytes(v1_root)
+        prepared_root_before = tree_bytes(prepared_root)
+        control_before = tree_bytes(world.control)
+        world.vanish(v1_checkout)
+        prepared_away = world.vanish(prepared_checkout)
+        plan, sha, preview = world.plan_file("version-1 vanished dry run", alpha, listed)
+        expect(v1_root in world.candidates(preview), f"a version-1 root was kept: {world.kept(preview, v1_root)}")
+        expect(preview["operator_list_sha256"] == hashlib.sha256(permanent.read_bytes(listed)).hexdigest(), "the preview does not bind the operator list")
+        # The valid noncommitted version-1 receipt keeps its own reference group.
+        expect(prepared_root not in world.candidates(preview), "a prepared version-1 root became a candidate")
+        reason = world.kept(preview, prepared_root)
+        expect("not committed" in reason, reason)
+        pending_root = world.version_one["prepared_next"]
+        expect(pending_root not in world.candidates(preview), "a pending version-1 root became a candidate")
+        reason = world.kept(preview, pending_root)
+        expect("prepared transition" in reason, reason)
+        # Reading and the dry run are not a migration: no receipt or root byte moved.
+        expect(permanent.read_bytes(v1_receipt) == receipt_before, "the dry run rewrote the version-1 receipt")
+        expect(permanent.read_bytes(prepared_receipt) == prepared_before, "the dry run rewrote the noncommitted receipt")
+        expect(tree_bytes(v1_root) == root_before, "the dry run changed the version-1 root")
+        expect(tree_bytes(prepared_root) == prepared_root_before, "the dry run changed the kept root")
+        expect(tree_bytes(world.control) == control_before, "the dry run changed control bytes")
+        # The exact preview bytes and the same operator list are the real run.
+        code, stdout, stderr = world.real_run("version-1 real run", alpha, plan, sha, listed)
+        expect(code == 0 and "deleted" in stdout, f"version-1 real run exited {code}: {stderr}")
+        expect(not os.path.lexists(v1_root), "the version-1 root remains")
+        # The kept namespace is untouched, including its version-1 receipt bytes.
+        expect(permanent.read_bytes(prepared_receipt) == prepared_before, "the kept version-1 receipt was rewritten")
+        expect(tree_bytes(prepared_root) == prepared_root_before, "the kept root changed")
+        world.restore(prepared_checkout, prepared_away)
+        # The pruned root's receipt is the current shape and the exact image its
+        # intent pinned; version 1 cannot express a prune state.
+        published = permanent.read_json(v1_receipt)
+        expect(published["version"] == "oxide.outputs.transition/2", published)
+        expect(published["state"] == "pruned" and published["pruned"]["outcome"] == "deleted", published)
+        expect(published["roots"][0]["root"] == v1_root, published)
+        # A fresh dry run offers nothing further and still binds the same list.
+        _, _, preview = world.plan_file("version-1 follow-up dry run", alpha, listed)
+        expect(v1_root not in world.candidates(preview), "a pruned root returned as a candidate")
 
     # ---- overflow (last: the sticky flag is never cleared) -----------------
-    case("overflow: keep every root; tagged reservation binds with no row")
-    doc = world.registry_doc()
-    doc["complete"] = False
-    doc["incomplete"] = {"reason": "proof overflow", "since_ms": 1, "transaction": doc["created_by"]}
-    doc["revision"] += 1
-    with open(world.registry, "w", encoding="utf-8") as handle:
-        json.dump(doc, handle)
-    os.chmod(world.registry, 0o600)
-    code, stdout, _ = world.dry_run("overflow dry run", alpha)
-    expect(code in (0, 2), f"overflow dry run exited {code}")
-    if code == 0:
-        expect(not json.loads(stdout)["candidates"], "an overflow registry yielded candidates")
-    tau = world.checkout("tau")
-    world.adopt(tau)
-    permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
-    starter, gate = world.paused(tau, "keyed", "overflow starter")
-    reserved = world.receipt(tau)["links"][0]["reserved"]
-    expect(reserved.get("overflow", {}).get("registry") == doc["created_by"], reserved)
-    expect(all(row["root"] != reserved["root"] for row in world.registry_doc()["rows"]), "an overflow row was invented")
-    release(gate)
-    code, _, stderr = permanent.finish_child(proof, starter, "overflow starter")
-    expect(code == 0, f"overflow starter failed: {stderr}")
-    permanent.set_recorded_uuid(world.pool, good)
-    expect(len(DONE) == CASES, f"ran {len(DONE)} cases, not {CASES}")
+    with case("22") as scope, scope.run():
+        doc = world.registry_doc()
+        doc["complete"] = False
+        doc["incomplete"] = {"reason": "proof overflow", "since_ms": 1, "transaction": doc["created_by"]}
+        doc["revision"] += 1
+        with open(world.registry, "w", encoding="utf-8") as handle:
+            json.dump(doc, handle)
+        os.chmod(world.registry, 0o600)
+        code, stdout, _ = world.dry_run("overflow dry run", alpha)
+        expect(code in (0, 2), f"overflow dry run exited {code}")
+        if code == 0:
+            expect(not json.loads(stdout)["candidates"], "an overflow registry yielded candidates")
+        tau = world.checkout("tau")
+        world.adopt(tau)
+        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+        starter, gate = world.paused(tau, "keyed", "overflow starter")
+        reserved = world.receipt(tau)["links"][0]["reserved"]
+        expect(reserved.get("overflow", {}).get("registry") == doc["created_by"], reserved)
+        expect(all(row["root"] != reserved["root"] for row in world.registry_doc()["rows"]), "an overflow row was invented")
+        release(gate)
+        code, _, stderr = world.finish(starter, "overflow starter")
+        expect(code == 0, f"overflow starter failed: {stderr}")
+        permanent.set_recorded_uuid(world.pool, good)
+    finish_cases()
 
     # The ordinary detach also runs inside the work window.
     permanent.work_left()
@@ -1220,13 +1576,322 @@ def run(proof, repo: str) -> None:
     proof.phase("after detach")
 
 
+def finish_cases() -> None:
+    """The run's own completeness check. The counted run must have executed
+    every case; a diagnostic must have recorded an outcome for each one."""
+    if DIAG.enabled:
+        unreached = [row["id"] for row in DIAG.results() if row["state"] == "unexecuted"]
+        if DIAG.aborted is None:
+            expect(
+                not unreached,
+                f"the diagnostic recorded no outcome for cases {unreached}",
+            )
+        return
+    expect(len(DONE) == CASES, f"ran {len(DONE)} cases, not {CASES}")
+
+
+def receipt_payload(document: dict) -> bytes:
+    """The bounded receipt bytes. Detail is trimmed first, so the document
+    always stays inside its cap instead of failing the collection."""
+    payload = json.dumps(document, indent=2, sort_keys=True).encode()
+    if len(payload) <= MAX_DIAGNOSTIC_RECEIPT_BYTES:
+        return payload
+    trimmed = dict(document)
+    trimmed["cases"] = [
+        {"id": row["id"], "name": row["name"], "state": row["state"]} for row in document["cases"]
+    ]
+    trimmed["notes"] = [note[:80] for note in document["notes"]][:4]
+    payload = json.dumps(trimmed, indent=2, sort_keys=True).encode()
+    expect(
+        len(payload) <= MAX_DIAGNOSTIC_RECEIPT_BYTES,
+        f"the diagnostic receipt is {len(payload)} bytes over its cap",
+    )
+    return payload
+
+
+def write_diagnostic_receipt() -> str | None:
+    """Write this run's uncounted receipt beside the guard's own. It is never a
+    PASS: `qualified` is false and the mode is diagnostic."""
+    if not DIAG.enabled:
+        return None
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    if not os.path.isdir(evidence):
+        DIAG.notes.append("the evidence directory is unavailable; no receipt was written")
+        return None
+    payload = receipt_payload(DIAG.receipt())
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    path = os.path.join(evidence, f"outputs-prune-diagnostic.{stamp}.{secrets.token_hex(3)}.json")
+    expect(not os.path.exists(path), f"the diagnostic receipt path {path} already exists")
+    with open(path, "wb") as handle:
+        handle.write(payload + b"\n")
+    os.chmod(path, 0o600)
+    print(f"diagnostic receipt: {path} (qualified=false, never a counted PASS)")
+    return path
+
+
+def self_test() -> int:
+    """Pure checks of this script's own dispatch and receipt logic.
+
+    No child, staging, fixture, pool, image or supervisor: the count dispatch
+    (counted fail-fast, keep-going, taint skips, abort precedence) and the
+    bounded unqualified receipt are driven with synthetic bodies.
+    """
+    global permanent, DIAG
+    restore = permanent
+    fake = type(
+        "FakePermanent",
+        (),
+        {
+            "work_left": staticmethod(lambda: 60.0),
+            "expect": staticmethod(
+                lambda condition, message: None
+                if condition
+                else (_ for _ in ()).throw(RuntimeError(message))
+            ),
+        },
+    )
+    permanent = fake
+    failures = 0
+
+    def check(label: str, body) -> None:
+        nonlocal failures
+        try:
+            body()
+        except BaseException as error:  # a self-test failure, never a pass
+            failures += 1
+            print(f"self-test FAIL {label}: {type(error).__name__}: {error}")
+
+    def drive(script: list, enabled: bool) -> str:
+        global DIAG
+        DIAG = Diagnostics(enabled=enabled)
+        for case_id, body in script:
+            with case(case_id) as scope, scope.run():
+                body()
+        return "completed"
+
+    def fault(message: str) -> None:
+        raise RuntimeError(message)
+
+    def abort_case(message: str) -> None:
+        raise Aborted(message)
+
+    def table() -> None:
+        assert len(CASE_PLAN) == CASES == len(CASE_NAMES) == sum(
+            count for _, count in CASE_ALLOCATION
+        )
+        assert [entry[0] for entry in CASE_PLAN] == [f"{index:02d}" for index in range(1, CASES + 1)]
+        for case_id, deps, _ in CASE_PLAN:
+            assert all(dep in CASE_INDEX and dep < case_id for dep in deps), (case_id, deps)
+        assert CRASH_CASES == {"intent": "13", "renamed": "14", "deleting": "15", "terminal": "16"}
+        assert CASE_NAMES[12:16] == [f"crash {label}: pending, then exact replay" for label in (
+            "after intent",
+            "after rename",
+            "during delete",
+            "after registry terminal",
+        )]
+
+    check("case table", table)
+
+    def helper_compatibility() -> None:
+        # The shared installed-handoff staging helper gained only an optional
+        # exact capability expectation: its default (None) still means this
+        # helper's own declared versions, so its other caller is unchanged. The
+        # encoded-RUSTFLAGS scrub is premise 7 and applies to every caller.
+        helper = _load("installed_handoff_selftest", "test-installed-handoff.py")
+        parameters = inspect.signature(helper.stage_subject).parameters
+        assert list(parameters) == ["root", "capability"], list(parameters)
+        assert parameters["capability"].default is None, parameters["capability"].default
+        assert "CARGO_ENCODED_RUSTFLAGS" in inspect.getsource(helper.stage_subject)
+        # This proof pins the current control format literally; a product bump
+        # must update this constant, case 01 and the staged capability together.
+        assert CONTROL_STATE_VERSION == 4 and OWNED_OUTPUTS_FENCE == "oxide.outputs/3"
+        assert CANDIDATE_CAPABILITY == {
+            "control_state_version": CONTROL_STATE_VERSION,
+            "registration_version": 2,
+            "test_controls": True,
+        }
+
+    check("shared staging helper compatibility", helper_compatibility)
+
+    def counted_fail_fast() -> None:
+        ran: list[str] = []
+        try:
+            drive(
+                [
+                    ("01", lambda: ran.append("01")),
+                    ("03", lambda: fault("counted oracle failure")),
+                    ("06", lambda: ran.append("06")),
+                ],
+                False,
+            )
+        except RuntimeError as error:
+            assert str(error) == "counted oracle failure", error
+        else:
+            raise AssertionError("the counted run suppressed its first fault")
+        assert ran == ["01"], ran
+        assert DIAG.states.get("01") == "completed" and DIAG.states.get("03") == "failed", DIAG.states
+        assert (DIAG.first_fault or "").startswith("case 03:"), DIAG.first_fault
+        assert not DIAG.enabled
+
+    check("counted fail-fast", counted_fail_fast)
+
+    def keep_going() -> None:
+        ran: list[str] = []
+        drive(
+            [
+                ("01", lambda: ran.append("01")),
+                ("06", lambda: fault("recoverable oracle failure")),
+                ("03", lambda: ran.append("03")),
+                ("08", lambda: ran.append("08")),
+                ("09", lambda: ran.append("09")),
+            ],
+            True,
+        )
+        # 03 is independent of the failed read-only case and still runs; 08 and
+        # 09 depend on 07, which never ran, and are skipped rather than guessed.
+        assert ran == ["01", "03"], ran
+        assert DIAG.states["06"] == "failed" and DIAG.states["03"] == "completed"
+        assert DIAG.states["08"] == "skipped" and DIAG.states["09"] == "skipped"
+        assert "dependency 07" in DIAG.details["08"], DIAG.details["08"]
+        assert DIAG.first_fault == "case 06: recoverable oracle failure", DIAG.first_fault
+        assert DIAG.taint is None
+
+    check("diagnostic keep-going and dependency skip", keep_going)
+
+    def taint_skips() -> None:
+        ran: list[str] = []
+        drive(
+            [
+                ("01", lambda: ran.append("01")),
+                ("06", lambda: ran.append("06")),
+                ("07", lambda: fault("registry state uncertain now")),
+                ("03", lambda: ran.append("03")),
+                ("08", lambda: ran.append("08")),
+            ],
+            True,
+        )
+        # 03 is independent of the failed case, but a registry/control taint is
+        # state the whole fixture shares: every later case is skipped.
+        assert ran == ["01", "06"], ran
+        assert DIAG.taint is not None and "case 07" in DIAG.taint, DIAG.taint
+        for case_id in ("03", "08"):
+            assert DIAG.states[case_id] == "skipped", DIAG.states
+            assert "not trusted" in DIAG.details[case_id], DIAG.details[case_id]
+
+    check("tainted state skips later cases", taint_skips)
+
+    def abort_after_fault() -> None:
+        ran: list[str] = []
+        try:
+            drive(
+                [
+                    ("01", lambda: ran.append("01")),
+                    ("06", lambda: fault("first oracle failure")),
+                    ("03", lambda: abort_case("child custody unknown")),
+                    ("08", lambda: ran.append("08")),
+                ],
+                True,
+            )
+        except Aborted as error:
+            assert str(error) == "child custody unknown", error
+        else:
+            raise AssertionError("a custody abort was suppressed")
+        assert ran == ["01"], ran
+        states = {row["id"]: row["state"] for row in DIAG.results()}
+        assert states["06"] == "failed" and states["03"] == "aborted", states
+        assert states["08"] == "unexecuted", states
+        assert DIAG.first_fault == "case 06: first oracle failure", DIAG.first_fault
+        assert DIAG.aborted is not None and "child custody unknown" in DIAG.aborted
+
+    check("abort after a prior fault keeps the first fault", abort_after_fault)
+
+    def deadline_aborts() -> None:
+        global permanent, DIAG
+        ran = type(fake)(
+            "DeadlinePermanent",
+            (),
+            {
+                "work_left": staticmethod(
+                    lambda: (_ for _ in ()).throw(
+                        RuntimeError("work deadline reached before the runner's shutdown margin")
+                    )
+                )
+            },
+        )
+        permanent = ran
+        DIAG = Diagnostics(enabled=True)
+        try:
+            with case("01") as scope, scope.run():
+                raise AssertionError("a body ran past the deadline")
+        except Aborted as error:
+            assert "work deadline" in str(error), error
+        else:
+            raise AssertionError("the deadline was treated as an oracle failure")
+        assert DIAG.states["01"] == "aborted" and DIAG.aborted is not None
+        permanent = fake
+
+    check("deadline aborts", deadline_aborts)
+
+    def receipts() -> None:
+        global DIAG
+        DIAG = Diagnostics(enabled=True)
+        DIAG.source = "0" * 40
+        for case_id, body in [
+            ("01", lambda: None),
+            ("06", lambda: fault("x" * 5000)),
+        ]:
+            try:
+                with case(case_id) as scope, scope.run():
+                    body()
+            except RuntimeError:
+                pass
+        document = DIAG.receipt()
+        assert document["qualified"] is False and document["mode"] == "diagnostic"
+        assert document["completed"] == ["01"] and document["failed"] == ["06"], document
+        assert document["unexecuted"] == [
+            entry[0] for entry in CASE_PLAN if entry[0] not in ("01", "06")
+        ], document["unexecuted"]
+        assert len(document["cases"]) == CASES
+        assert len(document["first_fault"]) <= MAX_FAULT_TEXT
+        assert document["source"] == "0" * 40
+        payload = receipt_payload(document)
+        assert len(payload) <= MAX_DIAGNOSTIC_RECEIPT_BYTES, len(payload)
+        assert json.loads(payload)["qualified"] is False
+
+    check("bounded unqualified receipt", receipts)
+
+    def counted_never_writes() -> None:
+        global DIAG
+        DIAG = Diagnostics(enabled=False)
+        assert write_diagnostic_receipt() is None
+
+    check("counted mode writes no diagnostic receipt", counted_never_writes)
+
+    permanent = restore
+    DIAG = Diagnostics(enabled=False)
+    if failures:
+        print(f"test-outputs-prune self-test: {failures} check(s) failed", file=sys.stderr)
+        return 1
+    print(
+        f"test-outputs-prune self-test: dispatch, skips, aborts and receipt logic hold "
+        f"({CASES} cases, {sum(len(deps) for _, deps, _ in CASE_PLAN)} dependencies)"
+    )
+    return 0
+
+
 def main(argv: list[str]) -> int:
-    global permanent, handoff, expect, fail
+    global permanent, handoff, expect, fail, DIAG
     if argv == ["--plan"]:
         return plan()
-    if argv:
+    if argv == ["--self-test"]:
+        return self_test()
+    if argv == ["--diagnostic"]:
+        DIAG = Diagnostics(enabled=True)
+    elif argv:
         print(f"test-outputs-prune: unknown arguments {argv!r}", file=sys.stderr)
         return 2
+    else:
+        DIAG = Diagnostics(enabled=False)
     permanent = _load("permanent_outputs", "test-permanent-outputs.py")
     handoff = _load("installed_handoff", "test-installed-handoff.py")
     expect, fail = permanent.expect, permanent.fail
@@ -1249,17 +1914,38 @@ def main(argv: list[str]) -> int:
     try:
         run(proof, repo)
     except BaseException as failure:
+        DIAG.notes.append(f"run ended: {type(failure).__name__}: {failure}")
         cleanup = permanent.cleanup_after_failure(proof)
+        receipt = write_diagnostic_receipt()
         permanent.record(
             "result.txt",
-            f"failed after {len(DONE)} case(s) {DONE}: {failure!r}\n"
-            f"unclosed children: {sorted(proof.unclosed)}\nroot: {root}\ncleanup: {cleanup}\n",
+            f"{'diagnostic collection' if DIAG.enabled else 'failed'} after {len(DONE)} case(s) {DONE}: {failure!r}\n"
+            f"case states: {DIAG.states}\nfirst fault: {DIAG.first_fault}\nabort: {DIAG.aborted}\n"
+            f"receipt: {receipt}\nunclosed children: {sorted(proof.unclosed)}\n"
+            f"root: {root}\ncleanup: {cleanup}\n",
         )
         print(f"outputs-prune proof failed; scratch {root} left to the shared supervisor", file=sys.stderr)
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
     elapsed = time.monotonic() - permanent.layout.runner.STARTED
+    if DIAG.enabled:
+        receipt = write_diagnostic_receipt()
+        unreached = [row["id"] for row in DIAG.results() if row["state"] == "unexecuted"]
+        line = (
+            f"outputs-prune diagnostic collected (UNCOUNTED, never a PASS): "
+            f"{len(DIAG.results()) - len(unreached)}/{CASES} cases recorded, "
+            f"failed {[row['id'] for row in DIAG.results() if row['state'] == 'failed']}, "
+            f"skipped {[row['id'] for row in DIAG.results() if row['state'] == 'skipped']}, "
+            f"unexecuted {unreached}; {elapsed:.0f} s script time, peak owned "
+            f"{proof.peak // permanent.MIB} MiB at phase checks, phase-sampled host free minimum "
+            f"{proof.low // permanent.MIB} MiB; one owned 128 MiB scratch image, ordinary detach; "
+            f"receipt {receipt}"
+        )
+        permanent.record("result.txt", f"diagnostic (not a PASS)\n{line}\n")
+        print(line)
+        expect(DIAG.aborted is None, f"the diagnostic aborted: {DIAG.aborted}")
+        return 0
     line = (
         f"outputs-prune proof held: {len(DONE)} cases, {elapsed:.0f} s script time, peak owned "
         f"{proof.peak // permanent.MIB} MiB at phase checks, phase-sampled host free minimum "
