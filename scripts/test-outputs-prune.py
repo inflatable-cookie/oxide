@@ -89,7 +89,11 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
 
   01 init: adopt publishes the current control format (state version 4 with
      the `oxide.outputs/3` owned-outputs fence and a ready transaction in both
-     controls) and `oxide.outputs.registry/1` exists. Older-binary control
+     controls) and the current registry document is exactly
+     `oxide.outputs.registry/2` with schema 2 and `complete: true` — the pair
+     this head writes, checked against the frozen `prune.rs` literals by the
+     pure selector; a legacy 1/1 document is readable by the product but is
+     not this proof's expected current write. Older-binary control
      (root-authorized read-only artifact): the exact released d246d400
      control-2 binary is read from its durable release-audit copy
      (`OLD_ARTIFACT_PATH`, recovered and independently hash/size verified)
@@ -244,6 +248,7 @@ import inspect
 import importlib.util
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -324,6 +329,13 @@ CAPABILITIES_PROBE = "__oxide-build-capabilities"
 # silently accepted drift.
 CONTROL_STATE_VERSION = 4
 OWNED_OUTPUTS_FENCE = "oxide.outputs/3"
+# The registry document this head WRITES (prune.rs REGISTRY_VERSION /
+# REGISTRY_SCHEMA): initialization creates 2/2 and a profile receipt promotes a
+# legacy 1/1 document to 2/2, so 2/2 is the current-write format case 01 must
+# see. The legacy 1/1 document stays readable by the product, but it is a
+# different (read-only) truth and is deliberately NOT accepted here.
+REGISTRY_VERSION = "oxide.outputs.registry/2"
+REGISTRY_SCHEMA = 2
 CANDIDATE_CAPABILITY = {
     "control_state_version": CONTROL_STATE_VERSION,
     "registration_version": 2,
@@ -636,6 +648,23 @@ class _Skippable:
 
 def case(case_id: str) -> _Case:
     return _Case(case_id)
+
+
+def registry_is_current(registry: dict) -> bool:
+    """The exact current registry document this proof's head writes: version
+    `oxide.outputs.registry/2` with schema 2 and `complete: true`.
+
+    This is case 01's production oracle. It is an exact pair, never "either
+    format", a mixed pair, or a value derived from the document it checks: a
+    legacy 1/1 document, a mixed pair, an unknown version, a missing/invalid
+    field or an incomplete registry all fail, so a product format bump fails
+    this proof loudly instead of silently following it.
+    """
+    return (
+        registry.get("version") == REGISTRY_VERSION
+        and registry.get("schema") == REGISTRY_SCHEMA
+        and registry.get("complete") is True
+    )
 
 
 class FixtureEffects:
@@ -1192,7 +1221,7 @@ def run(proof, repo: str) -> None:
             )
             expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
         registry = world.registry_doc()
-        expect(registry["version"] == "oxide.outputs.registry/1" and registry.get("schema") == 1 and registry["complete"], registry)
+        expect(registry_is_current(registry), registry)
         # Older-binary fence control: the exact d246d400 artifact's copy reports
         # control state 2, then its `check` and `outputs adopt` in this fixture
         # (private HOME without any install receipt, private CARGO_HOME, pool and
@@ -2112,6 +2141,62 @@ def self_test() -> int:
         assert parameters["effects"].default is REAL_FIXTURE_EFFECTS, parameters["effects"]
 
     check("private fixture output container", private_container)
+
+    def registry_oracle() -> None:
+        # (a) The production oracle accepts exactly the current 2/2 complete
+        # document.
+        current = {"version": REGISTRY_VERSION, "schema": REGISTRY_SCHEMA, "complete": True}
+        assert registry_is_current(current), current
+        # (b) Stale, mixed, unknown, missing and incomplete documents all fail:
+        # the oracle never accepts "either format", a mixed pair, or the
+        # document it is checking as its own expectation.
+        refuse = [
+            {"version": "oxide.outputs.registry/1", "schema": 1, "complete": True},
+            {"version": REGISTRY_VERSION, "schema": 1, "complete": True},
+            {"version": "oxide.outputs.registry/1", "schema": REGISTRY_SCHEMA, "complete": True},
+            {"version": REGISTRY_VERSION, "schema": REGISTRY_SCHEMA, "complete": False},
+            {"version": REGISTRY_VERSION, "schema": REGISTRY_SCHEMA, "complete": 1},
+            {"version": REGISTRY_VERSION, "schema": REGISTRY_SCHEMA},
+            {"version": REGISTRY_VERSION, "complete": True},
+            {"schema": REGISTRY_SCHEMA, "complete": True},
+            {"version": "oxide.outputs.registry/3", "schema": 3, "complete": True},
+            {"version": REGISTRY_VERSION, "schema": str(REGISTRY_SCHEMA), "complete": True},
+            {"version": REGISTRY_VERSION, "schema": REGISTRY_SCHEMA + 1, "complete": True},
+            {},
+        ]
+        for document in refuse:
+            assert not registry_is_current(document), document
+        # (c) The pinned pair must equal the FROZEN product's own literal
+        # constants, read from source (bounded) rather than assumed: a product
+        # bump fails this proof loudly instead of being followed silently.
+        source_path = os.path.join(os.path.dirname(HERE), "src", "bin", "oxide", "prune.rs")
+        with open(source_path, encoding="utf-8") as handle:
+            text = handle.read(2 * 1024 * 1024)
+        version = re.search(
+            r'^pub const REGISTRY_VERSION: &str = "([^"]+)";$', text, re.MULTILINE
+        )
+        schema = re.search(r"^const REGISTRY_SCHEMA: u32 = (\d+);$", text, re.MULTILINE)
+        assert version is not None, "prune.rs no longer declares REGISTRY_VERSION"
+        assert schema is not None, "prune.rs no longer declares REGISTRY_SCHEMA"
+        assert version.group(1) == REGISTRY_VERSION, (version.group(1), REGISTRY_VERSION)
+        assert int(schema.group(1)) == REGISTRY_SCHEMA, (schema.group(1), REGISTRY_SCHEMA)
+        # The legacy pair stays a distinct readable truth, never this proof's
+        # expected current write.
+        legacy_version = re.search(
+            r'^const LEGACY_REGISTRY_VERSION: &str = "([^"]+)";$', text, re.MULTILINE
+        )
+        legacy_schema = re.search(
+            r"^const LEGACY_REGISTRY_SCHEMA: u32 = (\d+);$", text, re.MULTILINE
+        )
+        assert legacy_version is not None and legacy_schema is not None
+        assert REGISTRY_VERSION != legacy_version.group(1)
+        assert REGISTRY_SCHEMA != int(legacy_schema.group(1))
+        # (d) The production case-01 body calls the same predicate.
+        case_one = inspect.getsource(run)
+        assert "expect(registry_is_current(registry), registry)" in case_one, case_one
+        assert 'registry["version"] ==' not in case_one, "case 01 still compares the version inline"
+
+    check("current registry format oracle", registry_oracle)
 
     def counted_fail_fast() -> None:
         ran: list[str] = []
