@@ -268,7 +268,7 @@ entries, symlinked pool/payload/slots/slot roots, unknown accounting and
 mismatched backing refuse. During a durably recorded whole-slot deletion, an
 owned nested symlink entry may be unlinked as a leaf after its parent and
 entry ownership are verified. The target is never followed or removed.
-Deletion never touches project or workspace paths. A lost delete is
+Deletion never touches project or workspace paths. A deletion restores owner read, write and search on each owned real directory it removes, so read-only directories a build or test left inside a slot (such as Effigy's `.effigy/state/objects/<hash>` under a slot's child scratch) cannot leave a recorded deletion unfinishable; foreign directories and symlinks still refuse, and a symlink is unlinked as a leaf, never followed. A lost delete is
 reconciled only for the recorded evicting slot path.
 
 **A command's child temporary directory is inside its slot (oxide#136).**
