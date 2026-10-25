@@ -697,7 +697,15 @@ oxide run --execution-budget 120s
   from private checkouts with private `HOME`/`CARGO_HOME`/`OXIDE_CONFIG`/
   `OXIDE_POOL`/temp. Staging is this clean HEAD's debug `oxide`, built
   offline with the pinned toolchain into scratch-owned target and build
-  directories; the copied candidate must hash-equal the staged binary and
+  directories at 4 Cargo jobs with 16 codegen units (opt-level `s`, debug
+  info off, debug assertions on, incremental off, symbol-stripped); fixtures
+  keep one Cargo job, run sequentially and never overlap staging. Those jobs
+  and codegen units are configured build parallelism, not a CPU or thread
+  hard cap, and they declare no admission demand: the guard's own admission
+  and monitoring stay authoritative. `effigy proof:command-budgets:test` runs
+  only the script's pure `--self-check`/`--self-test` modes, so it is not
+  native and the fit of this recipe stays unmeasured until a separately
+  activated diagnostic; the copied candidate must hash-equal the staged binary and
   then answer the built-in `__oxide-build-capabilities` probe (which reports
   `test_controls`) before any private-home fixture exists. The cumulative
   window's oracle is the launched program's own heartbeat counter after a

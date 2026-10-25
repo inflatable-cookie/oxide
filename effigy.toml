@@ -550,6 +550,17 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
 
+# Pure apparatus checks for oxide#140's command-budget proof, through the
+# script's existing `--self-check` and `--self-test` modes only: they stage
+# nothing, start no child, create no pool or image and touch no fixture, so
+# this selector is deliberately not heavy. It is not the native proof, advances
+# no gate and measures no fit.
+[tasks."proof:command-budgets:test"]
+run = [
+  "python3 scripts/test-command-budgets.py --self-check",
+  "python3 scripts/test-command-budgets.py --self-test",
+]
+
 # Opt-in command admission/execution budgets (oxide#140): one fixed proof
 # script and the whole command of the qualified shared supervisor under heavy
 # admission (300 s absolute, 512 MiB monitored scratch including staging). It

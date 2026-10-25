@@ -19,9 +19,13 @@ Apparatus contract
   independent per-case timeout can outlive the guard.
 - The staged candidate is this clean HEAD's debug `oxide`: plain Cargo, the
   invoking Cargo home, `--locked --offline`, pinned `RUSTUP_TOOLCHAIN`,
-  no auto-install, one job, explicit target and build directories inside the
-  monitored scratch, then copied out, hashed and identified; only the staging
-  directories are removed. Fixtures never see a staged target.
+  no auto-install, 4 Cargo jobs with 16 codegen units, explicit target and
+  build directories inside the monitored scratch, then copied out, hashed and
+  identified; only the staging directories are removed. Fixtures never see a
+  staged target: they keep one Cargo job, run sequentially and never overlap
+  the staging build. Cargo jobs and codegen units are configured build
+  parallelism, not a CPU or thread hard cap, and they declare no admission
+  demand.
 - Lockfile premise: the only `--locked` invocation in this proof is that
   staging build of this repository, whose committed `Cargo.lock` is present at
   the proof's own HEAD. Fixture crates are std-only and are never invoked with
@@ -102,7 +106,16 @@ EXPECTED_RUNNER_SHA256 = "961164e797c01432fa8234497627f75e56489ef6395ef66e48824c
 WALL_LIMIT_S = 300
 SCRATCH_BUDGET_MIB = 512
 SHUTDOWN_MARGIN_S = 30
-STAGE_JOBS = 1
+# Staging is one debug build of this repository. Four Cargo jobs with 16 codegen
+# units cut its wall time while the staged artifact keeps the same frozen
+# profile (opt-level `s`, debug info off, debug assertions on, incremental off,
+# symbol-stripped), and no case inspects debug info or symbols. Cargo jobs and
+# codegen units are configured build parallelism, not a CPU or thread hard cap,
+# and they promise no admission or capacity fit: the guard's own admission and
+# monitoring stay authoritative. Fixtures keep one job and run sequentially,
+# and no fixture runs while staging builds.
+STAGE_JOBS = 4
+STAGE_CODEGEN_UNITS = 16
 FIXTURE_JOBS = 1
 MAX_RECEIPT_BYTES = 64 * 1024
 SELECTOR = "rust:command-budgets"
@@ -459,9 +472,9 @@ def plan_document() -> dict:
             {"name": "unbudgeted", "oracle": "exit 3 preserved, no budget diagnostic, no events required"},
         ],
         "phases": [
-            {"name": "stage", "seconds": PHASE_ALLOCATION_S["stage"], "allocation": "one debug oxide, plain Cargo offline, target and build inside scratch, staging deleted before fixtures", "disk_mib": 220},
+            {"name": "stage", "seconds": PHASE_ALLOCATION_S["stage"], "allocation": "one debug oxide, plain Cargo offline, 4 Cargo jobs with 16 codegen units, target and build inside scratch, staging deleted before fixtures", "disk_mib": 220},
             {"name": "prepare", "seconds": PHASE_ALLOCATION_S["prepare"], "allocation": "private fixture roots and tiny std-only crates", "disk_mib": 20},
-            {"name": "cases", "seconds": PHASE_ALLOCATION_S["cases"], "allocation": "sequential fixture commands; peak: one staged binary, one compiler job, at most two live fixture processes", "disk_mib": 260},
+            {"name": "cases", "seconds": PHASE_ALLOCATION_S["cases"], "allocation": "sequential fixture commands after staging finishes; peak: one staged binary, one compiler job, at most two live fixture processes", "disk_mib": 260},
             {"name": "cleanup", "seconds": PHASE_ALLOCATION_S["cleanup"], "allocation": "owned direct children released, fixture roots removed", "disk_mib": 0},
             {"name": "margin", "seconds": PHASE_ALLOCATION_S["margin"], "allocation": "reserved for the guard's own shutdown", "disk_mib": 0},
         ],
@@ -480,8 +493,10 @@ def plan_document() -> dict:
         "concurrency": {
             "staged_binaries": 1,
             "stage_cargo_jobs": STAGE_JOBS,
+            "stage_codegen_units": STAGE_CODEGEN_UNITS,
             "fixture_cargo_jobs": FIXTURE_JOBS,
-            "fixture_commands": "sequential, at most one candidate and one holder at a time",
+            "fixture_commands": "sequential after staging finishes, at most one candidate and one holder at a time",
+            "not_a_cap": "Cargo jobs and codegen units are configured build parallelism, not a CPU or thread hard cap; they declare no admission demand and promise no capacity fit",
         },
         "diagnostic": {
             "qualified": False,
@@ -1737,50 +1752,112 @@ def case_unbudgeted(root: str, subject: str) -> None:
 # Staging and the counted run.
 
 
-def stage_subject(scratch: str) -> str:
-    """Stage this clean HEAD's debug oxide: plain Cargo, offline, in scratch."""
-    stage = private_dir(os.path.join(scratch, "stage"))
-    log = os.path.join(stage, "stage.log")
+# The staging profile is frozen apart from the build-parallelism constants
+# above: opt-level, debug info, debug assertions, incremental, strip flags, the
+# pinned toolchain, the offline lock and the scrubbed ambient variables.
+STAGING_ENV_REQUIRED = {
+    "RUSTUP_TOOLCHAIN": BUILDER,
+    "RUSTUP_AUTO_INSTALL": "0",
+    "RUSTC_WRAPPER": "",
+    "RUSTC_WORKSPACE_WRAPPER": "",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS": "true",
+    "CARGO_PROFILE_DEV_OPT_LEVEL": "s",
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": str(STAGE_CODEGEN_UNITS),
+    "CARGO_INCREMENTAL": "0",
+    "RUSTFLAGS": "-C strip=symbols",
+    "CARGO_NET_OFFLINE": "true",
+}
+STAGING_SCRUBBED = (
+    "CARGO",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "OXIDE_CONFIG",
+    "OXIDE_POOL",
+)
+
+
+# The staging build of this repository is the proof's only `--locked`
+# invocation; fixture crates are std-only and never pass it. Defining the flag
+# once keeps that single-invocation premise checkable in source.
+LOCKED_FLAG = "--locked"
+
+
+def staging_phase_bound() -> float:
+    """The staging phase bound before it is clipped to the guard's deadline."""
+    return float(PHASE_ALLOCATION_S["stage"])
+
+
+def staging_recipe(stage: str) -> tuple[list[str], dict]:
+    """The production staging recipe: the argv and environment it really uses.
+
+    Callers pass the owned stage directory so target and build stay inside the
+    monitored scratch. The child bound is applied by `timeout()` at the call
+    site, clipped to the guard's own remaining time.
+    """
     env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_"))
-        and key
-        not in (
-            "CARGO",
-            "RUSTC",
-            "RUSTC_WRAPPER",
-            "RUSTC_WORKSPACE_WRAPPER",
-            "CARGO_ENCODED_RUSTFLAGS",
-            "OXIDE_CONFIG",
-            "OXIDE_POOL",
-        )
+        and key not in STAGING_SCRUBBED
     }
-    env.update(
-        {
-            "RUSTUP_TOOLCHAIN": BUILDER,
-            "RUSTUP_AUTO_INSTALL": "0",
-            "RUSTC_WRAPPER": "",
-            "RUSTC_WORKSPACE_WRAPPER": "",
-            "CARGO_TARGET_DIR": os.path.join(stage, "target"),
-            "CARGO_BUILD_BUILD_DIR": os.path.join(stage, "build"),
-            "CARGO_PROFILE_DEV_DEBUG": "0",
-            "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS": "true",
-            "CARGO_PROFILE_DEV_OPT_LEVEL": "s",
-            "CARGO_PROFILE_DEV_CODEGEN_UNITS": "1",
-            "CARGO_INCREMENTAL": "0",
-            "RUSTFLAGS": "-C strip=symbols",
-            "CARGO_NET_OFFLINE": "true",
-        }
-    )
+    env.update(STAGING_ENV_REQUIRED)
+    env["CARGO_TARGET_DIR"] = os.path.join(stage, "target")
+    env["CARGO_BUILD_BUILD_DIR"] = os.path.join(stage, "build")
+    argv = ["cargo", "build", "-j", str(STAGE_JOBS), LOCKED_FLAG, "--offline", "--bin", "oxide"]
+    return argv, env
+
+
+def staging_recipe_problems(argv: list[str], env: dict, clipped_s: float, stage: str) -> list[str]:
+    """Every deviation from the frozen staging recipe; empty means conformant.
+
+    The pure checks use this on the production `staging_recipe()` output and on
+    deliberately mutated copies, so a regression in jobs, codegen units,
+    profile flags, a leaked encoded flag, a mis-scoped target directory or a
+    stretched child bound is reported as a concrete problem instead of being
+    silently accepted.
+    """
+    problems: list[str] = []
+    expected_argv = ["cargo", "build", "-j", str(STAGE_JOBS), LOCKED_FLAG, "--offline", "--bin", "oxide"]
+    if argv != expected_argv:
+        problems.append(f"staging argv is {argv!r}, not {expected_argv!r}")
+    if STAGE_JOBS != 4:
+        problems.append(f"staging must configure 4 Cargo jobs, not {STAGE_JOBS}")
+    if STAGE_CODEGEN_UNITS != 16:
+        problems.append(f"staging must configure 16 codegen units, not {STAGE_CODEGEN_UNITS}")
+    if FIXTURE_JOBS != 1:
+        problems.append(f"fixtures must keep one Cargo job, not {FIXTURE_JOBS}")
+    for key, value in STAGING_ENV_REQUIRED.items():
+        if env.get(key) != value:
+            problems.append(f"staging env {key} is {env.get(key)!r}, not {value!r}")
+    if env.get("CARGO_ENCODED_RUSTFLAGS"):
+        problems.append("staging leaked CARGO_ENCODED_RUSTFLAGS")
+    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
+        if not str(env.get(key, "")).startswith(stage):
+            problems.append(f"staging env {key} is not inside the owned stage directory")
+    if not 0 < clipped_s <= staging_phase_bound():
+        problems.append(f"staging child bound {clipped_s} is outside the {staging_phase_bound()} s phase")
+    return problems
+
+
+def stage_subject(scratch: str) -> str:
+    """Stage this clean HEAD's debug oxide: plain Cargo, offline, in scratch."""
+    stage = private_dir(os.path.join(scratch, "stage"))
+    log = os.path.join(stage, "stage.log")
+    argv, env = staging_recipe(stage)
+    stage_timeout = timeout(staging_phase_bound())
+    problems = staging_recipe_problems(argv, env, stage_timeout, stage)
+    expect(not problems, "the staging recipe drifted: " + "; ".join(problems))
     with open(log, "w", encoding="utf-8") as handle:
         build = subprocess.run(
-            ["cargo", "build", "-j", str(STAGE_JOBS), "--locked", "--offline", "--bin", "oxide"],
+            argv,
             cwd=REPO,
             env=env,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            timeout=timeout(PHASE_ALLOCATION_S["stage"]),
+            timeout=stage_timeout,
         )
     if build.returncode:
         fail(f"staging exit {build.returncode}: {read_text(log)[-2000:]}")
@@ -2089,6 +2166,7 @@ class Proof:
 
 def self_check() -> None:
     """Pure checks of the argument boundary, plan, arithmetic and oracles."""
+    global STAGE_JOBS, STAGE_CODEGEN_UNITS, FIXTURE_JOBS
     expect(parse_arguments([]) == ("proof", None), "the bare invocation must run the proof")
     expect(parse_arguments(["--plan"]) == ("plan", None), "--plan must be effect-free")
     expect(parse_arguments(["--self-check"]) == ("self-check", None), "--self-check must parse")
@@ -2206,6 +2284,79 @@ def self_check() -> None:
         plan["provenance"]["lockfile"].startswith("the only --locked call is the staging build")
         and "beside each fixture manifest" in plan["provenance"]["lockfile"],
         "the lockfile premise changed",
+    )
+    # Staging parallelism and its frozen surroundings: the production
+    # `staging_recipe()` output is the subject, not a copy of what the test
+    # expects, and each mutation below must surface as a concrete problem.
+    stage_dir = "/private/tmp/oxide-proof-selfcheck/stage"
+    stage_argv, stage_env = staging_recipe(stage_dir)
+    stage_bound = clip(staging_phase_bound(), 1000.0)
+    expect(stage_argv == ["cargo", "build", "-j", "4", LOCKED_FLAG, "--offline", "--bin", "oxide"], "the staging argv is no longer 4 jobs with the locked/offline flags")
+    expect(stage_env["CARGO_PROFILE_DEV_CODEGEN_UNITS"] == "16", "the staging codegen units are not 16")
+    expect(FIXTURE_JOBS == 1, "fixtures must keep one Cargo job")
+    expect(clip(staging_phase_bound(), 12.5) == 12.5, "the staging bound must still clip to the guard's remaining time")
+    expect(
+        staging_recipe_problems(stage_argv, stage_env, stage_bound, stage_dir) == [],
+        "the production staging recipe drifted: "
+        + "; ".join(staging_recipe_problems(stage_argv, stage_env, stage_bound, stage_dir)),
+    )
+    expect(plan["concurrency"]["stage_cargo_jobs"] == 4, "the plan does not report 4 staging Cargo jobs")
+    expect(plan["concurrency"]["stage_codegen_units"] == 16, "the plan does not report 16 staging codegen units")
+    expect(plan["concurrency"]["fixture_cargo_jobs"] == 1, "the plan does not report one fixture Cargo job")
+    expect("not a CPU or thread hard cap" in plan["concurrency"]["not_a_cap"], "the plan must deny a CPU or thread hard cap")
+    saved_parallelism = (STAGE_JOBS, STAGE_CODEGEN_UNITS, FIXTURE_JOBS)
+    try:
+        STAGE_JOBS = 1
+        mutated_argv, mutated_env = staging_recipe(stage_dir)
+        expect(
+            any("4 Cargo jobs" in problem for problem in staging_recipe_problems(mutated_argv, mutated_env, stage_bound, stage_dir)),
+            "a one-job staging mutation did not fail its oracle",
+        )
+        STAGE_JOBS = saved_parallelism[0]
+        STAGE_CODEGEN_UNITS = 1
+        mutated_argv, mutated_env = staging_recipe(stage_dir)
+        expect(
+            any("16 codegen units" in problem for problem in staging_recipe_problems(mutated_argv, mutated_env, stage_bound, stage_dir)),
+            "a one-codegen-unit staging mutation did not fail its oracle",
+        )
+        STAGE_CODEGEN_UNITS = saved_parallelism[1]
+        FIXTURE_JOBS = 2
+        expect(
+            any("fixtures must keep one Cargo job" in problem for problem in staging_recipe_problems(stage_argv, stage_env, stage_bound, stage_dir)),
+            "a two-job fixture mutation did not fail its oracle",
+        )
+    finally:
+        STAGE_JOBS, STAGE_CODEGEN_UNITS, FIXTURE_JOBS = saved_parallelism
+    drifted_env = dict(stage_env)
+    drifted_env["CARGO_PROFILE_DEV_OPT_LEVEL"] = "0"
+    expect(
+        any("CARGO_PROFILE_DEV_OPT_LEVEL" in problem for problem in staging_recipe_problems(stage_argv, drifted_env, stage_bound, stage_dir)),
+        "an opt-level drift was accepted",
+    )
+    stripped_env = dict(stage_env)
+    stripped_env.pop("RUSTFLAGS")
+    expect(
+        any("RUSTFLAGS" in problem for problem in staging_recipe_problems(stage_argv, stripped_env, stage_bound, stage_dir)),
+        "a missing strip flag was accepted",
+    )
+    leaked_env = dict(stage_env)
+    leaked_env["CARGO_ENCODED_RUSTFLAGS"] = "-Cdebuginfo=2"
+    expect(
+        any("CARGO_ENCODED_RUSTFLAGS" in problem for problem in staging_recipe_problems(stage_argv, leaked_env, stage_bound, stage_dir)),
+        "a leaked CARGO_ENCODED_RUSTFLAGS was accepted",
+    )
+    escaped_env = dict(stage_env)
+    escaped_env["CARGO_BUILD_BUILD_DIR"] = "/private/elsewhere/build"
+    expect(
+        any("CARGO_BUILD_BUILD_DIR" in problem for problem in staging_recipe_problems(stage_argv, escaped_env, stage_bound, stage_dir)),
+        "a staging build directory outside the owned stage was accepted",
+    )
+    expect(
+        any(
+            "staging child bound" in problem
+            for problem in staging_recipe_problems(stage_argv, stage_env, stage_bound + 1.0, stage_dir)
+        ),
+        "a stretched staging child bound was accepted",
     )
     expect("grammar" in plan["provenance"]["diagnostics"], "the diagnostic-grammar premise changed")
     # Diagnostic mode is declared, unqualified and dependency-ordered.
