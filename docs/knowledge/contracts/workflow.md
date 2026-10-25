@@ -1249,14 +1249,13 @@ identity lines.
 
 ### Temporary scratch placement
 
-**Status.** The proof and validation tooling default is implemented in source
-(oxide#145) and awaits independent review plus requalification; the Oxide
-children rule remains approved and not built (queue #136). Neither is measured
-SSD-write savings.
+The proof and validation tooling uses the selected-volume default described
+below. The Oxide children rule remains approved direction (queue #136), rather
+than installed behaviour. Neither establishes measured SSD-write savings.
 
 Tom, 2026-10-25: "Test and proof temp folders definitely should move to the
-drive." This is direction for two separate Oxide facilities; it is not current
-behaviour. Effigy owns its own test/run temp
+drive." The two Oxide facilities have separate qualification boundaries.
+Effigy owns its own test/run temp
 placement and retention; Oxide changes no consumer or daemon configuration.
 
 - **Oxide children.** The selected pool's actual volume decides temp placement
@@ -1273,7 +1272,7 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   the selected volume use owned temp too. Absent drive selection falls back
   internally without recreating a mount point. Bounded escaped summary/status
   labels distinguish `temp: inherited <path>` and `temp: oxide <path>`.
-- **Proof and validation tooling (oxide#145, source only).** With no caller
+- **Proof and validation tooling (oxide#145).** With no caller
   scratch or root parent, `scripts/bounded-test.py` creates its owned root in a
   private area on the volume the effect-free pool selection names:
   - the recorded removable selection when the pool's `removable.json` names a
@@ -1297,13 +1296,33 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   product's verified build-time selection (no container/role check), and the
   narrow config reader understands only a simple `[pool] path` entry.
 
-The previously qualified supervisor hash stays qualified only at its old
-bytes. This source has no native run: it needs independent review and
-`proof:supervisor:qualify` at the exact head, with the default selection
-actually exercised rather than masked by a root-parent override.
+Supervisor SHA-256
+`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
+has independent exact-head source review and separate author and reviewer
+`proof:supervisor:qualify` receipts, each exercising all 175 cases with the
+selected-volume default and positive outer closure. Qualification is bound to
+those bytes and evidence; an older hash's receipts do not transfer to new bytes.
 
-The implementation briefs and separate native activations live in Queue. No
-runtime scratch or host setting changes follow from this knowledge record.
+**Genuine internal-placement proofs (Tom, 2026-10-25).** Tom answered decision
+`bd357a4c-2e1d-4190-bafb-290d7c2ae244`: "Accept the internal-root exception for
+internal-placement proofs (#136 now, similar proofs later)". A proof that must
+exercise a genuine internal directory pool may fix the qualified supervisor's
+existing `--root-parent /private/tmp` option in its selector. Its selector and
+owning proof description must explain that requirement. One monitored owned
+root contains staging, temporary files, the internal fixture pool and any
+removable fixture image backing. The existing 512 MiB scratch budget,
+wall-clock bounds, custody, closure and retention rules remain unchanged;
+reserve sampling follows the filesystem actually holding that root. This
+exception grants no product pool-path bypass, extra unmonitored scratch root,
+new mount topology or host cleanup authority. Ordinary builds, tests and proofs
+continue to use the selected volume by default.
+
+Existing proof receipts remain bound to their activated recipe. Moving an
+internal-placement selector to this explicit root requires a short independent
+recipe review; already-passed evidence is not recounted solely for that selector
+migration unless its source changes. Separate ROOT activation still precedes
+each diagnostic or native submission. Briefs, activations and outcomes live in
+Queue; this knowledge record changes no runtime scratch or host setting.
 
 ## Proof-authoring premise checklist
 
@@ -1345,10 +1364,11 @@ and grants no native start, installation, clock extension or cleanup authority.
    consistently for staging and fixture commands. An inherited encoded value
    must not silently override the proof's declared flags or change the staged
    candidate's capabilities.
-8. **Temporary storage.** Once the child-temp and shared-proof defaults are
-   qualified and landed, use scratch and `TMPDIR` on the selected volume.
-   Until then, follow the exact qualified guard and activated recipe; this
-   checklist does not transfer qualification to an unpublished default.
+8. **Temporary storage.** Use scratch and `TMPDIR` on the selected volume
+   under the qualified defaults. A proof requiring a genuine internal pool
+   uses the documented internal-placement exception above, fixed in its
+   reviewed selector. Follow the exact qualified guard and activated recipe;
+   this checklist does not transfer qualification between supervisor bytes.
 9. **macOS mktemp.** `mktemp` without a template ignores `TMPDIR` on macOS.
    Supply a template under the intended owned scratch parent and verify that
    the executable fixture uses it.
