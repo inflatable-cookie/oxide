@@ -201,7 +201,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).
-- **Declined:** cached slot accounting; revisit only on new evidence.
+- **Approved, not built** (Tom, 2026-10-25): recorded per-slot accounting
+  replaces whole-payload admission walks. Closed-slot records are bound to
+  generation/incarnation; missing or invalid records require bounded slot
+  walks, and cross-slot hard-link overcount is accepted. Removable pools
+  also use the volume's used-space bound. The [accounting contract](contracts/local-lease.md#recorded-per-slot-accounting-approved-not-implemented)
+  owns the direction and trust limits. This supersedes the earlier cached
+  accounting decline for this scope; its negative reviews remain history.
 
 ### Adoption pattern
 

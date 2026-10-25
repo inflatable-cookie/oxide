@@ -567,7 +567,48 @@ are unit tests in `effigy test rust`. Not covered natively: the nine-grant
 freshness bound is a bounded-loop inspection, and no large live inventory or
 physical multi-million-entry performance is claimed.
 
-### Parked: cached closed-slot accounting (lead `cbb2824d`)
+### Recorded per-slot accounting (approved, not implemented)
+
+Tom's 2026-10-25 ruling, "We need a much faster way to do the accounting
+too" (Queue decision `8c6b8319-b20e-4a78-b987-c09dee69886c`), approves a
+different policy from the exact-cache proposal below. The removable-volume
+hotfix remains the implemented admission path until its reviewed replacement.
+
+At release after writer closure, record unique allocated bytes by walking
+only that slot, bounded, with the record bound to its generation/incarnation.
+Admission and eviction use the sum of current slot records and walk only
+slots without a current record. A missing, crashed or legacy record grants no
+size estimate; an incomplete required walk keeps the existing refusal rules.
+Held/writer transitions invalidate closed records. Publication, flush,
+recovery, version fencing and crash ordering require an independently
+reviewed detailed design before implementation.
+
+Cross-slot hard links may be counted more than once; that conservative
+overcount is accepted. This is not the old exact inode-union cache. A closed
+record is trusted until its generation changes or a held/crashed transition
+invalidates it: later changes inside an otherwise recorded idle slot need not
+be detected at each admission. That deliberate trust relaxation must remain
+explicit; a record does not prove immutable bytes or writer closure.
+Unrecorded slots still enforce ownership, unreadable-entry, foreign-entry and
+symlink refusals. Whole-slot eviction remains limited to positively owned
+idle slots, never active or uncertain writers or retained evidence.
+
+Removable pools also bound admission by verified volume used bytes. The
+internal directory pool uses the recorded sum. Default status reports
+recorded totals with their provenance; `status --measure` keeps the full walk
+as an audit. The implementation must justify removing the hotfix's 5 s
+fallback or retaining it only for legacy pools.
+
+Acceptance requires O(slots) admission with no inventory walks when all
+records are current, fixture comparisons where the sum is at least the
+full-walk union, crash/legacy migration and bounded unknown handling. The
+focused proof uses tiny fixtures and debug-only controls, with a premise
+sweep or safe diagnostic before a counted run. Changes decide deletion under
+byte pressure, so validation is elevated; author and independent reviewer
+native sessions remain separately activated. No live-pool migration,
+cleanup, installation or consumer change follows from this design approval.
+
+### Historical parked exact cache (lead `cbb2824d`)
 
 Parked on 2026-10-21, not implemented. Sol's re-review of revision 2 (`d578447`) was again changes required. Transient hard-link mutation means an idle slot's contents and link topology cannot be shown to be unchanged cheaply, and out-of-lock walks need snapshot and conditional-commit rules. An exact cache therefore needs an immutability mechanism or an explicit policy relaxation. The per-command cost is addressed first by removing the front door's non-authoritative whole-payload walks, a separate correction. Both review verdicts are kept on the lead. Revision 2 text follows for reference. Revision 2 answers Sol's prospective review of `5852670` (changes required: shared-inode mutation, metadata outside slots, transition rules). Revision 2 drops revision 1's held baselines and overcounting sums.
 
