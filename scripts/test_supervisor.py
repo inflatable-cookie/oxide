@@ -2068,105 +2068,267 @@ class FixtureProbe:
 
 
 class PureScratchPreparation(unittest.TestCase):
-    """The owned selected-volume parent under `<mount>/scratch/oxide`: created
-    when missing, validated when present, and never adopted, chmodded or removed
-    when it is unsafe."""
+    """The selected volume's scratch pair: a SHARED, pre-existing ancestor
+    `<mount>/scratch` (this user, selected device, no group/other WRITE; 0755 is
+    normal) and Oxide's PRIVATE leaf `<mount>/scratch/oxide` (exactly 0700).
+    Only the leaf is ever created; the ancestor is never created, chmodded,
+    adopted or removed."""
 
-    def world(self):
+    def world(self, ancestor_mode=0o755, leaf_mode=None):
         mount = Path(tempfile.mkdtemp(prefix="prepare.", dir=str(SCRATCH))).resolve()
         self.addCleanup(shutil.rmtree, str(mount), True)
         selection = {"source": "selected-volume", "mount": str(mount),
                      "root_parent": bounded.scratch_parent(str(mount)),
                      "device": os.stat(str(mount)).st_dev, "reason": None}
+        scratch = os.path.join(str(mount), "scratch")
+        if ancestor_mode is not None:
+            os.mkdir(scratch)
+            os.chmod(scratch, ancestor_mode)
+        if leaf_mode is not None:
+            os.mkdir(os.path.join(scratch, "oxide"))
+            os.chmod(os.path.join(scratch, "oxide"), leaf_mode)
         return str(mount), selection
 
-    def test_missing_components_are_created_private(self):
-        mount, selection = self.world()
+    def test_a_0755_shared_ancestor_is_accepted_and_only_the_leaf_is_created(self):
+        mount, selection = self.world(0o755)
+        scratch = os.path.join(mount, "scratch")
+        before = os.lstat(scratch)
         parent = bounded.prepare_scratch_parent(selection, FixtureProbe())
-        self.assertEqual(parent, os.path.join(mount, "scratch", "oxide"))
-        for path in (os.path.join(mount, "scratch"), parent):
-            info = os.lstat(path)
-            self.assertTrue(stat.S_ISDIR(info.st_mode))
-            self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
-            self.assertEqual(info.st_uid, os.geteuid())
-        self.assertEqual(os.listdir(mount), ["scratch"])
+        self.assertEqual(parent, os.path.join(scratch, "oxide"))
+        after = os.lstat(scratch)
+        self.assertEqual((after.st_ino, stat.S_IMODE(after.st_mode)), (before.st_ino, 0o755),
+                         "the shared ancestor was replaced or chmodded")
+        leaf = os.lstat(parent)
+        self.assertEqual(stat.S_IMODE(leaf.st_mode), 0o700)
+        self.assertEqual(leaf.st_uid, os.geteuid())
+        self.assertEqual(os.listdir(scratch), ["oxide"], "preparation created another entry")
         self.assertEqual(os.listdir(parent), [], "preparation created a run resource")
 
-    def test_already_safe_components_are_kept_untouched(self):
-        mount, selection = self.world()
-        scratch, oxide = os.path.join(mount, "scratch"), os.path.join(mount, "scratch", "oxide")
-        os.mkdir(scratch, 0o700)
-        os.mkdir(oxide, 0o700)
-        keep = os.path.join(oxide, "existing.bin")
-        Path(keep).write_bytes(b"x")
-        before = (os.lstat(scratch).st_ino, os.lstat(oxide).st_ino, Path(keep).read_bytes())
+    def test_a_0700_shared_ancestor_is_also_accepted(self):
+        mount, selection = self.world(0o700)
+        parent = bounded.prepare_scratch_parent(selection, FixtureProbe())
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(mount, "scratch")).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.lstat(parent).st_mode), 0o700)
+
+    def test_sticky_does_not_substitute_for_non_writability(self):
+        mount, selection = self.world(0o1777)  # sticky AND group/other writable
+        with self.assertRaises(bounded.SelectionRefused) as caught:
+            bounded.prepare_scratch_parent(selection, FixtureProbe())
+        self.assertIn("group/other writable", str(caught.exception))
+        self.assertIn("sticky", str(caught.exception))
+        self.assertFalse(os.path.lexists(selection["root_parent"]), "a refused ancestor still got a leaf")
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(mount, "scratch")).st_mode), 0o1777,
+                         "the refused shared ancestor was chmodded")
+        mount, selection = self.world(0o1755)  # sticky, readable, not writable
+        parent = bounded.prepare_scratch_parent(selection, FixtureProbe())
+        self.assertEqual(stat.S_IMODE(os.lstat(parent).st_mode), 0o700)
+
+    def test_unsafe_shared_ancestors_refuse_before_any_leaf_effect(self):
+        cases = {
+            "is a symlink": dict(build="symlink"),
+            "is not a directory": dict(build="file"),
+            "is not owned by this user": dict(build="dir", owners=0),
+            "is not on the selected device": dict(build="dir", device=1),
+            "is not canonical": dict(build="dir", realpaths="/private/tmp/shared-scratch"),
+            "is unreadable": dict(build="dir", error=errno.EACCES),
+            "is group/other writable": dict(build="mode", mode=0o775),
+            "is group/other writable, other": dict(build="mode", mode=0o703),
+        }
+        for marks, spec in cases.items():
+            with self.subTest(marks):
+                mount, selection = self.world(ancestor_mode=None)
+                target = os.path.join(mount, "scratch")
+                if spec["build"] == "symlink":
+                    os.mkdir(os.path.join(mount, "elsewhere"), 0o755)
+                    os.symlink(os.path.join(mount, "elsewhere"), target)
+                elif spec["build"] == "file":
+                    Path(target).write_bytes(b"")
+                else:
+                    os.mkdir(target)
+                    os.chmod(target, spec.get("mode", 0o755))
+                before = (os.lstat(target).st_ino, stat.S_IMODE(os.lstat(target).st_mode))
+                probe = FixtureProbe(
+                    owners={target: spec["owners"]} if "owners" in spec else None,
+                    devices={target: spec["device"]} if "device" in spec else None,
+                    realpaths={target: spec["realpaths"]} if "realpaths" in spec else None,
+                    errors={target: PermissionError(spec["error"], "denied", target)}
+                    if "error" in spec else None)
+                with self.assertRaises(bounded.SelectionRefused) as caught:
+                    bounded.prepare_scratch_parent(selection, probe)
+                self.assertIn(marks.split(",")[0], str(caught.exception))
+                self.assertTrue(os.path.lexists(target), "the refused ancestor was removed")
+                self.assertEqual((os.lstat(target).st_ino, stat.S_IMODE(os.lstat(target).st_mode)),
+                                 before, "the refused ancestor was mutated")
+                self.assertFalse(os.path.lexists(selection["root_parent"]),
+                                 "a refused ancestor still got a leaf")
+
+    def test_a_missing_shared_ancestor_refuses_and_creates_nothing(self):
+        mount, selection = self.world(ancestor_mode=None)
         calls = []
 
         def make_dir(path, mode):
             calls.append(path)
             os.mkdir(path, mode)
 
-        self.assertEqual(bounded.prepare_scratch_parent(selection, FixtureProbe(), make_dir), oxide)
-        self.assertEqual(calls, [], "an existing component was recreated")
-        self.assertEqual((os.lstat(scratch).st_ino, os.lstat(oxide).st_ino, Path(keep).read_bytes()), before)
+        with self.assertRaises(bounded.SelectionRefused) as caught:
+            bounded.prepare_scratch_parent(selection, FixtureProbe(), make_dir)
+        self.assertIn("is absent", str(caught.exception))
+        self.assertIn("never creates it", str(caught.exception))
+        self.assertEqual(calls, [], "the shared ancestor was created")
+        self.assertEqual(os.listdir(mount), [], "a refused preparation created an entry")
+
+    def test_the_private_leaf_must_be_exactly_0700_and_is_never_repaired(self):
+        cases = {
+            "0755": 0o755,          # no group/other write, still not 0700
+            "0750": 0o750,
+            "01700": 0o1700,
+        }
+        for marks, mode in cases.items():
+            with self.subTest(marks):
+                mount, selection = self.world(0o755, leaf_mode=mode)
+                leaf = selection["root_parent"]
+                with self.assertRaises(bounded.SelectionRefused) as caught:
+                    bounded.prepare_scratch_parent(selection, FixtureProbe())
+                self.assertIn("is not private", str(caught.exception))
+                self.assertIn("0o700 required", str(caught.exception))
+                self.assertEqual(stat.S_IMODE(os.lstat(leaf).st_mode), mode, "a refused leaf was chmodded")
+        for marks, probe in (("is not owned by this user", FixtureProbe()),
+                             ("is a symlink", FixtureProbe()),
+                             ("is not on the selected device", FixtureProbe(devices={}))):
+            with self.subTest(marks):
+                mount, selection = self.world(0o755)
+                leaf = selection["root_parent"]
+                if marks == "is not owned by this user":
+                    probe = FixtureProbe(owners={leaf: 0})
+                elif marks == "is a symlink":
+                    os.mkdir(os.path.join(mount, "leaf-referent"), 0o700)
+                    os.symlink(os.path.join(mount, "leaf-referent"), leaf)
+                else:
+                    probe = FixtureProbe(devices={leaf: 1})
+                with self.assertRaises(bounded.SelectionRefused) as caught:
+                    bounded.prepare_scratch_parent(selection, probe)
+                self.assertIn(marks, str(caught.exception))
+                self.assertTrue(os.path.lexists(leaf), "the refused leaf was removed")
+
+    def test_an_absent_leaf_is_created_0700_and_reverified(self):
+        mount, selection = self.world(0o755)
+        parent = bounded.prepare_scratch_parent(selection, FixtureProbe())
+        info = os.lstat(parent)
+        self.assertEqual((stat.S_IMODE(info.st_mode), info.st_uid), (0o700, os.geteuid()))
+        self.assertEqual(info.st_dev, os.stat(mount).st_dev)
+        # A post-create identity change refuses rather than being trusted.
+        original = os.lstat(parent)
+        forged = types.SimpleNamespace(st_dev=original.st_dev, st_ino=original.st_ino + 1,
+                                       st_mode=original.st_mode, st_uid=original.st_uid,
+                                       st_size=original.st_size)
+        mount, selection = self.world(0o755)
+
+        class MovingProbe(FixtureProbe):
+            calls = 0
+
+            def lstat(self, path):
+                if path == selection["root_parent"]:
+                    MovingProbe.calls += 1
+                    if MovingProbe.calls > 2:  # validated read, then a changed identity
+                        return forged
+                return super().lstat(path)
+
+        with self.assertRaises(bounded.SelectionRefused) as caught:
+            bounded.prepare_scratch_parent(selection, MovingProbe())
+        self.assertIn("changed while it was being prepared", str(caught.exception))
 
     def test_a_concurrent_creator_is_validated_not_adopted(self):
-        mount, selection = self.world()
-        scratch, oxide = os.path.join(mount, "scratch"), os.path.join(mount, "scratch", "oxide")
-        os.mkdir(scratch, 0o700)
+        mount, selection = self.world(0o755)
+        leaf = selection["root_parent"]
 
         def safe(path, mode):
             os.mkdir(path, 0o700)
             raise FileExistsError(path)  # another run won the race
 
-        self.assertEqual(bounded.prepare_scratch_parent(selection, FixtureProbe(), safe), oxide)
+        self.assertEqual(bounded.prepare_scratch_parent(selection, FixtureProbe(), safe), leaf)
 
         def unsafe(path, mode):
             os.mkdir(path, 0o755)
             raise FileExistsError(path)
 
-        os.rmdir(oxide)
+        os.rmdir(leaf)
         with self.assertRaises(bounded.SelectionRefused) as caught:
             bounded.prepare_scratch_parent(selection, FixtureProbe(), unsafe)
-        self.assertIn("not private to this user", str(caught.exception))
-        self.assertEqual(stat.S_IMODE(os.lstat(oxide).st_mode), 0o755, "a foreign component was chmodded")
+        self.assertIn("is not private", str(caught.exception))
+        self.assertEqual(stat.S_IMODE(os.lstat(leaf).st_mode), 0o755, "a foreign leaf was chmodded")
 
-    def test_unsafe_components_refuse_and_are_never_mutated(self):
-        cases = {
-            "is a symlink": dict(build="symlink"),
-            "is not a directory": dict(build="file"),
-            "is not private to this user": dict(build="mode"),
-            "is not owned by this user": dict(build="dir", owners=0),
-            "is not on the selected device": dict(build="dir", device=1),
-            "is not canonical": dict(build="dir", realpaths="/private/tmp/oxide"),
-            "is unreadable": dict(build="dir", error=errno.EACCES),
-        }
-        for marks, spec in cases.items():
-            with self.subTest(marks):
-                mount, selection = self.world()
-                target = os.path.join(mount, "scratch")
-                if spec["build"] == "symlink":
-                    os.mkdir(os.path.join(mount, "elsewhere"), 0o700)
-                    os.symlink(os.path.join(mount, "elsewhere"), target)
-                elif spec["build"] == "file":
-                    Path(target).write_bytes(b"")
+    def test_readiness_uses_the_same_policy_without_creating_anything(self):
+        def ready_world():
+            mount, selection = self.world(0o755)
+            return mount, selection
+
+        mount, selection = ready_world()
+        result = bounded.readiness(selection, FixtureProbe())
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["leaf"]["state"], "absent; would create 0700")
+        self.assertIn("absent", result["leaf"]["state"])
+        self.assertNotIn("exists", result["leaf"]["state"])
+        self.assertFalse(os.path.lexists(selection["root_parent"]), "readiness created the leaf")
+        self.assertEqual(sorted(os.listdir(os.path.join(mount, "scratch"))), [], "readiness created an entry")
+
+        mount, selection = ready_world()
+        bounded.prepare_scratch_parent(selection, FixtureProbe())
+        again = bounded.readiness(selection, FixtureProbe())
+        self.assertTrue(again["ready"])
+        self.assertEqual(again["leaf"]["state"], "exists")
+        self.assertEqual(again["leaf"]["mode"], "0o700")
+
+        for label, world in (("group writable", 0o775), ("missing ancestor", None),
+                             ("sticky writable", 0o1777)):
+            with self.subTest(label):
+                mount, selection = world_args = ready_world() if world is not None else \
+                    (None, None)
+                if world is None:
+                    mount, selection = self.world(ancestor_mode=None)
                 else:
-                    os.mkdir(target, 0o755 if spec["build"] == "mode" else 0o700)
-                owners = {target: spec["owners"]} if "owners" in spec else None
-                devices = {target: spec["device"]} if "device" in spec else None
-                realpaths = {target: spec["realpaths"]} if "realpaths" in spec else None
-                errors = {target: PermissionError(spec["error"], "denied", target)} \
-                    if "error" in spec else None
-                probe = FixtureProbe(owners=owners, devices=devices, realpaths=realpaths, errors=errors)
-                with self.assertRaises(bounded.SelectionRefused) as caught:
-                    bounded.prepare_scratch_parent(selection, probe)
-                self.assertIn(marks, str(caught.exception))
-                self.assertTrue(os.path.lexists(target), "the refused component was removed")
+                    mount, selection = self.world(world)
+                result = bounded.readiness(selection, FixtureProbe())
+                self.assertFalse(result["ready"], result)
+                self.assertTrue(result["reason"])
                 self.assertFalse(os.path.lexists(selection["root_parent"]),
-                                 "a refused preparation created a component")
+                                 "a refused readiness still created the leaf")
+                if world is None:
+                    self.assertIn("absent", result["reason"])
+                    self.assertEqual(os.listdir(mount), [], "readiness created the ancestor")
+                with self.assertRaises(bounded.SelectionRefused):
+                    bounded.prepare_scratch_parent(selection, FixtureProbe())
+
+    def test_readiness_refuses_without_a_selected_volume(self):
+        fallback = {"source": "fallback", "mount": None, "root_parent": bounded.FALLBACK_PARENT,
+                    "reason": "the volume holding the pool is the boot volume"}
+        result = bounded.readiness(fallback, FixtureProbe())
+        self.assertFalse(result["ready"])
+        self.assertIn("boot volume", result["reason"])
+
+    def test_contract_counterfactuals(self):
+        # (a) the superseded both-private-parent rule would refuse the shared
+        # ancestor the owner's contract now accepts; the accepted leaf is exact
+        # 0700, so privacy lives at the leaf.
+        mount, selection = self.world(0o755)
+        parent = bounded.prepare_scratch_parent(selection, FixtureProbe())
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(mount, "scratch")).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.lstat(parent).st_mode), 0o700)
+        # (b) allowing a writable shared ancestor is refused, sticky or not.
+        for mode in (0o775, 0o757, 0o1777):
+            with self.subTest(mode=oct(mode)):
+                mount, selection = self.world(mode)
+                with self.assertRaises(bounded.SelectionRefused):
+                    bounded.prepare_scratch_parent(selection, FixtureProbe())
+                self.assertFalse(os.path.lexists(selection["root_parent"]))
+        # (c) weakening the leaf below exact 0700 is refused even when no
+        # group/other WRITE bit is set.
+        mount, selection = self.world(0o755, leaf_mode=0o750)
+        with self.assertRaises(bounded.SelectionRefused) as caught:
+            bounded.prepare_scratch_parent(selection, FixtureProbe())
+        self.assertIn("0o700 required", str(caught.exception))
 
     def test_the_mount_and_the_reported_parent_are_revalidated(self):
-        mount, selection = self.world()
+        mount, selection = self.world(0o755)
         link = os.path.join(mount, "link")
         os.symlink(mount, link)
         root_parent = bounded.scratch_parent(link)
@@ -2195,7 +2357,7 @@ class PureScratchPreparation(unittest.TestCase):
         self.assertEqual(parent, "/Volumes/Builds/scratch/oxide-validation")
         self.assertEqual(parent.count("/scratch/"), 1, "a duplicate nested scratch component")
         self.assertNotIn("oxide-validation/scratch", parent)
-        mount, sandbox_selection = self.world()
+        mount, sandbox_selection = self.world(ancestor_mode=None)
         sandbox_parent = bounded.validation_parent(sandbox_selection)
         self.assertEqual(sandbox_parent, os.path.join(mount, "scratch", "oxide-validation"))
         self.assertEqual(sandbox_parent[len(mount):].count("/scratch/"), 1)
@@ -2208,7 +2370,7 @@ class PureScratchPreparation(unittest.TestCase):
         self.assertEqual(bounded.validation_parent({"source": "fallback", "mount": None}), bounded.FALLBACK_PARENT)
 
     def test_a_creation_refusal_keeps_the_warned_fallback_contract(self):
-        mount, selection = self.world()
+        mount, selection = self.world(0o755)
 
         def refuse(path, mode):
             raise PermissionError(errno.EACCES, "denied", path)
@@ -2216,7 +2378,7 @@ class PureScratchPreparation(unittest.TestCase):
         with self.assertRaises(bounded.SelectionRefused) as caught:
             bounded.prepare_scratch_parent(selection, FixtureProbe(), refuse)
         self.assertIn("cannot be created", str(caught.exception))
-        self.assertEqual(os.listdir(mount), [])
+        self.assertEqual(os.listdir(os.path.join(mount, "scratch")), [])
 
 
 OLD = dict(concluded_unix=1000.0, outcome="closed", closure="positive", kept_reason="evidence")

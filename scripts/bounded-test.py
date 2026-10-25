@@ -1643,36 +1643,74 @@ def create_owned_root(parent, probe, make_dir=None):
 
 
 # Owned selected-volume scratch parent ------------------------------------------
+#
+# The selected volume's proof scratch sits INSIDE a shared scratch folder that
+# other projects also use, so the two components have different contracts
+# (Supervisor2160fee3, 2026-10-25):
+#   - `<mount>/scratch` is SHARED. It must already exist; Oxide never creates,
+#     chmods, adopts, renames or removes it. It must be a real canonical
+#     directory of this user on the selected device with no group or other
+#     WRITE bit (0755 passes). A sticky bit is not a substitute for that.
+#   - `<mount>/scratch/oxide` is Oxide's PRIVATE leaf. It must be exactly 0700
+#     and this user's; only this leaf is ever created (0700) when absent.
+# On the Builds drive macOS ignores ownership (Owners Disabled), so these
+# checks are consistency and tamper guards for a cooperative same-user host,
+# not a multi-user privacy guarantee.
 
-def checked_component(path, device, probe):
-    """The facts one owned scratch component must have: a real canonical
-    directory of this user, private, on the selected volume's device."""
+def checked_ancestor(path, device, probe):
+    """A required, pre-existing shared scratch ancestor. It may be readable by
+    group/other (0755 is the normal case for a shared folder) but never
+    writable by them, and it is never created or repaired here."""
     info = probe.lstat(path)
     if stat.S_ISLNK(info.st_mode):
-        raise SelectionRefused(f"scratch component {path} is a symlink")
+        raise SelectionRefused(f"shared scratch ancestor {path} is a symlink")
     if not stat.S_ISDIR(info.st_mode):
-        raise SelectionRefused(f"scratch component {path} is not a directory")
-    if info.st_uid != probe.euid():
-        raise SelectionRefused(f"scratch component {path} is not owned by this user")
-    if info.st_mode & 0o077:
-        raise SelectionRefused(f"scratch component {path} is not private to this user")
+        raise SelectionRefused(f"shared scratch ancestor {path} is not a directory")
     if probe.realpath(path) != path:
-        raise SelectionRefused(f"scratch component {path} is not canonical")
+        raise SelectionRefused(f"shared scratch ancestor {path} is not canonical")
     if probe.stat(path).st_dev != device:
-        raise SelectionRefused(f"scratch component {path} is not on the selected device")
+        raise SelectionRefused(f"shared scratch ancestor {path} is not on the selected device")
+    if info.st_uid != probe.euid():
+        raise SelectionRefused(f"shared scratch ancestor {path} is not owned by this user")
+    if info.st_mode & 0o022:
+        raise SelectionRefused(f"shared scratch ancestor {path} is group/other writable"
+                               " (a sticky bit does not make a writable ancestor safe)")
+    return info
+
+
+def checked_leaf(path, device, probe):
+    """Oxide's private scratch leaf: exactly 0700, this user, real, canonical and
+    on the selected device. Anything else refuses rather than being repaired."""
+    info = probe.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise SelectionRefused(f"scratch leaf {path} is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        raise SelectionRefused(f"scratch leaf {path} is not a directory")
+    if probe.realpath(path) != path:
+        raise SelectionRefused(f"scratch leaf {path} is not canonical")
+    if probe.stat(path).st_dev != device:
+        raise SelectionRefused(f"scratch leaf {path} is not on the selected device")
+    if info.st_uid != probe.euid():
+        raise SelectionRefused(f"scratch leaf {path} is not owned by this user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise SelectionRefused(f"scratch leaf {path} is not private"
+                               f" (mode {oct(stat.S_IMODE(info.st_mode))}, 0o700 required)")
     return info
 
 
 def prepare_scratch_parent(selection, probe, make_dir=None):
-    """Ensure the selected volume's owned scratch parent exists and is safe.
+    """Make the selected volume's private scratch leaf usable, or refuse.
 
-    Selection stays effect-free; this runs in the supervisor's blocking setup,
-    before any mkdtemp, reserve reading or run resource. Missing `scratch` and
-    `oxide` components are created with 0700. An existing component is only
-    ever validated and never chmodded, adopted, renamed or removed, so a
-    symlink, foreign owner, non-directory, unreadable, non-canonical or
-    other-device component refuses and the caller keeps its warned fallback. A
-    concurrent creator that wins the mkdir is validated the same way."""
+    This ONE seam is the authority for both the real setup and the effect-free
+    readiness check. Selection stays effect-free; this runs in the supervisor's
+    blocking setup, before any mkdtemp, reserve reading or run resource.
+
+    The shared ancestor `<mount>/scratch` must already exist and pass
+    `checked_ancestor`; it is never created, chmodded, adopted, renamed or
+    removed. Only the private leaf `<mount>/scratch/oxide` is created, with
+    0700, when it is absent, and it is re-validated after creation (including
+    its device and inode identity and a concurrent creator's result). A refusal
+    leaves the caller its warned `/private/tmp` fallback."""
     make_dir = make_dir or os.mkdir
     mount, device, parent = selection.get("mount"), selection.get("device"), selection.get("root_parent")
     if selection.get("source") != "selected-volume" or not isinstance(mount, str):
@@ -1690,27 +1728,98 @@ def prepare_scratch_parent(selection, probe, make_dir=None):
         raise SelectionRefused(f"selected mount {mount} is not canonical")
     if probe.stat(mount).st_dev != device:
         raise SelectionRefused(f"selected mount {mount} is not on the selected device")
-    current = mount
-    for name in (SCRATCH_SUBDIR, SCRATCH_OWNER):
-        current = os.path.join(current, name)
-        try:
-            checked_component(current, device, probe)
-            continue
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise SelectionRefused(f"scratch component {current} is unreadable: {type_name(error)}")
-        try:
-            make_dir(current, 0o700)
-        except FileExistsError:
-            pass  # a concurrent run created it; validate it instead of adopting it
-        except OSError as error:
-            raise SelectionRefused(f"scratch component {current} cannot be created: {type_name(error)}")
-        try:
-            checked_component(current, device, probe)
-        except OSError as error:
-            raise SelectionRefused(f"scratch component {current} is unreadable: {type_name(error)}")
+    ancestor = os.path.join(mount, SCRATCH_SUBDIR)
+    try:
+        checked_ancestor(ancestor, device, probe)
+    except FileNotFoundError:
+        raise SelectionRefused(f"shared scratch ancestor {ancestor} is absent; Oxide never creates it")
+    except OSError as error:
+        raise SelectionRefused(f"shared scratch ancestor {ancestor} is unreadable: {type_name(error)}")
+    try:
+        checked_leaf(parent, device, probe)
+        return parent
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise SelectionRefused(f"scratch leaf {parent} is unreadable: {type_name(error)}")
+    try:
+        make_dir(parent, 0o700)
+    except FileExistsError:
+        pass  # a concurrent run created it; validate it instead of adopting it
+    except OSError as error:
+        raise SelectionRefused(f"scratch leaf {parent} cannot be created: {type_name(error)}")
+    try:
+        created = checked_leaf(parent, device, probe)
+        again = probe.lstat(parent)
+    except OSError as error:
+        raise SelectionRefused(f"scratch leaf {parent} is unreadable: {type_name(error)}")
+    if (again.st_dev, again.st_ino) != (created.st_dev, created.st_ino):
+        raise SelectionRefused(f"scratch leaf {parent} changed while it was being prepared")
     return parent
+
+
+def readiness(selection, probe=None):
+    """Effect-free, metadata-only readiness for the selected host.
+
+    It answers whether `prepare_scratch_parent` would succeed, describing an
+    absent leaf as `absent; would create 0700` instead of claiming it exists,
+    and it performs no mkdir, chmod, sweep, marker write, child launch or
+    reserve reading. The result is point-in-time: the real setup re-runs the
+    same checks, so this is never a reservation."""
+    probe = probe if probe is not None else DefaultProbe()
+    result = {"source": selection.get("source"), "mount": selection.get("mount"),
+              "root_parent": selection.get("root_parent"), "device": selection.get("device"),
+              "ready": False, "leaf": None, "reason": None}
+    if selection.get("source") != "selected-volume":
+        result["reason"] = selection.get("reason") or "no eligible selected volume"
+        return result
+    mount, device = selection.get("mount"), selection.get("device")
+    ancestor = os.path.join(mount, SCRATCH_SUBDIR)
+    leaf = scratch_parent(mount)
+
+    def facts(path):
+        info = probe.lstat(path)
+        return {"path": path, "mode": oct(stat.S_IMODE(info.st_mode)), "uid": info.st_uid,
+                "device": info.st_dev, "inode": info.st_ino}
+
+    try:
+        result["ancestor"] = facts(ancestor)
+        checked_ancestor(ancestor, device, probe)
+    except FileNotFoundError:
+        result["ancestor"] = {"path": ancestor, "state": "absent"}
+        result["reason"] = f"shared scratch ancestor {ancestor} is absent; Oxide never creates it"
+        return result
+    except SelectionRefused as refusal:
+        try:
+            result["ancestor"] = facts(ancestor)
+        except OSError:
+            result["ancestor"] = {"path": ancestor, "state": "unreadable"}
+        result["reason"] = str(refusal)
+        return result
+    except OSError as error:
+        result["ancestor"] = {"path": ancestor, "state": "unreadable"}
+        result["reason"] = f"shared scratch ancestor {ancestor} is unreadable: {type_name(error)}"
+        return result
+    try:
+        result["leaf"] = dict(facts(leaf), state="exists")
+        checked_leaf(leaf, device, probe)
+        result["ready"] = True
+        return result
+    except FileNotFoundError:
+        result["leaf"] = {"path": leaf, "state": "absent; would create 0700"}
+        result["ready"] = True
+        return result
+    except SelectionRefused as refusal:
+        try:
+            result["leaf"] = dict(facts(leaf), state="exists")
+        except OSError:
+            result["leaf"] = {"path": leaf, "state": "unreadable"}
+        result["reason"] = str(refusal)
+        return result
+    except OSError as error:
+        result["leaf"] = {"path": leaf, "state": "unreadable"}
+        result["reason"] = f"scratch leaf {leaf} is unreadable: {type_name(error)}"
+        return result
 
 
 # Owner marker and bounded self-expiry ------------------------------------------

@@ -77,8 +77,9 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 242  # 202 pure + 40 real (oxide#151 added the routing, marker,
-                      # nested-window protection, bounded-sweep and qualify-entry cases)
+EXPECTED_CASES = 249  # 209 pure + 40 real (oxide#151 added the routing, marker,
+                      # nested-window protection, bounded-sweep, qualify-entry,
+                      # shared-ancestor/private-leaf and readiness cases)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -656,7 +657,36 @@ def check(receipt, results, expected, record=None, facts=None, base=None):
     return problems
 
 
-def main():
+PREFLIGHT_FLAG = "--preflight"
+
+
+def preflight(argv):
+    """Effect-free readiness for the selected host, for `proof:supervisor:preflight`.
+
+    Metadata only: it selects and inspects paths, modes, owners and devices and
+    prints a bounded JSON result. It creates nothing (an absent private leaf is
+    reported as "absent; would create 0700"), never sweeps, marks, forks the
+    deadline actor, launches the candidate or reads reserves. The invoked
+    qualification re-runs the same checks in its own setup, so this is
+    point-in-time readiness, never a reservation."""
+    if argv != [PREFLIGHT_FLAG]:
+        print(f"refused: preflight takes no arguments (got {argv})", file=sys.stderr)
+        return 2
+    guard = candidate()
+    selection = guard.select_default_parent(os.environ)
+    result = {"selector": "proof:supervisor:preflight", "head": git("rev-parse", "HEAD").strip(),
+              "readiness": guard.readiness(selection)}
+    print(json.dumps(result, indent=1), flush=True)
+    return 0 if result["readiness"]["ready"] else 2
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == PREFLIGHT_FLAG:
+        return preflight(list(argv))
+    if argv:
+        raise SystemExit(f"qualify-supervisor.py: unknown argument {argv[0]}")
     return bounded(qualify, DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
 
 
@@ -816,4 +846,4 @@ def qualify():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

@@ -1663,13 +1663,35 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   the volume UUID and device facts are unchanged. Selection is effect-free: it
   only reports the parent, and creating it belongs to the supervisor's own
   blocking setup, so plans, pure probes and refusal paths create nothing.
-  - **Preparation.** Missing `scratch` and `oxide` components are created with
-    0700. An existing component is only validated — `lstat`, no symlink, this
-    user, no group/other bits, canonical, the selected device — and is never
-    chmodded, adopted, renamed or removed. A concurrent creator that wins the
-    mkdir is validated the same way. A refusal keeps the established
-    single-line warned fallback to `/private/tmp`, and the qualification
-    bootstrap still refuses to qualify on a fallback.
+  - **Preparation (shared ancestor, private leaf).** The two components have
+    different contracts (Supervisor `2160fee3`, 2026-10-25). `<mount>/scratch`
+    is a **shared** folder that other projects also use: it must already exist
+    and must be a real canonical directory of this user on the selected device
+    with no group or other **write** bit (`0755` is the normal, accepted case;
+    a sticky bit does not make a writable ancestor safe). Oxide never creates,
+    chmods, adopts, renames or removes it, so a missing, symlinked,
+    foreign-owned, group/other-writable, unreadable, non-canonical or
+    other-device ancestor refuses before any leaf or run effect. `<mount>/scratch/oxide`
+    is Oxide's **private leaf**: exactly `0700`, this user, real, canonical and
+    on the selected device. Only that leaf is ever created (with `0700`) when
+    absent, and it is re-validated after creation, including its device and
+    inode identity and a concurrent creator's result; an existing leaf with a
+    different mode, owner, target or device refuses with no chmod or adoption.
+    A refusal keeps the established single-line warned fallback to
+    `/private/tmp`, and the qualification bootstrap still refuses to qualify on
+    a fallback. On the Builds drive macOS ignores ownership (Owners Disabled),
+    so these UID/mode checks are consistency and tamper guards for a
+    cooperative same-user host, not a multi-user privacy guarantee; no
+    behaviour, diskutil probe or permission change is built on that fact.
+  - **Effect-free readiness.** `scripts/qualify-supervisor.py --preflight`
+    (`effigy proof:supervisor:preflight`, non-heavy) applies exactly this
+    preparation policy to the actual selected host using metadata only. It
+    creates nothing — an absent private leaf is reported as `absent; would
+    create 0700`, never as existing — and it never sweeps, marks, forks the
+    deadline actor, launches the candidate or reads reserves. It answers
+    ready / ready-to-create / refused for that point in time; the invoked
+    qualification re-runs the same checks in its own setup, so readiness is
+    never a reservation or a substitute for the setup rechecks.
   - **Run roots.** Each run is one `oxide-proof.*` directory (and each
     qualification bootstrap base one `oxide-supervisor-qualify.*` directory)
     created privately (0700, this user, canonical, same device as the parent)
@@ -1941,8 +1963,8 @@ bootstrap file changes with it for two concrete reasons and no others: its
 expected case count follows the suite's new total (160 pure + 40 real = 200)
 and it gains one limitation line describing this observation, so it adds no
 bound and no effect. Oxide#151 later raises the expected total to its own 202
-pure + 40 real = 242 with the routing, marker, nested-window protection,
-bounded-sweep and qualify-entry cases below. Every quality fact here binds to the digests its own
+pure + 40 real = 249 with the routing, marker, nested-window protection,
+bounded-sweep, qualify-entry and shared-ancestor/readiness cases below. Every quality fact here binds to the digests its own
 receipt records, never to the `#145` digests above.
 
 - The monitor's receipt gains a `settlement` object with a fixed schema:
@@ -2339,7 +2361,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 202 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 209 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2487,6 +2509,28 @@ runs in order:
   handle back to the shadowing name and must fail with `UnboundLocalError`
   without running the loader (the diagnostic2 bootstrap defect, caught without
   any native run);
+- the shared-ancestor / private-leaf preparation on real owned fixtures: a
+  `0755` shared `<mount>/scratch` accepted with only the private leaf created
+  (ancestor inode and mode unchanged), a `0700` ancestor also accepted, sticky
+  refused when it is also group/other writable and accepted when it is not,
+  symlinked, non-directory, foreign-owned, other-device, non-canonical,
+  unreadable and group/other-writable ancestors refused before any leaf effect
+  with no mutation and no leaf created, a missing ancestor refused with no
+  mkdir at all, and a private leaf that is `0755`, `0750`, `01700`,
+  foreign-owned, symlinked or on another device refused with zero chmod or
+  adoption (the leaf's mode and inode survive); an absent leaf created exactly
+  `0700` and re-verified, a changed post-create identity refused, a concurrent
+  creator's `0700` leaf validated and its `0755` leaf refused without a chmod,
+  and three contract counterfactuals: the superseded both-private-parent rule
+  would reject the now-accepted `0755` ancestor, a writable ancestor is
+  refused, and a leaf below exact `0700` is refused even with no group/other
+  write bit;
+- the effect-free readiness seam through the production validation code: a
+  ready world reports `absent; would create 0700` and creates nothing, an
+  existing leaf reports `exists` with its exact mode, and group-writable,
+  missing-ancestor and sticky-writable worlds are refused exactly as the real
+  preparation refuses them, with no leaf or ancestor created; a fallback
+  selection reports its own reason;
 - the qualification checks for this routing: a real owned tree whose parent is
   `<mount>/scratch/oxide` passes end to end, while the bare mount as parent, a
   root created directly at the drive root, a missing sweep summary, a sweep on
@@ -2589,7 +2633,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 242 cases;
+- all 249 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
