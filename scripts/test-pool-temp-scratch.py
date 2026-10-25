@@ -2539,10 +2539,20 @@ def removable(world: World, crate: str) -> None:
     finally:
         mounted = bool(mount) and os.path.ismount(mount)
         if not detached_ok and mounted:
-            # Never force-detach and never delete an unresolved attachment: the
-            # backing image, its intent and its attachment record stay for the
-            # owner.
-            say(f"the owned image is still mounted at {mount}; backing and records kept")
+            # One bounded ordinary detach for host hygiene (never a force
+            # detach). The backing image, its intent and its attachment record
+            # stay for the owner either way: an unresolved attachment is not
+            # evidence that the fixture volume is gone.
+            cleanup = subprocess.run(
+                ["hdiutil", "detach", mount],
+                capture_output=True,
+                text=True,
+                timeout=min(work_left(), 60),
+            )
+            say(
+                f"cleanup ordinary detach of {mount}: exit {cleanup.returncode}; "
+                "backing and records kept"
+            )
         elif image_custody_decision(mounted, detached_ok, mount) == "delete":
             if os.path.exists(image):
                 os.unlink(image)
@@ -2563,7 +2573,11 @@ def path_bound(world: World, crate: str) -> None:
     held_by_pool(world, observed)
     leaf = os.path.basename(observed)
     raw = observed.encode()
-    accepted = [path for path in world.accepted if path.endswith("scratch")]
+    accepted = [
+        path
+        for path in world.accepted
+        if path.endswith("scratch") and is_inside(path, world.pool)
+    ]
     longest = max(accepted, key=lambda path: len(path.encode())) if accepted else observed
     say(
         f"longest accepted injected path: {len(longest.encode())} bytes, "
