@@ -454,7 +454,7 @@ def plan_document() -> dict:
             {"name": "events-broken-reader", "oracle": "read end closed before start: exit 0, parent survives, one loss note, no typed record"},
             {"name": "unknown-closure-held", "oracle": "debug closure hook + 1s execution: exit 1, finished(unconfirmed_closure), drain not complete, lease held, status shows the held slot"},
             {"name": "preparation-stop-124", "oracle": "fake cargo sleeping in locate-project + 1ms admission: exit 124, no primary marker"},
-            {"name": "late-start", "oracle": "debug spawn delay past a 2s admission: exit 124, started record with spawn_late and overshoot, slot released"},
+            {"name": "late-start", "oracle": "debug spawn delay (9s) placed after the last admission check under an 8s window: one started exec_tool record with spawn_late and admission_expired_before_start true, a positive overshoot and admission_elapsed_ms past 8000, terminal admission_deadline with an admission origin, exit 124 and the slot released; a pre-spawn expiry (no started record) is reported as an unexercised fixture, not as a late start"},
             {"name": "no-mutation", "oracle": "a refused input leaves home/config/pool unchanged; a successful budgeted command adds no settings file, no new control-state fields and no budget lines in status"},
             {"name": "unbudgeted", "oracle": "exit 3 preserved, no budget diagnostic, no events required"},
         ],
@@ -1502,7 +1502,16 @@ def case_late_start(root: str, subject: str) -> None:
     case("late-start")
     env = fixture_env(root, "late")
     crate = create_crate(root, "late")
-    env["OXIDE_TEST_SPAWN_DELAY_MS"] = "3000"
+    # The debug hook sleeps after the last admission check and before the
+    # launch, so the window must survive preparation (pool creation plus the
+    # workspace and toolchain lookups) and must close during the sleep.
+    # Diagnostic1 showed preparation alone consumed a 2 s window before the
+    # hook was reached, so the budget now has real margin above preparation
+    # and the sleep is longer than the budget: any preparation shorter than
+    # the budget yields an observed late start.
+    admission_ms = 8000
+    delay_ms = 9000
+    env["OXIDE_TEST_SPAWN_DELAY_MS"] = str(delay_ms)
     tool = os.path.join(root, "late.sh")
     write_executable(tool, "#!/bin/sh\nexec sleep 60\n")
     read_fd, write_fd = event_pipe()
@@ -1512,7 +1521,7 @@ def case_late_start(root: str, subject: str) -> None:
                 subject,
                 "exec",
                 "--admission-budget",
-                "2s",
+                f"{admission_ms}ms",
                 "--execution-budget",
                 "60s",
                 "--budget-events",
@@ -1531,18 +1540,59 @@ def case_late_start(root: str, subject: str) -> None:
         os.close(read_fd)
     expect(result_run.returncode == ADMISSION_EXIT, f"the late start exited {result_run.returncode}")
     records = finish_events(raw)
-    record_detail("late-start", result_run.stderr, records, returncode=result_run.returncode)
-    expect_budget_diagnostic(result_run.stderr, "admission_stop", "late start")
+    record_detail(
+        "late-start",
+        result_run.stderr,
+        records,
+        returncode=result_run.returncode,
+        elapsed=round(result_run.elapsed, 3),
+        admission_ms=admission_ms,
+        spawn_delay_ms=delay_ms,
+    )
     started = started_records(records)
+    recorded = terminal(records)
+    if not started:
+        # Distinguish the two shapes honestly: a pre-spawn expiry (the last
+        # admission check saw the closed window, so nothing was launched and
+        # this case exercised nothing) is not a late start.
+        expect(
+            recorded["outcome"] == "admission_deadline",
+            f"the late start emitted no started record but reported {recorded['outcome']}: {recorded}",
+        )
+        expect_budget_diagnostic(result_run.stderr, "admission_stop", "late start")
+        fail(
+            "the late start reached pre-spawn admission expiry instead of the in-flight window: "
+            f"preparation consumed the {admission_ms}ms budget before the {delay_ms}ms sleep, so no "
+            "late start was observed (an unexercised fixture, not a product-stop claim)"
+        )
     expect(len(started) == 1, f"the late start emitted {len(started)} started records")
+    expect(started[0]["phase"] == "exec_tool", f"the late start was not the tool phase: {started[0]}")
     expect(started[0]["spawn_late"] is True, f"the late start was not reported: {started[0]}")
-    expect(started[0]["admission_expired_before_start"] is True, f"the expired window was not reported: {started[0]}")
-    expect(isinstance(started[0]["admission_overshoot_ms"], int), f"no overshoot: {started[0]}")
+    expect(
+        started[0]["admission_expired_before_start"] is True,
+        f"the expired window was not reported: {started[0]}",
+    )
+    expect(started[0]["admission_ms"] == admission_ms, f"the admission axis is {started[0]}")
+    overshoot = started[0]["admission_overshoot_ms"]
+    expect(isinstance(overshoot, int) and overshoot >= 1, f"no positive admission overshoot: {started[0]}")
+    observed = started[0]["admission_elapsed_ms"]
+    expect(
+        isinstance(observed, int) and observed > admission_ms,
+        f"the observed start was not late against the clock: {started[0]}",
+    )
+    expect(recorded["outcome"] == "admission_deadline", f"the terminal outcome is {recorded['outcome']}")
+    expect(recorded["stop_origin"] == "admission", f"the stop origin is {recorded['stop_origin']}")
+    expect_budget_diagnostic(result_run.stderr, "admission_stop", "late start")
     follow_tool = os.path.join(root, "late-ok.sh")
     write_executable(follow_tool, "#!/bin/sh\nexit 0\n")
     follow = run([subject, "exec", "--", follow_tool], cwd=crate, env=env, phase_seconds=30)
     expect(follow.returncode == 0, f"the slot was not released after a late start: {follow.returncode}")
-    result("late-start", True, "124, spawn_late with overshoot, slot released")
+    result(
+        "late-start",
+        True,
+        f"started {observed}ms into an {admission_ms}ms window (overshoot {overshoot}ms), "
+        "stopped as admission_deadline, slot released",
+    )
 
 
 def ticket_count(env: dict) -> int:
@@ -2040,6 +2090,11 @@ def self_check() -> None:
     expect("not asserted" in cumulative["oracle"], "the cumulative oracle must not gate closeout latency")
     nested = [entry for entry in plan["cases"] if entry["name"] == "nested-outer-window"][0]
     expect("outer 2s window" in nested["oracle"], "the nested oracle must attribute the stop to the outer window")
+    late = [entry for entry in plan["cases"] if entry["name"] == "late-start"][0]
+    expect(
+        "pre-spawn expiry" in late["oracle"] and "8s" in late["oracle"] and "9s" in late["oracle"],
+        "the late-start premise or its pre-spawn distinction changed",
+    )
     expect(remaining_quiet() >= 0.0, "the quiet remaining clock must not raise")
     expect(custody_bound() >= 0.05, "the custody bound must stay positive")
     # Human budget diagnostics are recognised by exact grammar, never by the
@@ -2187,7 +2242,14 @@ def self_test() -> None:
         return argv[argv.index(name) + 1] if name in argv else None
 
     def millis(text):
-        return None if text is None else int(text.rstrip("s")) * 1000
+        """Parse the product's ms|s budget grammar for the faked axis fields."""
+        if text is None:
+            return None
+        if text.endswith("ms"):
+            return int(text[:-2])
+        if text.endswith("s"):
+            return int(text[:-1]) * 1000
+        return int(text)
 
     def make_start(module, beats):
         """Fake `run`: refuses bad prefix order, writes events and heartbeat."""
@@ -2367,31 +2429,63 @@ def self_test() -> None:
     expect(load().budget_prefix_ok(["--admission-budget", "1s", "-j", "1"]), "a correct prefix was rejected")
     expect(not load().budget_prefix_ok(["-j", "1", "--admission-budget", "1s"]), "a late budget passed the prefix oracle")
 
-    # ---- late start: a non-late start must fail ----
-    late_ok = load()
-    late_ok.run = make_start(late_ok, beats=0)
-
-    def late_run(module_ref):
+    # ---- late start: an observed late start passes; a pre-spawn expiry and an
+    # on-time start each fail with their own distinct message. ----
+    def late_fake(module_ref, records, returncode, note, follow_code=0):
         def fake(argv, **kwargs):
             if not module_ref.budget_prefix_ok(argv[2:]):
                 return completed(argv, 2, "", "error: unexpected argument after the option prefix\n")
             if "--budget-events" not in argv:
-                return completed(argv, 0, "", "")
+                return completed(argv, follow_code, "", "")
             fd = int(flag(argv, "--budget-events"))
-            os.write(fd, stream([
-                {"seq": 1, "event": "admitted_child_started", "phase": "exec_tool",
-                 "spawn_late": True, "admission_expired_before_start": True,
-                 "admission_overshoot_ms": 1000},
-                {"seq": 2, "event": "finished", "outcome": "admission_deadline",
-                 "stop_origin": "admission", "exit_code": 124},
-            ]))
-            return completed(argv, 124, "", "oxide: stopped by the admission budget (2000ms) before a usable child start\n")
+            os.write(fd, stream(records))
+            return completed(argv, returncode, "", note)
 
         return fake
 
-    late_ok.run = late_run(late_ok)
-    expect(fault_of(late_ok, lambda: late_ok.case_late_start(scratch, "/bin/true")) is None,
-           "late-start should pass")
+    admission_note = "oxide: stopped by the admission budget (8000ms) before a usable child start\n"
+    started_late = {
+        "seq": 1, "event": "admitted_child_started", "phase": "exec_tool",
+        "spawn_late": True, "admission_expired_before_start": True,
+        "admission_ms": 8000, "execution_ms": 60000,
+        "admission_elapsed_ms": 10500, "admission_overshoot_ms": 2500,
+    }
+    finished_admission = {
+        "seq": 2, "event": "finished", "outcome": "admission_deadline",
+        "stop_origin": "admission", "drain": "not_reached", "lease": "released", "exit_code": 124,
+    }
+
+    late_ok = load()
+    late_ok.run = late_fake(late_ok, [started_late, finished_admission], 124, admission_note)
+    expect(
+        fault_of(late_ok, lambda: late_ok.case_late_start(scratch, "/bin/true")) is None,
+        "an observed late start should pass",
+    )
+
+    late_pre = load()
+    late_pre.run = late_fake(late_pre, [{"seq": 1, "event": "finished",
+                                         "outcome": "admission_deadline", "stop_origin": "admission",
+                                         "drain": "not_reached", "lease": "released", "exit_code": 124}],
+                             124, admission_note)
+    fault = fault_of(late_pre, lambda: late_pre.case_late_start(scratch, "/bin/true"))
+    expect(
+        fault is not None and "pre-spawn admission expiry" in fault,
+        f"a pre-spawn expiry was not distinguished from a late start: {fault}",
+    )
+
+    late_early = load()
+    on_time = dict(started_late, spawn_late=False, admission_expired_before_start=False,
+                   admission_elapsed_ms=500, admission_overshoot_ms=None)
+    late_early.run = late_fake(
+        late_early,
+        [on_time, {"seq": 2, "event": "finished", "outcome": "child_exit", "stop_origin": None,
+                   "drain": "complete", "lease": "released", "exit_code": 0}],
+        124,
+        admission_note,
+    )
+    fault = fault_of(late_early, lambda: late_early.case_late_start(scratch, "/bin/true"))
+    expect(fault is not None and "was not reported" in fault, f"an on-time start passed as late: {fault}")
+
     late_bad = load()
     late_bad.run = make_start(late_bad, beats=0)
     fault = fault_of(late_bad, lambda: late_bad.case_late_start(scratch, "/bin/true"))
