@@ -580,7 +580,9 @@ root. A new Cargo release needs this check before it joins the table.
    - `RUSTC_WRAPPER` set to the empty string, unless the opt-in keeps an
      inherited wrapper ([below](#inherited-rustc-wrapper)).
 5. `run`: keep the lease for the build, release it, then execute the binary
-   from the private target directory. `test`: keep the lease through test
+   from the private target directory. A bounded `run` (see
+   [command time budgets](#command-time-budgets-oxide140)) keeps the lease
+   through the program instead. `test`: keep the lease through test
    execution, because test binaries live in the build directory. Reuse never
    skips tests.
 6. When the process group exits, record the compile origin, release the lease
@@ -590,6 +592,160 @@ root. A new Cargo release needs this check before it joins the table.
    tool. Its summary adds the cumulative measured wait. The existing elapsed
    time still covers its original interval, including gate and execution
    work; it is not a compilation-only duration.
+
+### Command time budgets (oxide#140)
+
+Opt-in, leased commands only (`check`, `build`, `test`, `clippy`, `run`,
+`doc`, `bench`, the other building built-ins, `exec` and external
+subcommands). The three reserved names are Oxide's when they open the
+argument list; a tool that owns one of them is reachable through
+`oxide exec -- <tool> ...` (or `oxide exec -- cargo <external> ...`), because
+nothing after `--` is Oxide's. Other command classes refuse a reserved name
+by name.
+
+```text
+oxide check --admission-budget 45s --execution-budget 300s
+oxide test --execution-budget 90s --budget-events 3
+oxide run --execution-budget 120s
+```
+
+- **Grammar.** `--admission-budget <dur>`, `--execution-budget <dur>`,
+  `--budget-events <fd>`, in `--name value` or `--name=value` form, each at
+  most once, no short forms. `dur` is a positive whole number of milliseconds
+  or seconds (`30s`, `1500ms`), at most seven days. The two budgets are
+  independently optional: an omitted axis is unbounded exactly as before, and
+  `--budget-events` needs at least one budget. Invalid, duplicate or
+  unsupported-class options refuse before any pool or store effect.
+- **Admission** starts once the options are parsed, before the hand-off
+  check, `run` selection and every preparation step, and covers preparation
+  children, identity and workspace lookup, output custody, lock waits, every
+  slot wait or reacquisition and the freshness gate up to a successful
+  primary child start. It is one deadline: a grant, retry, eviction or gate
+  refusal never grants a new interval. An observed expiry before the launch
+  attempt starts no child, and the command exits 124.
+- **Execution** arms once, at the observed start of the child, not when the
+  caller receives an event. It covers compilation, Cargo's own locks, tests,
+  output drain and group closeout. A bounded `run` keeps its lease through the
+  program and uses one cumulative window through build, drain, post-build work
+  and the program: releasing the lease or launching the program never starts
+  a fresh clock. An unbudgeted `run` keeps today's release-then-`exec`
+  handoff.
+- **Stopping.** An expired execution window is a stop trigger, not an
+  immediate kernel guarantee. It latches its origin and reuses the owned-group
+  escalation the space watchdog uses (TERM, a two-second grace, KILL, then a
+  finite observation bound). The induced child status (143, 137 or even 0)
+  never replaces the deadline origin: a controlled stop exits 125, and a
+  child that ends 125 on its own is reported as a child exit with no budget
+  line. An unconfirmed group or drain is failure 1 with the lease held; a
+  successful `release` is not proof that the slot became idle, and a failed
+  flush retires it. Before a spawn, Ctrl-C keeps its existing 128+signal
+  status.
+- **Late starts.** A cooperative launch cannot promise that an in-flight
+  `spawn` fails, so a child that starts after the admission deadline is
+  reported truthfully as `spawn_late`, latches the admission origin and is
+  stopped on the first wait iteration. It never receives a usable execution
+  window. Each wait iteration harvests the child, forwards a caller signal,
+  then evaluates the deadline, so a child that exited naturally in the same
+  poll is reported as that exit rather than as a controlled stop; for `run`,
+  the bounded line-read slice is followed by a fresh harvest before the
+  deadline is evaluated, so a build whose output settles inside that slice
+  also keeps its natural status. The deadline still applies to whatever the
+  exit leaves in the group.
+- **Events.** `--budget-events <fd>` takes an existing, already-nonblocking,
+  writable pipe write end (descriptor 3–1023). Oxide validates the type,
+  access mode and flag without changing shared descriptor flags, takes a
+  private close-on-exec duplicate and marks the inherited descriptor
+  close-on-exec in its own process only. Records are newline JSON, one
+  `write` of at most 512 bytes, never retried or waited on. A short or failed
+  write disables the stream: a run is unknown unless a complete terminal
+  record with contiguous sequence numbers arrived, and a colliding process
+  exit code never implies a typed completion. The channel needs the pinned
+  Rust runtime's SIGPIPE disposition (parent ignores, children default); when
+  the installed runtime differs, a budgeted `--budget-events` command refuses
+  before any effect. Event delivery never controls a timer.
+- **Nesting and limits.** A nested `oxide` is an ordinary child of the outer
+  group: the outer wall-clock deadline keeps running while the outer command
+  waits, so a nested call consumes the outer window and never pauses or
+  resets it. A nested command has its own group and lease, so the outer
+  group's closure does not prove the inner one's; a surviving inner group
+  keeps its slot held under the crash-recovery rule. There is no deadline
+  inheritance yet. In-kernel filesystem, flush and lock sections, eviction
+  walks, standard-stream I/O, scheduling and a `setsid` escapee remain
+  cooperative limits; budgets do not make them preemptible.
+- **Independently optional axes.** An admission-only command still emits the
+  start record (with a null execution axis) and, if its child starts after the
+  admission deadline, stops at once and exits 124; a preparation step that the
+  window stops is the admission deadline, never an internal error.
+- **Debug proof controls.** Two debug-only variables exist for the fixed
+  proof and are absent from release builds, which refuse either variable when
+  present: `OXIDE_TEST_CLOSURE_STUCK` reports the owned group as unconfirmed
+  so the held-custody path is exercisable, and `OXIDE_TEST_SPAWN_DELAY_MS`
+  holds the window between the last admission check and the launch so a late
+  start is observable. Neither changes a product decision outside a debug
+  build.
+- **Proof apparatus.** `scripts/test-command-budgets.py` is the fixed proof
+  and the whole command of the qualified shared supervisor under heavy
+  admission (`bounded-test.py --limit 300 --scratch-budget-mib 512`). It is
+  held for owner activation: the declaration activates nothing. `--plan` is
+  effect-free and prints the cases, phases, disk and child-lifetime
+  allocation; an unrecognized argument refuses before any subprocess;
+  `--self-check` covers the pure boundaries; `--self-test` executes the
+  corrected case bodies and the whole-lifecycle fault paths against faked
+  process and filesystem seams (no child, image or pool), so a body that
+  stops asserting cannot pass it. Every child timeout is clipped to the
+  guard's exported deadline minus the reserved cleanup window; fixtures run
+  from private checkouts with private `HOME`/`CARGO_HOME`/`OXIDE_CONFIG`/
+  `OXIDE_POOL`/temp. Staging is this clean HEAD's debug `oxide`, built
+  offline with the pinned toolchain into scratch-owned target and build
+  directories at 4 Cargo jobs with 16 codegen units (opt-level `s`, debug
+  info off, debug assertions on, incremental off, symbol-stripped); fixtures
+  keep one Cargo job, run sequentially and never overlap staging. Those jobs
+  and codegen units are configured build parallelism, not a CPU or thread
+  hard cap, and they declare no admission demand: the guard's own admission
+  and monitoring stay authoritative. `effigy proof:command-budgets:test` runs
+  only the script's pure `--self-check`/`--self-test` modes, so it is not
+  native and the fit of this recipe stays unmeasured until a separately
+  activated diagnostic; the copied candidate must hash-equal the staged binary and
+  then answer the built-in `__oxide-build-capabilities` probe (which reports
+  `test_controls`) before any private-home fixture exists. The cumulative
+  window's oracle is the launched program's own heartbeat counter after a
+  ~3 s build under one 5 s window (about 10 beats; a reset window would give
+  it about 25), never the command's exit or closeout latency; the nested case has the outer command take the only slot first,
+  the inner call wait and end on its own 1 s admission budget with no build,
+  and the outer window stop the still-running tool. The late-start case first
+  runs one delay-free seed launch on the same private pool, checkout and tool
+  argv, and checks the prepared state positively (exit 0, the pool-creation
+  notice, recorded control state); the timed launch must reuse that state — a
+  second pool-creation notice, a different control root or any pre-spawn expiry
+  is an unexercised-fixture failure, never an alternate pass — and a
+  delay-free follow-up reuses the released slot. A run writes a uniquely
+  named bounded helper receipt beside the guard's own on every outcome,
+  including a staging, capability, assertion, interrupt or receipt-write
+  failure, with the primary fault, candidate identity when known, reached/
+  completed/failed/unexecuted cases and custody uncertainty; that receipt
+  never claims guard closure, which the supervisor alone decides. Human budget
+  results are recognised only by the product's exact `report_stop`/
+  `LOSS_NOTE` grammar: innocent Cargo, project or path output that contains
+  the word `budget` (the fixture crates are named `oxide-budget-<label>`) is
+  not a stop or a channel loss, and each failing oracle keeps a bounded
+  escaped stderr excerpt plus its typed fields. `--diagnostic` is a declared
+  but unactivated keep-going collection under the same guard: it records
+  recoverable oracle failures and continues only with dependency-independent
+  cases (each labels its own private fixtures), while an unknown child or
+  writer, custody uncertainty, a prerequisite failure or an exhausted
+  deadline stops it; its distinct receipt is `qualified=false` and is never a
+  counted PASS. `effigy rust:command-budgets:diagnostic` runs that mode as
+  the whole command of the same qualified guard, bounds and custody; like
+  the counted selector it is held for owner activation. The only `--locked` invocation is the staging build of this
+  repository, whose committed `Cargo.lock` is present; fixture crates are
+  std-only and are never invoked with `--locked`. The 300 s/512 MiB fit is
+  unmeasured.
+- **Locking.** A budgeted command waits for the admission, record and
+  checkout-binding locks with the existing nonblocking primitive, polling
+  against the remaining window in the unchanged order. Abandoning a wait
+  holds no lease and removes the wait ticket. Unbudgeted commands keep the
+  blocking calls and their FIFO behaviour; budgeted pollers forgo that
+  fairness.
 
 ### `oxide exec`: Cargo-wrapping tools
 

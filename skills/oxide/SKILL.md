@@ -90,6 +90,31 @@ stays with the category. These reasons are observations, not root causes, and
 do not include Cargo-lock, Cargo or execution time. If checked monotonic timing
 fails, Oxide reports that the wait duration is unavailable.
 
+## Time budgets
+
+Leased commands take opt-in budgets: `--admission-budget` bounds everything
+before the build or tool starts (preparation, slot waits, freshness) and
+`--execution-budget` bounds compilation, Cargo locks, tests and closeout from
+the observed start. Either may be given alone; an omitted axis is unbounded.
+
+```bash
+oxide test --execution-budget 90s          # stop a hung test run
+oxide check --admission-budget 45s         # give up before starting Cargo
+oxide run --execution-budget 120s          # one window through build + program
+oxide exec --execution-budget 300s -- npm run tauri build
+```
+
+`dur` is milliseconds or seconds (`30s`, `1500ms`), at most seven days.
+An admission expiry starts nothing and exits 124; an execution expiry stops
+the command's own process group and exits 125. A child that exits 124 or 125
+on its own is still that child's exit, not a budget stop. `run` with an
+execution budget holds the slot until the program exits, so `oxide clean` and
+another command in the checkout wait for it. Use `--budget-events <fd>` with
+a nonblocking pipe for typed JSON records (start phase, late start, terminal
+outcome); a lost stream makes the run unknown, never a typed success. Budgets
+do not cover kernel-blocking operations, a `setsid` escapee, or sleep time on
+macOS, and there is no deadline inheritance for nested `oxide` calls.
+
 ## Waits and refusals
 
 - `oxide: waiting for …` reports the current observed admission reason. A

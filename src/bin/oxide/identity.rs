@@ -76,8 +76,7 @@ pub fn locate_workspace(cargo: &str, manifest_path: Option<&Path>) -> Result<Pat
     if let Some(manifest) = manifest_path {
         command.arg("--manifest-path").arg(manifest);
     }
-    let output = command
-        .output()
+    let output = crate::budget::output(&mut command)
         .map_err(|error| format!("could not start Cargo: {error}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -122,8 +121,7 @@ pub fn run_pick(
     if let Some(manifest) = manifest_path {
         command.arg("--manifest-path").arg(manifest);
     }
-    let output = command
-        .output()
+    let output = crate::budget::output(&mut command)
         .map_err(|error| format!("could not start Cargo: {error}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -182,8 +180,8 @@ pub fn rustc_version(directory: Option<&Path>) -> Result<String, String> {
     let rustc = std::env::var_os("RUSTC")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from("rustc"));
-    let output = rustc_command(rustc, directory)
-        .output()
+    let mut command = rustc_command(rustc, directory);
+    let output = crate::budget::output(&mut command)
         .map_err(|error| format!("could not start rustc: {error}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -337,11 +335,9 @@ pub fn slot_folders(label: &str, identity: &str) -> Vec<String> {
 }
 
 fn git(workspace: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.args(args).current_dir(workspace);
+    let output = crate::budget::output(&mut command).ok()?;
     output
         .status
         .success()

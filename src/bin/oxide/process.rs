@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+/// The budget stop reuses the space watchdog's escalation allowances.
+const STOP_GRACE: Duration = crate::budget::GRACE;
+const STOP_CLOSE_BOUND: Duration = crate::budget::CLOSE_BOUND;
 const POLL: Duration = Duration::from_millis(20);
 const LINGER_NOTICE: Duration = Duration::from_secs(2);
 
@@ -68,6 +71,52 @@ pub fn signal_exit_code(signal: i32) -> u8 {
     128_u8.saturating_add(u8::try_from(signal).unwrap_or(0))
 }
 
+fn signal_group(group: i32, signal: libc::c_int) {
+    if group > 1 {
+        // SAFETY: a negative PID addresses the group this command created.
+        unsafe {
+            libc::kill(-group, signal);
+        }
+    }
+}
+
+/// The budget stop trigger, polled by every wait loop. It is independent of
+/// the space/volume watchdog: a budgeted stop happens even when no watchdog
+/// exists (a `DirectoryBudget` run-program wait, for example).
+#[derive(Default)]
+pub struct Stop {
+    term_at: Option<Instant>,
+    kill_at: Option<Instant>,
+}
+
+impl Stop {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Latch and escalate a budget stop when its deadline has arrived. Returns
+    /// `true` once the group has outlived the finite closeout allowance after
+    /// KILL: the caller then keeps custody instead of claiming closure.
+    pub fn poll(&mut self, group: i32) -> bool {
+        let now = Instant::now();
+        if self.term_at.is_none() {
+            if crate::budget::take_execution_stop().is_none() {
+                return false;
+            }
+            self.term_at = Some(now);
+            signal_group(group, libc::SIGTERM);
+            return false;
+        }
+        if self.kill_at.is_none() && now.duration_since(self.term_at.unwrap()) >= STOP_GRACE {
+            self.kill_at = Some(now);
+            signal_group(group, libc::SIGKILL);
+            return false;
+        }
+        self.kill_at
+            .is_some_and(|kill| now.duration_since(kill) >= STOP_CLOSE_BOUND)
+    }
+}
+
 /// A started Cargo process and the group it leads.
 pub struct Group {
     pub child: Child,
@@ -105,14 +154,35 @@ pub fn forward_pending(group: i32) {
 
 /// Wait for the leader, forwarding signals.
 pub fn wait_leader(group: &mut Group) -> Result<ExitStatus, String> {
+    match wait_leader_budgeted(group, &mut Stop::new())? {
+        Some(status) => Ok(status),
+        None => Err("the command was stopped before its leader exited".to_owned()),
+    }
+}
+
+/// [`wait_leader`] with a budget stop: `None` means the stop could not confirm
+/// group closure inside its finite closeout allowance.
+///
+/// Each iteration harvests the leader first, then forwards a caller signal,
+/// then evaluates the deadline. A child that already exited in this poll is a
+/// natural completion, so a due deadline must not latch a controlled stop over
+/// it (freeze A2 item 6). The deadline still applies to whatever the exit
+/// leaves behind in the group, which the closeout loops observe.
+pub fn wait_leader_budgeted(
+    group: &mut Group,
+    stop: &mut Stop,
+) -> Result<Option<ExitStatus>, String> {
     loop {
-        forward_pending(group.id);
         if let Some(status) = group
             .child
             .try_wait()
             .map_err(|error| format!("could not wait for Cargo: {error}"))?
         {
-            return Ok(status);
+            return Ok(Some(status));
+        }
+        forward_pending(group.id);
+        if stop.poll(group.id) {
+            return Ok(None);
         }
         std::thread::sleep(POLL);
     }
@@ -123,15 +193,20 @@ pub fn wait_leader(group: &mut Group) -> Result<ExitStatus, String> {
 pub fn wait_leader_watched(
     group: &mut Group,
     watchdog: &mut Watchdog,
+    stop: &mut Stop,
 ) -> Result<Option<ExitStatus>, String> {
     loop {
-        forward_pending(group.id);
+        // Same order as the unwatched wait: harvest, forward, then deadline.
         if let Some(status) = group
             .child
             .try_wait()
             .map_err(|error| format!("could not wait for Cargo: {error}"))?
         {
             return Ok(Some(status));
+        }
+        forward_pending(group.id);
+        if stop.poll(group.id) {
+            return Ok(None);
         }
         watchdog.poll(group.id);
         if watchdog.gave_up() {
@@ -144,7 +219,11 @@ pub fn wait_leader_watched(
 /// Wait until the group is empty while the watchdog samples. Returns when
 /// it is observed empty, or `None` once a stopped group outlives the
 /// watchdog's bound after KILL.
-pub fn wait_group_empty_watched(group: i32, watchdog: &mut Watchdog) -> Option<Instant> {
+pub fn wait_group_empty_watched(
+    group: i32,
+    watchdog: &mut Watchdog,
+    stop: &mut Stop,
+) -> Option<Instant> {
     let started = Instant::now();
     let mut noticed = false;
     loop {
@@ -152,6 +231,9 @@ pub fn wait_group_empty_watched(group: i32, watchdog: &mut Watchdog) -> Option<I
             return Some(Instant::now());
         }
         forward_pending(group);
+        if stop.poll(group) {
+            return None;
+        }
         watchdog.poll(group);
         if watchdog.gave_up() {
             return None;
@@ -167,16 +249,26 @@ pub fn wait_group_empty_watched(group: i32, watchdog: &mut Watchdog) -> Option<I
 /// Wait until no process remains in the group, forwarding signals. A
 /// descendant that escaped with `setsid` is not observed.
 pub fn wait_group_empty(group: i32) {
+    wait_group_empty_budgeted(group, &mut Stop::new());
+}
+
+/// [`wait_group_empty`] with a budget stop; `None` means the group outlived
+/// the finite closeout allowance after KILL.
+pub fn wait_group_empty_budgeted(group: i32, stop: &mut Stop) -> Option<Instant> {
     let started = Instant::now();
     let mut noticed = false;
     while !group_empty(group) {
         forward_pending(group);
+        if stop.poll(group) {
+            return None;
+        }
         if !noticed && started.elapsed() >= LINGER_NOTICE {
             eprintln!("oxide: waiting for processes left in Cargo's process group {group} to exit");
             noticed = true;
         }
         std::thread::sleep(POLL);
     }
+    Some(Instant::now())
 }
 
 /// True only when the kernel reports no process in the group.
@@ -252,5 +344,63 @@ pub fn exit_code(status: ExitStatus) -> u8 {
     match status.code() {
         Some(code) => u8::try_from(code).unwrap_or(1),
         None => signal_exit_code(status.signal().unwrap_or(0)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::{self, Options};
+
+    fn due_execution_clock() {
+        budget::clear();
+        budget::install(Options {
+            admission: None,
+            execution: Some(Duration::from_millis(1)),
+            events: None,
+        })
+        .expect("a budget clock");
+        budget::arm_execution(Instant::now(), budget::Phase::PrimaryCargo);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    #[test]
+    fn a_child_that_already_exited_wins_over_a_due_deadline() {
+        due_execution_clock();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut group = spawn_group(&mut command).expect("a child");
+        // Let the child exit so the harvest below is deterministic.
+        std::thread::sleep(Duration::from_millis(100));
+        let status = wait_leader_budgeted(&mut group, &mut Stop::new())
+            .expect("a status")
+            .expect("the natural exit must be returned, not a stop");
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(
+            budget::origin(),
+            None,
+            "a natural exit must not latch a stop"
+        );
+        budget::clear();
+    }
+
+    #[test]
+    fn a_live_child_is_stopped_when_the_deadline_is_due() {
+        due_execution_clock();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let mut group = spawn_group(&mut command).expect("a child");
+        let started = Instant::now();
+        let status = wait_leader_budgeted(&mut group, &mut Stop::new()).expect("a result");
+        // The stop is a trigger: the leader may be reaped as a signal status
+        // once TERM lands, and the closeout bound only matters if it survives.
+        assert_eq!(budget::origin(), Some(budget::Origin::Execution));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the deadline did not stop the child"
+        );
+        let _ = status;
+        let _ = group.child.wait();
+        budget::clear();
     }
 }
