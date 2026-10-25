@@ -17,20 +17,32 @@ worker is KILLed and the exit is 124 with whatever output was written.
 
 The worker runs the candidate with a 280 s limit and a 512 MiB monitored
 budget around `scripts/test_supervisor.py` and **no** `--root-parent` and no
-`--evidence`, so the candidate's default scratch routing is what runs: the
-private area on the volume the machine's effect-free pool selection names,
-with its evidence directory inside that same owned root. The bootstrap
-refuses before any effect when that selection does not resolve to an eligible
-non-boot volume, because a qualification that only exercised the
-`/private/tmp` fallback would not exercise the default. Because the suite's
-nested real-case directories live in that evidence directory, every nested
-case resource, its retained receipts and any kept UNCLOSED scratch stay
-inside the candidate's monitored root on the selected volume: the candidate's
-own owned-byte walk covers them and its 512 MiB budget applies, while
-evidence is never removed. The suite records that layout in
-`topology.json` under this bootstrap's base (also on the selected volume,
-under the bootstrap's own never-delete retention), and the bootstrap verifies
-it against kernel facts and the candidate's receipt rather than trusting it.
+`--evidence`, so the candidate's default scratch routing is what runs: one
+owned root under `<mount>/scratch/oxide` on the volume the machine's
+effect-free pool selection names, with its evidence directory inside that same
+owned root. The bootstrap refuses before any effect when that selection does
+not resolve to an eligible non-boot volume, because a qualification that only
+exercised the `/private/tmp` fallback would not exercise the default. This
+bootstrap prepares that owned parent through the candidate's own seam (missing
+components created 0700; an unsafe existing component refuses), runs one
+bounded startup self-expiry sweep there, and puts its own marked base in the
+same parent. Because the suite's nested real-case directories live in that
+evidence directory, every nested case resource, its retained receipts and any
+kept UNCLOSED scratch stay inside the candidate's monitored root on the
+selected volume. The suite records that layout in `topology.json` under this
+bootstrap's base (also on the selected volume, under the bootstrap's own
+never-delete retention), and the bootstrap verifies it against kernel facts
+and the candidate's receipt rather than trusting it, including that the root is
+inside the owned subtree and not at the drive root.
+
+Owner markers and expiry: the base and the candidate root each carry one
+private `.oxide-scratch.json` written before any run resource. A retained
+nested UNCLOSED fixture keeps the candidate root unconcluded with the honest
+`nested-unclosed` reason even when the outer session closed and the suite
+passed; a failed qualification keeps the base unconcluded. Only a positively
+concluded root strictly older than seven days is ever eligible for the bounded
+startup sweep, which the candidate and this bootstrap each run once for their
+own new resources. Nothing else is deleted and no marker is a liveness probe.
 Pass requires: candidate exit 0, receipt phase `monitor_complete`, closure
 established with command status 0 and no fault, the default scratch on the
 selected volume with the selected volume's UUID, the receipt and the suite's
@@ -65,7 +77,9 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 200
+EXPECTED_CASES = 249  # 209 pure + 40 real (oxide#151 added the routing, marker,
+                      # nested-window protection, bounded-sweep, qualify-entry,
+                      # shared-ancestor/private-leaf and readiness cases)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -79,8 +93,10 @@ LIMITATIONS = [
     "Only the pinned leader's group and the pinned monitor are ever signalled; survivors in other groups end the run UNCLOSED with scratch kept, never signalled.",
     "The census treats every unvalidated process on the host as uncertain, including zombies of unrelated parents, so such a process present after the stop yields a false UNCLOSED (fails closed).",
     "Host free space is a sampled abort threshold (0.25 s, 22 GiB = 20 GiB reserve + 2 GiB margin) read on the filesystem actually holding the scratch, so on the selected drive it is that volume's free space, not the internal disk's; no instantaneous guarantee. Owned bytes are walked every 2 s against a monitored budget, not a hard ceiling.",
-    "The default scratch parent is read passively from OXIDE_POOL, the user config file's [pool] path or the built-in pool, and the pool's removable registration, with one kernel volume-UUID read; that is not the product's verified build-time selection (no diskutil container/role check), the config reader understands only a simple [pool] path entry, and anything unreadable or unsupported falls back to /private/tmp with a warning. The bootstrap refuses to qualify on a fallback.",
-    "Scratch on the selected drive is created as a new private oxide-proof.* directory and is kept on a failed or unclosed run exactly like the /private/tmp default; the harness never removes any other directory on that volume. The bootstrap's own base (its cases and layout records) is one more new directory on that volume, kept by the bootstrap, which deletes nothing.",
+    "The default scratch parent is the owned subtree <mount>/scratch/oxide, read passively from OXIDE_POOL, the user config file's [pool] path or the built-in pool, and the pool's removable registration, with one kernel volume-UUID read; that is not the product's verified build-time selection (no diskutil container/role check), the config reader understands only a simple [pool] path entry, and anything unreadable or unsupported falls back to /private/tmp with a warning. The bootstrap refuses to qualify on a fallback.",
+    "Scratch on the selected drive is created as a new private oxide-proof.* directory under\n    <mount>/scratch/oxide and is kept on a failed or unclosed run exactly like the /private/tmp\n    default; the harness never removes any other directory on that volume. The bootstrap's own\n    base is one more marked directory in the same owned parent, kept by the bootstrap, which\n    deletes nothing.",
+    "Owner markers and bounded self-expiry: each run root in the owned parent carries one private\n    .oxide-scratch.json written before any child or run resource. The fixed startup sweep\n    (1 s and 4096 steps, checked between filesystem steps) removes only real owner-marked roots\n    whose marker records a positive conclusion of all their owned resources strictly older than\n    seven days; unmarked, foreign, corrupt, future-dated, unconcluded, nested-UNCLOSED or\n    otherwise non-expirable roots are never touched, and an exhausted budget leaves the rest for\n    a later run. There is no background reaper, and a partial deletion keeps the marker and the\n    root. The marker is not a liveness probe.",
+    "The candidate root that holds a retained nested UNCLOSED fixture stays unconcluded\n    (nested-unclosed) even when the outer session closed and the suite passed; a failed\n    qualification keeps the bootstrap base unconcluded. Neither can expire while that holds.",
     "Deadlines are enforced by a single-threaded custodian on CLOCK_UPTIME_RAW with bounded calls; no hard real-time scheduling claim.",
     "The candidate's settlement diagnostics (receipt `settlement` and the custodian's decision-time `settlement` record) are bounded observations, not acceptance gates: they never decide classification, closure, EOF, the deadline or cleanup, and a lost or truncated observation only means missing evidence. The receipt object keeps accumulating after the decision, so only the custodian's record is the decision-time view.",
     "macOS only (kqueue NOTE_EXIT, sysctl kinfo_proc at self-checked offsets); Linux is not qualified.",
@@ -209,14 +225,29 @@ def bounded(work, deadline_ns, finish_ns):
     return 124
 
 
+CANDIDATE = []
+
+
+def candidate():
+    """The candidate guard's own module: this bootstrap reuses its routing,
+    preparation, marker and sweep seams instead of copying their rules."""
+    if not CANDIDATE:
+        spec = importlib.util.spec_from_file_location("bounded_test", SOURCES["supervisor"])
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        CANDIDATE.append(module)
+    return CANDIDATE[0]
+
+
 def selection():
     """The candidate's own default routing, resolved here before anything is
     created: this bootstrap refuses rather than spend a native run that could
     not exercise it."""
-    spec = importlib.util.spec_from_file_location("bounded_test", SOURCES["supervisor"])
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.select_default_parent(os.environ)
+    return candidate().select_default_parent(os.environ)
+
+
+def scratch_parent(mount):
+    return candidate().scratch_parent(mount)
 
 
 def registration(path):
@@ -279,7 +310,8 @@ def topology(base, expected, facts=None):
         return None, problems + [f"the suite's owned root or the selected volume is unreadable: {error!r}"]
     if device != parent_device:
         problems.append(f"the suite's owned root is not on the selected volume's device: {root}")
-    return {"root": root, "scratch": scratch, "evidence": evidence}, problems
+    return ({"root": root, "scratch": scratch, "evidence": evidence,
+             "protection": record.get("protection")}, problems)
 
 
 # The suite also records three controls that never run a nested supervisor, so
@@ -383,6 +415,18 @@ def default_scratch(receipt, expected, record=None, facts=None):
     if record is None:
         return ["the suite topology record is unavailable, so no nested resource is proven inside the root"]
     root = record["root"]
+    mount = expected.get("mount")
+    if isinstance(mount, str):
+        # The routing change must be exercised: the parent is the owned subtree
+        # of the selected volume, never the drive root itself.
+        if expected.get("root_parent") != scratch_parent(mount):
+            problems.append(f"the expected scratch parent {expected.get('root_parent')} is not"
+                            f" {scratch_parent(mount)}")
+        if root == mount or os.path.dirname(root) == mount:
+            problems.append(f"the candidate root {root} is at the drive root, not inside"
+                            f" {scratch_parent(mount)}")
+        if not root.startswith(scratch_parent(mount) + "/"):
+            problems.append(f"the candidate root {root} is not inside {scratch_parent(mount)}")
     if receipt.get("root") != root or receipt.get("scratch") != record["scratch"]:
         problems.append(f"the candidate receipt {receipt.get('root')} {receipt.get('scratch')}"
                         f" is not the suite's recorded layout {root} {record['scratch']}")
@@ -427,7 +471,161 @@ def default_scratch(receipt, expected, record=None, facts=None):
     return problems
 
 
-def check(receipt, results, expected, record=None, facts=None):
+def scratch_sweep(receipt, expected, base=None, facts=None):
+    """The candidate's own bounded startup sweep must have run on the owned
+    parent, recorded its bounded summary, and left the bootstrap's unconcluded
+    base in place. A closed candidate must also have recorded its owner-marker
+    conclusion. Nothing here is taken on trust from prose: every field is the
+    candidate's own receipt and the base is checked against kernel facts."""
+    facts = facts if facts is not None else KernelFacts()
+    problems = []
+    sweep = receipt.get("scratch_sweep")
+    if not isinstance(sweep, dict):
+        return ["the candidate receipt records no bounded startup sweep"]
+    if sweep.get("parent") != expected.get("root_parent"):
+        problems.append(f"the sweep parent {sweep.get('parent')} is not the owned parent"
+                        f" {expected.get('root_parent')}")
+    for key in ("examined", "removed_total", "skipped_total", "steps"):
+        value = sweep.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            problems.append(f"the sweep summary has no valid {key}: {value!r}")
+    if sweep.get("stop") not in (None, "entries", "time", "parent-absent", "parent-unreadable"):
+        problems.append(f"the sweep stopped for an unrecognised reason: {sweep.get('stop')}")
+    if isinstance(base, str):
+        try:
+            facts.device(base)
+        except OSError as error:
+            return problems + [f"the bootstrap base {base} is gone after the candidate sweep: {error!r}"]
+    return problems
+
+
+def protected_root(receipt, record, probe=None):
+    """The candidate root must have been durably protected as `hosting` by the
+    suite BEFORE any nested case could exist, and the candidate must therefore
+    have deferred its own conclusion. Nothing is inferred from the outer
+    closure: the marker and the suite's own protection record have to agree on
+    one run identity."""
+    guard = candidate()
+    probe = probe if probe is not None else guard.DefaultProbe()
+    problems = []
+    marker = receipt.get("scratch_marker") or {}
+    state = marker.get("state")
+    if (receipt.get("outcome") or {}).get("closure") == "closed" and state != "nested-protected":
+        problems.append(f"the candidate did not defer its marker to the nested window: {marker}")
+    if state == "nested-protected" and marker.get("reason") != "nested-unconcluded":
+        problems.append(f"the candidate marker state has an inconsistent reason: {marker}")
+    protection = (record or {}).get("protection")
+    if not isinstance(protection, dict):
+        return problems + ["the suite recorded no nested-window protection"]
+    if protection.get("state") != "protected":
+        problems.append(f"the suite did not protect its outer root: {protection}")
+        return problems
+    if record is not None and protection.get("root") != record.get("root"):
+        problems.append(f"the suite protected {protection.get('root')}, not its own root"
+                        f" {record.get('root')}")
+    try:
+        document = guard.read_marker(record["root"], probe)
+    except (KeyError, TypeError):
+        return problems + [f"the suite record has no root to check: {record!r}"]
+    except (guard.MarkerInvalid, OSError) as error:
+        return problems + [f"the candidate root marker is unreadable: {error!r}"]
+    if document["nested_scope"] != "hosting":
+        problems.append(f"the candidate root is not protected as hosting: {document['nested_scope']}")
+    if document["run_id"] != protection.get("run_id"):
+        problems.append(f"the candidate marker run {document['run_id']} is not the suite's"
+                        f" protected run {protection.get('run_id')}")
+    return problems
+
+
+def marker_state_of(guard, probe, root):
+    """One marker's recorded state, read back after the transition: a bounded
+    statement, never a claim of closure."""
+    if not isinstance(root, str):
+        return {"state": "none"}
+    try:
+        document = guard.read_marker(root, probe)
+    except (guard.MarkerInvalid, OSError) as error:
+        return {"state": "unreadable",
+                "reason": getattr(error, "code", None) or type(error).__name__}
+    return {"state": document["outcome"], "closure": document["closure"],
+            "kept_reason": document["kept_reason"], "nested_scope": document["nested_scope"],
+            "concluded": document["concluded_unix"] is not None,
+            "run_id": document["run_id"]}
+
+
+def finish_candidate(guard, probe, record, nested_unclosed, protection):
+    """The candidate root's own marker transition, at one authority and now.
+
+    The suite protected the root as `hosting` before any nested case existed, so
+    the candidate's outer closure was never a whole-owned-resource conclusion.
+    With retained nested UNCLOSED fixtures the root stays truthfully unconcluded
+    (`retained`, kept-reason `nested-unclosed`); only when every nested case
+    concluded does this bootstrap record the positive conclusion. Every refusal
+    is a problem, never a silent pass, and an unmarked root (never expirable)
+    is left alone."""
+    guard_problems = []
+    try:
+        document = guard.read_marker(record["root"], probe)
+    except guard.MarkerInvalid as invalid:
+        if invalid.code == "absent":
+            return guard_problems, False  # unmarked roots are never eligible
+        return [f"the candidate root marker is unreadable: {invalid.code}"], False
+    except OSError as error:
+        return [f"the candidate root marker is unreadable: {error!r}"], False
+    hosting = document["nested_scope"] == "hosting"
+    if nested_unclosed:
+        if not hosting:
+            return ([f"the candidate root holds retained nested UNKNOWN resources but is not"
+                     f" protected as hosting: {document['nested_scope']}"], False)
+        try:
+            guard.record_conclusion(record["root"], document["run_id"], probe, "retained",
+                                    "none", "nested-unclosed")
+        except (guard.MarkerInvalid, OSError) as error:
+            return ([f"the candidate root could not record its nested-unknown retention: {error!r}"],
+                    False)
+        return guard_problems, False
+    if document["concluded_unix"] is not None:
+        if hosting:
+            return ([f"the candidate root was concluded from its outer closure while protected as"
+                     f" hosting: {document}"], False)
+        return guard_problems, True
+    if not hosting:
+        return ([f"the candidate root is neither protected nor concluded: {document['nested_scope']}"],
+                False)
+    if not isinstance(protection, dict) or protection.get("state") != "protected" \
+            or protection.get("run_id") != document["run_id"]:
+        return ([f"the candidate root's protection record does not match its marker: {protection}"],
+                False)
+    try:
+        guard.record_conclusion(record["root"], document["run_id"], probe, "closed", "positive",
+                                "evidence", nested_concluded=True)
+    except (guard.MarkerInvalid, OSError) as error:
+        return ([f"the candidate root could not record its positive conclusion: {error!r}"], False)
+    return guard_problems, True
+
+
+def finish_base(guard, probe, base, run_id, qualified, retained, candidate_concluded, protection):
+    """The bootstrap base's own marker transition. A passing qualification that
+    intentionally retains nested UNKNOWN resources keeps the base unconcluded
+    with the honest `nested-unclosed` reason; a failed qualification keeps it
+    `qualify-failed`; only a qualification whose whole owned tree concluded
+    records the positive `qualify-base` conclusion."""
+    if not qualified:
+        outcome, closure, reason = "failed", "none", "qualify-failed"
+    elif retained or (isinstance(protection, dict) and protection.get("state") == "protected"
+                      and not candidate_concluded):
+        outcome, closure, reason = "retained", "none", "nested-unclosed"
+    else:
+        outcome, closure, reason = "closed", "positive", "qualify-base"
+    try:
+        guard.record_conclusion(base, run_id, probe, outcome, closure, reason,
+                                nested_concluded=closure == "positive")
+    except (guard.MarkerInvalid, OSError) as error:
+        return [f"the bootstrap base could not record its conclusion: {error!r}"]
+    return []
+
+
+def check(receipt, results, expected, record=None, facts=None, base=None):
     facts = facts if facts is not None else KernelFacts()
     problems = []
     outcome = receipt.get("outcome") or {}
@@ -443,6 +641,8 @@ def check(receipt, results, expected, record=None, facts=None):
     if reserve["max_gap_ns"] > NS:
         problems.append(f"reserve sample gap {reserve['max_gap_ns']} ns over 1 s")
     problems += default_scratch(receipt, expected, record, facts)
+    problems += scratch_sweep(receipt, expected, base, facts)
+    problems += protected_root(receipt, record)
     problems += nested_cases(results, record, facts)
     owned = receipt["owned_bytes"]
     if owned["maximum"] is None or not 5 * MIB <= owned["maximum"] <= owned["budget"]:
@@ -457,7 +657,36 @@ def check(receipt, results, expected, record=None, facts=None):
     return problems
 
 
-def main():
+PREFLIGHT_FLAG = "--preflight"
+
+
+def preflight(argv):
+    """Effect-free readiness for the selected host, for `proof:supervisor:preflight`.
+
+    Metadata only: it selects and inspects paths, modes, owners and devices and
+    prints a bounded JSON result. It creates nothing (an absent private leaf is
+    reported as "absent; would create 0700"), never sweeps, marks, forks the
+    deadline actor, launches the candidate or reads reserves. The invoked
+    qualification re-runs the same checks in its own setup, so this is
+    point-in-time readiness, never a reservation."""
+    if argv != [PREFLIGHT_FLAG]:
+        print(f"refused: preflight takes no arguments (got {argv})", file=sys.stderr)
+        return 2
+    guard = candidate()
+    selection = guard.select_default_parent(os.environ)
+    result = {"selector": "proof:supervisor:preflight", "head": git("rev-parse", "HEAD").strip(),
+              "readiness": guard.readiness(selection)}
+    print(json.dumps(result, indent=1), flush=True)
+    return 0 if result["readiness"]["ready"] else 2
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == PREFLIGHT_FLAG:
+        return preflight(list(argv))
+    if argv:
+        raise SystemExit(f"qualify-supervisor.py: unknown argument {argv[0]}")
     return bounded(qualify, DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
 
 
@@ -483,8 +712,18 @@ def qualify():
               " default; run it where the machine's passive pool selection names the registered drive"
               " (account config or OXIDE_POOL). Nothing was created.", file=sys.stderr)
         return 2
+    guard = candidate()
+    probe = guard.DefaultProbe()
+    try:
+        parent = guard.prepare_scratch_parent(expected, probe)
+    except (guard.SelectionRefused, OSError) as error:
+        print(f"refused: the owned scratch parent {expected.get('root_parent')} cannot be prepared: {error!r}."
+              " Nothing was created.", file=sys.stderr)
+        return 2
+    print(f"owned scratch parent {parent} (0700 inside the selected volume; a new subfolder is not a new"
+          " volume)", flush=True)
     facts = KernelFacts()
-    opening = reserve_readings(expected["root_parent"], "/private/tmp", facts)
+    opening = reserve_readings(parent, "/private/tmp", facts)
     print(f"bootstrap scratch-volume free {opening['scratch_volume']['free'] / GIB:.1f} GiB on"
           f" {opening['scratch_volume']['path']} (abort threshold 22 GiB); boot-volume free"
           f" {opening['boot_volume']['free'] / GIB:.1f} GiB on {opening['boot_volume']['path']}", flush=True)
@@ -494,26 +733,40 @@ def qualify():
     if opening["boot_volume"]["free"] < THRESHOLD:
         print("refused: the boot volume has less than 22 GiB free", file=sys.stderr)
         return 2
-    base = os.path.realpath(tempfile.mkdtemp(prefix="oxide-supervisor-qualify.", dir=expected["root_parent"]))
-    print(f"scratch base {base} on the selected volume (kept: never deleted by this bootstrap)", flush=True)
+    sweep = guard.sweep_concluded_roots(parent, expected["device"], probe)
+    print(f"bounded startup sweep: examined {sweep['examined']}, removed {sweep['removed_total']},"
+          f" skipped {sweep['skipped_total']}, steps {sweep['steps']} of {sweep['entry_budget']},"
+          f" stop {sweep['stop']}", flush=True)
+    base = os.path.realpath(tempfile.mkdtemp(prefix=guard.QUALIFY_LEAF, dir=parent))
+    run_id = guard.new_run_id()
+    try:
+        guard.write_marker(base, guard.marker_document(run_id, base, probe), probe)
+    except (guard.MarkerInvalid, OSError) as error:
+        print(f"refused: the bootstrap base {base} could not be marked ({error!r}); it is kept and never"
+              " swept, so an owner must remove it", file=sys.stderr)
+        return 2
+    print(f"scratch base {base} on the selected volume (marked, kept: never deleted by this bootstrap)",
+          flush=True)
     env = {k: v for k, v in os.environ.items() if k not in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_SUPERVISOR_INJECT")}
     env["OXIDE_SUPERVISOR_CASES"] = os.path.join(base, "cases.json")
     env["OXIDE_SUPERVISOR_LAYOUT"] = os.path.join(base, "topology.json")
-    candidate = subprocess.Popen(
+    # The Popen handle is a local: its name must not shadow the module-level
+    # `candidate()` loader resolved above (diagnostic2 UnboundLocalError).
+    candidate_process = subprocess.Popen(
         [sys.executable, SOURCES["supervisor"], "--limit", str(CANDIDATE_LIMIT), "--scratch-budget-mib", "512",
          "--", sys.executable, SOURCES["suite"]], env=env)
     problems = []
     # Reaped only by `hold`, never by Popen, so the candidate stays pinned.
-    status = hold(candidate.pid, DEADLINE - 15 * NS, forward)
+    status = hold(candidate_process.pid, DEADLINE - 15 * NS, forward)
     if status is None:
         problems.append("candidate overran the bootstrap deadline")
         for number in (signal.SIGTERM, signal.SIGKILL):  # our own unreaped child only
             forward.append(number)
-            status = hold(candidate.pid, now_ns() + 3 * NS, forward)
+            status = hold(candidate_process.pid, now_ns() + 3 * NS, forward)
             if status is not None:
                 break
     code = None if status is None else code_of(status)
-    candidate.returncode = code
+    candidate_process.returncode = code
     if code != 0:
         problems.append(f"candidate exit {code}")
     closing = reserve_readings(expected["root_parent"], "/private/tmp", facts)
@@ -531,9 +784,24 @@ def qualify():
             receipt = json.load(handle)
         with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
             results = json.load(handle)
-        problems += check(receipt, results, expected, record, facts)
+        problems += check(receipt, results, expected, record, facts, base)
     except (OSError, ValueError, KeyError, TypeError) as error:
         problems.append(f"missing or malformed candidate evidence: {error!r}")
+    nested_unclosed = [case["dir"] for case in results.get("cases", []) if case.get("retained_unclosed")]
+    # The suite result and the custody of the owned resources are separate
+    # facts: intentional retained nested UNCLOSED fixtures are an expected PASS,
+    # and they never flip the result. They do keep every marker above them
+    # unconcluded, because a positive conclusion of ALL owned resources was not
+    # established.
+    qualified = not problems and code == 0 and (receipt.get("outcome") or {}).get("closure") == "closed"
+    candidate_concluded = False
+    if record is not None:
+        candidate_problems, candidate_concluded = finish_candidate(
+            guard, probe, record, nested_unclosed, (record or {}).get("protection"))
+        problems += candidate_problems
+    base_problems = finish_base(guard, probe, base, run_id, qualified, bool(nested_unclosed),
+                                candidate_concluded, (record or {}).get("protection"))
+    problems += base_problems
     reserve, owned = receipt.get("reserve", {}), receipt.get("owned_bytes", {})
     qualification = {
         "selector": "proof:supervisor:qualify",
@@ -546,7 +814,13 @@ def qualify():
         "candidate_phase": receipt.get("phase"),
         "candidate_outcome": receipt.get("outcome"),
         "default_scratch": {"expected": expected, "receipt": receipt.get("scratch_default"),
-                            "root": receipt.get("root"), "topology": record},
+                            "root": receipt.get("root"), "topology": record,
+                            "prepared_parent": parent},
+        "scratch_sweep": sweep,
+        "scratch_marker": {"candidate": marker_state_of(guard, probe, (record or {}).get("root")),
+                           "base": marker_state_of(guard, probe, base)},
+        "candidate_scratch_sweep": receipt.get("scratch_sweep"),
+        "candidate_scratch_marker": receipt.get("scratch_marker"),
         "reserve": {"samples": reserve.get("samples"), "minimum_bytes": reserve.get("minimum"),
                     "max_gap_ns": reserve.get("max_gap_ns"), "path": reserve.get("path"),
                     "device": reserve.get("device")},
@@ -561,8 +835,7 @@ def qualify():
         "owned_bytes_peak": owned.get("maximum"),
         "candidate_signals": [r for r in receipt.get("custodian", []) if r["event"] == "signal"],
         "cases": results.get("cases"),
-        "kept": {"base": base, "nested_unclosed": [case["dir"] for case in results.get("cases", [])
-                                                   if case.get("retained_unclosed")]},
+        "kept": {"base": base, "nested_unclosed": nested_unclosed},
         "outcomes": results.get("outcomes"),
         "limitations": LIMITATIONS,
     }
@@ -573,4 +846,4 @@ def qualify():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
