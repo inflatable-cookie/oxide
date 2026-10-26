@@ -4379,9 +4379,17 @@ author and reviewer native remain unactivated.
   checkout is ONE owner, so its own sibling members never keep each other,
   while a reference from a different checkout does keep the root. A dangling
   member link never transitions automatically (a command on an internal
-  fallback names the fallback and `oxide outputs adopt`), and a debug-only stop
-  after the fixed terminal image is published (before settlement) exercises
-  exact-image replay.
+  fallback names the fallback and `oxide outputs adopt`). The one repair
+  (oxide#162) belongs to a derived `oxide exec`: when the link selects exactly
+  the absent member destination of this checkout's own committed, verified root
+  — same root, nonce and volume, its marker/kind/volume/generation/device bound
+  — the binding creates that one member directory under the same writer custody
+  a member link's publication uses, and never relinks, replaces or follows
+  anything. A link naming a missing root, another checkout's root, an
+  unverified directory or a different nonce still refuses with
+  `oxide outputs adopt` named, and every other command keeps the refusal.
+  A debug-only stop after the fixed terminal image is published (before
+  settlement) exercises exact-image replay.
 - **Adding a member to a root that already exists.** The transition that
   created a root consumed its reservation, so a later member of the same root
   (a host `--target` triple after `debug`, say) needs none: the keyed root must
@@ -4391,7 +4399,13 @@ author and reviewer native remain unactivated.
   generation, never the placement revision that committed it. A nested
   `<triple>` member's real ancestor directory inside the checkout's `target` is
   created exclusively before its link is published; a symlink, a file or any
-  other entry there refuses, and nothing outside that target is created.
+  other entry there refuses, and nothing outside that target is created. Every
+  publication — a per-member transition, the explicit adoption, the automatic
+  first conversion and the whole-target migration — creates the member's real
+  directory inside the verified root before the member's link can name it, so
+  a committed placement never points at an absent directory; a symlink, a file
+  or any other entry at that destination refuses and is never followed
+  (oxide#162).
 - **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and
   `<triple>/release`. A member has at most two components matching
   `[A-Za-z0-9_.-]+`, is neither `.` nor `..`, and is never absolute or an
@@ -4426,13 +4440,18 @@ author and reviewer native remain unactivated.
   with the shipped `migration_members` traversal (member names first, so a
   real `target/debug` payload is never listed; `file_type()` and `read_link`
   only, so no link target is resolved or descended), a receipt-selected
-  member must already be this checkout's owned link at the recorded
-  destination (a missing, dangling, real or foreign entry refuses with
-  `oxide outputs adopt` named), a receipt-recorded real member stays `real`
-  with the existing notice, a link or file the receipt does not place
-  refuses, and a checkout placing more than eight members refuses naming
-  `oxide outputs detach`. The derived path reserves nothing, relinks nothing,
-  converts nothing and creates no member. A detached profile receipt plans no
+  member must be this checkout's owned link at the recorded destination — its
+  one repairable state is a link whose destination directory is absent beneath
+  the checkout's own committed, verified root (same root, nonce and volume),
+  which the permanent-mode binding creates under the same writer custody as a
+  member link's publication; a missing member link, a real directory, another
+  destination, a foreign link, an unverified or missing root and a different
+  nonce all still refuse with `oxide outputs adopt` named — a receipt-recorded
+  real member stays `real` with the existing notice, a link or file the receipt
+  does not place refuses, and a checkout placing more than eight members
+  refuses naming `oxide outputs detach`. The derived path itself reserves
+  nothing, relinks nothing, converts nothing and creates no member; only that
+  one absent member directory is created later, inside binding. A detached profile receipt plans no
   destination at all, so its `exec` runs locally through real directories; a
   legacy whole-target receipt and an unconverted checkout are unchanged (the
   declaration is not consulted), and a prepared, pruning or pruned receipt
@@ -4478,8 +4497,16 @@ author and reviewer native remain unactivated.
   publishes a durable prepared journal pinning the prior receipt digest, the
   exact target-link text/dev/ino, the parent identity and — for a root/1
   marker — the marker's dev/ino/SHA plus ONE freshly reserved root nonce. P1
-  creates the transaction's staging directory with only classified member
-  links into the same root and records its identity. The classified set is the
+  re-verifies the root (this checkout's marker, kind, volume, live device and
+  ancestry, and either the root/2 nonce or the exact pinned root/1 document),
+  creates every classified member's real directory inside that root — refusing
+  a symlink, a file or any other entry at a destination and creating nothing
+  outside the root — and only then creates the transaction's staging directory
+  with the member links into that root, recording its identity and the member
+  directories it had to create. No published link ever names an absent member:
+  the observed defect (oxide#162) was a migration that linked the host pair
+  into a root that had never held a release build, leaving `target/release`
+  dangling. The classified set is the
   host `debug`/`release` pair plus, one bounded component down, the `debug` and
   `release` directories of each positively identified plain triple directory
   in the old root; a linked triple directory, a JSON target specification, a
@@ -4500,8 +4527,10 @@ author and reviewer native remain unactivated.
   present with its recorded inode and bytes; a lookalike target directory, a
   missing or substituted backup leaves the transaction pending instead of
   committing. P4 verifies the final real directory and exact
-  member link set and commits the receipt, root/2 nonce and outputs-3 member
-  references — the COMMIT point, never rolled back. Journaled backups are
+  member link set, re-establishes every classified member directory under the
+  verified marker (so no committed placement can dangle) and commits the
+  receipt, root/2 nonce and outputs-3 member references — the COMMIT point,
+  never rolled back. Journaled backups are
   removed only under their pinned identities before the journal is dropped.
   Replay advances only exact recorded identities, including a crash before a
   phase record; ambiguous identity, a foreign creator, a lost volume, a
@@ -4511,7 +4540,10 @@ author and reviewer native remain unactivated.
   or staging publication, not merely recorded as a pathname, and a replaced
   backup with the same bytes but a new inode is refused. A pre-P4
   rollback restores the exact old marker from its pinned backup, the old
-  target link and the published /2 receipt, and retires the reserved nonce;
+  target link and the published /2 receipt, removes exactly the member
+  directories the journal recorded as created (and only while each is still
+  the real, empty directory the migration made; one holding content or a link
+  a creator put there is kept), and retires the reserved nonce;
   every rollback effect verifies the recorded parent first and removes only
   the transaction's own staged inode. The debug-only `OXIDE_TEST_MIGRATION_ROLLBACK` hook and
   `OXIDE_TEST_OUTPUTS_CRASH=migration-<phase>` crashes exist only in debug

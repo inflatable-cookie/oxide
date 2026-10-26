@@ -551,6 +551,10 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         held.record_id(),
         planned.as_ref(),
         pool_fallback.as_deref(),
+        // A derived `oxide exec` may create the absent member directory of its
+        // own verified, committed root (oxide#162); every other command keeps
+        // the existing refusal (`derives_exec` is false for them).
+        derives_exec,
     ) {
         Ok(binding) => binding,
         Err(reason) => {
