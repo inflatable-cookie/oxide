@@ -2054,7 +2054,13 @@ fn adopt_under_barrier(
         // A committed receipt whose owned link selects another known place:
         // relink under the barrier.
         (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => {
-            let committed = transition(context, &receipt, &spec, Start::Any)?;
+            let committed = transition(
+                context,
+                &receipt,
+                &spec,
+                Start::Any,
+                NonceAuthority::Unkeyed,
+            )?;
             let selected = committed
                 .selected()
                 .cloned()
@@ -2063,7 +2069,13 @@ fn adopt_under_barrier(
         }
         // A committed receipt whose link is missing: recreate it.
         (TargetState::Missing, Some(_)) => {
-            let committed = transition(context, &receipt, &spec, Start::Any)?;
+            let committed = transition(
+                context,
+                &receipt,
+                &spec,
+                Start::Any,
+                NonceAuthority::Unkeyed,
+            )?;
             let selected = committed
                 .selected()
                 .cloned()
@@ -2072,7 +2084,13 @@ fn adopt_under_barrier(
         }
         // Explicit first conversion, or one after `detach`.
         (TargetState::Missing | TargetState::RealEmpty, _) => {
-            let committed = transition(context, &receipt, &spec, Start::Any)?;
+            let committed = transition(
+                context,
+                &receipt,
+                &spec,
+                Start::Any,
+                NonceAuthority::Unkeyed,
+            )?;
             let selected = committed
                 .selected()
                 .cloned()
@@ -3438,7 +3456,14 @@ fn adopt_profile(context: &Context, receipt: Receipt) -> Result<(Receipt, Select
                 ))
             }
         }
-        committed = transition_at(&context, &committed, member.name(), &spec, Start::Adopt)?;
+        committed = transition_at(
+            &context,
+            &committed,
+            member.name(),
+            &spec,
+            Start::Adopt,
+            NonceAuthority::Unkeyed,
+        )?;
         converted = true;
     }
     let selected = committed.selected().cloned().unwrap_or(desired.clone());
@@ -3579,7 +3604,13 @@ pub fn auto_adopt(
             return Ok(None);
         }
         let receipt = Receipt::first(checkout, &context.checkout_id);
-        let committed = transition(&context, &receipt, &spec, Start::MissingOnly)?;
+        let committed = transition(
+            &context,
+            &receipt,
+            &spec,
+            Start::MissingOnly,
+            NonceAuthority::Unkeyed,
+        )?;
         committed
             .selected()
             .cloned()
@@ -4219,7 +4250,15 @@ fn bind_under_binding(
         )),
         Ok(CheckoutCustody::Writers) => Bind::Wait,
         Ok(CheckoutCustody::Clear) => {
-            let committed = match transition(context, receipt, &spec_for(&wanted), Start::Any) {
+            // The slot's own keyed nonce is the only future-root authority a
+            // leased command may bind (oxide#152).
+            let committed = match transition(
+                context,
+                receipt,
+                &spec_for(&wanted),
+                Start::Any,
+                NonceAuthority::Keyed(wanted.nonce()),
+            ) {
                 Ok(committed) => committed,
                 Err(reason) => return Bind::Refuse(reason),
             };
@@ -4418,7 +4457,17 @@ fn bind_profile(
         let mut current = receipt.clone();
         for (member, wanted) in &needed {
             let spec = spec_for(wanted);
-            match transition_at(context, &current, member, &spec, Start::Any) {
+            // The member's keyed nonce is the only future-root authority this
+            // command may bind; a cancelled, replaced or absent reservation
+            // refuses inside the transition before any write (oxide#152).
+            match transition_at(
+                context,
+                &current,
+                member,
+                &spec,
+                Start::Any,
+                NonceAuthority::Keyed(wanted.nonce()),
+            ) {
                 Ok(committed) => current = committed,
                 Err(reason) => return Bind::Refuse(reason),
             }
@@ -5786,6 +5835,23 @@ enum Start {
     MissingOnly,
 }
 
+/// The nonce authority one transition runs under (oxide#152).
+///
+/// A leased command's slot is keyed with the destination nonce it committed to
+/// today, and that keyed nonce is the only authority a transition may bind: a
+/// cancelled, replaced or absent reservation refuses before the prepared
+/// receipt, the root, the link or any registry row exists. Only an explicit
+/// adoption (or the automatic first conversion) never keyed a slot, so only it
+/// may draw a fresh nonce for a root it decides to create.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NonceAuthority<'a> {
+    /// A keyed command's destination nonce (its reservation nonce, or `None`
+    /// when no reservation existed when the slot was keyed).
+    Keyed(Option<&'a str>),
+    /// No slot was keyed: an explicit adoption or an automatic conversion.
+    Unkeyed,
+}
+
 /// Write the committed receipt for one transition (the legacy whole-target
 /// link).
 fn transition(
@@ -5793,8 +5859,9 @@ fn transition(
     receipt: &Receipt,
     spec: &RootSpec,
     start: Start,
+    authority: NonceAuthority<'_>,
 ) -> Result<Receipt, String> {
-    transition_at(context, receipt, MEMBER, spec, start)
+    transition_at(context, receipt, MEMBER, spec, start, authority)
 }
 
 /// Write the committed receipt for one member's transition: the legacy
@@ -5806,6 +5873,7 @@ fn transition_at(
     member: &str,
     spec: &RootSpec,
     start: Start,
+    authority: NonceAuthority<'_>,
 ) -> Result<Receipt, String> {
     let control = context
         .control()
@@ -5888,21 +5956,46 @@ fn transition_at(
         .as_ref()
         .map_or(generation, |marker| marker.generation);
     // A future root takes the nonce reserved for exactly it, after the
-    // reservation is validated against the registry (or its overflow tag);
-    // only an explicit adoption without a keyed slot draws a fresh one.
+    // reservation is validated against the registry (or its overflow tag).
+    // A slot that was KEYED for a future root binds only the exact nonce it
+    // named: a cancelled, replaced or absent reservation, or a root that now
+    // carries another nonce, refuses here — before the prepared receipt, the
+    // root, the link or any registry write — so a command that refuses leaves
+    // no authority effect (oxide#152). Only an explicit adoption without a
+    // keyed slot draws a fresh one.
     let reserved = receipt
         .reserved()
         .filter(|reserved| reserved.is_for(&spec.selected(generation)))
         .cloned();
     let nonce = match existing_nonce {
-        Some(nonce) => Some(nonce),
-        None if read_marker(spec.root()).is_ok() => None,
-        None => match &reserved {
-            Some(reserved) => {
-                crate::prune::validate_reservation(control, reserved)?;
-                Some(reserved.nonce.clone())
+        Some(nonce) => {
+            if let NonceAuthority::Keyed(keyed) = authority {
+                if keyed != Some(nonce.as_str()) {
+                    return Err(format!(
+                        "outputs: this command's slot was keyed for root nonce {} of {}, but the root now carries {nonce}; nothing was built. Run the command again",
+                        keyed.unwrap_or("(none)"),
+                        spec.root().display()
+                    ));
+                }
             }
-            None => Some(crate::prune::fresh_nonce()?),
+            Some(nonce)
+        }
+        None if read_marker(spec.root()).is_ok() => None,
+        None => match authority {
+            NonceAuthority::Keyed(keyed) => {
+                let wanted = spec
+                    .selected(root_generation)
+                    .with_nonce(keyed.map(str::to_owned));
+                reservation_matches(context, receipt, &wanted)?;
+                wanted.nonce().map(str::to_owned)
+            }
+            NonceAuthority::Unkeyed => match &reserved {
+                Some(reserved) => {
+                    crate::prune::validate_reservation(control, reserved)?;
+                    Some(reserved.nonce.clone())
+                }
+                None => Some(crate::prune::fresh_nonce()?),
+            },
         },
     };
     let to = spec.selected(root_generation).with_nonce(nonce);
@@ -8026,8 +8119,14 @@ mod tests {
     fn legacy_checkout() -> (Fixture, Receipt) {
         let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
         let context = fixture.context();
-        let receipt =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let receipt = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         (fixture, receipt)
     }
 
@@ -9754,8 +9853,14 @@ mod tests {
     fn adoption_refuses_a_whole_target_link_without_touching_it() {
         let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
         let context = fixture.context();
-        let legacy =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let legacy = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let target = context.link();
         assert!(fs::symlink_metadata(&target)
             .unwrap()
@@ -10124,6 +10229,7 @@ mod tests {
             &fixture.receipt(),
             &fixture.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap();
         let link = fixture.checkout.join("target");
@@ -10141,8 +10247,14 @@ mod tests {
         assert_eq!(receipt.roots.len(), 1);
         // A second transition to the same place is a new generation, not a
         // new root.
-        let second =
-            transition(&fixture.context(), &receipt, &fixture.local(), Start::Any).unwrap();
+        let second = transition(
+            &fixture.context(),
+            &receipt,
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         assert_eq!(second.generation, 2);
         assert_eq!(second.roots.len(), 1);
         assert!(!sibling_link(&link, 2).exists());
@@ -10160,6 +10272,7 @@ mod tests {
             &fixture.receipt(),
             &fixture.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
@@ -10177,6 +10290,7 @@ mod tests {
             &linked.receipt(),
             &linked.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
@@ -10236,6 +10350,7 @@ mod tests {
                 &fixture.receipt(),
                 &fixture.local(),
                 Start::Any,
+                NonceAuthority::Unkeyed,
             )
             .unwrap_err();
             assert!(refused.contains(reason), "{label}: {refused}");
@@ -10285,6 +10400,7 @@ mod tests {
                 &fixture.receipt(),
                 &fixture.local(),
                 Start::Any,
+                NonceAuthority::Unkeyed,
             )
             .unwrap_err();
             let expected = if label == "negated" {
@@ -10313,6 +10429,7 @@ mod tests {
                 &fixture.receipt(),
                 &fixture.local(),
                 Start::Any,
+                NonceAuthority::Unkeyed,
             )
             .unwrap();
             assert_eq!(receipt.state, ReceiptState::Committed, "{rule}");
@@ -10348,6 +10465,7 @@ mod tests {
             &allowed.receipt(),
             &allowed.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap();
         assert!(os_symlink_exists(&allowed.checkout.join("target")));
@@ -10378,6 +10496,7 @@ mod tests {
             &empty.receipt(),
             &empty.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap_err();
         assert!(reason.contains("directories only"), "{reason}");
@@ -10396,6 +10515,7 @@ mod tests {
             &refused.receipt(),
             &refused.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap_err();
         assert!(reason.contains("does not ignore"), "{reason}");
@@ -10425,6 +10545,7 @@ mod tests {
             &tracked.receipt(),
             &tracked.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap_err();
         assert!(refused.contains("already tracks"), "{refused}");
@@ -10437,6 +10558,7 @@ mod tests {
             &plain.receipt(),
             &plain.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap_err();
         assert!(refused.contains("could not confirm"), "{refused}");
@@ -10471,6 +10593,7 @@ mod tests {
             &fixture.receipt(),
             &fixture.local(),
             Start::Any,
+            NonceAuthority::Unkeyed,
         )
         .unwrap();
         assert_eq!(receipt.generation, 1);
@@ -10585,8 +10708,14 @@ mod tests {
             planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None).unwrap();
         assert!(planned.is_none());
         assert_eq!(destination_facts(None), "");
-        let receipt =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let receipt = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
             .unwrap()
             .unwrap();
@@ -10598,7 +10727,14 @@ mod tests {
         assert!(first.ends_with("g1"), "{first}");
         // Relinking to the same root keeps the same destination identity, so
         // a warm slot survives a relink.
-        let again = transition(&context, &receipt, &fixture.local(), Start::Any).unwrap();
+        let again = transition(
+            &context,
+            &receipt,
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         assert_eq!(again.generation, 2);
         let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
             .unwrap()
@@ -10732,7 +10868,14 @@ mod tests {
         let fixture = Fixture::new();
         let context = fixture.context();
         let spec = fixture.local();
-        let first = transition(&context, &fixture.receipt(), &spec, Start::Any).unwrap();
+        let first = transition(
+            &context,
+            &fixture.receipt(),
+            &spec,
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let old = first.selected().unwrap().root.clone();
         let mut receipt = first.clone();
         let prepared = Prepared {
@@ -10762,12 +10905,25 @@ mod tests {
     fn a_committed_receipt_refuses_a_dangling_link_that_is_not_its_own() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let receipt =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let receipt = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let foreign = fixture.root.join("foreign-absent");
         fs::remove_file(context.link()).unwrap();
         symlink(&foreign, context.link()).unwrap();
-        let refused = transition(&context, &receipt, &fixture.local(), Start::Any).unwrap_err();
+        let refused = transition(
+            &context,
+            &receipt,
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
         assert_eq!(fs::read_link(context.link()).unwrap(), foreign);
     }
@@ -10804,7 +10960,14 @@ mod tests {
         receipt.roots = vec![previous];
         write_receipt(&fixture.control, &receipt).unwrap();
         symlink(&absent, context.link()).unwrap();
-        let committed = transition(&context, &receipt, &fixture.local(), Start::Any).unwrap();
+        let committed = transition(
+            &context,
+            &receipt,
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         assert_eq!(committed.generation, 2);
         assert_eq!(
             fs::read_link(context.link()).unwrap(),
@@ -10819,8 +10982,14 @@ mod tests {
         let context = fixture.context();
         let absent = fixture.root.join("absent-root");
         symlink(&absent, context.link()).unwrap();
-        let refused =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap_err();
+        let refused = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
         assert_eq!(fs::read_link(context.link()).unwrap(), absent);
     }
@@ -10919,7 +11088,14 @@ mod tests {
         let fixture = Fixture::new();
         let context = fixture.context();
         let spec = fixture.local();
-        let receipt = transition(&context, &fixture.receipt(), &spec, Start::Any).unwrap();
+        let receipt = transition(
+            &context,
+            &fixture.receipt(),
+            &spec,
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let selected = receipt.selected().unwrap().clone();
         let outer = fixture.checkout.join(LOCAL_DIR);
         let moved = fixture.root.join("moved-outputs");
@@ -11082,7 +11258,14 @@ mod tests {
     fn a_link_restored_to_an_older_owned_root_is_refused() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let local = transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let local = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let expected = local.selected().unwrap().clone();
         let mut receipt = local.clone();
         receipt.link_mut().selected = Some(Selected {
@@ -11118,8 +11301,14 @@ mod tests {
         let fixture = Fixture::new();
         let other = Fixture::new();
         let context = fixture.context();
-        let committed =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let committed = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let mut receipt = committed.clone();
         let foreign_link = other.checkout.join("target");
         receipt.state = ReceiptState::Prepared;
@@ -11156,8 +11345,14 @@ mod tests {
     fn automatic_replay_refuses_unknown_custody_in_the_other_pool() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let committed =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let committed = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let root = committed.selected().unwrap().root.clone();
         let mut receipt = committed.clone();
         receipt.state = ReceiptState::Prepared;
@@ -11196,8 +11391,14 @@ mod tests {
         for occupant in ["other-link", "file", "absent"] {
             let fixture = Fixture::new();
             let context = fixture.context();
-            let committed =
-                transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+            let committed = transition(
+                &context,
+                &fixture.receipt(),
+                &fixture.local(),
+                Start::Any,
+                NonceAuthority::Unkeyed,
+            )
+            .unwrap();
             let old = committed.selected().unwrap().root.clone();
             let new_root = fixture.root.join("new-root");
             let mut receipt = committed.clone();
@@ -11369,7 +11570,14 @@ mod tests {
             .unwrap();
             assert!(keyed.is_none());
             // Adoption completes while the command waits.
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+            transition(
+                &context,
+                &fixture.receipt(),
+                &fixture.local(),
+                Start::Any,
+                NonceAuthority::Unkeyed,
+            )
+            .unwrap();
             match bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None) {
                 Ok(_) => panic!("{mode:?}: bound an owned root with an unconverted slot key"),
                 Err(reason) => assert!(reason.contains("converted to owned outputs"), "{reason}"),
@@ -11405,7 +11613,14 @@ mod tests {
             Some(store.owner_control().to_path_buf()),
             fixture.checkout.clone(),
         );
-        transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let keyed = planned_destination(
             Some(store.owner_control()),
             &fixture.checkout,
@@ -11446,8 +11661,14 @@ mod tests {
     fn a_receipt_write_publishes_registry_rows_and_prepared_keeps_selection() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let committed =
-            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let committed = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let selected = committed.selected().unwrap().clone();
         let rows = crate::prune::test_rows(&fixture.control).unwrap();
         assert!(
@@ -11536,7 +11757,14 @@ mod tests {
             .selected(1)
             .with_nonce(Some(reservation.nonce.clone()));
         reservation_matches(&context, &reserved, &wanted).unwrap();
-        let created = transition(&context, &reserved, &fixture.local(), Start::Any).unwrap();
+        let created = transition(
+            &context,
+            &reserved,
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         assert_eq!(
             read_marker(&future).unwrap().nonce,
             Some(reservation.nonce.clone())
@@ -11575,6 +11803,248 @@ mod tests {
         *dropped.reserved_mut() = None;
         let refused = write_receipt(&fixture.control, &dropped).unwrap_err();
         assert!(refused.contains("cancellation journal"), "{refused}");
+    }
+
+    /// The future-root shape this seam can build without a registered volume:
+    /// the checkout's own local root, held by a durable reservation on the same
+    /// fixture receipt the existing reservation test uses. The only variable
+    /// these tests add is the nonce AUTHORITY.
+    fn keyed_fixture(fixture: &Fixture) -> (Receipt, RootSpec) {
+        let spec = fixture.local();
+        let future = spec.root().to_path_buf();
+        let mut receipt = fixture.receipt();
+        publish_reservation(fixture, &mut receipt, &future);
+        (receipt, spec)
+    }
+
+    /// Every regular file's relative path, bytes and mode under `root`, plus
+    /// every symlink's target: the authority oracle for a refused transition.
+    /// Bounded by the fixture's own tiny control tree.
+    fn authority_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>, u32)> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                let facts = fs::symlink_metadata(&path).unwrap();
+                if facts.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if facts.file_type().is_symlink() {
+                    let target = fs::read_link(&path).unwrap();
+                    found.push((relative, target.as_os_str().as_encoded_bytes().to_vec(), 0));
+                } else {
+                    let mode = facts.permissions().mode();
+                    found.push((relative, fs::read(&path).unwrap(), mode));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// Publish the fixture's reservation for `root` in its receipt.
+    fn publish_reservation(fixture: &Fixture, receipt: &mut Receipt, root: &Path) -> Reservation {
+        let reservation = reservation_for(root, receipt.generation + 1);
+        *receipt.reserved_mut() = Some(reservation.clone());
+        write_receipt(&fixture.control, receipt).unwrap();
+        crate::prune::validate_reservation(&fixture.control, &reservation).unwrap();
+        reservation
+    }
+
+    /// A keyed future-root slot binds only the exact uncancelled reservation it
+    /// was keyed with (oxide#152). The positive arm: the surviving reservation's
+    /// nonce creates the root and the owned link, and the commit consumes it.
+    /// No Cargo process exists below this seam, so the whole authority surface a
+    /// lease would expose is the root, the receipt and the registry.
+    #[test]
+    fn a_keyed_future_root_binds_exactly_its_surviving_reservation() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let (reserved, spec) = keyed_fixture(&fixture);
+        let future = spec.root().to_path_buf();
+        let reservation = reserved.reserved().cloned().unwrap();
+        let bound = transition(
+            &context,
+            &reserved,
+            &spec,
+            Start::Any,
+            NonceAuthority::Keyed(Some(&reservation.nonce)),
+        )
+        .unwrap();
+        assert_eq!(
+            read_marker(&future).unwrap().nonce.as_deref(),
+            Some(reservation.nonce.as_str()),
+            "the created root did not carry the reserved nonce"
+        );
+        assert!(
+            bound.reserved().is_none(),
+            "the commit kept its consumed reservation"
+        );
+        assert_eq!(
+            fs::read_link(context.link()).unwrap(),
+            member_destination(&future, MEMBER),
+            "the owned link does not select the reserved root"
+        );
+        assert!(
+            crate::prune::validate_reservation(&fixture.control, &reservation).is_err(),
+            "the consumed reservation is still valid"
+        );
+    }
+
+    /// A keyed slot whose reservation was cancelled refuses with the
+    /// cancelled-or-replaced reason inside the transition, before the prepared
+    /// receipt, the root, the link or any registry write: the control tree and
+    /// the absent root are byte-identical afterwards.
+    #[test]
+    fn a_cancelled_keyed_reservation_refuses_before_any_authority_effect() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let (reserved, spec) = keyed_fixture(&fixture);
+        let future = spec.root().to_path_buf();
+        let reservation = reserved.reserved().cloned().unwrap();
+        let mut held = reserved.clone();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        cancel_reservation(&store, &fixture.control, &context, &mut held).unwrap();
+        assert!(
+            held.reserved().is_none(),
+            "the cancellation kept the reservation"
+        );
+        let before = authority_tree(&fixture.control);
+        let refused = transition(
+            &context,
+            &held,
+            &spec,
+            Start::Any,
+            NonceAuthority::Keyed(Some(&reservation.nonce)),
+        )
+        .unwrap_err();
+        assert!(refused.contains("cancelled or replaced"), "{refused}");
+        assert!(
+            !future.exists() && read_marker(&future).is_err(),
+            "a refused keyed transition created the future root"
+        );
+        assert_eq!(
+            authority_tree(&fixture.control),
+            before,
+            "a refused keyed transition wrote receipt or registry authority"
+        );
+        assert!(
+            fs::symlink_metadata(context.link()).is_err(),
+            "a refused keyed transition published the owned link"
+        );
+    }
+
+    /// The two zero-effect negatives a keyed future-root slot must refuse: no
+    /// reservation at all (the shape the old fresh-nonce fallback silently
+    /// converted into a root plus a committed receipt), and a reservation
+    /// replaced by another nonce after a cancellation. Both refuse with the
+    /// cancelled-or-replaced reason and leave every authority byte unchanged;
+    /// the surviving replacement still binds when the slot names it.
+    #[test]
+    fn an_absent_or_replaced_keyed_reservation_refuses_before_any_authority_effect() {
+        // Absent: the receipt holds no reservation at all.
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let spec = fixture.local();
+        let future = spec.root().to_path_buf();
+        let receipt = fixture.receipt();
+        let unbacked = crate::prune::fresh_nonce().unwrap();
+        let before = authority_tree(&fixture.control);
+        let refused = transition(
+            &context,
+            &receipt,
+            &spec,
+            Start::Any,
+            NonceAuthority::Keyed(Some(&unbacked)),
+        )
+        .unwrap_err();
+        assert!(refused.contains("cancelled or replaced"), "{refused}");
+        assert!(
+            !future.exists() && read_marker(&future).is_err(),
+            "an unbacked keyed nonce created the future root"
+        );
+        assert_eq!(
+            authority_tree(&fixture.control),
+            before,
+            "an unbacked keyed nonce wrote receipt or registry authority"
+        );
+        assert!(
+            fs::symlink_metadata(context.link()).is_err(),
+            "an unbacked keyed nonce published the owned link"
+        );
+
+        // Replaced: the same future root, cancelled and reserved again under a
+        // new nonce; the stale keyed nonce refuses with no further effect.
+        let (mut reserved, spec) = keyed_fixture(&fixture);
+        let first = reserved.reserved().cloned().unwrap();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        cancel_reservation(&store, &fixture.control, &context, &mut reserved).unwrap();
+        let second = publish_reservation(&fixture, &mut reserved, &future);
+        assert_ne!(
+            first.nonce, second.nonce,
+            "the replacement reused its nonce"
+        );
+        let before = authority_tree(&fixture.control);
+        let refused = transition(
+            &context,
+            &reserved,
+            &spec,
+            Start::Any,
+            NonceAuthority::Keyed(Some(&first.nonce)),
+        )
+        .unwrap_err();
+        assert!(refused.contains("cancelled or replaced"), "{refused}");
+        assert!(
+            !future.exists() && read_marker(&future).is_err(),
+            "a replaced keyed nonce created the future root"
+        );
+        assert_eq!(
+            authority_tree(&fixture.control),
+            before,
+            "a replaced keyed nonce wrote receipt or registry authority"
+        );
+        // The surviving replacement still binds when the slot names it.
+        let bound = transition(
+            &context,
+            &reserved,
+            &spec,
+            Start::Any,
+            NonceAuthority::Keyed(Some(&second.nonce)),
+        )
+        .unwrap();
+        assert_eq!(
+            read_marker(&future).unwrap().nonce.as_deref(),
+            Some(second.nonce.as_str())
+        );
+        assert!(bound.reserved().is_none());
+    }
+
+    /// Only an unkeyed explicit adoption may draw a fresh nonce for a future
+    /// root: `oxide outputs adopt` has no keyed slot, and the root it creates
+    /// carries a fresh 128-bit nonce that no reservation names.
+    #[test]
+    fn an_unkeyed_adoption_draws_a_fresh_future_root_nonce() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (committed, _local, converted) = adopt_profile(&context, receipt).unwrap();
+        assert!(converted, "the first adoption converted nothing");
+        assert!(
+            committed.reserved().is_none(),
+            "an unkeyed adoption published a reservation"
+        );
+        assert_eq!(
+            committed
+                .selected_for("debug")
+                .and_then(Selected::nonce)
+                .map(str::len),
+            Some(32),
+            "the adoption did not draw a fresh 128-bit nonce"
+        );
     }
 
     /// A receiptless legacy root's checkout gets an exclusive `pruning`
@@ -11655,7 +12125,14 @@ mod tests {
         // A committed receipt is never replaced by the creator.
         let other = Fixture::new();
         let other_context = other.context();
-        transition(&other_context, &other.receipt(), &other.local(), Start::Any).unwrap();
+        transition(
+            &other_context,
+            &other.receipt(),
+            &other.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
         let other_id = identity::digest(&other.checkout.to_string_lossy());
         assert!(create_pruning_receipt(
             &other.control,
@@ -11770,6 +12247,7 @@ mod tests {
             &fixture.receipt(),
             &fixture.local(),
             Start::MissingOnly,
+            NonceAuthority::Unkeyed,
         )
         .unwrap();
         assert_eq!(committed.generation, 1);
@@ -11794,6 +12272,7 @@ mod tests {
             &fixture.receipt(),
             &fixture.local(),
             Start::MissingOnly,
+            NonceAuthority::Unkeyed,
         )
         .unwrap_err();
         assert!(refused.contains("auto-adopt refused"), "{refused}");
@@ -11805,7 +12284,8 @@ mod tests {
             &context,
             &fixture.receipt(),
             &fixture.local(),
-            Start::MissingOnly
+            Start::MissingOnly,
+            NonceAuthority::Unkeyed
         )
         .is_err());
         assert_eq!(fs::read(&link).unwrap(), b"kept");
@@ -11816,7 +12296,8 @@ mod tests {
             &context,
             &fixture.receipt(),
             &fixture.local(),
-            Start::MissingOnly
+            Start::MissingOnly,
+            NonceAuthority::Unkeyed
         )
         .is_err());
         assert_eq!(fs::read_link(&link).unwrap(), dangling);
@@ -11888,6 +12369,7 @@ mod tests {
             &fixture.receipt(),
             &fixture.local(),
             Start::MissingOnly,
+            NonceAuthority::Unkeyed,
         )
         .unwrap();
         let planned = planned_destination(

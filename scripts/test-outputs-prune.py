@@ -120,22 +120,30 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
   03 root nonce: the external root's v2 marker nonce (32 hex) equals the
      receipt's selected nonce and every placed member's registry row nonce
      (a current profile receipt records one row per member for one root).
-  04 shared reservation: an ELIGIBLE reservation path (a committed profile
-     receipt whose placed members are external on the healthy registered
-     volume, with the selected root leaf gone, so the fresh selection is still
-     external and `reserve` publishes a fresh nonce for the missing root before
-     the slot key): two starters paused after slot keying (their captured
-     destination keys compared before release) share one reserved nonce; both
-     bind it and the recreated root carries it. The reservation is read from
-     the receipt's ROOT-LEVEL `reserved` field. A NON-RESERVING control is kept
-     inside the same case: with the registered volume made unusable the fresh
-     selection is local against committed external members, which is binding's
-     P4 precondition, so the command publishes no reservation, changes no
-     receipt byte and the prune preview keeps the root.
+  04 shared reservation: an ELIGIBLE reservation path (oxide#152): the
+     registered drive is unusable, so this checkout adopts and builds LOCAL
+     owned placements whose member destinations exist (live owned links); with
+     the drive restored the fresh selection is a DIFFERENT external root that
+     does not exist yet, and `reserve` publishes exactly one future-root nonce
+     with one pending registry row before the slot key. Two starters paused
+     after slot keying (their captured destination keys compared before
+     release) share that one nonce; both bind it, the redocked root carries it,
+     and the replaced local root is preserved. Negative control kept inside the
+     same case: a committed external root deleted under its live member links is
+     DANGLING, so the command refuses "not available now; nothing was built",
+     no root comes back and only the explicit `oxide outputs adopt` the refusal
+     names recovers it. A NON-RESERVING control is kept too: with the registered
+     volume made unusable the fresh selection is local against committed
+     external members, which is binding's P4 precondition, so the command
+     publishes no reservation, changes no receipt byte and the prune preview
+     keeps the root. The reservation is read from the receipt's ROOT-LEVEL
+     `reserved` field.
   05 cancel + stale starter: on the same eligible path, a starter paused after
      keying has its real reservation cancelled by `outputs cancel-reservation`;
-     the starter refuses before Cargo with "cancelled or replaced"; the root is
-     never created; the row is gone.
+     released with no surviving reservation it refuses inside binding with
+     "cancelled or replaced" before any root, receipt, registry or Cargo effect
+     (the keyed future-root nonce contract of oxide#152); the root is never
+     created, the row is gone, and the receipt and registry bytes are unchanged.
   06 dry run: canonical preview bytes on stdout match the SHA-256 on stderr,
      schema prune-preview/1, control bytes unchanged.
   07 malformed receipt: one corrupt receipt keeps the whole batch.
@@ -195,8 +203,9 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
      asserting a false pass.
   22 overflow: a sticky-incomplete registry keeps every root and a new
      reservation carries an overflow tag naming the registry; the starter binds
-     it with no invented row, on the same eligible path (a committed external
-     root whose leaf is gone). Run last: the flag is never cleared.
+     it with no invented row, on the same eligible path (a committed local
+     placement and a DIFFERENT external future root). Run last: the flag is
+     never cleared.
 
 Dependency matrix (id, declared dependencies, taints fixture state on failure):
 
@@ -320,6 +329,10 @@ SUPERVISOR = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 22
+# The registered drive's recorded UUID is made unusable (a UUID no volume can
+# match) to select the checkout-LOCAL fallback deliberately, then restored. It
+# is a fixture premise only: no host drive, registration or setting is changed.
+DEAD_UUID = "00000000-0000-0000-0000-000000000000"
 
 ALLOCATION = [
     ("staging (constrained debug oxide)", 288),
@@ -1136,6 +1149,32 @@ def current_reservation(receipt: dict) -> dict | None:
     return receipt.get("reserved")
 
 
+def committed_selected_roots(receipt: dict) -> set:
+    """Every root this receipt's placements currently select."""
+    return {
+        link["selected"]["root"]
+        for link in receipt.get("links") or []
+        if link.get("selected")
+    }
+
+
+def reservation_names_a_new_root(receipt: dict, reserved: dict) -> bool:
+    """The eligible future-root reservation (oxide#152).
+
+    It must be EXTERNAL (the healthy registered volume) and name a root path no
+    committed placement of this receipt selects. That is the only shape whose
+    publication adds a fresh pending registry row: a reservation for the
+    committed root's own path reuses that selected row, so
+    `validate_reservation` refuses the new nonce and a second starter
+    re-reserves (prune.rs `note_reservation`/`validate_reservation`). This
+    proof's eligible cases therefore build a committed LOCAL placement first and
+    let the drive return, which selects a DIFFERENT external root."""
+    return (
+        reserved.get("kind") == "external"
+        and reserved.get("root") not in committed_selected_roots(receipt)
+    )
+
+
 class FixtureEffects:
     """The filesystem effects the fixture's private output container needs, so
     the pure selector can drive this real seam with in-memory stubs."""
@@ -1243,6 +1282,37 @@ class World:
         code, _, stderr = self.oxide(["outputs", "adopt"], f"adopt {os.path.basename(checkout)}", checkout)
         expect(code == 0, f"adopt failed: {stderr}")
         return self.receipt(checkout)
+
+    def local_adopt(self, checkout: str) -> dict:
+        """Adopt and build this checkout while the registered drive is unusable.
+
+        Its committed profile placements are then LOCAL owned roots under
+        `<checkout>/.oxide-outputs/target` (outputs.rs `local_spec`), and the
+        real local build creates their member destinations, so every member
+        link is a live `OwnedLink`. Restoring the drive is the eligible
+        local→external redock: the next fresh selection is a DIFFERENT external
+        root that does not exist yet, which is the only future-root shape a
+        validated reservation can name (outputs.rs `reserve`,
+        `note_reservation`, `validate_reservation`, `transition_at`)."""
+        recorded = permanent.real_uuid(self.pool)
+        permanent.set_recorded_uuid(self.pool, DEAD_UUID)
+        try:
+            receipt = self.adopt(checkout)
+            code, _, stderr = self.oxide(
+                ["check"], f"local fallback build ({os.path.basename(checkout)})", checkout
+            )
+            expect(code == 0, f"the local fallback build failed: {stderr}")
+        finally:
+            permanent.set_recorded_uuid(self.pool, recorded)
+        links = receipt.get("links") or []
+        expect(bool(links), f"{checkout} adopted no profile placement: {receipt}")
+        for link in links:
+            selected = link.get("selected") or {}
+            expect(
+                selected.get("kind") == "local",
+                f"a committed placement is not local: {selected}",
+            )
+        return receipt
 
     def receipt(self, checkout: str) -> dict:
         # A receipt outcome that cannot be read or parsed is never an oracle
@@ -1742,25 +1812,49 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         )
 
     with case("04") as scope, scope.run():
-        # ELIGIBLE reservation path (source-anchored): a committed profile
-        # receipt whose placed members are external on the healthy registered
-        # volume, with the root leaf gone so the fresh selection is still
-        # EXTERNAL but its root does not exist. `reserve` publishes a fresh
-        # root nonce for exactly that missing root before the slot key
-        # (outputs.rs:4842-4905; `refuses_committed_external` is false because
-        # wanted.kind is External, and `read_marker(wanted.root)` fails).
-        world.adopt(beta)
-        beta_root = world.selected(beta)["root"]
-        shutil.rmtree(beta_root)
-        expect(not os.path.lexists(beta_root), "the recreated root is still present")
+        # ELIGIBLE reservation path (source-anchored, oxide#152): the drive is
+        # unusable, so this checkout's committed placements are LOCAL owned
+        # roots under `<checkout>/.oxide-outputs/target` whose member
+        # destinations a real local build creates (live `OwnedLink` states).
+        # Restoring the drive makes the fresh selection a DIFFERENT external
+        # root that does not exist yet: `reserve` publishes one future-root
+        # nonce for it before the slot key (outputs.rs `reserve`), and
+        # `note_reservation` adds exactly one pending row because no committed
+        # row names that new path. A recreated root at the COMMITTED path is
+        # NOT eligible: its selected row keeps its old nonce, so
+        # `validate_reservation` refuses the new one, and a deleted root leaves
+        # a dangling member link the product never transitions automatically
+        # (kept below as this case's negative control).
+        receipt = world.local_adopt(beta)
+        local_root = receipt["links"][0]["selected"]["root"]
+        expect(
+            os.path.realpath(local_root).startswith(os.path.realpath(beta) + os.sep),
+            f"the committed local root {local_root} is not inside the checkout",
+        )
+        expect(marker(local_root)["nonce"], "the committed local root has no marker nonce")
+        expect(
+            os.path.isdir(os.path.join(local_root, "debug")),
+            "the local build created no owned debug destination",
+        )
         with Starters("case 04") as starters:
             first, first_gate = starters.pause(world, beta, "keyed", "starter one")
             second, second_gate = starters.pause(world, beta, "keyed", "starter two")
             reserved = current_reservation(world.receipt(beta))
             expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
             expect(
-                reserved["kind"] == "external" and reserved["root"] == beta_root,
-                f"the reservation names {reserved.get('kind')} {reserved.get('root')}, not the recreated external root",
+                reservation_names_a_new_root(world.receipt(beta), reserved),
+                f"the reservation {reserved} does not name a fresh external root",
+            )
+            rows = [
+                row
+                for row in world.registry_doc()["rows"]
+                if row.get("reservation") == reserved["id"]
+            ]
+            expect(
+                len(rows) == 1
+                and rows[0]["nonce"] == reserved["nonce"]
+                and rows[0]["root"] == reserved["root"],
+                f"the one future root has {len(rows)} reservation row(s): {rows}",
             )
             # Both starters keyed the same reserved nonce, before either proceeds.
             first_key, second_key = keyed_destination(first_gate), keyed_destination(second_gate)
@@ -1770,17 +1864,65 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
             for child, label in ((first, "starter one"), (second, "starter two")):
                 code, _, stderr = starters.finish(world, child, label)
                 expect(code == 0, f"{label} failed: {stderr}")
+        beta_root = reserved["root"]
         expect(
             marker(beta_root)["nonce"] == reserved["nonce"],
-            "the recreated root does not carry the reserved nonce",
+            "the redocked root does not carry the reserved nonce",
         )
         expect(current_reservation(world.receipt(beta)) is None, "the reservation was not consumed")
+        redocked = world.selected(beta)
+        expect(
+            redocked["root"] == beta_root and redocked["kind"] == "external",
+            f"the checkout still selects {redocked}",
+        )
+        expect(
+            permanent.link_target(os.path.join(beta, "target", "debug"))
+            == os.path.join(beta_root, "debug"),
+            "the owned member link does not select the redocked root",
+        )
+        expect(
+            marker(local_root)["nonce"] and os.path.isdir(os.path.join(local_root, "debug")),
+            "the replaced local root was not preserved",
+        )
+        # NEGATIVE control (retained, not removed or relabelled): a committed
+        # external root deleted under its live member links is a DANGLING
+        # member destination. The product never transitions it automatically,
+        # so the command refuses "not available now; nothing was built" and the
+        # root does not come back; the explicit `oxide outputs adopt` the
+        # refusal names is the sanctioned recovery, and it consumes the
+        # reservation the refused command had published.
+        links_before = {
+            name: permanent.link_target(os.path.join(beta, "target", name))
+            for name in ("debug", "release")
+        }
+        shutil.rmtree(beta_root)
+        expect(not os.path.lexists(beta_root), "the deleted root is still present")
+        code, _, stderr = world.oxide(["check"], "dangling member link", beta)
+        expect(code != 0, f"a dangling member link built (exit {code}): {stderr}")
+        expect(
+            "not available now" in stderr and "nothing was built" in stderr,
+            f"the dangling refusal did not name its premise: {stderr}",
+        )
+        expect(not os.path.lexists(beta_root), "a dangling member link recreated the root")
+        expect(
+            {
+                name: permanent.link_target(os.path.join(beta, "target", name))
+                for name in ("debug", "release")
+            }
+            == links_before,
+            "a dangling member link moved an owned link",
+        )
+        recovered = world.adopt(beta)
+        beta_root = recovered["links"][0]["selected"]["root"]
+        expect(marker(beta_root)["nonce"], "the explicit recovery created no owned root")
+        expect(current_reservation(world.receipt(beta)) is None, "the recovery kept a reservation")
         # NON-RESERVING control, retained from the old premise as an added
         # assertion (not a removal or a relabelled case): a fresh selection
         # that is not external against a committed external profile member is
         # exactly binding's P4 precondition, so the command changes no
         # authority at all (oxide#133 case14) and prune keeps the root.
-        permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+        recorded = permanent.real_uuid(world.pool)
+        permanent.set_recorded_uuid(world.pool, DEAD_UUID)
         try:
             settled = permanent.read_bytes(permanent.receipt_path(world.pool, beta))
             with Starters("case 04 control") as control:
@@ -1798,23 +1940,31 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
                 expect(code != 0, f"the refused local-fallback starter exited {code}: {stderr}")
             _, _, preview = world.plan_file("non-reserving control dry run", alpha)
             reason = world.kept(preview, beta_root)
-            expect("present" in reason, f"the non-reserving control root was not kept: {reason}")
+            expect(reason, f"the non-reserving control root is neither kept nor explained: {reason}")
+            expect(
+                beta_root not in world.candidates(preview),
+                "the non-reserving control root became a candidate",
+            )
         finally:
-            permanent.set_recorded_uuid(world.pool, good)
+            permanent.set_recorded_uuid(world.pool, recorded)
 
     with case("05") as scope, scope.run():
         gamma = world.checkout("gamma")
-        world.adopt(gamma)
-        gamma_root = world.selected(gamma)["root"]
-        shutil.rmtree(gamma_root)
+        receipt = world.local_adopt(gamma)
+        gamma_local = receipt["links"][0]["selected"]["root"]
         with Starters("case 05") as starters:
             stale, stale_gate = starters.pause(world, gamma, "keyed", "stale starter")
             reserved = current_reservation(world.receipt(gamma))
             expect(reserved is not None, f"no reservation: {reserved}")
             expect(
+                reservation_names_a_new_root(world.receipt(gamma), reserved),
+                f"the reservation {reserved} does not name a fresh external root",
+            )
+            expect(
                 reserved["nonce"] in keyed_destination(stale_gate),
                 "the stale starter did not key the reserved nonce",
             )
+            expect(not os.path.lexists(reserved["root"]), "the future root exists before binding")
             code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
             expect(code == 0 and "cancelled" in stdout, stdout + stderr)
             expect(current_reservation(world.receipt(gamma)) is None, "the receipt kept the reservation")
@@ -1822,10 +1972,33 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
                 not any(row.get("reservation") == reserved["id"] or row.get("cancelling") for row in world.registry_doc()["rows"]),
                 "the cancelled reservation's row remains",
             )
+            # A keyed future-root slot binds only the exact surviving
+            # reservation it was keyed with (oxide#152): released with none, the
+            # stale starter refuses inside binding, before any root, receipt,
+            # registry or Cargo effect. The receipt and registry bytes are taken
+            # after the cancellation and must be identical afterwards.
+            receipt_settled = permanent.read_bytes(permanent.receipt_path(world.pool, gamma))
+            registry_settled = permanent.read_bytes(world.registry)
             release(stale_gate)
             code, _, stderr = starters.finish(world, stale, "stale starter")
             expect(code != 0 and "cancelled or replaced" in stderr, f"stale starter exit {code}: {stderr}")
-        expect(not os.path.lexists(reserved["root"]), "the cancelled root was created")
+            expect("nothing was built" in stderr, f"the stale refusal did not name its zero effect: {stderr}")
+            expect(
+                not os.path.lexists(reserved["root"]),
+                "a cancelled reservation's stale starter created the future root",
+            )
+            expect(
+                permanent.read_bytes(permanent.receipt_path(world.pool, gamma)) == receipt_settled,
+                "a cancelled reservation's stale starter rewrote the receipt",
+            )
+            expect(
+                permanent.read_bytes(world.registry) == registry_settled,
+                "a cancelled reservation's stale starter rewrote the registry",
+            )
+            expect(
+                marker(gamma_local)["nonce"] and os.path.isdir(os.path.join(gamma_local, "debug")),
+                "the stale starter touched the committed local root",
+            )
         proof.phase("after reservation cases")
 
     # ---- registry / snapshot ----------------------------------------------
@@ -2261,6 +2434,12 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
 
     # ---- overflow (last: the sticky flag is never cleared) -----------------
     with case("22") as scope, scope.run():
+        # The local→external redock shape first, on the complete registry the
+        # adoption path was proven with; the sticky-incomplete registry is
+        # planted only for the reservation below.
+        tau = world.checkout("tau")
+        receipt = world.local_adopt(tau)
+        tau_local = receipt["links"][0]["selected"]["root"]
         doc = world.registry_doc()
         doc["complete"] = False
         doc["incomplete"] = {"reason": "proof overflow", "since_ms": 1, "transaction": doc["created_by"]}
@@ -2272,19 +2451,20 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         expect(code in (0, 2), f"overflow dry run exited {code}")
         if code == 0:
             expect(not json.loads(stdout)["candidates"], "an overflow registry yielded candidates")
-        tau = world.checkout("tau")
-        world.adopt(tau)
-        tau_root = world.selected(tau)["root"]
-        # The same eligible reservation path as case 04: the committed external
-        # root's leaf is gone, so the fresh selection is external and its root
-        # does not exist; with a sticky-incomplete registry the publication must
-        # carry the overflow tag and invent no row.
-        shutil.rmtree(tau_root)
+        # The same eligible reservation path as case 04: the committed local
+        # placement makes the returned drive's fresh selection a DIFFERENT
+        # external root that does not exist yet, so with a sticky-incomplete
+        # registry the publication must carry the overflow tag and invent no
+        # row.
         with Starters("case 22") as starters:
             starter, gate = starters.pause(world, tau, "keyed", "overflow starter")
             reserved = current_reservation(world.receipt(tau))
             expect(reserved is not None, f"no reservation: {reserved}")
             expect(reserved.get("overflow", {}).get("registry") == doc["created_by"], reserved)
+            expect(
+                reservation_names_a_new_root(world.receipt(tau), reserved),
+                f"the reservation {reserved} does not name a fresh external root",
+            )
             expect(
                 all(row["root"] != reserved["root"] for row in world.registry_doc()["rows"]),
                 "an overflow row was invented",
@@ -2292,6 +2472,14 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
             release(gate)
             code, _, stderr = starters.finish(world, starter, "overflow starter")
             expect(code == 0, f"overflow starter failed: {stderr}")
+        expect(
+            marker(reserved["root"])["nonce"] == reserved["nonce"],
+            "the overflow root does not carry the reserved nonce",
+        )
+        expect(
+            marker(tau_local)["nonce"],
+            "the overflow redock did not preserve the committed local root",
+        )
     finish_cases()
 
     # The image's ONE ordinary-detach disposition runs in main()'s finally, so
@@ -3279,6 +3467,56 @@ def self_test() -> int:
         assert "world.paused(" not in case_source, case_source
 
     check("keyed starter custody", starters)
+
+    def eligible_reservation_premises() -> None:
+        # oxide#152: the eligible cases need the product's real local→external
+        # redock shape (a committed LOCAL placement with live member
+        # destinations, then a DIFFERENT external future root). A deleted
+        # committed root is a dangling member link and stays a negative control
+        # only. Pure: this reads the proof's own source and the receipt shape
+        # predicates the cases use; it starts no child and touches no pool,
+        # image or product state.
+        body = inspect.getsource(run)
+
+        def case_block(case_id: str) -> str:
+            return body.split(f'with case("{case_id}")', 1)[1].split('with case("', 1)[0]
+
+        local = {"links": [{"selected": {"kind": "local", "root": "/c/.oxide-outputs/target"}}]}
+        assert not reservation_names_a_new_root(
+            local, {"kind": "local", "root": "/c/.oxide-outputs/target"}
+        ), "a local reservation passed as a future external root"
+        assert not reservation_names_a_new_root(
+            local, {"kind": "external", "root": "/c/.oxide-outputs/target"}
+        ), "a reservation at the committed path passed as a new root"
+        assert reservation_names_a_new_root(
+            local, {"kind": "external", "root": "/Volumes/x/oxide-outputs/leaf"}
+        ), "a fresh external root was rejected"
+        # The ineligible shape diagnostic 6 hit: the committed root's own path.
+        external = {
+            "links": [{"selected": {"kind": "external", "root": "/Volumes/x/oxide-outputs/leaf"}}]
+        }
+        assert not reservation_names_a_new_root(
+            external, {"kind": "external", "root": "/Volumes/x/oxide-outputs/leaf"}
+        ), "a reservation for the committed external row passed as a new root"
+
+        for case_id, checkout in (("04", "beta"), ("05", "gamma"), ("22", "tau")):
+            block = case_block(case_id)
+            adopt_at = block.index(f"world.local_adopt({checkout})")
+            starters_at = block.index("with Starters(")
+            assert adopt_at < starters_at, f"case {case_id} reserves before its local adoption"
+            if case_id == "04":
+                assert block.index("shutil.rmtree(") > starters_at, (
+                    "case 04 deletes a committed root before its reserved starters"
+                )
+                assert "not available now" in block and "world.adopt(beta)" in block, block
+            else:
+                assert "shutil.rmtree(" not in block, f"case {case_id} still deletes a committed root"
+        helper = inspect.getsource(World.local_adopt)
+        assert helper.count("permanent.set_recorded_uuid(self.pool") == 2, helper
+        assert "finally:" in helper, helper
+        assert "DEAD_UUID" in helper
+
+    check("eligible reservation premises", eligible_reservation_premises)
 
     def counted_fail_fast() -> None:
         ran: list[str] = []

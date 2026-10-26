@@ -4355,8 +4355,13 @@ author and reviewer native remain unactivated.
   real member never share a warm slot; legacy whole-target keys stay exactly
   `outputs-2`. Adding a member to a root preserves the root's nonce; a
   reservation is root-level and may not be cancelled while another member's
-  consumer owns it. A command whose slot was keyed before the layout changed
-  refuses before Cargo without an automatic retry.
+  consumer owns it. A slot KEYED for a future root binds only the exact
+  uncancelled reservation it named (receipt, keyed nonce and registry row): a
+  cancelled, replaced or absent one refuses inside binding before the prepared
+  receipt, the root, the link or any registry write, and only an explicit
+  adoption with no keyed slot may draw a fresh nonce (oxide#152). A command
+  whose slot was keyed before the layout changed refuses before Cargo without an
+  automatic retry.
 - **Explicit profile adoption.** `oxide outputs adopt` on a checkout with no
   receipt selects the profile layout: it creates the real `target`, links the
   host `debug`/`release` pair (and every member the receipt already places)
