@@ -398,7 +398,11 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # a case COMPLETED (case 24 has no finally), the ordinary detach needs a clean
 # collection with no unclosed child, and the failure-cleanup path applies the same
 # gate (it records the retention instead of detaching), so none of them touches
-# custody while it is unconfirmed. Its bounded
+# custody while it is unconfirmed. The COUNTED run latches the same abort when a
+# custody fault escapes its collector (a setup abort or a final detach that
+# failed, timed out or ended by a signal), so the counted failure cleanup never
+# detaches twice and the receipt's disposition matches the cleanup actually made.
+# Its bounded
 # `qualified: false` receipt is written in every
 # outcome, and a skipped or unexecuted case is never a pass. Each run needs its
 # own owner activation, and only a counted run at the exact merge head can
@@ -407,7 +411,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # `proof:exec-inference:test` is the pure apparatus check of that collection:
 # the real case table, collector and receipt builder with fake bodies and seams,
 # including the runtime binding of every case body (a case calling a helper that
-# does not exist fails here) and the failure-cleanup retention gate.
+# does not exist fails here) and the failure-cleanup retention gate in both modes,
+# with a counted signalled-detach counterfactual (no second detach).
 # It stages nothing, starts no child and touches no scratch, image, pool or
 # supervisor, so a dispatch, dependency-skip, keep-going, abort-latch or receipt
 # regression costs no native activation.

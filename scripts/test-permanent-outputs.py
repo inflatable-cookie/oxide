@@ -2789,6 +2789,52 @@ def detach_decision(collection: "Collection", unclosed) -> str | None:
     return None
 
 
+def uncertain_outcome(failure: BaseException) -> bool:
+    """Whether a fault that escaped the collector leaves custody unknown, so
+    BOTH modes latch it as the collection's abort (oxide#164 review).
+
+    A recoverable case-oracle failure is the ordinary `RuntimeError` an `expect`
+    raises; custody is unaffected, so the counted run keeps its shipped cleanup.
+    A `ProofAbort` (unknown outcome, lost resource or custody, a failed resource
+    checkpoint, an abnormal child exit) and every non-`RuntimeError` fault (an
+    interrupt, a signalled helper, an unexpected exception) leave the image, its
+    device or its writers in an unknown state: nothing may operate on them again.
+    """
+    if isinstance(failure, ProofAbort):
+        return True
+    return not isinstance(failure, RuntimeError)
+
+
+def run_ordinary_detach(proof: Proof, collection: "Collection") -> None:
+    """Make this run's ONE ordinary detach and latch its failure in either mode.
+
+    A detach that failed, timed out or ended by a signal (for example `hdiutil`
+    killed with an empty direct-child census) leaves the device in an unknown
+    state. A second detach must never be attempted, so the fault both latches the
+    collection — which the failure cleanup's retention gate reads — and
+    propagates unchanged.
+    """
+    try:
+        proof.detach()
+    except BaseException as fault:
+        collection.aborted = f"the ordinary detach could not be confirmed: {fault!r}"[:600]
+        raise
+
+
+def detach_disposition(collection: "Collection", unclosed) -> str:
+    """The disposition to record when a run ends before its own detach decision.
+
+    It reads the SAME gate the clean tail and the failure cleanup use, so the
+    receipt never claims a resource state the cleanup contradicts: a retained
+    image is named as retained, and a clean run that failed before its decision
+    says so instead of implying nothing was attempted.
+    """
+    refusal = detach_decision(collection, unclosed)
+    if refusal is not None:
+        return f"retained: {refusal}"
+    return "not reached: the run failed before its own detach decision"
+
+
 def require_case_custody(*, unclosed, mount: str, registration: str, case: str) -> None:
     """The shared post-case custody check of a keep-going collection.
 
@@ -3023,6 +3069,11 @@ def finish_diagnostic(proof: Proof, collection: Collection, failure, writer=None
 def write_diagnostic(proof: Proof, collection: Collection) -> str:
     """Write the bounded receipt of one keep-going collection, in every outcome,
     including an abort or a setup failure before the first case ran."""
+    if collection.detached.startswith("not attempted"):
+        # The run ended before its own detach decision (a setup failure, an
+        # abort, an interrupt): record what the retention gate says the failure
+        # cleanup will do, so the receipt and the actual resource state agree.
+        collection.detached = detach_disposition(collection, proof.unclosed)
     document = diagnostic_document(
         source=collection.source,
         rows=exec_case_rows(collection.outcomes),
@@ -3870,6 +3921,137 @@ def exec_self_test() -> None:
         f"a clean failure cleanup recorded a retention: {clean_record.detached}",
     )
     shutil.rmtree(clean_cleanup.root, ignore_errors=True)
+
+    # 7g. The COUNTED run's failure cleanup (oxide#164 review). A fault that
+    #     escapes the collector latches the collection as an abort whenever
+    #     custody is uncertain — in either mode — so `cleanup_after_failure`
+    #     must refuse its detach instead of retrying one whose device outcome is
+    #     unknown. A recoverable counted oracle failure keeps the shipped cleanup.
+    expect(uncertain_outcome(ProofAbort("abnormal child exit")), "a counted abort was classed recoverable")
+    expect(uncertain_outcome(KeyboardInterrupt()), "an interrupt was classed recoverable")
+    expect(uncertain_outcome(OSError(5, "detach failed")), "an OSError was classed recoverable")
+    expect(
+        not uncertain_outcome(RuntimeError("an oracle")),
+        "a counted oracle failure was treated as unknown custody",
+    )
+
+    # A counted run whose ORDINARY DETACH ends by signal (hdiutil killed, empty
+    # direct-child census) latches the abort and never detaches again: the
+    # counterfactual is the same cleanup on a clean collection, which does.
+    class SignalDetachProof:
+        def __init__(self) -> None:
+            self.root = tempfile.mkdtemp(prefix="oxide-detach-check.")
+            self.mount = "/"
+            self.unclosed: set = set()
+            self.attempts: list[str] = []
+
+        def detach(self) -> None:
+            self.attempts.append(self.mount)
+            if len(self.attempts) == 1:
+                raise ProofAbort("hdiutil ended by signal 9, so the device outcome is unknown")
+
+    signalled = SignalDetachProof()
+    counted = Collection()
+    try:
+        run_ordinary_detach(signalled, counted)
+        raise AssertionError("a signalled detach did not propagate")
+    except ProofAbort as fault:
+        expect("signal 9" in str(fault), f"{fault}")
+    expect(
+        counted.aborted is not None and "could not be confirmed" in counted.aborted,
+        f"the counted detach abort was not latched: {counted.aborted}",
+    )
+    expect(signalled.unclosed == set(), "the counterfactual did not use an empty child census")
+    message = cleanup_after_failure(signalled, counted)
+    expect(
+        signalled.attempts == ["/"],
+        f"the failure cleanup made a SECOND detach after a signalled one: {signalled.attempts}",
+    )
+    expect("retained" in message, f"{message}")
+    expect(
+        counted.detached.startswith("retained:"),
+        f"the receipt disposition does not match the retention: {counted.detached}",
+    )
+    shutil.rmtree(signalled.root, ignore_errors=True)
+
+    # The same wrapper propagates a classifiable nonzero detach and latches it,
+    # so a second attempt is never made for that case either.
+    class FailingDetachProof(SignalDetachProof):
+        def detach(self) -> None:
+            self.attempts.append(self.mount)
+            raise RuntimeError("hdiutil detach exited 1")
+
+    failing = FailingDetachProof()
+    counted_failing = Collection()
+    try:
+        run_ordinary_detach(failing, counted_failing)
+        raise AssertionError("a failing detach did not propagate")
+    except RuntimeError as fault:
+        expect("exited 1" in str(fault), f"{fault}")
+    expect(
+        counted_failing.aborted is not None,
+        "a classifiable failing detach was not latched",
+    )
+    cleanup_after_failure(failing, counted_failing)
+    expect(failing.attempts == ["/"], f"a second detach was attempted: {failing.attempts}")
+    shutil.rmtree(failing.root, ignore_errors=True)
+
+    # A clean counted run still detaches once through the wrapper.
+    class CleanDetachProof(SignalDetachProof):
+        def detach(self) -> None:
+            self.attempts.append(self.mount)
+
+    clean_detach = CleanDetachProof()
+    clean_collection = Collection()
+    run_ordinary_detach(clean_detach, clean_collection)
+    expect(
+        clean_detach.attempts == ["/"] and clean_collection.aborted is None,
+        f"a clean counted detach changed: {clean_detach.attempts} {clean_collection.aborted}",
+    )
+    shutil.rmtree(clean_detach.root, ignore_errors=True)
+
+    # A counted SETUP abort now latches, so its failure cleanup retains the
+    # image; the diagnostic reports the matching disposition.
+    held_counted = Collection()
+    setup_fault = ProofAbort("staging failed before the first case")
+    if uncertain_outcome(setup_fault):
+        held_counted.aborted = f"before the first case: {setup_fault!r}"
+    expect(
+        detach_decision(held_counted, set()) == "the collection aborted",
+        "a counted setup abort did not refuse the detach",
+    )
+    expect(
+        detach_disposition(held_counted, set()) == "retained: the collection aborted",
+        f"{detach_disposition(held_counted, set())}",
+    )
+    # A clean collection that failed before its own decision says exactly that.
+    expect(
+        detach_disposition(Collection(), set())
+        == "not reached: the run failed before its own detach decision",
+        f"{detach_disposition(Collection(), set())}",
+    )
+    # The receipt written after such a failure carries the gate's disposition,
+    # never the placeholder that implies nothing was attempted.
+    pending = Collection()
+    pending.aborted = "before the first case: staging failed"
+    pending.detached = detach_disposition(pending, set())
+    document = diagnostic_document(
+        source="source",
+        rows=exec_case_rows({}),
+        failures=[],
+        aborted=pending.aborted,
+        detached=pending.detached,
+        mount_present=None,
+        reattach=None,
+        elapsed_s=1.0,
+        peak_owned_mib=1,
+        host_free_min_mib=2,
+        unclosed=[],
+    )
+    expect(
+        document["observations"]["detach"].startswith("retained: the collection aborted"),
+        f"{document['observations']}",
+    )
 
     # 9. The receipt document itself: `qualified: false`, counted outcomes,
     #    a skipped case never counted as completed, and the limitation stated.
@@ -5552,7 +5734,9 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     # which makes that same single attempt and keeps the evidence.
     refusal = detach_decision(collection, proof.unclosed)
     if refusal is None:
-        proof.detach()
+        # A failed, timed-out or signalled detach latches the collection in
+        # EITHER mode, so the failure cleanup can never detach a second time.
+        run_ordinary_detach(proof, collection)
         expect(
             not os.path.ismount(mount),
             f"the owned image is still mounted at {mount} after its ordinary detach",
@@ -5590,11 +5774,13 @@ def exec_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
         exec_inference(proof, repo, diagnostic, collection)
     except BaseException as error:
         failure = error
-        if diagnostic and collection.aborted is None:
+        if collection.aborted is None and (diagnostic or uncertain_outcome(error)):
             # The collection latches its own abort and records its own failures;
             # anything that escaped it (an interrupt, staging, the image, the
             # drive registration, the detach check) is named here, so the
-            # receipt never implies a clean run.
+            # receipt never implies a clean run — and, in EITHER mode, so the
+            # failure cleanup cannot re-detach or re-operate an image whose
+            # device or writer outcome is unknown.
             where = (
                 "after the last recorded case"
                 if collection.outcomes
@@ -6104,9 +6290,20 @@ def cleanup_after_failure(proof: Proof, collection: "Collection | None" = None) 
     try:
         proof.detach()
     except BaseException as error:
+        if collection is not None:
+            collection.detached = (
+                f"unknown: failure cleanup could not confirm the detach of {mount} ({error!r})"
+            )
         return f"detach of {mount} (image {image}) not completed: {error!r}"
     if os.path.ismount(mount):
+        if collection is not None:
+            collection.detached = (
+                f"unknown: failure cleanup returned but {mount} is still mounted"
+            )
         return f"detach of {mount} (image {image}) returned but the mount is still present"
+    if collection is not None:
+        collection.detached = "ordinary detach during failure cleanup; mount absent"
+        collection.mount_present = os.path.lexists(mount)
     return f"ordinary detach of {mount} (image {image}) confirmed; mount no longer present"
 
 
@@ -6130,8 +6327,9 @@ def main() -> int:
         exec_self_test()
         print(
             "exec-inference apparatus self-test passed: case outcomes, dependency "
-            "skips, keep-going, abort latching and the receipt document "
-            "(no scratch, child, toolchain or image)"
+            "skips, keep-going, abort latching, the receipt document, the runtime "
+            "binding of every case body and the counted/diagnostic cleanup "
+            "retention gates (no scratch, child, toolchain or image)"
         )
         return 0
     if sys.platform != "darwin":
