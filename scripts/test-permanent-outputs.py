@@ -3380,7 +3380,10 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
             ("does not ignore",),
             empty=True,
         )
-        expect("`/target`" in stderr, f"the refusal did not name the covering rule: {stderr}")
+        expect(
+            "`/target/debug`" in stderr,
+            f"the refusal did not name the exact ignored member path: {stderr}",
+        )
 
     def negated() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-negated", "target\n!/target\n/.oxide-outputs/\n")
