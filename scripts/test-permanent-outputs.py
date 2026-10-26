@@ -3204,17 +3204,29 @@ def guard_work_left() -> float:
 
 
 def track_member(proof: Proof, checkout: str, member: str = "debug") -> None:
-    """Track `target/<member>` in the index while the working tree has neither
-    the file nor the `target` directory."""
+    """Track `target/<member>` in the index while the working tree holds no such
+    file.
+
+    The `target` directory may be absent (the ineligible-build fixture) or a
+    real empty directory the explicit-adopt refusal fixture created on purpose
+    (`ignore_fixture(..., empty=True)`). This creates the directory only when it
+    is absent and leaves a pre-existing one exactly as it is, so both callers'
+    target oracles stay unchanged; a non-directory path still raises the
+    ordinary error. Only the member file is staged and then removed."""
     target = os.path.join(checkout, "target")
-    os.makedirs(target)
+    created = False
+    if not os.path.isdir(target):
+        # A file, link or other non-directory path keeps raising here.
+        os.makedirs(target)
+        created = True
     path = os.path.join(target, member)
     with open(path, "wb") as handle:
         handle.write(b"tracked")
     added = proof.run(["git", "add", "-f", os.path.join("target", member)], cwd=checkout, timeout=30)
     expect(added.returncode == 0, f"git add failed: {added.stderr!r}")
     os.remove(path)
-    os.rmdir(target)
+    if created:
+        os.rmdir(target)
 
 
 def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
