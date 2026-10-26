@@ -49,9 +49,11 @@ records a bounded `qualified: false` receipt of reached, completed and failed
 cases and stops on any outcome it cannot classify. `--self-check` is the pure
 apparatus check run before any activation: no child, pool, image or device.
 It pins the full fixture environment every boot-closure child (`status`
-included) receives, the diagnostic receipt's bounded unqualified `json`
-document, the argument dispatch and the product deletion line the candidate
-marker quotes.
+included) receives, the deletion oracle's slot-leaf resolution (the slot's
+own `<profile>-<id>` leaf, never the project-label folder a build or an
+`outputs adopt` also creates or reuses), the diagnostic receipt's bounded
+unqualified `json` document, the argument dispatch and the product deletion
+line the candidate marker quotes.
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import glob
 import hashlib
 import importlib.util
 import json
@@ -516,6 +519,39 @@ def read_json(path: str) -> dict:
         return json.load(handle)
 
 
+def slot_leaf_directory(slots: str, slot: str) -> str:
+    """The slot's own directory, `slots/<project folder>/<profile>-<id>`
+    (`split_slot_dir` in `src/lease/pool.rs`), resolved by the product's
+    recorded slot id across the whole slots tree. `slots/<folder>` is only
+    the project label a build, an adopt or a relink also creates or reuses,
+    so it is never what a lost-slot oracle names."""
+    leaves = sorted(glob.glob(os.path.join(glob.escape(slots), "*", f"*-{slot}")))
+    need(len(leaves) == 1, f"slot {slot} has {len(leaves)} slot leaves under {slots}: {leaves}")
+    leaf = leaves[0]
+    need(
+        os.path.dirname(os.path.dirname(leaf)) == slots,
+        f"slot {slot} leaf {leaf} is not one level below a project folder in {slots}",
+    )
+    return leaf
+
+
+def deletion_oracle_leaf(slots: str, slot: str, folder: str) -> str:
+    """The exact path a lost-slot deletion oracle names: the slot's own leaf,
+    required to sit in the project folder just discovered and to be distinct
+    from it. Every fact is re-derived from the recorded id alone, so no
+    build output or project directory can satisfy or fail the oracle."""
+    leaf = slot_leaf_directory(slots, slot)
+    need(
+        os.path.dirname(leaf) == folder,
+        f"slot {slot} leaf {leaf} is not in the project folder {folder}",
+    )
+    need(
+        os.path.realpath(leaf) != os.path.realpath(folder),
+        f"slot {slot} resolved to the project-label directory {folder}",
+    )
+    return leaf
+
+
 def write_tool(path: str) -> str:
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(HOLD_TOOL)
@@ -681,20 +717,36 @@ class BootClosure:
         after = set(os.listdir(self.slots))
         new = sorted(after - before)
         need(len(new) == 1, f"{case}: {len(new)} new slot directories appeared: {new}")
-        directory = os.path.join(self.slots, new[0])
-        need(os.path.isdir(directory), f"{case}: {directory} is not a new slot directory")
+        folder = os.path.join(self.slots, new[0])
+        need(os.path.isdir(folder), f"{case}: {folder} is not a new project folder")
+        # `slots/<folder>` is the project-label directory, not the slot: the
+        # slot is the single `<profile>-<id>` leaf inside it. Resolve that
+        # leaf from the product's recorded id here, before any admission of
+        # this case runs, so the deletion oracle names the slot itself.
+        directory = deletion_oracle_leaf(self.slots, slot, folder)
+        need(os.path.isdir(directory), f"{case}: slot leaf {directory} is not a directory")
         started = int((record.get("holder") or {}).get("started_ms") or 0)
         need(started > 0, f"{case}: the recorded holder start is {started}")
         print(
-            f"{case}: quarantined slot {slot} in {directory}, holder started {started} ms, "
-            f"state record {record.get('id')}"
+            f"{case}: quarantined slot {slot} leaf {directory} in project folder {folder}, "
+            f"holder started {started} ms, state record {record.get('id')}"
         )
-        return {"case": case, "slot": slot, "directory": directory, "started": started, "victim": victim}
+        return {
+            "case": case,
+            "slot": slot,
+            "folder": folder,
+            "directory": directory,
+            "started": started,
+            "victim": victim,
+        }
 
     def kept(self, found: dict, extra: dict) -> None:
-        """The slot stays held with its bytes: no deletion, the directory and
-        the record unchanged, and status still reports the quarantine."""
-        case, slot, directory, victim = found["case"], found["slot"], found["directory"], found["victim"]
+        """The slot stays held with its bytes: no deletion, its project folder
+        and record unchanged, and status still reports the quarantine. A
+        forced detach may not persist the leaf's last writes (the main mode's
+        `kept_present` precedent), so this oracle keeps the folder and the
+        record rather than the leaf."""
+        case, slot, folder, victim = found["case"], found["slot"], found["folder"], found["victim"]
         stdout = self.status(f"{case} status", victim, extra)
         oracle(
             re.search(
@@ -707,13 +759,13 @@ class BootClosure:
         code, _, stderr = self.proof.oxide(["build"], f"{case} admission", victim, self.child_env(extra))
         oracle(code == 0, f"{case}: the admission failed: {stderr[-1200:]}")
         oracle("deleted slot" not in stderr, f"{case}: a quarantined slot was deleted: {stderr[-1200:]}")
-        oracle(os.path.isdir(directory), f"{case}: {directory} was removed")
+        oracle(os.path.isdir(folder), f"{case}: the project folder {folder} was removed")
         self.lost_record(slot)
-        print(f"{case}: slot {slot} kept at {directory} with its record")
+        print(f"{case}: slot {slot} kept in {folder} with its record")
 
     def before_boot(self) -> None:
         found = self.quarantine("before-boot")
-        slot, directory, victim = found["slot"], found["directory"], found["victim"]
+        slot, folder, directory, victim = found["slot"], found["folder"], found["directory"], found["victim"]
         # A later boot session: the holder started more than the safety
         # margin before this one. The proof cannot reboot the host, so it
         # names the session through the debug-only override.
@@ -724,6 +776,26 @@ class BootClosure:
             f"before-boot: status does not report the restart closure: {stdout[-1200:]}",
         )
         oracle(os.path.isdir(directory), "before-boot: the quarantined slot is already gone")
+        # Pre-build and project-directory-independent: re-resolve the slot
+        # leaf from the recorded id alone — no build output, no reliance on
+        # the project folder `slots/<folder>` — and require it to be the path
+        # `quarantine` named, inside its folder and not that folder. The
+        # deleting admission below creates a fresh slot of this same project
+        # in the same folder, so a folder oracle could not tell deletion from
+        # replacement.
+        oracle(
+            deletion_oracle_leaf(self.slots, slot, folder) == directory,
+            f"before-boot: slot {slot} leaf resolved away from {directory} before the build",
+        )
+        oracle(
+            os.path.dirname(directory) == folder and os.path.realpath(directory) != os.path.realpath(folder),
+            f"before-boot: the oracle names {directory}, not the slot leaf of {slot} in {folder}",
+        )
+        oracle(
+            os.path.isdir(directory),
+            f"before-boot: slot leaf {directory} is not on the volume before the build",
+        )
+        self.lost_record(slot)
         # The observed defect: any whole-target checkout's explicit conversion
         # refused on the quarantined record in the paired pool.
         code, stdout, stderr = self.proof.oxide(
@@ -762,13 +834,26 @@ class BootClosure:
             is not None,
             f"before-boot: the boot-closed slot was not deleted: {stderr[-1200:]}",
         )
-        oracle(not os.path.exists(directory), f"before-boot: {directory} still exists after deletion")
         oracle(
-            not any(
-                str((record.get("lost") or {}).get("slot_id")) == slot
-                for record in self.state().get("records", [])
-            ),
-            "before-boot: the deleted slot's record is still in state",
+            not os.path.lexists(directory),
+            f"before-boot: slot leaf {directory} still exists after deletion",
+        )
+        # The project-label folder is a different path and legitimately outlives
+        # the slot: the deleting admission creates its own slot there. The
+        # deletion is proven by the slot leaf above, the product's own line and
+        # the record, not by the folder's absence.
+        oracle(
+            os.path.isdir(folder),
+            f"before-boot: the project folder {folder} is gone; the leaf and folder are not distinguishable",
+        )
+        records = [
+            record
+            for record in self.state().get("records", [])
+            if str((record.get("lost") or {}).get("slot_id")) == slot
+        ]
+        oracle(
+            not records,
+            f"before-boot: the deleted slot's record is still in state: {records[:1]}",
         )
         stdout = self.status("before-boot status after", victim, override)
         oracle(
@@ -883,7 +968,10 @@ def self_check() -> int:
     device or supervisor. It pins the two defects an exact-head review found
     before any native activation — the diagnostic receipt's `json` dependency
     and the full fixture environment every child (`status` included) receives
-    — plus the dispatch, the product-message marker and the receipt bound."""
+    — plus the deletion oracle's slot-leaf resolution (the slot's own leaf,
+    never the project-label folder a build or an adopt also creates or
+    reuses), the dispatch, the product-message marker and the receipt
+    bound."""
     fixture = {
         "OXIDE_POOL": "/fixture/pool",
         "HOME": "/fixture/home",
@@ -917,8 +1005,51 @@ def self_check() -> int:
         case.env = dict(fixture)
         case.proof = Recorder()
         case.lost_record = lambda slot: {"holder": {"command": "exec /fixture/tool"}}
-        slot_dir = os.path.join(root, "slots", "victim-7")
+        slots = os.path.join(root, "slots")
+        folder = os.path.join(slots, "victim-deadbeef")
+        slot_dir = os.path.join(folder, "quick-7")
         os.makedirs(slot_dir)
+        os.makedirs(os.path.join(slots, "other-cafe", "debug-8"))
+        # The deletion oracle names the slot's own `<profile>-<id>` leaf, not
+        # the project-label folder a build, an adopt or a relink also creates
+        # or reuses: resolve it by the recorded id across the tree, require it
+        # inside the discovered folder, and refuse anything else.
+        expect(slot_leaf_directory(slots, "7") == slot_dir, "slot leaf resolution")
+        expect(os.path.dirname(slot_leaf_directory(slots, "7")) != slots, "the slot leaf is the slots root")
+        expect(deletion_oracle_leaf(slots, "7", folder) == slot_dir, "deletion oracle leaf")
+        for bad, why in (
+            ((slots, "7", os.path.join(slots, "other-cafe")), "a leaf in another project folder"),
+            ((slots, "9", folder), "a missing slot leaf"),
+        ):
+            try:
+                deletion_oracle_leaf(*bad)
+            except UnknownOutcome:
+                print(f"deletion oracle refused {why}")
+            else:
+                expect(False, f"the deletion oracle accepted {why}")
+        # Counterfactual: the pre-fix oracle named `slots/<folder>`, the
+        # project-label directory. A resolver that returned it is refused,
+        # never silently accepted as the deleted slot.
+        original = globals()["slot_leaf_directory"]
+        globals()["slot_leaf_directory"] = lambda tree, slot_id: folder
+        try:
+            try:
+                deletion_oracle_leaf(slots, "7", folder)
+            except UnknownOutcome as error:
+                print(f"deletion oracle refused the project-label folder: {error}")
+            else:
+                expect(False, "the project-label folder was accepted as the slot leaf")
+        finally:
+            globals()["slot_leaf_directory"] = original
+        # A second leaf ending in the recorded id is ambiguous, never a pick.
+        os.makedirs(os.path.join(slots, "other-cafe", "debug-7"))
+        try:
+            slot_leaf_directory(slots, "7")
+        except UnknownOutcome as error:
+            expect("2 slot leaves" in str(error), f"ambiguous leaf message {error}")
+        else:
+            expect(False, "two slot leaves with the recorded id resolved to one")
+        os.rmdir(os.path.join(slots, "other-cafe", "debug-7"))
         # status(): one child, the whole fixture environment plus the override.
         case.status("self-check status", "/fixture/victim", override)
         expect(len(calls) == 1, f"status launched {len(calls)} children")
@@ -939,6 +1070,7 @@ def self_check() -> int:
             {
                 "case": "self-check",
                 "slot": "7",
+                "folder": folder,
                 "directory": slot_dir,
                 "started": 1,
                 "victim": "/fixture/victim",
@@ -1027,8 +1159,9 @@ def self_check() -> int:
         "BOOT_MARKER is not the product's boot-session line",
     )
     print(
-        "boot-closure self-check ok: status/build child environments, diagnostic "
-        "receipt (json, bounded, unqualified), dispatch, marker"
+        "boot-closure self-check ok: status/build child environments, deletion "
+        "oracle slot leaf, diagnostic receipt (json, bounded, unqualified), "
+        "dispatch, marker"
     )
     return 0
 
