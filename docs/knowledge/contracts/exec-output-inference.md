@@ -581,9 +581,17 @@ python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- \
 - **Bounds:** 300 s wall clock, 512 MiB monitored scratch, helper work cutoff
   ~270 s so cleanup and ordinary detach finish inside the deadline; one owned
   128 MiB APFS sparse image attached with `hdiutil -owners on`; normal
-  admission and selected-volume scratch (no internal-root exception: the
-  operating pool is the image-backed removable pool and the control pool is an
-  ordinary directory pool inside the monitored scratch).
+  admission and the owner-accepted internal monitored root
+  (`--root-parent /private/tmp`, decision `bd357a4c`, Tom-approved apparatus
+  correction 2026-10-26). The fixture's control pool is a genuine internal
+  `directory-budget` pool, which the product correctly refuses on the selected
+  external volume — the 2026-10-26 uncounted diagnostic at `171ae6fb` failed
+  there before attaching its image, which is apparatus premise 8 and not a
+  product defect. The internal pool, the supervisor's monitored root, the
+  image backing and every fixture temp path stay inside the same monitored
+  512 MiB root; the image-backed removable pool is attached with `-owners on`
+  and registered as the operating pool after the internal-pool fixture. Limits
+  and the scratch budget are unchanged, as is the ordinary one-shot detach.
 - **Planning allocation (unmeasured):** staging peak ~288 MiB + image 128 MiB +
   fixtures 48 MiB + evidence 32 MiB + margin 16 MiB = 512 MiB; 4 Cargo jobs for
   the single staging, 1 per fixture child, sequential, at most one Cargo child
@@ -638,7 +646,7 @@ script, to be traced through the executable case bodies (not this prose):
 | 5 | Cargo external argv | only relevant to the tiny fixture tool if it is invoked through a Cargo subcommand; the design's fixture tool is invoked directly, so the premise is recorded as not applicable with that reason |
 | 6 | owned images | `hdiutil attach -owners on` on attach and reattach, asserted by the bounded read-only mount observation and the product's own registration refusal |
 | 7 | compiler flags | `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` frozen consistently for staging and fixture children |
-| 8 | temporary storage | supervisor scratch and the fixture `TMPDIR` on the selected volume; no internal-root exception; the qualified guard and its pinned bytes |
+| 8 | temporary storage | the owner-accepted internal monitored root (`--root-parent /private/tmp`, decision `bd357a4c`): the fixture's control pool is a genuine internal `directory-budget` pool, which the product refuses on an external volume, so the internal pool, the supervisor scratch, the image backing and the fixture `TMPDIR` all stay inside one monitored 512 MiB root, with the image-backed removable pool registered afterwards as the operating pool; the qualified guard and its pinned bytes. The failed `171ae6fb` diagnostic is the apparatus evidence for this disposition |
 | 9 | macOS `mktemp` | every fixture temp path uses a template under the owned scratch parent, and the executable fixture's own `mktemp` use is verified |
 
 ### Activation sequence

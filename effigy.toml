@@ -354,9 +354,23 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # HOME/rustup, OXIDE_TEST_HOME_FROM_ENV, the OXIDE_/XDG_/CARGO_*/GIT_ scrub,
 # an explicitly created unconverted control, `-owners on` plus a read-only
 # mount observation, one frozen RUSTFLAGS with CARGO_ENCODED_RUSTFLAGS
-# removed for staging and every fixture child, selected-volume scratch, and
-# mkdtemp-only fixture temp roots. `--plan` prints the fixed table and
-# allocation with no effect.
+# removed for staging and every fixture child, the internal monitored scratch
+# root described below, and mkdtemp-only fixture temp roots.
+# `--plan` prints the fixed table and allocation with no effect.
+#
+# `--root-parent /private/tmp` is the owner-accepted internal-placement
+# exception (decision bd357a4c, Tom-approved apparatus correction 2026-10-26),
+# exactly as `rust:profile-outputs`, `rust:command-budgets`,
+# `rust:pool-temp-scratch`, `rust:recorded-slot-accounting` and
+# `rust:outputs-prune` use it: this fixture's control pool is a genuine
+# internal `directory-budget` pool, which the product correctly refuses on the
+# selected external volume (the diagnostic at 171ae6fb failed there before
+# attaching its image). The internal pool, the supervisor's monitored root,
+# the image backing and every fixture temp path stay inside the same monitored
+# 512 MiB root, and the owned 128 MiB image is attached with `-owners on` and
+# registered as the operating removable pool after the internal-pool fixture,
+# with the same 300 s limit and the same ordinary detach. It is not a limit
+# change or a different scratch location.
 # `rust:exec-output-inference:diagnostic` appends `--diagnostic`: the same
 # bounded guard, uncounted, aborting at the first fault and writing a bounded
 # `qualified: false` receipt (it has no keep-going collection). Each run needs
@@ -364,11 +378,11 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # pass. Not a benchmark, real-drive qualification or an alias for full QA.
 [tasks."rust:exec-output-inference"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference"
 
 [tasks."rust:exec-output-inference:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference --diagnostic"
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the qualified shared supervisor (`scripts/bounded-test.py` SHA-256

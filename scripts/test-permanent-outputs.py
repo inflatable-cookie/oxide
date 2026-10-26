@@ -44,8 +44,12 @@ The focused modes reuse this fixture and staging helpers:
   that places a tool's build in the checkout's committed members, a warm
   repeat, the declared `--output` parity, an unrecorded member left local,
   a detached and an unconverted checkout running locally, a spaced checkout
-  path, a foreign member link, root drift and a receipt changed while the
-  command waits.
+  path, an existing whole-target checkout that stays whole-target, a foreign
+  member link, root drift, a receipt changed while the command waits and an
+  interrupted tool whose group closes before the lease releases. It runs
+  under `--root-parent /private/tmp`, the owner-accepted internal-placement
+  exception (decision bd357a4c): its control pool is a genuine internal
+  `directory-budget` pool, which the product refuses on an external volume.
 
 Not a benchmark, not real-drive qualification and not full QA.
 """
@@ -2547,11 +2551,16 @@ def plan_exec_inference() -> None:
     """The effect-free table and allocation, printed by `--plan`."""
     print("exec-inference (oxide#160): S1 derived exec member sets + S4b profile first conversion")
     print(
-        "supervisor: python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- "
-        "python3 scripts/test-permanent-outputs.py exec-inference"
+        "supervisor: python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 "
+        "--scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference"
     )
     print("limits: 300 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
-    print("        attached with hdiutil -owners on, ordinary detach, selected-volume scratch")
+    print("        attached with hdiutil -owners on, ordinary detach")
+    print("root:   --root-parent /private/tmp, the owner-accepted internal-placement exception")
+    print("        (decision bd357a4c): the fixture's internal directory-budget pool, the")
+    print("        supervisor scratch, the image backing and fixture temp paths stay inside")
+    print("        one monitored 512 MiB root; the image-backed removable pool is registered")
+    print("        as the operating pool afterwards")
     print("fixture work, sequential, one Cargo child at a time: 4 Cargo jobs for the single")
     print("        staging and 1 per fixture child; planning demand 4 CPU / 6 GiB")
     print("cases (fail-fast, in this order):")
@@ -2762,10 +2771,18 @@ def exec_run(proof: Proof, repo: str) -> None:
        removes `CARGO_ENCODED_RUSTFLAGS` on `os.environ` BEFORE staging and on
        the fixture environment afterwards, so the staged binary and every
        fixture child build under the same flag set.
-    8. temporary storage: the supervisor's scratch and the fixture `TMPDIR`
-       are the same selected-volume directory (asserted), there is no
-       internal-root exception, and the guard is the qualified shared
-       supervisor.
+    8. temporary storage: this fixture's control pool is a genuine internal
+       `directory-budget` pool, which the product correctly refuses on an
+       external volume, so the selector runs under the owner-accepted internal
+       monitored root (`--root-parent /private/tmp`, decision `bd357a4c`,
+       Tom-approved 2026-10-26): the internal pool, the supervisor scratch, the
+       image backing and the fixture `TMPDIR` all stay inside one monitored
+       512 MiB root (asserted as `TMPDIR == OXIDE_TASK_SCRATCH_ROOT`), the
+       owned image is attached with `-owners on` and registered as the
+       operating removable pool afterwards, and the guard is the qualified
+       shared supervisor with its unchanged 300 s limit. The uncounted
+       diagnostic at `171ae6fb` failed exactly on the missing exception, which
+       is apparatus evidence, not a product defect.
     9. macOS `mktemp`: every fixture temp root is `tempfile.mkdtemp` under
        `OXIDE_TASK_SCRATCH_ROOT` and the gate/release paths are fixed names
        inside it; no fixture or tool calls `mktemp`.
