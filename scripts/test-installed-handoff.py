@@ -188,7 +188,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 
 
-def stage_subject(root: str) -> str:
+def stage_subject(root: str, capability: dict | None = None) -> str:
     """Stage this HEAD's `oxide` with plain Cargo, offline, in owned scratch.
 
     No Oxide pool is created or touched, and the staged target is deleted once
@@ -200,7 +200,14 @@ def stage_subject(root: str) -> str:
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_"))
-        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+        and key
+        not in (
+            "CARGO",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        )
     }
     env.update(
         {
@@ -248,10 +255,17 @@ def stage_subject(root: str) -> str:
         timeout=min(30, work_left()),
     )
     expect(probe.returncode == 0, f"capability probe exit {probe.returncode}: {probe.stderr!r}")
+    # The default stays exactly this proof's own declared versions, so every
+    # existing caller is unchanged; a caller whose fixture needs a different
+    # exact expectation passes it explicitly rather than accepting any value.
+    expected = capability if capability is not None else {
+        "control_state_version": STATE_VERSION,
+        "registration_version": REGISTRATION_VERSION,
+        "test_controls": True,
+    }
     expect(
-        json.loads(probe.stdout)
-        == {"control_state_version": STATE_VERSION, "registration_version": REGISTRATION_VERSION, "test_controls": True},
-        f"capability probe {probe.stdout!r} disagrees with this proof's versions",
+        json.loads(probe.stdout) == expected,
+        f"capability probe {probe.stdout!r} disagrees with the declared expectation {expected!r}",
     )
     return subject
 
