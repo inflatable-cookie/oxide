@@ -2938,6 +2938,26 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
             results.append({"case": case_name, "result": "failed", "fault": str(fault)[:600]})
         proof.phase(f"after {case_name}")
 
+    # The owned image is this run's custody. A collection that recorded no
+    # failure makes exactly one ordinary detach through the shared helper and
+    # positively verifies the mount is gone before its receipt can report
+    # success; a failed detach raises into the existing failure cleanup, which
+    # makes that same single attempt and keeps the evidence. No path forces a
+    # detach, detaches twice on the success path, or deletes the backing.
+    detached = "not attempted (collection recorded a failure or an abort)"
+    mount_present = None
+    if not failures and aborted is None:
+        proof.detach()
+        expect(
+            not os.path.ismount(mount),
+            f"the owned image is still mounted at {mount} after its ordinary detach",
+        )
+        expect(
+            not proof.unclosed,
+            f"unclosed children after detach: {sorted(proof.unclosed)}",
+        )
+        mount_present = os.path.lexists(mount)
+        detached = "ordinary detach through Proof.detach; mount absent"
     elapsed = time.monotonic() - layout.runner.STARTED
     document = {
         "proof": "rust:auto-adopt-ineligible",
@@ -2951,6 +2971,9 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
             "elapsed_s": round(elapsed, 1),
             "peak_owned_mib": proof.peak // MIB,
             "host_free_min_mib": None if proof.low is None else proof.low // MIB,
+            "detach": detached,
+            "mount_path_present_after_detach": mount_present,
+            "unclosed_children": sorted(proof.unclosed),
         },
         "limits": {"wall_clock_s": 300, "scratch_mib": 512},
     }
