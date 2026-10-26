@@ -38,11 +38,20 @@
 //! the lease records `Evicting` in its durable ledger before the deletion and
 //! only clears the record after a positive removal, and the prune journals
 //! `deleting`/`marker_last`/`deleted` around its own bounded pass.
+//!
+//! A tree **root** capture is journaled intent-first by its caller: before the
+//! exclusive rename (and before any permission change) the caller durably
+//! records the planned private name, the root's `(device, inode)`, the
+//! verified parent's identity and the root's full mode, and after the rename it
+//! records the captured phase. A crash then leaves two names and an explicit
+//! record, and recovery reconciles them conservatively instead of finding the
+//! recorded path absent and concluding a deletion that never finished.
 
+use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
@@ -373,6 +382,97 @@ impl EntryFacts {
     }
 }
 
+/// How far one journaled root capture durably got.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootCapturePhase {
+    /// The record is durable and the exclusive rename has not been recorded as
+    /// done. A crash here may still leave either name holding the root, so
+    /// recovery decides from both names and their identities.
+    Planned,
+    /// The exclusive rename to the recorded private name is durable.
+    Captured,
+}
+
+/// The caller's durable record of one tree-root capture (oxide#155).
+///
+/// It is written before the rename and before any permission change, so a
+/// crash between any two steps leaves the planned private name, the root's own
+/// identity, the parent it must be found in and the mode it must be restored to
+/// recoverable. It never authorizes an effect on its own: every step below
+/// revalidates the identities against live descriptors.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootCapturePlan {
+    /// The private name the root is exclusively renamed to.
+    pub private: String,
+    pub phase: RootCapturePhase,
+    /// The root's `(device, inode)` as observed before the rename.
+    pub device: u64,
+    pub inode: u64,
+    /// The verified parent directory's `(device, inode)`.
+    pub parent_device: u64,
+    pub parent_inode: u64,
+    /// The root's full `st_mode` before any permission change, so recovery can
+    /// put back exactly the mode the owner had.
+    pub mode: u32,
+}
+
+impl RootCapturePlan {
+    /// The root's permission bits, as a value that can be handed back to
+    /// `fchmod`.
+    pub fn mode_bits(&self) -> libc::mode_t {
+        (self.mode & 0o7777) as libc::mode_t
+    }
+
+    /// Whether this record is one a writer can produce. A ledger or journal
+    /// holding anything else is refused, never acted on.
+    pub fn is_valid(&self) -> bool {
+        let private = self.private.as_bytes();
+        let type_bits = self.mode & u32::from(libc::S_IFMT);
+        private.len() > CAPTURE_PREFIX.len()
+            && private.len() <= CAPTURE_PREFIX.len() + 2 * CAPTURE_TAG_BYTES
+            && private.starts_with(CAPTURE_PREFIX.as_bytes())
+            && private[CAPTURE_PREFIX.len()..]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+            && self.device != 0
+            && self.inode != 0
+            && self.parent_device != 0
+            && self.parent_inode != 0
+            && type_bits == u32::from(libc::S_IFDIR)
+            && self.mode & !(u32::from(libc::S_IFMT) | 0o7777) == 0
+    }
+}
+
+/// A caller's durable journal for the capture of one tree root. The seam calls
+/// `planned` after it has generated the private name and read the identities
+/// but before the exclusive rename, and `captured` with that same plan after the
+/// rename and its directory sync, so the caller records the captured phase
+/// itself. An error from either stops the caller: nothing else is attempted and
+/// no record is cleared.
+pub trait RootCaptureJournal {
+    fn planned(&mut self, plan: &RootCapturePlan) -> Result<(), String>;
+    fn captured(&mut self, plan: &RootCapturePlan) -> Result<(), String>;
+}
+
+/// What the two names of one journaled root capture hold right now.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RootCaptureState {
+    /// The original name holds the recorded root and the private name is free:
+    /// no capture is in effect.
+    Original,
+    /// The private name holds the recorded root and the original name is free:
+    /// the capture is in effect.
+    Private,
+    /// Neither name exists.
+    Absent,
+    /// The parent is not the recorded parent, a name holds another object, or
+    /// both names hold something. Nothing may be assumed and nothing may be
+    /// removed.
+    Uncertain { reason: String },
+}
+
 /// One exclusive rename inside a single held directory: never across
 /// directories, never replacing an existing name.
 fn rename_exclusive(dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> io::Result<()> {
@@ -430,25 +530,224 @@ fn random_tag() -> io::Result<String> {
     Ok(tag)
 }
 
+/// One fresh private capture name. 128 random bits make it unguessable and a
+/// collision practically impossible; `capture_named` still handles `EEXIST`.
+fn capture_name() -> io::Result<String> {
+    Ok(format!("{CAPTURE_PREFIX}{}", random_tag()?))
+}
+
 /// Capture `name` under a fresh private name in the same directory. Retries a
 /// name collision a bounded number of times; any other rename error is the
 /// caller's stop.
 pub fn capture_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<Capture> {
     for _ in 0..8 {
-        let private = CString::new(format!("{CAPTURE_PREFIX}{}", random_tag()?))
-            .map_err(|_| io::Error::other("capture name"))?;
-        match rename_exclusive(dir, name, &private) {
-            Ok(()) => {
-                return Ok(Capture {
-                    private,
-                    original: name.to_owned(),
-                })
-            }
+        match capture_named(dir, name, &capture_name()?) {
+            Ok(capture) => return Ok(capture),
             Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
             Err(error) => return Err(error),
         }
     }
     Err(io::Error::from_raw_os_error(libc::EEXIST))
+}
+
+/// Capture `name` under one already-planned private name. This is the form a
+/// caller uses when the name must be durable before the rename: the plan names
+/// it, so recovery can look for exactly these two names.
+pub fn capture_named(dir: BorrowedFd<'_>, name: &CStr, private: &str) -> io::Result<Capture> {
+    let private =
+        CString::new(private).map_err(|_| io::Error::other("capture name holds a NUL"))?;
+    rename_exclusive(dir, name, &private)?;
+    Ok(Capture {
+        private,
+        original: name.to_owned(),
+    })
+}
+
+/// Plan the capture of one verified tree root: its own no-follow facts, the
+/// held parent's identity, and a fresh private name. Reads only; the caller
+/// must journal the returned plan durably before [`capture_planned`].
+pub fn plan_root_capture(
+    parent: BorrowedFd<'_>,
+    observed: &EntryFacts,
+) -> io::Result<RootCapturePlan> {
+    let (parent_device, parent_inode) = descriptor_identity(parent)?;
+    Ok(RootCapturePlan {
+        private: capture_name()?,
+        phase: RootCapturePhase::Planned,
+        device: observed.device,
+        inode: observed.inode,
+        parent_device,
+        parent_inode,
+        mode: u32::try_from(observed.mode).unwrap_or(u32::MAX),
+    })
+}
+
+/// Move a verified root to its planned private name and make that rename
+/// durable, so the caller can record the captured phase afterwards. A failed
+/// rename is reported and moved nothing.
+pub fn capture_planned(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    plan: &RootCapturePlan,
+) -> io::Result<Capture> {
+    let capture = capture_named(parent, name, &plan.private)?;
+    sync_directory(parent)?;
+    Ok(capture)
+}
+
+/// Compare the two names of one journaled root capture against the recorded
+/// identities. Reads only; nothing is renamed, created or removed.
+pub fn reconcile_root_capture(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    plan: &RootCapturePlan,
+) -> RootCaptureState {
+    if !plan.is_valid() {
+        return RootCaptureState::Uncertain {
+            reason: "the recorded capture plan is not one a writer produces".to_owned(),
+        };
+    }
+    match descriptor_identity(parent) {
+        Ok(identity) if identity == (plan.parent_device, plan.parent_inode) => {}
+        Ok(_) => {
+            return RootCaptureState::Uncertain {
+                reason: "the recorded parent directory is not the parent this run holds".to_owned(),
+            }
+        }
+        Err(error) => {
+            return RootCaptureState::Uncertain {
+                reason: format!("the parent's identity cannot be read ({error})"),
+            }
+        }
+    }
+    let original = match name_holds(parent, name, plan) {
+        Ok(state) => state,
+        Err(reason) => return RootCaptureState::Uncertain { reason },
+    };
+    let private = match CString::new(plan.private.as_str()) {
+        Err(_) => {
+            return RootCaptureState::Uncertain {
+                reason: "the recorded private name holds a NUL".to_owned(),
+            }
+        }
+        Ok(private) => match name_holds(parent, &private, plan) {
+            Ok(state) => state,
+            Err(reason) => return RootCaptureState::Uncertain { reason },
+        },
+    };
+    match (original, private) {
+        (Some(true), Some(false)) => RootCaptureState::Original,
+        (Some(false), Some(true)) => RootCaptureState::Private,
+        (Some(false), Some(false)) => RootCaptureState::Absent,
+        (Some(true), Some(true)) => RootCaptureState::Uncertain {
+            reason: "both the original and the private name hold the recorded root".to_owned(),
+        },
+        _ => RootCaptureState::Uncertain {
+            reason: "a name holds an object that is not the recorded root".to_owned(),
+        },
+    }
+}
+
+/// Whether one name holds the recorded root (`Some(true)`), is free
+/// (`Some(false)`) or holds another object (`None`).
+fn name_holds(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    plan: &RootCapturePlan,
+) -> Result<Option<bool>, String> {
+    match stat_at(parent, name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(false)),
+        Err(error) => Err(format!("a capture name cannot be read ({error})")),
+        Ok(stat) => Ok(
+            if stat_mode(&stat) == libc::S_IFDIR
+                && stat_device(&stat) == plan.device
+                && stat_ino(&stat) == plan.inode
+            {
+                Some(true)
+            } else {
+                None
+            },
+        ),
+    }
+}
+
+/// Put a captured root back under its recorded name, in exactly the mode the
+/// record kept. The mode is restored while the object is still under the
+/// private name, so the recorded name never briefly holds a widened mode, and
+/// only then is the exclusive rename done. Every step revalidates an identity;
+/// a failure leaves both names as they were and the caller keeps its record.
+pub fn restore_root_capture(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    plan: &RootCapturePlan,
+) -> Result<(), String> {
+    if !plan.is_valid() {
+        return Err("the recorded capture plan is not one a writer produces".to_owned());
+    }
+    match descriptor_identity(parent) {
+        Ok(identity) if identity == (plan.parent_device, plan.parent_inode) => {}
+        Ok(_) => {
+            return Err("the recorded parent directory is not the parent this run holds".to_owned())
+        }
+        Err(error) => return Err(format!("the parent's identity cannot be read ({error})")),
+    }
+    let private = CString::new(plan.private.as_str())
+        .map_err(|_| "the recorded private name holds a NUL".to_owned())?;
+    if name_holds(parent, &private, plan)? != Some(true) {
+        return Err("the private name does not hold the recorded root".to_owned());
+    }
+    if name_holds(parent, name, plan)? != Some(false) {
+        return Err("the recorded name is not free, so the root cannot be put back".to_owned());
+    }
+    // The mode is restored through a search-only, no-follow descriptor of the
+    // captured entry itself, so nothing is chmodded through a name a racer
+    // could redirect.
+    {
+        let held = open_directory_for_repair(parent, &private)
+            .map_err(|error| format!("the captured root cannot be opened ({error})"))?;
+        match descriptor_identity(held.as_fd()) {
+            Ok(identity) if identity == (plan.device, plan.inode) => {}
+            Ok(_) => {
+                return Err(
+                    "the captured root was replaced before its mode was restored".to_owned(),
+                )
+            }
+            Err(error) => {
+                return Err(format!(
+                    "the captured root's identity cannot be read ({error})"
+                ))
+            }
+        }
+        // SAFETY: `held` is a live descriptor for the captured directory.
+        if unsafe { libc::fchmod(held.as_raw_fd(), plan.mode_bits()) } != 0 {
+            return Err(format!(
+                "the captured root's recorded mode cannot be restored ({})",
+                io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::fsync(held.as_raw_fd()) } != 0 {
+            return Err(format!(
+                "the restored mode cannot be synced ({})",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    rename_exclusive(parent, &private, name)
+        .map_err(|error| format!("the captured root cannot be put back ({error})"))?;
+    sync_directory(parent).map_err(|error| format!("the put-back cannot be synced ({error})"))?;
+    match name_holds(parent, name, plan)? {
+        Some(true) => Ok(()),
+        _ => Err("the recorded name does not hold the recorded root after its put-back".to_owned()),
+    }
+}
+
+/// Make a directory rename durable before it is recorded.
+fn sync_directory(dir: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: `dir` is a live descriptor for the call.
+    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// `fstatat` facts for one name in a held directory, never following a link.

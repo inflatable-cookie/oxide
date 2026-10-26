@@ -14,8 +14,9 @@ mod backing;
 mod pool;
 
 use crate::owned_delete::{
-    capture_entry, descriptor_identity, names_of, observe_entry, open_directory_at, put_back,
-    remove_captured_directory, unlink_captured, verify_captured,
+    capture_entry, capture_planned, descriptor_identity, names_of, observe_entry,
+    open_directory_at, plan_root_capture, put_back, remove_captured_directory, unlink_captured,
+    verify_captured, RootCaptureJournal,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -780,7 +781,18 @@ fn random_hex(bytes: usize) -> Result<String, LeaseError> {
 /// `ENOTEMPTY`, Finder metadata recreated after our own listing is verified and
 /// unlinked, and only that, within a fixed finite bound. Anything else that
 /// appeared stays a refusal, which the caller keeps as unfinished intent.
-fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
+///
+/// `journal` is the caller's durable record for the **root** of this tree. When
+/// it is present the seam plans the private capture name, lets the caller make
+/// the plan durable, performs the exclusive rename, and only then records the
+/// captured phase — so a crash never leaves the root under a private name no
+/// record names. Nested entries pass `None`: the root's record covers the whole
+/// tree, and a leftover capture inside it is deleted with it.
+fn remove_tree_owned(
+    root: &Path,
+    path: &Path,
+    journal: Option<&mut dyn RootCaptureJournal>,
+) -> Result<(), LeaseError> {
     let name = path.file_name().ok_or(LeaseError::UnknownAccounting)?;
     let parent_path = path.parent().ok_or(LeaseError::UnknownAccounting)?;
     // Containment is decided once, from the real path, while the tree is still
@@ -797,7 +809,33 @@ fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
     let parent = open_verified_directory(parent_path)?;
     let name =
         std::ffi::CString::new(name.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
-    remove_tree_owned_at(root, parent.as_fd(), &name, path)
+    remove_tree_owned_at(root, parent.as_fd(), &name, path, journal)
+}
+
+/// Put a captured entry back under its observed name and return the caller's
+/// own cause. The journal record is deliberately kept: only a completed
+/// deletion or a later two-name reconciliation clears it, so a crash or a
+/// failed put-back never loses the only name that can find the object.
+fn abort_capture(
+    parent: BorrowedFd<'_>,
+    capture: &crate::owned_delete::Capture,
+    cause: LeaseError,
+) -> LeaseError {
+    match put_back(parent, capture) {
+        Ok(()) => cause,
+        Err(error) => LeaseError::Io(format!(
+            "{cause}; the captured entry {} could not be put back under its recorded name ({error}), so both names are kept",
+            entry_label(std::ffi::OsStr::from_bytes(capture.private.as_bytes()))
+        )),
+    }
+}
+
+/// Restore one directory's exact mode through an already-verified descriptor,
+/// so a refusal never leaves an owner's directory widened.
+fn restore_mode(dir: BorrowedFd<'_>, mode: libc::mode_t) {
+    // SAFETY: the descriptor is live for the call and its identity has been
+    // revalidated by the caller.
+    unsafe { libc::fchmod(dir.as_raw_fd(), mode) };
 }
 
 /// One entry, named in the held `parent`, of the tree rooted at `root`.
@@ -806,6 +844,7 @@ fn remove_tree_owned_at(
     parent: BorrowedFd<'_>,
     name: &std::ffi::CString,
     path: &Path,
+    journal: Option<&mut dyn RootCaptureJournal>,
 ) -> Result<(), LeaseError> {
     // Observe the entry first, then *capture* it under a private name this
     // process just created. Every later check and the removal itself act on
@@ -835,20 +874,61 @@ fn remove_tree_owned_at(
     } else {
         return Err(LeaseError::UnknownAccounting);
     }
-    let capture = capture_entry(parent, name).map_err(io_error)?;
+    // A tree root is journaled intent-first: the planned private name, its own
+    // identity, the verified parent's identity and its full mode are durable
+    // before the rename and before any permission change.
+    let is_root = journal.is_some();
+    #[cfg(not(test))]
+    let _ = is_root;
+    let mut journal = journal;
+    let mut plan = None;
+    if let Some(sink) = journal.take() {
+        let observed_plan = plan_root_capture(parent, &observed).map_err(io_error)?;
+        sink.planned(&observed_plan).map_err(LeaseError::Io)?;
+        plan = Some(observed_plan);
+        journal = Some(sink);
+    }
+    #[cfg(test)]
+    if is_root {
+        crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::Planned);
+    }
+    let capture = match plan.as_ref() {
+        Some(plan) => capture_planned(parent, name, plan).map_err(io_error)?,
+        None => capture_entry(parent, name).map_err(io_error)?,
+    };
+    #[cfg(test)]
+    if is_root {
+        crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::Renamed);
+    }
+    // The captured phase is durable before the captured object is verified or
+    // removed, so no record ever describes a location the object has already
+    // left. A failure here puts the root back and keeps the record.
+    if let (Some(plan_ref), Some(sink)) = (plan.as_ref(), journal.take()) {
+        if let Err(reason) = sink.captured(plan_ref) {
+            return Err(abort_capture(
+                parent,
+                &capture,
+                LeaseError::Io(format!(
+                    "the root capture could not be recorded durably ({reason})"
+                )),
+            ));
+        }
+    }
     if verify_captured(parent, &capture, &observed).is_err() {
-        let restored = put_back(parent, &capture).is_ok();
-        return Err(if restored {
-            LeaseError::UnsafePath("the verified entry was replaced before its capture")
-        } else {
-            LeaseError::UnknownAccounting
-        });
+        return Err(abort_capture(
+            parent,
+            &capture,
+            LeaseError::UnsafePath("the verified entry was replaced before its capture"),
+        ));
     }
     if observed.file_type() != libc::S_IFDIR {
         // A captured file or link is removed by its private name only; a link's
         // referent is never touched.
         return unlink_captured(parent, &capture).map_err(io_error);
     }
+    // The owner's exact mode is restored on every refusal after a repair, so a
+    // kept directory never stays widened just because a later step refused.
+    let mut repaired: Option<std::os::fd::OwnedFd> = None;
     let child = match open_directory_at(parent, &capture.private) {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -862,35 +942,68 @@ fn remove_tree_owned_at(
             ) {
                 Ok(repair) => repair,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    let _ = put_back(parent, &capture);
-                    return Err(LeaseError::UnsafePath(
-                        "an owned directory that cannot be opened is kept, never chmodded through its name",
+                    return Err(abort_capture(
+                        parent,
+                        &capture,
+                        LeaseError::UnsafePath(
+                            "an owned directory that cannot be opened is kept, never chmodded through its name",
+                        ),
                     ));
                 }
-                Err(error) => return Err(io_error(error)),
+                Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
             };
-            let repaired = descriptor_identity(repair.as_fd()).map_err(io_error)?;
-            if repaired != (observed.device, observed.inode) {
-                let _ = put_back(parent, &capture);
-                return Err(LeaseError::UnsafePath(
-                    "the verified directory was replaced before its access was repaired",
+            let identity = match descriptor_identity(repair.as_fd()) {
+                Ok(identity) => identity,
+                Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
+            };
+            if identity != (observed.device, observed.inode) {
+                return Err(abort_capture(
+                    parent,
+                    &capture,
+                    LeaseError::UnsafePath(
+                        "the verified directory was replaced before its access was repaired",
+                    ),
                 ));
             }
-            crate::owned_delete::restore_owner_access(repair.as_fd()).map_err(io_error)?;
-            open_directory_at(parent, &capture.private).map_err(io_error)?
+            if let Err(error) = crate::owned_delete::restore_owner_access(repair.as_fd()) {
+                return Err(abort_capture(parent, &capture, io_error(error)));
+            }
+            match open_directory_at(parent, &capture.private) {
+                Ok(child) => {
+                    repaired = Some(repair);
+                    child
+                }
+                Err(error) => {
+                    // The repair widened this entry's own mode; put the owner's
+                    // exact mode back through the verified descriptor before the
+                    // capture is returned.
+                    restore_mode(repair.as_fd(), observed.mode_bits());
+                    return Err(abort_capture(parent, &capture, io_error(error)));
+                }
+            }
         }
+        Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
+    };
+    let held = match descriptor_identity(child.as_fd()) {
+        Ok(held) => held,
         Err(error) => {
-            let _ = put_back(parent, &capture);
-            return Err(io_error(error));
+            if let Some(repair) = &repaired {
+                restore_mode(repair.as_fd(), observed.mode_bits());
+            }
+            return Err(abort_capture(parent, &capture, io_error(error)));
         }
     };
-    let held = descriptor_identity(child.as_fd()).map_err(io_error)?;
     if held != (observed.device, observed.inode) {
-        let _ = put_back(parent, &capture);
-        return Err(LeaseError::UnsafePath(
-            "the verified directory was replaced before it was opened",
+        if let Some(repair) = &repaired {
+            restore_mode(repair.as_fd(), observed.mode_bits());
+        }
+        return Err(abort_capture(
+            parent,
+            &capture,
+            LeaseError::UnsafePath("the verified directory was replaced before it was opened"),
         ));
     }
+    drop(repaired);
     // The owner's original mode is kept exactly, so any refusal can put the
     // directory back as it was. Nothing is widened before the capture and its
     // verification above.
@@ -899,9 +1012,16 @@ fn remove_tree_owned_at(
     if widened {
         // SAFETY: `child` is a live descriptor for the verified directory.
         if unsafe { libc::fchmod(child.as_raw_fd(), original_mode | 0o700) } != 0 {
-            let _ = put_back(parent, &capture);
-            return Err(io_error(std::io::Error::last_os_error()));
+            return Err(abort_capture(
+                parent,
+                &capture,
+                io_error(std::io::Error::last_os_error()),
+            ));
         }
+    }
+    #[cfg(test)]
+    if is_root {
+        crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::ModeWidened);
     }
     let restore = |child: BorrowedFd<'_>| {
         if widened {
@@ -913,12 +1033,15 @@ fn remove_tree_owned_at(
         let entry =
             std::ffi::CString::new(entry.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
         let entry_path = path.join(std::ffi::OsStr::from_bytes(entry.as_bytes()));
-        if let Err(error) = remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path) {
+        if let Err(error) = remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path, None) {
             // Restore the owner's own mode, then leave the captured directory
             // under its original name where the racer has not taken it.
             restore(child.as_fd());
-            let _ = put_back(parent, &capture);
-            return Err(error);
+            return Err(abort_capture(parent, &capture, error));
+        }
+        #[cfg(test)]
+        if is_root {
+            crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::MidDelete);
         }
     }
     // The seam's label is the entry's *observed* name: it is diagnostic and

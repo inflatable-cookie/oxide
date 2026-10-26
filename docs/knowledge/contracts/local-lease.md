@@ -1382,6 +1382,19 @@ may return exit 5 without touching any new holder. Do not treat an unknown
 or mistyped ID as evidence that the intended writer ended. A held compatible
 project/profile returns busy rather than allowing a concurrent writer.
 
+A recorded deletion also journals its root capture (oxide#155). The slot's
+ledger record carries the planned private name, the root's `(device, inode)`,
+the verified parent's `(device, inode)` and the root's full `st_mode` before the
+exclusive rename, and then the captured phase after it. The next open reconciles
+the recorded original name and the recorded private name: the root is put back
+under its recorded name with exactly the recorded mode when it is under the
+private one, the record goes when neither name holds the tree or the recorded
+name still does, and a parent or name that is not the recorded object (or both
+names holding something) keeps the record and both objects. A capture record on
+anything but an `Evicting` slot, or in a shape no writer produces, refuses the
+ledger read. That write is atomic and synced with the rest of the ledger, so a
+crash between any two steps leaves the plan findable.
+
 If an interrupted `Evicting` deletion cannot safely remove its recorded slot
 root or an owned entry, the generation remains `Evicting` and unavailable.
 Status stays bounded and reports unknown accounting; an unrelated held lease

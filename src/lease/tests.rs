@@ -10,6 +10,7 @@ use super::{
 };
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::fd::AsFd;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2782,7 +2783,7 @@ fn owned_read_only_directories_left_by_tests_are_deleted_whole() {
     fs::set_permissions(&object, fs::Permissions::from_mode(0o555)).expect("ro dir");
     fs::set_permissions(&objects, fs::Permissions::from_mode(0o500)).expect("ro parent");
 
-    remove_tree_owned(fixture.path(), &slot).expect("owned read-only tree is removed");
+    remove_tree_owned(fixture.path(), &slot, None).expect("owned read-only tree is removed");
     assert!(!slot.exists(), "the whole slot is gone");
 }
 
@@ -2796,7 +2797,7 @@ fn a_symlink_inside_a_read_only_directory_is_unlinked_not_followed() {
     symlink(&outside, inner.join("link")).expect("symlink");
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o500)).expect("ro inner");
     // The owned symlink is unlinked as a leaf; its target is never touched.
-    remove_tree_owned(fixture.path(), &slot).expect("owned symlink leaf removed");
+    remove_tree_owned(fixture.path(), &slot, None).expect("owned symlink leaf removed");
     assert!(outside.exists(), "symlink target untouched");
 }
 
@@ -3184,7 +3185,7 @@ fn finder_metadata_recreated_during_a_slot_deletion_is_drained() {
     fs::create_dir(&inner).expect("nested directory");
     fs::write(inner.join("blob"), b"x").expect("blob");
     let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "metadata", false);
-    remove_tree_owned(fixture.path(), &slot).expect("owned raced tree is removed");
+    remove_tree_owned(fixture.path(), &slot, None).expect("owned raced tree is removed");
     assert!(!slot.exists(), "the whole raced slot is gone");
 }
 
@@ -3196,7 +3197,7 @@ fn a_foreign_entry_recreated_during_a_slot_deletion_refuses_and_is_kept() {
     let slot = fixture.dir("slot");
     fs::write(slot.join("blob"), b"keep").expect("blob");
     let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "foreign", false);
-    match remove_tree_owned(fixture.path(), &slot) {
+    match remove_tree_owned(fixture.path(), &slot, None) {
         Err(LeaseError::UnexpectedEntry { place, entry }) => {
             assert_eq!(place, "slot directory");
             assert_eq!(entry, "foreign.txt");
@@ -3217,7 +3218,7 @@ fn a_metadata_named_link_recreated_during_a_slot_deletion_is_not_followed() {
     let fixture = Fixture::new("race-link");
     let slot = fixture.dir("slot");
     let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "link", false);
-    match remove_tree_owned(fixture.path(), &slot) {
+    match remove_tree_owned(fixture.path(), &slot, None) {
         Err(LeaseError::UnexpectedEntry { place, entry }) => {
             assert_eq!(place, "slot directory");
             assert_eq!(entry, ".DS_Store");
@@ -3239,7 +3240,7 @@ fn repeated_metadata_recreation_leaves_the_slot_deletion_unfinished() {
     let slot = fixture.dir("slot");
     let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "metadata", true);
     assert_eq!(
-        remove_tree_owned(fixture.path(), &slot),
+        remove_tree_owned(fixture.path(), &slot, None),
         Err(LeaseError::UnknownAccounting)
     );
     assert!(slot.is_dir(), "the slot that was not removed is kept");
@@ -3309,7 +3310,7 @@ fn an_owned_directory_left_without_read_permission_is_still_deleted_whole() {
     fs::create_dir(&inner).expect("locked directory");
     fs::write(inner.join("data"), b"x").expect("data");
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o100)).expect("search-only directory");
-    remove_tree_owned(fixture.path(), &slot).expect("owned unreadable tree is removed");
+    remove_tree_owned(fixture.path(), &slot, None).expect("owned unreadable tree is removed");
     assert!(!slot.exists(), "the whole slot is gone");
 }
 
@@ -3325,7 +3326,7 @@ fn an_owned_unreachable_directory_is_kept_not_chmodded() {
     fs::create_dir(&inner).expect("locked directory");
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).expect("unreachable directory");
     assert_eq!(
-        remove_tree_owned(fixture.path(), &slot),
+        remove_tree_owned(fixture.path(), &slot, None),
         Err(LeaseError::UnsafePath(
             "an owned directory that cannot be opened is kept, never chmodded through its name"
         ))
@@ -3350,7 +3351,7 @@ fn an_owned_write_only_directory_is_still_deleted_whole() {
     let inner = slot.join("locked");
     fs::create_dir(&inner).expect("locked directory");
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o300)).expect("write-only directory");
-    remove_tree_owned(fixture.path(), &slot).expect("owned write-only tree is removed");
+    remove_tree_owned(fixture.path(), &slot, None).expect("owned write-only tree is removed");
     assert!(!slot.exists(), "the whole slot is gone");
 }
 
@@ -3398,7 +3399,7 @@ fn a_rebound_repair_target_is_refused_and_its_referent_is_untouched() {
     });
     // The deletion refuses: the repair's no-follow open sees a link, not the
     // verified directory.
-    assert!(remove_tree_owned(fixture.path(), &slot).is_err());
+    assert!(remove_tree_owned(fixture.path(), &slot, None).is_err());
     assert_eq!(
         fs::symlink_metadata(&referent)
             .expect("referent metadata")
@@ -3475,7 +3476,7 @@ fn a_large_tolerated_metadata_file_is_still_removed() {
     let fixture = Fixture::new("metadata-no-size-cap");
     let slot = fixture.dir("slot");
     fs::write(slot.join(".DS_Store"), vec![b'd'; 5 * 1024 * 1024]).expect("large metadata");
-    remove_tree_owned(fixture.path(), &slot).expect("the owned tree is removed");
+    remove_tree_owned(fixture.path(), &slot, None).expect("the owned tree is removed");
     assert!(
         !slot.exists(),
         "a large tolerated metadata file does not block deletion"
@@ -3495,7 +3496,7 @@ fn a_refused_repair_restores_the_original_directory_mode() {
     // The finder race seam fires in the slot's own drain; a foreign entry left
     // there keeps the deletion unfinished after the repair widened the mode.
     let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("locked"), "foreign", true);
-    assert!(remove_tree_owned(fixture.path(), &slot).is_err());
+    assert!(remove_tree_owned(fixture.path(), &slot, None).is_err());
     assert_eq!(
         fs::symlink_metadata(&inner)
             .expect("kept directory")
@@ -3506,4 +3507,412 @@ fn a_refused_repair_restores_the_original_directory_mode() {
         "the owner's original mode was not restored"
     );
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// Intent-first root-capture journal and two-name recovery (oxide#155).
+// ---------------------------------------------------------------------------
+
+/// One idle whole slot in a fresh budget pool, ready for a recorded deletion.
+fn idle_slot_for_eviction(fixture: &Fixture, label: &str) -> (PathBuf, u64, PathBuf) {
+    let pool = fixture.dir(&format!("{label}-pool"));
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fixture.dir(&format!("{label}-project"));
+    let workspace = fixture.dir(&format!("{label}-workspace"));
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    fs::write(
+        leased.env.cargo_build_build_dir.join("blob"),
+        vec![7_u8; 4096],
+    )
+    .expect("blob");
+    release_injected(&pool, &leased.lease_id).expect("release");
+    let slot_id = leased.slot_id.parse::<u64>().expect("slot id");
+    let slot_path = pool.join("payload/slots").join(&leased.slot_id);
+    (pool, slot_id, slot_path)
+}
+
+/// Every capture-named entry directly inside `parent`.
+fn capture_names(parent: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(parent)
+        .expect("parent listed")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with(".oxide-capture-").then_some(name)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+fn mode_of(path: &Path) -> u32 {
+    fs::symlink_metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// A journal that records what the filesystem held at each step, so the
+/// ordering is asserted from the real deletion rather than from a mirror of it.
+struct RecordingJournal<'a> {
+    slot: &'a Path,
+    events: Vec<(
+        &'static str,
+        crate::owned_delete::RootCapturePlan,
+        bool,
+        usize,
+    )>,
+}
+
+impl crate::owned_delete::RootCaptureJournal for RecordingJournal<'_> {
+    fn planned(&mut self, plan: &crate::owned_delete::RootCapturePlan) -> Result<(), String> {
+        let parent = self.slot.parent().expect("slot parent");
+        self.events.push((
+            "planned",
+            plan.clone(),
+            self.slot.exists(),
+            capture_names(parent).len(),
+        ));
+        Ok(())
+    }
+
+    fn captured(&mut self, plan: &crate::owned_delete::RootCapturePlan) -> Result<(), String> {
+        let parent = self.slot.parent().expect("slot parent");
+        self.events.push((
+            "captured",
+            plan.clone(),
+            self.slot.exists(),
+            capture_names(parent).len(),
+        ));
+        Ok(())
+    }
+}
+
+/// The root capture is journaled intent-first through the real deletion: the
+/// planned record exists while the slot is still at its recorded name, and the
+/// captured phase is recorded only after the exclusive rename — with the
+/// root's own identity and its full mode in the record.
+#[test]
+fn the_root_capture_record_is_durable_before_the_rename() {
+    let fixture = Fixture::new("capture-order");
+    let slot = fixture.dir("slot");
+    let inner = slot.join("locked");
+    fs::create_dir(&inner).expect("nested directory");
+    fs::write(inner.join("blob"), b"x").expect("blob");
+    fs::set_permissions(&slot, fs::Permissions::from_mode(0o500)).expect("owner mode");
+    let slot_metadata = fs::symlink_metadata(&slot).expect("slot metadata");
+
+    let mut journal = RecordingJournal {
+        slot: &slot,
+        events: Vec::new(),
+    };
+    remove_tree_owned(fixture.path(), &slot, Some(&mut journal)).expect("owned tree removed");
+
+    assert_eq!(
+        journal
+            .events
+            .iter()
+            .map(|(stage, ..)| *stage)
+            .collect::<Vec<_>>(),
+        vec!["planned", "captured"],
+        "the record is written once before and once after the rename"
+    );
+    let (_, planned, original_present, captures_at_plan) = &journal.events[0];
+    assert!(
+        *original_present && *captures_at_plan == 0,
+        "the planned record was not written while the slot was at its own name"
+    );
+    assert_eq!(
+        planned.phase,
+        crate::owned_delete::RootCapturePhase::Planned
+    );
+    assert_eq!(
+        (planned.device, planned.inode),
+        (slot_metadata.dev(), slot_metadata.ino()),
+        "the record keeps the root's own identity"
+    );
+    assert_eq!(
+        planned.mode_bits(),
+        0o500,
+        "the record keeps the owner's mode"
+    );
+    assert_eq!(
+        (planned.parent_device, planned.parent_inode),
+        (
+            fs::symlink_metadata(slot.parent().expect("parent"))
+                .expect("parent metadata")
+                .dev(),
+            fs::symlink_metadata(slot.parent().expect("parent"))
+                .expect("parent metadata")
+                .ino()
+        ),
+        "the record keeps the verified parent's identity"
+    );
+    let (_, captured, original_present, captures_at_capture) = &journal.events[1];
+    assert!(
+        !*original_present && *captures_at_capture == 1,
+        "the captured phase was recorded before the exclusive rename"
+    );
+    // The seam hands the same plan to the captured step; recording the
+    // captured phase is the caller's own journal step (the pool tests assert
+    // the lease's ledger then reads `Captured`).
+    assert_eq!(captured, planned, "both steps describe one object");
+    assert!(!slot.exists(), "the tree is gone");
+    assert!(capture_names(fixture.path()).is_empty());
+}
+
+/// End the real deletion at one root-capture stage the way a crash does: no
+/// put-back, no journal write and no ledger write runs after the panic.
+fn crash_eviction(pool: &Path, slot_id: u64, stage: crate::test_fs::RootCaptureCrash) {
+    let slot_id = slot_id.to_string();
+    let armed = crate::test_fs::root_capture_crash(stage);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        evict_idle_slot_injected(pool, &slot_id)
+    }));
+    drop(armed);
+    assert!(
+        outcome.is_err(),
+        "the armed crash at {stage:?} did not fire"
+    );
+}
+
+/// A crash after the planned record and before the rename: the ledger names the
+/// planned private name while the slot is still at its own, and the next open
+/// reconciles both names and finishes the deletion.
+#[test]
+fn a_crash_before_the_rename_recovers_the_recorded_slot() {
+    let fixture = Fixture::new("crash-planned");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-planned");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+
+    crash_eviction(&pool, slot_id, crate::test_fs::RootCaptureCrash::Planned);
+    let plan = super::pool::capture_record_injected(&pool, slot_id).expect("planned record");
+    assert_eq!(
+        plan.phase,
+        crate::owned_delete::RootCapturePhase::Planned,
+        "the planned phase is what the crashed run recorded"
+    );
+    assert!(slot_path.is_dir(), "the slot is still at its recorded name");
+    assert!(
+        capture_names(&parent).is_empty(),
+        "no private name exists before the rename"
+    );
+
+    let after = status_injected(&pool).expect("status");
+    assert!(after.slots.is_empty(), "the recorded deletion completed");
+    assert!(!slot_path.exists(), "the slot is gone");
+    assert!(
+        capture_names(&parent).is_empty(),
+        "no capture is left behind"
+    );
+    assert!(
+        super::pool::capture_record_injected(&pool, slot_id).is_none(),
+        "the reconciled record is gone"
+    );
+}
+
+/// A crash after the rename but before its phase is recorded: the record names
+/// the planned private name and the original name is free. Recovery finds the
+/// captured root under the recorded private name, puts it back and finishes.
+#[test]
+fn a_crash_between_the_rename_and_its_phase_recovers_the_capture() {
+    let fixture = Fixture::new("crash-renamed");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-renamed");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+
+    crash_eviction(&pool, slot_id, crate::test_fs::RootCaptureCrash::Renamed);
+    let plan = super::pool::capture_record_injected(&pool, slot_id).expect("planned record");
+    assert_eq!(
+        plan.phase,
+        crate::owned_delete::RootCapturePhase::Planned,
+        "the crashed run never recorded the captured phase"
+    );
+    assert!(!slot_path.exists(), "the root left its recorded name");
+    assert_eq!(
+        capture_names(&parent),
+        vec![plan.private.clone()],
+        "the recorded private name holds the captured root"
+    );
+    assert!(
+        parent.join(&plan.private).is_dir(),
+        "the captured tree is still there"
+    );
+
+    let after = status_injected(&pool).expect("status");
+    assert!(after.slots.is_empty(), "the recorded deletion completed");
+    assert!(!slot_path.exists(), "the slot is gone");
+    assert!(
+        capture_names(&parent).is_empty(),
+        "the capture name is gone"
+    );
+}
+
+/// A crash mid-delete: the captured phase is durable, the root is under the
+/// recorded private name with some children already deleted. Recovery puts the
+/// root back under its recorded name and the next deletion finishes it, so no
+/// private-named tree is ever stranded in the payload.
+#[test]
+fn a_crash_mid_delete_restores_the_captured_root_and_finishes() {
+    let fixture = Fixture::new("crash-mid-delete");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-mid-delete");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let children_before = fs::read_dir(&slot_path).expect("slot listed").count();
+    assert!(children_before > 0, "the slot holds a build tree");
+
+    crash_eviction(&pool, slot_id, crate::test_fs::RootCaptureCrash::MidDelete);
+    let plan = super::pool::capture_record_injected(&pool, slot_id).expect("captured record");
+    assert_eq!(
+        plan.phase,
+        crate::owned_delete::RootCapturePhase::Captured,
+        "the captured phase was durable before the tree was walked"
+    );
+    assert!(!slot_path.exists(), "the root is under its private name");
+    let captured = parent.join(&plan.private);
+    assert!(
+        captured.is_dir(),
+        "the captured tree is still in the payload"
+    );
+    assert_eq!(capture_names(&parent), vec![plan.private.clone()]);
+    let children_after = fs::read_dir(&captured)
+        .expect("captured tree listed")
+        .count();
+    assert!(
+        children_after < children_before,
+        "the crash left the tree mid-delete ({children_after} of {children_before} children)"
+    );
+
+    let after = status_injected(&pool).expect("status");
+    assert!(after.slots.is_empty(), "the recorded deletion completed");
+    assert!(!slot_path.exists(), "the slot is gone");
+    assert!(
+        capture_names(&parent).is_empty(),
+        "no capture is left behind"
+    );
+}
+
+/// A crate-owned racer takes the recorded name while the captured root waits
+/// under its private name: recovery sees both names and keeps everything —
+/// both names, the record, and the pool's refusal — never a partial delete.
+#[test]
+fn a_racer_at_the_recorded_name_keeps_both_names_and_the_record() {
+    let fixture = Fixture::new("crash-putback-failed");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-putback-failed");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+
+    crash_eviction(&pool, slot_id, crate::test_fs::RootCaptureCrash::Renamed);
+    let plan = super::pool::capture_record_injected(&pool, slot_id).expect("capture record");
+    // A foreign object now sits at the recorded name, so the put-back cannot
+    // happen without replacing it.
+    fs::write(&slot_path, b"foreign").expect("foreign replacement");
+    let captured = parent.join(&plan.private);
+
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(
+        after.slots.len(),
+        1,
+        "the unfinished deletion stays recorded"
+    );
+    assert_eq!(after.slots[0].state, SlotOccupancy::Abandoned);
+    assert_eq!(
+        after.coverage,
+        AccountingCoverage::Unknown,
+        "a blocked reconciliation is not complete coverage"
+    );
+    assert_eq!(
+        fs::read(&slot_path).expect("foreign object kept"),
+        b"foreign",
+        "the racer's object is untouched"
+    );
+    assert!(captured.is_dir(), "the captured tree is untouched");
+    assert_eq!(
+        capture_names(&parent),
+        vec![plan.private.clone()],
+        "the private name is kept"
+    );
+    assert!(
+        super::pool::capture_record_injected(&pool, slot_id).is_some(),
+        "the record is retained on a failed put-back"
+    );
+    let project = fixture.dir("crash-putback-failed-project-b");
+    let workspace = fixture.dir("crash-putback-failed-workspace-b");
+    assert_eq!(
+        lease_injected(request(&pool, &project, &workspace, "next")),
+        Err(LeaseError::UnknownAccounting),
+        "new leases stay refused while the two names disagree"
+    );
+}
+
+/// A recorded capture whose object is not the recorded root is uncertain: the
+/// record and every object are kept and nothing is removed.
+#[test]
+fn a_capture_record_whose_identity_changed_blocks_and_keeps_everything() {
+    let fixture = Fixture::new("crash-identity");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-identity");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+
+    crash_eviction(&pool, slot_id, crate::test_fs::RootCaptureCrash::Renamed);
+    let plan = super::pool::capture_record_injected(&pool, slot_id).expect("capture record");
+    let captured = parent.join(&plan.private);
+    let foreign = fixture.dir("not-the-root");
+    fs::create_dir(foreign.join("content")).expect("foreign content");
+    // The recorded original name is now the wrong object.
+    fs::rename(&foreign, &slot_path).expect("foreign directory at the recorded name");
+
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the record is kept");
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert!(
+        slot_path.join("content").is_dir(),
+        "the foreign directory is untouched"
+    );
+    assert!(captured.is_dir(), "the captured tree is untouched");
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
+/// A crash after the product widened the captured root's mode: the record keeps
+/// the owner's exact mode, and the two-name recovery puts the root back with
+/// exactly that mode — not the widened one.
+#[test]
+fn a_crash_after_widening_the_capture_restores_the_owners_exact_mode() {
+    let fixture = Fixture::new("crash-mode");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-mode");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o500)).expect("owner mode");
+
+    crash_eviction(
+        &pool,
+        slot_id,
+        crate::test_fs::RootCaptureCrash::ModeWidened,
+    );
+    let plan = super::pool::capture_record_injected(&pool, slot_id).expect("capture record");
+    assert_eq!(
+        plan.mode_bits(),
+        0o500,
+        "the durable record keeps the owner's mode, not the widened one"
+    );
+    let captured = parent.join(&plan.private);
+    assert_eq!(
+        mode_of(&captured),
+        0o700,
+        "the product widened the captured root"
+    );
+
+    // The recorded recovery restores the captured tree under its recorded name
+    // with exactly the recorded mode.
+    let held = File::open(&parent).expect("parent descriptor");
+    let name = std::ffi::CString::new(slot_path.file_name().expect("slot leaf").as_encoded_bytes())
+        .expect("leaf name");
+    crate::owned_delete::restore_root_capture(held.as_fd(), &name, &plan).expect("put back");
+    assert!(!captured.exists(), "the private name is free again");
+    assert_eq!(
+        mode_of(&slot_path),
+        0o500,
+        "the owner's exact mode was restored through the record"
+    );
+
+    let after = status_injected(&pool).expect("status");
+    assert!(after.slots.is_empty(), "the recorded deletion completed");
+    assert!(!slot_path.exists());
+    assert!(capture_names(&parent).is_empty());
 }

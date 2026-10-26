@@ -387,3 +387,62 @@ pub(crate) fn run_before_repair() {
         action();
     }
 }
+
+/// The exact point at which a test models an abrupt process end inside the
+/// journaled root capture of a whole-slot deletion. A real crash runs no
+/// put-back, no journal write and no ledger write, so the armed action panics
+/// and the test unwinds without any of that.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootCaptureCrash {
+    /// The planned record is durable and the exclusive rename has not run.
+    Planned,
+    /// The rename is durable and the captured phase is not recorded.
+    Renamed,
+    /// The captured root's mode was widened and the tree was not walked.
+    ModeWidened,
+    /// The captured root lost its first child deletion.
+    MidDelete,
+}
+
+thread_local! {
+    static ROOT_CRASH: RefCell<Option<RootCaptureCrash>> = const { RefCell::new(None) };
+}
+
+/// Arm one root-capture crash. The armed stage fires once; the guard clears it
+/// for a test that does not reach the stage.
+#[must_use = "dropping the guard ends the armed crash"]
+pub(crate) struct RootCaptureCrashGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn root_capture_crash(stage: RootCaptureCrash) -> RootCaptureCrashGuard {
+    ROOT_CRASH.with(|cell| {
+        assert!(cell.borrow().is_none(), "overlapping root-capture crashes");
+        *cell.borrow_mut() = Some(stage);
+    });
+    RootCaptureCrashGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for RootCaptureCrashGuard {
+    fn drop(&mut self) {
+        ROOT_CRASH.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed root-capture crash for this stage, if any.
+pub(crate) fn run_root_capture(stage: RootCaptureCrash) {
+    let armed = ROOT_CRASH.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.as_ref() != Some(&stage) {
+            return None;
+        }
+        cell.take()
+    });
+    if armed.is_some() {
+        panic!("test: modelled crash at root capture stage {stage:?}");
+    }
+}
