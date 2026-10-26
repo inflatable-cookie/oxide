@@ -13,7 +13,10 @@
 mod backing;
 mod pool;
 
-use crate::owned_delete::{descriptor_identity, names_of, open_directory_at};
+use crate::owned_delete::{
+    capture_entry, descriptor_identity, names_of, observe_entry, open_directory_at, put_back,
+    remove_captured_directory, unlink_captured, verify_captured,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -780,6 +783,17 @@ fn random_hex(bytes: usize) -> Result<String, LeaseError> {
 fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
     let name = path.file_name().ok_or(LeaseError::UnknownAccounting)?;
     let parent_path = path.parent().ok_or(LeaseError::UnknownAccounting)?;
+    // Containment is decided once, from the real path, while the tree is still
+    // at its recorded names: after a capture every level below is addressed by
+    // a private name, and descriptor identity plus the capture verification is
+    // what authorizes those levels.
+    let canonical = fs::canonicalize(path).map_err(io_error)?;
+    let canonical_root = fs::canonicalize(root).map_err(io_error)?;
+    if !canonical.starts_with(&canonical_root) || canonical == canonical_root {
+        return Err(LeaseError::UnsafePath(
+            "deletion is limited to recorded owned slot paths",
+        ));
+    }
     let parent = open_verified_directory(parent_path)?;
     let name =
         std::ffi::CString::new(name.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
@@ -793,116 +807,135 @@ fn remove_tree_owned_at(
     name: &std::ffi::CString,
     path: &Path,
 ) -> Result<(), LeaseError> {
-    let stat = stat_at(parent, name)?;
-    let kind = stat.st_mode & libc::S_IFMT;
-    if kind == libc::S_IFLNK {
-        if stat_uid(&stat) != current_uid() {
+    // Observe the entry first, then *capture* it under a private name this
+    // process just created. Every later check and the removal itself act on
+    // that private name, so nothing a racer does to the original name can
+    // redirect a delete.
+    let observed = observe_entry(parent, name).map_err(io_error)?;
+    if observed.mode == libc::S_IFLNK {
+        if observed.uid != current_uid() {
             return Err(LeaseError::UnsafePath(
                 "refusing to delete a foreign symlink",
             ));
         }
-        // The parent is the verified owned directory this recursion holds.
-        // `unlinkat` without a flag removes the link itself, never its target.
-        return unlink_at(parent, name, 0).map_err(io_error);
-    }
-    if kind == libc::S_IFREG {
-        if stat_uid(&stat) != current_uid() {
+    } else if observed.mode == libc::S_IFREG {
+        if observed.uid != current_uid() {
             return Err(LeaseError::UnsafePath("refusing to delete a foreign file"));
         }
-        return unlink_at(parent, name, 0).map_err(io_error);
-    }
-    if kind != libc::S_IFDIR {
+    } else if observed.mode == libc::S_IFDIR {
+        // Containment was proved once for the whole tree from its recorded
+        // path; this level is authorized by the held parent plus the captured
+        // identity check below.
+        let _ = root;
+        if observed.uid != current_uid() {
+            return Err(LeaseError::UnsafePath(
+                "refusing to delete a foreign directory",
+            ));
+        }
+    } else {
         return Err(LeaseError::UnknownAccounting);
     }
-    let canonical = fs::canonicalize(path).map_err(io_error)?;
-    let canonical_root = fs::canonicalize(root).map_err(io_error)?;
-    if !canonical.starts_with(&canonical_root) || canonical == canonical_root {
-        return Err(LeaseError::UnsafePath(
-            "deletion is limited to recorded owned slot paths",
-        ));
+    let capture = capture_entry(parent, name).map_err(io_error)?;
+    if verify_captured(parent, &capture, &observed).is_err() {
+        let restored = put_back(parent, &capture).is_ok();
+        return Err(if restored {
+            LeaseError::UnsafePath("the verified entry was replaced before its capture")
+        } else {
+            LeaseError::UnknownAccounting
+        });
     }
-    if stat_uid(&stat) != current_uid() {
-        return Err(LeaseError::UnsafePath(
-            "refusing to delete a foreign directory",
-        ));
+    if observed.mode != libc::S_IFDIR {
+        // A captured file or link is removed by its private name only; a link's
+        // referent is never touched.
+        return unlink_captured(parent, &capture).map_err(io_error);
     }
-    // An owned directory a build or test left read-only (Effigy fixtures make
-    // `.effigy/state/objects/<hash>` read-only under a slot's child scratch)
-    // cannot have its entries removed. Restore the owner's own access first;
-    // it is already verified as an owned real directory inside the slot. A
-    // directory the owner made unreadable cannot even be opened, so that
-    // restore happens through the held parent and the identity is revalidated
-    // on the re-open.
-    let child = match open_directory_at(parent, name) {
+    let child = match open_directory_at(parent, &capture.private) {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             // The repair boundary: a replacement here must be refused, never
             // repaired through its name.
             #[cfg(test)]
             crate::test_fs::run_before_repair();
-            // A search-only descriptor of this very entry, its identity
-            // revalidated before the repair: no path and no link is involved,
-            // so an out-of-tree referent can never be chmodded.
-            let repair = match crate::owned_delete::open_directory_for_repair(parent, name) {
+            let repair = match crate::owned_delete::open_directory_for_repair(
+                parent,
+                &capture.private,
+            ) {
                 Ok(repair) => repair,
-                // A directory without its own search bit cannot be reached by
-                // any descriptor as this user. Repairing it would need a chmod
-                // through the name, which could follow a replacement link, so
-                // it is kept and the deletion refuses instead.
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    let _ = put_back(parent, &capture);
                     return Err(LeaseError::UnsafePath(
                         "an owned directory that cannot be opened is kept, never chmodded through its name",
-                    ))
+                    ));
                 }
                 Err(error) => return Err(io_error(error)),
             };
             let repaired = descriptor_identity(repair.as_fd()).map_err(io_error)?;
-            if repaired != (stat_device(&stat), stat_ino(&stat)) {
+            if repaired != (observed.device, observed.inode) {
+                let _ = put_back(parent, &capture);
                 return Err(LeaseError::UnsafePath(
                     "the verified directory was replaced before its access was repaired",
                 ));
             }
             crate::owned_delete::restore_owner_access(repair.as_fd()).map_err(io_error)?;
-            open_directory_at(parent, name).map_err(io_error)?
+            open_directory_at(parent, &capture.private).map_err(io_error)?
         }
-        Err(error) => return Err(io_error(error)),
+        Err(error) => {
+            let _ = put_back(parent, &capture);
+            return Err(io_error(error));
+        }
     };
-    // Revalidate identity at the effect boundary: the descriptor must still be
-    // the entry this recursion inspected, not a replacement under the same
-    // name.
     let held = descriptor_identity(child.as_fd()).map_err(io_error)?;
-    if held != (stat_device(&stat), stat_ino(&stat)) {
+    if held != (observed.device, observed.inode) {
+        let _ = put_back(parent, &capture);
         return Err(LeaseError::UnsafePath(
             "the verified directory was replaced before it was opened",
         ));
     }
-    let mode = stat.st_mode & 0o7777;
+    let mode = observed.mode_bits();
     if mode & 0o700 != 0o700 {
         // SAFETY: `child` is a live descriptor for the verified directory.
         if unsafe { libc::fchmod(child.as_raw_fd(), mode | 0o700) } != 0 {
+            let _ = put_back(parent, &capture);
             return Err(io_error(std::io::Error::last_os_error()));
         }
     }
-    let label = std::ffi::OsStr::from_bytes(name.to_bytes());
     for entry in names_of(child.as_fd()).map_err(io_error)? {
         let entry =
             std::ffi::CString::new(entry.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
         let entry_path = path.join(std::ffi::OsStr::from_bytes(entry.as_bytes()));
-        remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path)?;
+        if let Err(error) = remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path) {
+            // Leave the captured directory under its original name where the
+            // racer has not taken it, and keep the private name otherwise.
+            let _ = put_back(parent, &capture);
+            return Err(error);
+        }
     }
-    // The lease caller has no reserve, volume or deadline check of its own to
-    // run between metadata unlinks; its bound is the seam's fixed attempt
-    // bound.
-    let mut between = || Ok::<(), crate::owned_delete::DrainStop>(());
-    match crate::owned_delete::rmdir_retrying_finder_metadata(
+    // The seam's label is the entry's *observed* name: it is diagnostic and
+    // drives the debug-only proof injection, and a private capture name would
+    // hide both from the proof. The removal itself uses the private name.
+    let label = std::ffi::OsStr::from_bytes(name.to_bytes());
+    let outcome = crate::owned_delete::rmdir_retrying_finder_metadata(
         parent,
-        name,
+        &capture.private,
         child.as_fd(),
         label,
-        &mut between,
+        &mut || Ok::<(), crate::owned_delete::DrainStop>(()),
+    );
+    // Anything but a positive removal restores the recorded name, so a refused
+    // or pending slot is never left under a capture name the ledger cannot
+    // name.
+    if !matches!(
+        outcome,
+        crate::owned_delete::Rmdir::Removed | crate::owned_delete::Rmdir::Vanished
     ) {
-        // A directory that is gone is removed, and this slot's recorded
-        // deletion can be cleared: nothing of it remains.
+        let restored = put_back(parent, &capture).is_ok();
+        if !restored {
+            return Err(LeaseError::Io(
+                "a refused slot directory was left under its capture name".to_owned(),
+            ));
+        }
+    }
+    match outcome {
         crate::owned_delete::Rmdir::Removed | crate::owned_delete::Rmdir::Vanished => Ok(()),
         crate::owned_delete::Rmdir::Failed { error } => Err(io_error(error)),
         crate::owned_delete::Rmdir::Replaced { entry }
@@ -910,8 +943,20 @@ fn remove_tree_owned_at(
             place: "slot directory",
             entry,
         }),
-        // A bound, a mid-drain stop, or new content that is not Finder
-        // metadata is unknown accounting: the slot's deletion stays unfinished.
+        crate::owned_delete::Rmdir::Mismatch {
+            original,
+            private,
+            restored,
+            ..
+        } => Err(LeaseError::Io(format!(
+            "a captured slot entry ({private}) was not the observed {original}; {}",
+            if restored {
+                "it was put back and nothing was deleted"
+            } else {
+                "the original name was taken, so both names are kept"
+            }
+        ))),
+        crate::owned_delete::Rmdir::CaptureFailed { error } => Err(io_error(error)),
         crate::owned_delete::Rmdir::RefusedMany { .. }
         | crate::owned_delete::Rmdir::Exhausted { .. }
         | crate::owned_delete::Rmdir::Stopped { .. }

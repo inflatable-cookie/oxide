@@ -72,6 +72,15 @@ pub const FINDER_RACE_ATTEMPTS: u32 = 3;
 /// Short pause between attempts, so a writer that is mid-create is not polled
 /// in a tight loop. It is part of the fixed bound, not a wait for Finder.
 pub const FINDER_RACE_PAUSE: Duration = Duration::from_millis(10);
+/// Captured entries are renamed to a private name carrying 128 random bits.
+pub const CAPTURE_TAG_BYTES: usize = 16;
+/// Every captured name carries this prefix, so a leftover capture is
+/// recognisable in a directory listing.
+pub const CAPTURE_PREFIX: &str = ".oxide-capture-";
+/// Tolerated Finder metadata is small; a captured regular file larger than
+/// this is not treated as metadata and is put back.
+pub const FINDER_METADATA_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Most names one re-list may see and unlink. Recreated Finder metadata is one
 /// or two entries; a directory that gained more content than this is not this
 /// race and is refused.
@@ -173,6 +182,19 @@ pub enum Rmdir {
     RefusedMany { entries: u64 },
     /// The removal failed for any other reason.
     Failed { error: io::Error },
+    /// A captured entry was not the observed object. It was either put back
+    /// under its original name or, when a racer had already taken that name,
+    /// left under the private name. Both names are reported; nothing was
+    /// deleted.
+    Mismatch {
+        original: String,
+        private: String,
+        restored: bool,
+        kind: &'static str,
+    },
+    /// A capture rename failed, so nothing was removed and the caller stops
+    /// pending.
+    CaptureFailed { error: io::Error },
     /// The caller's between-entries check stopped the drain. The entries it
     /// unlinked before stopping stay deleted; every remaining entry, and the
     /// directory itself, are left exactly as they were found.
@@ -300,6 +322,196 @@ struct VerifiedEntry {
     name: CString,
     device: u64,
     inode: u64,
+    size: u64,
+    /// 1-based position in this round's verified list, for the test seams.
+    ordinal: u32,
+}
+
+/// One entry moved to an unguessable private name inside the same directory.
+///
+/// The object is captured *before* it is verified, so verification and removal
+/// both act on a name the deleting process itself just created: a same-user
+/// racer can no longer substitute anything between a check and a removal,
+/// because the name being removed is not one the racer knows.
+#[derive(Debug)]
+pub struct Capture {
+    /// The private name now holding the object.
+    pub private: CString,
+    /// The name the object was observed under.
+    pub original: CString,
+}
+
+/// Facts about one directory entry, read with `fstatat` and `AT_SYMLINK_NOFOLLOW`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryFacts {
+    pub device: u64,
+    pub inode: u64,
+    pub mode: libc::mode_t,
+    pub uid: u32,
+    pub size: u64,
+}
+
+impl EntryFacts {
+    pub fn is_regular(&self) -> bool {
+        self.mode == libc::S_IFREG
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.mode == libc::S_IFDIR
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode == libc::S_IFLNK
+    }
+
+    /// The permission bits of the observed entry.
+    pub fn mode_bits(&self) -> libc::mode_t {
+        self.mode & 0o7777
+    }
+}
+
+/// One exclusive rename inside a single held directory: never across
+/// directories, never replacing an existing name.
+fn rename_exclusive(dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the descriptor and both C strings are live for the call.
+        let status = unsafe {
+            libc::renameatx_np(
+                dir.as_raw_fd(),
+                from.as_ptr(),
+                dir.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if status == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the descriptor and both C strings are live for the call.
+        let status = unsafe {
+            libc::renameat2(
+                dir.as_raw_fd(),
+                from.as_ptr(),
+                dir.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if status == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (dir, from, to);
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+}
+
+fn random_tag() -> io::Result<String> {
+    let mut value = vec![0_u8; CAPTURE_TAG_BYTES];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut value))
+        .map_err(|_| io::Error::other("cannot read a random capture tag"))?;
+    use std::fmt::Write as _;
+    let mut tag = String::with_capacity(CAPTURE_TAG_BYTES * 2);
+    for byte in value {
+        let _ = write!(&mut tag, "{byte:02x}");
+    }
+    Ok(tag)
+}
+
+/// Capture `name` under a fresh private name in the same directory. Retries a
+/// name collision a bounded number of times; any other rename error is the
+/// caller's stop.
+pub fn capture_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<Capture> {
+    for _ in 0..8 {
+        let private = CString::new(format!("{CAPTURE_PREFIX}{}", random_tag()?))
+            .map_err(|_| io::Error::other("capture name"))?;
+        match rename_exclusive(dir, name, &private) {
+            Ok(()) => {
+                return Ok(Capture {
+                    private,
+                    original: name.to_owned(),
+                })
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::EEXIST))
+}
+
+/// `fstatat` facts for one name in a held directory, never following a link.
+pub fn observe_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryFacts> {
+    let stat = stat_at(dir, name)?;
+    Ok(EntryFacts {
+        device: stat_device(&stat),
+        inode: stat_ino(&stat),
+        mode: stat_mode(&stat),
+        uid: stat_uid(&stat),
+        size: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
+    })
+}
+
+/// The captured object must be the object that was observed: same device, same
+/// inode and same type. Anything else is a mismatch and is never removed.
+pub fn verify_captured(
+    dir: BorrowedFd<'_>,
+    capture: &Capture,
+    observed: &EntryFacts,
+) -> Result<EntryFacts, &'static str> {
+    let captured = observe_entry(dir, &capture.private).map_err(|_| "unreadable capture")?;
+    if captured.device != observed.device {
+        return Err("captured object is on another device");
+    }
+    if captured.inode != observed.inode {
+        return Err("captured object is not the observed entry");
+    }
+    if captured.mode != observed.mode {
+        return Err("captured object changed type");
+    }
+    Ok(captured)
+}
+
+/// Put a captured object back under its original name, exclusively. A racer
+/// that took that name again makes this fail; the caller then leaves the
+/// private name in place and reports both.
+pub fn put_back(dir: BorrowedFd<'_>, capture: &Capture) -> io::Result<()> {
+    rename_exclusive(dir, &capture.private, &capture.original)
+}
+
+/// Remove the captured regular file or link by its private name only.
+pub fn unlink_captured(dir: BorrowedFd<'_>, capture: &Capture) -> io::Result<()> {
+    // SAFETY: the descriptor and the private C string are live for the call.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), capture.private.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Remove the captured (already emptied) directory by its private name only.
+pub fn remove_captured_directory(dir: BorrowedFd<'_>, capture: &Capture) -> io::Result<()> {
+    // SAFETY: the descriptor and the private C string are live for the call.
+    if unsafe {
+        libc::unlinkat(
+            dir.as_raw_fd(),
+            capture.private.as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn drain_finder_metadata(
@@ -341,6 +553,8 @@ fn drain_finder_metadata(
                 name,
                 device: identity.0,
                 inode: identity.1,
+                size: identity.2,
+                ordinal: u32::try_from(verified.len() + 1).unwrap_or(u32::MAX),
             }),
             Ok(None) => {
                 return Err(Rmdir::Refused {
@@ -356,8 +570,7 @@ fn drain_finder_metadata(
     let mut entries = 0;
     for entry in &verified {
         // The directory binding is revalidated for every entry, not only once
-        // per round: a name rebound while the drain runs stops it before the
-        // next unlink.
+        // per round: a name rebound while the drain runs stops it.
         match held_name(parent, name, dir) {
             Ok(HeldName::Held) => {}
             Ok(HeldName::Vanished) => return Err(Rmdir::Vanished),
@@ -368,24 +581,67 @@ fn drain_finder_metadata(
             }
             Err(error) => return Err(Rmdir::Failed { error }),
         }
-        // Revalidate the exact entry immediately before its unlink: a
-        // metadata-named replacement (a link, a directory, another device or
-        // another inode) is refused and left alone.
-        match metadata_identity(dir, &entry.name, device) {
-            Ok(Some((device, inode))) if device == entry.device && inode == entry.inode => {}
-            Ok(Some(_)) | Ok(None) => {
-                return Err(Rmdir::Refused {
-                    entry: entry_label(OsStr::from_bytes(entry.name.to_bytes())),
-                })
+        // Capture first: from here on the object lives under a private name
+        // this process just created, so nothing a racer does to the original
+        // name can redirect the removal.
+        #[cfg(test)]
+        crate::test_fs::run_before_capture(entry.ordinal);
+        let capture = match capture_entry(dir, &entry.name) {
+            Ok(capture) => capture,
+            Err(error) => return Err(Rmdir::CaptureFailed { error }),
+        };
+        let observed = EntryFacts {
+            device: entry.device,
+            inode: entry.inode,
+            mode: libc::S_IFREG,
+            uid: caller_uid(),
+            size: entry.size,
+        };
+        // Verify the *captured* object against the observation, never the name
+        // a racer could still be holding.
+        let mismatch = match verify_captured(dir, &capture, &observed) {
+            Ok(facts)
+                if facts.is_regular()
+                    && facts.device == device
+                    && facts.uid == caller_uid()
+                    && facts.size <= FINDER_METADATA_MAX_BYTES =>
+            {
+                None
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(Rmdir::Failed { error }),
+            Ok(_) => Some("the captured entry is not tolerated Finder metadata"),
+            Err(reason) => Some(reason),
+        };
+        if let Some(kind) = mismatch {
+            let restored = put_back(dir, &capture).is_ok();
+            return Err(Rmdir::Mismatch {
+                original: entry_label(OsStr::from_bytes(entry.name.to_bytes())),
+                private: entry_label(OsStr::from_bytes(capture.private.to_bytes())),
+                restored,
+                kind,
+            });
+        }
+        // Parent binding rechecked after the capture.
+        match held_name(parent, name, dir) {
+            Ok(HeldName::Held) => {}
+            Ok(HeldName::Vanished) => {
+                let _ = put_back(dir, &capture);
+                return Err(Rmdir::Vanished);
+            }
+            Ok(HeldName::Different) => {
+                let _ = put_back(dir, &capture);
+                return Err(Rmdir::Replaced {
+                    entry: entry_label(OsStr::from_bytes(name.to_bytes())),
+                });
+            }
+            Err(error) => {
+                let _ = put_back(dir, &capture);
+                return Err(Rmdir::Failed { error });
+            }
         }
         #[cfg(test)]
         crate::test_fs::run_before_unlink();
-        // SAFETY: `dir` and the C string are live for the call. This unlinks
-        // the name itself; a symlink is never followed by `unlinkat`.
-        let status = unsafe { libc::unlinkat(dir.as_raw_fd(), entry.name.as_ptr(), 0) };
+        // Only the private name this process created is removed.
+        let status = unsafe { libc::unlinkat(dir.as_raw_fd(), capture.private.as_ptr(), 0) };
         if status == 0 {
             entries += 1;
             // The caller's own bounded check runs after *every* metadata unlink,
@@ -414,7 +670,7 @@ fn metadata_identity(
     dir: BorrowedFd<'_>,
     name: &CStr,
     device: u64,
-) -> io::Result<Option<(u64, u64)>> {
+) -> io::Result<Option<(u64, u64, u64)>> {
     let stat = stat_at(dir, name)?;
     if !is_finder_metadata(OsStr::from_bytes(name.to_bytes()))
         || stat_mode(&stat) != libc::S_IFREG
@@ -423,7 +679,11 @@ fn metadata_identity(
     {
         return Ok(None);
     }
-    Ok(Some((stat_device(&stat), stat_ino(&stat))))
+    Ok(Some((
+        stat_device(&stat),
+        stat_ino(&stat),
+        u64::try_from(stat.st_size).unwrap_or(u64::MAX),
+    )))
 }
 
 /// What one name in a held parent currently denotes, relative to the held

@@ -274,6 +274,62 @@ impl Drop for BeforeUnlinkGuard {
 
 /// Fire the armed action, if any. Called by the seam before each per-entry
 /// unlink; a no-op everywhere else.
+/// Fire the armed capture action for this 1-based entry ordinal, if any.
+pub(crate) fn run_before_capture(ordinal: u32) {
+    let action = BEFORE_CAPTURE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let armed = cell.as_mut()?;
+        if armed.ordinal != ordinal {
+            return None;
+        }
+        cell.take().map(|armed| armed.action)
+    });
+    if let Some(action) = action {
+        action();
+    }
+}
+
+thread_local! {
+    static BEFORE_CAPTURE: RefCell<Option<ArmedCapture>> = const { RefCell::new(None) };
+}
+
+struct ArmedCapture {
+    ordinal: u32,
+    action: Box<dyn FnOnce()>,
+}
+
+/// Arm one action that runs immediately *before* the drain captures the
+/// `ordinal`-th verified entry. This is how a test puts a replacement at the
+/// original name after its checks and before the capture.
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct BeforeCaptureGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn before_capture(ordinal: u32, action: impl FnOnce() + 'static) -> BeforeCaptureGuard {
+    BEFORE_CAPTURE.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping before-capture injections"
+        );
+        *cell.borrow_mut() = Some(ArmedCapture {
+            ordinal: ordinal.max(1),
+            action: Box::new(action),
+        });
+    });
+    BeforeCaptureGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for BeforeCaptureGuard {
+    fn drop(&mut self) {
+        BEFORE_CAPTURE.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
 pub(crate) fn run_before_unlink() {
     let action = BEFORE_UNLINK.with(|cell| {
         let mut cell = cell.borrow_mut();

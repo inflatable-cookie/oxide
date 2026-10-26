@@ -3369,10 +3369,32 @@ fn a_rebound_repair_target_is_refused_and_its_referent_is_untouched() {
     fs::create_dir(&locked).expect("locked directory");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
 
-    let (slot_path, locked_path, referent_path) = (slot.clone(), locked.clone(), referent.clone());
+    let (fixture_path, referent_path) = (fixture.path().to_path_buf(), referent.clone());
     let _rebind = crate::test_fs::before_repair(move || {
-        fs::rename(slot_path.join("locked"), slot_path.join("locked-moved")).expect("rename away");
-        symlink(&referent_path, &locked_path).expect("replacement link");
+        // The slot and the entry are both captured under private names by this
+        // point, so those are the names the racer has to replace.
+        let captures = |dir: &Path| -> Vec<std::path::PathBuf> {
+            fs::read_dir(dir)
+                .expect("directory listed")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"))
+                })
+                .collect()
+        };
+        let slot_capture = captures(&fixture_path)
+            .into_iter()
+            .next()
+            .expect("the slot is captured under a private name");
+        let entry_capture = captures(&slot_capture)
+            .into_iter()
+            .next()
+            .expect("the entry is captured under a private name");
+        fs::rename(&entry_capture, slot_capture.join("captured-moved"))
+            .expect("rename the capture away");
+        symlink(&referent_path, &entry_capture).expect("replacement link at the private name");
     });
     // The deletion refuses: the repair's no-follow open sees a link, not the
     // verified directory.
@@ -3386,16 +3408,28 @@ fn a_rebound_repair_target_is_refused_and_its_referent_is_untouched() {
         0o000,
         "the referent's mode changed through the repair"
     );
+    // The captured object is never removed: the slot is restored under its
+    // recorded name and the racer's replacement link is still inside it.
     assert!(
-        fs::symlink_metadata(slot.join("locked"))
-            .expect("replacement link kept")
-            .file_type()
-            .is_symlink(),
+        fs::read_dir(&slot)
+            .expect("restored slot listed")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_symlink())),
         "the replacement link is untouched"
     );
     fs::set_permissions(&referent, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
-    fs::set_permissions(slot.join("locked-moved"), fs::Permissions::from_mode(0o700))
-        .expect("fixture cleanup");
+    // The racer moved the capture aside and put a writable link in its place, so
+    // the only restrictive leftover is that moved capture.
+    for entry in fs::read_dir(&slot).expect("restored slot listed") {
+        let path = entry.expect("entry").path();
+        if fs::symlink_metadata(&path)
+            .expect("metadata")
+            .file_type()
+            .is_dir()
+        {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
+        }
+    }
 }
 
 /// The falsifying control for that test: the *following* repair this code used

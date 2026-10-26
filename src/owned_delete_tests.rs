@@ -365,29 +365,24 @@ fn an_entry_that_vanishes_before_its_unlink_does_not_fail_the_round() {
     assert!(!tree.exists());
 }
 
-/// Whether both tolerated metadata entries are gone from `held`, which would
-/// mean the drain deleted more than the single entry its last check covered.
-fn verified_names_removed_twice(held: &Path) -> bool {
-    !held.join(".DS_Store").exists() && !held.join("._member").exists()
-}
-
-/// The directory binding is revalidated for *every* entry, not once per round:
-/// a name rebound just before an entry's unlink stops the drain and leaves the
-/// replacement untouched.
+/// Successive same-user replacements at the original name before a capture
+/// remove **zero** foreign objects: the first capture verifies the object it
+/// actually holds, finds it is not the observed one, puts it back and stops.
 #[test]
-fn a_rebind_during_the_drain_stops_it_before_the_next_unlink() {
-    let fx = Fixture::new("seam-drain-rebind");
+fn replacements_before_a_capture_remove_no_foreign_object_and_stop_at_the_first() {
+    let fx = Fixture::new("seam-capture-mismatch");
     let parent = open(fx.path());
     let tree = fx.dir("slot");
-    fs::write(tree.join(".DS_Store"), b"x").expect("metadata");
-    fs::write(tree.join("._member"), b"y").expect("metadata");
+    fs::write(tree.join(".DS_Store"), b"first").expect("metadata");
+    fs::write(tree.join("._z"), b"second").expect("metadata");
     let dir = open(&tree);
-    let held = fx.path().join("slot-moved");
-    let replacement = fx.path().join("slot-replacement");
-    let (parent_path, replacement_path) = (fx.path().to_path_buf(), replacement.clone());
-    let _rebind = crate::test_fs::before_unlink(move || {
-        fs::rename(parent_path.join("slot"), parent_path.join("slot-moved")).expect("rename away");
-        fs::create_dir(&parent_path.join("slot")).expect("replacement directory");
+    let (tree_path,) = (tree.clone(),);
+    let _swap = crate::test_fs::before_capture(1, move || {
+        // A same-user racer replaces both names after the observation pass.
+        fs::remove_file(tree_path.join(".DS_Store")).expect("remove first");
+        fs::write(tree_path.join(".DS_Store"), b"racer one").expect("racer one");
+        fs::remove_file(tree_path.join("._z")).expect("remove second");
+        fs::write(tree_path.join("._z"), b"racer two").expect("racer two");
     });
     match rmdir_draining_finder_metadata(
         parent.as_fd(),
@@ -396,31 +391,160 @@ fn a_rebind_during_the_drain_stops_it_before_the_next_unlink() {
         OsStr::new("slot"),
         &mut || Ok(()),
     ) {
-        Rmdir::Replaced { entry } => assert_eq!(entry, "slot"),
-        other => panic!("a rebound name must stop the drain: {other:?}"),
+        Rmdir::Mismatch {
+            original,
+            restored,
+            kind,
+            ..
+        } => {
+            assert_eq!(original, ".DS_Store");
+            assert!(restored, "the captured object was not put back");
+            assert!(
+                kind.contains("observed") || kind.contains("type"),
+                "the mismatch names its reason: {kind}"
+            );
+        }
+        other => panic!("a pre-capture replacement must stop as a mismatch: {other:?}"),
     }
-    assert!(held.is_dir(), "the held directory is still there");
-    assert!(
-        fs::read_dir(fx.path().join("slot"))
-            .expect("replacement kept")
-            .count()
-            == 0,
-        "the replacement is untouched"
-    );
-    // The residual check-to-unlink window may delete the one entry that was
-    // already verified, and never a second: the rebind is caught before it.
-    let survived = fs::read_dir(&held).expect("held directory listed").count();
+    // Zero foreign objects were removed: both racer files are still there.
     assert_eq!(
-        survived, 1,
-        "a rebind after the last check may cost at most the one checked entry"
+        fs::read(tree.join(".DS_Store")).expect("racer one kept"),
+        b"racer one"
     );
-    assert!(
-        !verified_names_removed_twice(&held),
-        "both metadata entries were deleted after a single checked entry"
+    assert_eq!(
+        fs::read(tree.join("._z")).expect("racer two kept"),
+        b"racer two"
     );
+    assert!(tree.is_dir());
+}
+
+/// The same race against the *previous* check-then-unlink approach loses a
+/// racer's object, which is why the capture exists. This is the falsifying
+/// counterfactual, not product code.
+#[test]
+fn the_previous_check_then_unlink_would_lose_the_racers_object() {
+    let fx = Fixture::new("seam-old-approach");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"observed").expect("metadata");
+    let dir = open(&tree);
+    // The old order: observe, then a racer replaces the name, then unlink by
+    // that name.
+    let observed = observe_entry(dir.as_fd(), &name(".DS_Store")).expect("observed");
+    fs::remove_file(tree.join(".DS_Store")).expect("remove");
+    fs::write(tree.join(".DS_Store"), b"racer").expect("racer");
+    let current = observe_entry(dir.as_fd(), &name(".DS_Store")).expect("current");
+    assert_ne!(
+        observed.inode, current.inode,
+        "the racer replaced the entry"
+    );
+    let status = unsafe { libc::unlinkat(dir.as_fd().as_raw_fd(), name(".DS_Store").as_ptr(), 0) };
+    assert_eq!(status, 0);
     assert!(
-        !replacement_path.exists(),
-        "the control did not create an extra directory"
+        !tree.join(".DS_Store").exists(),
+        "the old approach removed the racer's object by name"
+    );
+    let _ = parent;
+}
+
+/// A symlink swapped in before the capture is not followed: it is captured,
+/// verified as the wrong type, put back, and its referent is never touched.
+#[test]
+fn a_symlink_swapped_before_the_capture_is_not_followed() {
+    let fx = Fixture::new("seam-capture-link");
+    let outside = fx.dir("outside");
+    let referent = outside.join("referent");
+    fs::write(&referent, b"keep").expect("referent");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"observed").expect("metadata");
+    let dir = open(&tree);
+    let (tree_path, referent_path) = (tree.clone(), referent.clone());
+    let _swap = crate::test_fs::before_capture(1, move || {
+        fs::remove_file(tree_path.join(".DS_Store")).expect("remove");
+        symlink(&referent_path, tree_path.join(".DS_Store")).expect("swap in a link");
+    });
+    match rmdir_draining_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+        &mut || Ok(()),
+    ) {
+        Rmdir::Mismatch { restored, .. } => assert!(restored),
+        other => panic!("a swapped link must stop as a mismatch: {other:?}"),
+    }
+    assert_eq!(fs::read(&referent).expect("referent kept"), b"keep");
+    assert!(
+        fs::symlink_metadata(tree.join(".DS_Store"))
+            .expect("link kept")
+            .file_type()
+            .is_symlink(),
+        "the captured link was put back, not removed"
+    );
+}
+
+/// A directory swapped in before the capture is not recursed into: it is
+/// verified as the wrong type, put back and left entire.
+#[test]
+fn a_directory_swapped_before_the_capture_is_not_recursed() {
+    let fx = Fixture::new("seam-capture-dir");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"observed").expect("metadata");
+    let dir = open(&tree);
+    let (tree_path,) = (tree.clone(),);
+    let _swap = crate::test_fs::before_capture(1, move || {
+        fs::remove_file(tree_path.join(".DS_Store")).expect("remove");
+        fs::create_dir(tree_path.join(".DS_Store")).expect("swap in a directory");
+        fs::write(tree_path.join(".DS_Store/inside"), b"content").expect("inside");
+    });
+    match rmdir_draining_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+        &mut || Ok(()),
+    ) {
+        Rmdir::Mismatch { restored, .. } => assert!(restored),
+        other => panic!("a swapped directory must stop as a mismatch: {other:?}"),
+    }
+    assert_eq!(
+        fs::read(tree.join(".DS_Store/inside")).expect("directory content kept"),
+        b"content"
+    );
+}
+
+/// A put-back collision keeps **both** names: the captured object stays under
+/// its private name and the racer keeps the original one.
+#[test]
+fn a_put_back_collision_keeps_both_names() {
+    let fx = Fixture::new("seam-put-back-collision");
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"observed").expect("metadata");
+    let dir = open(&tree);
+    let observed = observe_entry(dir.as_fd(), &name(".DS_Store")).expect("observed");
+    let capture = capture_entry(dir.as_fd(), &name(".DS_Store")).expect("capture");
+    // A racer takes the original name again, so the exclusive put-back fails.
+    fs::write(tree.join(".DS_Store"), b"racer").expect("racer");
+    assert!(
+        put_back(dir.as_fd(), &capture).is_err(),
+        "put-back must not replace a name"
+    );
+    let private = tree.join(OsStr::from_bytes(capture.private.to_bytes()));
+    assert_eq!(
+        fs::read(&private).expect("captured object kept"),
+        b"observed"
+    );
+    assert_eq!(
+        fs::read(tree.join(".DS_Store")).expect("racer kept"),
+        b"racer"
+    );
+    assert_ne!(
+        observed.inode,
+        observe_entry(dir.as_fd(), &name(".DS_Store"))
+            .expect("current")
+            .inode
     );
 }
 
@@ -469,57 +593,4 @@ fn a_caller_stop_after_one_unlink_keeps_the_rest_of_the_drain() {
         "only the entry the check covered was unlinked"
     );
     assert!(tree.is_dir(), "the stopped directory is kept");
-}
-
-/// The accepted boundary: a same-user process that races into the directory at
-/// the last verified entry can lose at most that one entry **name**. A symlink
-/// swapped in at that moment has its name unlinked and its referent survives,
-/// because the removal is by name and never follows a link; the next step then
-/// stops on the content the racer left behind.
-#[test]
-fn a_link_swapped_in_at_the_last_boundary_keeps_its_referent_and_the_next_step_stops() {
-    let fx = Fixture::new("seam-last-swap");
-    let outside = fx.dir("outside");
-    let referent = outside.join("referent");
-    fs::write(&referent, b"keep").expect("referent");
-    let parent = open(fx.path());
-    let tree = fx.dir("slot");
-    fs::write(tree.join(".DS_Store"), b"x").expect("metadata");
-    fs::write(tree.join("._z"), b"y").expect("metadata");
-    let dir = open(&tree);
-    let (tree_path, referent_path) = (tree.clone(), referent.clone());
-    let _swap = crate::test_fs::before_unlink_at(2, move || {
-        fs::remove_file(tree_path.join("._z")).expect("remove the last verified entry");
-        symlink(&referent_path, tree_path.join("._z")).expect("swap in a link");
-        fs::write(tree_path.join("stray"), b"racer content").expect("foreign entry");
-    });
-    // The drain loses only the swapped name; the retry then refuses the foreign
-    // content the racer left, so the deletion stays unfinished.
-    match rmdir_retrying_finder_metadata(
-        parent.as_fd(),
-        &name("slot"),
-        dir.as_fd(),
-        OsStr::new("slot"),
-        &mut || Ok(()),
-    ) {
-        Rmdir::Refused { entry } => assert_eq!(entry, "stray"),
-        other => panic!("the next step must stop on the racer's content: {other:?}"),
-    }
-    assert_eq!(
-        fs::read(&referent).expect("referent kept"),
-        b"keep",
-        "the removal followed the swapped link"
-    );
-    assert!(
-        !tree.join("._z").exists(),
-        "the swapped entry name is the one the accepted bound may lose"
-    );
-    assert_eq!(
-        fs::read(tree.join("stray")).expect("foreign entry kept"),
-        b"racer content"
-    );
-    assert!(
-        tree.is_dir(),
-        "the directory stays while content is unverified"
-    );
 }

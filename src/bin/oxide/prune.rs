@@ -3357,6 +3357,8 @@ impl RootSession {
                 | Rmdir::RefusedMany { .. }
                 | Rmdir::Exhausted { .. }
                 | Rmdir::Stopped { .. }
+                | Rmdir::Mismatch { .. }
+                | Rmdir::CaptureFailed { .. }
                 | Rmdir::Failed { .. } => {
                     return Err(race_pending("the quarantine leaf", &outcome))
                 }
@@ -3539,6 +3541,8 @@ fn remove_quarantined_directory(
             | Rmdir::Refused { .. }
             | Rmdir::RefusedMany { .. }
             | Rmdir::Exhausted { .. }
+            | Rmdir::Mismatch { .. }
+            | Rmdir::CaptureFailed { .. }
             | Rmdir::Failed { .. } => {
                 return Err(Stop::Pending(race_pending(
                     "a quarantined directory",
@@ -3572,6 +3576,24 @@ fn race_pending(what: &str, outcome: &Rmdir) -> String {
         // The caller's own bounded check stopped the drain and already gave the
         // reason; that reason is the pending text.
         Rmdir::Stopped { reason } => reason.clone(),
+        // A captured object that is not the observed one is never removed; both
+        // names are reported so the pending intent names exactly what is left.
+        Rmdir::Mismatch {
+            original,
+            private,
+            restored,
+            kind,
+        } => format!(
+            "{what} captured {private} for {original}, but {kind}; {}; nothing was deleted",
+            if *restored {
+                "it was put back under its original name"
+            } else {
+                "the original name was taken, so both names are kept"
+            }
+        ),
+        Rmdir::CaptureFailed { error } => {
+            format!("{what} could not capture an entry ({error}); it is kept")
+        }
         Rmdir::Failed { error } => format!("cannot remove {what} ({error}); it is kept"),
         // Completed or retryable outcomes are handled by every caller before
         // this function; reaching them here is still a pending intent, never

@@ -1118,7 +1118,17 @@ def settle_target(case: str):
     return settle_completion_fault if case == "prune_completion_fault" else settle_case
 
 
+def replay_prune(oxide: str, env: dict, base: str, plan: str, digest: str):
+    """The one replay invocation both settle handlers use."""
+    return run(
+        [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
+        cwd=base,
+        env=env,
+    )
+
+
 def settle_case(settle: Settle) -> str:
+    oxide = settle.oxide
     env = settle.env
     base = settle.base
     case = settle.case
@@ -1220,11 +1230,7 @@ def settle_case(settle: Settle) -> str:
     else:
         fail(f"{case}: unknown prune case")
 
-    replay = run(
-        [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
-        cwd=base,
-        env=env,
-    )
+    replay = replay_prune(oxide, env, base, plan, digest)
     if replay.returncode != 3:
         fail(
             f"{case}: a replay over a mutated quarantine did not exit 3 "
@@ -1301,6 +1307,41 @@ def self_check() -> int:
         problems.append("the completion-fault case does not route to its own handler")
     if settle_target("prune_metadata") is not settle_case:
         problems.append("an ordinary prune case does not route to the shared settle handler")
+    for handler, label in (
+        (settle_case, "settle_case"),
+        (settle_completion_fault, "settle_completion_fault"),
+    ):
+        if "replay_prune(" not in inspect.getsource(handler):
+            problems.append(f"{label} does not route its replay through replay_prune")
+    # Execute the replay body itself against a fake runner, so a name or shape
+    # drift there fails a pure check instead of a native case.
+    seen = []
+    real_runner = globals()["run"]
+
+    def fake_runner(command, *, cwd, env, timeout=120.0):
+        seen.append((list(command), cwd))
+        return type("Done", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    globals()["run"] = fake_runner
+    try:
+        outcome = replay_prune("oxide", {}, "/nonexistent", "plan.json", "0" * 64)
+    finally:
+        globals()["run"] = real_runner
+    expected = (
+        [
+            "oxide",
+            "outputs",
+            "prune",
+            "--plan",
+            "plan.json",
+            "--plan-sha256",
+            "0" * 64,
+        ],
+        "/nonexistent",
+    )
+    if outcome.returncode != 0 or seen != [expected]:
+        problems.append(f"the replay invocation drifted: {seen!r}")
+    print("  replay dispatch: both settle handlers share one executed replay body")
     print(f"  settle dispatch: {len(CASES)} cases bind one {Settle.__name__} bundle")
     # An overlong volume name must be refused, not attached.
     try:
@@ -1372,11 +1413,7 @@ def settle_completion_fault(settle: Settle) -> str:
 
     replay_env = dict(env)
     replay_env.pop("OXIDE_TEST_PRUNE_CRASH", None)
-    replay = run(
-        [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
-        cwd=base,
-        env=replay_env,
-    )
+    replay = replay_prune(oxide, replay_env, base, plan, digest)
     if replay.returncode:
         fail(f"{case}: the receipt-step replay did not settle: {replay.stderr[-1500:]}")
     _, document = registry(env)
