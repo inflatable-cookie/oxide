@@ -4721,7 +4721,10 @@ guard's rule parsing and decisions are unit-tested in `effigy test rust`.
 `scripts/test-permanent-outputs.py auto-ineligible`, a focused mode of the
 same fixture, as the whole command of the same qualified shared supervisor
 (300 s, 512 MiB monitored scratch, ordinary detach) over one owned 128 MiB
-scratch image. It proves expected ineligibility leaves the build usable: for
+scratch image, with `--root-parent /private/tmp` — the owner-accepted
+internal-placement exception (decision bd357a4c), because the fixture needs a
+genuine internal directory-budget pool that the product correctly refuses on
+an external volume; the supervisor monitors that same root. It proves expected ineligibility leaves the build usable: for
 no repository, no Git on `PATH`, an unignored path, a directory-only rule, a
 negated rule, an already-tracked path and a Git that does not answer, the
 leased build exits 0 into a real local `target/` holding the built binary,

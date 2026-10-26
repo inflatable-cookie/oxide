@@ -337,7 +337,12 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # Automatic-adoption ineligibility (oxide#154): the focused `auto-ineligible`
 # mode of the #117 fixture under the same qualified shared supervisor (300 s,
 # 512 MiB monitored scratch, ordinary detach) and one owned 128 MiB scratch
-# image. An expected ignore-safety ineligibility (no repository, no Git on
+# image. `--root-parent /private/tmp` is the owner-accepted internal-placement
+# exception (decision bd357a4c), not a default change: the fixture needs a
+# genuine internal directory-budget pool (`OXIDE_POOL` at the directory
+# default), and the product correctly refuses that backend on an external
+# volume. The supervisor monitors that same root, so the image, fixtures and
+# evidence stay inside one 512 MiB budget. An expected ignore-safety ineligibility (no repository, no Git on
 # PATH, an unignored, negated, directory-only or already-tracked path, a Git
 # that does not answer) leaves the build an ordinary unconverted checkout: a
 # real local target holding the built binary, exactly one unconverted notice,
@@ -352,7 +357,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # Not a benchmark, real-drive qualification or an alias for full QA.
 [tasks."rust:auto-adopt-ineligible"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-ineligible"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-ineligible"
 
 # The same fixed guard, mode and limits with `--diagnostic` appended: the
 # uncounted keep-going collection required before the counted run above. It
@@ -362,7 +367,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # exhausted guard deadline. It is never a counted PASS.
 [tasks."rust:auto-adopt-ineligible:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-ineligible --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-ineligible --diagnostic"
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the qualified shared supervisor (`scripts/bounded-test.py` SHA-256
