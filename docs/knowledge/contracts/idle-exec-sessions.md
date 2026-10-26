@@ -89,7 +89,8 @@ probed by this design.
 | A command's child temp is one decision: a same-pool-volume inherited `TMPDIR` is kept, otherwise one owned `<slot>/scratch` directory with an ownership marker; over-long paths refuse before spawn. | `src/bin/oxide/child_temp.rs`, [#136](workflow.md#child-temporary-files-oxide136) |
 | An unbounded `run` without an owned temp directory releases the lease and `exec`s the program; with an owned directory it keeps the lease, the record, the group, the removal watchdog and the slot until the program group is empty. | `main.rs` (`run_owned_program`, release-then-`exec` path), [#136](workflow.md#child-temporary-files-oxide136) |
 | A bounded `run` keeps the lease through the program under one cumulative execution window. | [command time budgets](workflow.md#command-time-budgets-oxide140) |
-| The directory-pool watchdog samples caller-available bytes about once a second and stops the group below a 20 GiB reserve plus a 2 GiB margin; a debug-only injected reading exists. | `src/bin/oxide/watchdog.rs` |
+| A **leased Cargo or `exec`** group polls `store.watchdog()` for its whole life: on a `directory-budget-v1` pool that is `Watchdog::for_pool` (caller-available bytes about once a second, stop below a 20 GiB reserve plus a 2 GiB margin; a debug-only injected reading exists); on an `apfs-volume-v1` pool it is `Watchdog::for_volume`, whose `trigger` is 0, so it stops only on removal and never on host free space. | `Store::watchdog`, `Watchdog::for_pool`, `Watchdog::for_volume`, `src/bin/oxide/main.rs` |
+| A **`run` program under `run_owned_program`** builds a watchdog only for `Backend::ApfsVolume` and `None` for `Backend::DirectoryBudget` (the code comment: "a program on the internal disk is never stopped for host free space"). The release-then-`exec` run path has no watchdog at all. | `src/bin/oxide/main.rs` (`run_owned_program`, release-then-`exec` path) |
 | Admission/execution budgets, a typed start, a bounded stop escalation and a fail-closed event channel already exist. | `src/bin/oxide/budget.rs`, [budgets](workflow.md#command-time-budgets-oxide140) |
 | The control state is versioned (`STATE_VERSION = 5`) with a forward-only fence and installed-binary hand-off for older builds. | `store.rs`, [installed hand-off](workflow.md#installed-binary-hand-off-oxide122) |
 | `oxide-managed` is the private control root; `oxide status` by default reports recorded facts only. | [local lease](local-lease.md#oxide-front-door-control-directory), [status](workflow.md#storage-and-space-management) |
@@ -119,9 +120,20 @@ probed by this design.
 - **R6 — unknown cannot fabricate idle or closed.** A state that is not
   positively observed is reported as held/unknown; a failed gate never starts
   a compiler ([validation policy](../vision.md#validation-policy)).
-- **R7 — the reserve watchdog and removability rules are unchanged.** A
-  session is still stopped by the host-reserve watchdog and by a removable
-  volume's disappearance at the existing cadence, idle or not.
+- **R7 — no watchdog change.** The permit split adds no stop and removes none.
+  The three current paths stay exactly as they are:
+  1. a leased Cargo or `exec` group on a `directory-budget-v1` pool samples
+     host reserve and may stop the group (`Watchdog::for_pool`);
+  2. a leased Cargo or `exec` group on an `apfs-volume-v1` pool gets the
+     removal-only stop (`Watchdog::for_volume`, `trigger = 0`), never a host
+     space stop;
+  3. a `run` program under `run_owned_program` gets the removal-only stop on a
+     removable pool and **no** watchdog on a directory pool, while the
+     release-then-`exec` run program has none at all.
+
+  An idle exec session keeps path 1 or 2; a `run` state A program keeps path
+  3 unchanged. This design does not add a host-space stop to long-lived
+  programs and does not claim one.
 - **R8 — no consumer, install, host-setting, scheduler or capacity change.**
   Config keys and flags are not added by this design.
 
@@ -249,6 +261,13 @@ already holds `pools.json`), one per-user copy, mode 0700, atomically
 replaced when the running binary's content hash differs, and
 protocol-versioned (`OXIDE-GATE/1`). The copy is not pool payload and not
 part of a slot.
+- gate replacement: another Oxide build may atomically replace
+  `<state-dir>/gate/oxide` while a session lives. Gate processes already
+  running keep their image; later invocations execute the new copy and must
+  speak the broker's protocol version. A mismatch closes the connection with
+  no grant (fail closed). Replacement changes neither the durable permit state
+  nor slot custody, and the installed-binary hand-off still owns two builds
+  sharing one pool.
 - session socket: `<slot>/g` (a Unix domain socket), created after the lease
   and before the tool starts. The existing 91-byte path rule (`#136`) is
   applied to the longer of `<slot>/scratch` and `<slot>/g`, so a session whose
@@ -359,8 +378,11 @@ custody-holding session may release it. Nothing else about the record changes.
    the preparation permit. If a gate request arrived first, the broker grants
    from the held permit and no release happens.
 4. **Idle** — writers = 0, permit released, slot and temp held, the record
-   still active for slot purposes, the tool's group unchanged, the watchdog
-   still sampling (R7).
+   still active for slot purposes, the tool's group unchanged, and the
+   watchdog it already had: an exec session keeps host-reserve sampling on a
+   directory pool and the removal stop on a removable pool; `run` state A
+   keeps only its removal stop (removable) or no watchdog (directory pool),
+   exactly as today (R7).
 5. **Reacquire** — the next gate request duplicates the permit with the
    store's durable write before a grant. The session prints the ordinary wait
    line if the permit is not immediately available.
@@ -378,7 +400,8 @@ custody-holding session may release it. Nothing else about the record changes.
    and a gate blocked on a permit never starts after the stop latches.
 10. **Removable volume** — a permit transition never flushes; the flush stays
     where it is (before a slot goes idle). If the volume disappears while the
-    session is idle, the existing removal watchdog stops the group and
+    session is idle, the existing removal watchdog stops the group
+    (`exec` and `run` state A; a release-then-`exec` program has none) and
     custody/quarantine rules apply; the gate cannot connect to a socket on a
     vanished volume, so a compile fails closed instead of running elsewhere.
 
@@ -398,8 +421,10 @@ custody-holding session may release it. Nothing else about the record changes.
 | Malformed/foreign/stale token or protocol | unchanged | held | connection closed, no grant, one bounded diagnostic |
 | A stale socket from a previous incarnation | n/a | held | marker mismatch is reported and kept, never removed or used |
 | Tool bypasses the gate (absolute toolchain, cleaned env, clippy) | released | held | compile is **not** counted (documented gap, §7); the slot is still protected |
-| Host reserve breach while idle | n/a | held | watchdog stops the group and reports at the existing cadence (R7) |
-| Removable volume removed while idle | n/a | held | removal watchdog + existing quarantine rules; a compile cannot start |
+| `exec` on a directory pool, host reserve breached while idle | unchanged | held | path 1 stops the group at the existing cadence and the report is unchanged |
+| `run` state A on a directory pool, host reserve breached while the program runs | n/a | held | **no** watchdog is built today (`run_owned_program` ⇒ `None`); this design adds none, and the proof must not assert a stop here |
+| Removable volume removed while idle (`exec` or `run` state A) | n/a | held | removal watchdog + existing quarantine rules; a compile cannot start. A release-then-`exec` program has no watchdog, unchanged |
+| Gate copy replaced under a live session by another Oxide build | held or released per the durable state, unchanged | held | running gates keep their image; later ones must speak the broker's protocol or fail closed; no custody change |
 | Nested `oxide` inside the session | see §13 | held | joining nested work uses the outer permit; an independent nested command takes its own and does not double-count |
 | Budget expiry while a gate waits | released/held per durable state | held | the stop latches; the gate never starts; closure rules unchanged |
 
@@ -415,7 +440,7 @@ Guaranteed inside the boundary:
 - at most one permit per session no matter how many gated compilers run;
 - an idle session releases its permit and reacquires it with ordinary waiting;
 - slot custody, temp custody, crash recovery, unknown-writer handling and the
-  reserve watchdog are exactly as before.
+  three watchdog paths (§3, R7) are exactly as before.
 
 Not guaranteed (and not claimed): that every compiler an arbitrary tool can
 reach is gated, that Cargo's non-compiler children are counted, or that a tool
@@ -481,8 +506,9 @@ program:
 Two states exist today and must stay distinct:
 
 - **A — owned temp directory.** `run_owned_program` keeps the lease, the
-  record, the group, the removal watchdog and the slot until the program group
-  closes. This is the Effigy case: warm slot pinned while the server lives.
+  record, the group and the slot until the program group closes, plus the
+  removal watchdog on a removable pool (none on a directory pool). This is the
+  Effigy case: warm slot pinned while the server lives.
 - **B — inherited temp directory.** The lease is released and the program is
   `exec`ed in place. The slot is reusable **today**, with no gate and no
   broker afterwards; any runtime reference into the slot is already exposed.
@@ -532,7 +558,12 @@ asked about without touching the bytes the server may still read.
   `RUSTC_WRAPPER` gate and a per-session broker in the child environment; no
   PATH shim, no daemon, no machine-wide wrapper. Confirm this does not
   conflict with the deferred-interception ruling (R4). Accept / reject.
-  *Reject ⇒ S7.*
+  *Reject ⇒ S7.* An offered variant: install the same stable gate path as the
+  wrapper on **every** leased command, with a pass-through mode where no
+  session broker exists, so gated and ungated commands present one wrapper
+  value and Slice 2's fingerprint check is not predetermined to fail. It is a
+  larger change to today's empty-wrapper bypass; this design offers it and
+  selects neither form here.
 - **D-3 — supported boundary.** Accept that ungated compiles (§7) and Cargo's
   non-compiler children are not counted while a session is idle. Accept /
   reject. *Reject ⇒ S7.*
@@ -565,7 +596,9 @@ approved brief per slice; no slice before D-1..D-4 are recorded.
    transparent (P3/P4) before any release exists. **Feasibility gate:** if
    gated and ungated builds in one slot rebuild units (fingerprint or
    identity sensitivity), or the wrapper changes recorded tool identity, stop
-   — the mechanism would cause the churn it exists to avoid.
+   — the mechanism would cause the churn it exists to avoid. D-2's offered
+   pass-through form (the same wrapper path on every leased command) is the
+   candidate remedy to test before declaring that stop.
 3. **Slice 3 — idle release and reacquire** for `exec`, bounded `run`, and
    `run` state A; wait accounting; status; cancellation; budget interaction.
    Depends on Slice 2's feasibility gate passing.
@@ -645,9 +678,14 @@ Cases:
 10. **Gate EOF / cancellation** — close the broker (kill the session) while a
     gate waits; the compile never starts and the tool reports a failed
     compiler; the slot stays held.
-11. **Reserve pressure while idle** — with the debug injected watchdog
-    reading, trip the reserve while the session is idle: the group stops, the
-    slot stays held, and the report is unchanged in shape.
+11. **Reserve pressure while idle (exec, directory pool)** — with the debug
+    injected watchdog reading, trip the reserve while an `exec` session is
+    idle on a `directory-budget` pool: the group stops, the slot stays held,
+    and the report is unchanged in shape. This is the only session shape with
+    a host-space stop today (path 1). A `run` state A program on a directory
+    pool has none (path 3), and a case must not assert a stop there or treat
+    its absence as a defect; bounded `run` also uses `run_owned_program` and
+    therefore has no directory-pool host stop to exercise.
 12. **Nested `oxide`** — a session tool launches a nested leased command
     (independent path): it takes its own slot and permit, the host count is
     correct, no double count, and the outer idle session's permit is
