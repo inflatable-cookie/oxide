@@ -185,6 +185,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   links migrate only by explicit adoption. It never moves existing output,
   and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
+- **Profile layout becomes the default** (approved, not built): automatic first conversion will create profile member links, keeping `target` a real directory so container tools that mount it (Effigy's isolated `target` mounts) keep working, instead of the legacy whole-target link. Prerequisite: `oxide exec` infers a tool's output members from Cargo's own plan, so no route needs `--output`. Existing whole-target checkouts then migrate by explicit `oxide outputs adopt`, Acowtancy's primary checkout first. Today automatic conversion creates the whole-target link.
 - **Owned links at profile directories** (v1, operator accepted): a converted
   checkout keeps `target` itself a real directory and owns only the positively
   identified members `debug`, `release`, `<triple>/debug` and
