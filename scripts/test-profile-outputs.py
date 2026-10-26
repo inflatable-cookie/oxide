@@ -34,11 +34,12 @@ The image is 128 MiB and every normal registration reserves 16 MiB below that
 geometry with a 64 MiB admission cap, so an external root is really selected; a
 positive control asserts the selected root is under
 `<mount>/oxide-outputs/` with no fallback warning before any external-root
-oracle. The fixture `.gitignore` uses `/target` (valid for a whole-target link
+oracle. The fixture `.gitignore` uses `/target` (valid for the whole-target legacy shape
 and as a member parent rule) and a separate `/target/` parent-ignore control
-proves a directory-only rule makes the automatic whole-target conversion
-ineligible (the build stays an ordinary unconverted checkout) while it is
-accepted as a profile member parent rule. The top-level preservation control lives on its own checkout so the
+proves a directory-only rule genuinely covers the `target/<member>` links a
+first conversion publishes (oxide#160), so the automatic conversion publishes
+the profile layout instead of staying unconverted, and an explicit adoption
+over a real empty target accepts the same rule. The top-level preservation control lives on its own checkout so the
 cleaned checkout carries no foreign entry. The selected-clean reserve stop runs
 on the internal directory-budget store while the pool's OWN recorded permanent
 registration still grants drive mode: the existing low-reserve pattern raises
@@ -304,8 +305,9 @@ def plan_only() -> int:
     print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
     print("  ignore          the fixture uses /target (valid for whole-target links and")
     print("                  member parents) plus a separate /target/ parent-ignore control")
-    print("                  proving automatic adoption is ineligible (ordinary unconverted")
-    print("                  build) while a profile member link accepts the parent rule")
+    print("                  proving a directory-only rule covers the member links: the")
+    print("                  automatic conversion publishes the profile layout and an")
+    print("                  explicit adoption over a real empty target accepts it")
     print("  peer keep       an injected committed peer receipt plus matching registry")
     print("                  rows (SYNTHETIC INJECTED AUTHORITY, not a bind-produced")
     print("                  receipt) keeps that root; a second, distinct eligible gone")
@@ -2945,54 +2947,62 @@ def run(proof: Proof, repo: str) -> None:
                 "the low-reserve control did not restore the recorded registration",
             )
 
-            # A separate parent-ignore control: a directory-only `/target/` rule
-            # cannot cover the published non-directory link, so the automatic
-            # whole-target conversion is INELIGIBLE for it (oxide#154). Expected
-            # ineligibility never fails the command: the build stays an ordinary
-            # unconverted checkout with a real local target and exactly one notice,
-            # and no receipt, owned link, owned root or output conversion appears.
-            # Git decides that question itself and answers "does not ignore
-            # `target`" while the path is still absent (a trailing-slash rule only
-            # matches a directory it can see).
+            # A separate parent-ignore control: a directory-only `/target/`
+            # rule genuinely covers the `target/<member>` links a first
+            # conversion publishes (oxide#160), so the automatic conversion
+            # publishes the profile layout rather than staying unconverted - a
+            # real `target` holding an owned debug/release pair into ONE root on
+            # the drive, one notice and a committed profile receipt - and no
+            # checkout-local root appears.
             parent = make_checkout(proof, "parent-ignore", PARENT_IGNORE_APP)
             parent_target = os.path.join(parent, "target")
-            code, _, stderr = oxide(proof, ["build"], "parent-ignore ineligible auto-adopt", parent)
+            code, _, stderr = oxide(proof, ["build"], "parent-ignore auto-adopt", parent)
             expect(
                 code == 0,
-                f"an ineligible automatic conversion failed the build: exit {code}: {stderr}",
+                f"the directory-only parent rule did not convert: exit {code}: {stderr}",
             )
             expect(
-                stderr.count("not converted to owned outputs") == 1,
-                f"the unconverted build did not print exactly one notice: {stderr}",
-            )
-            expect("auto-adopted" not in stderr, f"an ineligible checkout was adopted: {stderr}")
-            expect(
-                is_real_dir(parent_target) and not os.path.islink(parent_target),
-                f"the ineligible conversion did not leave a real local target: {parent_target}",
+                stderr.count(perm.AUTO_NOTICE) == 1,
+                f"the automatic conversion did not print exactly one notice: {stderr}",
             )
             expect(
-                not os.path.exists(receipt_file(pool, parent)),
-                "an ineligible checkout wrote a receipt",
+                "not converted to owned outputs" not in stderr,
+                f"a covering directory-only rule was treated as ineligible: {stderr}",
+            )
+            parent_root = root_of(pool, parent)
+            expect(
+                parent_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+                f"the parent-ignore root {parent_root} is not on the drive",
+            )
+            expect_layout(
+                parent,
+                {"debug": f"link:{parent_root}", "release": f"link:{parent_root}"},
+            )
+            expect(
+                is_real_dir(parent_target),
+                f"the conversion left no real target: {parent_target}",
             )
             expect(
                 not os.path.lexists(os.path.join(parent, ".oxide-outputs")),
-                "the ineligible conversion created a checkout-local owned root",
-            )
-            # Explicit adoption still refuses: the local target the build left is
-            # non-empty, and the rule is still not a link rule. Nothing changes.
-            code, _, stderr = oxide(proof, ["outputs", "adopt"], "parent-ignore explicit adopt", parent)
-            expect(code != 0 and "never moves" in stderr, f"explicit adopt did not refuse the local target: {stderr}")
-            expect(
-                is_real_dir(parent_target) and not os.path.islink(parent_target),
-                "the refused explicit adopt replaced the local target",
+                "the conversion created a checkout-local owned root",
             )
             expect(
-                not os.path.exists(receipt_file(pool, parent)),
-                "the refused explicit adopt wrote a receipt",
+                perm.read_json(perm.receipt_file(pool, parent))["state"] == "committed",
+                "the parent-ignore conversion did not commit its receipt",
+            )
+            code, _, stderr = oxide(proof, ["build"], "parent-ignore build", parent)
+            expect(code == 0, f"the converted parent-ignore checkout did not build: {stderr}")
+            expect(
+                "fallback" not in summary(stderr),
+                f"parent-ignore: external placement unexpectedly fell back: {summary(stderr)}",
+            )
+            expect_layout(
+                parent,
+                {"debug": f"link:{parent_root}", "release": f"link:{parent_root}"},
             )
             # The same rule stays a valid parent ignore for profile members under
-            # the real target directory, so a separate real-empty checkout adopts
-            # its member links through the explicitly requested profile conversion.
+            # the real target directory, so a separate real-empty checkout also
+            # adopts its member links through the explicitly requested conversion.
             member_parent = make_checkout(proof, "parent-ignore-member", PARENT_IGNORE_APP)
             os.makedirs(os.path.join(member_parent, "target"))
             adopt(proof, member_parent, "parent-ignore-member adopt")

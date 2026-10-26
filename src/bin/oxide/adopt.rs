@@ -200,11 +200,12 @@ fn adopt(manifest: &Path) -> Result<u8, String> {
         ignored.describe(),
         workspace.join(GITIGNORE).display()
     );
-    // A first permanent-drive conversion publishes an owned `target` link only
-    // when Git ignores that exact non-directory path; a directory-only rule
-    // like `target/` never covers it. Name the exact rule to add instead of
-    // rewriting a user's `.gitignore` (oxide#154). Outside Git nothing is
-    // ignored and nothing is converted, so there is nothing to report.
+    // A first permanent-drive conversion publishes owned `target/<member>`
+    // links only when Git ignores each exact path; a rule that covers the
+    // member links (including a directory-only parent rule) is silent. When it
+    // does not, name the rule that covers them instead of rewriting a user's
+    // `.gitignore` (oxide#154). Outside Git nothing is ignored and nothing is
+    // converted, so there is nothing to report.
     if matches!(placement, Placement::Worktree(_)) {
         if let Some(warning) = crate::outputs::gitignore_diagnostic(&workspace) {
             eprintln!("oxide: WARNING: {warning}");
