@@ -4880,6 +4880,43 @@ fn refuses_committed_external(
     })
 }
 
+/// The dangling member link binding refuses, evaluated before the lease.
+///
+/// `bind_profile` refuses a REQUESTED profile member whose owned member link
+/// dangles (the committed root is missing at that member's destination). A
+/// future-root reservation published for that destination is dead on arrival:
+/// its registry row is the committed SELECTED row, which keeps the root's old
+/// nonce, so `validate_reservation` refuses it — and it then blocks the
+/// explicit `oxide outputs adopt` that the binding refusal names. Reserving
+/// nothing keeps that refusal at zero authority effect, and the adopt recovers
+/// with a fresh nonce through the ordinary rules (oxide#152).
+///
+/// Only the requested member set is classified, and only the exact
+/// `TargetState::Dangling` binding refuses: a member link that still resolves
+/// (`OwnedLink`, the local→external redock) and a missing link (a new member
+/// joining an existing root) keep their reservation, as does any whole-target
+/// layout.
+fn refuses_dangling_member(
+    context: &Context,
+    receipt: &Receipt,
+    declaration: &crate::layout::Declaration,
+) -> Result<bool, String> {
+    if receipt.layout() != LayoutKind::Profile {
+        return Ok(false);
+    }
+    for member in declaration.members() {
+        if receipt.selected_for(member.name()).is_none() {
+            continue;
+        }
+        let link = link_path(&context.workspace, member.name());
+        let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+        if matches!(state, TargetState::Dangling(_)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Reserve the nonce of this command's future root before its slot is keyed
 /// (oxide#129). Runs after automatic adoption and before
 /// `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding
@@ -4937,6 +4974,13 @@ pub fn reserve(
         // binding's own P4 precondition, per requested member and profile
         // layout only, so every command binding accepts still reserves.
         if refuses_committed_external(&receipt, &wanted, declaration) {
+            return Ok(());
+        }
+        // oxide#152: a requested member whose owned link dangles is a
+        // destination binding refuses, so this command publishes no
+        // reservation at all. Its receipt and registry stay byte-identical and
+        // the explicit `oxide outputs adopt` the refusal names can recover.
+        if refuses_dangling_member(&context, &receipt, declaration)? {
             return Ok(());
         }
         if read_marker(&wanted.root).is_ok() {
@@ -12020,6 +12064,219 @@ mod tests {
             Some(second.nonce.as_str())
         );
         assert!(bound.reserved().is_none());
+    }
+
+    /// A committed profile checkout whose owned local root and both member
+    /// destinations exist, so every member link resolves (`OwnedLink`).
+    fn committed_local_profile(fixture: &Fixture, context: &Context) -> Receipt {
+        let mut receipt = profile_receipt(fixture);
+        receipt.reserved = None;
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let selected = receipt.selected().cloned().unwrap();
+        let root = selected.root.clone();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::Local,
+            volume_uuid: None,
+            nonce: selected.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(context.link()).unwrap();
+        for member in ["debug", "release"] {
+            fs::create_dir_all(member_destination(&root, member)).unwrap();
+            symlink(
+                member_destination(&root, member),
+                context.link().join(member),
+            )
+            .unwrap();
+        }
+        receipt
+    }
+
+    fn declared(members: &[&str]) -> crate::layout::Declaration {
+        crate::layout::Declaration::new(
+            members
+                .iter()
+                .map(|name| crate::layout::Member::parse(name).unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// oxide#152 publication seam: a requested member whose owned link dangles
+    /// is a destination binding refuses, so the pre-lease reservation publishes
+    /// NOTHING — every control byte, the receipt bytes and the registry revision
+    /// stay identical, no root appears and no Cargo runs. The explicit
+    /// `oxide outputs adopt` the refusal names then recovers with a FRESH nonce
+    /// (superseding the old committed row through the ordinary rules) and the
+    /// next ordinary build binds the recovered root.
+    #[test]
+    fn a_dangling_requested_member_reserves_nothing_and_adopt_recovers() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let store = pool_store(&fixture.root.join("pool"));
+        let receipt = committed_local_profile(&fixture, &context);
+        let old_nonce = receipt
+            .selected()
+            .and_then(Selected::nonce)
+            .unwrap()
+            .to_owned();
+        let root = receipt.selected().unwrap().root().to_path_buf();
+        let declaration = declared(&["debug", "release"]);
+        let receipt_file = receipt_path(&fixture.control, &context.checkout_id);
+        // The committed root disappears under its live member links: binding's
+        // exact Dangling precondition.
+        fs::remove_dir_all(&root).unwrap();
+        for member in ["debug", "release"] {
+            let state = link_state(
+                &link_path(&context.workspace, member),
+                &context.workspace,
+                &context.checkout_id,
+            )
+            .unwrap();
+            assert!(
+                matches!(state, TargetState::Dangling(_)),
+                "{member}: {state:?}"
+            );
+        }
+        assert!(refuses_dangling_member(&context, &receipt, &declaration).unwrap());
+        let before = authority_tree(&fixture.control);
+        let receipt_bytes = fs::read(&receipt_file).unwrap();
+        let revision = crate::prune::registry_revision(&fixture.control).unwrap();
+        reserve(
+            &store,
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap();
+        assert!(
+            context.receipt().unwrap().unwrap().reserved().is_none(),
+            "a dangling requested member published a reservation"
+        );
+        assert_eq!(
+            authority_tree(&fixture.control),
+            before,
+            "the refused reservation wrote receipt or registry authority"
+        );
+        assert_eq!(fs::read(&receipt_file).unwrap(), receipt_bytes);
+        assert_eq!(
+            crate::prune::registry_revision(&fixture.control).unwrap(),
+            revision
+        );
+        assert!(
+            read_marker(&root).is_err() && !root.exists(),
+            "the refused reservation created the root"
+        );
+        // Binding then refuses exactly as before, still with no authority effect.
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => assert!(reason.contains("not available now"), "{reason}"),
+            _ => panic!("a dangling member bound"),
+        }
+        assert_eq!(
+            authority_tree(&fixture.control),
+            before,
+            "binding wrote authority alongside its dangling refusal"
+        );
+        // The explicit adopt the refusal names recovers with a fresh nonce.
+        let (committed, recovered, converted) = adopt_profile(&context, receipt.clone()).unwrap();
+        assert!(converted, "the explicit adopt converted nothing");
+        let fresh = committed
+            .selected_for("debug")
+            .and_then(Selected::nonce)
+            .unwrap()
+            .to_owned();
+        assert_ne!(
+            fresh, old_nonce,
+            "the recovery reused the old committed nonce"
+        );
+        assert_eq!(recovered.root(), root.as_path());
+        assert_eq!(
+            read_marker(&root).unwrap().nonce.as_deref(),
+            Some(fresh.as_str())
+        );
+        assert!(committed.reserved().is_none());
+        let rows = crate::prune::test_rows(&fixture.control).unwrap();
+        let root_rows: Vec<_> = rows
+            .iter()
+            .filter(|(row_root, ..)| row_root == &root)
+            .collect();
+        assert_eq!(root_rows.len(), 2, "{rows:?}");
+        assert!(
+            root_rows
+                .iter()
+                .all(|(_, selected, pending, _)| *selected && !*pending),
+            "the recovery left a pending or unselected row: {rows:?}"
+        );
+        // The next ordinary build binds the recovered root with its fresh nonce.
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        match bind_profile(&context, &store, 0, &committed, Some(&plan)) {
+            Bind::Bound(outcome) => assert_eq!(outcome.root, Some(root.clone())),
+            Bind::Refuse(reason) => panic!("the recovered root did not bind: {reason}"),
+            Bind::Wait => panic!("the recovered root waited"),
+        }
+    }
+
+    /// The publication guard is scoped exactly like binding: only the REQUESTED
+    /// member set is classified, and only the exact dangling state refuses. An
+    /// unrequested dangling sibling cannot block another member's reservation, a
+    /// resolving owned link (the local→external redock) and a new member's
+    /// absent link keep theirs, and a whole-target layout is never guarded here.
+    #[test]
+    fn the_dangling_publication_guard_is_scoped_to_requested_members() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let receipt = committed_local_profile(&fixture, &context);
+        let root = receipt.selected().unwrap().root().to_path_buf();
+        assert!(!refuses_dangling_member(&context, &receipt, &declared(&["debug"])).unwrap());
+        assert!(!refuses_dangling_member(&context, &receipt, &declared(&["release"])).unwrap());
+        // Only release's destination disappears: a debug-only command still
+        // reserves, and a command that requests release is refused.
+        fs::remove_dir_all(member_destination(&root, "release")).unwrap();
+        assert!(
+            !refuses_dangling_member(&context, &receipt, &declared(&["debug"])).unwrap(),
+            "an unrequested dangling sibling blocked the reservation"
+        );
+        assert!(refuses_dangling_member(&context, &receipt, &declared(&["release"])).unwrap());
+        // A new member has no committed placement and its link is absent: it
+        // joins the owned root and is never treated as dangling.
+        let new_member = "aarch64-apple-darwin/debug";
+        assert!(
+            !refuses_dangling_member(&context, &receipt, &declared(&[new_member])).unwrap(),
+            "a new member was treated as a dangling committed member"
+        );
+        // A whole-target layout keeps its reservation: `reserve` for the legacy
+        // layout needs it so `reservation_matches` can accept the transition.
+        let whole = fixture.receipt();
+        assert_eq!(whole.layout(), LayoutKind::WholeTarget);
+        assert!(!refuses_dangling_member(&context, &whole, &declared(&["debug"])).unwrap());
     }
 
     /// Only an unkeyed explicit adoption may draw a fresh nonce for a future

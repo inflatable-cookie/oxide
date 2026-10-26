@@ -130,9 +130,12 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
      release) share that one nonce; both bind it, the redocked root carries it,
      and the replaced local root is preserved. Negative control kept inside the
      same case: a committed external root deleted under its live member links is
-     DANGLING, so the command refuses "not available now; nothing was built",
-     no root comes back and only the explicit `oxide outputs adopt` the refusal
-     names recovers it. A NON-RESERVING control is kept too: with the registered
+     DANGLING, so the command refuses "not available now; nothing was built" and
+     publishes NO reservation — receipt bytes, registry bytes, revision, digest,
+     generation and timestamps are identical before and after — and then the ONE
+     explicit `oxide outputs adopt` the refusal names recovers with a fresh
+     nonce that supersedes the old committed row, which the next build uses. A
+     NON-RESERVING control is kept too: with the registered
      volume made unusable the fresh selection is local against committed
      external members, which is binding's P4 precondition, so the command
      publishes no reservation, changes no receipt byte and the prune preview
@@ -1345,6 +1348,31 @@ class World:
     def registry_doc(self) -> dict:
         return aborting("registry outcome", lambda: permanent.read_json(self.registry))
 
+    def authority(self, checkout: str) -> dict:
+        """The exact owned-output authority of one checkout (oxide#152).
+
+        Receipt bytes, registry bytes, the registry revision and content digest,
+        and the receipt's generation and timestamp. A command that binding
+        refuses must leave every field unchanged: no reservation, no row, no
+        revision bump. It is not a freshness oracle for a command that builds."""
+        receipt_bytes = aborting(
+            "receipt bytes",
+            lambda: permanent.read_bytes(permanent.receipt_path(self.pool, checkout)),
+        )
+        registry_bytes = aborting(
+            "registry bytes", lambda: permanent.read_bytes(self.registry)
+        )
+        document = json.loads(receipt_bytes)
+        registry = json.loads(registry_bytes)
+        return {
+            "receipt": receipt_bytes,
+            "registry": registry_bytes,
+            "revision": registry.get("revision"),
+            "digest": hashlib.sha256(registry_bytes).hexdigest(),
+            "generation": document.get("generation"),
+            "updated_ms": document.get("updated_ms"),
+        }
+
     def finish(self, child, label: str) -> tuple:
         """Finish one owned child: its custody is never an oracle failure."""
         return aborting(f"child custody ({label})", lambda: permanent.finish_child(self.proof, child, label))
@@ -1886,15 +1914,19 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         )
         # NEGATIVE control (retained, not removed or relabelled): a committed
         # external root deleted under its live member links is a DANGLING
-        # member destination. The product never transitions it automatically,
-        # so the command refuses "not available now; nothing was built" and the
-        # root does not come back; the explicit `oxide outputs adopt` the
-        # refusal names is the sanctioned recovery, and it consumes the
-        # reservation the refused command had published.
+        # member destination. Binding never transitions it automatically, and
+        # the pre-lease publication seam now publishes NO reservation either
+        # (oxide#152), so the refusal leaves receipt bytes, registry bytes,
+        # revision, digest, generation and timestamps exactly as they were. The
+        # explicit `oxide outputs adopt` the refusal names then recovers in ONE
+        # command with a FRESH nonce that supersedes the old committed row, and
+        # the next ordinary build uses the recovered root.
         links_before = {
             name: permanent.link_target(os.path.join(beta, "target", name))
             for name in ("debug", "release")
         }
+        old_nonce = marker(beta_root)["nonce"]
+        settled = world.authority(beta)
         shutil.rmtree(beta_root)
         expect(not os.path.lexists(beta_root), "the deleted root is still present")
         code, _, stderr = world.oxide(["check"], "dangling member link", beta)
@@ -1912,10 +1944,40 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
             == links_before,
             "a dangling member link moved an owned link",
         )
+        expect(
+            current_reservation(world.receipt(beta)) is None,
+            "the dangling refusal published a reservation",
+        )
+        expect(
+            world.authority(beta) == settled,
+            "the dangling refusal wrote receipt or registry authority",
+        )
         recovered = world.adopt(beta)
         beta_root = recovered["links"][0]["selected"]["root"]
         expect(marker(beta_root)["nonce"], "the explicit recovery created no owned root")
+        expect(
+            marker(beta_root)["nonce"] != old_nonce,
+            "the explicit recovery reused the superseded root nonce",
+        )
         expect(current_reservation(world.receipt(beta)) is None, "the recovery kept a reservation")
+        recovered_rows = [
+            row
+            for row in world.registry_doc()["rows"]
+            if row["root"] == beta_root and row["checkout"] == beta
+        ]
+        expect(
+            recovered_rows
+            and all(row["selected"] and not row["pending"] for row in recovered_rows)
+            and all(row["nonce"] == marker(beta_root)["nonce"] for row in recovered_rows),
+            f"the recovery did not supersede the old row: {recovered_rows}",
+        )
+        code, _, stderr = world.oxide(["check"], "build after the dangling recovery", beta)
+        expect(code == 0, f"the build after the recovery failed: {stderr}")
+        expect(
+            permanent.link_target(os.path.join(beta, "target", "debug"))
+            == os.path.join(beta_root, "debug"),
+            "the recovered build did not use the recovered root",
+        )
         # NON-RESERVING control, retained from the old premise as an added
         # assertion (not a removal or a relabelled case): a fresh selection
         # that is not external against a committed external profile member is
@@ -3508,7 +3570,17 @@ def self_test() -> int:
                 assert block.index("shutil.rmtree(") > starters_at, (
                     "case 04 deletes a committed root before its reserved starters"
                 )
-                assert "not available now" in block and "world.adopt(beta)" in block, block
+                assert "not available now" in block, block
+                assert block.count("world.adopt(beta)") == 1, (
+                    "case 04's dangling recovery is not one explicit adopt"
+                )
+                assert block.count("world.authority(beta)") >= 2, (
+                    "case 04's dangling refusal does not snapshot its authority"
+                )
+                assert "cancel-reservation" not in block, (
+                    "case 04 recovers with a cancel/adopt workaround"
+                )
+                assert "build after the dangling recovery" in block, block
             else:
                 assert "shutil.rmtree(" not in block, f"case {case_id} still deletes a committed root"
         helper = inspect.getsource(World.local_adopt)
