@@ -211,11 +211,16 @@ struct Lost {
 }
 
 impl Lost {
-    fn describe(&self) -> String {
-        match &self.unclosed {
-            None => "lost with the removable volume; deleted whole when the volume returns".to_owned(),
-            Some(why) => format!(
+    fn describe(&self, closed_by_boot: bool) -> String {
+        match (&self.unclosed, closed_by_boot) {
+            (None, _) => {
+                "lost with the removable volume; deleted whole when the volume returns".to_owned()
+            }
+            (Some(why), false) => format!(
                 "quarantined: lost with the removable volume and {why}; kept with its bytes, never reused or deleted"
+            ),
+            (Some(why), true) => format!(
+                "lost with the removable volume and {why}; its holder predates this boot session, so it is deleted whole when the volume returns"
             ),
         }
     }
@@ -493,6 +498,130 @@ fn unclosed_writers(record: &Record) -> Option<String> {
     .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
     workspace_wrapper
         .then(|| "a workspace rustc wrapper was set and may outlive the build".to_owned())
+}
+
+/// The safety margin a recorded holder start must precede the boot session
+/// by. A restart ends every process, but the boot instant and a holder start
+/// are wall-clock milliseconds from the same host, and macOS sets the wall
+/// clock from the RTC or network during early boot. The kernel's boot time
+/// (`kern.boottime`) then moves with later clock adjustments, so a holder
+/// from the current session never falls behind it; 60 s absorbs the
+/// early-boot clock set and millisecond truncation while leaving any start
+/// within the last minute before boot unknown.
+const BOOT_MARGIN_MS: u64 = 60_000;
+
+/// A debug-only proof control naming the boot time a closure decision uses.
+/// A native proof cannot reboot the host to test a previous boot session, so
+/// the qualified shared supervisor's own layout may override the reading.
+/// Release builds have no hook, and outside that layout the variable is
+/// ignored. A present value defines the reading even when it is unusable: an
+/// unparseable or zero value is an unknown boot time, never a fall back to
+/// the real one.
+#[cfg(debug_assertions)]
+const BOOT_HOOK: &str = "OXIDE_TEST_BOOT_MS";
+
+/// The qualified shared supervisor's own layout: a canonical
+/// `OXIDE_TASK_SCRATCH_ROOT` at `<root>/scratch`, its sibling `evidence`
+/// directory and an `OXIDE_PROOF_DEADLINE_NS`, under one `oxide-proof.*`
+/// root.
+#[cfg(debug_assertions)]
+fn supervisor_layout() -> bool {
+    let canonical = |name: &str| {
+        let path = PathBuf::from(std::env::var_os(name)?);
+        let resolved = path.canonicalize().ok()?;
+        (resolved == path && resolved.is_dir()).then_some(resolved)
+    };
+    let (Some(scratch), Some(evidence)) = (
+        canonical("OXIDE_TASK_SCRATCH_ROOT"),
+        canonical("OXIDE_PROOF_EVIDENCE"),
+    ) else {
+        return false;
+    };
+    supervisor_layout_paths(
+        &scratch,
+        &evidence,
+        std::env::var("OXIDE_PROOF_DEADLINE_NS").ok().as_deref(),
+    )
+}
+
+/// The layout rule over already-canonical paths, so the seam's scope is
+/// testable without touching the process environment.
+#[cfg(debug_assertions)]
+fn supervisor_layout_paths(scratch: &Path, evidence: &Path, deadline: Option<&str>) -> bool {
+    let Some(root) = scratch.parent().filter(|root| {
+        scratch.file_name().is_some_and(|name| name == "scratch")
+            && root
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("oxide-proof."))
+    }) else {
+        return false;
+    };
+    evidence == root.join("evidence")
+        && deadline.is_some_and(|deadline| deadline.parse::<u64>().is_ok())
+}
+
+/// Parse a boot-time override: `None` when there is none, `Some(None)` when
+/// one is present but unusable.
+#[cfg(debug_assertions)]
+fn boot_override(value: Option<&str>) -> Option<Option<u64>> {
+    Some(value?.parse::<u64>().ok().filter(|ms| *ms > 0))
+}
+
+/// The boot session's start for a closure decision, or `None` when unknown.
+/// Unknown is the safe answer: it never closes a slot.
+fn boot_session() -> Option<u64> {
+    #[cfg(debug_assertions)]
+    if supervisor_layout() {
+        let value = std::env::var_os(BOOT_HOOK).map(|value| value.to_string_lossy().into_owned());
+        if let Some(injected) = boot_override(value.as_deref()) {
+            return injected;
+        }
+    }
+    process::boot_ms()
+}
+
+/// Whether the record's holder started before the current boot session, so a
+/// restart ended every process that could still write through its slot. An
+/// unknown boot time, a missing or zero start and a start inside the safety
+/// margin are not closure; elapsed time, PID absence and device
+/// disappearance never are either.
+fn started_before_boot(record: &Record, boot_ms: Option<u64>) -> bool {
+    let Some(boot) = boot_ms else {
+        return false;
+    };
+    let Some(holder) = record
+        .holder
+        .as_ref()
+        .filter(|holder| holder.started_ms > 0)
+    else {
+        return false;
+    };
+    holder
+        .started_ms
+        .checked_add(BOOT_MARGIN_MS)
+        .is_some_and(|started| started < boot)
+}
+
+/// Whether a lost record's writers are positively closed: the holding command
+/// saw its own group empty, or the current boot session began after its
+/// holder started. [`unclosed_writers`] records the first reason at loss;
+/// this is the one later fact that can close it.
+fn lost_writers_closed(record: &Record, boot_ms: Option<u64>) -> bool {
+    match record.lost.as_ref() {
+        Some(lost) if lost.unclosed.is_none() => true,
+        Some(_) => started_before_boot(record, boot_ms),
+        None => false,
+    }
+}
+
+/// Whether a quarantined lost record is closed by the boot session alone: its
+/// recorded reason still stands, but a restart ended its writers.
+fn closed_by_boot(record: &Record, boot_ms: Option<u64>) -> bool {
+    record
+        .lost
+        .as_ref()
+        .is_some_and(|lost| lost.unclosed.is_some())
+        && started_before_boot(record, boot_ms)
 }
 
 /// The own-command recovery rule. `held` is the held slot on the record's
@@ -1129,6 +1258,7 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let boot = boot_session();
     Ok(state
         .records
         .iter()
@@ -1137,7 +1267,7 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
             Some((
                 lost.slot_id.clone(),
                 record.checkout.clone(),
-                lost.describe(),
+                lost.describe(closed_by_boot(record, boot)),
             ))
         })
         .collect())
@@ -1808,9 +1938,9 @@ impl Store {
                         };
                         eprintln!(
                             "oxide: removable volume gone; slot {slot_id} is {}",
-                            found.describe()
+                            found.describe(false)
                         );
-                        entry.retired = Some(found.describe());
+                        entry.retired = Some(found.describe(false));
                         entry.lost = Some(found);
                     } else {
                         eprintln!(
@@ -1846,10 +1976,10 @@ impl Store {
             eprintln!(
                 "oxide: removable volume gone; slot {} is {}",
                 held.slot_id,
-                found.describe()
+                found.describe(false)
             );
             entry.phase = Phase::Retired;
-            entry.retired = Some(found.describe());
+            entry.retired = Some(found.describe(false));
             entry.lost = Some(found);
         }
         self.save(&state)
@@ -1866,19 +1996,17 @@ impl Store {
     /// Delete whole every slot lost with the removable volume whose writers
     /// are positively closed: no live Oxide holds its record, the recorded
     /// group (if Cargo started) is still empty and nothing known could
-    /// outlive it. Runs when the volume is selected again, under the
-    /// admission lock. Anything else stays quarantined.
+    /// outlive it. A quarantined record whose holder started before this boot
+    /// session is closed too: a restart ended every process, and its recorded
+    /// group number says nothing about the current session. Runs when the
+    /// volume is selected again, under the admission lock. Anything else
+    /// stays quarantined.
     fn discard_lost(&self, state: &mut State) -> Result<(), String> {
+        let boot = boot_session();
         let candidates: Vec<u64> = state
             .records
             .iter()
-            .filter(|record| {
-                record.phase == Phase::Retired
-                    && record
-                        .lost
-                        .as_ref()
-                        .is_some_and(|lost| lost.unclosed.is_none())
-            })
+            .filter(|record| record.phase == Phase::Retired && lost_writers_closed(record, boot))
             .map(|record| record.id)
             .collect();
         if candidates.is_empty() {
@@ -1892,13 +2020,37 @@ impl Store {
             if !matches!(probe_lock(&self.lock_path(id), true)?, Probe::Free(_)) {
                 continue;
             }
-            if record
-                .process_group
-                .is_some_and(|group| !process::group_empty(group))
+            // A group recorded in an earlier boot session cannot still be
+            // this slot's writer: the number may belong to an unrelated
+            // process now, so only a group of the current session is checked.
+            let boot_closed = closed_by_boot(record, boot);
+            if !boot_closed
+                && record
+                    .process_group
+                    .is_some_and(|group| !process::group_empty(group))
             {
                 continue;
             }
             let project = self.affinity_dir(id);
+            let reported = if boot_closed {
+                let elapsed = boot
+                    .zip(record.holder.as_ref())
+                    .map_or(0, |(boot, holder)| {
+                        boot.saturating_sub(holder.started_ms) / 1_000
+                    });
+                format!(
+                    "lost before this boot (holder started {elapsed} s before boot; a restart ends every process)"
+                )
+            } else {
+                record.process_group.map_or_else(
+                    || "held when the removable volume was lost (Cargo never started)".to_owned(),
+                    |group| {
+                        format!(
+                            "held when the removable volume was lost (Cargo group {group} empty)"
+                        )
+                    },
+                )
+            };
             if let Some(slot) = view.slots.iter().find(|slot| slot.project == project) {
                 if slot.state == SlotOccupancy::Held {
                     let lease_id = slot
@@ -1910,14 +2062,7 @@ impl Store {
                 }
                 evict_idle_slot(&self.pool, &slot.slot_id)
                     .map_err(|error| lease_error("cannot delete a lost slot", &error))?;
-                eprintln!(
-                    "oxide: deleted slot {} held when the removable volume was lost ({})",
-                    slot.slot_id,
-                    record.process_group.map_or_else(
-                        || "Cargo never started".to_owned(),
-                        |group| format!("Cargo group {group} empty")
-                    )
-                );
+                eprintln!("oxide: deleted slot {} {reported}", slot.slot_id);
             }
             self.forget_record(state, id);
             self.save(state)?;
@@ -2357,7 +2502,7 @@ impl Store {
             holder: None,
             lease_id: None,
             pending_recovery: None,
-            retired: Some(lost.describe()),
+            retired: Some(lost.describe(false)),
             lost: Some(lost),
             last_used_ms: Some(1),
         });
@@ -2452,6 +2597,7 @@ impl Store {
             },
         };
         let mut writers = false;
+        let boot = boot_session();
         // Record IDs are per pool, so the caller's own ID is exempt only in
         // this store's state; an equal ID in the other pool is another command.
         for (pool, state, exempt) in [
@@ -2465,7 +2611,14 @@ impl Store {
                 }
                 if record.phase == Phase::Retired {
                     if let Some(lost) = record.lost.as_ref() {
-                        if let Some(why) = lost.unclosed.as_deref() {
+                        // A restart closed a quarantined record whose holder
+                        // predates this boot session; its slot is released and
+                        // deleted whole at the next admission.
+                        if let Some(why) = lost
+                            .unclosed
+                            .as_deref()
+                            .filter(|_| !closed_by_boot(record, boot))
+                        {
                             return Ok(CheckoutCustody::Unknown(format!(
                                 "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
                                 lost.slot_id
@@ -2696,6 +2849,7 @@ impl Store {
             read_observations(&self.control)
         };
         let now = process::now_ms();
+        let boot = boot_session();
         let slots = snapshot
             .slots
             .iter()
@@ -2728,7 +2882,16 @@ impl Store {
                             holder_pid: record.holder.as_ref().map(|holder| holder.pid),
                             path: return_path(record, slot),
                         }),
-                    retired: record.and_then(|record| record.retired.clone()),
+                    // A quarantined record whose holder predates this boot
+                    // session is reported as closed by the restart, not as
+                    // kept forever.
+                    retired: record.and_then(|record| {
+                        if closed_by_boot(record, boot) {
+                            record.lost.as_ref().map(|lost| lost.describe(true))
+                        } else {
+                            record.retired.clone()
+                        }
+                    }),
                     holder: record
                         .filter(|_| slot.state == SlotOccupancy::Held)
                         .and_then(|record| record.holder.as_ref())
@@ -4018,12 +4181,18 @@ impl Drop for PublicationGuard {
 /// initialization (see [`Store::initialize_outputs`]). Anything that is not
 /// positively idle, closed or the caller's own barrier refuses.
 fn writers_closed(state: &State, pool: &str, own_checkout: Option<&Path>) -> Result<(), String> {
+    let boot = boot_session();
     for record in &state.records {
         if record.active() {
             return Err(format!(
                 "{pool} pool holds an active command record (record {}); the shared output format is initialized only after every command in both pools closes",
                 record.id
             ));
+        }
+        if closed_by_boot(record, boot) {
+            // A restart ended the quarantined writers; the slot is released
+            // and deleted whole at the next admission.
+            continue;
         }
         if let Some(why) = record
             .lost
@@ -4607,7 +4776,7 @@ mod tests {
             holder: None,
             lease_id: None,
             pending_recovery: None,
-            retired: lost.as_ref().map(Lost::describe),
+            retired: lost.as_ref().map(|lost| lost.describe(false)),
             lost,
             last_used_ms: Some(1),
         }
@@ -4894,6 +5063,8 @@ mod tests {
         removable.save(&State::default()).unwrap();
         let mut lost = State::default();
         let mut retired = record(Phase::Retired, None, None);
+        // A holder of this boot session: the restart fact never closes it.
+        retired.holder.as_mut().unwrap().started_ms = process::now_ms();
         retired.lost = Some(Lost {
             slot_id: "1".to_owned(),
             at_ms: 1,
@@ -4932,6 +5103,160 @@ mod tests {
             ));
             assert_eq!(state.owned_outputs.as_deref(), Some(OWNED_OUTPUTS_FENCE));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Owned output format initialization accepts a quarantined lost slot in
+    /// either pool when a restart ended its writers, and still refuses the
+    /// same record when its holder started in this boot session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn output_initialization_accepts_a_lost_slot_from_an_earlier_boot() {
+        let own = Path::new("/own");
+        let transaction = "e".repeat(32);
+        let quarantined = |started_ms: u64| {
+            let mut entry = record(Phase::Retired, None, None);
+            entry.holder.as_mut().unwrap().started_ms = started_ms;
+            entry.holder.as_mut().unwrap().command = Some("exec tool".to_owned());
+            entry.lost = Some(Lost {
+                slot_id: "4".to_owned(),
+                at_ms: 1,
+                unclosed: Some("exec tool may have started processes outside its group".to_owned()),
+            });
+            entry
+        };
+        for label in ["internal", "paired"] {
+            let (root, internal, removable) = paired_controls(&format!("init-boot-{label}"));
+            let (side, other) = if label == "internal" {
+                (&internal, &removable)
+            } else {
+                (&removable, &internal)
+            };
+            // This boot session's holder: unchanged refusal, in either pool.
+            other.save(&State::default()).unwrap();
+            side.save(&state_with(vec![quarantined(process::now_ms())]))
+                .unwrap();
+            let created = std::cell::Cell::new(false);
+            let error = internal
+                .initialize_outputs(&transaction, Some(own), &|_, _| {
+                    created.set(true);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(error.contains("never confirmed closed"), "{label}: {error}");
+            assert!(!created.get(), "{label}: the registry was created");
+            // A holder from an earlier boot session: the restart closed it,
+            // so initialization proceeds and reads both pools the same way.
+            side.save(&state_with(vec![quarantined(1)])).unwrap();
+            internal
+                .initialize_outputs(&transaction, Some(own), &|_, may_create| {
+                    assert!(may_create);
+                    Ok(())
+                })
+                .unwrap();
+            for pool in [&internal, &removable] {
+                let state = pool.load().unwrap();
+                assert!(matches!(
+                    state.outputs_init,
+                    Some(OutputsInit::Ready { .. })
+                ));
+                assert_eq!(state.owned_outputs.as_deref(), Some(OWNED_OUTPUTS_FENCE));
+            }
+            // The record is still present until the next admission deletes
+            // it whole; initialization never deletes a slot itself.
+            assert_eq!(side.load().unwrap().records.len(), 1, "{label}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// A quarantined lost slot whose holder started before this boot session
+    /// is released and deleted whole through the existing path. A group
+    /// number that is live now does not keep it: it belongs to no writer of an
+    /// earlier session. The same record with a current-session holder is kept
+    /// (the counterfactual).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_lost_slot_from_an_earlier_boot_is_released_and_deleted_whole() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-lost-boot-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let pool = root.join("pool");
+        init_budget_pool(&pool, 1 << 30).unwrap();
+        let store = Store {
+            control: pool.join(MANAGED_NAME),
+            payload: pool.join("payload"),
+            pool: pool.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: Some(1 << 30),
+            recorded_budget: 1 << 30,
+            max_active: 16,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "identity".to_owned(),
+            compatibility: "quick-key".to_owned(),
+        };
+        let leased = lease(&store, &key, None).expect("a slot");
+        let record_id = leased.record_id();
+        let slot_id = leased.slot_id.clone();
+        let slot_dir = leased.build_dir.parent().expect("slot dir").to_path_buf();
+        drop(leased);
+        // SAFETY: getpgrp has no preconditions and this test process is in
+        // its group, so the recorded group is genuinely not empty.
+        let live_group = unsafe { libc::getpgrp() };
+        let quarantine = |started_ms: u64| {
+            let mut state = store.load().unwrap();
+            let entry = state
+                .records
+                .iter_mut()
+                .find(|entry| entry.id == record_id)
+                .unwrap();
+            entry.phase = Phase::Retired;
+            entry.process_group = Some(live_group);
+            entry.holder.as_mut().unwrap().started_ms = started_ms;
+            entry.lost = Some(Lost {
+                slot_id: slot_id.clone(),
+                at_ms: 1,
+                unclosed: Some("exec tool may have started processes outside its group".to_owned()),
+            });
+            store.save(&state).unwrap();
+        };
+        // Counterfactual: this session's holder is never closed by the boot
+        // fact, whatever its recorded group is.
+        quarantine(process::now_ms());
+        let mut state = store.load().unwrap();
+        store.discard_lost(&mut state).unwrap();
+        assert!(slot_dir.is_dir(), "a current-session lost slot was deleted");
+        assert_eq!(
+            store.load().unwrap().records.len(),
+            1,
+            "a current-session lost record was forgotten"
+        );
+        // A holder from an earlier boot session: deleted whole, with its
+        // record, despite the live group number.
+        quarantine(1);
+        let mut state = store.load().unwrap();
+        store.discard_lost(&mut state).unwrap();
+        assert!(!slot_dir.exists(), "the boot-closed slot was not deleted");
+        assert!(
+            store.load().unwrap().records.is_empty(),
+            "the boot-closed record was not forgotten"
+        );
+        assert!(
+            store.ledger().unwrap().slots.is_empty(),
+            "the boot-closed slot is still in the ledger"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5476,18 +5801,148 @@ mod tests {
             .lost
             .as_ref()
             .unwrap()
-            .describe()
+            .describe(false)
             .contains("deleted whole"));
         lost.lost.as_mut().unwrap().unclosed = Some("why".to_owned());
         assert!(lost
             .lost
             .as_ref()
             .unwrap()
-            .describe()
+            .describe(false)
             .starts_with("quarantined"));
         let encoded = serde_json::to_string(&lost).unwrap();
         let decoded: Record = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.lost.unwrap().unclosed.as_deref(), Some("why"));
+    }
+
+    /// A quarantined lost record with a holder start, for the boot-session
+    /// closure table.
+    fn quarantined_at(started_ms: u64) -> Record {
+        let mut entry = record(Phase::Retired, None, Some("lease"));
+        entry.holder.as_mut().unwrap().started_ms = started_ms;
+        entry.holder.as_mut().unwrap().command = Some("exec tool".to_owned());
+        entry.lost = Some(Lost {
+            slot_id: "5".to_owned(),
+            at_ms: 1,
+            unclosed: Some("exec tool may have started processes outside its group".to_owned()),
+        });
+        entry
+    }
+
+    /// A restart ends every process: a quarantined holder that started before
+    /// the current boot session is closed, one that started inside the safety
+    /// margin or during this session is not.
+    #[test]
+    fn only_a_holder_from_an_earlier_boot_session_is_closed_by_the_restart() {
+        let boot = 1_900_000_000_000_u64;
+        let earlier = quarantined_at(boot - BOOT_MARGIN_MS - 1);
+        assert!(lost_writers_closed(&earlier, Some(boot)));
+        assert!(closed_by_boot(&earlier, Some(boot)));
+        // The same record is still quoted and kept when the boot fact is
+        // absent (the counterfactual: without the check nothing closes it).
+        assert!(!lost_writers_closed(&earlier, None));
+        assert!(!closed_by_boot(&earlier, None));
+        for started in [boot - BOOT_MARGIN_MS, boot - 1, boot, boot + 1] {
+            let near = quarantined_at(started);
+            assert!(!lost_writers_closed(&near, Some(boot)), "started {started}");
+            assert!(!closed_by_boot(&near, Some(boot)), "started {started}");
+        }
+        // A record that already closed positively is never reported as
+        // closed by the boot session, whatever the boot time says.
+        let mut positive = quarantined_at(0);
+        positive.lost.as_mut().unwrap().unclosed = None;
+        assert!(lost_writers_closed(&positive, None));
+        assert!(!closed_by_boot(&positive, Some(boot)));
+    }
+
+    /// An unknown boot time, a missing holder and a zero start are never
+    /// closure, and elapsed time is not a fact this reads.
+    #[test]
+    fn an_unknown_boot_time_or_a_missing_start_never_closes_a_lost_slot() {
+        let boot = 1_900_000_000_000_u64;
+        assert!(!lost_writers_closed(
+            &quarantined_at(boot - BOOT_MARGIN_MS - 1),
+            None
+        ));
+        assert!(!lost_writers_closed(&quarantined_at(0), Some(boot)));
+        let mut missing = quarantined_at(boot - BOOT_MARGIN_MS - 1);
+        missing.holder = None;
+        assert!(!lost_writers_closed(&missing, Some(boot)));
+        assert!(!closed_by_boot(&missing, Some(boot)));
+        // A record without a lost entry is not a lost slot at all.
+        assert!(!lost_writers_closed(
+            &record(Phase::Idle, None, None),
+            Some(boot)
+        ));
+    }
+
+    /// The boot override works only inside the shared supervisor's own
+    /// scratch/evidence/deadline layout; anything else leaves the real
+    /// reading in force.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_boot_override_needs_the_supervisors_own_layout() {
+        let root = Path::new("/scratch/oxide-proof.unit");
+        let scratch = root.join("scratch");
+        let evidence = root.join("evidence");
+        assert!(supervisor_layout_paths(
+            &scratch,
+            &evidence,
+            Some("1900000000000")
+        ));
+        for (label, scratch, evidence, deadline) in [
+            (
+                "evidence elsewhere",
+                scratch.clone(),
+                root.join("other"),
+                Some("1"),
+            ),
+            (
+                "nested evidence",
+                scratch.clone(),
+                scratch.join("evidence"),
+                Some("1"),
+            ),
+            ("absent deadline", scratch.clone(), evidence.clone(), None),
+            (
+                "unparseable deadline",
+                scratch.clone(),
+                evidence.clone(),
+                Some("soon"),
+            ),
+            (
+                "not the supervisor leaf",
+                root.to_path_buf(),
+                evidence.clone(),
+                Some("1"),
+            ),
+            (
+                "not an oxide-proof root",
+                Path::new("/scratch/other/scratch").to_path_buf(),
+                Path::new("/scratch/other/evidence").to_path_buf(),
+                Some("1"),
+            ),
+        ] {
+            assert!(
+                !supervisor_layout_paths(&scratch, &evidence, deadline),
+                "{label}"
+            );
+        }
+    }
+
+    /// The debug proof control defines the reading only when it is present,
+    /// and a present but unusable value is unknown rather than the real boot.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_present_boot_override_is_read_or_unknown_but_never_ignored() {
+        assert_eq!(boot_override(None), None);
+        assert_eq!(
+            boot_override(Some("1900000000000")),
+            Some(Some(1_900_000_000_000))
+        );
+        for unusable in ["unreadable", "0", "", "1900000000000 "] {
+            assert_eq!(boot_override(Some(unusable)), Some(None), "{unusable:?}");
+        }
     }
 
     fn held(holder: &str, lease_id: &str) -> LedgerSlot {

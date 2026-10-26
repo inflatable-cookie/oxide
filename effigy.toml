@@ -451,6 +451,45 @@ run = "python3 scripts/test-oxide-removable-pool.py"
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py"
 
+# Boot-session closure (oxide#161): the removable-removal proof's focused
+# mode. A restart ends every process, so a quarantined lost slot whose holder
+# started before the current boot session is positively closed. Stages this
+# HEAD's debug `oxide` offline with 1.97.1 and, over one owned 128 MiB scratch
+# APFS image at a unique /Volumes/<name> (`-owners on`) with a private HOME
+# and CARGO_HOME, proves three independent cases: a quarantined `exec` slot
+# (the product's own removal path: the removal stop ends the blocked tool and
+# its release flush fails with the mount gone) whose debug-only override
+# boot time follows its holder start is reported closed by `status`, an
+# explicit adopt of a whole-target fixture then migrates, and the next
+# admission deletes the slot whole; a slot whose override boot time precedes
+# its holder start stays kept with its bytes; an unreadable override stays
+# kept. The explicit internal root is the owner-accepted exception for this
+# fixture's genuine directory-budget internal pool (a pool under /Volumes
+# refuses). 300 s, 512 MiB monitored scratch, ordinary detach. No reinstall,
+# live pool or live slot mutation. Not a benchmark or full QA.
+[tasks."rust:oxide-removable-boot-closure"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure"
+
+# The uncounted diagnostic twin of the same focused mode (oxide#161): the same
+# guard, root and limits with `--diagnostic` appended. It records reached,
+# completed and failed cases and stops on any outcome it cannot classify, and
+# writes ONE bounded `qualified: false` receipt beside the guard's. It is never
+# a counted native PASS.
+[tasks."rust:oxide-removable-boot-closure:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure --diagnostic"
+
+# The pure apparatus check of the boot-closure mode (oxide#161): no child,
+# pool, image, device or supervisor, and no gate credit. It pins the two
+# defects the first exact-head review found before a native activation (the
+# diagnostic receipt's `json` dependency and a boot-closure child handed only
+# the override instead of the full fixture environment), plus the argument
+# dispatch and the product's own deletion line the candidate marker quotes.
+# It runs before the uncounted diagnostic and is not native evidence.
+[tasks."rust:oxide-removable-boot-closure:test"]
+run = "python3 scripts/test-oxide-removable-removal.py --self-check"
+
 # Budget-only default pool (oxide#102): the removable-pool proof's guarded
 # session, preceded by the default-pool cases over a scratch HOME (legacy
 # image pool detection untouched, creation at the new path with a verified

@@ -27,6 +27,33 @@ predeclared cases:
 
 Final outputs stay in `<checkout>/target` throughout. Cleanup is an ordinary
 detach. Not a benchmark and not real-drive qualification.
+
+`--boot-closure` is the focused mode for oxide#161: a restart ends every
+process, so a quarantined lost slot whose holder started before the current
+boot session is positively closed. It stages the same candidate and uses the
+same owned image, and runs three independent cases over private checkouts:
+a quarantined `exec` slot whose override boot time follows its holder start
+is reported closed by `status`, an explicit `outputs adopt` of a whole-target
+fixture then migrates, and the next admission deletes the slot whole with
+`oxide: deleted slot <n> lost before this boot (...)`; a quarantined slot
+whose override boot time precedes its holder start stays kept with its
+bytes; and an unreadable override stays kept. The one seam is the debug-only
+`OXIDE_TEST_BOOT_MS` override, which the product honors only under this
+supervisor's own scratch/evidence/deadline layout. The quarantines are made by
+the product's own removal path: a blocked `oxide exec` tool loses the volume
+under the removal stop, and its release flush fails with the mount gone, so
+the lost record names the exec holder (an exec may start processes outside
+its group) and is quarantined. No state file is edited.
+`--diagnostic` (with `--boot-closure`) is the uncounted collection mode: it
+records a bounded `qualified: false` receipt of reached, completed and failed
+cases and stops on any outcome it cannot classify. `--self-check` is the pure
+apparatus check run before any activation: no child, pool, image or device.
+It pins the full fixture environment every boot-closure child (`status`
+included) receives, the deletion oracle's slot-leaf resolution (the slot's
+own `<profile>-<id>` leaf, never the project-label folder a build or an
+`outputs adopt` also creates or reuses), the diagnostic receipt's bounded
+unqualified `json` document, the argument dispatch and the product deletion
+line the candidate marker quotes.
 """
 
 from __future__ import annotations
@@ -35,11 +62,15 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import glob
+import hashlib
 import importlib.util
+import json
 import os
 import plistlib
 import re
 import secrets
+import shutil
 import signal
 import stat
 import subprocess
@@ -55,6 +86,40 @@ expect, fail, summary, MIB = runner.expect, runner.fail, runner.summary, runner.
 
 CANDIDATE_MARKER = b"lost with the removable volume; deleted whole when the volume returns"
 WAIT_SECONDS = 60
+
+# The boot-session closure mode (oxide#161): a marker only a candidate with
+# the boot fact carries, the ONE debug-only override that names a boot time,
+# and the fixed safety margin the product uses between a holder start and the
+# boot session it must precede.
+BOOT_MARKER = b"lost before this boot (holder started"
+BOOT_HOOK = "OXIDE_TEST_BOOT_MS"
+BOOT_MARGIN_MS = 60_000
+REMOVABLE_STATE = os.path.join("oxide-managed", "removable", "oxide-managed", "state.json")
+DIAGNOSTIC_RECEIPT = "removal-boot-closure.diagnostic"
+DIAGNOSTIC_RECEIPT_BYTES = 16 * 1024
+BOOT_CASES = (
+    ("before-boot", "a quarantined holder from an earlier boot session is deleted whole and its checkout adopts"),
+    ("after-boot", "a holder from this boot session stays quarantined"),
+    ("unreadable-boot", "an unreadable boot time stays quarantined"),
+)
+BOOT_APP = {
+    "Cargo.toml": '[package]\nname = "bootapp"\nversion = "0.1.0"\nedition = "2021"\n',
+    "src/main.rs": 'fn main() {\n    println!("bootapp ok");\n}\n',
+}
+# A tool that holds its slot until the volume goes away. It ends by itself
+# after a bounded wait, so a removal stop that failed to end its group cannot
+# leave a writer running into the next case or the supervisor's census.
+HOLD_TOOL = """#!/bin/sh
+set -eu
+echo started > "$FIXTURE_GATE/started"
+n=0
+while [ "$n" -lt 1200 ]; do
+    if [ -e "$FIXTURE_GATE/go" ]; then exit 0; fi
+    n=$((n + 1))
+    sleep 0.05
+done
+exit 0
+"""
 
 APP = {
     "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -127,6 +192,14 @@ class Proof(layout.Proof):
         print(f"----- {label}: exit {child.returncode} -----\n{stdout}{stderr}", flush=True)
         return child.returncode, stdout, stderr
 
+    def oxide(self, args: list, label: str, cwd: str, env: dict | None = None) -> tuple:
+        """One `oxide` child; `env` names the child's own environment (the
+        boot-session mode runs some children with a debug-only override)."""
+        result = self.run([self.binary, *args], cwd=cwd, env=env)
+        stdout, stderr = result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace")
+        print(f"----- {label}: exit {result.returncode} -----\n{stdout}{stderr}", flush=True)
+        return result.returncode, stdout, stderr
+
 
 def write_tree(root: str, files: dict) -> str:
     for relative, text in files.items():
@@ -148,14 +221,16 @@ def wait_for(path: str, label: str) -> None:
 class Volume:
     """The one owned scratch image: path, root device, mount and UUID."""
 
-    def __init__(self, proof: Proof, image: str, mount: str):
+    def __init__(self, proof: Proof, image: str, mount: str, owners: bool = False):
         self.proof, self.image, self.mount = proof, image, mount
+        self.owners = owners
         self.device = None
         self.uuid = None
 
     def attach(self) -> None:
         expect(not os.path.lexists(self.mount), f"{self.mount} exists before attach")
-        attached = self.proof.run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-noverify", "-plist", self.image], timeout=60)
+        options = ["-owners", "on"] if self.owners else []
+        attached = self.proof.run(["/usr/bin/hdiutil", "attach", *options, "-nobrowse", "-noverify", "-plist", self.image], timeout=60)
         expect(attached.returncode == 0, f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}")
         entities = plistlib.loads(attached.stdout)["system-entities"]
         mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
@@ -229,24 +304,10 @@ def late_writes(out_dir: str, label: str) -> None:
         print(f"{label}: late directory creation refused: {error}")
 
 
-def run(proof: Proof, repo: str) -> None:
-    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
-    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
-    expect(not dirty, f"candidate checkout is not clean: {dirty}")
-    name = "OxRm" + secrets.token_hex(4)
-    mount = f"/Volumes/{name}"
-    print(f"removal proof {os.getpid()} source {source} ({layout.source_facts(repo)}) volume {name}")
-    expect(not os.path.lexists(mount), f"{mount} already exists; never touched")
-    proof.phase("start")
-    root = proof.root
-    candidate = layout.stage_at(proof, repo, "oxide-candidate")
-    print(f"staged candidate sha256 {layout.sha256(candidate)}")
-    with open(candidate, "rb") as handle:
-        expect(CANDIDATE_MARKER in handle.read(), "candidate binary lacks the #098 lost-volume text")
-    proof.binary = candidate
-    proof.phase("after staging")
-
-    pool = os.path.join(root, "pool")
+def private_environment(root: str) -> dict:
+    """The private HOME, CARGO_HOME, gate and sanitized command environment
+    every fixture child gets; nothing here may reach the operator's account,
+    Cargo home, wrapper or target settings."""
     home = os.path.join(root, "home")
     cargo_home = os.path.join(root, "cargo-home")
     gate = os.path.join(root, "gate")
@@ -262,7 +323,7 @@ def run(proof: Proof, repo: str) -> None:
     tmp = os.environ["TMPDIR"]
     env.update(
         {
-            "OXIDE_POOL": pool,
+            "OXIDE_POOL": os.path.join(root, "pool"),
             "OXIDE_POOL_CAP": "64MiB",
             "HOME": home,
             "OXIDE_TEST_HOME_FROM_ENV": "1",
@@ -281,6 +342,28 @@ def run(proof: Proof, repo: str) -> None:
             "TEMP": tmp,
         }
     )
+    return env
+
+
+def run(proof: Proof, repo: str) -> None:
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    name = "OxRm" + secrets.token_hex(4)
+    mount = f"/Volumes/{name}"
+    print(f"removal proof {os.getpid()} source {source} ({layout.source_facts(repo)}) volume {name}")
+    expect(not os.path.lexists(mount), f"{mount} already exists; never touched")
+    proof.phase("start")
+    root = proof.root
+    candidate = layout.stage_at(proof, repo, "oxide-candidate")
+    print(f"staged candidate sha256 {layout.sha256(candidate)}")
+    with open(candidate, "rb") as handle:
+        expect(CANDIDATE_MARKER in handle.read(), "candidate binary lacks the #098 lost-volume text")
+    proof.binary = candidate
+    proof.phase("after staging")
+
+    env = private_environment(root)
+    gate = env["FIXTURE_GATE"]
     proof.env = env
     app = write_tree(os.path.join(root, "app"), APP)
     held = write_tree(os.path.join(root, "held"), held_fixture("held"))
@@ -410,7 +493,688 @@ def run(proof: Proof, repo: str) -> None:
     proof.phase("after quarantine")
 
 
+# --- Boot-session closure mode (oxide#161) --------------------------------
+
+
+class OracleFailure(RuntimeError):
+    """A product expectation that did not hold (recoverable in a diagnostic)."""
+
+
+class UnknownOutcome(RuntimeError):
+    """An outcome this proof cannot classify: writers, volume, device or custody."""
+
+
+def oracle(condition: bool, message: str) -> None:
+    if not condition:
+        raise OracleFailure(message)
+
+
+def need(condition: bool, message: str) -> None:
+    if not condition:
+        raise UnknownOutcome(message)
+
+
+def read_json(path: str) -> dict:
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def slot_leaf_directory(slots: str, slot: str) -> str:
+    """The slot's own directory, `slots/<project folder>/<profile>-<id>`
+    (`split_slot_dir` in `src/lease/pool.rs`), resolved by the product's
+    recorded slot id across the whole slots tree. `slots/<folder>` is only
+    the project label a build, an adopt or a relink also creates or reuses,
+    so it is never what a lost-slot oracle names."""
+    leaves = sorted(glob.glob(os.path.join(glob.escape(slots), "*", f"*-{slot}")))
+    need(len(leaves) == 1, f"slot {slot} has {len(leaves)} slot leaves under {slots}: {leaves}")
+    leaf = leaves[0]
+    need(
+        os.path.dirname(os.path.dirname(leaf)) == slots,
+        f"slot {slot} leaf {leaf} is not one level below a project folder in {slots}",
+    )
+    return leaf
+
+
+def deletion_oracle_leaf(slots: str, slot: str, folder: str) -> str:
+    """The exact path a lost-slot deletion oracle names: the slot's own leaf,
+    required to sit in the project folder just discovered and to be distinct
+    from it. Every fact is re-derived from the recorded id alone, so no
+    build output or project directory can satisfy or fail the oracle."""
+    leaf = slot_leaf_directory(slots, slot)
+    need(
+        os.path.dirname(leaf) == folder,
+        f"slot {slot} leaf {leaf} is not in the project folder {folder}",
+    )
+    need(
+        os.path.realpath(leaf) != os.path.realpath(folder),
+        f"slot {slot} resolved to the project-label directory {folder}",
+    )
+    return leaf
+
+
+def write_tool(path: str) -> str:
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(HOLD_TOOL)
+    os.chmod(path, 0o755)
+    return os.path.realpath(path)
+
+
+def git_fixture(proof: Proof, path: str, files: dict) -> str:
+    """A tiny crate that is a Git repository already ignoring `/target`, the
+    prerequisite a first conversion checks."""
+    root = write_tree(path, files)
+    proof.run(["git", "init", "-q"], cwd=root, timeout=30)
+    with open(os.path.join(root, ".gitignore"), "w", encoding="utf-8") as handle:
+        handle.write("/target\n")
+    return root
+
+
+def diagnostic_receipt(outcome: dict) -> str:
+    """Write ONE bounded, uniquely named, explicitly unqualified receipt."""
+    recorded = {
+        **outcome,
+        "failed": [[case, message[:400]] for case, message in outcome["failed"][:8]],
+    }
+    body = json.dumps(recorded, indent=1) + "\n"
+    if len(body.encode()) > DIAGNOSTIC_RECEIPT_BYTES:
+        recorded = {
+            "version": recorded["version"],
+            "mode": "diagnostic",
+            "qualified": False,
+            "incomplete": True,
+            "reason": f"the bounded receipt exceeded {DIAGNOSTIC_RECEIPT_BYTES} bytes",
+            "completed": recorded["completed"],
+            "failed_cases": [case for case, _ in recorded["failed"]],
+        }
+        body = json.dumps(recorded, indent=1) + "\n"
+    name = f"{DIAGNOSTIC_RECEIPT}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.json"
+    path = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], name)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    return path
+
+
+class BootClosure:
+    """The focused session: one candidate, one owned image, three independent
+    cases. Every quarantine is made by the product's own removal stop; no
+    state file is edited."""
+
+    def __init__(self, proof: Proof, repo: str):
+        self.proof = proof
+        self.repo = repo
+        self.source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+        dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+        expect(not dirty, f"candidate checkout is not clean: {dirty}")
+        self.name = "OxBc" + secrets.token_hex(4)
+        self.mount = f"/Volumes/{self.name}"
+        expect(not os.path.lexists(self.mount), f"{self.mount} already exists; never touched")
+        print(f"boot-closure proof {os.getpid()} source {self.source} ({layout.source_facts(repo)}) volume {self.name}")
+        proof.phase("start")
+        # Premise 7: the staged candidate's debug capability is what the boot
+        # hook needs, and staging inherits these flags. Refuse an inherited
+        # value rather than let it change what the candidate is.
+        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
+            need(
+                not os.environ.get(name),
+                f"{name} is inherited; the candidate's debug capability is not frozen",
+            )
+        candidate = layout.stage_at(proof, repo, "oxide-boot-closure")
+        print(f"staged candidate sha256 {layout.sha256(candidate)}")
+        with open(candidate, "rb") as handle:
+            need(BOOT_MARKER in handle.read(), "the candidate binary lacks the boot-session closure text")
+        proof.binary = candidate
+        self.env = private_environment(proof.root)
+        proof.env = self.env
+        self.pool = self.env["OXIDE_POOL"]
+        self.tool = write_tool(os.path.join(proof.root, "hold-tool"))
+        self.victims = {}
+        for case, _ in BOOT_CASES:
+            victim = git_fixture(proof, os.path.join(proof.root, f"victim-{case}"), BOOT_APP)
+            # A nonempty real target keeps this checkout unconverted, so only
+            # the normal pool path runs there (automatic first conversion is
+            # the separate oxide#121 feature, not this proof's subject).
+            os.makedirs(os.path.join(victim, "target"), exist_ok=True)
+            with open(os.path.join(victim, "target", "keep.txt"), "wb") as handle:
+                handle.write(b"checkout-local output")
+            self.victims[case] = victim
+        # The whole-target fixture: a Git checkout ignoring `/target` with an
+        # empty real target, which only an explicit `outputs adopt` converts.
+        self.whole = git_fixture(proof, os.path.join(proof.root, "whole"), BOOT_APP)
+        os.makedirs(os.path.join(self.whole, "target"), exist_ok=True)
+        proof.phase("after staging")
+
+        image = os.path.join(proof.root, "volume.sparseimage")
+        created = proof.run(
+            ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", self.name, "-type", "SPARSE", image],
+            timeout=60,
+        )
+        need(created.returncode == 0, f"image creation failed: {created.stderr!r}")
+        # `-owners on` on every attach: the product judges the mounted root's
+        # own ownership and mode, and a mount that ignores ownership would
+        # make that judgement meaningless.
+        self.volume = Volume(proof, image, self.mount, owners=True)
+        self.volume.attach()
+        code, stdout, stderr = proof.oxide(
+            ["pool", "register-removable", self.mount, "--reserve", "16MiB", "--cap", "64MiB", "--mode", "permanent"],
+            "register permanent",
+            self.whole,
+        )
+        need(code == 0 and "registered removable pool" in stdout, f"registration failed: {stderr[-800:]}")
+        self.slots = os.path.join(self.mount, "oxide-pool", "slots")
+        proof.phase("after registration")
+
+    def child_env(self, extra: dict) -> dict:
+        """The full fixture environment plus one child's own controls. Every
+        boot-closure child — `status` included — starts here, so no call can
+        hand a child only the boot override."""
+        return dict(self.env, **extra)
+
+    def state(self) -> dict:
+        path = os.path.join(self.pool, REMOVABLE_STATE)
+        need(os.path.isfile(path), f"no removable pool state at {path}; custody unknown")
+        return read_json(path)
+
+    def lost_record(self, slot: str) -> dict:
+        for record in self.state().get("records", []):
+            if str((record.get("lost") or {}).get("slot_id")) == slot:
+                return record
+        raise UnknownOutcome(f"no state record for lost slot {slot}; custody unknown")
+
+    def status(self, label: str, cwd: str, extra: dict) -> str:
+        code, stdout, stderr = self.proof.oxide(["status"], label, cwd, self.child_env(extra))
+        need(code == 0, f"{label}: status exit {code}: {stderr[-800:]}")
+        return stdout
+
+    def quarantine(self, case: str) -> dict:
+        """Hold a removable slot with `oxide exec`, force the volume away, and
+        return the product's own quarantined record facts."""
+        env = self.child_env({"FIXTURE_GATE": os.path.join(self.proof.root, "gate", case)})
+        os.makedirs(env["FIXTURE_GATE"], mode=0o700)
+        victim = self.victims[case]
+        before = set(os.listdir(self.slots))
+        child = self.proof.start(["exec", "--", self.tool], victim, env)
+        wait_for(os.path.join(env["FIXTURE_GATE"], "started"), f"{case} exec")
+        self.volume.force_detach(f"{case} removal")
+        code, _, stderr = self.proof.finish(child, f"{case} exec after removal", WAIT_SECONDS)
+        # A surviving exec, or a removal without the product's own quarantine
+        # record, leaves the slot's custody unknown: no later case may assume
+        # this pool is in a state the proof can classify.
+        need(code != 0, f"{case}: the exec survived the removal; custody unknown")
+        found = re.search(
+            r"slot (\d+) is quarantined: lost with the removable volume and .+; kept with its bytes, never reused or deleted",
+            stderr,
+        )
+        need(found is not None, f"{case}: the quarantine was not recorded: {stderr[-1200:]}")
+        slot = found.group(1)
+        record = self.lost_record(slot)
+        command = str((record.get("holder") or {}).get("command") or "")
+        need(command.startswith("exec "), f"{case}: the quarantined record is not an exec holder: {command!r}")
+        need(
+            bool((record.get("lost") or {}).get("unclosed")),
+            f"{case}: the lost record carries no unclosed reason",
+        )
+        self.volume.attach()
+        after = set(os.listdir(self.slots))
+        new = sorted(after - before)
+        need(len(new) == 1, f"{case}: {len(new)} new slot directories appeared: {new}")
+        folder = os.path.join(self.slots, new[0])
+        need(os.path.isdir(folder), f"{case}: {folder} is not a new project folder")
+        # `slots/<folder>` is the project-label directory, not the slot: the
+        # slot is the single `<profile>-<id>` leaf inside it. Resolve that
+        # leaf from the product's recorded id here, before any admission of
+        # this case runs, so the deletion oracle names the slot itself.
+        directory = deletion_oracle_leaf(self.slots, slot, folder)
+        need(os.path.isdir(directory), f"{case}: slot leaf {directory} is not a directory")
+        started = int((record.get("holder") or {}).get("started_ms") or 0)
+        need(started > 0, f"{case}: the recorded holder start is {started}")
+        print(
+            f"{case}: quarantined slot {slot} leaf {directory} in project folder {folder}, "
+            f"holder started {started} ms, state record {record.get('id')}"
+        )
+        return {
+            "case": case,
+            "slot": slot,
+            "folder": folder,
+            "directory": directory,
+            "started": started,
+            "victim": victim,
+        }
+
+    def kept(self, found: dict, extra: dict) -> None:
+        """The slot stays held with its bytes: no deletion, its project folder
+        and record unchanged, and status still reports the quarantine. A
+        forced detach may not persist the leaf's last writes (the main mode's
+        `kept_present` precedent), so this oracle keeps the folder and the
+        record rather than the leaf."""
+        case, slot, folder, victim = found["case"], found["slot"], found["folder"], found["victim"]
+        stdout = self.status(f"{case} status", victim, extra)
+        oracle(
+            re.search(
+                rf"slot {slot} retired and held, never reused \(quarantined: lost with the removable volume and .+; kept with its bytes, never reused or deleted",
+                stdout,
+            )
+            is not None,
+            f"{case}: status does not report the quarantine: {stdout[-1200:]}",
+        )
+        code, _, stderr = self.proof.oxide(["build"], f"{case} admission", victim, self.child_env(extra))
+        oracle(code == 0, f"{case}: the admission failed: {stderr[-1200:]}")
+        oracle("deleted slot" not in stderr, f"{case}: a quarantined slot was deleted: {stderr[-1200:]}")
+        oracle(os.path.isdir(folder), f"{case}: the project folder {folder} was removed")
+        self.lost_record(slot)
+        print(f"{case}: slot {slot} kept in {folder} with its record")
+
+    def before_boot(self) -> None:
+        found = self.quarantine("before-boot")
+        slot, folder, directory, victim = found["slot"], found["folder"], found["directory"], found["victim"]
+        # A later boot session: the holder started more than the safety
+        # margin before this one. The proof cannot reboot the host, so it
+        # names the session through the debug-only override.
+        override = {BOOT_HOOK: str(found["started"] + 2 * BOOT_MARGIN_MS)}
+        stdout = self.status("before-boot status", victim, override)
+        oracle(
+            re.search(rf"slot {slot} retired and held, never reused \(.*predates this boot session", stdout) is not None,
+            f"before-boot: status does not report the restart closure: {stdout[-1200:]}",
+        )
+        oracle(os.path.isdir(directory), "before-boot: the quarantined slot is already gone")
+        # Pre-build and project-directory-independent: re-resolve the slot
+        # leaf from the recorded id alone — no build output, no reliance on
+        # the project folder `slots/<folder>` — and require it to be the path
+        # `quarantine` named, inside its folder and not that folder. The
+        # deleting admission below creates a fresh slot of this same project
+        # in the same folder, so a folder oracle could not tell deletion from
+        # replacement.
+        oracle(
+            deletion_oracle_leaf(self.slots, slot, folder) == directory,
+            f"before-boot: slot {slot} leaf resolved away from {directory} before the build",
+        )
+        oracle(
+            os.path.dirname(directory) == folder and os.path.realpath(directory) != os.path.realpath(folder),
+            f"before-boot: the oracle names {directory}, not the slot leaf of {slot} in {folder}",
+        )
+        oracle(
+            os.path.isdir(directory),
+            f"before-boot: slot leaf {directory} is not on the volume before the build",
+        )
+        self.lost_record(slot)
+        # The observed defect: any whole-target checkout's explicit conversion
+        # refused on the quarantined record in the paired pool.
+        code, stdout, stderr = self.proof.oxide(
+            ["outputs", "adopt"], "before-boot adopt", self.whole, self.child_env(override)
+        )
+        oracle(
+            code == 0 and "now selects" in stdout,
+            f"before-boot: adopt refused or did not migrate: {code} {stdout[-800:]} {stderr[-800:]}",
+        )
+        # The conversion this head publishes for an empty whole-target
+        # checkout is the profile layout: `target` stays a real directory and
+        # the host members become owned links, with one committed receipt.
+        target = os.path.join(self.whole, "target")
+        oracle(
+            os.path.isdir(target) and not os.path.islink(target),
+            "before-boot: the whole target directory did not stay real",
+        )
+        for member in ("debug", "release"):
+            oracle(
+                os.path.islink(os.path.join(target, member)),
+                f"before-boot: the {member} member was not converted to an owned link",
+            )
+        key = hashlib.sha256(self.whole.encode()).hexdigest()
+        receipt = os.path.join(self.pool, "oxide-managed", "outputs", key + ".json")
+        oracle(os.path.isfile(receipt), f"before-boot: no committed output receipt at {receipt}")
+        # The next admission releases and deletes the slot whole.
+        code, _, stderr = self.proof.oxide(
+            ["build"], "before-boot deleting admission", victim, self.child_env(override)
+        )
+        oracle(code == 0, f"before-boot: the deleting admission failed: {stderr[-1200:]}")
+        oracle(
+            re.search(
+                rf"deleted slot {slot} lost before this boot \(holder started \d+ s before boot; a restart ends every process\)",
+                stderr,
+            )
+            is not None,
+            f"before-boot: the boot-closed slot was not deleted: {stderr[-1200:]}",
+        )
+        oracle(
+            not os.path.lexists(directory),
+            f"before-boot: slot leaf {directory} still exists after deletion",
+        )
+        # The project-label folder is a different path and legitimately outlives
+        # the slot: the deleting admission creates its own slot there. The
+        # deletion is proven by the slot leaf above, the product's own line and
+        # the record, not by the folder's absence.
+        oracle(
+            os.path.isdir(folder),
+            f"before-boot: the project folder {folder} is gone; the leaf and folder are not distinguishable",
+        )
+        records = [
+            record
+            for record in self.state().get("records", [])
+            if str((record.get("lost") or {}).get("slot_id")) == slot
+        ]
+        oracle(
+            not records,
+            f"before-boot: the deleted slot's record is still in state: {records[:1]}",
+        )
+        stdout = self.status("before-boot status after", victim, override)
+        oracle(
+            re.search(rf"slot {slot} retired and held", stdout) is None,
+            "before-boot: status still lists the deleted slot",
+        )
+
+    def after_boot(self) -> None:
+        found = self.quarantine("after-boot")
+        # A boot session that began before the holder: this session's writers
+        # may still run, so the record keeps today's behaviour exactly.
+        self.kept(found, {BOOT_HOOK: str(found["started"] - BOOT_MARGIN_MS)})
+
+    def unreadable_boot(self) -> None:
+        found = self.quarantine("unreadable-boot")
+        # A present but unusable override is an unknown boot time, never the
+        # real one and never closure.
+        self.kept(found, {BOOT_HOOK: "unreadable"})
+
+
+def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
+    """Run the three cases; return the one result line. The diagnostic mode
+    records recoverable failures and stops on an outcome it cannot classify."""
+    outcome = {
+        "version": "oxide.removal.boot-closure-diagnostic/1",
+        "mode": "diagnostic",
+        "qualified": False,
+        "claims": "diagnostic case coverage only; never a counted native PASS, closure, census or resource claim",
+        "cases": [case for case, _ in BOOT_CASES],
+        "purposes": dict(BOOT_CASES),
+        "source": None,
+        "limits": {"seconds": 300, "scratch_mib": 512, "image_mib": 128, "boot_margin_ms": BOOT_MARGIN_MS},
+        "reached": [],
+        "completed": [],
+        "failed": [],
+        "first_fault": None,
+        "aborted": None,
+        "unexecuted": [],
+        "root": proof.root,
+    }
+    session = None
+    try:
+        session = BootClosure(proof, repo)
+        outcome["source"] = session.source
+        outcome["manifest_lock"] = layout.source_facts(repo)
+        outcome["mount"] = session.mount
+        outcome["device"] = session.volume.device
+        outcome["volume_uuid"] = session.volume.uuid
+        for case, _ in BOOT_CASES:
+            outcome["reached"].append(case)
+            try:
+                getattr(session, case.replace("-", "_"))()
+            except OracleFailure as failure:
+                outcome["failed"].append([case, str(failure)])
+                outcome["first_fault"] = outcome["first_fault"] or f"{case}: {failure}"
+                print(f"{case}: FAILED {failure}", file=sys.stderr)
+                if not diagnostic:
+                    raise
+                continue
+            except UnknownOutcome as failure:
+                outcome["aborted"] = f"{case}: {failure}"
+                raise
+            outcome["completed"].append(case)
+            proof.phase(f"after {case}")
+    finally:
+        if diagnostic:
+            outcome["unexecuted"] = [case for case, _ in BOOT_CASES if case not in outcome["reached"]]
+            outcome["unclosed"] = sorted(proof.unclosed)
+            outcome["mount"] = proof.mount
+            path = diagnostic_receipt(outcome)
+            print(f"boot-closure diagnostic receipt {path}")
+    elapsed = time.monotonic() - runner.STARTED
+    if diagnostic or outcome["failed"]:
+        line = (
+            f"boot-closure diagnostic collected (UNCOUNTED, never a PASS): "
+            f"{len(outcome['completed'])}/{len(BOOT_CASES)} cases completed, failed "
+            f"{[case for case, _ in outcome['failed']]}, unexecuted {outcome['unexecuted']}; "
+            f"{elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
+            f"host free minimum {proof.low // MIB} MiB; one owned 128 MiB scratch image, "
+            f"ordinary detach; receipt {path if diagnostic else 'none'}"
+        )
+    else:
+        line = (
+            f"boot-closure proof held: {elapsed:.0f} s script time, peak owned "
+            f"{proof.peak // MIB} MiB at phase checks, host free minimum {proof.low // MIB} MiB; "
+            f"one owned 128 MiB scratch image, ordinary detach"
+        )
+    layout.record("result.txt", f"{'diagnostic (not a PASS)' if diagnostic else 'passed'}\n{line}\n")
+    print(line)
+    return line
+
+
+USAGE = "usage: test-oxide-removable-removal.py [--boot-closure [--diagnostic]] | --self-check"
+
+
+def mode_from_args(arguments: list) -> tuple | None:
+    """`(focused, diagnostic)` for a fixed argument list, or `None` when the
+    request is not one this script defines."""
+    focused = "--boot-closure" in arguments
+    diagnostic = "--diagnostic" in arguments
+    if (focused, diagnostic) not in ((False, False), (True, False), (True, True)):
+        return None
+    if not focused and arguments:
+        return None
+    if focused and sorted(arguments) != sorted(["--boot-closure"] + (["--diagnostic"] if diagnostic else [])):
+        return None
+    return focused, diagnostic
+
+
+def self_check() -> int:
+    """Pure apparatus check for the boot-closure mode: no child, pool, image,
+    device or supervisor. It pins the two defects an exact-head review found
+    before any native activation — the diagnostic receipt's `json` dependency
+    and the full fixture environment every child (`status` included) receives
+    — plus the deletion oracle's slot-leaf resolution (the slot's own leaf,
+    never the project-label folder a build or an adopt also creates or
+    reuses), the dispatch, the product-message marker and the receipt
+    bound."""
+    fixture = {
+        "OXIDE_POOL": "/fixture/pool",
+        "HOME": "/fixture/home",
+        "CARGO_HOME": "/fixture/cargo-home",
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
+        "OXIDE_TASK_SCRATCH_ROOT": "/fixture/scratch",
+        "TMPDIR": "/fixture/scratch",
+        "FIXTURE_GATE": "/fixture/gate",
+    }
+    override = {BOOT_HOOK: "1900000000000"}
+    quarantine = (
+        "  slot 7 retired and held, never reused (quarantined: lost with the removable volume and "
+        "exec /fixture/tool may have started processes outside its group; kept with its bytes, "
+        "never reused or deleted) project victim /fixture/victim 12 MiB allocated by slots, "
+        "slots/victim-7/quick-7"
+    )
+    calls = []
+
+    class Recorder:
+        root = "/fixture/root"
+
+        def oxide(self, args, label, cwd, env=None):
+            calls.append((list(args), dict(env or {})))
+            if args == ["status"]:
+                return 0, quarantine, ""
+            return 0, "", "oxide: fixture build summary"
+
+    root = tempfile.mkdtemp(prefix="boot-closure-self-check.")
+    try:
+        case = BootClosure.__new__(BootClosure)
+        case.env = dict(fixture)
+        case.proof = Recorder()
+        case.lost_record = lambda slot: {"holder": {"command": "exec /fixture/tool"}}
+        slots = os.path.join(root, "slots")
+        folder = os.path.join(slots, "victim-deadbeef")
+        slot_dir = os.path.join(folder, "quick-7")
+        os.makedirs(slot_dir)
+        os.makedirs(os.path.join(slots, "other-cafe", "debug-8"))
+        # The deletion oracle names the slot's own `<profile>-<id>` leaf, not
+        # the project-label folder a build, an adopt or a relink also creates
+        # or reuses: resolve it by the recorded id across the tree, require it
+        # inside the discovered folder, and refuse anything else.
+        expect(slot_leaf_directory(slots, "7") == slot_dir, "slot leaf resolution")
+        expect(os.path.dirname(slot_leaf_directory(slots, "7")) != slots, "the slot leaf is the slots root")
+        expect(deletion_oracle_leaf(slots, "7", folder) == slot_dir, "deletion oracle leaf")
+        for bad, why in (
+            ((slots, "7", os.path.join(slots, "other-cafe")), "a leaf in another project folder"),
+            ((slots, "9", folder), "a missing slot leaf"),
+        ):
+            try:
+                deletion_oracle_leaf(*bad)
+            except UnknownOutcome:
+                print(f"deletion oracle refused {why}")
+            else:
+                expect(False, f"the deletion oracle accepted {why}")
+        # Counterfactual: the pre-fix oracle named `slots/<folder>`, the
+        # project-label directory. A resolver that returned it is refused,
+        # never silently accepted as the deleted slot.
+        original = globals()["slot_leaf_directory"]
+        globals()["slot_leaf_directory"] = lambda tree, slot_id: folder
+        try:
+            try:
+                deletion_oracle_leaf(slots, "7", folder)
+            except UnknownOutcome as error:
+                print(f"deletion oracle refused the project-label folder: {error}")
+            else:
+                expect(False, "the project-label folder was accepted as the slot leaf")
+        finally:
+            globals()["slot_leaf_directory"] = original
+        # A second leaf ending in the recorded id is ambiguous, never a pick.
+        os.makedirs(os.path.join(slots, "other-cafe", "debug-7"))
+        try:
+            slot_leaf_directory(slots, "7")
+        except UnknownOutcome as error:
+            expect("2 slot leaves" in str(error), f"ambiguous leaf message {error}")
+        else:
+            expect(False, "two slot leaves with the recorded id resolved to one")
+        os.rmdir(os.path.join(slots, "other-cafe", "debug-7"))
+        # status(): one child, the whole fixture environment plus the override.
+        case.status("self-check status", "/fixture/victim", override)
+        expect(len(calls) == 1, f"status launched {len(calls)} children")
+        expect(calls[0][0] == ["status"], calls[0][0])
+        expect(
+            calls[0][1] == case.child_env(override),
+            f"status child env {sorted(calls[0][1])}",
+        )
+        for name in fixture:
+            expect(name in calls[0][1], f"status child lost {name}")
+        expect(
+            calls[0][1][BOOT_HOOK] == override[BOOT_HOOK],
+            "status child lost the override",
+        )
+        # kept(): its status and build children carry the same full
+        # environment, and its oracles pass on the canned product output.
+        case.kept(
+            {
+                "case": "self-check",
+                "slot": "7",
+                "folder": folder,
+                "directory": slot_dir,
+                "started": 1,
+                "victim": "/fixture/victim",
+            },
+            override,
+        )
+        expect(
+            [args for args, _ in calls] == [["status"], ["status"], ["build"]],
+            calls,
+        )
+        for args, env in calls:
+            expect(
+                env == case.child_env(override),
+                f"{args} child env {sorted(env)}",
+            )
+        # The diagnostic receipt uses json, stays bounded and is never
+        # qualified; an oversized body is honestly marked incomplete.
+        holder = dict(os.environ)
+        os.environ["OXIDE_PROOF_EVIDENCE"] = root
+        try:
+            path = diagnostic_receipt(
+                {
+                    "version": "oxide.removal.boot-closure-diagnostic/1",
+                    "mode": "diagnostic",
+                    "qualified": False,
+                    "completed": ["before-boot"],
+                    "failed": [["after-boot", "x" * 4000]],
+                    "reached": ["before-boot", "after-boot"],
+                    "unexecuted": [],
+                }
+            )
+            with open(path, "rb") as handle:
+                body = handle.read()
+            receipt = json.loads(body)
+            expect(
+                receipt["qualified"] is False and receipt["mode"] == "diagnostic",
+                f"diagnostic receipt {receipt.get('mode')}/{receipt.get('qualified')}",
+            )
+            expect(len(body) <= DIAGNOSTIC_RECEIPT_BYTES, f"receipt {len(body)} bytes")
+            path = diagnostic_receipt(
+                {
+                    "version": "v",
+                    "mode": "diagnostic",
+                    "qualified": False,
+                    "completed": [],
+                    "failed": [],
+                    "unexecuted": [],
+                    "huge": "z" * DIAGNOSTIC_RECEIPT_BYTES,
+                }
+            )
+            with open(path, "rb") as handle:
+                body = handle.read()
+            receipt = json.loads(body)
+            expect(
+                receipt.get("incomplete") is True
+                and len(body) <= DIAGNOSTIC_RECEIPT_BYTES,
+                f"oversized receipt {len(body)} bytes",
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(holder)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    # Dispatch: only the documented argument lists select a mode.
+    expect(mode_from_args([]) == (False, False), "no-argument mode")
+    expect(mode_from_args(["--boot-closure"]) == (True, False), "focused mode")
+    expect(
+        mode_from_args(["--boot-closure", "--diagnostic"]) == (True, True),
+        "diagnostic mode",
+    )
+    expect(
+        mode_from_args(["--diagnostic", "--boot-closure"]) == (True, True),
+        "diagnostic mode, reversed",
+    )
+    for refused in (
+        ["--diagnostic"],
+        ["--bogus"],
+        ["--self-check", "--boot-closure"],
+        ["--boot-closure", "--diagnostic", "--diagnostic"],
+    ):
+        expect(mode_from_args(refused) is None, f"{refused} selected a mode")
+    # The candidate marker is the product's own deletion line, as documented.
+    expect(
+        BOOT_MARKER
+        in b"oxide: deleted slot 2 lost before this boot (holder started 3 s before boot; a restart ends every process)",
+        "BOOT_MARKER is not the product's boot-session line",
+    )
+    print(
+        "boot-closure self-check ok: status/build child environments, deletion "
+        "oracle slot leaf, diagnostic receipt (json, bounded, unqualified), "
+        "dispatch, marker"
+    )
+    return 0
+
+
 def main() -> int:
+    arguments = list(sys.argv[1:])
+    if arguments == ["--self-check"]:
+        return self_check()
+    mode = mode_from_args(arguments)
+    if mode is None:
+        print(USAGE, file=sys.stderr)
+        return 2
+    focused, diagnostic = mode
     if sys.platform != "darwin":
         fail("the removal proof requires macOS")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
@@ -425,7 +1189,10 @@ def main() -> int:
     signal.setitimer(signal.ITIMER_REAL, layout.work_left())
     proof = Proof(root)
     try:
-        run(proof, repo)
+        if focused:
+            boot_closure(proof, repo, diagnostic)
+        else:
+            run(proof, repo)
         proof.detach()
     except BaseException as failure:
         try:
@@ -438,6 +1205,10 @@ def main() -> int:
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
     proof.phase("end")
+    if focused:
+        # The mode already recorded its own result line and, for a
+        # diagnostic, its unqualified receipt.
+        return 0
     elapsed = time.monotonic() - runner.STARTED
     line = (
         f"removal proof held: {elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
