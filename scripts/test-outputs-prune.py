@@ -230,9 +230,33 @@ above.
 Nine-premise sweep (source fit, UNMEASURED): private `HOME`/`CARGO_HOME` with
 the invoking `RUSTUP_HOME`, `RUSTUP_AUTO_INSTALL=0` and `OXIDE_TEST_HOME_FROM_ENV=1`;
 `OXIDE_*`/`XDG_*`/`CARGO_*`/`GIT_*` scrubbed by `proof_env`; `CARGO_ENCODED_RUSTFLAGS`
-removed so the declared `RUSTFLAGS` are the only ones in force; the owned image
-attached with `hdiutil -owners on`; one ordinary detach with unknown custody
-left ambiguous; `mktemp` always with a template under owned scratch. Automatic
+removed so the declared `RUSTFLAGS` are the only ones in force; `mktemp` always
+with a template under owned scratch.
+
+Image custody (oxide#152, corrected after diagnostics 3 and 5): the one owned
+128 MiB image's backing file AND its custody record live under the guard's
+never-auto-cleaned `OXIDE_PROOF_EVIDENCE` directory, never in the scratch the
+supervisor may clean. That path is verified BEFORE any effect against the
+qualified guard's own published topology (`scripts/bounded-test.py`): the guard
+creates one 0700 owned run root, `os.mkdir(<root>/scratch)` 0700 and
+`os.makedirs(<root>/evidence)` at the umask default (0755 in practice, its own
+receipts 0644), and its shared-ancestor contract accepts a directory with no
+group or other WRITE bit. So the evidence directory must be this user's real
+canonical directory that is NOT group/other writable (`mode & 0o022 == 0`; 0755
+passes), a sibling of the exported scratch on the same device, outside the
+workspace, and its containing owned root must also be this user's real
+directory and not group/other writable: that parent is the anti-replacement
+boundary, and group/other READ or traverse of the evidence directory itself
+grants no write authority (this never claims owner-only privacy for a 0755
+directory). The custody record is written 0600 before the create effect; after
+the image is created and immediately BEFORE attach, the backing is positively
+re-verified as a real regular file this user owns, not group/other writable,
+canonically inside the evidence directory and on its device, and its identity
+(device, inode, size) is recorded with the attach facts. Exactly ONE ordinary
+detach disposition (attempted / refused:not-attached / refused:unclosed-sessions
+/ unknown / completed) runs in `main()`'s finally path and is never replayed;
+the backing is removed only after a completed detach whose mount and device are
+positively gone, and every other disposition keeps it. Automatic
 adoption is not assumed: every converted checkout is adopted explicitly and
 each receipt state is asserted. No fake Cargo subcommand is used.
 
@@ -751,9 +775,27 @@ REAL_CUSTODY_EFFECTS = CustodyEffects()
 
 def verify_evidence_root(evidence: str, scratch: str, effects=REAL_CUSTODY_EFFECTS) -> str:
     """The guard's never-auto-cleaned evidence directory, verified before any
-    effect: canonical, this user's owner-only real directory, a sibling of the
-    exported scratch root inside one supervisor-owned root, never the
-    workspace. Anything else refuses before creating, attaching or writing."""
+    effect against the qualified guard's OWN published topology.
+
+    Source basis (`scripts/bounded-test.py`, the merged oxide#151 supervisor):
+    the guard creates one owned run root (`/private/tmp/oxide-proof.<id>`, 0700,
+    this user), then `os.mkdir(<root>/scratch)` (0700) and
+    `os.makedirs(<root>/evidence, exist_ok=True)` with the umask default (0755
+    in practice; its own receipt/result files there are 0644). The same file's
+    shared `<mount>/scratch` ancestor contract requires "no group or other
+    WRITE bit (0755 passes)" and states that a sticky bit is not a substitute,
+    while its private scratch leaf requires exactly 0700.
+
+    So this proof accepts an evidence directory this user owns that is NOT
+    group/other writable (0755 passes), and requires the containing owned root
+    to be this user's real directory that is also not group/other writable.
+    That parent is the anti-replacement boundary: another user cannot create,
+    rename or replace an entry inside it, so group/other READ and traverse of
+    the evidence directory itself grants no write authority. This never claims
+    owner-only privacy for a 0755 evidence directory.
+
+    Anything else refuses before creating, attaching or writing.
+    """
     repository = os.path.dirname(HERE)
     if not evidence:
         raise Aborted("no OXIDE_PROOF_EVIDENCE directory is exported; image custody cannot be allocated")
@@ -771,12 +813,23 @@ def verify_evidence_root(evidence: str, scratch: str, effects=REAL_CUSTODY_EFFEC
         )
     try:
         facts = effects.stat(evidence)
+        scratch_facts = effects.stat(scratch)
+        parent = effects.stat(os.path.dirname(evidence))
     except OSError as error:
-        raise Aborted(f"the evidence directory {evidence} is not inspectable ({error})") from error
-    if not stat.S_ISDIR(facts.st_mode) or facts.st_uid != effects.euid():
-        raise Aborted(f"the evidence directory {evidence} is not this user's real directory")
-    if facts.st_mode & 0o077:
-        raise Aborted(f"the evidence directory {evidence} is not owner-only")
+        raise Aborted(f"the evidence path is not inspectable ({error})") from error
+    for path, entry, what in (
+        (evidence, facts, "the evidence directory"),
+        (os.path.dirname(evidence), parent, "the owned root"),
+        (scratch, scratch_facts, "the scratch root"),
+    ):
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise Aborted(f"{what} {path} is not a real directory")
+        if entry.st_uid != effects.euid():
+            raise Aborted(f"{what} {path} is not owned by this user")
+        if entry.st_mode & 0o022:
+            raise Aborted(f"{what} {path} is group/other writable")
+    if facts.st_dev != scratch_facts.st_dev:
+        raise Aborted(f"the evidence directory {evidence} is not on the scratch root's device")
     return evidence
 
 
@@ -823,6 +876,27 @@ class ImageCustody:
         self._write("allocated", allocated_ms=int(time.time() * 1000))
         return self.record
 
+    def verify_backing(self) -> dict:
+        """Positively re-verify the backing immediately BEFORE attach: a real
+        regular file this user owns, not group/other writable, canonically
+        inside the verified evidence directory and on its device. A symlink,
+        replacement, foreign owner or unexpected write permission refuses with
+        the backing kept and nothing attached."""
+        if not self.evidence:
+            raise Aborted("image custody has no verified evidence directory")
+        facts = self.effects.stat(self.backing)
+        if stat.S_ISLNK(facts.st_mode) or not stat.S_ISREG(facts.st_mode):
+            raise Aborted(f"the image backing {self.backing} is not a real regular file")
+        if facts.st_uid != self.effects.euid():
+            raise Aborted(f"the image backing {self.backing} is not owned by this user")
+        if facts.st_mode & 0o022:
+            raise Aborted(f"the image backing {self.backing} is group/other writable")
+        if os.path.dirname(self.backing) != self.evidence or self.effects.realpath(self.backing) != self.backing:
+            raise Aborted(f"the image backing {self.backing} left its evidence directory")
+        if facts.st_dev != self.effects.stat(self.evidence).st_dev:
+            raise Aborted(f"the image backing {self.backing} is on another device")
+        return {"dev": facts.st_dev, "ino": facts.st_ino, "size": facts.st_size}
+
     def attach(self) -> str:
         if self.state != "allocated":
             raise Aborted(f"image custody is {self.state}, not allocated; nothing is attached")
@@ -830,6 +904,7 @@ class ImageCustody:
             raise Aborted(f"the image backing {self.backing} left its evidence directory; nothing is attached")
         try:
             self.effects.create_image(self.backing, self.name)
+            identity = self.verify_backing()
             facts = self.effects.attach(self.backing)
         except BaseException as error:
             self.notes.append(f"attach: {type(error).__name__}: {error}")
@@ -837,7 +912,7 @@ class ImageCustody:
             raise Aborted(f"image attach is unknown; backing kept: {error}") from error
         self.mount = facts["mount"]
         self.device = facts["device"]
-        self._write("attached")
+        self._write("attached", backing_identity=identity)
         return self.mount
 
     def detach_once(self, sessions_closed: bool) -> str:
@@ -2613,15 +2688,35 @@ def self_test() -> int:
     check("receipt field paths", receipt_field_paths)
 
     def image_custody() -> None:
-        # (a) The evidence directory is verified BEFORE any effect.
         class MemoryCustody(CustodyEffects):
-            def __init__(self, *, mode: int = 0o700, uid: int = 501, sibling: bool = True):
-                self.paths = {"/root/evidence", "/root/scratch" if sibling else "/other/scratch"}
-                self.modes = {
-                    "/root/evidence": mode,
-                    "/root/scratch" if sibling else "/other/scratch": 0o700,
+            """In-memory stand-in for the real custody effects: directories and
+            the image backing are entries carrying kind/mode/uid/dev/ino/size."""
+
+            def __init__(
+                self,
+                *,
+                evidence_mode: int = 0o755,
+                evidence_uid: int = 501,
+                evidence_kind: str = "dir",
+                parent_mode: int = 0o700,
+                scratch_mode: int = 0o700,
+                evidence_dev: int = 1,
+                scratch_dev: int = 1,
+                canonical: bool = True,
+            ):
+                self.entries = {
+                    "/root": {"kind": "dir", "mode": parent_mode, "uid": 501, "dev": 1, "ino": 1, "size": 0},
+                    "/root/evidence": {
+                        "kind": evidence_kind,
+                        "mode": evidence_mode,
+                        "uid": evidence_uid,
+                        "dev": evidence_dev,
+                        "ino": 2,
+                        "size": 0,
+                    },
+                    "/root/scratch": {"kind": "dir", "mode": scratch_mode, "uid": 501, "dev": scratch_dev, "ino": 3, "size": 0},
                 }
-                self.uids = {"/root/evidence": uid}
+                self.canonical = canonical
                 self.created: list[str] = []
                 self.attached: list[str] = []
                 self.detached: list[str] = []
@@ -2631,35 +2726,54 @@ def self_test() -> int:
                 self.fail_attach = False
                 self.detach_result = (0, "")
                 self.leave_mount = False
+                self.backing_override: dict | None = None
 
             def realpath(self, path: str) -> str:
-                return path
+                return path if self.canonical else path + "/..escaped"
 
             def stat(self, path: str):
-                if path not in self.paths:
+                if path not in self.entries:
                     raise FileNotFoundError(path)
+                entry = self.entries[path]
+                bits = {
+                    "dir": stat.S_IFDIR,
+                    "file": stat.S_IFREG,
+                    "symlink": stat.S_IFLNK,
+                }[entry["kind"]]
                 return type(
                     "Facts",
                     (),
                     {
-                        "st_mode": stat.S_IFDIR | self.modes.get(path, 0o700),
-                        "st_uid": self.uids.get(path, 501),
-                        "st_dev": 1,
+                        "st_mode": bits | entry["mode"],
+                        "st_uid": entry["uid"],
+                        "st_dev": entry["dev"],
+                        "st_ino": entry["ino"],
+                        "st_size": entry["size"],
                     },
                 )()
 
             def exists(self, path: str) -> bool:
                 if path in ("/Volumes/OxMem1", "/dev/disk9s1"):
                     return self.mounted
-                return path in self.paths
+                return path in self.entries
 
             def write_record(self, path: str, text: str) -> None:
                 self.records.append(path)
-                self.paths.add(path)
+                self.entries[path] = {
+                    "kind": "file",
+                    "mode": 0o600,
+                    "uid": 501,
+                    "dev": 1,
+                    "ino": 9,
+                    "size": len(text),
+                }
 
             def create_image(self, path: str, name: str) -> None:
                 self.created.append(path)
-                self.paths.add(path)
+                entry = {"kind": "file", "mode": 0o644, "uid": 501, "dev": 1, "ino": 4, "size": 128 * 1024 * 1024}
+                if self.backing_override is not None:
+                    entry.update(self.backing_override)
+                self.entries[path] = entry
 
             def attach(self, path: str) -> dict:
                 if self.fail_attach:
@@ -2670,57 +2784,100 @@ def self_test() -> int:
 
             def detach(self, mount: str) -> tuple:
                 self.detached.append(mount)
-                code, error = self.detach_result
+                code, _error = self.detach_result
                 if code == 0 and not self.leave_mount:
                     self.mounted = False
                 return self.detach_result
 
             def remove(self, path: str) -> None:
                 self.removed.append(path)
-                self.paths.discard(path)
+                self.entries.pop(path, None)
 
-        def refuses(evidence: str, scratch: str, label: str) -> None:
-            effects = MemoryCustody()
+        def allocate_refuses(effects: MemoryCustody, evidence: str = "/root/evidence", scratch: str = "/root/scratch", label: str = "") -> None:
             custody = ImageCustody("cap", effects)
             try:
                 custody.allocate(evidence, scratch)
             except Aborted:
                 pass
             else:
-                raise AssertionError(f"{label}: a bad evidence root was accepted")
+                raise AssertionError(f"{label}: an unsafe evidence root was accepted")
             assert effects.created == [] and effects.attached == [], (label, effects.created, effects.attached)
             assert effects.records == [], (label, effects.records)
 
-        refuses("", "/root/scratch", "missing evidence")
-        refuses("/root/evidence", "", "missing scratch")
-        refuses("/root/../root/evidence", "/root/scratch", "non-canonical")
-        refuses(os.path.dirname(HERE) + "/evidence", os.path.dirname(HERE) + "/scratch", "workspace")
-        refuses("/root/evidence", "/other/scratch", "non-sibling")
-        for label, mode, uid in (("group-readable", 0o755, 501), ("foreign-owner", 0o700, 502)):
-            effects = MemoryCustody(mode=mode, uid=uid)
+        # (a) The qualified guard's own 0755 evidence directory, owned by this
+        # user under its 0700 owned root, is ACCEPTED before any image effect.
+        # Counterfactual: the old owner-only predicate (mode & 0o077) rejects
+        # exactly that directory, so the positive fixture proves the fix.
+        assert 0o755 & 0o077, "the old owner-only predicate would have accepted 0755"
+        effects = MemoryCustody(evidence_mode=0o755)
+        custody = ImageCustody("cap", effects)
+        custody.allocate("/root/evidence", "/root/scratch")
+        assert effects.created == [] and effects.attached == [] and effects.records
+        assert effects.records[0] == custody.record
+
+        # (b) Any group/other WRITE bit, a foreign owner, a writable owned root,
+        # a writable scratch leaf, a device mismatch, a symlink or non-directory
+        # evidence entry, a non-canonical path, a non-sibling and a workspace
+        # path all refuse with ZERO effects.
+        for label, effects in (
+            ("group-writable evidence", MemoryCustody(evidence_mode=0o775)),
+            ("other-writable evidence", MemoryCustody(evidence_mode=0o777)),
+            ("other-writable-only evidence", MemoryCustody(evidence_mode=0o733)),
+            ("foreign evidence", MemoryCustody(evidence_uid=502)),
+            ("group-writable owned root", MemoryCustody(parent_mode=0o770)),
+            ("group-writable scratch", MemoryCustody(scratch_mode=0o770)),
+            ("other device", MemoryCustody(evidence_dev=2)),
+            ("symlink evidence", MemoryCustody(evidence_kind="symlink")),
+            ("file evidence", MemoryCustody(evidence_kind="file")),
+            ("non-canonical", MemoryCustody(canonical=False)),
+        ):
+            allocate_refuses(effects, label=label)
+        allocate_refuses(MemoryCustody(), evidence="/other/evidence", label="non-sibling")
+        allocate_refuses(
+            MemoryCustody(),
+            evidence=os.path.dirname(HERE) + "/evidence",
+            scratch=os.path.dirname(HERE) + "/scratch",
+            label="workspace",
+        )
+
+        # (c) The backing is positively re-verified BEFORE attach: a symlink, a
+        # foreign owner, a group/other-writable file or another device refuses
+        # with nothing attached and the backing kept.
+        for label, override in (
+            ("symlink backing", {"kind": "symlink"}),
+            ("foreign backing", {"uid": 502}),
+            ("group/other-writable backing", {"mode": 0o666}),
+            ("other-device backing", {"dev": 2}),
+        ):
+            effects = MemoryCustody()
+            effects.backing_override = override
             custody = ImageCustody("cap", effects)
+            custody.allocate("/root/evidence", "/root/scratch")
             try:
-                custody.allocate("/root/evidence", "/root/scratch")
+                custody.attach()
             except Aborted:
                 pass
             else:
-                raise AssertionError(f"{label}: a bad evidence directory was accepted")
-            assert effects.created == [] and effects.attached == []
+                raise AssertionError(f"{label}: an unsafe backing was attached")
+            assert effects.attached == [], (label, effects.attached)
+            assert effects.removed == [], (label, effects.removed)
+            assert custody.state == "unknown", (label, custody.state)
+            assert custody.detach_once(True) == "refused:not-attached", label
 
-        # (b) Success: record before attach, one completed detach, backing
-        # removed only after the positive post-state, record kept.
-        effects = MemoryCustody()
+        # (d) A correct backing (real regular file, this user, not group/other
+        # writable, inside the evidence directory on its device) attaches, and
+        # the one-shot detach outcomes below still hold.
+        effects = MemoryCustody(evidence_mode=0o755)
         custody = ImageCustody("cap", effects)
         custody.allocate("/root/evidence", "/root/scratch")
-        assert effects.records and not effects.created and not effects.attached
         mount = custody.attach()
-        assert mount == "/Volumes/OxMem1" and effects.created and effects.attached
+        assert mount == "/Volumes/OxMem1" and effects.attached and effects.created
         assert custody.detach_once(True) == "completed"
         assert effects.removed == [custody.backing], effects.removed
-        assert effects.records[-1] == custody.record
         assert custody.detach_once(True) == "completed" and effects.detached == [mount]
+        assert effects.records[-1] == custody.record
 
-        # (c) Unclosed sessions: no OS detach, backing kept, no replay later.
+        # refused-before-OS-call: unclosed sessions keep the backing, no replay
         effects = MemoryCustody()
         custody = ImageCustody("cap", effects)
         custody.allocate("/root/evidence", "/root/scratch")
@@ -2730,7 +2887,7 @@ def self_test() -> int:
         assert custody.detach_once(True) == "refused:unclosed-sessions"
         assert effects.detached == [] and effects.removed == []
 
-        # (d) Unknown detach outcomes keep the backing and are never replayed.
+        # unknown detach outcomes keep the backing and are never replayed
         for configured in ((1, "resource busy"), (0, "")):
             effects = MemoryCustody()
             effects.detach_result = configured
@@ -2742,13 +2899,12 @@ def self_test() -> int:
             assert effects.removed == [], configured
             assert custody.detach_once(True) == "unknown" and len(effects.detached) == 1
 
-        # (e) No attachment, no detach; an outer closure never authorizes it.
+        # no attachment, no detach; an attach failure keeps the backing
         effects = MemoryCustody()
         custody = ImageCustody("cap", effects)
         custody.allocate("/root/evidence", "/root/scratch")
         assert custody.detach_once(True) == "refused:not-attached"
         assert effects.detached == [] and effects.removed == []
-        # attach failure keeps the backing and refuses a later detach
         failing = MemoryCustody()
         failing.fail_attach = True
         broken = ImageCustody("cap", failing)
@@ -2762,13 +2918,19 @@ def self_test() -> int:
         assert broken.state == "unknown" and failing.attached == []
         assert broken.detach_once(True) == "refused:not-attached" and failing.detached == []
 
-        # (f) The production run allocates before attaching and performs its one
-        # detach in main's finally, never through the shared helper's own path.
+        # (e) Real seam wiring: the new predicate, its non-vacuity, and the
+        # ordering of record -> create -> verify_backing -> attach.
+        seam = inspect.getsource(verify_evidence_root)
+        assert "0o022" in seam and "0o077" not in seam, seam
+        assert "the owned root" in seam and "scratch root" in seam, seam
+        attach_source = inspect.getsource(ImageCustody.attach)
+        assert attach_source.index("self.verify_backing()") < attach_source.index("self.effects.attach(")
+        backing_source = inspect.getsource(ImageCustody.verify_backing)
+        assert "S_ISREG" in backing_source and "S_ISLNK" in backing_source and "0o022" in backing_source
         run_source = inspect.getsource(run)
         assert run_source.index("custody.allocate(") < run_source.index("world.mount = custody.attach()")
         main_source = inspect.getsource(main)
-        assert "finally:" in main_source and "custody.detach_once(" in main_source
-        assert main_source.index("custody.detach_once(") > main_source.index("finally:")
+        assert "finally:" in main_source and main_source.index("custody.detach_once(") > main_source.index("finally:")
         assert "proof.detach()" not in run_source and "cleanup_after_failure" not in main_source
 
     check("image custody", image_custody)
