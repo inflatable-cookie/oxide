@@ -630,7 +630,24 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   14 `oxide outputs detach` after an exec session restores real empty member
   directories and keeps the root — no new custody, reuses the shipped detach;
   15 interrupt control: a gated tool is stopped by Ctrl-C, group closure holds
-  the lease until the child exits, and the slot is released afterwards.
+  the lease until the child exits, and the slot is released afterwards;
+  16-18 the oxide#162 member-directory scenarios (migrate a debug-only
+  whole-target root and run a derived exec; repair a dangling `release`
+  member of the checkout's own verified root and build release into it; and
+  refuse an unverified root); the script's `EXEC_CASES` is authoritative;
+  19 a live checkout's committed version-1 whole-target receipt (oxide#163):
+  the fixture turns a product-created profile checkout into the root/1 marker
+  and `oxide.outputs.transition/1` receipt oxide#117 published, `build`,
+  `outputs detach` and `clean` each refuse it naming `oxide outputs adopt`
+  (recorded `status` reads no checkout state; `status --measure` reports
+  `outputs: unknown` naming adopt) with the receipt bytes, the root tree and the
+  whole-target link unchanged, a noncommitted version-1 control keeps its exact
+  bytes (and gets no target), and one explicit adopt upgrades it through the
+  shipped migration: the same root with an owned `debug`/`release` pair and a
+  committed `/3` profile receipt, the root/2 marker nonce added while its
+  creation timestamp is preserved, the old output still visible through the
+  migrated member link, and a following `build` and `exec` succeeding without
+  relinking or rewriting the upgraded receipt.
 - **Oracles** are positive-path plus a control that must fail: cases 02/03 and
   case 10 differ only in the link's destination, so case 02's oracles fail if
   the classification is removed; no case is satisfied by "no output".

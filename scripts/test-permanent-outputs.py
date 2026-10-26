@@ -45,8 +45,13 @@ The focused modes reuse this fixture and staging helpers:
   repeat, the declared `--output` parity, an unrecorded member left local,
   a detached and an unconverted checkout running locally, a spaced checkout
   path, an existing whole-target checkout that stays whole-target, a foreign
-  member link, root drift, a receipt changed while the command waits and an
-  interrupted tool whose group closes before the lease releases. It runs
+  member link, root drift, a receipt changed while the command waits, an
+  interrupted tool whose group closes before the lease releases, and a live
+  checkout's committed version-1 whole-target receipt: every failing reader
+  refuses it naming adopt while recorded `status` reads nothing and `--measure`
+  reports the same refusal, one explicit adopt upgrades it through the shipped
+  migration with its old outputs intact, and a noncommitted version-1 control
+  keeps its exact bytes (oxide#163). It runs
   under `--root-parent /private/tmp`, the owner-accepted internal-placement
   exception (decision bd357a4c): its control pool is a genuine internal
   `directory-budget` pool, which the product refuses on an external volume.
@@ -2557,6 +2562,7 @@ EXEC_CASES = [
     ("12", "root drift refuses and names the explicit adoption"),
     ("13", "a checkout path containing a space converts and runs end to end"),
     ("15", "Ctrl-C reaches the tool group, the lease holds until the group closes, then releases"),
+    ("19", "a committed version-1 whole-target receipt makes every failing reader refuse naming adopt (recorded status reads nothing; --measure reports outputs unknown naming adopt), an explicit adopt upgrades it through the shipped migration with the old outputs intact, and a noncommitted version-1 control keeps its bytes"),
 ]
 
 
@@ -2746,6 +2752,101 @@ def legacy_whole_target(proof: Proof, pool: str, mount: str, checkout: str, labe
     with open(receipt_file(pool, checkout), "w", encoding="utf-8") as handle:
         json.dump(legacy, handle, indent=2)
     return root
+
+
+def file_proof(path: str) -> tuple:
+    """A receipt's exact bytes and the metadata a read must never touch."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    stat = os.stat(path)
+    return (data, stat.st_ino, stat.st_size, stat.st_mode, stat.st_mtime_ns)
+
+
+def version_one_whole_target(proof: Proof, pool: str, mount: str, checkout: str, label: str) -> tuple:
+    """Turn a product-created profile checkout into a live version-1
+    whole-target one (oxide#163). No fact is hand-derived: the product's own
+    explicit conversion creates the root, its marker and the receipt bytes, and
+    the fixture then records the shape oxide#117 published — a root/1 marker
+    (no nonce, no checkout volume) and a `oxide.outputs.transition/1` receipt
+    (no layout, placements, root-level reservation, prune state or nonce)
+    selecting that same root behind the legacy whole-target link. It returns
+    the root, the marker's pinned creation timestamp and the generation."""
+    code, _, stderr = proof.oxide(["outputs", "adopt"], f"{label}: product conversion", checkout)
+    expect(code == 0, stderr)
+    root = expect_profile_layout(pool, mount, checkout, label)
+    receipt = read_json(receipt_file(pool, checkout))
+    selected = next(
+        (
+            placement["selected"]
+            for placement in receipt["links"]
+            if placement.get("selected")
+        ),
+        None,
+    )
+    expect(selected is not None, f"{label}: the conversion selected no root")
+    # Old payload the upgrade must neither move, copy nor delete.
+    with open(os.path.join(root, "sentinel"), "wb") as handle:
+        handle.write(b"root")
+    with open(os.path.join(root, "debug", "old-artifact"), "wb") as handle:
+        handle.write(b"old")
+    # The legacy whole-target link this receipt selects.
+    target = os.path.join(checkout, "target")
+    for member in ("debug", "release"):
+        path = os.path.join(target, member)
+        if os.path.islink(path):
+            os.remove(path)
+    os.rmdir(target)
+    os.symlink(root, target)
+    # The root/1 marker: its immutable fields, without the successor surfaces.
+    marker_path = os.path.join(root, MARKER)
+    marker = read_json(marker_path)
+    created_ms = marker["created_ms"]
+    marker.pop("nonce", None)
+    marker.pop("checkout_volume_uuid", None)
+    marker["version"] = "oxide.outputs.root/1"
+    with open(marker_path, "w", encoding="utf-8") as handle:
+        json.dump(marker, handle)
+    # The version-1 receipt, copying the product's own checkout and identity
+    # bytes so no fixture-side derivation can disagree with it.
+    legacy_selected = {
+        "kind": selected["kind"],
+        "root": selected["root"],
+        "generation": selected["generation"],
+    }
+    if selected.get("volume_uuid"):
+        legacy_selected["volume_uuid"] = selected["volume_uuid"]
+    legacy = {
+        "version": "oxide.outputs.transition/1",
+        "checkout": receipt["checkout"],
+        "checkout_id": receipt["checkout_id"],
+        "generation": receipt["generation"],
+        "state": "committed",
+        "selected": legacy_selected,
+        "roots": [legacy_selected],
+        "updated_ms": int(time.time() * 1000),
+    }
+    with open(receipt_file(pool, checkout), "w", encoding="utf-8") as handle:
+        json.dump(legacy, handle, indent=2)
+    return root, created_ms, receipt["generation"]
+
+
+def detached_version_one(pool: str, checkout: str) -> str:
+    """A valid NONCOMMITTED version-1 receipt for a never-converted checkout:
+    the control that an explicit adopt must refuse with every byte unchanged."""
+    path = receipt_file(pool, checkout)
+    receipt = {
+        "version": "oxide.outputs.transition/1",
+        "checkout": checkout,
+        "checkout_id": hashlib.sha256(checkout.encode()).hexdigest(),
+        "generation": 1,
+        "state": "detached",
+        "updated_ms": int(time.time() * 1000),
+    }
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(receipt, handle, indent=2)
+    os.chmod(path, 0o600)
+    return path
 
 
 def exec_run(proof: Proof, repo: str) -> None:
@@ -3313,6 +3414,176 @@ def exec_run(proof: Proof, repo: str) -> None:
     code, _, stderr = proof.oxide(["build"], "15 the slot is released after the group closes", interrupted)
     expect(code == 0, stderr)
     phase(proof, "after the interrupt control")
+
+    # 19: a live checkout whose receipt is still the committed version-1
+    # whole-target shape (oxide#163). Every failing reader refuses it and names
+    # adopt, `status` reports the same refusal in its own report grammar, and
+    # the one explicit adopt upgrades it through the shipped layout migration
+    # with the old outputs intact.
+    live = fresh_checkout(proof, root, "legacy-v1")
+    (v1_root, v1_created_ms, v1_generation) = version_one_whole_target(
+        proof, pool, mount, live, "19 v1 fixture"
+    )
+    v1_target = os.path.join(live, "target")
+    v1_receipt = receipt_file(pool, live)
+    v1_before = file_proof(v1_receipt)
+    root_before = tree_digest(v1_root)
+    for arguments, reader in (
+        (["build"], "bind/lease"),
+        (["outputs", "detach"], "detach"),
+        (["clean"], "clean"),
+    ):
+        code, _, stderr = proof.oxide(
+            arguments, f"19 {reader} refuses a version-1 receipt", live
+        )
+        expect(code != 0, f"19: {reader} accepted a version-1 receipt\n{stderr}")
+        expect(
+            "unsupported version" in stderr and "oxide.outputs.transition/1" in stderr,
+            f"19: {reader} did not name the version: {stderr}",
+        )
+        expect(
+            "oxide outputs adopt" in stderr,
+            f"19: {reader} did not name the fix: {stderr}",
+        )
+        expect(file_proof(v1_receipt) == v1_before, f"19: {reader} rewrote the receipt")
+        expect(tree_digest(v1_root) == root_before, f"19: {reader} changed the root")
+        expect(
+            os.path.islink(v1_target) and os.readlink(v1_target) == v1_root,
+            f"19: {reader} changed the whole-target link",
+        )
+    # `status` never fails on an unreadable receipt: recorded status reads no
+    # checkout state at all (it says so), and measured status renders the same
+    # refusal as unknown outputs. Both exit 0 and change nothing.
+    code, stdout, stderr = proof.oxide(
+        ["status"], "19 recorded status does not read the version-1 receipt", live
+    )
+    expect(code == 0, f"19: recorded status exited {code}: {stdout}{stderr}")
+    expect(
+        "outputs: not measured by status" in stdout,
+        f"19: recorded status read the checkout receipt: {stdout}{stderr}",
+    )
+    expect(
+        "unsupported version" not in stdout + stderr,
+        f"19: recorded status reported the receipt: {stdout}{stderr}",
+    )
+    code, stdout, stderr = proof.oxide(
+        ["status", "--measure"], "19 measured status reports the version-1 refusal", live
+    )
+    expect(code == 0, f"19: measured status exited {code}: {stdout}{stderr}")
+    expect(
+        "outputs: unknown" in stdout,
+        f"19: measured status did not report unknown outputs: {stdout}{stderr}",
+    )
+    expect(
+        "unsupported version" in stdout and "oxide.outputs.transition/1" in stdout,
+        f"19: measured status did not name the version: {stdout}{stderr}",
+    )
+    expect(
+        "oxide outputs adopt" in stdout,
+        f"19: measured status did not name the fix: {stdout}{stderr}",
+    )
+    expect(file_proof(v1_receipt) == v1_before, "19: status rewrote the receipt")
+    expect(tree_digest(v1_root) == root_before, "19: status changed the root")
+    expect(
+        os.path.islink(v1_target) and os.readlink(v1_target) == v1_root,
+        "19: status changed the whole-target link",
+    )
+    phase(proof, "after the version-1 refusals")
+
+    # The noncommitted version-1 control: no adopt, no target, no byte change.
+    uncommitted = fresh_checkout(proof, root, "legacy-v1-detached")
+    uncommitted_receipt = detached_version_one(pool, uncommitted)
+    uncommitted_before = file_proof(uncommitted_receipt)
+    code, _, stderr = proof.oxide(
+        ["outputs", "adopt"], "19 adopt refuses a noncommitted version-1 receipt", uncommitted
+    )
+    expect(code != 0, f"19: adopt accepted a noncommitted version-1 receipt\n{stderr}")
+    expect(
+        "only a committed version-1 receipt can be upgraded" in stderr and "detached" in stderr,
+        stderr,
+    )
+    expect(
+        file_proof(uncommitted_receipt) == uncommitted_before,
+        "19: the refused adopt rewrote the noncommitted receipt",
+    )
+    expect(
+        not os.path.lexists(os.path.join(uncommitted, "target")),
+        "19: the refused adopt created a target",
+    )
+    phase(proof, "after the noncommitted version-1 control")
+
+    # The upgrade: one explicit adopt, the shipped migration, the current
+    # receipt, the same root and the old outputs still there.
+    code, stdout, stderr = proof.oxide(
+        ["outputs", "adopt"], "19 explicit adopt upgrades the version-1 receipt", live
+    )
+    expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
+    upgraded_root = expect_profile_layout(pool, mount, live, "19 upgrade")
+    expect(
+        upgraded_root == v1_root,
+        f"19: the upgrade selected {upgraded_root}, not the recorded root {v1_root}",
+    )
+    marker = read_json(os.path.join(v1_root, MARKER))
+    expect(marker["version"] == "oxide.outputs.root/2", f"19: the marker is {marker}")
+    expect(
+        isinstance(marker.get("nonce"), str) and len(marker["nonce"]) == 32,
+        f"19: the upgraded marker has no 128-bit nonce: {marker}",
+    )
+    expect(
+        marker["created_ms"] == v1_created_ms,
+        "19: the upgrade rewrote the root's creation timestamp",
+    )
+    receipt = read_json(v1_receipt)
+    expect(
+        receipt["version"] == "oxide.outputs.transition/3"
+        and receipt["layout"] == "profile"
+        and receipt["state"] == "committed",
+        f"19: the upgraded receipt is not the current profile shape: {receipt}",
+    )
+    expect(
+        receipt["generation"] == v1_generation + 1,
+        f"19: the upgrade advanced {v1_generation} to {receipt['generation']}",
+    )
+    expect(
+        sorted(placement["member"] for placement in receipt["links"]) == ["debug", "release"],
+        f"19: the upgraded receipt places {receipt['links']}",
+    )
+    expect(
+        read_bytes(os.path.join(v1_root, "sentinel")) == b"root",
+        "19: the upgrade lost the root's old payload",
+    )
+    expect(
+        read_bytes(os.path.join(v1_target, "debug", "old-artifact")) == b"old",
+        "19: the old output is not visible through the migrated member link",
+    )
+    debug_link = member_link_target(live, "debug")
+    release_link = member_link_target(live, "release")
+    receipt_after = read_bytes(v1_receipt)
+
+    # A leased build and an exec now work in the upgraded checkout, without
+    # relinking anything and without rewriting the receipt.
+    code, _, stderr = proof.oxide(["build"], "19 the upgraded checkout builds", live)
+    expect(code == 0, stderr)
+    expect(
+        member_link_target(live, "debug") == debug_link
+        and member_link_target(live, "release") == release_link,
+        "19: the build relinked an upgraded member",
+    )
+    expect(
+        os.path.isfile(os.path.join(v1_target, "debug", "poutputs")),
+        "19: the build wrote no binary through the upgraded member link",
+    )
+    expect(
+        read_bytes(os.path.join(v1_target, "debug", "old-artifact")) == b"old",
+        "19: the build lost the old output",
+    )
+    code, _, stderr = proof.oxide(["exec", "--", "/usr/bin/true"], "19 the upgraded checkout execs", live)
+    expect(code == 0, stderr)
+    expect("through profile member links" in stderr, stderr)
+    expect(read_bytes(v1_receipt) == receipt_after, "19: a command rewrote the upgraded receipt")
+    plan_report = plan(proof, live, "19 the upgraded checkout plans the profile layout")
+    expect(plan_report["layout"] == "profile", f"19: the plan reports {plan_report['layout']}")
+    phase(proof, "after the version-1 upgrade")
 
     proof.detach()
 
