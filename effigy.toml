@@ -480,6 +480,16 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure --diagnostic"
 
+# The pure apparatus check of the boot-closure mode (oxide#161): no child,
+# pool, image, device or supervisor, and no gate credit. It pins the two
+# defects the first exact-head review found before a native activation (the
+# diagnostic receipt's `json` dependency and a boot-closure child handed only
+# the override instead of the full fixture environment), plus the argument
+# dispatch and the product's own deletion line the candidate marker quotes.
+# It runs before the uncounted diagnostic and is not native evidence.
+[tasks."rust:oxide-removable-boot-closure:test"]
+run = "python3 scripts/test-oxide-removable-removal.py --self-check"
+
 # Budget-only default pool (oxide#102): the removable-pool proof's guarded
 # session, preceded by the default-pool cases over a scratch HOME (legacy
 # image pool detection untouched, creation at the new path with a verified

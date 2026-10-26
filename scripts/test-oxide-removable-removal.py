@@ -46,7 +46,12 @@ the lost record names the exec holder (an exec may start processes outside
 its group) and is quarantined. No state file is edited.
 `--diagnostic` (with `--boot-closure`) is the uncounted collection mode: it
 records a bounded `qualified: false` receipt of reached, completed and failed
-cases and stops on any outcome it cannot classify.
+cases and stops on any outcome it cannot classify. `--self-check` is the pure
+apparatus check run before any activation: no child, pool, image or device.
+It pins the full fixture environment every boot-closure child (`status`
+included) receives, the diagnostic receipt's bounded unqualified `json`
+document, the argument dispatch and the product deletion line the candidate
+marker quotes.
 """
 
 from __future__ import annotations
@@ -57,10 +62,12 @@ sys.dont_write_bytecode = True
 
 import hashlib
 import importlib.util
+import json
 import os
 import plistlib
 import re
 import secrets
+import shutil
 import signal
 import stat
 import subprocess
@@ -620,6 +627,12 @@ class BootClosure:
         self.slots = os.path.join(self.mount, "oxide-pool", "slots")
         proof.phase("after registration")
 
+    def child_env(self, extra: dict) -> dict:
+        """The full fixture environment plus one child's own controls. Every
+        boot-closure child — `status` included — starts here, so no call can
+        hand a child only the boot override."""
+        return dict(self.env, **extra)
+
     def state(self) -> dict:
         path = os.path.join(self.pool, REMOVABLE_STATE)
         need(os.path.isfile(path), f"no removable pool state at {path}; custody unknown")
@@ -632,14 +645,14 @@ class BootClosure:
         raise UnknownOutcome(f"no state record for lost slot {slot}; custody unknown")
 
     def status(self, label: str, cwd: str, extra: dict) -> str:
-        code, stdout, stderr = self.proof.oxide(["status"], label, cwd, dict(self.env, **extra))
+        code, stdout, stderr = self.proof.oxide(["status"], label, cwd, self.child_env(extra))
         need(code == 0, f"{label}: status exit {code}: {stderr[-800:]}")
         return stdout
 
     def quarantine(self, case: str) -> dict:
         """Hold a removable slot with `oxide exec`, force the volume away, and
         return the product's own quarantined record facts."""
-        env = dict(self.env, FIXTURE_GATE=os.path.join(self.proof.root, "gate", case))
+        env = self.child_env({"FIXTURE_GATE": os.path.join(self.proof.root, "gate", case)})
         os.makedirs(env["FIXTURE_GATE"], mode=0o700)
         victim = self.victims[case]
         before = set(os.listdir(self.slots))
@@ -691,7 +704,7 @@ class BootClosure:
             is not None,
             f"{case}: status does not report the quarantine: {stdout[-1200:]}",
         )
-        code, _, stderr = self.proof.oxide(["build"], f"{case} admission", victim, dict(self.env, **extra))
+        code, _, stderr = self.proof.oxide(["build"], f"{case} admission", victim, self.child_env(extra))
         oracle(code == 0, f"{case}: the admission failed: {stderr[-1200:]}")
         oracle("deleted slot" not in stderr, f"{case}: a quarantined slot was deleted: {stderr[-1200:]}")
         oracle(os.path.isdir(directory), f"{case}: {directory} was removed")
@@ -714,7 +727,7 @@ class BootClosure:
         # The observed defect: any whole-target checkout's explicit conversion
         # refused on the quarantined record in the paired pool.
         code, stdout, stderr = self.proof.oxide(
-            ["outputs", "adopt"], "before-boot adopt", self.whole, dict(self.env, **override)
+            ["outputs", "adopt"], "before-boot adopt", self.whole, self.child_env(override)
         )
         oracle(
             code == 0 and "now selects" in stdout,
@@ -737,7 +750,9 @@ class BootClosure:
         receipt = os.path.join(self.pool, "oxide-managed", "outputs", key + ".json")
         oracle(os.path.isfile(receipt), f"before-boot: no committed output receipt at {receipt}")
         # The next admission releases and deletes the slot whole.
-        code, _, stderr = self.proof.oxide(["build"], "before-boot deleting admission", victim, dict(self.env, **override))
+        code, _, stderr = self.proof.oxide(
+            ["build"], "before-boot deleting admission", victim, self.child_env(override)
+        )
         oracle(code == 0, f"before-boot: the deleting admission failed: {stderr[-1200:]}")
         oracle(
             re.search(
@@ -846,21 +861,187 @@ def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
     return line
 
 
-def main() -> int:
-    arguments = sys.argv[1:]
+USAGE = "usage: test-oxide-removable-removal.py [--boot-closure [--diagnostic]] | --self-check"
+
+
+def mode_from_args(arguments: list) -> tuple | None:
+    """`(focused, diagnostic)` for a fixed argument list, or `None` when the
+    request is not one this script defines."""
     focused = "--boot-closure" in arguments
     diagnostic = "--diagnostic" in arguments
-    if arguments not in (
-        [],
-        ["--boot-closure"],
-        ["--boot-closure", "--diagnostic"],
-        ["--diagnostic", "--boot-closure"],
+    if (focused, diagnostic) not in ((False, False), (True, False), (True, True)):
+        return None
+    if not focused and arguments:
+        return None
+    if focused and sorted(arguments) != sorted(["--boot-closure"] + (["--diagnostic"] if diagnostic else [])):
+        return None
+    return focused, diagnostic
+
+
+def self_check() -> int:
+    """Pure apparatus check for the boot-closure mode: no child, pool, image,
+    device or supervisor. It pins the two defects an exact-head review found
+    before any native activation — the diagnostic receipt's `json` dependency
+    and the full fixture environment every child (`status` included) receives
+    — plus the dispatch, the product-message marker and the receipt bound."""
+    fixture = {
+        "OXIDE_POOL": "/fixture/pool",
+        "HOME": "/fixture/home",
+        "CARGO_HOME": "/fixture/cargo-home",
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
+        "OXIDE_TASK_SCRATCH_ROOT": "/fixture/scratch",
+        "TMPDIR": "/fixture/scratch",
+        "FIXTURE_GATE": "/fixture/gate",
+    }
+    override = {BOOT_HOOK: "1900000000000"}
+    quarantine = (
+        "  slot 7 retired and held, never reused (quarantined: lost with the removable volume and "
+        "exec /fixture/tool may have started processes outside its group; kept with its bytes, "
+        "never reused or deleted) project victim /fixture/victim 12 MiB allocated by slots, "
+        "slots/victim-7/quick-7"
+    )
+    calls = []
+
+    class Recorder:
+        root = "/fixture/root"
+
+        def oxide(self, args, label, cwd, env=None):
+            calls.append((list(args), dict(env or {})))
+            if args == ["status"]:
+                return 0, quarantine, ""
+            return 0, "", "oxide: fixture build summary"
+
+    root = tempfile.mkdtemp(prefix="boot-closure-self-check.")
+    try:
+        case = BootClosure.__new__(BootClosure)
+        case.env = dict(fixture)
+        case.proof = Recorder()
+        case.lost_record = lambda slot: {"holder": {"command": "exec /fixture/tool"}}
+        slot_dir = os.path.join(root, "slots", "victim-7")
+        os.makedirs(slot_dir)
+        # status(): one child, the whole fixture environment plus the override.
+        case.status("self-check status", "/fixture/victim", override)
+        expect(len(calls) == 1, f"status launched {len(calls)} children")
+        expect(calls[0][0] == ["status"], calls[0][0])
+        expect(
+            calls[0][1] == case.child_env(override),
+            f"status child env {sorted(calls[0][1])}",
+        )
+        for name in fixture:
+            expect(name in calls[0][1], f"status child lost {name}")
+        expect(
+            calls[0][1][BOOT_HOOK] == override[BOOT_HOOK],
+            "status child lost the override",
+        )
+        # kept(): its status and build children carry the same full
+        # environment, and its oracles pass on the canned product output.
+        case.kept(
+            {
+                "case": "self-check",
+                "slot": "7",
+                "directory": slot_dir,
+                "started": 1,
+                "victim": "/fixture/victim",
+            },
+            override,
+        )
+        expect(
+            [args for args, _ in calls] == [["status"], ["status"], ["build"]],
+            calls,
+        )
+        for args, env in calls:
+            expect(
+                env == case.child_env(override),
+                f"{args} child env {sorted(env)}",
+            )
+        # The diagnostic receipt uses json, stays bounded and is never
+        # qualified; an oversized body is honestly marked incomplete.
+        holder = dict(os.environ)
+        os.environ["OXIDE_PROOF_EVIDENCE"] = root
+        try:
+            path = diagnostic_receipt(
+                {
+                    "version": "oxide.removal.boot-closure-diagnostic/1",
+                    "mode": "diagnostic",
+                    "qualified": False,
+                    "completed": ["before-boot"],
+                    "failed": [["after-boot", "x" * 4000]],
+                    "reached": ["before-boot", "after-boot"],
+                    "unexecuted": [],
+                }
+            )
+            with open(path, "rb") as handle:
+                body = handle.read()
+            receipt = json.loads(body)
+            expect(
+                receipt["qualified"] is False and receipt["mode"] == "diagnostic",
+                f"diagnostic receipt {receipt.get('mode')}/{receipt.get('qualified')}",
+            )
+            expect(len(body) <= DIAGNOSTIC_RECEIPT_BYTES, f"receipt {len(body)} bytes")
+            path = diagnostic_receipt(
+                {
+                    "version": "v",
+                    "mode": "diagnostic",
+                    "qualified": False,
+                    "completed": [],
+                    "failed": [],
+                    "unexecuted": [],
+                    "huge": "z" * DIAGNOSTIC_RECEIPT_BYTES,
+                }
+            )
+            with open(path, "rb") as handle:
+                body = handle.read()
+            receipt = json.loads(body)
+            expect(
+                receipt.get("incomplete") is True
+                and len(body) <= DIAGNOSTIC_RECEIPT_BYTES,
+                f"oversized receipt {len(body)} bytes",
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(holder)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    # Dispatch: only the documented argument lists select a mode.
+    expect(mode_from_args([]) == (False, False), "no-argument mode")
+    expect(mode_from_args(["--boot-closure"]) == (True, False), "focused mode")
+    expect(
+        mode_from_args(["--boot-closure", "--diagnostic"]) == (True, True),
+        "diagnostic mode",
+    )
+    expect(
+        mode_from_args(["--diagnostic", "--boot-closure"]) == (True, True),
+        "diagnostic mode, reversed",
+    )
+    for refused in (
+        ["--diagnostic"],
+        ["--bogus"],
+        ["--self-check", "--boot-closure"],
+        ["--boot-closure", "--diagnostic", "--diagnostic"],
     ):
-        print("usage: test-oxide-removable-removal.py [--boot-closure [--diagnostic]]", file=sys.stderr)
+        expect(mode_from_args(refused) is None, f"{refused} selected a mode")
+    # The candidate marker is the product's own deletion line, as documented.
+    expect(
+        BOOT_MARKER
+        in b"oxide: deleted slot 2 lost before this boot (holder started 3 s before boot; a restart ends every process)",
+        "BOOT_MARKER is not the product's boot-session line",
+    )
+    print(
+        "boot-closure self-check ok: status/build child environments, diagnostic "
+        "receipt (json, bounded, unqualified), dispatch, marker"
+    )
+    return 0
+
+
+def main() -> int:
+    arguments = list(sys.argv[1:])
+    if arguments == ["--self-check"]:
+        return self_check()
+    mode = mode_from_args(arguments)
+    if mode is None:
+        print(USAGE, file=sys.stderr)
         return 2
-    if diagnostic and not focused:
-        print("--diagnostic is only defined with --boot-closure", file=sys.stderr)
-        return 2
+    focused, diagnostic = mode
     if sys.platform != "darwin":
         fail("the removal proof requires macOS")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
