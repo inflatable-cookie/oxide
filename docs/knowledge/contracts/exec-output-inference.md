@@ -667,9 +667,10 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   has no `finally`), the ordinary detach needs a clean collection with no
   unclosed child, and the failure-cleanup path applies the same gate, recording
   the retention instead of detaching. The counted run's tail goes through the
-  same latching wrapper, so any unsuccessful ordinary detach or a custody fault
-  escaping its collector latches unknown custody: its failure cleanup never
-  detaches twice and the original fault is preserved. The receipt is written in every
+  same latching wrapper, so any unsuccessful ordinary detach — or a detach that
+  returns while the image is still mounted — and any custody fault escaping its
+  collector latch unknown custody (never a counted pass): its failure cleanup
+  never detaches twice and the original fault is preserved. The receipt is written in every
   outcome, carries one row per declared case and is `qualified: false`; a
   skipped or unexecuted case is never a pass.
   01 conversion via explicit adopt (host pair linked), asserted committed;

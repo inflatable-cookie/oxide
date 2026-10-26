@@ -403,7 +403,9 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # signal, a timeout) or a custody fault escaping its collector latches unknown
 # custody before any outer cleanup: the counted failure cleanup never detaches
 # twice, the original fault is preserved, and the recorded disposition names the
-# retention the cleanup made. Its bounded
+# retention the cleanup made. A detach that RETURNS while the image is still
+# mounted is the same unknown device outcome: the counted tail aborts (never a
+# pass) and the image is retained. Its bounded
 # `qualified: false` receipt is written in every
 # outcome, and a skipped or unexecuted case is never a pass. Each run needs its
 # own owner activation, and only a counted run at the exact merge head can

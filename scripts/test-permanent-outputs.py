@@ -4108,6 +4108,73 @@ def exec_self_test() -> None:
     )
     shutil.rmtree(counted_tail.root, ignore_errors=True)
 
+    # A detach that RETURNS while the image is still mounted is unknown device
+    # custody too: the counted tail must abort (never report a pass), latch, and
+    # leave the image to the retaining cleanup with no second attempt. "/" is a
+    # real mount, so the fake detach "succeeds" without unmounting anything.
+    class SurvivingMountProof:
+        def __init__(self) -> None:
+            self.root = tempfile.mkdtemp(prefix="oxide-mounted-tail.")
+            self.mount = "/"
+            self.unclosed: set = set()
+            self.attempts: list[str] = []
+
+        def detach(self) -> None:
+            self.attempts.append(self.mount)
+
+    mounted_tail = SurvivingMountProof()
+    mounted_collection = Collection()
+    try:
+        finish_exec_inference(mounted_tail, mounted_collection, diagnostic=False, mount="/")
+        raise AssertionError("the counted tail reported success with its image still mounted")
+    except ProofAbort as fault:
+        expect("still mounted" in str(fault), f"{fault}")
+        expect("device outcome is unknown" in str(fault), f"{fault}")
+    expect(
+        mounted_tail.attempts == ["/"],
+        f"the mounted tail made more than one attempt: {mounted_tail.attempts}",
+    )
+    expect(
+        mounted_collection.aborted is not None
+        and "could not be confirmed" in mounted_collection.aborted,
+        f"the mounted tail did not latch custody: {mounted_collection.aborted}",
+    )
+    expect(
+        mounted_collection.detached.startswith("retained:"),
+        f"the mounted tail did not retain the image: {mounted_collection.detached}",
+    )
+    message = cleanup_after_failure(mounted_tail, mounted_collection)
+    expect(
+        mounted_tail.attempts == ["/"],
+        f"the failure cleanup retried a detach whose mount survived: {mounted_tail.attempts}",
+    )
+    expect("retained" in message, f"{message}")
+    shutil.rmtree(mounted_tail.root, ignore_errors=True)
+
+    # The clean control for the counted tail: a detach that removes the mount
+    # records the ordinary disposition and never aborts. A plain temporary
+    # directory is not a mount point, so the observation is a real one.
+    class UnmountedProof(SurvivingMountProof):
+        pass
+
+    unmounted_tail = UnmountedProof()
+    unmounted_tail.mount = tempfile.mkdtemp(prefix="oxide-unmounted-tail.")
+    unmounted_collection = Collection()
+    finish_exec_inference(
+        unmounted_tail, unmounted_collection, diagnostic=False, mount=unmounted_tail.mount
+    )
+    expect(
+        unmounted_tail.attempts == [unmounted_tail.mount],
+        f"the clean counted tail did not detach once: {unmounted_tail.attempts}",
+    )
+    expect(
+        unmounted_collection.aborted is None
+        and unmounted_collection.detached == "ordinary detach through Proof.detach; mount absent",
+        f"the clean counted tail disposition changed: {unmounted_collection.detached}",
+    )
+    shutil.rmtree(unmounted_tail.mount, ignore_errors=True)
+    shutil.rmtree(unmounted_tail.root, ignore_errors=True)
+
     retained_tail = NonzeroDetachProof()
     retained_collection = Collection()
     retained_collection.aborted = "case 21: Oxide reported unconfirmed writer closure"
@@ -4445,12 +4512,20 @@ def finish_exec_inference(
             "the counted collection did not complete",
         )
         run_ordinary_detach(proof, collection)
-        collection.mount_present = os.path.ismount(mount)
-        collection.detached = (
-            "ordinary detach through Proof.detach; mount absent"
-            if not collection.mount_present
-            else "unknown: Proof.detach returned but the mount is still present"
-        )
+        if os.path.ismount(mount):
+            # The detach command RETURNED but the image is still mounted, so its
+            # device outcome is unknown: this is a custody abort, never a counted
+            # pass. The abort is latched (so the outer cleanup retains the image
+            # and does not detach again) and re-raised as the first fault.
+            fault = ProofAbort(
+                f"the ordinary detach returned but the owned image is still "
+                f"mounted at {mount}, so its device outcome is unknown"
+            )
+            collection.aborted = f"the ordinary detach could not be confirmed: {fault!r}"[:600]
+            collection.detached = detach_disposition(collection, proof.unclosed)
+            raise fault
+        collection.mount_present = os.path.lexists(mount)
+        collection.detached = "ordinary detach through Proof.detach; mount absent"
         return
     # The owned image is this run's custody. Only a collection that recorded no
     # failure, did not abort and left no child unclosed makes its ordinary
@@ -6421,8 +6496,8 @@ def main() -> int:
         print(
             "exec-inference apparatus self-test passed: case outcomes, dependency "
             "skips, keep-going, abort latching, the receipt document, the runtime "
-            "binding of every case body and the counted/diagnostic cleanup "
-            "retention gates (no scratch, child, toolchain or image)"
+            "binding of every case body and the counted/diagnostic cleanup and "
+            "device-outcome retention gates (no scratch, child, toolchain or image)"
         )
         return 0
     if sys.platform != "darwin":
