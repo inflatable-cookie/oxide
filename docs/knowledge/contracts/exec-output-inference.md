@@ -39,10 +39,12 @@ local directory and is reported once by the bounded `tool directories kept local
 notice (`outputs::target_entries` + `outputs::tool_directories_note`): two
 listings of ONE directory — the real target's direct entries before the writer
 starts and after its group closes — capped at eight names, with no recursion, no
-payload walk and no link followed, printed only for a command that runs a tool
-(`exec` or an external subcommand). Cargo-only commands keep the shipped
-silence, and the receipt-recorded real member keeps its own separate
-unplaced-member notice.
+payload walk and no link followed, printed only on the receipt-derived
+**profile-member layout** (`outputs::tool_notice_applies`). A never-converted,
+ephemeral, whole-target or detached checkout, a Cargo-only command, a modelled
+command and an explicit `--output` declaration all keep their previous stderr;
+the receipt-recorded real member keeps its own separate unplaced-member
+notice.
 
 This document is the design for one prerequisite: **`oxide exec` must not
 need `--output`**. Today a checkout that places outputs at profile members

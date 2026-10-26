@@ -637,10 +637,13 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // directory, and is reported once. This is a bounded observation of ONE
     // directory — the real target's direct entries, before the writer starts
     // and after its group closes — with no recursion, no payload walk, no link
-    // followed and no new authority. Only a command that runs a tool takes it:
-    // a Cargo-only command's top-level files and `target/tmp` are Cargo's, not
-    // a tool's output directory.
-    let target_entries_before = (!cli::models_profile_outputs(&invocation.command))
+    // followed and no new authority. It belongs to the receipt-derived
+    // PROFILE-MEMBER layout only: a Cargo-only command, an unconverted,
+    // ephemeral, whole-target or detached checkout, a modelled command and an
+    // explicit `--output` declaration all keep their shipped stderr.
+    let reports_tool_directories =
+        outputs::tool_notice_applies(derives_from_receipt, planned.as_ref());
+    let target_entries_before = reports_tool_directories
         .then(|| outputs::target_entries(&key.checkout))
         .flatten();
     let started_group = store
@@ -763,7 +766,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let measured = held.measured.clone();
     // The one bounded notice for what this tool created in the checkout's real
     // target (oxide#164). Printed after the writer's group closed and before
-    // the summary, once.
+    // the summary, once, and only on the receipt-derived profile-member layout.
     if let Some(note) =
         outputs::tool_directories_note(&key.checkout, target_entries_before.as_deref())
     {

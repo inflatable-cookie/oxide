@@ -42,8 +42,10 @@ repeatable: `oxide exec --output debug -- npm run tauri build`. A tool that
 passes its own `--target` needs the matching `<triple>/debug` or
 `<triple>/release` declaration in that project's selector. A tool's own
 directory that is not a profile member — `target/doc`, or `target/nextest` for
-nextest — stays a real local directory and is not placed; Oxide reports it once,
-by name, in its `tool directories kept local` line, and never walks it. A member
+nextest — stays a real local directory and is not placed; in a profile-layout
+checkout Oxide reports it once, by name, in its `tool directories kept local`
+line, and never walks it. Other layouts (never converted, ephemeral,
+whole-target, detached) print no such line. A member
 the receipt records as a real directory is kept local and reported once in its
 own unplaced-member line. `oxide outputs adopt` selects that layout explicitly
 and `oxide outputs detach` returns the checkout to real directories; a checkout

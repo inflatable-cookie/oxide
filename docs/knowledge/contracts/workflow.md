@@ -4526,8 +4526,10 @@ author and reviewer native remain unactivated.
   the writer's group closes, by the bounded `tool directories kept local`
   notice: two listings of ONE directory (the real target's direct entries before
   the writer starts and after its group closes), capped at eight names, with no
-  recursion, no payload walk and no link followed, and only for a command that
-  runs a tool (`exec` or an external subcommand). A detached profile receipt
+  recursion, no payload walk and no link followed, and only on the
+  receipt-derived profile-member layout — a never-converted, ephemeral,
+  whole-target or detached checkout, a modelled command and an explicit
+  `--output` declaration keep their previous stderr. A detached profile receipt
   plans no
   destination at all, so its `exec` runs locally through real directories; a
   legacy whole-target receipt and an unconverted checkout are unchanged (the

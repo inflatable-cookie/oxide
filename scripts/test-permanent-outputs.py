@@ -2689,6 +2689,7 @@ EXEC_CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("22", (), "an external subcommand in a profile checkout whose receipt records a real member (detach, content, re-adopt) prints that one bounded unplaced-member notice naming only the receipt's member, beside the separate tool-directories notice for its own directory"),
     ("23", (), "the same external subcommand is unchanged in a whole-target checkout (link and receipt bytes), and a foreign member link still refuses before the tool runs"),
     ("24", (), "a whole-target checkout whose root is gone plans a FUTURE root, and the external subcommand reserves that root's keyed nonce first and binds the local fallback instead of refusing with no nonce"),
+    ("25", (), "the tool-directory notice appears only on the receipt-derived profile layout: a never-converted real target and an ephemeral real target run the external subcommand, write their own directory locally, and print no tool-directories notice"),
 ]
 
 
@@ -5740,6 +5741,14 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             os.path.isfile(tool_marker) and read_bytes(tool_marker) == b"oxfixture",
             "23: the external tool did not run in the whole-target checkout",
         )
+        expect(
+            not [
+                line
+                for line in stderr.splitlines()
+                if "tool directories kept local" in line
+            ],
+            f"23: a whole-target checkout printed the tool-directory notice: {stderr}",
+        )
         # The refusal half: a profile checkout with a foreign release link
         # refuses before the tool runs.
         foreign = fresh_checkout(proof, root, "external-foreign")
@@ -5877,6 +5886,70 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         )
         phase(proof, "after the future whole-target root")
 
+    def case_25() -> None:
+        # 25 (oxide#164 review): the tool-directory notice belongs to the
+        # receipt-derived PROFILE layout only. A never-converted real target and
+        # an ephemeral real target keep their prior stderr: the external
+        # subcommand runs, writes its own directory locally, and prints no
+        # tool-directories notice.
+        tool_marker = os.path.join(root, "external-oxfixture-layouts-argv")
+        external_env = {
+            **proof.env,
+            "PATH": tools + os.pathsep + proof.env.get("PATH", ""),
+            "OXIDE_EXTERNAL_MARKER": tool_marker,
+        }
+
+        def unchanged_layout(checkout: str, label: str) -> None:
+            target = os.path.join(checkout, "target")
+            expect(
+                os.path.isdir(target) and not os.path.islink(target),
+                f"{label}: the checkout's target is not a real directory",
+            )
+            if os.path.exists(tool_marker):
+                os.remove(tool_marker)
+            code, _, stderr = oxide_env(
+                proof, ["oxfixture"], f"{label}: external subcommand", checkout, external_env
+            )
+            expect(code == 0, f"{label}: the external subcommand failed: {stderr}")
+            expect(
+                os.path.isfile(tool_marker) and read_bytes(tool_marker) == b"oxfixture",
+                f"{label}: the external tool did not run",
+            )
+            expect(
+                os.path.isdir(target) and not os.path.islink(target),
+                f"{label}: the checkout's target changed layout",
+            )
+            expect(
+                os.path.isfile(os.path.join(target, "oxfixture", "out")),
+                f"{label}: the tool wrote no local directory",
+            )
+            expect(
+                not os.path.exists(receipt_file(pool, checkout)),
+                f"{label}: the checkout gained an output receipt",
+            )
+            expect(
+                not [
+                    line
+                    for line in stderr.splitlines()
+                    if "tool directories kept local" in line
+                ],
+                f"{label}: the tool-directory notice changed an unchanged layout's stderr: {stderr}",
+            )
+
+        # a) Never converted: a real target with no receipt at all.
+        unconverted = fresh_checkout(proof, root, "external-unconverted")
+        os.makedirs(os.path.join(unconverted, "target"))
+        unchanged_layout(unconverted, "25 unconverted")
+
+        # b) Ephemeral drive mode: outputs stay in the real checkout target.
+        set_mode(proof, "ephemeral", maker)
+        try:
+            ephemeral = fresh_checkout(proof, root, "external-ephemeral")
+            unchanged_layout(ephemeral, "25 ephemeral")
+        finally:
+            set_mode(proof, "permanent", maker)
+        phase(proof, "after the unchanged-layout notice controls")
+
     bodies = {
         "s4b": case_s4b,
         "01": case_01,
@@ -5902,6 +5975,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         "22": case_22,
         "23": case_23,
         "24": case_24,
+        "25": case_25,
     }
     expect(
         sorted(bodies) == sorted(case for case, _requires, _text in EXEC_CASES),

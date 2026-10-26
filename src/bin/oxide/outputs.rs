@@ -5783,9 +5783,29 @@ pub fn target_entries(checkout: &Path) -> Option<Vec<String>> {
     Some(names)
 }
 
+/// Whether one command's bound layout is the receipt-derived PROFILE-MEMBER
+/// layout, the only path that prints the tool-directory notice (oxide#164).
+///
+/// A derived command (`oxide exec` without `--output`, or an external
+/// subcommand) that planned profile members is the checkout shape the brief's
+/// "reported once" belongs to. Every other shape keeps its shipped stderr: a
+/// never-converted or ephemeral checkout plans nothing, a legacy whole-target
+/// checkout plans the whole target, a detached profile receipt plans no
+/// destination, and a modelled command or an explicit `--output` declaration is
+/// not a derived set. None of them gets the extra line.
+pub fn tool_notice_applies(derived: bool, plan: Option<&Plan>) -> bool {
+    // The checkout's layout decides, not which members this command happened to
+    // place: a profile plan whose member is a receipt-recorded real directory is
+    // still the profile layout, and the tool may create a non-member directory
+    // beside it.
+    derived && plan.is_some_and(|plan| !plan.whole_target && !plan.members.is_empty())
+}
+
 /// One bounded notice naming the directories a tool created directly under its
 /// real target that are NOT profile members — the tool's own `target/nextest`
-/// or `target/llvm-cov` (oxide#164).
+/// or `target/llvm-cov` (oxide#164). Callers print it only when
+/// [`tool_notice_applies`] holds, so an unconverted, ephemeral, whole-target or
+/// detached checkout keeps its previous stderr.
 ///
 /// `before` is [`target_entries`] captured before the writer started. The
 /// comparison is two listings of ONE directory: no recursion, no payload walk,
@@ -10051,6 +10071,54 @@ mod tests {
         // notice.
         assert!(target_entries(&linked.root.join("absent")).is_none());
         assert!(tool_directories_note(&fixture.checkout, None).is_none());
+    }
+
+    /// oxide#164 review: the tool-directory notice belongs to the
+    /// receipt-derived PROFILE-MEMBER layout only. An unconverted, ephemeral,
+    /// whole-target or detached checkout plans nothing (or the whole target), a
+    /// modelled command and an explicit `--output` declaration are not derived,
+    /// so none of them may gain the extra line: their shipped stderr stays.
+    #[test]
+    fn the_tool_directory_notice_applies_only_to_a_derived_profile_plan() {
+        let fixture = Fixture::new();
+        let selected = fixture.local().selected(1);
+        let owned = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "debug".to_owned(),
+                selected: Some(selected),
+            }],
+        };
+        let real = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "release".to_owned(),
+                selected: None,
+            }],
+        };
+        let whole = Plan {
+            whole_target: true,
+            members: vec![PlannedMember {
+                member: MEMBER.to_owned(),
+                selected: Some(fixture.local().selected(1)),
+            }],
+        };
+        let empty = Plan {
+            whole_target: false,
+            members: Vec::new(),
+        };
+        // The profile layout, owned or receipt-recorded real.
+        assert!(tool_notice_applies(true, Some(&owned)));
+        assert!(tool_notice_applies(true, Some(&real)));
+        // Unconverted, ephemeral and detached checkouts plan nothing.
+        assert!(!tool_notice_applies(true, None));
+        // A legacy whole-target checkout plans the whole target.
+        assert!(!tool_notice_applies(true, Some(&whole)));
+        // An explicit `--output` declaration and every modelled command are not
+        // derived sets.
+        assert!(!tool_notice_applies(false, Some(&owned)));
+        // A plan with no member places nothing to report against.
+        assert!(!tool_notice_applies(true, Some(&empty)));
     }
 
     /// S1 counterfactual 14: member names are matched before triple descent, so
