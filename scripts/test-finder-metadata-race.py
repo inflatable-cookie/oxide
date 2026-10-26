@@ -72,7 +72,9 @@ Diagnostic safety (`--diagnostic`): only a *recoverable oracle* failure is
 recorded and followed by the next independent case. An unknown writer, device,
 custody, detach or deadline outcome aborts the whole collection immediately,
 retains every image backing and its custody record, and writes a bounded
-`qualified: false` receipt. The receipt covers setup and staging failures too,
+`qualified: false` receipt. The receipt covers setup and staging failures too
+(a staging timeout, a setup `OSError` or any other non-classified setup
+exception is unknown closure, and an unwritable receipt aborts explicitly),
 records the first fault and a per-case reason, and lists reached, completed,
 failed, skipped and unexecuted cases. Unknown journal or receipt state (an
 absent, unreadable, incomplete or malformed pool-owned registry, or an intent
@@ -106,7 +108,10 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    attaches it with `hdiutil attach -owners on`, parses the raw plist and
    requires exactly one mounted entity whose mount point is this run's expected
    `/Volumes/<name>` and whose device entry is a block device matching the
-   mount's `st_dev`. Before detaching it revalidates that attachment (the mount
+   mount's `st_dev`. The image is created with `-volname <this run's unique
+   name>` (hdiutil's default volume name would mount at `/Volumes/untitled`),
+   an explicit `-mountpoint` is passed when that path already exists, and any
+   other resulting mount point is unknown custody. Before detaching it revalidates that attachment (the mount
    is a real directory on that recorded device, the device entry is the same
    block device), and after detaching it accepts absence only from `ENOENT`:
    a failed metadata read is unknown, our device still mounted is unknown, and
@@ -346,26 +351,46 @@ def stage(root: str) -> str:
         }
     )
     log = os.path.join(root, "stage.log")
-    with open(log, "w", encoding="utf-8") as handle:
-        build = subprocess.run(
-            ["cargo", "build", "-j", "4", "--locked", "--offline", "--bin", "oxide"],
-            cwd=REPO,
-            env=env,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            timeout=work_left(),
-        )
+    try:
+        handle = open(log, "w", encoding="utf-8")
+    except OSError as error:
+        unknown(f"cannot open the staging log {log}: {error}")
+    with handle:
+        try:
+            build = subprocess.run(
+                ["cargo", "build", "-j", "4", "--locked", "--offline", "--bin", "oxide"],
+                cwd=REPO,
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                timeout=work_left(),
+            )
+        except subprocess.TimeoutExpired:
+            # A staging child that outlived the work window has unknown
+            # closure: never a recoverable failure.
+            unknown("staging cargo timed out; its child closure is unknown")
+        except OSError as error:
+            unknown(f"cannot run the staging cargo: {error}")
     if build.returncode:
-        with open(log, encoding="utf-8") as handle:
-            fail(f"staging exit {build.returncode}: {handle.read()[-2000:]}")
+        try:
+            with open(log, encoding="utf-8") as handle:
+                text = handle.read()[-2000:]
+        except OSError as error:
+            unknown(f"cannot read the staging log {log}: {error}")
+        # A staging build that simply fails is an ordinary (recoverable)
+        # failure; only an unreadable log or a filesystem fault is unknown.
+        fail(f"staging exit {build.returncode}: {text}")
     built = os.path.join(stage_dir, "target", "debug", "oxide")
     if not os.path.isfile(built):
         fail(f"staging produced no binary at {built}")
     subject = os.path.join(root, "oxide")
-    shutil.copy2(built, subject)
-    os.chmod(subject, 0o755)
-    shutil.rmtree(stage_dir, ignore_errors=True)
-    os.unlink(log)
+    try:
+        shutil.copy2(built, subject)
+        os.chmod(subject, 0o755)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        os.unlink(log)
+    except OSError as error:
+        unknown(f"cannot publish the staged binary at {subject}: {error}")
     return subject
 
 
@@ -607,6 +632,11 @@ class ImageCustody:
             handle.write("\n")
 
     def attach(self) -> str:
+        # The volume name is this run's unique name. Without it the created APFS
+        # volume is called `untitled` (hdiutil's default) and would mount at
+        # `/Volumes/untitled` (or `/Volumes/untitled 1`), never at the expected
+        # mount this proof binds — so the name is part of the fixture, not
+        # decoration.
         created = run(
             [
                 "hdiutil",
@@ -617,6 +647,8 @@ class ImageCustody:
                 "APFS",
                 "-type",
                 "SPARSE",
+                "-volname",
+                self.name,
                 "-quiet",
                 self.backing,
             ],
@@ -629,17 +661,36 @@ class ImageCustody:
         facts = os.lstat(self.backing)
         if not stat.S_ISREG(facts.st_mode) or facts.st_uid != os.getuid():
             unknown(f"{self.case}: the created backing is not an owned regular file")
-        self.write("created", size=facts.st_size, inode=facts.st_ino, device=facts.st_dev)
+        self.write(
+            "created",
+            size=facts.st_size,
+            inode=facts.st_ino,
+            device=facts.st_dev,
+            volume_name=self.name,
+        )
+        # An explicit mount point is used when it already exists as an empty
+        # directory we can bind; `/Volumes` itself is root-owned, so the normal
+        # route is the unique volume name above, and the attach must then land
+        # on exactly that path or it is unknown custody.
+        attach = ["hdiutil", "attach", "-owners", "on", "-nobrowse", "-plist"]
+        mount_state, mount_facts = lstat_state(self.expected_mount)
+        if mount_state == "error":
+            unknown(
+                f"{self.case}: cannot inspect the expected mount {self.expected_mount} "
+                f"({mount_facts}); retained"
+            )
+        if mount_state == "present":
+            unknown(
+                f"{self.case}: the expected mount {self.expected_mount} already exists; retained"
+            )
+        if os.path.isdir(self.expected_mount):
+            attach += ["-mountpoint", self.expected_mount]
+            self.write("mountpoint-explicit", mount=self.expected_mount)
+        else:
+            self.write("mountpoint-volume-name", expected=self.expected_mount)
+        attach.append(self.backing)
         attached = run(
-            [
-                "hdiutil",
-                "attach",
-                "-owners",
-                "on",
-                "-nobrowse",
-                "-plist",
-                self.backing,
-            ],
+            attach,
             cwd=self.directory,
             env=scrubbed(os.environ),
             timeout=60,
@@ -1067,7 +1118,18 @@ def main(argv: list) -> int:
     def finish(code: int) -> int:
         if not diagnostic:
             return code
-        receipt = write_receipt(state)
+        try:
+            receipt = write_receipt(state)
+        except Exception as error:  # noqa: BLE001 - a missing receipt is reported
+            # An unwritable receipt aborts the collection explicitly instead of
+            # reporting a diagnostic that does not exist.
+            print(
+                f"diagnostic: the receipt could not be written ({error!r}); "
+                "the collection is aborted and reports nothing",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
         print(
             f"diagnostic: qualified=false, phase {state['phase']}, reached "
             f"{len(state['reached'])}, completed {len(state['completed'])}, failed "
@@ -1089,6 +1151,12 @@ def main(argv: list) -> int:
         state["first_fault"] = f"setup: {type(error).__name__}: {error}"
         if isinstance(error, Unknown):
             state["abort"] = state["first_fault"]
+        return finish(1)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        # Setup or staging raised outside the classified paths: its closure is
+        # unknown, so it is recorded as an abort, never as an oracle failure.
+        state["first_fault"] = f"setup: {type(error).__name__}: {error}"
+        state["abort"] = state["first_fault"]
         return finish(1)
     print(f"staged oxide from this HEAD: {oxide}", flush=True)
     state["phase"] = "body"
