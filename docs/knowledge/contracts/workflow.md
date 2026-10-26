@@ -4442,6 +4442,26 @@ author and reviewer native remain unactivated.
   a committed placement never points at an absent directory; a symlink, a file
   or any other entry at that destination refuses and is never followed
   (oxide#162).
+- **A deleted `target` directory (oxide#165).** The profile layout keeps
+  `<checkout>/target` itself a real directory that holds the owned member
+  links, so a checkout whose `target` was deleted — a manual `rm -rf target`,
+  a task-local build-output cleanup — is a positively absent target and
+  nothing more. A leased command with a committed profile receipt recreates
+  that one real directory with a single exclusive `mkdir` under the checkout's
+  own directory descriptor, at the mode a conversion creates (0755), and then
+  republishes the missing owned member links through the unchanged per-member
+  transition into the same root the receipt commits to: the root, its marker,
+  its nonce and its payload are untouched and the receipt only advances its
+  generation. The create runs under the checkout's binding mutex after the
+  same writer-custody clearance as a relink, so no cooperative command can
+  race it; an entry that appears meanwhile is never replaced or followed —
+  only a real directory is accepted as that creator's result, and a file or
+  any link refuses. An existing `target` that is a file or a link of any kind
+  refuses the profile binding (this layout requires the real directory there),
+  an unreadable parent or unknown state refuses, a whole-target receipt and a
+  never-converted checkout are unchanged, and no other refusal is relaxed.
+  `oxide exec` and an external subcommand's own builds bind through the same
+  path and get the same recreation.
 - **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and
   `<triple>/release`. A member has at most two components matching
   `[A-Za-z0-9_.-]+`, is neither `.` nor `..`, and is never absolute or an

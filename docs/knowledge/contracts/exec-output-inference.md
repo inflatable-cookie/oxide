@@ -648,6 +648,13 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   creation timestamp is preserved, the old output still visible through the
   migrated member link, and a following `build` and `exec` succeeding without
   relinking or rewriting the upgraded receipt.
+  20 a converted checkout's whole `target` directory deleted (oxide#165): the
+  next leased build recreates that real directory exclusively and republishes
+  the owned `debug`/`release` pair through the unchanged per-member transition
+  into the SAME root, whose payload is intact and whose committed placement
+  (root and nonce) the receipt still records, and an `exec` after it runs;
+  before the fix every leased command failed with ENOENT while creating the
+  transition link inside the absent directory.
 - **Oracles** are positive-path plus a control that must fail: cases 02/03 and
   case 10 differ only in the link's destination, so case 02's oracles fail if
   the classification is removed; no case is satisfied by "no output".

@@ -2563,6 +2563,7 @@ EXEC_CASES = [
     ("13", "a checkout path containing a space converts and runs end to end"),
     ("15", "Ctrl-C reaches the tool group, the lease holds until the group closes, then releases"),
     ("19", "a committed version-1 whole-target receipt makes every failing reader refuse naming adopt (recorded status reads nothing; --measure reports outputs unknown naming adopt), an explicit adopt upgrades it through the shipped migration with the old outputs intact, and a noncommitted version-1 control keeps its bytes"),
+    ("20", "a converted checkout whose target directory was deleted recreates it: the next leased build exits 0 with the owned pair back in the same root, the root's old outputs intact and the receipt still committed to that root, and an exec then runs"),
 ]
 
 
@@ -2869,8 +2870,12 @@ def exec_run(proof: Proof, repo: str) -> None:
     dangling, and proves a derived `exec` creates that one directory, builds
     `--release` into it and changes neither the link nor the receipt; 18 points
     `target/release` at an unverified root and proves the refusal creates
-    nothing there. `--plan` prints the same table and allocation with no
-    effect.
+    nothing there. Case 20 (oxide#165) deletes a converted checkout's whole
+    `target` directory — what a task-local build-output cleanup does — and
+    proves the next leased build recreates it exclusively and republishes the
+    owned pair into the SAME root, whose payload and committed placement
+    survive, and that an exec then runs. `--plan` prints the same table and
+    allocation with no effect.
 
     The HIGH premise checklist is traced through the executable bodies:
 
@@ -3584,6 +3589,89 @@ def exec_run(proof: Proof, repo: str) -> None:
     plan_report = plan(proof, live, "19 the upgraded checkout plans the profile layout")
     expect(plan_report["layout"] == "profile", f"19: the plan reports {plan_report['layout']}")
     phase(proof, "after the version-1 upgrade")
+
+    # 20 (oxide#165): a converted checkout whose `target` directory was deleted
+    # — what a task-local build-output cleanup, or a manual `rm -rf target`,
+    # does — must not be a checkout that can never build again. Every leased
+    # command used to fail before compiling with ENOENT while creating the
+    # transition link inside the absent directory. The binding now recreates
+    # that one real directory exclusively and republishes the owned pair
+    # through the existing transition, into the SAME root: the receipt's
+    # committed root and nonce and the root's payload survive.
+    deleted = fresh_checkout(proof, root, "deleted-target")
+    code, _, stderr = proof.oxide(["build"], "20 deleted-target fixture adopts", deleted)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    deleted_root = expect_profile_layout(pool, mount, deleted, "20 adoption")
+    with open(os.path.join(deleted_root, "sentinel"), "wb") as handle:
+        handle.write(b"kept")
+    with open(os.path.join(deleted_root, "debug", "old-output"), "wb") as handle:
+        handle.write(b"old")
+    deleted_receipt = read_json(receipt_file(pool, deleted))
+    deleted_selected = next(
+        (
+            placement["selected"]
+            for placement in deleted_receipt["links"]
+            if placement.get("selected")
+        ),
+        None,
+    )
+    expect(deleted_selected is not None, "20: the fixture's receipt selects no root")
+    deleted_target = os.path.join(deleted, "target")
+    expect(
+        os.path.isdir(deleted_target) and not os.path.islink(deleted_target),
+        "20: the fixture's target is not a real directory",
+    )
+    shutil.rmtree(deleted_target)
+    expect(not os.path.lexists(deleted_target), "20: the fixture's target was not deleted")
+    code, _, stderr = proof.oxide(["build"], "20 a build recreates the deleted target directory", deleted)
+    expect(code == 0, f"20: a leased build failed on the deleted target directory: {stderr}")
+    expect(
+        "through profile member links" in stderr,
+        f"20: the build did not bind the owned profile members: {stderr}",
+    )
+    recreated_root = expect_profile_layout(pool, mount, deleted, "20 recreation")
+    expect(
+        recreated_root == deleted_root,
+        f"20: the build bound {recreated_root}, not the recorded root {deleted_root}",
+    )
+    expect(
+        os.path.isfile(os.path.join(deleted_root, "debug", "poutputs")),
+        "20: the build wrote no binary through the recreated member link",
+    )
+    expect(
+        read_bytes(os.path.join(deleted_root, "sentinel")) == b"kept",
+        "20: the recreation lost the root's old file",
+    )
+    expect(
+        read_bytes(os.path.join(deleted_root, "debug", "old-output")) == b"old",
+        "20: the recreation lost the root's old output",
+    )
+    recreated_receipt = read_json(receipt_file(pool, deleted))
+    expect(
+        recreated_receipt["layout"] == "profile" and recreated_receipt["state"] == "committed",
+        f"20: the receipt is not a committed profile receipt: {recreated_receipt}",
+    )
+    for placement in recreated_receipt["links"]:
+        expect(
+            placement.get("selected") is not None
+            and placement["selected"]["root"] == deleted_selected["root"]
+            and placement["selected"].get("nonce") == deleted_selected.get("nonce"),
+            f"20: {placement['member']} moved off the recorded root or nonce: {placement}",
+        )
+    code, _, stderr = proof.oxide(
+        ["exec", "--", "/usr/bin/true"], "20 an exec after the recreation", deleted
+    )
+    expect(code == 0, f"20: an exec failed after the recreation: {stderr}")
+    expect("through profile member links" in stderr, stderr)
+    expect(
+        member_link_target(deleted, "debug") == os.path.join(deleted_root, "debug"),
+        "20: the exec relinked debug",
+    )
+    expect(
+        read_bytes(os.path.join(deleted_root, "debug", "old-output")) == b"old",
+        "20: the exec lost the root's old output",
+    )
+    phase(proof, "after the deleted target recreation")
 
     proof.detach()
 
