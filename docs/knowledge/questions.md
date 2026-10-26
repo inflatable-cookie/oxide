@@ -13,7 +13,27 @@ and program. Nested commands never inherit or reset a deadline. Owning
 contract: [workflow](contracts/workflow.md#command-time-budgets-oxide140).
 Still open, not implementation gaps: an inner-deadline inheritance interface,
 and whether a future event transport should carry more than the frozen v1
-start and terminal records.
+start and terminal records. The [nested lease design](contracts/nested-lease.md)
+deliberately does not inherit a deadline into a joined command; that remains
+this question's decision.
+
+
+## Q-019 — How should nested Oxide lease joining and permit borrowing work?
+
+Design answer, 2026-10-26, unreviewed and unimplemented: the
+[nested lease design](contracts/nested-lease.md) proposes that a leased
+command issue a lease token scoped to its own process subtree (a nonce, an
+inherited unlinked owner-only descriptor and durable record state), that a
+nested command with the same workspace, recipe and toolchain join the outer
+lease with no new slot or host permit, and that one with a different key take
+its own slot while borrowing the outer host permit. Joins register writer
+tickets so closure, recorded accounting and the removable flush still hold;
+a stale or foreign token is ignored and the command takes the independent
+path. The design is HIGH complexity and ELEVATED where it changes closure
+and recovery. Independent exact-head design review and the operator's design
+freeze (Tom, decision `95b3bc63`) must both pass before any implementation
+brief. Open after it: deadline inheritance (Q-018), the separate idle-exec
+permit design, hostile same-UID code and non-macOS/Linux platforms.
 
 
 ## Q-001 — What implementation shape best supports durable exclusive ownership?

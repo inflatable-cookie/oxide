@@ -571,6 +571,16 @@ root. A new Cargo release needs this check before it joins the table.
    unknown-accounting refusal are unchanged. Two slots of one checkout share
    `<workspace>/target`: Cargo serializes the brief final-output uplift on
    `target/<profile>` and the latest final artifact wins.
+
+   A nested `oxide` today takes an independent lease under that second-slot
+   rule. Tom approved a design-first change in which a nested command with
+   the same workspace, recipe and toolchain joins the outer lease (no new
+   slot or host permit) and one with a different key takes its own slot but
+   borrows the outer host permit; the
+   [nested lease design](nested-lease.md) owns the proposed token,
+   validation, closure, accounting and deadlock rules and is awaiting
+   independent design review and the operator's design freeze. Nothing above
+   changes until that design is frozen and implemented.
 3. Run the freshness gate when the slot's last origin differs.
 4. Run the real Cargo as the leader of a new process group, with:
    - the build directory pointed at the slot;

@@ -13,6 +13,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Build-context policy (proposed)](knowledge/contracts/build-context-policy.md)
 - [Storage inventory (read-only)](knowledge/contracts/storage-inventory.md)
 - [Local lease library (standalone CLI retired)](knowledge/contracts/local-lease.md)
+- [Nested Oxide lease joining and borrowed host permits (proposed design)](knowledge/contracts/nested-lease.md)
 - [Rust toolchain and quality](knowledge/rust-toolchain-and-quality.md)
 - [Opt-in stable Cargo profiles](knowledge/contracts/stable-cargo-profiles.md)
 - [Open decisions](knowledge/questions.md)

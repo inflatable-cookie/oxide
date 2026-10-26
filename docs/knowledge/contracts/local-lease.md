@@ -159,6 +159,16 @@ expose it. Ledger v1, receipt v2, JSON and exits are unchanged. An earlier
 `oxide-storage-lease` build refuses a pool that has `oxide-managed` as an
 unknown entry; use the current build against pools the front door touched.
 
+Proposed, not implemented: the front door would add one
+`oxide-managed/nested/<record>/` generation directory per leased command
+(with a `gate` lock file and `writers/` tickets) and one optional `permit`
+field on the control-state record, so a nested `oxide` can join that
+generation or borrow its host permit. The ledger, lease identity, slots,
+accounting and release order are unchanged; the permit is control state, not
+a lease. The [nested lease design](nested-lease.md) owns the rules, the state
+fence and the proof plan, and it awaits independent design review and the
+operator's design freeze.
+
 ## Commands
 
 **init** checks cap and image size, and refuses unsupported platforms, before
