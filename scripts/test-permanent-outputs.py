@@ -2067,11 +2067,13 @@ def fake_git(root: str, kind: str, script: str) -> str:
 
 
 def private_path(root: str) -> str:
-    """A PATH with the tools oxide needs before its first Git call, and no
-    git at all."""
+    """A PATH with the tools oxide needs to reach a real build — Cargo, rustc,
+    rustup and the C linker it invokes — and no git at all. Without `git` the
+    ignore prerequisite cannot be confirmed, which must leave the build usable
+    rather than failing at link time for a missing `cc`."""
     directory = os.path.join(root, "no-git-bin")
     os.makedirs(directory)
-    for tool in ("cargo", "rustc", "rustup"):
+    for tool in ("cargo", "rustc", "rustup", "cc"):
         found = shutil.which(tool)
         expect(found is not None, f"{tool} is not on the host PATH")
         os.symlink(found, os.path.join(directory, tool))
