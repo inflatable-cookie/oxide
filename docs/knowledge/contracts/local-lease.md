@@ -161,11 +161,12 @@ unknown entry; use the current build against pools the front door touched.
 
 Proposed, not implemented: the front door would add one
 `oxide-managed/nested/<record>/` generation directory per leased command
-(with a `gate` lock file and `writers/` tickets) and one optional `permit`
-field on the control-state record, so a nested `oxide` can join that
-generation or borrow its host permit. The ledger, lease identity, slots,
-accounting and release order are unchanged; the permit is control state, not
-a lease. The [nested lease design](nested-lease.md) owns the rules, the state
+(with a `gate` lock file and `writers/` tickets) and one optional `nested`
+field on the control-state record (the generation nonce, its depth and any
+borrowed root permit reference), so a nested `oxide` can join that generation
+or borrow its host permit. The ledger, lease identity, slots, accounting and
+release order are unchanged; the field is control state, not a lease, and it
+is distinct from the idle-exec design's `permit` (held/released) fact. The [nested lease design](nested-lease.md) owns the rules, the state
 fence and the proof plan; its independent design review passed (comment
 `6412288358`) and the operator's design freeze is pending.
 
