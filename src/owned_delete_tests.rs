@@ -97,7 +97,13 @@ fn a_plain_removal_fails_on_the_raced_state_the_seam_completes() {
     );
     assert!(tree.is_dir());
 
-    match rmdir_retrying_finder_metadata(parent.as_fd(), &name, dir.as_fd(), OsStr::new("slot")) {
+    match rmdir_retrying_finder_metadata(
+        parent.as_fd(),
+        &name,
+        dir.as_fd(),
+        OsStr::new("slot"),
+        &mut || Ok(()),
+    ) {
         Rmdir::Removed => {}
         other => panic!("the seam did not complete the same raced state: {other:?}"),
     }
@@ -119,6 +125,7 @@ fn finder_metadata_recreated_before_the_removal_is_drained() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Removed => {}
         other => panic!("Finder metadata kept the directory: {other:?}"),
@@ -141,6 +148,7 @@ fn a_foreign_entry_is_refused_by_name_and_untouched() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Refused { entry } => assert_eq!(entry, "foreign.txt"),
         other => panic!("a foreign entry must refuse: {other:?}"),
@@ -167,6 +175,7 @@ fn a_metadata_named_link_is_refused_and_never_followed() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Refused { entry } => assert_eq!(entry, ".DS_Store"),
         other => panic!("a metadata-named link must refuse: {other:?}"),
@@ -195,6 +204,7 @@ fn a_metadata_named_directory_is_refused() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Refused { entry } => assert_eq!(entry, ".DS_Store"),
         other => panic!("a metadata-named directory must refuse: {other:?}"),
@@ -217,6 +227,7 @@ fn repeated_recreation_exhausts_the_fixed_bound() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Exhausted { entries } => {
             // The hook recreates both tolerated forms each round: one drain of
@@ -251,6 +262,7 @@ fn more_names_than_one_pass_is_refused_without_deleting() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::RefusedMany { entries } => {
             assert!(entries > FINDER_RACE_MAX_NAMES as u64);
@@ -316,6 +328,7 @@ fn a_rebound_name_is_neither_removed_nor_drained() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Replaced { entry } => assert_eq!(entry, "slot"),
         other => panic!("a rebound name must be refused: {other:?}"),
@@ -344,11 +357,18 @@ fn an_entry_that_vanishes_before_its_unlink_does_not_fail_the_round() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Removed => {}
         other => panic!("an emptied directory is removed: {other:?}"),
     }
     assert!(!tree.exists());
+}
+
+/// Whether both tolerated metadata entries are gone from `held`, which would
+/// mean the drain deleted more than the single entry its last check covered.
+fn verified_names_removed_twice(held: &Path) -> bool {
+    !held.join(".DS_Store").exists() && !held.join("._member").exists()
 }
 
 /// The directory binding is revalidated for *every* entry, not once per round:
@@ -374,6 +394,7 @@ fn a_rebind_during_the_drain_stops_it_before_the_next_unlink() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut || Ok(()),
     ) {
         Rmdir::Replaced { entry } => assert_eq!(entry, "slot"),
         other => panic!("a rebound name must stop the drain: {other:?}"),
@@ -386,8 +407,66 @@ fn a_rebind_during_the_drain_stops_it_before_the_next_unlink() {
             == 0,
         "the replacement is untouched"
     );
+    // The residual check-to-unlink window may delete the one entry that was
+    // already verified, and never a second: the rebind is caught before it.
+    let survived = fs::read_dir(&held).expect("held directory listed").count();
+    assert_eq!(
+        survived, 1,
+        "a rebind after the last check may cost at most the one checked entry"
+    );
+    assert!(
+        !verified_names_removed_twice(&held),
+        "both metadata entries were deleted after a single checked entry"
+    );
     assert!(
         !replacement_path.exists(),
         "the control did not create an extra directory"
     );
+}
+
+/// A caller's own bounded check runs after *every* recovered metadata unlink: a
+/// failure there stops the drain at that entry, keeps the rest of the metadata
+/// and the directory, and never reports a removal.
+#[test]
+fn a_caller_stop_after_one_unlink_keeps_the_rest_of_the_drain() {
+    let fx = Fixture::new("seam-mid-drain-stop");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"x").expect("metadata");
+    fs::write(tree.join("._member"), b"y").expect("metadata");
+    fs::write(tree.join("._sidecar"), b"z").expect("metadata");
+    let dir = open(&tree);
+    let mut checks = 0;
+    let mut between = || {
+        checks += 1;
+        if checks == 1 {
+            Err(DrainStop::Stopped(
+                "the registered volume's reserve was reached".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match rmdir_draining_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+        &mut between,
+    ) {
+        Rmdir::Stopped { reason } => {
+            assert!(reason.contains("reserve"), "{reason}");
+        }
+        other => panic!("a caller stop must be reported: {other:?}"),
+    }
+    assert_eq!(
+        checks, 1,
+        "the check runs once per unlinked entry, not per batch"
+    );
+    assert_eq!(
+        fs::read_dir(&tree).expect("kept").count(),
+        2,
+        "only the entry the check covered was unlinked"
+    );
+    assert!(tree.is_dir(), "the stopped directory is kept");
 }

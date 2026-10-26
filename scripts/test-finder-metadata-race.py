@@ -62,6 +62,15 @@ after the caller's listing, before the removal:
   replaced by a different directory (same name, new inode): the replay exits 3,
   the replacement and its content are untouched, and the intent stays
   unfinished.
+- `prune_drain_fault`: tolerated metadata is recreated and the product's
+  debug-only low-reserve reading fires on the first check *after one recovered
+  entry was unlinked*, so the per-unlink check stops the drain mid-way: exit 3,
+  the `.prune-<intent>` leaf kept with its remaining metadata, the intent
+  non-terminal and `receipt_settled: false`.
+- `prune_completion_fault`: the product's terminal crash point fires after the
+  quarantine leaf is removed and the registry terminal write lands but before
+  the checkout receipt settles: exit 3 with `deleted` yet `receipt_settled:
+  false` and no leaf, and the receipt-step replay then settles it exactly.
 
 Limits, stated rather than implied: `oxide clean` is deliberately unchanged (it
 removes exactly its enumerated plan, so new content is left and counted) and has
@@ -174,6 +183,16 @@ PRUNE_SLUGS = {
     "prune_exhaust": "exh",
     "prune_missing_quarantine": "miss",
     "prune_replaced_quarantine": "repl",
+    "prune_drain_fault": "dfault",
+    "prune_completion_fault": "cflt",
+}
+# Debug-only product injections for the two fault cases: a low reserve reading
+# on the first check after one metadata entry was unlinked (mid-drain), and the
+# product's terminal crash point after the registry terminal write but before
+# the checkout receipt settles (pre-completion).
+CASE_ENV = {
+    "prune_drain_fault": {"OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES": "1"},
+    "prune_completion_fault": {"OXIDE_TEST_PRUNE_CRASH": "terminal"},
 }
 SLOT_FOLDER_HEX = "0" * 8
 SLOT_LEAF_WORST = "quick-999"
@@ -230,6 +249,8 @@ CASES = (
     "prune_exhaust",
     "prune_missing_quarantine",
     "prune_replaced_quarantine",
+    "prune_drain_fault",
+    "prune_completion_fault",
 )
 # The race each case arms: `repeat` recreates on every attempt, so the fixed
 # bound is exercised; `None` is the unraced premise control.
@@ -244,6 +265,8 @@ RACES = {
     "prune_exhaust": "*:repeat",
     "prune_missing_quarantine": "*:foreign",
     "prune_replaced_quarantine": "*:foreign",
+    "prune_drain_fault": "*:metadata",
+    "prune_completion_fault": "*:metadata",
 }
 COMPLETING = {"lease_control", "lease_metadata", "prune_metadata"}
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -510,6 +533,8 @@ def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
             env[key] = os.environ[key]
     if race is not None:
         env["OXIDE_TEST_FINDER_RACE"] = race
+    for key, value in CASE_ENV.get(case, {}).items():
+        env[key] = value
     return env, base
 
 
@@ -1074,11 +1099,13 @@ def settle_case(
             f"{case}: an unsettled deletion did not exit 3 "
             f"(exit {real.returncode}: {real.stderr[-1500:]})"
         )
-    if not quarantined:
+    if not quarantined and case != "prune_completion_fault":
         fail(f"{case}: the pending intent left no quarantined leaf")
     if kept_root:
         fail(f"{case}: the root is still under its live name while a quarantine exists")
-    leaf = os.path.join(outputs, quarantined[0])
+    leaf = os.path.join(outputs, quarantined[0]) if quarantined else os.path.join(
+        outputs, "_missing"
+    )
     document, intent = intent_for(env, leaf)
     phase = intent.get("phase")
     if phase not in UNFINISHED_PHASES:
@@ -1087,6 +1114,40 @@ def settle_case(
         fail(f"{case}: the intent claims a settled receipt: {intent.get('receipt_settled')}")
     if phase in TERMINAL_PHASES:
         fail(f"{case}: the journal reached a terminal phase {phase!r}")
+
+    if case == "prune_drain_fault":
+        if not [
+            path
+            for path in tree_files(leaf)
+            if os.path.basename(path) == ".DS_Store"
+            or os.path.basename(path).startswith("._")
+        ]:
+            fail(f"{case}: the mid-drain stop deleted every recovered metadata entry")
+        require_fired(case, mark, "Metadata")
+        return f"{case}: pending mid-drain, quarantine {quarantined[0]}, phase {phase}"
+
+    if case == "prune_completion_fault":
+        if quarantined:
+            fail(f"{case}: the pre-completion fault left a quarantined leaf")
+        if kept_root:
+            fail(f"{case}: the root is still under its live name")
+        if phase != "deleted" or intent.get("receipt_settled") is not False:
+            fail(
+                f"{case}: expected an unfinished `deleted` intent, got phase {phase!r} "
+                f"receipt_settled {intent.get('receipt_settled')!r}"
+            )
+        replay = run(
+            [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
+            cwd=base,
+            env=env,
+        )
+        if replay.returncode:
+            fail(f"{case}: the receipt-step replay did not settle: {replay.stderr[-1500:]}")
+        document, _ = registry(env)
+        if json.dumps(document.get("intents") or []).find(leaf) >= 0:
+            fail(f"{case}: the settled intent is still in the live registry")
+        require_fired(case, mark, "Metadata")
+        return f"{case}: pending pre-completion (phase deleted, receipt unsettled), replayed to settled"
 
     if case == "prune_foreign":
         if not [
@@ -1186,11 +1247,12 @@ def plan() -> int:
         race = RACES[case]
         print(f"  {case:<26} race {race or 'none (control)'}")
     print(
-        "allocation: 5 internal 1 MiB directory pools on the boot Data volume "
-        "(the selector's internal-placement exception), one private HOME/CARGO_HOME "
-        "and TMPDIR per case, 5 owned 128 MiB sparse images with custody records in "
-        "the guard's evidence directory, one attached at a time and ordinarily "
-        "detached, staged debug oxide in owned scratch"
+        f"allocation: {sum(1 for c in CASES if c.startswith('lease_'))} internal 1 MiB "
+        "directory pools on the boot Data volume (the selector's internal-placement "
+        f"exception), {len(PRUNE_SLUGS)} owned 128 MiB sparse images with custody records "
+        "in the guard's evidence directory (one attached at a time and ordinarily "
+        "detached), one private HOME/CARGO_HOME and TMPDIR per case, staged debug oxide "
+        "in owned scratch"
     )
     print("prune fixture layout (product Unix-socket bound %d bytes):" % SOCKET_PATH_BUDGET)
     for case in CASES:

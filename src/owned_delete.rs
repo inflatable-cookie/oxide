@@ -134,6 +134,14 @@ pub(crate) fn entry_label(name: &OsStr) -> String {
     label
 }
 
+/// Why a caller stopped a drain between two verified entries: its own bounded
+/// check (volume, reserve, deadline, journal) failed. The caller keeps the
+/// reason, so its refusal or pending intent is unchanged by the seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DrainStop {
+    Stopped(String),
+}
+
 /// One bounded removal round of a held, verified directory.
 #[derive(Debug)]
 pub enum Rmdir {
@@ -165,6 +173,10 @@ pub enum Rmdir {
     RefusedMany { entries: u64 },
     /// The removal failed for any other reason.
     Failed { error: io::Error },
+    /// The caller's between-entries check stopped the drain. The entries it
+    /// unlinked before stopping stay deleted; every remaining entry, and the
+    /// directory itself, are left exactly as they were found.
+    Stopped { reason: String },
 }
 
 /// Remove `name` — a directory named in `parent` — and, when the removal races
@@ -179,6 +191,7 @@ pub fn rmdir_draining_finder_metadata(
     name: &CStr,
     dir: BorrowedFd<'_>,
     label: &OsStr,
+    between: &mut dyn FnMut() -> Result<(), DrainStop>,
 ) -> Rmdir {
     hook::race(dir, label);
     // The name must still name exactly the held, verified directory before any
@@ -222,7 +235,7 @@ pub fn rmdir_draining_finder_metadata(
         Ok(device) => device,
         Err(error) => return Rmdir::Failed { error },
     };
-    match drain_finder_metadata(parent, name, dir, device) {
+    match drain_finder_metadata(parent, name, dir, device, between) {
         Ok(entries) => Rmdir::Drained { entries },
         Err(outcome) => outcome,
     }
@@ -235,6 +248,7 @@ pub fn rmdir_retrying_finder_metadata(
     name: &CStr,
     dir: BorrowedFd<'_>,
     label: &OsStr,
+    between: &mut dyn FnMut() -> Result<(), DrainStop>,
 ) -> Rmdir {
     let mut attempt = 0;
     let mut drained = 0;
@@ -243,7 +257,7 @@ pub fn rmdir_retrying_finder_metadata(
         if attempt > 1 {
             std::thread::sleep(FINDER_RACE_PAUSE);
         }
-        match rmdir_draining_finder_metadata(parent, name, dir, label) {
+        match rmdir_draining_finder_metadata(parent, name, dir, label, between) {
             Rmdir::Drained { entries } => {
                 drained += entries;
                 if attempt >= FINDER_RACE_ATTEMPTS {
@@ -293,6 +307,7 @@ fn drain_finder_metadata(
     name: &CStr,
     dir: BorrowedFd<'_>,
     device: u64,
+    between: &mut dyn FnMut() -> Result<(), DrainStop>,
 ) -> Result<u64, Rmdir> {
     // Revalidate the directory binding one last time before anything in it is
     // deleted, and again before every single unlink below: the entries must
@@ -373,6 +388,12 @@ fn drain_finder_metadata(
         let status = unsafe { libc::unlinkat(dir.as_raw_fd(), entry.name.as_ptr(), 0) };
         if status == 0 {
             entries += 1;
+            // The caller's own bounded check runs after *every* metadata unlink,
+            // never once per batch: a reserve, volume or deadline failure stops
+            // the drain here with the remaining entries untouched.
+            if let Err(DrainStop::Stopped(reason)) = between() {
+                return Err(Rmdir::Stopped { reason });
+            }
             continue;
         }
         let error = io::Error::last_os_error();

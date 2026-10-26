@@ -890,7 +890,17 @@ fn remove_tree_owned_at(
         let entry_path = path.join(std::ffi::OsStr::from_bytes(entry.as_bytes()));
         remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path)?;
     }
-    match crate::owned_delete::rmdir_retrying_finder_metadata(parent, name, child.as_fd(), label) {
+    // The lease caller has no reserve, volume or deadline check of its own to
+    // run between metadata unlinks; its bound is the seam's fixed attempt
+    // bound.
+    let mut between = || Ok::<(), crate::owned_delete::DrainStop>(());
+    match crate::owned_delete::rmdir_retrying_finder_metadata(
+        parent,
+        name,
+        child.as_fd(),
+        label,
+        &mut between,
+    ) {
         // A directory that is gone is removed, and this slot's recorded
         // deletion can be cleared: nothing of it remains.
         crate::owned_delete::Rmdir::Removed | crate::owned_delete::Rmdir::Vanished => Ok(()),
@@ -900,10 +910,11 @@ fn remove_tree_owned_at(
             place: "slot directory",
             entry,
         }),
-        // A bound or new content that is not Finder metadata is unknown
-        // accounting: the slot's deletion stays unfinished.
+        // A bound, a mid-drain stop, or new content that is not Finder
+        // metadata is unknown accounting: the slot's deletion stays unfinished.
         crate::owned_delete::Rmdir::RefusedMany { .. }
         | crate::owned_delete::Rmdir::Exhausted { .. }
+        | crate::owned_delete::Rmdir::Stopped { .. }
         | crate::owned_delete::Rmdir::Drained { .. } => Err(LeaseError::UnknownAccounting),
     }
 }

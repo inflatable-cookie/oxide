@@ -23,7 +23,7 @@ use crate::removable;
 use crate::store::{self, CheckoutCustody, Store};
 use oxide_storage::inventory::{self, InventoryLimits};
 use oxide_storage::owned_delete::{
-    only_finder_metadata, rmdir_draining_finder_metadata, Rmdir, FINDER_RACE_ATTEMPTS,
+    only_finder_metadata, rmdir_draining_finder_metadata, DrainStop, Rmdir, FINDER_RACE_ATTEMPTS,
     FINDER_RACE_PAUSE,
 };
 use oxide_storage::volume::Binding;
@@ -3290,18 +3290,26 @@ impl RootSession {
     /// anything else and an exhausted bound keep the intent pending. A leaf
     /// that is simply missing is NOT positive deletion proof for a journaled
     /// intent, so it stays pending here.
-    fn remove_quarantine(&self, quarantine: &str) -> Result<(), String> {
+    fn remove_quarantine(
+        &self,
+        quarantine: &str,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         let name =
             std::ffi::CString::new(quarantine.as_bytes()).map_err(|error| error.to_string())?;
         for attempt in 1..=FINDER_RACE_ATTEMPTS {
             if attempt > 1 {
                 std::thread::sleep(FINDER_RACE_PAUSE);
             }
+            // Immediately before the leaf's own removal: the volume, reserve
+            // and host control volume are checked again.
+            check()?;
             let outcome = rmdir_draining_finder_metadata(
                 self.outputs.as_fd(),
                 &name,
                 self.root.as_fd(),
                 std::ffi::OsStr::new(quarantine),
+                &mut || Ok(()),
             );
             match &outcome {
                 Rmdir::Removed => return sync_fd(&self.outputs),
@@ -3316,6 +3324,7 @@ impl RootSession {
                 | Rmdir::Refused { .. }
                 | Rmdir::RefusedMany { .. }
                 | Rmdir::Exhausted { .. }
+                | Rmdir::Stopped { .. }
                 | Rmdir::Failed { .. } => {
                     return Err(race_pending("the quarantine leaf", &outcome))
                 }
@@ -3444,8 +3453,21 @@ fn remove_quarantined_directory(
         if attempt > 1 {
             std::thread::sleep(FINDER_RACE_PAUSE);
         }
-        let outcome =
-            rmdir_draining_finder_metadata(parent, name_c, child, std::ffi::OsStr::new(name));
+        // The caller's bounded check runs after *every* recovered metadata
+        // unlink, not once per batch: a reserve, volume or deadline failure
+        // stops the drain at that entry and keeps the intent pending.
+        let mut between = || {
+            deleter
+                .check()
+                .map_err(|stop| DrainStop::Stopped(stop_text(stop)))
+        };
+        let outcome = rmdir_draining_finder_metadata(
+            parent,
+            name_c,
+            child,
+            std::ffi::OsStr::new(name),
+            &mut between,
+        );
         match &outcome {
             Rmdir::Removed => return Ok(()),
             Rmdir::Drained { entries } => {
@@ -3455,6 +3477,9 @@ fn remove_quarantined_directory(
                 deleter.entries += entries;
                 deleter.check()?;
             }
+            // A mid-drain stop already ran the caller's check and carries its
+            // reason: the intent stays pending, nothing is cleared.
+            Rmdir::Stopped { reason } => return Err(Stop::Pending(reason.clone())),
             // A nested directory that vanished under us is finished work
             // inside this bounded pass; unlike the quarantine leaf, its
             // absence never proves the intent's deletion.
@@ -3493,6 +3518,9 @@ fn race_pending(what: &str, outcome: &Rmdir) -> String {
         Rmdir::RefusedMany { .. } | Rmdir::Exhausted { .. } => format!(
             "{what} gained more content than {FINDER_RACE_ATTEMPTS} Finder-metadata attempts may recover; it is kept"
         ),
+        // The caller's own bounded check stopped the drain and already gave the
+        // reason; that reason is the pending text.
+        Rmdir::Stopped { reason } => reason.clone(),
         Rmdir::Failed { error } => format!("cannot remove {what} ({error}); it is kept"),
         // Completed or retryable outcomes are handled by every caller before
         // this function; reaching them here is still a pending intent, never
@@ -4291,9 +4319,12 @@ fn finish_quarantine(
         ));
     }
     deleter.check()?;
+    let mut check = || deleter.check().map_err(stop_text);
     session
-        .remove_quarantine(&format!("{QUARANTINE_PREFIX}{id}"))
+        .remove_quarantine(&format!("{QUARANTINE_PREFIX}{id}"), &mut check)
         .map_err(Stop::Pending)?;
+    // Immediately before the terminal journal writes: the same bounded check.
+    deleter.check()?;
     complete_intent(store, control, id, "deleted")
 }
 
@@ -5494,6 +5525,11 @@ mod tests {
         // Absence is uncertainty, never completion: a missing quarantine leaf
         // and a removal this seam did not positively make both stay pending.
         assert!(!pending(Rmdir::Vanished).is_empty());
+        // A mid-drain caller stop carries its own reason and stays pending.
+        assert!(pending(Rmdir::Stopped {
+            reason: "the registered volume's reserve was reached".to_owned()
+        })
+        .contains("reserve"));
         assert!(!pending(Rmdir::Removed).is_empty());
         assert!(!pending(Rmdir::Drained { entries: 1 }).is_empty());
     }
