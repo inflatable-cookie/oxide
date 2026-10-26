@@ -171,7 +171,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Drive mode:** the Builds drive is registered as permanent or ephemeral,
   with a loud warning when a build falls back to the internal pool.
   `oxide pool describe --json` reports it to other tools.
-- **Low space on the Builds drive** (approved, not built): the pool cap counts
+- **Low space on the Builds drive** (approved, not built; delivered through Barge stage 3, not in Oxide): the pool cap counts
   pool bytes only; caches, scratch and other data on the drive never count
   against it. The drive's registered reserve is a prune trigger, not a stop:
   below it, at admission and while builds run, Oxide evicts the
