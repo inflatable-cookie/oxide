@@ -50,6 +50,10 @@ implementation choice to the reviewed implementation brief.
   evicts, flushes, relabels or rebinds anything it does not own; a nested
   command never releases the outer lease or the outer permit; a permit is
   never duplicated.
+- **Bounded**: four joined levels below one outer command, eight live joined
+  writers per generation and eight live borrows per root permit. A token or
+  command past a bound refuses with exit 1; it is never quietly converted
+  into an independent lease.
 - **Stale, foreign, malformed or unknown** evidence is ignored, never
   permission: the command takes the independent path. Where an independent
   wait could only be satisfied by the ancestor that is waiting for it, the
@@ -116,7 +120,7 @@ one of them is checked by the nested command before it does anything:
    least one of these.
 3. **Process-subtree relation**: a bounded walk of the caller's ancestors
    (PID + start time, so PID reuse cannot satisfy it) reaches the token's
-   outer PID. A token replayed into an unrelated process, a daemonized
+   issuer PID. A token replayed into an unrelated process, a daemonized
    helper that left the subtree, or a `setsid` escape fails this.
 
 The threat model is the existing cooperative same-UID one
@@ -137,10 +141,10 @@ OXIDE_LEASE_TOKEN=<32 lowercase hex, 128 random bits>
 OXIDE_LEASE_TOKEN_FD=<integer 3..=1023>
 ```
 
-Both are set on every child the outer spawns for a leased command. A child
+Both are set on every child an issuing command spawns for a leased command. A child
 that rewrites, clears or forges them loses the join, not correctness.
 
-**Descriptor (the capability).** The outer creates
+**Descriptor (the capability).** The issuing command creates
 `<control>/nested/<record>/.token-<nonce>`, mode `0600`, writes one JSON
 document `oxide.nested.token/1`, `fsync`s it, clears `FD_CLOEXEC` on the
 descriptor so the whole subtree inherits it, and unlinks the name. The
@@ -149,42 +153,103 @@ document is at most 4 KiB with UTF-8 byte caps like the record's:
 | Field | Meaning |
 | --- | --- |
 | `version` | exactly `1` |
-| `nonce` | the 128-bit generation nonce |
+| `nonce` | the issuing record's `permit.nonce` (the generation nonce; a joined issuer keeps the root record's) |
 | `store_id` | the granting pool's recorded store identity |
-| `record` | the outer record id |
+| `record` | the issuing record's id (the root record, or a borrowing command's own record; a joined issuer keeps the root record) |
+| `permit_root` | `{ store_id, record, nonce }`: the permit a borrowing descendant records as its parent. A record-holding issuer sets it to its own permit triple when `parent` is null, else to its `parent`; a joined issuer passes its own `permit_root` through unchanged |
 | `lease_id`, `slot_id`, `incarnation` | the held ledger generation |
 | `checkout`, `compatibility` | the canonical workspace and the slot key |
-| `outer_pid`, `outer_started_ms` | the issuing process |
-| `group` | the outer Cargo/tool group, once recorded (`null` before) |
-| `depth` | `0` for the outer; a joined command passes `depth + 1` |
+| `issuer_pid`, `issuer_started_ms` | the process that issued **this** token: an outer issuing depth 1, or a joined command re-issuing for its own children |
+| `issuer_session` | the issuing process's session id (`getsid(0)`) |
+| `group` | the issuer's child group, once recorded (`null` before) |
+| `depth` | the joined level the holder would become **within the issuing record's generation**: a record-holding command issues `1`; a joined command at level `d` issues `d + 1`. A token above `MAX_JOINED_LEVELS` (4) refuses; it never grants and never falls back |
 | `issued_ms` | wall clock, an observation only |
 
 Unknown fields, unknown versions and malformed values refuse the join. The
 document carries no secret; its authority comes from being *unopenable by
-path* and from the other two factors.
+path* and from the other two factors. Every issuer creates a **new**
+unlinked descriptor, so a derived token is a distinct capability. A joined
+issuer keeps the root record's `nonce`, so every derived token in one
+generation dies together; a record-holding issuer mints a fresh nonce for its
+own generation.
 
-**Durable state.** `Record` gains one optional field, `permit: { nonce,
-issued_ms, depth }`, cleared when the record leaves the active phases and
-re-minted by every command that takes the record. `State` gains no other
-field: the gate, its closing marker and the tickets are files under the
+**Durable state.** `Record` gains one optional field:
+
+```text
+permit = { nonce, issued_ms, depth,
+           parent: null | { store_id, record, nonce } }
+```
+
+The command's own `nonce` is fresh per command and addresses its subtree. For
+a record-holding command `parent` is `null`; a borrowing command records its
+parent permit reference here, which is exactly what §5.2 counts and §5.4
+shows. `depth` is the record's own joined level within its generation (`0`
+for a record-holding command that joined nothing). Every borrow anywhere in
+the tree references the **root** permit (the token's `permit_root`), not its
+immediate parent, so the coverage chain is one level deep and cannot be held
+open by an intermediate command.
+The field is cleared when the record leaves the active
+phases and re-minted by every command that takes the record. `State` gains no
+other field: the gate, its closing marker and the tickets are files under the
 generation's control directory, so closure never depends on parsing a large
 document.
 
-### 3.3 Issuance, in the outer command only
+### 3.3 Issuance
 
-Issuance happens after the lease is held, after the checkout binding and
-after the child-temporary decision, and before the child is spawned:
+There are exactly two issuers, and both run the same steps through one code
+path; they differ only in the record mutation and the depth they stamp.
 
-1. Under the admission lock, write `permit` into the record (fresh nonce)
-   and save. This is the durable half: a command that crashes after this
-   point leaves an active record with a permit that the next recovery clears.
-2. Create `<control>/nested/<record>/` (`0700`), its empty `gate` file (the
-   lock target), and its `writers/` directory, with the control directory's
+**Steps (every issuer).** After the child-temporary decision and before the
+child is spawned:
+
+1. Create the descriptor: a fresh `0600` file
+   `<control>/nested/<record>/.token-<random>`, write `oxide.nested.token/1`
+   with `depth = own level + 1` (a record-holding command's own level is `0`),
+   and `issuer_pid`, `issuer_started_ms`, `issuer_session` from this
+   process; `fsync`, clear `FD_CLOEXEC`, unlink.
+2. Add `OXIDE_LEASE_TOKEN` (the token's own `nonce`, which is the issuing
+   record's `permit.nonce`) and `OXIDE_LEASE_TOKEN_FD` to the child `Command`
+   immediately before spawn.
+3. For a **record-holding** command (top-level, independent or borrowing)
+   only: write `permit` into its record under the admission lock (fresh
+   nonce; `parent` = `null` or the borrowed reference), before the descriptor
+   exists. A command that crashes after this leaves an active record whose
+   permit the next release or recovery clears.
+4. For a **record-holding** command only: create
+   `<control>/nested/<record>/` (`0700`), its empty `gate` file (the lock
+   target) and its `writers/` directory, with the control directory's
    existing owner-only, no-symlink checks. Closure later creates the sibling
-   `closed` marker under the gate lock.
-3. Write and unlink the token descriptor; clear `FD_CLOEXEC`.
-4. Add the two environment variables to the child `Command` (Cargo, the
-   `exec` tool, or a `run` program) immediately before spawn.
+   `closed` marker under the gate lock. A borrowing command does create this:
+   it is the root of its own generation and its joined children write into
+   its own slot.
+
+**Record-holding issuance** (token depth 1). Every command that holds a
+record — a top-level command, an independent fallback or a borrowing command —
+writes its own `permit` (step 3), creates its own generation directory
+(step 4), and issues a depth-1 token for its own subtree. A borrow therefore
+starts a **new** generation with its own depth counter; recursion across
+borrows is bounded by the eight-live-borrows-per-root-permit rule (§5.2), not
+by the joined-level counter.
+
+**Joined re-issue** (token depth `d + 1`). A joined command that validated a
+token of depth `d` issues a depth-`d + 1` token for its own children, because
+it is the only process that can prove its own subtree: it does **not** write
+a record or a `permit`, does **not** touch the gate or the ticket, does
+**not** mint a nonce, and does **not** create a second generation directory.
+It reuses the facts it validated (`store_id`, `record`, `nonce`, `lease_id`,
+`slot_id`, `incarnation`, `checkout`, `compatibility`) and adds only its own
+issuer identity and `depth + 1`. Every derived descriptor is unlinked like
+any other, so a grandchild holds a distinct capability whose ancestor check
+can succeed. A joined command at level 4 issues a depth-5 token, which the
+depth rule refuses rather than silently converting a fifth level into an
+independent lease.
+
+**Borrowing command.** A borrowing command has its own record, lease and
+permit, so it is an ordinary issuer for its own subtree: its children join
+*its* lease (depth 1 relative to it), and a descendant borrow records the
+root permit carried in `permit_root`, never the intermediate record. That
+keeps the coverage chain one level deep (§5.2), makes the borrow fan-out
+countable at the root, and needs no cross-store stitching.
 
 Nothing is issued for a command that will not spawn (refusals, admission
 expiry, budget expiry before the launch attempt, a gate refusal): those
@@ -196,8 +261,8 @@ The token's authority ends at the **earliest** of:
 
 - the record leaving `Acquiring`/`Spawning`/`Running` (release, retirement,
   recovery, eviction, quarantine);
-- the record lock becoming free (the outer process died);
-- the `closed` marker being created (the outer started its closeout);
+- the record lock becoming free (the issuing record's holder died);
+- the `closed` marker being created (the record holder started its closeout);
 - `permit.nonce` changing (a later command took the record);
 - the issuing process exiting.
 
@@ -216,7 +281,8 @@ Removing the directory is cleanup, never the revocation itself.
 The nested command performs these checks after resolving its own workspace
 and slot key, and before any pool write, any wait, any output effect or any
 spawn. `F` means "ignore the token and take the independent path (§6)";
-`J`/`B` mean join/borrow eligible.
+`B` means borrow-eligible; a named refusal is exit 1 and is never converted
+into a fallback.
 
 | # | Check | Failure |
 | --- | --- | --- |
@@ -226,9 +292,10 @@ spawn. `F` means "ignore the token and take the independent path (§6)";
 | V4 | The selected pool's recorded `store_id` equals the token's, and the record lives in that pool's control directory. | F |
 | V5 | A passive snapshot shows the ledger lease held with the token's `lease_id`, `slot_id`, `incarnation` on the token's project, and `state.json` shows that record active with `permit.nonce` equal. | F |
 | V6 | A non-blocking exclusive `flock` on the record lock fails with `EWOULDBLOCK` (still held). A free lock, a missing lock file or any other error is not liveness. | F |
-| V7 | The bounded ancestor walk (`≤ 64` hops, each PID with its start time) reaches `outer_pid`; the token's `depth < 4`. | F |
-| V8 | This command's computed key equals the token's `checkout` and `compatibility`. | B if unequal (V5–V7 already held) |
-| V9 | For a join only: the `closed` marker is absent, and the inherited `TMPDIR` is the qualified directory this command would keep (§4.2). | The independent path when the gate is closed; exit 1 before the spawn when the inherited temporary directory is unqualified |
+| V7 | The bounded ancestor walk (`≤ 64` hops, each PID with its start time) reaches `issuer_pid`, and this process's session id (`getsid(0)`) equals `issuer_session`. A caller that left the session with `setsid` keeps its ancestry only if the chain still reaches the issuer; the session check refuses it either way. | F |
+| V8 | `token.depth ≤ 4` (`MAX_JOINED_LEVELS`). Checked only after V1–V7 held, so a depth-5 token minted by a level-4 joined command **refuses**; it never becomes an independent lease. | exit 1 |
+| V9 | This command's computed key equals the token's `checkout` and `compatibility`. | B if unequal (V5–V8 already held) |
+| V10 | For a join only: the `closed` marker is absent, and the inherited `TMPDIR` is the qualified directory this command would keep (§4.2). | The independent path when the gate is closed; exit 1 before the spawn when the inherited temporary directory is unqualified |
 
 V5 and V6 are separate on purpose: the ledger can still name a lease whose
 holder died, and the record can be active with a lock already dropped. Both
@@ -247,8 +314,9 @@ nothing on success.
   through normal admission only.
 - It cannot name a pool, path or slot the nested command did not verify.
 - It cannot outlive the generation, and it cannot be renewed by a child: a
-  joined command re-issues a *derived* token for its own subtree with
-  `depth + 1` and the same root record/nonce, but never mints a nonce.
+  joined command re-issues a *derived* token for its own subtree with its own
+  issuer identity and `depth + 1` and the same root record/nonce, but never
+  mints a nonce and never writes durable state (§3.3).
 - It cannot authorize deletion, release, recovery, eviction, flush, relabel,
   rebind, adoption, detach or prune. Those commands never join
   ([§4.2](#42-what-a-joined-command-does-and-does-not-do)).
@@ -261,7 +329,7 @@ nothing on success.
 
 ### 4.1 Eligibility
 
-Join requires V1–V9 and **exact key equality**: same canonical workspace,
+Join requires V1–V10 and **exact key equality**: same canonical workspace,
 same compatibility digest (repository identity, recipe, resolved `rustc -vV`,
 target triple, codegen backend, owned-output destination) and the same pool
 generation. "Same workspace, recipe and toolchain" in
@@ -395,22 +463,22 @@ is never authorized by a join.
 
 ### 4.5 Exactly-once release
 
-Only the outer releases. Its release remains one call, in the unchanged
-order, after the ticket gate and the closure decision. A joined command has
-no `release` path, no lease ID and no record, so there is no second releaser
-to race. If the outer dies, exactly one later command may recover the
-generation, and only under §4.4's ticket + group + lock rule; the recovery
-is logged once by the existing pending-recovery record.
+Only the record holder releases. Its release remains one call, in the
+unchanged order, after the ticket gate and the closure decision. A joined
+command has no `release` path, no lease ID and no record, so there is no
+second releaser to race. If the record holder dies, exactly one later command
+may recover the generation, and only under §4.4's ticket + group + lock rule;
+the recovery is logged once by the existing pending-recovery record.
 
 ## 5. Borrow
 
 ### 5.1 Eligibility
 
-Borrow requires V1–V7 (possession, a live generation in the **same pool**,
-the same nonce, and subtree membership), plus `depth < 4`, plus any key —
-including a different workspace, recipe, toolchain, target or destination.
-V8 unequal is the normal case; the nested command then runs the **whole**
-existing admission path.
+Borrow requires V1–V8 (possession, a live generation in the **same pool**,
+the same nonce, session and subtree membership, and a usable depth), plus any
+key — including a different workspace, recipe, toolchain, target or
+destination. V9's key comparison is unequal in the normal case; the nested
+command then runs the **whole** existing admission path.
 
 Borrow is refused when the nested command's own pool selection differs from
 the token's pool (a drive removed between the outer's start and the nested
@@ -427,18 +495,34 @@ active = records in this pool that are active and not covered by a live permit
        + sibling pool's same figure
 ```
 
-A record is **covered** only when its `permit` reference resolves, in the
-same locked snapshot, to an active record in either pool whose
-`permit.nonce`, `store_id` and `record` all match. Anything else — an idle
-parent, a freed lock, a recovered parent, a mismatched nonce, a missing
-record, an unreadable sibling state — counts the record itself. The rule is
-conservative in both directions:
+`Record.permit.parent` is the only input this design adds, and it is exactly
+the triple `{ store_id, record, nonce }` the token carries in `permit_root`:
 
-- a borrowed command is admitted while the parent holds the permit, so
-  nesting cannot deadlock `max_active = 1`;
-- if the parent releases (or dies and is recovered) while a borrowed command
+- a record with `parent: null` is a root permit holder and is always counted;
+- a record is **covered** only when `parent` is present and, in the same
+  locked snapshot, a record with that store and record id is active in either
+  pool and its `permit.nonce` equals the referenced nonce;
+- anything else — an idle parent, a freed lock, a recovered parent, a
+  mismatched nonce, a missing record, an unreadable sibling state, a
+  malformed reference — counts the record itself.
+
+The rule is conservative in both directions:
+
+- a borrowed command is admitted while its root permit is held, so nesting
+  cannot deadlock `max_active = 1`;
+- if the root releases (or dies and is recovered) while a borrowed command
   still runs, the next admission counts the borrower as its own active
   command. It is never free.
+
+**Borrow fan-out.** In the same locked snapshot, a borrow is admitted only
+when fewer than `MAX_BORROWS_PER_PERMIT` (8) active records in the two pools
+name this exact permit reference as `parent`; the ninth refuses with exit 1
+and names the limit. The count is taken under the admission lock that also
+grants the borrow, so a race cannot exceed it by more than the existing
+cross-pool one. Because every borrow in a tree references the **root** permit
+(§3.2), the count is per outer generation and an intermediate command cannot
+open a fresh allowance. Root permits and joins have their own bounds
+(§6.2); the three bounds are independent.
 
 The parent's release is unchanged and takes the same admission lock that
 validates and grants a borrow, so a borrow and a parent release are totally
@@ -465,11 +549,11 @@ never touches the outer's held slot.
 
 Default `oxide status` stays lock-free and walk-free. For a record with a
 permit it prints one extra fact from the recorded field, for example
-`permit borrowed from record 7 (nested depth 1)`; it does not probe tickets,
-PIDs or groups. `--measure` may additionally list the generation's tickets
-(names, phases, groups) since it is already the diagnostic path. A borrowed
-record shows as an ordinary active slot with its own provenance; the outer's
-line does not claim the borrower.
+`permit borrowed from record 7 (nested depth 1)`, using `permit.parent.record`
+and `permit.depth`; it does not probe tickets, PIDs or groups. `--measure` may
+additionally list the generation's tickets (names, phases, groups) since it is
+already the diagnostic path. A borrowed record shows as an ordinary active
+slot with its own provenance; the outer's line does not claim the borrower.
 
 ## 6. Waiting, deadlock and cancellation
 
@@ -489,7 +573,7 @@ whose next admission attempt returns one of
 **refuses with exit 1** naming the ancestor and the reason, instead of
 waiting. Waiting can only be satisfied by the ancestor, and the ancestor is
 waiting for this process. The same rule covers a same-key token whose
-join was refused (V9 closed gate), an invalid token in a same-key nested
+join was refused (V10 closed gate), an invalid token in a same-key nested
 call, a nested `oxide clean`, and a nested `outputs adopt|detach` in the
 ancestor's checkout: those refuse immediately with an actionable message
 rather than queuing behind the process that spawned them.
@@ -504,8 +588,9 @@ wait, and the outer's own window (if any) still covers it.
 
 | Bound | Value | Behaviour |
 | --- | --- | --- |
-| Join depth | 4 (outer = 0) | Deeper nested leased commands refuse with exit 1 and name the limit. Fallback to an independent slot is **not** allowed, because unbounded recursion (a build script that calls `oxide`, whose build script calls `oxide`) would otherwise consume every slot and permit. |
+| Joined levels below one outer command | 4 | Each record-holding command issues token depth 1 for its own generation; a joined command at level `d` issues `d + 1`; a token at depth 5 (issued by the level-4 command) refuses with exit 1. Fallback to an independent slot is **not** allowed, because unbounded recursion (a build script that calls `oxide`, whose build script calls `oxide`) would otherwise consume every slot and permit. |
 | Live joined writers per generation | 8 | A ninth join refuses with exit 1. The writer set is read under the ticket gate; a closed ticket never counts. |
+| Live borrows per root permit | 8 | A ninth borrow refuses with exit 1. Counted under the admission lock from both pools' active records whose `permit.parent` is this permit (§5.2). |
 | Ancestor hops | 64 | Beyond it: no ancestors, so no join and no borrow (independent path). |
 | Token document | 4 KiB | Larger or unparsable: no join. |
 | Ticket scan | 32 tickets, 4 KiB each | More tickets than the bound: the outer keeps the slot held (never silently ignores one). |
@@ -546,7 +631,7 @@ These are product constants in the reviewed implementation, not settings.
 | 6 | Token presented outside the subtree | V7 | independent path | none |
 | 7 | PID reuse satisfies a forged chain | V7 start-time compare | independent path | none |
 | 8 | Token for another generation of the same record | V3 + V5 `permit.nonce` | independent path | none |
-| 9 | Join refused because the gate closed | V9 | refuse (same key) or borrow (different key) | outer continues its closeout |
+| 9 | Join refused because the gate closed | V10 | refuse (same key) or borrow (different key) | outer continues its closeout |
 | 10 | Two joined writers start together | gate lock ordering | both register, separate build dirs | both ticketed |
 | 11 | Joined writer registers as the outer closes | gate lock ordering | registration refused | fallback/refuse, no lost writer |
 | 12 | Joined command crashes before spawn | ticket phase `registering` | outer keeps the slot held | ticket remains for recovery |
@@ -560,8 +645,10 @@ These are product constants in the reviewed implementation, not settings.
 | 20 | Parent releases while a borrower runs | admission-lock ordering | borrower counts itself at the next admission | never free |
 | 21 | Borrower daemonizes and the parent exits | no ticket (borrow has none) | borrower's own record keeps its lease | its own recovery rules |
 | 22 | Nested same-key call whose token is invalid | §6.1 | exit 1 naming the ancestor | nothing taken |
-| 23 | Nesting deeper than 4 | token `depth` | exit 1 | nothing taken |
+| 23 | Token depth 5 (a fifth joined level) | V8 | exit 1 | nothing taken |
 | 24 | Ninth live joined writer | ticket count | exit 1 | nothing taken |
+| 24a | Ninth live borrow for one permit | §5.2 count under the admission lock | exit 1 | nothing taken |
+| 24b | Borrow whose parent reference is malformed or unresolvable | §5.2 coverage rule | the record counts itself | nothing taken away |
 | 25 | Torn `state.json` read (V5) | one reread, then refuse | independent path | none |
 | 26 | Mixed binaries: outer predates join | no token at all | today's independent lease | none |
 | 27 | Mixed binaries: nested predates join | it cannot read the fenced state (hand-off or refusal), and ignores the token | hand-off/refusal, else today's independent lease | outer's window |
@@ -668,10 +755,12 @@ review; none may be treated as settled by the design's existence.
 | D6 | Only joins register tickets; borrows rely on their own record. | Ticketing borrowers and making the outer wait for them. |
 | D7 | Outer never waits for a live ticket; it keeps the slot held. | Bounded wait; implicit release. |
 | D8 | Nested no-wait refusal for ancestor-implicated waits. | Unbounded wait; automatic second slot. |
-| D9 | Depth 4 and 8 live joined writers. | Unbounded; per-project cap reuse. |
+| D9 | Four joined levels, 8 live joined writers and 8 live borrows per root permit. | Unbounded; per-project cap reuse. |
 | D10 | A join does not run `auto_adopt`, `reserve` or binding. | Replaying the outer's output transition. |
 | D11 | Borrow requires the same pool/store. | Cross-pool permit stitching. |
 | D12 | Refusals exit 1 with an actionable message. | A new exit code (124/125 stay the budget meanings). |
+| D13 | A borrow references the **root** permit (flat, one-level coverage) and is capped at 8 per root permit. | Chained parent references with per-level caps (an intermediate command would hold an allowance open and the count would be per level). |
+| D14 | Ancestry is checked together with the issuer's session id, so a `setsid` caller is refused even when its ancestry survives. | Ancestry alone. |
 
 Still open, deliberately not decided here:
 
@@ -699,11 +788,11 @@ judge the shape and a later brief can be scoped.
 
 | Slice | Content | Depends on |
 | --- | --- | --- |
-| S1 | Pure token codec, ticket codec, limits, ordered validation V1–V9 against injected seams (snapshot, lock probe, ancestor chain). No effects. | this design |
-| S2 | Issuance in the outer: record `permit`, generation directory, descriptor, environment, `STATE_VERSION` bump and hand-off trigger. | S1; installed-binary hand-off gate for any host install |
+| S1 | Pure token codec, ticket codec, limits, ordered validation V1–V10 against injected seams (snapshot, lock probe, ancestor chain). No effects. | this design |
+| S2 | Issuance in every record-holding command (top-level, independent or borrowing): `permit` with its own nonce and optional parent reference, generation directory, descriptor, environment, `STATE_VERSION` bump and hand-off trigger. | S1; installed-binary hand-off gate for any host install |
 | S3 | Join: admission branch, private build directory and marker, ticket lifecycle, no gate/no origin/no release, summary and status. | S2 |
 | S4 | Closure: gate protocol, ticket decision, `settle`/`unclosed_writers` extension, exactly-once release, recovery. | S3 |
-| S5 | Borrow: permit reference, covered-record counting, no-wait rule, depth/fan-out bounds, diagnostics. | S2, S4 |
+| S5 | Borrow: `permit_root` propagation, permit reference, covered-record counting, the root fan-out bound, the no-wait rule and diagnostics. | S2, S4 |
 | S6 | Knowledge: replace the proposed text with current truth, link the proof, record the limits. | S1–S5 reviewed |
 
 Dependencies outside this task: oxide#146's recorded per-slot accounting is
@@ -719,18 +808,26 @@ consumer adoption, host settings and real-drive qualification stay separate.
 
 - Token and ticket codecs: every field cap, unknown field, unknown version,
   truncation, over-size, invalid UTF-8.
-- Validation matrix V1–V9 with injected descriptor facts, `state.json`
-  copies, ledger snapshots, lock probes and ancestor chains, including: a
-  recycled PID with a different start time; a token from a later generation;
-  a torn `state.json`; a free record lock; an unreadable pool.
+- Validation matrix V1–V10 with injected descriptor facts, `state.json`
+  copies, ledger snapshots, lock probes, session ids and ancestor chains,
+  including: a recycled PID with a different start time; a `setsid` caller
+  whose ancestry survives but whose session does not; a token from a later
+  generation; a torn `state.json`; a free record lock; an unreadable pool; a
+  depth-5 token that must refuse rather than fall back.
 - Counting: covered vs uncovered records across both pools, a released
-  parent, a recovered parent, a mismatched nonce, an unreadable sibling.
+  parent, a recovered parent, a mismatched nonce, a malformed or missing
+  `parent` reference, an unreadable sibling, and the borrow fan-out at 7, 8
+  and 9 live borrows for one root permit.
 - Gate protocol: registration vs close in every interleaving (a
   deterministic two-thread unit test on the lock, not a timing test).
-- Decision functions: depth, fan-out, ticket state → closed/held, the
-  no-wait classification.
-- `STATE_VERSION` fence: previous version readable, new field defaulted,
-  older reader refuses.
+- Issuance: depth stamping and the level-4 → depth-5 refusal, a fresh
+  descriptor per issuer carrying the same generation nonce, `permit_root`
+  propagation through a joined issuer, the `permit` shape for a borrowing
+  record, and a borrow starting its own generation counter.
+- Decision functions: depth, both fan-out bounds, ticket state → closed/held,
+  the no-wait classification.
+- `STATE_VERSION` fence: previous version readable, new `permit` field
+  defaulted, older reader refuses.
 
 ### 13.2 Native proof (proposed selector `rust:nested-lease`)
 
@@ -776,8 +873,10 @@ Cases (internal, tiny, std-only crates; each fixture checks its own premise):
    descriptor: no join, independent path.
 5. **Tampered/fake token.** An unrelated file as `FD`, a wrong nonce, a
    token for another pool: no join, independent path, nothing written.
-6. **Depth and fan-out.** A recursive build script stops at depth 4; no more
-   than eight joined writers are live at once and the excess refuse.
+6. **Depth and fan-out.** A recursive build script succeeds through four
+   joined levels and the fifth refuses; no more than eight joined writers are
+   live at once; a ninth borrow for one permit refuses while eight are
+   admitted.
 7. **Exactly-once release.** Two joined writers, one killed un-reaped: the
    outer keeps the slot held, `status` names it, the next command recovers it
    only after the group is `ESRCH`, and exactly one recovery entry is logged.
@@ -791,12 +890,17 @@ Cases (internal, tiny, std-only crates; each fixture checks its own premise):
 10. **No-wait refusal.** A nested `oxide clean` (or an invalid-token
     same-key call) exits 1 naming the ancestor instead of hanging; the
     outer's group then closes normally.
+11. **Grandchild join.** A joined command's own build script (second level)
+    validates the derived descriptor and joins: it is ticketed at the outer
+    generation, the summary names depth 2, the outer's closeout covers both
+    tickets, and a level-4 issuer's depth-5 token refuses rather than
+    falling back to an independent slot.
 
 Bounds: 300 s including staging and cleanup; 512 MiB monitored scratch
 including the 128 MiB image; ordinary detach only; the supervisor owns
 closure, the deadline and cleanup. The fit is **UNMEASURED**; if staging plus
-ten cases cannot fit, the implementation brief's scoped amendment raises the
-limit *before* activation, never during a run.
+eleven cases cannot fit, the implementation brief's scoped amendment raises
+the limit *before* activation, never during a run.
 
 ### 13.3 Gates, tiers and the nine premises
 
@@ -848,9 +952,9 @@ environment; it complements the uncounted diagnostic and cannot replace it.
 
 **Unsupported (refused, not silently degraded):**
 
-- Join or borrow deeper than the depth bound, beyond the fan-out bound,
-  without a qualified inherited temporary directory, or from a platform that
-  cannot supply ancestry.
+- Join or borrow deeper than the depth bound, beyond either live-writer or
+  live-borrow fan-out bound, without a qualified inherited temporary
+  directory, or from a platform that cannot supply ancestry.
 - `clean`, `outputs adopt|detach|prune`-class mutations, `pool *`,
   `recover-interrupted` and `init`/`new` joining or borrowing; same-checkout
   `clean`/`adopt`/`detach` while nested refuse.
