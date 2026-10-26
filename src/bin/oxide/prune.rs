@@ -22,6 +22,10 @@ use crate::process;
 use crate::removable;
 use crate::store::{self, CheckoutCustody, Store};
 use oxide_storage::inventory::{self, InventoryLimits};
+use oxide_storage::owned_delete::{
+    only_finder_metadata, rmdir_draining_finder_metadata, Rmdir, FINDER_RACE_ATTEMPTS,
+    FINDER_RACE_PAUSE,
+};
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2705,17 +2709,13 @@ fn injected_eacces(_directory: &Path) -> bool {
 /// /private/tmp, evidence nested in it or its `evidence/` sibling).
 #[cfg(debug_assertions)]
 fn proof_evidence() -> Option<PathBuf> {
-    std::env::var("OXIDE_PROOF_DEADLINE_NS")
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
+    // The shared guard (`oxide_storage::proof`) requires the supervisor's
+    // deadline, canonical owned scratch and nested-or-sibling evidence; the
+    // prune hooks additionally stay on the internal volume, which is where
+    // their own proofs run.
+    let evidence = oxide_storage::proof::evidence()?;
     let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
-    let evidence = fs::canonicalize(std::env::var_os("OXIDE_PROOF_EVIDENCE")?).ok()?;
-    let nested = evidence.starts_with(&scratch);
-    let sibling = scratch.file_name() == Some(std::ffi::OsStr::new("scratch"))
-        && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
-        && scratch.parent() == evidence.parent();
-    if !scratch.starts_with("/private/tmp") || !(nested || sibling) {
+    if !scratch.starts_with("/private/tmp") {
         return None;
     }
     Some(evidence)
@@ -3285,20 +3285,33 @@ impl RootSession {
         Ok(target)
     }
 
-    /// Remove the empty quarantine leaf itself.
+    /// Remove the quarantine leaf itself. Finder metadata recreated in it after
+    /// the delete pass is drained under the shared fixed bound (oxide#155);
+    /// anything else and an exhausted bound keep the intent pending.
     fn remove_quarantine(&self, quarantine: &str) -> Result<(), String> {
         let name =
             std::ffi::CString::new(quarantine.as_bytes()).map_err(|error| error.to_string())?;
-        // SAFETY: the descriptor and C string are live for the call.
-        let status =
-            unsafe { libc::unlinkat(self.outputs.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
-        if status != 0 {
-            return Err(format!(
-                "cannot remove the quarantine leaf ({})",
-                std::io::Error::last_os_error()
-            ));
+        for attempt in 1..=FINDER_RACE_ATTEMPTS {
+            if attempt > 1 {
+                std::thread::sleep(FINDER_RACE_PAUSE);
+            }
+            match rmdir_draining_finder_metadata(
+                self.outputs.as_fd(),
+                &name,
+                self.root.as_fd(),
+                std::ffi::OsStr::new(quarantine),
+            ) {
+                Rmdir::Removed => return sync_fd(&self.outputs),
+                Rmdir::Drained { .. } => continue,
+                other => match race_pending("the quarantine leaf", &other) {
+                    Some(reason) => return Err(reason),
+                    None => return sync_fd(&self.outputs),
+                },
+            }
         }
-        sync_fd(&self.outputs)
+        Err(format!(
+            "the quarantine leaf is still not empty after {FINDER_RACE_ATTEMPTS} Finder-metadata attempts; it is kept"
+        ))
     }
 }
 
@@ -3403,6 +3416,64 @@ impl Deleter<'_> {
     }
 }
 
+/// Remove one quarantined directory through the held descriptors. A
+/// list-then-rmdir race with Finder metadata is drained by the shared seam
+/// under its fixed bound (oxide#155); every other new entry, and an exhausted
+/// bound, keeps the intent pending.
+fn remove_quarantined_directory(
+    deleter: &mut Deleter,
+    parent: BorrowedFd,
+    name_c: &std::ffi::CString,
+    name: &str,
+    child: BorrowedFd,
+) -> Result<(), Stop> {
+    let mut drained = 0_u64;
+    for attempt in 1..=FINDER_RACE_ATTEMPTS {
+        if attempt > 1 {
+            std::thread::sleep(FINDER_RACE_PAUSE);
+        }
+        let outcome =
+            rmdir_draining_finder_metadata(parent, name_c, child, std::ffi::OsStr::new(name));
+        match outcome {
+            Rmdir::Removed => return Ok(()),
+            Rmdir::Drained { entries } => {
+                // Recovered entries are deleted work: the existing entry
+                // cadence and reserve check stay honest.
+                drained += entries;
+                deleter.entries += entries;
+                deleter.check()?;
+            }
+            other => match race_pending("a quarantined directory", &other) {
+                Some(reason) => return Err(Stop::Pending(reason)),
+                // A directory that vanished under us is already removed.
+                None => return Ok(()),
+            },
+        }
+    }
+    Err(Stop::Pending(format!(
+        "a quarantined directory is still not empty after {FINDER_RACE_ATTEMPTS} Finder-metadata attempts ({drained} Finder-managed entries removed); it is kept"
+    )))
+}
+
+/// The pending reason for a Finder-metadata race outcome that did not remove
+/// the directory, or `None` when it completed or may be retried. Every terminal
+/// race outcome keeps the intent pending: an unfinished deletion never becomes
+/// a success, and no intent phase is rewritten or cleared to recover it.
+fn race_pending(what: &str, outcome: &Rmdir) -> Option<String> {
+    match outcome {
+        Rmdir::Removed | Rmdir::Drained { .. } => None,
+        // The name is already escaped by the seam.
+        Rmdir::Refused { entry } => Some(format!(
+            "{what} holds an entry that is not tolerated Finder metadata ({entry}); deletion stops and the intent stays pending"
+        )),
+        Rmdir::RefusedMany { .. } | Rmdir::Exhausted { .. } => Some(format!(
+            "{what} gained more content than {FINDER_RACE_ATTEMPTS} Finder-metadata attempts may recover; it is kept"
+        )),
+        Rmdir::Failed { error } if error.kind() == std::io::ErrorKind::NotFound => None,
+        Rmdir::Failed { error } => Some(format!("cannot remove {what} ({error}); it is kept")),
+    }
+}
+
 fn delete_contents(deleter: &mut Deleter, dir: BorrowedFd, top: bool) -> Result<(), Stop> {
     delete_contents_at(deleter, dir, top, 0)
 }
@@ -3485,18 +3556,7 @@ fn delete_contents_at(
             // SAFETY: `child` is a newly owned descriptor.
             let child = unsafe { OwnedFd::from_raw_fd(child) };
             delete_contents_at(deleter, child.as_fd(), false, depth + 1)?;
-            // SAFETY: the descriptor and C string are live for the call.
-            let removed =
-                unsafe { libc::unlinkat(dir.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) };
-            if removed != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    continue;
-                }
-                return Err(Stop::Pending(format!(
-                    "a quarantined directory is not empty after deletion ({error}); new content appeared"
-                )));
-            }
+            remove_quarantined_directory(deleter, dir, &name_c, &name, child.as_fd())?;
         } else {
             // SAFETY: the descriptor and C string are live for the call.
             let removed = unsafe { libc::unlinkat(dir.as_raw_fd(), name_c.as_ptr(), 0) };
@@ -3574,45 +3634,6 @@ fn list_directory_checked(dir: BorrowedFd, deleter: &mut Deleter) -> Result<Vec<
     // SAFETY: `stream` is live and closed once.
     unsafe { libc::closedir(stream) };
     outcome.map(|()| names)
-}
-
-fn list_directory(dir: BorrowedFd) -> Result<Vec<String>, String> {
-    // SAFETY: `dup` returns a new descriptor.
-    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
-    if dup < 0 {
-        return Err(format!(
-            "cannot read a directory ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `dup` is a live descriptor that `fdopendir` takes ownership of.
-    let stream = unsafe { libc::fdopendir(dup) };
-    if stream.is_null() {
-        // SAFETY: the duplicate is still owned here.
-        unsafe { libc::close(dup) };
-        return Err(format!(
-            "cannot read a directory ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let mut names = Vec::new();
-    loop {
-        // SAFETY: `stream` is a live directory stream.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        // SAFETY: `d_name` is a live NUL-terminated array for this entry.
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        let name = name.to_string_lossy().into_owned();
-        if name == "." || name == ".." {
-            continue;
-        }
-        names.push(name);
-    }
-    // SAFETY: `stream` is live and closed once.
-    unsafe { libc::closedir(stream) };
-    Ok(names)
 }
 
 fn unlink_marker(root: &OwnedFd) -> Result<(), String> {
@@ -4231,9 +4252,10 @@ fn finish_quarantine(
     update_intent(control, id, IntentPhase::MarkerLast)
         .map_err(|error| Stop::Pending(format!("cannot record marker-last: {error}")))?;
     unlink_marker(&session.root).map_err(Stop::Refuse)?;
-    if !list_directory(session.root.as_fd())
-        .map_err(Stop::Refuse)?
-        .is_empty()
+    // Content gained after the marker was removed keeps the intent pending,
+    // except the Finder metadata the bounded removal recovers (oxide#155).
+    if !only_finder_metadata(session.root.as_fd())
+        .map_err(|error| Stop::Refuse(format!("cannot read the quarantine ({error})")))?
     {
         return Err(Stop::Pending(
             "the quarantine gained content after its marker was removed".to_owned(),
@@ -5418,6 +5440,32 @@ pub(crate) fn test_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// oxide#155: a Finder-metadata race that did not remove the quarantine is
+    /// a pending intent for every caller, never a completed deletion. The
+    /// journal phases are not rewritten to recover it.
+    #[test]
+    fn every_terminal_finder_race_outcome_keeps_the_intent_pending() {
+        let pending = |outcome: Rmdir| race_pending("the quarantine leaf", &outcome);
+        assert!(pending(Rmdir::Removed).is_none());
+        assert!(pending(Rmdir::Drained { entries: 2 }).is_none());
+        let refused = pending(Rmdir::Refused {
+            entry: "stray\\x07".to_owned(),
+        })
+        .expect("a foreign entry is pending");
+        assert!(refused.contains("stray\\x07"), "{refused}");
+        assert!(pending(Rmdir::RefusedMany { entries: 65 }).is_some());
+        assert!(pending(Rmdir::Exhausted { entries: 6 }).is_some());
+        assert!(pending(Rmdir::Failed {
+            error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        })
+        .is_some());
+        // A directory that is already gone is not a race at all.
+        assert!(pending(Rmdir::Failed {
+            error: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })
+        .is_none());
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);

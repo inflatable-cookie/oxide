@@ -13,9 +13,11 @@
 mod backing;
 mod pool;
 
+use crate::owned_delete::{descriptor_identity, names_of, open_directory_at};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -486,47 +488,10 @@ pub enum AccountingCoverage {
     Unknown,
 }
 
-/// Finder metadata a pool tolerates beside its own entries: exactly
-/// `.DS_Store` (Finder's Desktop Services store; Apple's
-/// `com.apple.desktopservices` `DSDontWriteNetworkStores` /
-/// `DSDontWriteUSBStores` preferences govern where Finder writes it) and
-/// AppleDouble sidecars `._<name>` with a nonempty `<name>` (dot_clean(1):
-/// "Merge ._* files with corresponding native files"). The name alone
-/// grants nothing: callers still require an owned regular file on the
-/// pool's device, and its bytes stay in accounting.
-fn is_finder_metadata(name: &std::ffi::OsStr) -> bool {
-    let name = name.as_bytes();
-    name == b".DS_Store" || (name.len() > 2 && name.starts_with(b"._"))
-}
-
-/// Whether a no-follow `metadata` is a Finder metadata file the pool may
-/// hold: a regular caller-owned file on `device`.
-fn is_tolerated_metadata_file(metadata: &fs::Metadata, device: u64) -> bool {
-    metadata.file_type().is_file() && metadata.dev() == device && metadata.uid() == current_uid()
-}
-
-/// Longest entry name, in bytes, a diagnostic prints before eliding.
-const MAX_ENTRY_LABEL_BYTES: usize = 64;
-
-/// An entry name safe to print: printable ASCII except `"` and `\` as is,
-/// every other byte (control, non-ASCII, non-UTF-8) as `\xNN`, at most
-/// [`MAX_ENTRY_LABEL_BYTES`] input bytes followed by `...` when longer.
-fn entry_label(name: &std::ffi::OsStr) -> String {
-    use std::fmt::Write as _;
-    let bytes = name.as_bytes();
-    let mut label = String::new();
-    for &byte in bytes.iter().take(MAX_ENTRY_LABEL_BYTES) {
-        if byte == b' ' || (byte.is_ascii_graphic() && byte != b'"' && byte != b'\\') {
-            label.push(char::from(byte));
-        } else {
-            let _ = write!(label, "\\x{byte:02x}");
-        }
-    }
-    if bytes.len() > MAX_ENTRY_LABEL_BYTES {
-        label.push_str("...");
-    }
-    label
-}
+/// The oxide#105 tolerated-metadata rule, shared with the deletion seam: the
+/// name alone grants nothing, a caller still requires an owned regular file on
+/// the pool's device, and its bytes stay in accounting.
+pub(crate) use crate::owned_delete::{entry_label, is_finder_metadata, is_tolerated_metadata_file};
 
 fn unexpected_entry(place: &'static str, name: &std::ffi::OsStr) -> LeaseError {
     LeaseError::UnexpectedEntry {
@@ -803,40 +768,50 @@ fn random_hex(bytes: usize) -> Result<String, LeaseError> {
     Ok(result)
 }
 
+/// Delete one verified owned entry and, for a directory, everything below it.
+///
+/// Every level is descriptor-relative: the entry is inspected with `fstatat`
+/// against its held parent, opened with `O_NOFOLLOW` (a link is unlinked, never
+/// followed) and removed through that parent's descriptor. The removal of a
+/// directory is the shared seam's bounded race recovery (oxide#155): on
+/// `ENOTEMPTY`, Finder metadata recreated after our own listing is verified and
+/// unlinked, and only that, within a fixed finite bound. Anything else that
+/// appeared stays a refusal, which the caller keeps as unfinished intent.
 fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
-    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    if metadata.file_type().is_symlink() {
-        if metadata.uid() != current_uid() {
+    let name = path.file_name().ok_or(LeaseError::UnknownAccounting)?;
+    let parent_path = path.parent().ok_or(LeaseError::UnknownAccounting)?;
+    let parent = open_verified_directory(parent_path)?;
+    let name =
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
+    remove_tree_owned_at(root, parent.as_fd(), &name, path)
+}
+
+/// One entry, named in the held `parent`, of the tree rooted at `root`.
+fn remove_tree_owned_at(
+    root: &Path,
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::CString,
+    path: &Path,
+) -> Result<(), LeaseError> {
+    let stat = stat_at(parent, name)?;
+    let kind = stat.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFLNK {
+        if stat_uid(&stat) != current_uid() {
             return Err(LeaseError::UnsafePath(
                 "refusing to delete a foreign symlink",
             ));
         }
-        let parent = path.parent().ok_or(LeaseError::UnknownAccounting)?;
-        let parent_metadata = fs::symlink_metadata(parent).map_err(io_error)?;
-        if parent_metadata.file_type().is_symlink()
-            || !parent_metadata.file_type().is_dir()
-            || parent_metadata.uid() != current_uid()
-        {
-            return Err(LeaseError::UnsafePath(
-                "symlink parent must be an owned directory",
-            ));
-        }
-        let canonical_root = fs::canonicalize(root).map_err(io_error)?;
-        let canonical_parent = fs::canonicalize(parent).map_err(io_error)?;
-        if canonical_parent == canonical_root || !canonical_parent.starts_with(&canonical_root) {
-            return Err(LeaseError::UnsafePath(
-                "deletion is limited to recorded owned slot paths",
-            ));
-        }
-        return fs::remove_file(path).map_err(io_error);
+        // The parent is the verified owned directory this recursion holds.
+        // `unlinkat` without a flag removes the link itself, never its target.
+        return unlink_at(parent, name, 0).map_err(io_error);
     }
-    if metadata.file_type().is_file() {
-        if metadata.uid() != current_uid() {
+    if kind == libc::S_IFREG {
+        if stat_uid(&stat) != current_uid() {
             return Err(LeaseError::UnsafePath("refusing to delete a foreign file"));
         }
-        return fs::remove_file(path).map_err(io_error);
+        return unlink_at(parent, name, 0).map_err(io_error);
     }
-    if !metadata.file_type().is_dir() {
+    if kind != libc::S_IFDIR {
         return Err(LeaseError::UnknownAccounting);
     }
     let canonical = fs::canonicalize(path).map_err(io_error)?;
@@ -846,22 +821,125 @@ fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
             "deletion is limited to recorded owned slot paths",
         ));
     }
-    if metadata.uid() != current_uid() {
+    if stat_uid(&stat) != current_uid() {
         return Err(LeaseError::UnsafePath(
             "refusing to delete a foreign directory",
+        ));
+    }
+    let child = open_directory_at(parent, name).map_err(io_error)?;
+    // Revalidate identity at the effect boundary: the descriptor must still be
+    // the entry this recursion inspected, not a replacement under the same
+    // name.
+    let held = descriptor_identity(child.as_fd()).map_err(io_error)?;
+    if held != (stat_device(&stat), stat_ino(&stat)) {
+        return Err(LeaseError::UnsafePath(
+            "the verified directory was replaced before it was opened",
         ));
     }
     // An owned directory a build or test left read-only (Effigy fixtures make
     // `.effigy/state/objects/<hash>` read-only under a slot's child scratch)
     // cannot have its entries removed. Restore the owner's own access first;
     // it is already verified as an owned real directory inside the slot.
-    let mode = metadata.permissions().mode();
+    let mode = stat.st_mode & 0o7777;
     if mode & 0o700 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700)).map_err(io_error)?;
+        // SAFETY: `child` is a live descriptor for the verified directory.
+        if unsafe { libc::fchmod(child.as_raw_fd(), mode | 0o700) } != 0 {
+            return Err(io_error(std::io::Error::last_os_error()));
+        }
     }
-    for entry in fs::read_dir(path).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        remove_tree_owned(root, &entry.path())?;
+    let label = std::ffi::OsStr::from_bytes(name.to_bytes());
+    for entry in names_of(child.as_fd()).map_err(io_error)? {
+        let entry =
+            std::ffi::CString::new(entry.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
+        let entry_path = path.join(std::ffi::OsStr::from_bytes(entry.as_bytes()));
+        remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path)?;
     }
-    fs::remove_dir(path).map_err(io_error)
+    match crate::owned_delete::rmdir_retrying_finder_metadata(parent, name, child.as_fd(), label) {
+        // A directory that vanished under us is already removed.
+        crate::owned_delete::Rmdir::Removed => Ok(()),
+        crate::owned_delete::Rmdir::Failed { error }
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(())
+        }
+        crate::owned_delete::Rmdir::Failed { error } => Err(io_error(error)),
+        crate::owned_delete::Rmdir::Refused { entry } => Err(LeaseError::UnexpectedEntry {
+            place: "slot directory",
+            entry,
+        }),
+        // A bound or new content that is not Finder metadata is unknown
+        // accounting: the slot's deletion stays unfinished.
+        crate::owned_delete::Rmdir::RefusedMany { .. }
+        | crate::owned_delete::Rmdir::Exhausted { .. }
+        | crate::owned_delete::Rmdir::Drained { .. } => Err(LeaseError::UnknownAccounting),
+    }
+}
+
+/// A real, owned parent directory held by descriptor, with the path's own
+/// identity revalidated against the descriptor.
+fn open_verified_directory(path: &Path) -> Result<File, LeaseError> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != current_uid()
+    {
+        return Err(LeaseError::UnsafePath(
+            "symlink parent must be an owned directory",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(io_error)?;
+    let held = file.metadata().map_err(io_error)?;
+    if held.dev() != metadata.dev() || held.ino() != metadata.ino() {
+        return Err(LeaseError::UnsafePath(
+            "the deletion parent was replaced before it was opened",
+        ));
+    }
+    Ok(file)
+}
+
+fn stat_at(parent: BorrowedFd<'_>, name: &std::ffi::CStr) -> Result<libc::stat, LeaseError> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor and C string are live for the call; `NOFOLLOW`
+    // never resolves a link at the last component.
+    let status = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return Err(io_error(std::io::Error::last_os_error()));
+    }
+    Ok(stat)
+}
+
+fn unlink_at(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: the descriptor and C string are live for the call.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn stat_device(stat: &libc::stat) -> u64 {
+    u64::try_from(stat.st_dev).unwrap_or(u64::MAX)
+}
+
+fn stat_ino(stat: &libc::stat) -> u64 {
+    u64::try_from(stat.st_ino).unwrap_or(u64::MAX)
+}
+
+fn stat_uid(stat: &libc::stat) -> u32 {
+    stat.st_uid
 }

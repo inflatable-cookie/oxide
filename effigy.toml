@@ -665,6 +665,10 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-front-door-accountin
 admission = "heavy"
 run = "python3 scripts/test-oxide-finder-metadata.py"
 
+[tasks."rust:finder-metadata-race"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py"
+
 # Project-named slots and pool status (oxide#104), under the qualified shared
 # proof supervisor (oxide#109): 300 s absolute, 512 MiB monitored scratch,
 # children kept in its session, writes and evidence under its scratch and

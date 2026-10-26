@@ -154,3 +154,71 @@ pub(crate) fn symlink_metadata(path: &Path) -> io::Result<fs::Metadata> {
         None => fs::symlink_metadata(path),
     }
 }
+
+thread_local! {
+    static RACE: RefCell<Option<RaceArm>> = const { RefCell::new(None) };
+}
+
+/// One armed Finder-metadata race for the deletion seam (oxide#155): the
+/// labelled directory gets the named entry created between the caller's own
+/// listing and its removal.
+struct RaceArm {
+    label: std::ffi::OsString,
+    kind: &'static str,
+    remaining: usize,
+}
+
+/// Arm one deterministic race and remove it again on drop. `kind` is one of
+/// the seam's debug-hook kinds; `every_round` recreates the entry on each
+/// removal attempt so the fixed bound can be exercised.
+#[must_use = "dropping the guard ends the armed race"]
+pub(crate) struct RaceGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn arm_race(
+    label: &std::ffi::OsStr,
+    kind: &'static str,
+    every_round: bool,
+) -> RaceGuard {
+    RACE.with(|race| {
+        let mut race = race.borrow_mut();
+        assert!(race.is_none(), "overlapping race injections");
+        *race = Some(RaceArm {
+            label: label.to_os_string(),
+            kind,
+            remaining: if every_round { usize::MAX } else { 1 },
+        });
+    });
+    RaceGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for RaceGuard {
+    fn drop(&mut self) {
+        RACE.with(|race| {
+            let _ = race.borrow_mut().take();
+        });
+    }
+}
+
+/// One firing for this label, in the form the debug hook reads, if the arm
+/// still has one. The arm owns its own count, so one test never consumes
+/// another's firing.
+pub(crate) fn race_firing(label: &std::ffi::OsStr) -> Option<&'static str> {
+    RACE.with(|race| {
+        let mut race = race.borrow_mut();
+        let arm = race.as_mut()?;
+        if arm.label != label && arm.label != "*" {
+            return None;
+        }
+        if arm.remaining == 0 {
+            return None;
+        }
+        if arm.remaining != usize::MAX {
+            arm.remaining -= 1;
+        }
+        Some(arm.kind)
+    })
+}

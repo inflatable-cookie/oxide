@@ -3169,3 +3169,130 @@ fn an_incomplete_release_walk_records_nothing_and_never_zero() {
         "a refused admission published a figure"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bounded Finder-metadata races in owned-tree deletion (oxide#155)
+// ---------------------------------------------------------------------------
+
+/// Finder metadata recreated after the walk listed a slot directory, and
+/// before its removal, completes the deletion instead of leaving it pending.
+#[test]
+fn finder_metadata_recreated_during_a_slot_deletion_is_drained() {
+    let fixture = Fixture::new("race-metadata");
+    let slot = fixture.dir("slot");
+    let inner = slot.join("debug");
+    fs::create_dir(&inner).expect("nested directory");
+    fs::write(inner.join("blob"), b"x").expect("blob");
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "metadata", false);
+    remove_tree_owned(fixture.path(), &slot).expect("owned raced tree is removed");
+    assert!(!slot.exists(), "the whole raced slot is gone");
+}
+
+/// A recreated entry that is not tolerated Finder metadata stays a refusal and
+/// is left exactly as the writer made it.
+#[test]
+fn a_foreign_entry_recreated_during_a_slot_deletion_refuses_and_is_kept() {
+    let fixture = Fixture::new("race-foreign");
+    let slot = fixture.dir("slot");
+    fs::write(slot.join("blob"), b"keep").expect("blob");
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "foreign", false);
+    match remove_tree_owned(fixture.path(), &slot) {
+        Err(LeaseError::UnexpectedEntry { place, entry }) => {
+            assert_eq!(place, "slot directory");
+            assert_eq!(entry, "foreign.txt");
+        }
+        other => panic!("a foreign entry must refuse: {other:?}"),
+    }
+    assert_eq!(
+        fs::read(slot.join("foreign.txt")).expect("foreign entry kept"),
+        vec![b'd'; 16]
+    );
+    assert!(slot.is_dir(), "the slot with foreign content is kept");
+}
+
+/// A metadata-named link is refused by name: it is never followed, and neither
+/// the link nor the directory it names is removed.
+#[test]
+fn a_metadata_named_link_recreated_during_a_slot_deletion_is_not_followed() {
+    let fixture = Fixture::new("race-link");
+    let slot = fixture.dir("slot");
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "link", false);
+    match remove_tree_owned(fixture.path(), &slot) {
+        Err(LeaseError::UnexpectedEntry { place, entry }) => {
+            assert_eq!(place, "slot directory");
+            assert_eq!(entry, ".DS_Store");
+        }
+        other => panic!("a metadata-named link must refuse: {other:?}"),
+    }
+    assert!(fs::symlink_metadata(slot.join(".DS_Store"))
+        .expect("link kept")
+        .file_type()
+        .is_symlink());
+    assert!(slot.is_dir());
+}
+
+/// A writer that recreates metadata on every attempt uses the fixed bound and
+/// leaves the deletion unfinished; it never becomes a success.
+#[test]
+fn repeated_metadata_recreation_leaves_the_slot_deletion_unfinished() {
+    let fixture = Fixture::new("race-exhaust");
+    let slot = fixture.dir("slot");
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "metadata", true);
+    assert_eq!(
+        remove_tree_owned(fixture.path(), &slot),
+        Err(LeaseError::UnknownAccounting)
+    );
+    assert!(slot.is_dir(), "the slot that was not removed is kept");
+}
+
+/// A recorded `Evicting` slot whose directory races Finder metadata is
+/// reconciled at the next open, and its record leaves the ledger only after
+/// that positive removal.
+#[test]
+fn an_evicting_slot_raced_by_finder_metadata_is_reconciled() {
+    let fx = Fixture::new("race-evicting");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    fs::write(
+        leased.env.cargo_build_build_dir.join("blob"),
+        vec![7_u8; 4096],
+    )
+    .expect("blob");
+    release_injected(&pool, &leased.lease_id).expect("release");
+    let slot = leased.slot_id.parse::<u64>().expect("slot id");
+    mark_evicting_for_test(&pool, slot).expect("mark evicting");
+    let slot_path = pool.join("payload/slots").join(&leased.slot_id);
+
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "metadata", false);
+    let after = status_injected(&pool).expect("status");
+    assert!(
+        after.slots.is_empty(),
+        "the reconciled slot leaves the ledger"
+    );
+    assert!(!slot_path.exists(), "the raced recorded deletion completed");
+}
+
+/// Foreign content racing the same reconciliation keeps both the slot and its
+/// recorded intent: status reports the slot and never claims a deletion.
+#[test]
+fn a_foreign_entry_racing_an_evicting_reconciliation_keeps_the_record() {
+    let fx = Fixture::new("race-evicting-foreign");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    release_injected(&pool, &leased.lease_id).expect("release");
+    let slot = leased.slot_id.parse::<u64>().expect("slot id");
+    mark_evicting_for_test(&pool, slot).expect("mark evicting");
+    let slot_path = pool.join("payload/slots").join(&leased.slot_id);
+
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "foreign", false);
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the unfinished slot stays recorded");
+    assert_eq!(after.slots[0].state, SlotOccupancy::Abandoned);
+    assert!(slot_path.is_dir(), "the slot with foreign content is kept");
+}
