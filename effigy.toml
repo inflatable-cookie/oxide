@@ -388,11 +388,16 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # complete, aborted or unexecuted; a recoverable case-oracle failure is recorded
 # and the cases that do not depend on it still run, while an unknown outcome, a
 # lost resource or writer custody (an unclosed child, a lost mount or drive
-# registration), an exhausted guard deadline or a command result whose stderr
-# carries Oxide's own unconfirmed-closure report (could not confirm Cargo group /
-# stays held, and a later oxide command recovers it / is retired and stays held /
-# quarantined: lost with the removable volume) aborts and leaves the rest
-# unexecuted, because the group's custody is unknown. Its bounded
+# registration), an exhausted guard deadline, an abnormal or unclassifiable
+# proof-child exit (-9 or an unreaped leader, even with empty stderr), a command
+# result whose stderr carries Oxide's own unconfirmed-closure report (could not
+# confirm Cargo group / stays held, and a later oxide command recovers it / is
+# retired and stays held / quarantined: lost with the removable volume) aborts
+# and leaves the rest unexecuted, because the group's custody is unknown. An
+# abort retains an uncertain resource: the owned image is re-attached only after
+# a case COMPLETED (case 24 has no finally), and the ordinary detach needs a
+# clean collection with no unclosed child, so neither touches custody while it is
+# unconfirmed. Its bounded
 # `qualified: false` receipt is written in every
 # outcome, and a skipped or unexecuted case is never a pass. Each run needs its
 # own owner activation, and only a counted run at the exact merge head can

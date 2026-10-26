@@ -322,6 +322,43 @@ UNCONFIRMED_CUSTODY_MARKERS = (
 CHILD_CUSTODY_GUARD = None
 
 
+def require_normal_exit(label: str, code) -> None:
+    """Abort when a proof child's exit status cannot be classified.
+
+    A negative status means the leader itself was terminated by a signal
+    (`-9` = SIGKILL) and `None` means it was never reaped. Neither says anything
+    about the Cargo group, its slot or its writers, so a signalled or unreaped
+    leader is unknown custody — never a recoverable case-oracle failure even
+    with empty stderr. An ordinary exit, including Oxide's own `128 + signal`
+    status (130 after a forwarded interrupt), is classifiable and passes.
+    """
+    if code is None:
+        raise ProofAbort(
+            f"{label}: the proof child was not reaped, so its writer custody is unknown"
+        )
+    if code < 0:
+        raise ProofAbort(
+            f"{label}: the proof child ended by signal {-code}, so its writer "
+            f"custody is unknown"
+        )
+
+
+def reattach_after_case(*, completed: bool, reattach, reason: str) -> str:
+    """Reattach this run's owned image after a case that detached it, and ONLY
+    after that case COMPLETED (oxide#164 review).
+
+    A custody abort must retain the uncertain resource: reattaching during an
+    abort would mount a volume whose writers, mount identity or device binding
+    are exactly what the abort could not confirm. So the decision is explicit and
+    testable, and a case that aborted or failed leaves the volume detached and
+    says so in the receipt. Returns the disposition to record.
+    """
+    if not completed:
+        return f"retained detached: {reason}"
+    reattach()
+    return "ordinary re-attach after the completed case"
+
+
 def require_confirmed_closure(label: str, stderr) -> None:
     """Abort when Oxide explicitly reports UNCONFIRMED writer custody.
 
@@ -343,17 +380,26 @@ def require_confirmed_closure(label: str, stderr) -> None:
 
 
 def guard_writer_custody(proof: Proof) -> None:
-    """Scan every command this proof runs for the product's unconfirmed-closure
-    report (oxide#164 review): `Proof.oxide`, `Proof.run` (which carries the
-    `oxide_env` helper, staging, git and plan calls) and the gated child's own
-    stderr through `finish_child`."""
+    """Classify every command this proof runs (oxide#164 review).
+
+    `Proof.oxide`, `Proof.run` (which carries the `oxide_env` helper, staging,
+    git and plan calls) and the gated child's own exit status and stderr through
+    `finish_child` are checked for TWO conditions that make writer custody
+    unknown, and both are `ProofAbort`s so the collection latches before any
+    independent case can run beside them:
+
+    1. an abnormal or unclassifiable leader exit (`require_normal_exit`: `-9`, or
+       never reaped), even with empty stderr, and
+    2. Oxide's own unconfirmed-closure report on stderr
+       (`require_confirmed_closure`).
+    """
     global CHILD_CUSTODY_GUARD
-    CHILD_CUSTODY_GUARD = require_confirmed_closure
     inner_oxide = proof.oxide
 
     def oxide(args: list, label: str, cwd: str) -> tuple:
         code, stdout, stderr = inner_oxide(args, label, cwd)
         require_confirmed_closure(label, stderr)
+        require_normal_exit(label, code)
         return code, stdout, stderr
 
     proof.oxide = oxide
@@ -361,12 +407,16 @@ def guard_writer_custody(proof: Proof) -> None:
 
     def run(command: list, *, cwd: str | None = None, env: dict | None = None, timeout: float = 120):
         result = inner_run(command, cwd=cwd, env=env, timeout=timeout)
-        require_confirmed_closure(
-            " ".join(str(part) for part in command[:1]) or "command", result.stderr
-        )
+        label = " ".join(str(part) for part in command[:1]) or "command"
+        require_confirmed_closure(label, result.stderr)
+        require_normal_exit(label, result.returncode)
         return result
 
     proof.run = run
+    CHILD_CUSTODY_GUARD = lambda label, stderr, code: (
+        require_confirmed_closure(label, stderr),
+        require_normal_exit(label, code),
+    )
 
 
 def finish_child(proof: Proof, child: subprocess.Popen, label: str) -> tuple[int, str, str]:
@@ -384,7 +434,7 @@ def finish_child(proof: Proof, child: subprocess.Popen, label: str) -> tuple[int
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
     print(f"----- {label}: exit {child.returncode} -----\n{stdout}{stderr}", flush=True)
     if CHILD_CUSTODY_GUARD is not None:
-        CHILD_CUSTODY_GUARD(label, stderr)
+        CHILD_CUSTODY_GUARD(label, stderr, child.returncode)
     return child.returncode, stdout, stderr
 
 
@@ -2718,7 +2768,25 @@ class Collection:
         self.aborted: str | None = None
         self.detached = "not attempted (the collection did not reach the detach decision)"
         self.mount_present: bool | None = None
+        self.reattach: str | None = None
         self.source: str | None = None
+
+
+def detach_decision(collection: "Collection", unclosed) -> str | None:
+    """Why this run must NOT make its ordinary detach, or `None` when it may.
+
+    The diagnostic detaches only a clean collection whose custody is positively
+    whole. A recorded failure, a latched abort or any unclosed child means the
+    image (or the writer that outlived its leader) is not ours to touch, so the
+    resource is retained and the receipt names the refusal (oxide#164 review).
+    """
+    if collection.failures:
+        return "the collection recorded a failure"
+    if collection.aborted is not None:
+        return "the collection aborted"
+    if unclosed:
+        return f"unclosed children {sorted(unclosed)}"
+    return None
 
 
 def require_case_custody(*, unclosed, mount: str, registration: str, case: str) -> None:
@@ -2878,6 +2946,7 @@ def diagnostic_document(
     aborted: str | None,
     detached: str,
     mount_present: bool | None,
+    reattach: str | None,
     elapsed_s: float,
     peak_owned_mib: int,
     host_free_min_mib: int | None,
@@ -2910,6 +2979,7 @@ def diagnostic_document(
             "host_free_min_mib": host_free_min_mib,
             "detach": detached,
             "mount_path_present_after_detach": mount_present,
+            "reattach": reattach,
             "unclosed_children": unclosed,
         },
         "limits": {
@@ -2960,6 +3030,7 @@ def write_diagnostic(proof: Proof, collection: Collection) -> str:
         aborted=collection.aborted,
         detached=collection.detached,
         mount_present=collection.mount_present,
+        reattach=collection.reattach,
         elapsed_s=round(time.monotonic() - layout.runner.STARTED, 1),
         peak_owned_mib=proof.peak // MIB,
         host_free_min_mib=None if proof.low is None else proof.low // MIB,
@@ -3503,6 +3574,196 @@ def exec_self_test() -> None:
     for gate in ("require_case_custody", "require_case_resources"):
         expect(gate in seam_calls, f"the post-case seam does not call {gate}")
 
+    # 7b. An abnormal or unclassifiable proof-child exit is a CUSTODY ABORT, not
+    #     a recoverable oracle failure. A leader killed by a signal (`-9`) with
+    #     EMPTY stderr says nothing about the Cargo group it may have left behind,
+    #     so no independent case may run beside it. The counterfactual: treating
+    #     `-9` as recoverable would run the later cases, which these checks
+    #     reject. An ordinary exit, including Oxide's own 128+signal status, is
+    #     classifiable and passes.
+    for code in (0, 1, 101, 130, 137):
+        require_normal_exit("classifiable", code)
+    for code in (-9, -15, -2, None):
+        try:
+            require_normal_exit("abnormal", code)
+            raise AssertionError(f"an abnormal exit status {code!r} was accepted")
+        except ProofAbort as fault:
+            expect("writer custody is unknown" in str(fault), f"{fault}")
+
+    class ExitProof:
+        """The two guarded seams with a chosen exit status and stderr."""
+
+        def __init__(self, code: int, stderr: bytes = b"") -> None:
+            self.code = code
+            self.stderr = stderr
+            self.unclosed: set = set()
+            self.peak = 0
+            self.low = None
+            self.binary = None
+
+        def phase(self, _label: str) -> None:
+            return None
+
+        def oxide(self, _args, _label, _cwd):
+            return self.code, "", self.stderr.decode(errors="replace")
+
+        def run(self, command, *, cwd=None, env=None, timeout=120):
+            class Result:
+                returncode = self.code
+                stdout = b""
+                stderr = self.stderr
+
+            return Result
+
+    # The real guard raises for -9 with empty stderr through BOTH helpers, and
+    # for Oxide's own unconfirmed-closure line at a classifiable status.
+    for code, stderr, expected in (
+        (-9, b"", "writer custody is unknown"),
+        (-15, b"", "writer custody is unknown"),
+        (1, b"oxide: could not confirm Cargo group 42 closed after the stop; slot 7 stays held, and a later oxide command recovers it\n", "unconfirmed writer closure"),
+    ):
+        for helper in ("oxide", "run"):
+            guarded = ExitProof(code, stderr)
+            guard_writer_custody(guarded)
+            try:
+                if helper == "oxide":
+                    guarded.oxide([], "case 21", ".")
+                else:
+                    guarded.run(["oxide", "build"])
+                raise AssertionError(f"{helper} accepted exit {code} stderr {stderr!r}")
+            except ProofAbort as fault:
+                expect(expected in str(fault), f"{helper}: {fault}")
+    # A clean command passes and its result is unchanged.
+    guarded = ExitProof(130, b"oxide: quick profile, build strategy, slot 7\n")
+    guard_writer_custody(guarded)
+    code, _stdout, stderr = guarded.oxide([], "case 15", ".")
+    expect(code == 130 and "quick profile" in stderr, f"{code} {stderr!r}")
+    expect(guarded.run(["oxide", "status"]).returncode == 130, "the guarded run changed its status")
+
+    # The collector latches such an abort before any independent case, and the
+    # FIRST recoverable failure recorded earlier is preserved in the receipt.
+    ran.clear()
+
+    def abnormal_leader() -> None:
+        ran.append("21")
+        require_normal_exit("case 21", -9)
+
+    record = collect(
+        [
+            ("20", (), lambda: ran.append("20")),
+            ("21", (), abnormal_leader),
+            ("22", (), lambda: ran.append("22")),
+        ]
+    )
+    expect(ran == ["20", "21"], f"the collection continued past an abnormal leader: {ran}")
+    expect(record.outcomes["20"]["result"] == "completed", f"{record.outcomes['20']}")
+    expect(record.outcomes["21"]["result"] == "aborted", f"{record.outcomes['21']}")
+    expect("writer custody is unknown" in record.outcomes["21"]["fault"], f"{record.outcomes['21']}")
+    expect(record.outcomes["22"]["result"] == "unexecuted", f"{record.outcomes['22']}")
+    expect(record.failures == [], f"an abnormal exit was recorded as recoverable: {record.failures}")
+    expect(record.aborted is not None, "an abnormal exit did not latch the abort")
+
+    ran.clear()
+    record = collect(
+        [
+            ("20", (), lambda: (_ for _ in ()).throw(RuntimeError("oracle 20"))),
+            ("21", (), abnormal_leader),
+            ("22", (), lambda: ran.append("22")),
+        ]
+    )
+    expect(ran == ["21"], f"a case ran after the abnormal leader: {ran}")
+    expect(
+        [failure["case"] for failure in record.failures] == ["20"],
+        f"the first failure was lost: {record.failures}",
+    )
+    expect(record.outcomes["20"]["result"] == "failed", f"{record.outcomes['20']}")
+    expect(record.outcomes["21"]["result"] == "aborted", f"{record.outcomes['21']}")
+    expect(record.outcomes["22"]["result"] == "unexecuted", f"{record.outcomes['22']}")
+
+    # 7c. Case 24's abort-time resource path: the OWNED IMAGE IS NOT REATTACHED
+    #     while a custody abort is in flight. The counterfactual is the same
+    #     decision taken on a completed case, which does call the reattach.
+    reattached: list[str] = []
+    disposition = reattach_after_case(
+        completed=False,
+        reattach=lambda: reattached.append("reattached"),
+        reason="case 24 aborted before its oracles held",
+    )
+    expect(reattached == [], f"an aborted case reattached the image: {reattached}")
+    expect("retained detached" in disposition, f"{disposition}")
+    disposition = reattach_after_case(
+        completed=True, reattach=lambda: reattached.append("reattached"), reason="unused"
+    )
+    expect(reattached == ["reattached"], f"a completed case did not reattach: {reattached}")
+    expect("ordinary re-attach" in disposition, f"{disposition}")
+
+    # The real case body has no `finally` that could reattach during an abort:
+    # the call sits on the success path only, after every oracle.
+    import ast as _ast
+
+    module_source = open(__file__, encoding="utf-8").read()
+    case_24_node = next(
+        node
+        for node in _ast.walk(_ast.parse(module_source))
+        if isinstance(node, _ast.FunctionDef) and node.name == "case_24"
+    )
+    expect(
+        not [
+            node
+            for node in _ast.walk(case_24_node)
+            if isinstance(node, _ast.Try) and node.finalbody
+        ],
+        "case 24 regained a try/finally that can reattach during an abort",
+    )
+    case_24_source = _ast.get_source_segment(module_source, case_24_node) or ""
+    expect(
+        case_24_source.index("reattach_after_case(") > case_24_source.index("future_receipt = "),
+        "case 24 reattaches before its oracles held",
+    )
+
+    # 7d. The ordinary detach is gated on positively whole custody: a recorded
+    #     failure, a latched abort OR any unclosed child refuses it, and only a
+    #     clean collection with closed custody may detach.
+    clean = Collection()
+    expect(detach_decision(clean, set()) is None, "a clean collection refused its detach")
+    failed = Collection()
+    failed.failures.append({"case": "x", "fault": "x"})
+    expect(detach_decision(failed, set()) == "the collection recorded a failure", "a failure detached")
+    aborted_record = Collection()
+    aborted_record.aborted = "x: custody"
+    expect(detach_decision(aborted_record, set()) == "the collection aborted", "an abort detached")
+    expect(
+        detach_decision(clean, {"4242"}) == "unclosed children ['4242']",
+        "an unclosed child did not refuse the detach",
+    )
+    # The refusal is recorded as the receipt's detach disposition, never a detach.
+    kept = Collection()
+    kept.failures.append({"case": "x", "fault": "x"})
+    refusal = detach_decision(kept, set())
+    expect(refusal is not None, "the gated detach decision changed")
+    kept.detached = f"retained: {refusal}"
+    document = diagnostic_document(
+        source="source",
+        rows=exec_case_rows({}),
+        failures=kept.failures,
+        aborted=None,
+        detached=kept.detached,
+        mount_present=None,
+        reattach="retained detached: case 24 aborted",
+        elapsed_s=1.0,
+        peak_owned_mib=1,
+        host_free_min_mib=2,
+        unclosed=[],
+    )
+    expect(
+        document["observations"]["detach"].startswith("retained:"),
+        f"{document['observations']}",
+    )
+    expect(
+        document["observations"]["reattach"].startswith("retained detached:"),
+        f"{document['observations']}",
+    )
+
     # 9. The receipt document itself: `qualified: false`, counted outcomes,
     #    a skipped case never counted as completed, and the limitation stated.
     document = diagnostic_document(
@@ -3518,6 +3779,7 @@ def exec_self_test() -> None:
         aborted=None,
         detached="not attempted",
         mount_present=None,
+        reattach=None,
         elapsed_s=1.0,
         peak_owned_mib=1,
         host_free_min_mib=2,
@@ -3550,6 +3812,7 @@ def exec_self_test() -> None:
         aborted="setup failed",
         detached="not attempted",
         mount_present=None,
+        reattach=None,
         elapsed_s=0.0,
         peak_owned_mib=0,
         host_free_min_mib=None,
@@ -4864,7 +5127,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             and isinstance(placements.get("debug"), dict),
             f"22: the receipt places {unplaced_receipt['links']}",
         )
-        receipt_before = read_bytes(receipt_file(pool, unplaced))
+        notice_receipt_before = read_bytes(receipt_file(pool, unplaced))
         tool_marker = os.path.join(root, "external-oxfixture-real-member-argv")
         external_env = {
             **proof.env,
@@ -4930,7 +5193,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             "22: the real member became a link",
         )
         expect(
-            read_bytes(receipt_file(pool, unplaced)) == receipt_before,
+            read_bytes(receipt_file(pool, unplaced)) == notice_receipt_before,
             "22: the external subcommand changed the receipt",
         )
         phase(proof, "after the unplaced-member notice")
@@ -4939,14 +5202,14 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         # 23 (oxide#164): the external subcommand is unchanged in a whole-target
         # checkout, and the derivation's foreign-member refusal is preserved
         # before the tool runs.
-        legacy = fresh_checkout(proof, root, "external-whole-target")
-        legacy_root = legacy_whole_target(
-            proof, pool, mount, legacy, "23 external whole-target fixture"
+        external_whole = fresh_checkout(proof, root, "external-whole-target")
+        external_whole_root = external_whole_whole_target(
+            proof, pool, mount, external_whole, "23 external whole-target fixture"
         )
-        legacy_target = os.path.join(legacy, "target")
-        legacy_receipt = read_bytes(receipt_file(pool, legacy))
+        external_whole_target = os.path.join(external_whole, "target")
+        external_whole_receipt = read_bytes(receipt_file(pool, external_whole))
         expect(
-            not os.path.exists(os.path.join(legacy_target, "debug", "poutputs")),
+            not os.path.exists(os.path.join(external_whole_target, "debug", "poutputs")),
             "23: the whole-target fixture already built its binary",
         )
         tool_marker = os.path.join(root, "external-oxfixture-whole-target-argv")
@@ -4959,20 +5222,20 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             proof,
             ["oxfixture"],
             "23 external subcommand on a whole-target checkout",
-            legacy,
+            external_whole,
             external_env,
         )
         expect(code == 0, stderr)
         expect(
-            os.path.islink(legacy_target) and os.readlink(legacy_target) == legacy_root,
+            os.path.islink(external_whole_target) and os.readlink(external_whole_target) == external_whole_root,
             "23: the external subcommand replaced or relinked the whole target",
         )
         expect(
-            os.path.isfile(os.path.join(legacy_target, "debug", "poutputs")),
+            os.path.isfile(os.path.join(external_whole_target, "debug", "poutputs")),
             "23: the external tool built nothing through the whole-target link",
         )
         expect(
-            read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
+            read_bytes(receipt_file(pool, external_whole)) == external_whole_receipt,
             "23: the external subcommand rewrote the whole-target receipt",
         )
         expect(
@@ -5054,57 +5317,66 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         }
         volume_uuid = real_uuid(pool)
         force_detach(proof, os.path.join(root, "volume.sparseimage"), mount, volume_uuid)
-        try:
-            if os.path.exists(tool_marker):
-                os.remove(tool_marker)
-            code, _, stderr = oxide_env(
-                proof,
-                ["oxfixture"],
-                "24 external subcommand onto a future whole-target root",
-                future,
-                external_env,
-            )
+
+        def reattach() -> None:
+            mounted_now = attach_image(proof, root, name, owners=True)
             expect(
-                code == 0,
-                "24: the first whole-target fallback refused (a derived command "
-                f"skipped its reservation): {stderr}",
-            )
-            local_root = os.path.join(future, ".oxide-outputs", "local")
-            expect(
-                os.path.isdir(local_root) and not os.path.islink(local_root),
-                "24: the fallback created no local root",
-            )
-            expect(
-                os.path.islink(future_target)
-                and os.path.realpath(future_target) == os.path.realpath(local_root),
-                "24: the whole-target link does not select the local fallback",
-            )
-            expect(
-                os.path.isfile(os.path.join(future_target, "debug", "poutputs")),
-                "24: the external tool built nothing through the fallback root",
-            )
-            expect(os.path.isfile(tool_marker), "24: the external tool did not run")
-            future_receipt = read_json(receipt_file(pool, future))
-            expect(
-                future_receipt["state"] == "committed",
-                f"24: the receipt is {future_receipt['state']}",
-            )
-            expect(
-                future_receipt.get("reserved") is None,
-                "24: the future root's reservation was not consumed by the transition",
-            )
-            selected = (future_receipt.get("links") or [{}])[0].get("selected") or {}
-            expect(
-                str(selected.get("root", "")).startswith(future),
-                f"24: the receipt does not select the local fallback root: {future_receipt['links']}",
-            )
-        finally:
-            mounted = attach_image(proof, root, name, owners=True)
-            expect(
-                mounted == mount,
-                f"24: the scratch volume re-attached at {mounted}, not {mount}",
+                mounted_now == mount,
+                f"24: the scratch volume re-attached at {mounted_now}, not {mount}",
             )
             owners_honored(proof, mount, "24 re-attach")
+
+        # No `finally`: the re-attach happens only after this case COMPLETED.
+        # A custody abort inside it retains the detached volume instead of
+        # mounting a resource whose writers or device binding are unconfirmed.
+        if os.path.exists(tool_marker):
+            os.remove(tool_marker)
+        code, _, stderr = oxide_env(
+            proof,
+            ["oxfixture"],
+            "24 external subcommand onto a future whole-target root",
+            future,
+            external_env,
+        )
+        expect(
+            code == 0,
+            "24: the first whole-target fallback refused (a derived command "
+            f"skipped its reservation): {stderr}",
+        )
+        local_root = os.path.join(future, ".oxide-outputs", "local")
+        expect(
+            os.path.isdir(local_root) and not os.path.islink(local_root),
+            "24: the fallback created no local root",
+        )
+        expect(
+            os.path.islink(future_target)
+            and os.path.realpath(future_target) == os.path.realpath(local_root),
+            "24: the whole-target link does not select the local fallback",
+        )
+        expect(
+            os.path.isfile(os.path.join(future_target, "debug", "poutputs")),
+            "24: the external tool built nothing through the fallback root",
+        )
+        expect(os.path.isfile(tool_marker), "24: the external tool did not run")
+        future_receipt = read_json(receipt_file(pool, future))
+        expect(
+            future_receipt["state"] == "committed",
+            f"24: the receipt is {future_receipt['state']}",
+        )
+        expect(
+            future_receipt.get("reserved") is None,
+            "24: the future root's reservation was not consumed by the transition",
+        )
+        selected = (future_receipt.get("links") or [{}])[0].get("selected") or {}
+        expect(
+            str(selected.get("root", "")).startswith(future),
+            f"24: the receipt does not select the local fallback root: {future_receipt['links']}",
+        )
+        # Every oracle above held, so this case COMPLETED and only now may the
+        # owned image come back; `reattach_after_case` records the disposition.
+        collection.reattach = reattach_after_case(
+            completed=True, reattach=reattach, reason="case 24 did not complete"
+        )
         phase(proof, "after the future whole-target root")
 
     bodies = {
@@ -5166,11 +5438,13 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         )
         proof.detach()
         return
-    # The owned image is this run's custody. A collection that recorded no
-    # failure and did not abort makes exactly one ordinary detach and verifies
-    # the mount is gone; a failed detach raises into the existing failure
-    # cleanup, which makes that same single attempt and keeps the evidence.
-    if not collection.failures and collection.aborted is None:
+    # The owned image is this run's custody. Only a collection that recorded no
+    # failure, did not abort and left no child unclosed makes exactly one
+    # ordinary detach; anything else retains the resource and the receipt names
+    # the refusal. A failed detach raises into the existing failure cleanup,
+    # which makes that same single attempt and keeps the evidence.
+    refusal = detach_decision(collection, proof.unclosed)
+    if refusal is None:
         proof.detach()
         expect(
             not os.path.ismount(mount),
@@ -5182,6 +5456,8 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         )
         collection.detached = "ordinary detach through Proof.detach; mount absent"
         collection.mount_present = os.path.lexists(mount)
+    else:
+        collection.detached = f"retained: {refusal}"
     if collection.failures or collection.aborted:
         fail(
             "exec-inference cases did not all complete: "

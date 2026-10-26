@@ -659,7 +659,13 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   already reached and every failure already recorded keeps its place in the
   receipt even when the run is cancelled — the interrupted case is recorded
   `aborted`, never `unexecuted` — and a receipt that cannot be written ends the
-  diagnostic instead of reporting success. The receipt is written in every
+  diagnostic instead of reporting success. An abnormal or unclassifiable
+  proof-child exit (`-9`, or an unreaped leader, even with empty stderr) and any
+  command result carrying Oxide's own unconfirmed-closure report abort the same
+  way, because the group's custody is unknown; an abort retains the uncertain
+  resource — the owned image is re-attached only after a case completed (case 24
+  has no `finally`) and the ordinary detach needs a clean collection with no
+  unclosed child. The receipt is written in every
   outcome, carries one row per declared case and is `qualified: false`; a
   skipped or unexecuted case is never a pass.
   01 conversion via explicit adopt (host pair linked), asserted committed;
