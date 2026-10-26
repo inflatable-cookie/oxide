@@ -8,9 +8,41 @@ the independent exact-head review (decision `95b3bc63`) and written against
 `a7ed41b`. The operator direction is Tom's design-first ruling of
 2026-10-26 (Oxide Supervisor lead `d30b48c8`, parent direction `d78a7afa` /
 `a96712b`). As published, this document activated nothing; the implementation
-is in `src/bin/oxide/outputs.rs` (`exec_declaration`, `exec_members`, the
-shared `adopt_profile_from`) and `src/bin/oxide/main.rs`, with the
-`effigy rust:exec-output-inference` proof.
+is in `src/bin/oxide/outputs.rs` (`exec_declaration`, `exec_members`,
+`lease_declaration`, `needs_reservation`, the shared `adopt_profile_from`) and
+`src/bin/oxide/main.rs`, with the `effigy rust:exec-output-inference` proof.
+
+**Amendment note (oxide#164).** S1 item 4 as shipped kept
+`refuse_unknown_layout` for every non-`exec` external subcommand, so in a
+profile-layout checkout — now the default for a fresh or migrated checkout
+(S4b) — `oxide nextest`, `oxide llvm-cov` and every other external subcommand
+refused instead of running. Swallowtail's milestone QA and Effigy's built-in
+Rust test route both hit it. An external subcommand is Cargo running
+`cargo-<name>`, which is exactly what `oxide exec -- cargo <name>` runs, so it
+now takes **the same derivation through the same function** (`lease_declaration`
+→ `exec_declaration`): the receipt-keyed member set, #162's absent-member
+handling, the bounded notice for unplaced members and the member cap, with
+`--output`, modelled commands, whole-target and unconverted checkouts, and every
+refusal unchanged. `refuse_unknown_layout` survives only for a modelled
+command whose target the layout cannot model (a JSON target specification).
+
+Two points the review of that amendment settled. First, a derived set that is
+**empty** names no placement — a whole-target checkout, a detached receipt or an
+unconverted checkout — and a whole-target plan can still name a FUTURE root (the
+first local fallback to an absent root, oxide#117), which binding accepts only
+through the exact reservation its slot was keyed with. The reservation skip is
+therefore scoped to a NON-EMPTY derived set (`outputs::needs_reservation`); an
+empty one keeps the shipped reservation path, exactly as every command behaved
+before, and a derived `exec` in the same state now does too. Second, a tool's own
+directory that is not a member (`target/nextest`, `target/llvm-cov`) stays a real
+local directory and is reported once by the bounded `tool directories kept local`
+notice (`outputs::target_entries` + `outputs::tool_directories_note`): two
+listings of ONE directory — the real target's direct entries before the writer
+starts and after its group closes — capped at eight names, with no recursion, no
+payload walk and no link followed, printed only for a command that runs a tool
+(`exec` or an external subcommand). Cargo-only commands keep the shipped
+silence, and the receipt-recorded real member keeps its own separate
+unplaced-member notice.
 
 This document is the design for one prerequisite: **`oxide exec` must not
 need `--output`**. Today a checkout that places outputs at profile members
@@ -272,8 +304,12 @@ all **before** Cargo and before any authority write:
 3. a receipt state that is not `Committed` or `Detached` (a prepared, pruning
    or pruned receipt) refuses (existing rule).
 
-`exec` performs **no** reservation (`outputs::reserve` is skipped: the keyed set
-is a subset of the receipt, so no root nonce and no member is new), never
+`exec` performs **no** reservation when its derived set is non-empty
+(`outputs::reserve` is skipped: the keyed set is a subset of the receipt, so no
+root nonce and no member is new). A derived set that is EMPTY (whole-target,
+detached or unconverted) keeps the shipped reservation path, because a
+whole-target plan there may name a future root (oxide#117;
+`outputs::needs_reservation`, oxide#164). `exec` never
 relinks, never converts a real directory, never deletes, and never creates a
 member while it derives or classifies. The classified set is validation only:
 it cannot add a member, extend the key or authorize a write. The single later
@@ -671,6 +707,16 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   creation timestamp is preserved, the old output still visible through the
   migrated member link, and a following `build` and `exec` succeeding without
   relinking or rewriting the upgraded receipt.
+  21-24 the external Cargo subcommand (oxide#164): 21 it derives the same
+  receipt-keyed pair as `exec` and shares `exec`'s warm slot, writes its nested
+  `$CARGO build` through the owned `debug` member, keeps `target/debug` a link,
+  leaves its own non-member `target/oxfixture` real and local, reports it once
+  with the bounded `tool directories kept local` notice and leaves the receipt
+  bytes unchanged; 22 the separate unplaced-member notice for a receipt-RECORDED
+  real member (detach, content, re-adopt); 23 an unchanged whole-target checkout
+  (link and receipt bytes) and a foreign member link that refuses before the tool
+  runs; 24 a whole-target checkout whose root is gone reserves the FUTURE root's
+  keyed nonce and binds the first local fallback.
   20 a converted checkout's whole `target` directory deleted (oxide#165): the
   next leased build recreates that real directory exclusively and republishes
   the member it places through the unchanged per-member transition into the
@@ -739,6 +785,10 @@ clock, scratch budget or previous allowance transfers from #107, #117, #121,
    `exec` key marker?
 5. Is removing the "declares none" refusal for `exec` sufficient to keep
    `refuse_unknown_layout` meaningful for other external subcommands?
+   **Answered by oxide#164:** no. An external subcommand is Cargo running
+   `cargo-<name>`, so the refusal over-refused every profile-layout checkout
+   (`oxide nextest`); it now derives like `exec`, and the refusal is kept only
+   for a modelled command's unmodelled target.
 6. Should the derived path ever be allowed to exceed eight members, and is
    refusing with `oxide outputs detach` the right remedy?
 7. Are S1's native cases the right minimum, and does case 06 (an unrecorded

@@ -304,6 +304,71 @@ def start_child(proof: Proof, command: list, cwd: str, env: dict) -> subprocess.
     return child
 
 
+# Oxide's own words for a writer group (or a retired slot) whose closure is NOT
+# confirmed. They are the product's explicit custody statement, not an oracle
+# value: the collection must stop, because the group may still be live and no
+# later case may run beside it. The markers are the exact sentences
+# `main.rs`/`store.rs` print, never loose keywords.
+UNCONFIRMED_CUSTODY_MARKERS = (
+    "could not confirm Cargo group",
+    "could not confirm the Cargo clean group",
+    "stays held, and a later oxide command recovers it",
+    "is retired and stays held",
+    "quarantined: lost with the removable volume",
+)
+
+# Installed by `guard_writer_custody` for the run that needs it, so a mode whose
+# crash cases legitimately produce such a message is not affected.
+CHILD_CUSTODY_GUARD = None
+
+
+def require_confirmed_closure(label: str, stderr) -> None:
+    """Abort when Oxide explicitly reports UNCONFIRMED writer custody.
+
+    A stopped group whose closure could not be confirmed, a retired slot that
+    stays held, or a slot quarantined with a lost volume keeps an unknown writer
+    alive. That is an unknown outcome, never a recoverable case-oracle failure:
+    `ProofAbort` latches the collection (and, outside a case, ends the run), so
+    nothing else runs beside it.
+    """
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    for marker in UNCONFIRMED_CUSTODY_MARKERS:
+        if marker in stderr:
+            line = next(text for text in stderr.splitlines() if marker in text)
+            raise ProofAbort(
+                f"{label}: Oxide reported unconfirmed writer closure, so nothing "
+                f"else may run beside it: {line.strip()[:400]}"
+            )
+
+
+def guard_writer_custody(proof: Proof) -> None:
+    """Scan every command this proof runs for the product's unconfirmed-closure
+    report (oxide#164 review): `Proof.oxide`, `Proof.run` (which carries the
+    `oxide_env` helper, staging, git and plan calls) and the gated child's own
+    stderr through `finish_child`."""
+    global CHILD_CUSTODY_GUARD
+    CHILD_CUSTODY_GUARD = require_confirmed_closure
+    inner_oxide = proof.oxide
+
+    def oxide(args: list, label: str, cwd: str) -> tuple:
+        code, stdout, stderr = inner_oxide(args, label, cwd)
+        require_confirmed_closure(label, stderr)
+        return code, stdout, stderr
+
+    proof.oxide = oxide
+    inner_run = proof.run
+
+    def run(command: list, *, cwd: str | None = None, env: dict | None = None, timeout: float = 120):
+        result = inner_run(command, cwd=cwd, env=env, timeout=timeout)
+        require_confirmed_closure(
+            " ".join(str(part) for part in command[:1]) or "command", result.stderr
+        )
+        return result
+
+    proof.run = run
+
+
 def finish_child(proof: Proof, child: subprocess.Popen, label: str) -> tuple[int, str, str]:
     try:
         out, err = child.communicate(timeout=min(60, work_left()))
@@ -318,6 +383,8 @@ def finish_child(proof: Proof, child: subprocess.Popen, label: str) -> tuple[int
     proof.unclosed.discard(child.pid)
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
     print(f"----- {label}: exit {child.returncode} -----\n{stdout}{stderr}", flush=True)
+    if CHILD_CUSTODY_GUARD is not None:
+        CHILD_CUSTODY_GUARD(label, stderr)
     return child.returncode, stdout, stderr
 
 
@@ -2568,6 +2635,10 @@ EXEC_CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("15", (), "Ctrl-C reaches the tool group, the lease holds until the group closes, then releases"),
     ("19", (), "a committed version-1 whole-target receipt makes every failing reader refuse naming adopt (recorded status reads nothing; --measure reports outputs unknown naming adopt), an explicit adopt upgrades it through the shipped migration with the old outputs intact, and a noncommitted version-1 control keeps its bytes"),
     ("20", (), "a converted checkout whose target directory was deleted recreates it: the next leased build exits 0 with its own member link back inside the same root and the root's old outputs intact, a derived exec then places the whole pair there, and the receipt still names that root"),
+    ("21", (), "an external subcommand (cargo-oxfixture on a private PATH) derives the same receipt-keyed pair as exec, shares exec's warm slot, exits 0, writes its build through the owned debug member, keeps target/debug a link, reports its own non-member directory once with the bounded tool-directories notice and no unplaced-member notice, and keeps the receipt bytes"),
+    ("22", (), "an external subcommand in a profile checkout whose receipt records a real member (detach, content, re-adopt) prints that one bounded unplaced-member notice naming only the receipt's member, beside the separate tool-directories notice for its own directory"),
+    ("23", (), "the same external subcommand is unchanged in a whole-target checkout (link and receipt bytes), and a foreign member link still refuses before the tool runs"),
+    ("24", (), "a whole-target checkout whose root is gone plans a FUTURE root, and the external subcommand reserves that root's keyed nonce first and binds the local fallback instead of refusing with no nonce"),
 ]
 
 
@@ -3493,6 +3564,22 @@ EXEC_TOOLS = {
     # and the build directory, so the tool's own build is what writes the
     # profile members; Oxide reads no argv from it.
     "tool-build.sh": '#!/bin/sh\nset -eu\nexec cargo build "$@"\n',
+    # A Cargo external subcommand (oxide#164): Cargo resolves `cargo-oxfixture`
+    # for `oxide oxfixture` and passes the subcommand name as the tool's first
+    # argument. It records that exact argv, writes a directory the receipt does
+    # not place (nextest's own `target/nextest` analogue), then builds through
+    # the inherited Cargo, which is what writes the profile members.
+    "cargo-oxfixture": (
+        '#!/bin/sh\nset -eu\n'
+        '[ "${1:-}" = "oxfixture" ] || { echo "unexpected external argv: $*" >&2; exit 64; }\n'
+        'if [ -n "${OXIDE_EXTERNAL_MARKER:-}" ]; then\n'
+        '  printf "%s" "$*" > "$OXIDE_EXTERNAL_MARKER"\n'
+        'fi\n'
+        'shift\n'
+        'mkdir -p target/oxfixture\n'
+        'printf local > target/oxfixture/out\n'
+        'exec "${CARGO:-cargo}" build "$@"\n'
+    ),
     # A tool that writes a member-shaped directory the receipt does not place.
     "tool-staging.sh": (
         '#!/bin/sh\nset -eu\n'
@@ -3514,6 +3601,7 @@ EXEC_TOOLS = {
         '  while [ ! -f "$gate.release" ]; do sleep 0.05; done\n'
         ') &\n'
         "trap 'exit 130' INT TERM\n"
+        'printf armed > "$gate.armed"\n'
         'while [ ! -f "$gate.release" ]; do sleep 0.05; done\n'
         'wait\n'
     ),
@@ -3736,7 +3824,16 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     proves the next leased build recreates it exclusively and republishes the
     member that build places into the SAME root, whose payload and committed
     placement survive, and that a derived `exec` then places the whole owned
-    pair there. `--plan` prints the same table and allocation with no effect.
+    pair there. The oxide#164 cases (21-24) add the external Cargo subcommand:
+    21 proves it is Cargo running `cargo-<name>` — the same derivation, key and
+    warm slot as `exec` — and that its own non-member `target/oxfixture` stays a
+    real local directory reported once by the bounded tool-directories notice;
+    22 proves the separate unplaced-member notice for a receipt-RECORDED real
+    member (detach, content, re-adopt); 23 proves the unchanged whole-target
+    checkout and the foreign-member refusal before the tool runs; 24 proves a
+    whole-target checkout whose root is gone reserves the FUTURE root's keyed
+    nonce and binds the first local fallback. `--plan` prints the same table and
+    allocation with no effect.
 
     With `diagnostic` the same cases run keep-going (oxide#165's apparatus
     correction): a recoverable case-oracle failure is recorded and the cases
@@ -3745,7 +3842,12 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     resource or custody (an unclosed child, a lost mount, a vanished drive
     registration) or an exhausted guard deadline aborts and leaves the rest
     unexecuted. Every declared case is recorded, and a skipped or unexecuted
-    case is never a pass. It is never a counted native PASS.
+    case is never a pass. Any command result whose stderr carries Oxide's own
+    unconfirmed-closure report (a group that `could not confirm Cargo group …`,
+    a slot that `stays held, and a later oxide command recovers it` or `is
+    retired and stays held`, or `quarantined: lost with the removable volume`)
+    also aborts: the group's custody is unknown, so no later case may run beside
+    it. It is never a counted native PASS.
 
     The HIGH premise checklist is traced through the executable bodies:
 
@@ -3761,9 +3863,11 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     4. automatic adoption: every case states its receipt premise, and case 08
        positively creates an ineligible (real empty target) checkout and
        asserts the receipt is absent.
-    5. Cargo external argv: not applicable. The fixture tools are invoked
-       directly (`oxide exec -- <tool>`); none is a Cargo subcommand, so no
-       external argv is modelled.
+    5. Cargo external argv: the oxide#164 cases run a real external subcommand
+       (`cargo-oxfixture` from a private `PATH` directory outside every
+       checkout), so Cargo's convention is exercised and asserted: the tool is
+       invoked as `<tool> oxfixture …`, refuses any other first argument, and
+       records that exact argv before it calls the inherited `$CARGO build`.
     6. owned images: every attach goes through `attach_image(..., owners=True)`
        and `owners_honored` observes the mount read-only; the product's own
        `pool register-removable` is the second control, since it refuses an
@@ -3788,6 +3892,10 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
        `OXIDE_TASK_SCRATCH_ROOT` and the gate/release paths are fixed names
        inside it; no fixture or tool calls `mktemp`.
     """
+    # oxide#164 review: any command result that carries Oxide's own
+    # unconfirmed-closure report stops the collection; the group's custody is
+    # unknown, so no later case may run beside it.
+    guard_writer_custody(proof)
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     collection.source = source
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
@@ -4299,6 +4407,10 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         )
         try:
             wait_for(f"{gate}.started", "15 the gated tool started")
+            # A `dash` in a non-foreground process group starts with SIGINT
+            # ignored, so the fixture publishes `armed` only after installing its
+            # trap; signalling before that window would be silently dropped.
+            wait_for(f"{gate}.armed", "15 the gated tool armed its interrupt trap")
             exec_child.send_signal(signal.SIGINT)
             # The leader exits on the forwarded signal; the surviving group member
             # ignores it, so the exec process must still be running and `status`
@@ -4602,6 +4714,399 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         )
         phase(proof, "after the deleted target recreation")
 
+    def case_21() -> None:
+        # 21 (oxide#164): an external Cargo subcommand is Cargo running
+        # `cargo-<name>`, which is exactly what `oxide exec -- cargo <name>`
+        # runs, so a profile checkout derives its member set from the receipt
+        # instead of refusing. The shared key is proved positively: the exec
+        # derivation warms the slot first, then the external subcommand must
+        # reuse that exact slot warm.
+        external = fresh_checkout(proof, root, "exec-external")
+        code, _, stderr = proof.oxide(["build"], "21 external fixture converts", external)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        external_root = expect_profile_layout(pool, mount, external, "21 conversion")
+        external_debug = member_link_target(external, "debug")
+        external_release = member_link_target(external, "release")
+        external_receipt = read_bytes(receipt_file(pool, external))
+        code, _, stderr = proof.oxide(
+            ["exec", "--", "/usr/bin/true"], "21 warm the exec derivation's key", external
+        )
+        expect(code == 0, stderr)
+        exec_slot, _ = slot_state(stderr)
+        # Remove the first build's binary, so the external tool's own nested
+        # `$CARGO build` is what has to recreate it through the member link.
+        os.remove(os.path.join(external_root, "debug", "poutputs"))
+        tool_marker = os.path.join(root, "external-oxfixture-argv")
+        external_env = {
+            **proof.env,
+            "PATH": tools + os.pathsep + proof.env.get("PATH", ""),
+            "OXIDE_EXTERNAL_MARKER": tool_marker,
+        }
+        code, _, stderr = oxide_env(
+            proof,
+            ["oxfixture"],
+            "21 external subcommand in a profile checkout",
+            external,
+            external_env,
+        )
+        expect(code == 0, stderr)
+        expect(
+            os.path.isfile(tool_marker) and read_bytes(tool_marker) == b"oxfixture",
+            "21: the external tool did not run with Cargo's own external argv: "
+            f"{read_bytes(tool_marker) if os.path.isfile(tool_marker) else 'no recorded argv'}",
+        )
+        expect(
+            member_link_target(external, "debug") == external_debug
+            and member_link_target(external, "release") == external_release,
+            "21: the external subcommand relinked a member",
+        )
+        expect(
+            os.path.isfile(os.path.join(external_root, "debug", "poutputs")),
+            "21: the external tool's build is not in the owned debug member",
+        )
+        local_tool_dir = os.path.join(external, "target", "oxfixture")
+        expect(
+            os.path.isdir(local_tool_dir) and not os.path.islink(local_tool_dir),
+            "21: the tool's non-member directory is not a real local directory",
+        )
+        expect(
+            read_bytes(os.path.join(local_tool_dir, "out")) == b"local",
+            "21: the tool's local write was lost",
+        )
+        expect(
+            not os.path.exists(os.path.join(external_root, "oxfixture")),
+            "21: a non-member tool directory reached the owned root",
+        )
+        expect(
+            read_bytes(receipt_file(pool, external)) == external_receipt,
+            "21: the external subcommand changed the receipt",
+        )
+        external_slot, external_state = slot_state(stderr)
+        expect(
+            external_slot == exec_slot and external_state == "warm",
+            f"21: the external subcommand did not share exec's key: {external_slot} "
+            f"{external_state} (exec {exec_slot})\n{stderr}",
+        )
+        # The brief's tool-directory notice: the tool created `target/oxfixture`,
+        # a directory that is not a profile member, so the product reports it
+        # once, naming only that directory, and never places it.
+        tool_notices = [
+            line for line in stderr.splitlines() if "tool directories kept local" in line
+        ]
+        expect(
+            len(tool_notices) == 1,
+            f"21: the tool-directory notice is not printed exactly once: {tool_notices}",
+        )
+        expect(
+            "oxfixture" in tool_notices[0]
+            and "debug" not in tool_notices[0]
+            and "release" not in tool_notices[0],
+            f"21: the tool-directory notice names the wrong directory: {tool_notices[0]}",
+        )
+        expect(
+            not [line for line in stderr.splitlines() if "and are used locally" in line],
+            f"21: a fully placed checkout reported an unplaced member: {stderr}",
+        )
+        phase(proof, "after the external subcommand")
+
+    def case_22() -> None:
+        # 22 (oxide#164): the one bounded notice for an unplaced member is the
+        # existing bind report for a receipt-RECORDED real member, reached the
+        # way the product reaches it: detach restores real empty members and
+        # keeps their unselected placements, content is written, and the
+        # explicit re-adopt keeps that nonempty member real. The tool's own
+        # directory is the SEPARATE bounded tool-directory notice and is never
+        # named by the unplaced-member line.
+        unplaced = fresh_checkout(proof, root, "exec-external-real-member")
+        code, _, stderr = proof.oxide(["build"], "22 convert the notice fixture", unplaced)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        expect_profile_layout(pool, mount, unplaced, "22 conversion")
+        code, _, stderr = proof.oxide(
+            ["outputs", "detach"], "22 detach the notice fixture", unplaced
+        )
+        expect(code == 0, stderr)
+        expect(
+            receipt_state(pool, unplaced) == "detached",
+            "22: the notice fixture did not detach",
+        )
+        local_member = os.path.join(unplaced, "target", "release")
+        expect(
+            os.path.isdir(local_member) and not os.path.islink(local_member),
+            "22: detach did not restore a real release member",
+        )
+        with open(os.path.join(local_member, "local-artifact"), "wb") as handle:
+            handle.write(b"local")
+        code, stdout, stderr = proof.oxide(
+            ["outputs", "adopt"], "22 re-adopt with a real nonempty member", unplaced
+        )
+        expect(code == 0, stdout + stderr)
+        unplaced_root = os.path.dirname(member_link_target(unplaced, "debug"))
+        expect(
+            unplaced_root.startswith(os.path.join(mount, "oxide-outputs") + os.sep),
+            f"22: debug selects {unplaced_root}, not a root on the drive",
+        )
+        expect(
+            os.path.isdir(local_member) and not os.path.islink(local_member),
+            "22: the real member was converted",
+        )
+        unplaced_receipt = read_json(receipt_file(pool, unplaced))
+        expect(
+            unplaced_receipt["layout"] == "profile"
+            and unplaced_receipt["state"] == "committed",
+            f"22: the receipt is not a committed profile receipt: {unplaced_receipt}",
+        )
+        placements = {
+            entry["member"]: entry.get("selected") for entry in unplaced_receipt["links"]
+        }
+        expect(
+            "release" in placements
+            and placements.get("release") is None
+            and isinstance(placements.get("debug"), dict),
+            f"22: the receipt places {unplaced_receipt['links']}",
+        )
+        receipt_before = read_bytes(receipt_file(pool, unplaced))
+        tool_marker = os.path.join(root, "external-oxfixture-real-member-argv")
+        external_env = {
+            **proof.env,
+            "PATH": tools + os.pathsep + proof.env.get("PATH", ""),
+            "OXIDE_EXTERNAL_MARKER": tool_marker,
+        }
+        code, _, stderr = oxide_env(
+            proof,
+            ["oxfixture"],
+            "22 external subcommand with a receipt-recorded real member",
+            unplaced,
+            external_env,
+        )
+        expect(code == 0, stderr)
+        expect(os.path.isfile(tool_marker), "22: the external tool did not run")
+        unplaced_notices = [
+            line for line in stderr.splitlines() if "and are used locally" in line
+        ]
+        expect(
+            len(unplaced_notices) == 1,
+            f"22: the unplaced-member notice is not printed exactly once: {unplaced_notices}",
+        )
+        expect(
+            "release" in unplaced_notices[0],
+            f"22: the notice does not name the receipt's real member: {unplaced_notices[0]}",
+        )
+        expect(
+            "oxfixture" not in unplaced_notices[0],
+            f"22: the notice names a directory the receipt never placed: {unplaced_notices[0]}",
+        )
+        tool_notices = [
+            line for line in stderr.splitlines() if "tool directories kept local" in line
+        ]
+        expect(
+            len(tool_notices) == 1,
+            f"22: the tool-directory notice is not printed exactly once: {tool_notices}",
+        )
+        expect(
+            "oxfixture" in tool_notices[0] and "release" not in tool_notices[0],
+            f"22: the tool-directory notice names the wrong directory: {tool_notices[0]}",
+        )
+        expect(
+            os.path.isfile(os.path.join(unplaced_root, "debug", "poutputs")),
+            "22: the external tool's build is not in the owned debug member",
+        )
+        tool_dir = os.path.join(unplaced, "target", "oxfixture")
+        expect(
+            os.path.isdir(tool_dir)
+            and not os.path.islink(tool_dir)
+            and os.path.isfile(os.path.join(tool_dir, "out")),
+            "22: the tool's own directory is not a real local directory",
+        )
+        expect(
+            not os.path.exists(os.path.join(unplaced_root, "oxfixture")),
+            "22: a tool directory the receipt never placed reached the owned root",
+        )
+        expect(
+            read_bytes(os.path.join(local_member, "local-artifact")) == b"local",
+            "22: the real member's content changed",
+        )
+        expect(
+            os.path.isdir(local_member) and not os.path.islink(local_member),
+            "22: the real member became a link",
+        )
+        expect(
+            read_bytes(receipt_file(pool, unplaced)) == receipt_before,
+            "22: the external subcommand changed the receipt",
+        )
+        phase(proof, "after the unplaced-member notice")
+
+    def case_23() -> None:
+        # 23 (oxide#164): the external subcommand is unchanged in a whole-target
+        # checkout, and the derivation's foreign-member refusal is preserved
+        # before the tool runs.
+        legacy = fresh_checkout(proof, root, "external-whole-target")
+        legacy_root = legacy_whole_target(
+            proof, pool, mount, legacy, "23 external whole-target fixture"
+        )
+        legacy_target = os.path.join(legacy, "target")
+        legacy_receipt = read_bytes(receipt_file(pool, legacy))
+        expect(
+            not os.path.exists(os.path.join(legacy_target, "debug", "poutputs")),
+            "23: the whole-target fixture already built its binary",
+        )
+        tool_marker = os.path.join(root, "external-oxfixture-whole-target-argv")
+        external_env = {
+            **proof.env,
+            "PATH": tools + os.pathsep + proof.env.get("PATH", ""),
+            "OXIDE_EXTERNAL_MARKER": tool_marker,
+        }
+        code, _, stderr = oxide_env(
+            proof,
+            ["oxfixture"],
+            "23 external subcommand on a whole-target checkout",
+            legacy,
+            external_env,
+        )
+        expect(code == 0, stderr)
+        expect(
+            os.path.islink(legacy_target) and os.readlink(legacy_target) == legacy_root,
+            "23: the external subcommand replaced or relinked the whole target",
+        )
+        expect(
+            os.path.isfile(os.path.join(legacy_target, "debug", "poutputs")),
+            "23: the external tool built nothing through the whole-target link",
+        )
+        expect(
+            read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
+            "23: the external subcommand rewrote the whole-target receipt",
+        )
+        expect(
+            os.path.isfile(tool_marker) and read_bytes(tool_marker) == b"oxfixture",
+            "23: the external tool did not run in the whole-target checkout",
+        )
+        # The refusal half: a profile checkout with a foreign release link
+        # refuses before the tool runs.
+        foreign = fresh_checkout(proof, root, "external-foreign")
+        code, _, stderr = proof.oxide(["build"], "23 foreign fixture converts", foreign)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        expect_profile_layout(pool, mount, foreign, "23 adoption")
+        outside = os.path.join(root, "outside-external")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "sentinel"), "wb") as handle:
+            handle.write(b"foreign")
+        foreign_debug = member_link_target(foreign, "debug")
+        foreign_receipt = read_bytes(receipt_file(pool, foreign))
+        os.remove(os.path.join(foreign, "target", "release"))
+        os.symlink(outside, os.path.join(foreign, "target", "release"))
+        if os.path.exists(tool_marker):
+            os.remove(tool_marker)
+        code, _, stderr = oxide_env(
+            proof,
+            ["oxfixture"],
+            "23 external subcommand against a foreign member link",
+            foreign,
+            external_env,
+        )
+        expect(
+            code != 0,
+            f"23: an external subcommand was accepted through a foreign member link\n{stderr}",
+        )
+        expect("target/release" in stderr, stderr)
+        expect("oxide outputs adopt" in stderr, stderr)
+        expect(
+            not os.path.exists(tool_marker),
+            "23: the external tool ran through a refused layout",
+        )
+        expect(
+            read_bytes(os.path.join(outside, "sentinel")) == b"foreign",
+            "23: the foreign referent mutated",
+        )
+        expect(
+            member_link_target(foreign, "debug") == foreign_debug,
+            "23: a refused external subcommand relinked debug",
+        )
+        expect(
+            read_bytes(receipt_file(pool, foreign)) == foreign_receipt,
+            "23: a refused external subcommand changed the receipt",
+        )
+        phase(proof, "after the external whole-target and refusal controls")
+
+    def case_24() -> None:
+        # 24 (oxide#164): a whole-target checkout whose own root is gone plans a
+        # FUTURE root, and binding accepts that plan only through the exact
+        # reservation its slot was keyed with (#117). A derived command must
+        # therefore still reserve: skipping it because it derives refuses the
+        # first whole-target fallback with no nonce.
+        #
+        # The checkout-local fallback root is only created when Git ignores it
+        # (oxide#125), so this fixture states both rules its two layouts need.
+        future = fresh_checkout(
+            proof, root, "external-future-root", ignore="/target\n/.oxide-outputs/\n"
+        )
+        future_root = legacy_whole_target(
+            proof, pool, mount, future, "24 future-root fixture"
+        )
+        future_target = os.path.join(future, "target")
+        expect(
+            os.path.islink(future_target) and os.readlink(future_target) == future_root,
+            "24: the fixture's target is not the whole-target link",
+        )
+        tool_marker = os.path.join(root, "external-oxfixture-future-root-argv")
+        external_env = {
+            **proof.env,
+            "PATH": tools + os.pathsep + proof.env.get("PATH", ""),
+            "OXIDE_EXTERNAL_MARKER": tool_marker,
+        }
+        volume_uuid = real_uuid(pool)
+        force_detach(proof, os.path.join(root, "volume.sparseimage"), mount, volume_uuid)
+        try:
+            if os.path.exists(tool_marker):
+                os.remove(tool_marker)
+            code, _, stderr = oxide_env(
+                proof,
+                ["oxfixture"],
+                "24 external subcommand onto a future whole-target root",
+                future,
+                external_env,
+            )
+            expect(
+                code == 0,
+                "24: the first whole-target fallback refused (a derived command "
+                f"skipped its reservation): {stderr}",
+            )
+            local_root = os.path.join(future, ".oxide-outputs", "local")
+            expect(
+                os.path.isdir(local_root) and not os.path.islink(local_root),
+                "24: the fallback created no local root",
+            )
+            expect(
+                os.path.islink(future_target)
+                and os.path.realpath(future_target) == os.path.realpath(local_root),
+                "24: the whole-target link does not select the local fallback",
+            )
+            expect(
+                os.path.isfile(os.path.join(future_target, "debug", "poutputs")),
+                "24: the external tool built nothing through the fallback root",
+            )
+            expect(os.path.isfile(tool_marker), "24: the external tool did not run")
+            future_receipt = read_json(receipt_file(pool, future))
+            expect(
+                future_receipt["state"] == "committed",
+                f"24: the receipt is {future_receipt['state']}",
+            )
+            expect(
+                future_receipt.get("reserved") is None,
+                "24: the future root's reservation was not consumed by the transition",
+            )
+            selected = (future_receipt.get("links") or [{}])[0].get("selected") or {}
+            expect(
+                str(selected.get("root", "")).startswith(future),
+                f"24: the receipt does not select the local fallback root: {future_receipt['links']}",
+            )
+        finally:
+            mounted = attach_image(proof, root, name, owners=True)
+            expect(
+                mounted == mount,
+                f"24: the scratch volume re-attached at {mounted}, not {mount}",
+            )
+            owners_honored(proof, mount, "24 re-attach")
+        phase(proof, "after the future whole-target root")
+
     bodies = {
         "s4b": case_s4b,
         "01": case_01,
@@ -4623,6 +5128,10 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         "15": case_15,
         "19": case_19,
         "20": case_20,
+        "21": case_21,
+        "22": case_22,
+        "23": case_23,
+        "24": case_24,
     }
     expect(
         sorted(bodies) == sorted(case for case, _requires, _text in EXEC_CASES),

@@ -32,14 +32,21 @@ Cooperative only: a tool that sets its own `CARGO_TARGET_DIR`, switches
 workspace or toolchain, or daemonizes escapes Oxide.
 
 A checkout whose outputs Oxide places at profile members (`target/debug`,
-`target/release`, `target/<triple>/debug`, `target/<triple>/release`) refuses a
-tool that does not say which members it writes. Declare the tool's complete
-profile-output set with `--output`, repeatable: `oxide exec --output debug --
-npm run tauri build`. A tool that passes its own `--target` needs the matching
-`<triple>/debug` or `<triple>/release` declaration in that project's selector.
-Real documentation and tool directories (such as `target/doc`) are outside the
-declared set. `oxide outputs adopt` selects that layout explicitly and
-`oxide outputs detach` returns the checkout to real directories; a checkout
+`target/release`, `target/<triple>/debug`, `target/<triple>/release`) uses those
+members for `oxide exec` and for external subcommands such as `oxide nextest` or
+`oxide llvm-cov`: their member set is derived from the checkout's committed
+placement (the receipt), so they run without `--output` and without guessing a
+profile. Declare the set explicitly only to place a member the checkout does not
+already place (a custom profile directory or a triple it has never built),
+repeatable: `oxide exec --output debug -- npm run tauri build`. A tool that
+passes its own `--target` needs the matching `<triple>/debug` or
+`<triple>/release` declaration in that project's selector. A tool's own
+directory that is not a profile member — `target/doc`, or `target/nextest` for
+nextest — stays a real local directory and is not placed; Oxide reports it once,
+by name, in its `tool directories kept local` line, and never walks it. A member
+the receipt records as a real directory is kept local and reported once in its
+own unplaced-member line. `oxide outputs adopt` selects that layout explicitly
+and `oxide outputs detach` returns the checkout to real directories; a checkout
 that has not been converted keeps the whole-target layout.
 
 Plain `cargo` still works but builds privately and wastes space;
