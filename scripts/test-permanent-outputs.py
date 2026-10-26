@@ -515,12 +515,8 @@ def run(proof: Proof, repo: str) -> None:
         "a refused adopt created the local root",
     )
 
-    # Premise 6: this proof's own image is attached with filesystem owners on
-    # and observed read-only; the product registration that follows is the
-    # second control (it refuses an ignore-ownership mount).
-    mounted = attach_image(proof, root, name, owners=True)
+    mounted = attach_image(proof, root, name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
-    owners_honored(proof, mount, "exec-inference attach")
     code, stdout, stderr = proof.oxide(
         [
             "pool",
@@ -2813,8 +2809,12 @@ def exec_run(proof: Proof, repo: str) -> None:
     maker = fresh_checkout(proof, root, "pool-maker")
     code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
     expect(code == 0, stderr)
-    mounted = attach_image(proof, root, name)
+    # Premise 6: this proof's own image is attached with filesystem owners on
+    # and observed read-only; the product registration that follows is the
+    # second control (it refuses an ignore-ownership mount).
+    mounted = attach_image(proof, root, name, owners=True)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
+    owners_honored(proof, mount, "exec-inference attach")
     code, stdout, stderr = proof.oxide(
         [
             "pool",
