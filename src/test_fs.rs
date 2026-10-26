@@ -264,3 +264,45 @@ pub(crate) fn run_before_unlink() {
         action();
     }
 }
+
+thread_local! {
+    static BEFORE_REPAIR: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside the lease deletion, immediately before an
+/// unreadable owned directory's permission repair. This is how a unit test
+/// rebinds that name at exactly the repair boundary the no-follow rule has to
+/// survive.
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct BeforeRepairGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn before_repair(action: impl FnOnce() + 'static) -> BeforeRepairGuard {
+    BEFORE_REPAIR.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping before-repair injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    BeforeRepairGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for BeforeRepairGuard {
+    fn drop(&mut self) {
+        BEFORE_REPAIR.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed repair action, if any.
+pub(crate) fn run_before_repair() {
+    let action = BEFORE_REPAIR.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}

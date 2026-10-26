@@ -3353,3 +3353,83 @@ fn an_owned_write_only_directory_is_still_deleted_whole() {
     remove_tree_owned(fixture.path(), &slot).expect("owned write-only tree is removed");
     assert!(!slot.exists(), "the whole slot is gone");
 }
+
+/// The no-follow permission repair, driven through the real lease deletion
+/// path: an owned unreadable directory is rebound to a symlink at exactly the
+/// repair boundary, and the repair refuses instead of chmodding the referent.
+#[test]
+fn a_rebound_repair_target_is_refused_and_its_referent_is_untouched() {
+    let fixture = Fixture::new("repair-rebind");
+    let outside = fixture.dir("outside");
+    let referent = outside.join("referent");
+    fs::create_dir(&referent).expect("referent");
+    fs::set_permissions(&referent, fs::Permissions::from_mode(0o000)).expect("referent mode");
+    let slot = fixture.dir("slot");
+    let locked = slot.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
+
+    let (slot_path, locked_path, referent_path) = (slot.clone(), locked.clone(), referent.clone());
+    let _rebind = crate::test_fs::before_repair(move || {
+        fs::rename(slot_path.join("locked"), slot_path.join("locked-moved")).expect("rename away");
+        symlink(&referent_path, &locked_path).expect("replacement link");
+    });
+    // The deletion refuses: the repair's no-follow open sees a link, not the
+    // verified directory.
+    assert!(remove_tree_owned(fixture.path(), &slot).is_err());
+    assert_eq!(
+        fs::symlink_metadata(&referent)
+            .expect("referent metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o000,
+        "the referent's mode changed through the repair"
+    );
+    assert!(
+        fs::symlink_metadata(slot.join("locked"))
+            .expect("replacement link kept")
+            .file_type()
+            .is_symlink(),
+        "the replacement link is untouched"
+    );
+    fs::set_permissions(&referent, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
+    fs::set_permissions(slot.join("locked-moved"), fs::Permissions::from_mode(0o700))
+        .expect("fixture cleanup");
+}
+
+/// The falsifying control for that test: the *following* repair this code used
+/// to perform, applied to the same raced state, does chmod the out-of-tree
+/// referent. The no-follow refusal above is therefore not vacuous.
+#[test]
+fn the_previous_following_repair_would_have_chmodded_the_referent() {
+    let fixture = Fixture::new("repair-falsification");
+    let outside = fixture.dir("outside");
+    let referent = outside.join("referent");
+    fs::create_dir(&referent).expect("referent");
+    fs::set_permissions(&referent, fs::Permissions::from_mode(0o000)).expect("referent mode");
+    let slot = fixture.dir("slot");
+    let locked = slot.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
+
+    // Exactly the raced state: the name is rebound to a link between the entry
+    // being verified and the repair.
+    fs::rename(&locked, slot.join("locked-moved")).expect("rename away");
+    symlink(&referent, &locked).expect("replacement link");
+    // The old repair was `fs::set_permissions(path, mode | 0o700)`, which
+    // follows a link at that path.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("old repair");
+    assert_eq!(
+        fs::symlink_metadata(&referent)
+            .expect("referent metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "the falsifying control did not reproduce the out-of-tree chmod"
+    );
+    fs::set_permissions(&referent, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
+    fs::set_permissions(slot.join("locked-moved"), fs::Permissions::from_mode(0o700))
+        .expect("fixture cleanup");
+}

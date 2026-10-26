@@ -836,6 +836,10 @@ fn remove_tree_owned_at(
     let child = match open_directory_at(parent, name) {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // The repair boundary: a replacement here must be refused, never
+            // repaired through its name.
+            #[cfg(test)]
+            crate::test_fs::run_before_repair();
             // A search-only descriptor of this very entry, its identity
             // revalidated before the repair: no path and no link is involved,
             // so an out-of-tree referent can never be chmodded.

@@ -42,7 +42,9 @@ after the caller's listing, before the removal:
   bound is used up and the deletion stays pending; never a success.
 - `prune_metadata`: one owned 128 MiB APFS image, registered as the permanent
   outputs drive, with one real private Git checkout on it (ignored `target`)
-  whose first build is asserted to have adopted an owned root and member link.
+  whose first build is asserted to have adopted an owned root into a real
+  `target` directory, with the committed member links the pool-owned registry
+  (`<pool>/oxide-managed/outputs/registry.json`) names for that root.
   The checkout is then removed and `oxide outputs prune` runs with exactly its
   preview plan: the deletion completes, no quarantined leaf is left, the live
   registry keeps no intent for that root and no row selects it.
@@ -70,8 +72,12 @@ Diagnostic safety (`--diagnostic`): only a *recoverable oracle* failure is
 recorded and followed by the next independent case. An unknown writer, device,
 custody, detach or deadline outcome aborts the whole collection immediately,
 retains every image backing and its custody record, and writes a bounded
-`qualified: false` receipt with reached, completed, failed, skipped and
-unexecuted cases plus the abort reason. `subprocess` timeouts are unknown
+`qualified: false` receipt. The receipt covers setup and staging failures too,
+records the first fault and a per-case reason, and lists reached, completed,
+failed, skipped and unexecuted cases. Unknown journal or receipt state (an
+absent, unreadable, incomplete or malformed pool-owned registry, or an intent
+count other than exactly one for the recorded quarantine) aborts; it is never
+counted as a recoverable oracle failure. `subprocess` timeouts are unknown
 closure, never a recoverable failure.
 
 Nine-premise checklist (docs/knowledge/contracts/workflow.md
@@ -100,8 +106,13 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    attaches it with `hdiutil attach -owners on`, parses the raw plist and
    requires exactly one mounted entity whose mount point is this run's expected
    `/Volumes/<name>` and whose device entry is a block device matching the
-   mount's `st_dev`; detach is ordinary only, and the backing is removed only
-   after the mount and device are positively gone.
+   mount's `st_dev`. Before detaching it revalidates that attachment (the mount
+   is a real directory on that recorded device, the device entry is the same
+   block device), and after detaching it accepts absence only from `ENOENT`:
+   a failed metadata read is unknown, our device still mounted is unknown, and
+   only a *different* volume at the same path is recorded as reuse. Detach is
+   ordinary only, and the backing is removed only after the device entry is
+   positively gone.
 7. compiler flags: `RUSTFLAGS` is frozen for staging and every fixture child and
    `CARGO_ENCODED_RUSTFLAGS` is removed everywhere.
 8. temporary storage: scratch and `TMPDIR`/`TMP`/`TEMP` come from the
@@ -117,7 +128,6 @@ import sys
 
 sys.dont_write_bytecode = True
 
-import glob
 import hashlib
 import json
 import os
@@ -136,6 +146,8 @@ RESERVE = "16MiB"
 IMAGE_CAP = "64MiB"
 SHUTDOWN_MARGIN_SECONDS = 25
 MUTED = ("OXIDE_", "XDG_", "CARGO_", "GIT_", "RUSTUP_", "RUSTC", "RUSTFLAGS")
+MANAGED_NAME = "oxide-managed"
+REGISTRY_RELATIVE = ("outputs", "registry.json")
 TERMINAL_PHASES = {"deleted", "resolved"}
 UNFINISHED_PHASES = {"intent", "renamed", "deleting", "marker_last"}
 CRATE = {
@@ -281,6 +293,20 @@ def run(command: list, *, cwd: str, env: dict, timeout: float = 120.0):
     except subprocess.TimeoutExpired:
         # A child that outlived its bound has unknown closure: never continue.
         unknown(f"child {command[0]} timed out after {bound:.0f}s; closure is unknown")
+
+
+def lstat_state(path: str) -> tuple[str, object]:
+    """`present`, `absent` (ENOENT: certain) or `error` (metadata unknown).
+
+    `os.path.exists` collapses every error into "absent", which would let a
+    failed metadata read pass for positive absence. This never does.
+    """
+    try:
+        return "present", os.lstat(path)
+    except FileNotFoundError:
+        return "absent", None
+    except OSError as error:
+        return "error", error
 
 
 def git(env: dict, cwd: str, *args: str):
@@ -443,20 +469,30 @@ def require_fired(case: str, mark: int, kind: str) -> None:
 
 
 def registry(env: dict) -> tuple[str, dict]:
-    """The internal live registry this fixture's private store wrote."""
-    matches = glob.glob(
-        os.path.join(env["HOME"], "**", "outputs", "registry.json"), recursive=True
-    )
-    if len(matches) != 1:
-        fail(f"the fixture left {len(matches)} registries, expected one: {matches}")
-    path = matches[0]
+    """The pool-owned live registry: `<pool>/oxide-managed/outputs/registry.json`.
+
+    This is the control directory the product itself reads and writes
+    (`prune::registry_path`), not a guessed path under the private HOME. An
+    absent, unreadable, incomplete or oddly shaped document is unknown journal
+    state: the collection aborts rather than treating it as an oracle failure.
+    """
+    control = os.path.join(env["OXIDE_POOL"], MANAGED_NAME)
+    path = os.path.join(control, *REGISTRY_RELATIVE)
+    state, _ = lstat_state(path)
+    if state == "absent":
+        unknown(f"the pool-owned registry {path} is missing; journal state is unknown")
+    if state == "error":
+        unknown(f"the pool-owned registry {path} cannot be inspected; journal state is unknown")
     try:
         with open(path, encoding="utf-8") as handle:
             document = json.load(handle)
-    except Exception as error:  # noqa: BLE001 - one bounded failure line
-        fail(f"the fixture registry is unreadable ({error!r})")
-    if document.get("complete") is not True:
-        fail("the fixture registry is not complete")
+    except Exception as error:  # noqa: BLE001 - unreadable journal state
+        unknown(f"the pool-owned registry {path} is unreadable ({error!r})")
+    if not isinstance(document, dict) or document.get("complete") is not True:
+        unknown(f"the pool-owned registry {path} is not a complete document")
+    for key in ("rows", "intents"):
+        if document.get(key) is not None and not isinstance(document.get(key), list):
+            unknown(f"the pool-owned registry {path} has a malformed {key} list")
     return path, document
 
 
@@ -465,11 +501,28 @@ def intent_for(env: dict, leaf: str) -> tuple[dict, dict]:
     intents = [
         intent
         for intent in document.get("intents") or []
-        if intent.get("quarantine") == leaf
+        if isinstance(intent, dict) and intent.get("quarantine") == leaf
     ]
     if len(intents) != 1:
-        fail(f"the registry holds {len(intents)} intents for {leaf}, expected one")
+        unknown(f"the registry holds {len(intents)} intents for {leaf}, expected exactly one")
     return document, intents[0]
+
+
+def selected_members(document: dict, root_path: str) -> list:
+    """The committed member links the registry says select this root."""
+    return sorted(
+        {
+            row.get("member")
+            for row in document.get("rows") or []
+            if isinstance(row, dict)
+            and row.get("root") == root_path
+            and row.get("selected") is True
+            and row.get("pending") is not True
+            and row.get("pruning") is None
+            and isinstance(row.get("member"), str)
+            and row.get("member")
+        }
+    )
 
 
 def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
@@ -638,13 +691,51 @@ class ImageCustody:
         )
         return mount
 
+    def verify_owned_attachment(self) -> None:
+        """Revalidate this run's attachment before detaching it.
+
+        The mount must still be *our* mounted directory (its `st_dev` equals the
+        device recorded at attach) and its device entry must still be the same
+        block device. A metadata read that fails is unknown, never absence.
+        """
+        mount_state, mount_facts = lstat_state(self.mount)
+        device_state, device_facts = lstat_state(self.device_entry)
+        if mount_state == "error":
+            unknown(
+                f"{self.case}: cannot read the attachment's mount {self.mount} ({mount_facts}); retained"
+            )
+        if device_state == "error":
+            unknown(
+                f"{self.case}: cannot read the attachment's device entry {self.device_entry} "
+                f"({device_facts}); retained"
+            )
+        if mount_state != "present" or device_state != "present":
+            unknown(
+                f"{self.case}: the owned attachment is no longer present "
+                f"(mount {mount_state}, device {device_state}); retained"
+            )
+        if stat.S_ISLNK(mount_facts.st_mode) or not stat.S_ISDIR(mount_facts.st_mode):
+            unknown(f"{self.case}: {self.mount} is not a mounted directory; retained")
+        if mount_facts.st_dev != self.device:
+            unknown(
+                f"{self.case}: the mount {self.mount} is device {mount_facts.st_dev}, "
+                f"not our attachment {self.device}; retained"
+            )
+        if not stat.S_ISBLK(device_facts.st_mode) or device_facts.st_rdev != self.device:
+            unknown(
+                f"{self.case}: the device entry {self.device_entry} no longer binds our "
+                f"device {self.device}; retained"
+            )
+        self.write("attachment-revalidated", device=self.device)
+
     def detach(self) -> None:
         """Ordinary detach only, then positive device/mount absence, then the
-        backing. Never forced, never retried."""
+        backing. Never forced, never retried, never inferred from a swallowed
+        error."""
         if self.mount is None:
             self.write("detach-unnecessary")
             return
-        attached = os.path.isdir(self.mount) and os.path.exists(self.device_entry)
+        self.verify_owned_attachment()
         result = run(
             ["hdiutil", "detach", self.mount],
             cwd="/",
@@ -654,12 +745,27 @@ class ImageCustody:
         if result.returncode:
             self.write("detach-failed", stderr=result.stderr[-400:], retained=True)
             unknown(f"{self.case}: the ordinary detach of {self.mount} failed; retained")
-        if os.path.exists(self.mount) or os.path.exists(self.device_entry):
-            self.write("detach-unproven", retained=True)
+        mount_state, mount_facts = lstat_state(self.mount)
+        device_state, device_facts = lstat_state(self.device_entry)
+        if mount_state == "error" or device_state == "error":
+            self.write("detach-unreadable", retained=True)
             unknown(
-                f"{self.case}: the mount or its device entry is still present after detach; retained"
+                f"{self.case}: cannot prove absence after detach "
+                f"(mount {mount_state}/{mount_facts}, device {device_state}/{device_facts}); retained"
             )
-        self.write("detached", previously_attached=attached)
+        if device_state == "present":
+            self.write("detach-unproven", device_still_present=True, retained=True)
+            unknown(
+                f"{self.case}: the device entry {self.device_entry} is still present after detach; retained"
+            )
+        if mount_state == "present":
+            if mount_facts.st_dev == self.device:
+                self.write("detach-unproven", mount_still_ours=True, retained=True)
+                unknown(f"{self.case}: our mount {self.mount} is still attached; retained")
+            # A different volume took the path: our attachment is positively
+            # gone, and that observation is recorded rather than assumed.
+            self.write("mount-path-reused", device=mount_facts.st_dev)
+        self.write("detached")
         os.unlink(self.backing)
         self.write("backing-removed")
 
@@ -668,7 +774,13 @@ class ImageCustody:
 
 
 def adopt_and_assert(oxide: str, env: dict, checkout: str, mount: str) -> tuple:
-    """Build the fresh Git checkout and assert the conversion really happened."""
+    """Build the fresh Git checkout and assert the conversion really happened.
+
+    The profile layout publishes owned member links *inside* a real `target`
+    directory (oxide#160), so the oracle asks the committed registry which
+    members this root selected and then requires each of those links to resolve
+    into that root. It never assumes a whole-target `target` symlink.
+    """
     built = run([oxide, "check"], cwd=checkout, env=env)
     if built.returncode:
         fail(f"the fixture build on the drive failed: {built.stderr[-1500:]}")
@@ -683,17 +795,24 @@ def adopt_and_assert(oxide: str, env: dict, checkout: str, mount: str) -> tuple:
     if len(roots) != 1:
         fail(f"the build left {len(roots)} owned roots on the drive, expected one: {roots}")
     root_path = os.path.join(outputs, roots[0])
-    link = os.path.join(checkout, "target")
-    if not os.path.islink(link):
-        fail(f"the converted checkout has no owned member link at {link}")
-    target = os.readlink(link)
-    if not target.startswith(root_path):
-        fail(f"the member link {link} points at {target}, not the owned root {root_path}")
+    target = os.path.join(checkout, "target")
+    state, facts = lstat_state(target)
+    if state != "present" or stat.S_ISLNK(facts.st_mode) or not stat.S_ISDIR(facts.st_mode):
+        fail(f"the converted checkout has no real target directory at {target}")
     _, document = registry(env)
-    rows = json.dumps(document.get("rows") or [])
-    if root_path not in rows:
-        fail(f"the committed registry names no row for the adopted root {root_path}")
-    return outputs, root_path
+    members = selected_members(document, root_path)
+    if not members:
+        fail(f"the committed registry names no selected member row for {root_path}")
+    root_real = os.path.realpath(root_path)
+    for member in members:
+        link = os.path.join(target, member)
+        link_state, link_facts = lstat_state(link)
+        if link_state != "present" or not stat.S_ISLNK(link_facts.st_mode):
+            fail(f"the member link {link} is {link_state}, not an owned link")
+        resolved = os.path.realpath(link)
+        if not (resolved == root_real or resolved.startswith(root_real + os.sep)):
+            fail(f"the member link {link} resolves to {resolved}, outside the root {root_path}")
+    return outputs, root_path, members
 
 
 def preview_plan(oxide: str, env: dict, base: str) -> tuple[str, str]:
@@ -739,7 +858,7 @@ def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
             fail(f"{case}: cannot register the owned drive: {register.stderr[-1500:]}")
         checkout = os.path.join(mount, "checkout")
         shutil.copytree(workspace(env, base, "a"), checkout)
-        outputs, root_path = adopt_and_assert(oxide, env, checkout, mount)
+        outputs, root_path, members = adopt_and_assert(oxide, env, checkout, mount)
         # The checkout must be positively gone before the root is eligible.
         shutil.rmtree(checkout)
         if os.path.exists(checkout):
@@ -763,6 +882,7 @@ def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
             real,
             outputs,
             root_path,
+            members,
             quarantined,
             kept_root,
             plan,
@@ -794,6 +914,7 @@ def settle_case(
     real,
     outputs: str,
     root_path: str,
+    members: list,
     quarantined: list,
     kept_root: bool,
     plan: str,
@@ -809,7 +930,7 @@ def settle_case(
         _, document = registry(env)
         if json.dumps(document.get("intents") or []).find(root_path) >= 0:
             fail(f"{case}: the live registry still holds an intent for {root_path}")
-        if root_path in json.dumps(document.get("rows") or []):
+        if selected_members(document, root_path):
             fail(f"{case}: the live registry still selects the pruned root {root_path}")
         require_fired(case, mark, "Metadata")
         return f"{case}: deleted, exit {real.returncode}"
@@ -897,18 +1018,23 @@ def plan() -> int:
     return 0
 
 
-def diagnostic_receipt(reached, completed, failed, skipped, unexecuted, abort) -> str:
+def write_receipt(state: dict) -> str:
+    """One bounded `qualified: false` receipt for every diagnostic outcome,
+    including a setup or staging failure before any case ran."""
     receipt = {
         "proof": "oxide#155-finder-metadata-race",
         "qualified": False,
         "mode": "diagnostic",
-        "reached": reached,
-        "completed": completed,
-        "failed": failed,
-        "skipped": skipped,
-        "unexecuted": unexecuted,
-        "aborted": abort is not None,
-        "abort": abort,
+        "phase": state["phase"],
+        "reached": state["reached"],
+        "completed": state["completed"],
+        "failed": state["failed"],
+        "skipped": state["skipped"],
+        "unexecuted": state["unexecuted"],
+        "reasons": state["reasons"],
+        "first_fault": state["first_fault"],
+        "aborted": state["abort"] is not None,
+        "abort": state["abort"],
     }
     path = os.path.join(evidence_dir(), "finder-metadata-race-diagnostic.json")
     with open(path, "w", encoding="utf-8") as handle:
@@ -926,58 +1052,88 @@ def main(argv: list) -> int:
             fail(f"unknown argument {argv[0]!r}; known: --plan, --diagnostic")
         diagnostic = True
 
-    root = scratch_root()
-    evidence_dir()
-    work_left()
-    oxide = stage(root)
-    print(f"staged oxide from this HEAD: {oxide}", flush=True)
+    state = {
+        "phase": "setup",
+        "reached": [],
+        "completed": [],
+        "failed": [],
+        "skipped": [],
+        "unexecuted": list(CASES),
+        "reasons": {},
+        "first_fault": None,
+        "abort": None,
+    }
 
-    reached, completed, failed, skipped = [], [], [], []
-    abort = None
+    def finish(code: int) -> int:
+        if not diagnostic:
+            return code
+        receipt = write_receipt(state)
+        print(
+            f"diagnostic: qualified=false, phase {state['phase']}, reached "
+            f"{len(state['reached'])}, completed {len(state['completed'])}, failed "
+            f"{len(state['failed'])}, skipped {len(state['skipped'])}, unexecuted "
+            f"{len(state['unexecuted'])}, aborted {state['abort'] is not None}, "
+            f"first fault {state['first_fault']!r}, receipt {receipt}",
+            flush=True,
+        )
+        return code
+
+    # Setup and staging are inside the receipt lifecycle: a failure there is a
+    # recorded diagnostic outcome, never an unrecorded exit.
+    try:
+        root = scratch_root()
+        evidence_dir()
+        work_left()
+        oxide = stage(root)
+    except (Unknown, Recoverable) as error:
+        state["first_fault"] = f"setup: {type(error).__name__}: {error}"
+        if isinstance(error, Unknown):
+            state["abort"] = state["first_fault"]
+        return finish(1)
+    print(f"staged oxide from this HEAD: {oxide}", flush=True)
+    state["phase"] = "body"
+
     for index, case in enumerate(CASES):
-        reached.append(case)
+        state["reached"].append(case)
         try:
             line = (
                 lease_case(oxide, root, case, RACES[case])
                 if case.startswith("lease_")
                 else prune_case(oxide, root, case, RACES[case])
             )
-            completed.append(case)
+            state["completed"].append(case)
             print(line, flush=True)
         except Unknown as error:
-            abort = f"{case}: {type(error).__name__}: {error}"
-            skipped.extend(CASES[index + 1 :])
+            text = f"{case}: {type(error).__name__}: {error}"
+            state["reasons"][case] = text
+            state["first_fault"] = state["first_fault"] or text
+            state["abort"] = text
+            state["skipped"] = list(CASES[index + 1 :])
             break
         except Recoverable as error:
-            text = f"{type(error).__name__}: {error}"
+            text = f"{case}: {type(error).__name__}: {error}"
+            state["reasons"][case] = text
+            state["first_fault"] = state["first_fault"] or text
             if not diagnostic:
                 raise
-            failed.append(case)
+            state["failed"].append(case)
             print(f"{case}: FAILED {text}", flush=True)
         except Exception as error:  # noqa: BLE001 - unknown outcome, never continued
-            abort = f"{case}: unexpected {type(error).__name__}: {error}"
-            skipped.extend(CASES[index + 1 :])
+            text = f"{case}: unexpected {type(error).__name__}: {error}"
+            state["reasons"][case] = text
+            state["first_fault"] = state["first_fault"] or text
+            state["abort"] = text
+            state["skipped"] = list(CASES[index + 1 :])
             break
 
+    state["unexecuted"] = [case for case in CASES if case not in state["reached"]]
+    if state["abort"] is not None and not diagnostic:
+        raise Unknown(state["abort"])
+    if state["failed"] and not diagnostic:
+        raise Recoverable(state["first_fault"])
     if diagnostic:
-        receipt = diagnostic_receipt(
-            reached,
-            completed,
-            failed,
-            skipped,
-            [case for case in CASES if case not in reached],
-            abort,
-        )
-        print(
-            f"diagnostic: qualified=false, reached {len(reached)}, completed "
-            f"{len(completed)}, failed {len(failed)}, skipped {len(skipped)}, "
-            f"aborted {abort is not None}, receipt {receipt}",
-            flush=True,
-        )
-        return 0 if not failed and abort is None else 1
-    if abort is not None:
-        raise Unknown(abort)
-    print(f"proof: {len(completed)} cases passed", flush=True)
+        return finish(0 if not state["failed"] and state["abort"] is None else 1)
+    print(f"proof: {len(state['completed'])} cases passed", flush=True)
     return 0
 
 
