@@ -45,10 +45,13 @@ The focused modes reuse this fixture and staging helpers:
   repository, no Git, an unignored, directory-only, negated or tracked path, a
   Git that does not answer) builds as an ordinary unconverted checkout: a real
   local target, exactly one notice, no receipt, no owned link and no output
-  root. Explicit `oxide outputs adopt` still refuses with nothing changed;
-  corrupt and partially converted state still fails closed; `oxide init` names
-  the exact non-directory rule to add without rewriting any rule. The mode
-  also accepts `--diagnostic` (uncounted keep-going collection).
+  root. An explicit whole-target adoption (a detached whole-target receipt,
+  the same state the automatic conversion would publish) still refuses with
+  nothing changed, while a fresh explicit adopt selects the profile layout
+  whose member paths a directory-only parent rule legitimately covers; corrupt
+  and partially converted state still fails closed; `oxide init` names the
+  exact non-directory rule to add without rewriting any rule. The mode also
+  accepts `--diagnostic` (uncounted keep-going collection).
 
 Not a benchmark, not real-drive qualification and not full QA.
 """
@@ -2483,12 +2486,13 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
     directory-only or already-tracked path, or a Git that does not answer —
     the command is an ordinary unconverted checkout: the build reaches Cargo
     into a real local target, prints exactly one unconverted notice, and
-    writes no receipt, owned link, owned root or downgrade fence. Explicit
-    `oxide outputs adopt` still refuses with the target, receipt and drive
-    roots unchanged; a corrupt receipt and a partially converted checkout
-    still fail closed; and `oxide init` names the exact non-directory rule to
-    add without rewriting any rule. Every case uses its own checkout, so a
-    failure never taints another case's premise.
+    writes no receipt, owned link, owned root or downgrade fence. An explicit
+    whole-target adoption (a detached whole-target receipt, which is the state
+    the automatic conversion publishes) still refuses with the target, receipt
+    bytes and drive roots unchanged; a corrupt receipt and a partially
+    converted checkout still fail closed; and `oxide init` names the exact
+    non-directory rule to add without rewriting any rule. Every case uses its
+    own checkout, so a failure never taints another case's premise.
 
     With `diagnostic` the same cases run keep-going: a recoverable oracle
     failure is recorded and independent cases continue, an unclosed child or
@@ -2572,106 +2576,172 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
         expect(not os.path.exists(receipt_file(pool, checkout)), f"{label}: a receipt was written")
         expect(roots_on(mount) == before, f"{label}: the drive's roots changed")
 
+    def detached_whole_target(name: str) -> str:
+        """An eligible automatic whole-target conversion, then `detach`: a real
+        empty target beside a detached whole-target receipt.
+
+        That is the state an explicit `oxide outputs adopt` converts through
+        the whole-target transition (a fresh checkout's explicit adopt selects
+        the profile layout instead), so it is where the explicit conversion's
+        ignore prerequisite still refuses. The automatic conversion is the
+        only way to publish this state, so it runs while the rule is still
+        eligible."""
+        _, checkout = ignore_fixture(proof, root, name, "/target\n/.oxide-outputs/\n")
+        code, _, stderr = proof.oxide(["build"], f"{name}: eligible automatic conversion", checkout)
+        expect(
+            code == 0 and len(auto_notices(stderr)) == 1,
+            f"{name}: the eligible automatic conversion did not adopt: {stderr}",
+        )
+        code, _, stderr = proof.oxide(["outputs", "detach"], f"{name}: detach", checkout)
+        expect(code == 0, f"{name}: detach refused: {stderr}")
+        target = os.path.join(checkout, "target")
+        expect(
+            os.path.isdir(target) and not os.path.islink(target) and os.listdir(target) == [],
+            f"{name}: detach left no real empty target",
+        )
+        return checkout
+
+    def explicit_adopt_refuses(
+        label: str,
+        checkout: str,
+        reasons: tuple,
+        *,
+        env: dict | None = None,
+        keeps_target: bool = True,
+    ) -> None:
+        """An explicit whole-target adoption still refuses the same answer the
+        automatic conversion treats as ineligibility: the real target, the
+        receipt bytes and the drive's roots are exactly unchanged."""
+        receipt = receipt_file(pool, checkout)
+        before_receipt = read_bytes(receipt)
+        before_roots = roots_on(mount)
+        if env is None:
+            code, stdout, stderr = proof.oxide(["outputs", "adopt"], label, checkout)
+        else:
+            code, stdout, stderr = oxide_env(
+                proof, ["outputs", "adopt"], label, checkout, env
+            )
+        expect(code != 0, f"{label}: explicit adopt did not refuse (exit {code}): {stdout}{stderr}")
+        expect(
+            any(reason in stderr for reason in reasons),
+            f"{label}: unexpected refusal for {reasons}: {stderr}",
+        )
+        expect(
+            "nothing was changed" in stderr.casefold(),
+            f"{label}: the refusal omits the no-change promise: {stderr}",
+        )
+        target = os.path.join(checkout, "target")
+        if keeps_target:
+            expect(
+                os.path.isdir(target) and not os.path.islink(target) and os.listdir(target) == [],
+                f"{label}: the real empty target changed",
+            )
+        else:
+            expect(not os.path.lexists(target), f"{label}: a target appeared")
+        expect(read_bytes(receipt) == before_receipt, f"{label}: the receipt changed")
+        expect(roots_on(mount) == before_roots, f"{label}: the drive's roots changed")
+        return stderr
+
+    def track(checkout: str, relative: str = "target") -> None:
+        """Track `relative` in the index while it is absent from the tree."""
+        with open(os.path.join(checkout, relative), "wb") as handle:
+            handle.write(b"tracked")
+        added = proof.run(["git", "add", "-f", relative], cwd=checkout, timeout=30)
+        expect(added.returncode == 0, f"git add failed: {added.stderr!r}")
+        os.remove(os.path.join(checkout, relative))
+
     def no_repository() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-no-repository", None, git=False)
-        refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
+        ineligible("no Git repository", checkout)
+        detached = detached_whole_target("ai-detached-no-repository")
+        shutil.rmtree(os.path.join(detached, ".git"))
+        explicit_adopt_refuses(
             "no repository: explicit adopt still refuses",
-            ["outputs", "adopt"],
+            detached,
             ("could not confirm",),
         )
-        ineligible("no Git repository", checkout)
 
     def no_git() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-no-git", "/target\n/.oxide-outputs/\n")
         env = dict(proof.env, PATH=private_path(root))
-        refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
+        ineligible("no Git binary on PATH", checkout, env)
+        detached = detached_whole_target("ai-detached-no-git")
+        explicit_adopt_refuses(
             "no Git on PATH: explicit adopt still refuses",
-            ["outputs", "adopt"],
+            detached,
             ("could not confirm", "cannot run git"),
             env=env,
         )
-        ineligible("no Git binary on PATH", checkout, env)
 
     def unignored() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-unignored", "/.oxide-outputs/\n")
-        refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
+        ineligible("an unignored target", checkout)
+        detached = detached_whole_target("ai-detached-unignored")
+        with open(os.path.join(detached, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("/.oxide-outputs/\n")
+        explicit_adopt_refuses(
             "unignored target: explicit adopt still refuses",
-            ["outputs", "adopt"],
+            detached,
             ("does not ignore",),
         )
-        ineligible("an unignored target", checkout)
 
     def directory_only() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-directory-only", "target/\n/.oxide-outputs/\n")
-        refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
-            "directory-only rule: explicit adopt still refuses",
-            ["outputs", "adopt"],
-            ("does not ignore", "matches directories only"),
-        )
         ineligible("a directory-only target rule", checkout)
+        # Detach leaves a real empty target, so Git answers for a *directory*
+        # with the directory-only rule: the reported papercut, and the branch
+        # where Git recognises the rule's form.
+        detached = detached_whole_target("ai-detached-directory-only")
+        with open(os.path.join(detached, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("target/\n/.oxide-outputs/\n")
+        stderr = explicit_adopt_refuses(
+            "directory-only rule: explicit adopt still refuses",
+            detached,
+            ("matches directories only",),
+        )
+        expect(
+            "not `target/`" in stderr and "`/target`" in stderr,
+            f"the refusal did not name the exact non-slash rule: {stderr}",
+        )
 
     def negated() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-negated", "target\n!/target\n/.oxide-outputs/\n")
-        refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
+        ineligible("a negated target rule", checkout)
+        detached = detached_whole_target("ai-detached-negated")
+        with open(os.path.join(detached, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("target\n!/target\n/.oxide-outputs/\n")
+        explicit_adopt_refuses(
             "negated target rule: explicit adopt still refuses",
-            ["outputs", "adopt"],
+            detached,
             ("re-includes",),
         )
-        ineligible("a negated target rule", checkout)
 
     def tracked() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-tracked", "/target\n/.oxide-outputs/\n")
-        with open(os.path.join(checkout, "target"), "wb") as handle:
-            handle.write(b"tracked")
-        added = proof.run(["git", "add", "-f", "target"], cwd=checkout, timeout=30)
-        expect(added.returncode == 0, f"git add failed: {added.stderr!r}")
-        os.remove(os.path.join(checkout, "target"))
-        refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
-            "tracked target path: explicit adopt still refuses",
-            ["outputs", "adopt"],
-            ("already tracks",),
-        )
+        track(checkout)
         ineligible("an already tracked target path", checkout)
+        detached = detached_whole_target("ai-detached-tracked")
+        os.rmdir(os.path.join(detached, "target"))
+        track(detached)
+        explicit_adopt_refuses(
+            "tracked target path: explicit adopt still refuses",
+            detached,
+            ("already tracks",),
+            keeps_target=False,
+        )
 
     def git_timeout() -> None:
         _, checkout = ignore_fixture(proof, root, "ai-slow-git", "/target\n/.oxide-outputs/\n")
-        slow_dir = fake_git(root, "ineligible-timeout", "#!/bin/sh\nexec sleep 30\n")
+        slow_dir = fake_git(root, "ineligible-timeout", "#!/bin/sh\nexec sleep 8\n")
         env = dict(proof.env, PATH=slow_dir + ":" + proof.env["PATH"])
-        refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
+        ineligible("a Git that does not answer in time", checkout, env)
+        detached = detached_whole_target("ai-detached-slow-git")
+        explicit_adopt_refuses(
             "a Git that does not answer in time: explicit adopt still refuses",
-            ["outputs", "adopt"],
+            detached,
             ("did not finish in time",),
             env=env,
         )
-        ineligible("a Git that does not answer in time", checkout, env)
 
     def real_target_opt_out() -> None:
         # The documented per-checkout opt-out: an existing real target is never

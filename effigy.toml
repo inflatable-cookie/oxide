@@ -346,9 +346,10 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # PATH, an unignored, negated, directory-only or already-tracked path, a Git
 # that does not answer) leaves the build an ordinary unconverted checkout: a
 # real local target holding the built binary, exactly one unconverted notice,
-# and no receipt, owned link, owned root or downgrade fence. Explicit adopt
-# still refuses with the target, receipt and drive roots unchanged; a corrupt
-# receipt and a partially converted checkout still fail closed; an existing
+# and no receipt, owned link, owned root or downgrade fence. An explicit
+# whole-target adoption (a detached whole-target receipt) still refuses with the
+# target, receipt bytes and drive roots unchanged; a corrupt receipt and a
+# partially converted checkout still fail closed; an existing
 # real target stays the documented opt-out; and `oxide init` names the exact
 # non-directory rule to add without rewriting any rule. Each case uses its own
 # checkout, so a failure never taints another case's premise. Its case table

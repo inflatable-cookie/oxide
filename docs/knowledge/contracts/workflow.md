@@ -4729,10 +4729,12 @@ no repository, no Git on `PATH`, an unignored path, a directory-only rule, a
 negated rule, an already-tracked path and a Git that does not answer, the
 leased build exits 0 into a real local `target/` holding the built binary,
 prints exactly one unconverted notice and no auto-adopted line, and writes no
-receipt, owned link, owned root or downgrade fence. Explicit
-`oxide outputs adopt` still refuses each class with the target, receipt and
-drive roots unchanged; a corrupt receipt is still an error that creates no
-target; an automatic conversion stopped after its prepared receipt keeps that
+receipt, owned link, owned root or downgrade fence. An explicit whole-target
+adoption — a detached whole-target receipt, the state the automatic conversion
+publishes — still refuses each class with the target, receipt bytes and drive
+roots unchanged; a fresh explicit adopt instead selects the profile layout,
+whose member paths a directory-only parent rule legitimately covers (oxide#133);
+a corrupt receipt is still an error that creates no target; an automatic conversion stopped after its prepared receipt keeps that
 receipt and no link, refuses a replay within a broken rule, and recovers only
 through the documented explicit adopt; an existing real target stays the
 per-checkout opt-out; and `oxide init` names the exact non-directory rule
