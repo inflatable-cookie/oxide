@@ -144,37 +144,57 @@ tool's own request as unobservable within the cooperative boundary.
 
 ### Member derivation
 
-For `oxide exec` with **no** `--output`, Oxide derives one complete member set
-before anything is reserved, keyed or started:
+For `oxide exec` with **no** `--output`, Oxide derives **one keyed member set**
+and separately **classifies** every candidate member-shaped entry. The two sets
+are deliberately different:
 
-```
-derived_members =
-    { m : the committed profile receipt places m }        // Cargo-shaped, durable
-  ∪ { m : a real member-shaped directory exists under target }  // used locally
-```
+- the **keyed plan set** is exactly the receipt's placements (`debug`,
+  `release`, `<triple>/debug`, `<triple>/release`, selected or unselected). It
+  is the only set planned, keyed and bound, it is by construction a **subset of
+  the receipt**, and it never grows during the session;
+- the **classified set** is every candidate member path that exists under
+  `target`. It is read-only validation: it can only **refuse**, never plan, key,
+  convert or grant. A real directory the receipt does not record is local and
+  path-stable, so it is not placed and not keyed.
 
-and then classifies every entry it will touch:
-
-| Live entry at `target/<m>` | Derived plan |
-| --- | --- |
-| owned link to this checkout's root at `<root>/<m>` | planned `selected = that root` (keyed) |
-| owned link to any other destination, an unmarked root, or another checkout's root | **refuse** before Cargo: never followed or replaced |
-| dangling owned link | **refuse** before Cargo, naming `oxide outputs adopt` |
-| real empty or real nonempty directory | planned `selected = None`, used locally, one bounded notice (existing grammar) |
-| regular file or other non-directory entry at a member path | **refuse** before Cargo (`TargetState::Foreign`, `outputs.rs:1395-1396`, the existing planner refusal) |
-| absent | not planned; if the tool creates it, it is real and local |
+| Live entry at a candidate `target/<m>` | Plan | Authority |
+| --- | --- | --- |
+| receipt places `m` as selected; the entry is an owned link to `<root>/<m>` | planned owned link (keyed) | used |
+| receipt places `m` as selected; the entry is anything other than the exact owned link to `<root>/<m>` (missing, dangling, a real directory, another destination, unmarked/foreign) | not planned | **refuse** before Cargo (the existing binding and P4 rules); `exec` follows nothing and replaces nothing |
+| receipt records `m` unselected; the entry is a real directory | planned `selected = None` (keyed `real <m>`) | kept local, one bounded notice (existing grammar) |
+| receipt records `m` unselected; the entry is a link or a file | not planned | **refuse**: it contradicts the receipt |
+| receipt does not record `m`; the entry is a real directory | not planned, not keyed | ignored: local, no authority |
+| receipt does not record `m`; the entry is a link (owned or not) or a file | not planned | **refuse**: a link outside the receipt is a contradiction, and `exec` never writes through a link it does not own (`TargetState::Foreign` for a non-directory, `outputs.rs:1395-1396`) |
+| absent | not planned | if the tool creates it, it is real and local |
 
 Everything not in the table stays untouched: `target` itself, `CACHEDIR.TAG`,
 `.rustc_info.json`, `tmp`, `doc`, `package`, a `<triple>` ancestor directory
 and any entry that is not one of the four member forms.
 
-**Bounded classification.** The member-shaped set is enumerated read-only and
-without a payload walk: `target/debug`, `target/release`, and `target/<e>/debug`
-+ `target/<e>/release` for each existing plain-triple-named directory `e` at the
-top level of `target` (bounded to 32 top-level entries; more than that, and any
-entry whose type or link target cannot be read, is unknown and never
-permission, so the command refuses). No directory is created, no link is
-followed, and the classification writes nothing.
+**Candidate enumeration (the shipped traversal, no payload walk).** Candidate
+member paths are enumerated with the traversal `migration_members` already uses
+for this same job (`src/bin/oxide/outputs.rs:2107-2164`, unit case at
+`:8059-8096`), reused rather than reinvented:
+
+- `debug` and `release` are matched as **member names first**, so a real or
+  linked `target/debug` is never treated as a triple ancestor and its payload is
+  never listed. The order matters: `layout::plain_triple("debug")` is true
+  (`layout.rs:157-164`), so a scan that tested triples first would walk a
+  profile payload;
+- `file_type()` is taken **without following a link**, so a linked entry is
+  never classified as a directory and never descended;
+- only a positively identified plain-triple directory contributes one bounded
+  second component (`debug`, `release`), and the joined name is re-validated by
+  `Member::parse`; there is no third level and no other profile name;
+- the result is sorted, deduplicated and capped (`MAX_RECEIPT_MEMBERS` 32).
+
+This design adds one step, which grants nothing: for each candidate path it
+takes `symlink_metadata` and, for a link, `read_link` — the same nofollow pair
+`link_state` already uses (`outputs.rs:5303-5349`). Reading a link's own text
+and its own metadata is **not** following it: no link *target* is resolved,
+opened, read or descended here. An unreadable entry, a read error and a
+non-directory at a candidate path are unknown, never permission, so the command
+refuses. Nothing is created and nothing is written.
 
 This derivation is *Cargo-derived* in a precise sense: the member names are
 Cargo's own output-directory grammar (`dev`/`test`→`debug`, `release`/`bench`
@@ -208,23 +228,25 @@ binding barriers than this prerequisite needs.
 
 ### Slot key
 
-The derived set renders exactly like any other planned set: one
-`outputs-3 <kind> <root> <volume> g<generation> <member>` line per owned member
-and one `real <member>` line per receipt-recorded local member, sorted. No new
-grammar, no new prefix and no version bump: an `exec` that derives the same set
-a declared or modelled command would declare produces the **same** key and can
-share its warm slot. Whole-target (`outputs-2`) and unconverted keys are
-unchanged; an absent or detached receipt adds no destination lines.
+The keyed set renders exactly like any other planned set: one
+`outputs-3 <nonce> <kind> <root> <volume> g<generation> <member>` line per owned
+member and one `real <member>` line per receipt-recorded unselected member,
+sorted (`destination_facts`, `outputs.rs:5162-5185`). No new grammar, no new
+prefix and no version bump: an `exec` that derives the same set a declared or
+modelled command would declare produces the **same** key and can share its warm
+slot. Whole-target (`outputs-2`) and unconverted keys are unchanged; an absent
+or detached receipt adds no destination lines.
 
 Consequences stated openly:
 
+- The keyed set is the receipt's placements and nothing else, so no exec key
+  depends on what a previous tool run wrote. An unrecorded real member the tool
+  creates stays local; it is not placed, not keyed and not converted, and a
+  later conversion is an explicit adopt or declared route that changes the
+  receipt and therefore the key.
 - A derived `exec` set normally contains the host pair while a modelled command
   keys only the profile it builds, so they do not share slots. That is the
   existing conservatism of the member key, not a new rule.
-- An unrecorded real member directory the tool created is included in the key as
-  `real <member>`, so the command that writes it and the command after it may
-  partition cold once. Conservative, never unsound, and it keeps the derived
-  key identical to the declared key for the same layout.
 - A receipt that places more than eight members cannot be bound by one command
   (`MAX_MEMBERS` 8): the command refuses before Cargo and names
   `oxide outputs detach`. Whether a derived set should ever exceed the declared
@@ -235,22 +257,24 @@ Consequences stated openly:
 Binding is unchanged in substance: under the checkout's binding mutex the
 command validates the exact surviving reservation, the receipt generation, the
 root marker, kind, volume, device and ancestry, and every keyed destination,
-excluding only its own record. The derived plan adds three fail-closed rules,
+excluding only its own record. The classified set adds fail-closed validation,
 all **before** Cargo and before any authority write:
 
-1. an existing member-shaped link that this checkout does not positively own
-   refuses the command (`exec` never writes through a link it does not own, and
-   never removes one);
-2. a member-shaped non-directory entry at a member path refuses;
+1. every planned owned member must already be this checkout's owned link at
+   `<root>/<member>` — binding's existing per-member check, unchanged;
+2. a candidate member path outside the plan that holds any link (owned or not)
+   or a non-directory entry refuses the command, so `exec` never writes through
+   a link it does not own and never removes or replaces one;
 3. a receipt state that is not `Committed` or `Detached` (a prepared, pruning
    or pruned receipt) refuses (existing rule).
 
-`exec` performs **no** reservation (`outputs::reserve` is skipped for a derived
-plan), never relinks, never converts a real directory, never deletes and never
-creates a member: the derived set is a subset of what the receipt already
-commits. There is no new "authority on refusal" path — a refusal leaves the
-link, receipt, root, marker, registry and slot exactly as they were
-(oxide#152's rule).
+`exec` performs **no** reservation (`outputs::reserve` is skipped: the keyed set
+is a subset of the receipt, so no root nonce and no member is new), never
+relinks, never converts a real directory, never deletes and never creates a
+member. The classified set is validation only: it cannot add a member, extend
+the key or authorize a write. There is no new "authority on refusal" path — a
+refusal leaves the link, receipt, root, marker, registry and slot exactly as
+they were (oxide#152's rule).
 
 ### Explicit `--output` (kept)
 
@@ -391,7 +415,7 @@ receipt, root, marker, registry, reservation and slot are unchanged.
 | `target` itself became a link | refuse (unowned/whole-target link in a profile checkout) |
 | member link dangling, wrong destination, unmarked root, another checkout's root | refuse, naming `oxide outputs adopt` |
 | member path holds a file or unknown entry type | refuse |
-| real nonempty member directory appeared between plan and bind | binding refuses "not the keyed placement" |
+| real nonempty member directory appeared between plan and bind at a **planned** member path | binding refuses "not the keyed placement" |
 | `oxide outputs prune` intent unsettled for this checkout | refuse (existing) |
 | unknown writer custody in either pool | refuse any relink or clean for the checkout; `exec` itself only reads and binds |
 | second exec in the same checkout | second-slot rule: own idle compatible slot or a new one; the busy slot is never reused, released or relabelled |
@@ -449,9 +473,11 @@ entry. No code.
 
 **S1: derived exec plan.** Small and reviewable:
 
-1. a receipt-derived member set for `exec` without `--output`, plus the bounded
-   member-shaped classification (all in `outputs.rs`, reusing `link_state`,
-   `Member`, `Declaration`);
+1. a receipt-derived keyed member set for `exec` without `--output`, reusing
+   the shipped `migration_members` traversal and `link_state` for the candidate
+   classification (no new traversal rule, no payload walk, no link target
+   followed), plus `Member`/`Declaration` for the plan. The classification runs
+   for every `exec`; the receipt only decides the keyed set;
 2. `planned_destination` plans nothing (instead of refusing) when a profile
    receipt desires no destination, i.e. detached — modelled commands are
    unaffected because their declarations are never empty;
@@ -506,8 +532,9 @@ whether the derived cap may exceed eight. Both are recorded in
 5. whole-target receipt → `outputs-2` key and the whole-target plan unchanged;
    a declaration is still ignored.
 6. absent receipt → unchanged ephemeral behaviour.
-7. derived set with a foreign member link → refusal naming the path; a
-   counterfactual asserts `link_state` was consulted, not a glob or a guess.
+7. a candidate link outside the receipt (owned or foreign) → refusal naming the
+   path; a candidate real directory outside the receipt is ignored and is not
+   keyed, so the owned/ignored pair is non-vacuous.
 8. member-shaped regular file → refusal.
 9. more than eight receipt members → refusal naming `oxide outputs detach`.
 10. declared `--output` parity: the same input produces a byte-identical
@@ -518,6 +545,14 @@ whether the derived cap may exceed eight. Both are recorded in
 13. the pair (owned member link accepted, foreign member link refused) differs
     only in the link's destination, so it is non-vacuous: deleting the
     classification makes the accepted case fail.
+14. a **real** `target/debug` holding payload, and a **linked** one, are never
+    enumerated as a triple ancestor: no `target/debug/debug` or
+    `target/debug/release` candidate appears and the payload is never listed.
+    This is the ordering/nofollow assertion the shipped
+    `migration_members_discover_only_bounded_triple_pairs` case does not make.
+15. a receipt-recorded unselected member is planned `real <member>`; an
+    unrecorded real member is in neither the plan nor the key.
+16. an owned link at a candidate path the receipt does not place → refusal.
 
 These belong beside the existing `layout.rs` and `outputs.rs` tests, run by
 `effigy test rust`.
@@ -627,9 +662,11 @@ clock, scratch budget or previous allowance transfers from #107, #117, #121,
 2. Does deriving from the committed placement genuinely satisfy "no exec route
    needs `--output`", or does it move the requirement into an implicit
    pre-condition that the reviewer considers a silent weakening?
-3. Is the member-shaped classification bounded and fail-closed enough (unreadable
-   entry, 32 top-level bound, file at a member path), and does it ever follow a
-   link or create something?
+3. Is the candidate classification bounded and fail-closed enough: member names
+   matched before triple descent (so a real `target/debug` payload is never
+   listed), nofollow `file_type` and `read_link` only, unreadable entry →
+   refuse, file at a candidate path → refuse — and does it ever resolve, open or
+   descend a link target?
 4. Is the key treatment right: same grammar, no marker, sharing with an equal
    declared set, and no sharing with a modelled subset — versus a dedicated
    `exec` key marker?
