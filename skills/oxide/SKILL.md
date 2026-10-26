@@ -206,14 +206,18 @@ macOS, and there is no deadline inheritance for nested `oxide` calls.
 - A first conversion (`oxide outputs adopt`, or the automatic one on a fresh
   checkout's first build in permanent mode) publishes the owned
   `<workspace>/target` link only when Git ignores that exact non-directory
-  path. A `target/`, `/target/` or `**/target/` rule ignores directories only
-  and refuses; add `/target` (or `target`), not `target/`, to the repository
-  `.gitignore`. A nested workspace needs its exact repository-relative rule,
-  for example `/rust/target`. A tracked `target`, an unignored or negated
-  path, or a Git decision Oxide cannot confirm (no repository, no `git`, a
-  timeout, an error or a bad answer) also refuse, and nothing changes.
-  Already-created links, `detach`, `status`, `plan` and ordinary builds are
-  unaffected.
+  path. A `target/`, `/target/` or `**/target/` rule ignores directories only;
+  add `/target` (or `target`), not `target/`, to the repository `.gitignore`.
+  A nested workspace needs its exact repository-relative rule, for example
+  `/rust/target`. A tracked `target`, an unignored or negated path, or a Git
+  decision Oxide cannot confirm (no repository, no `git`, a timeout, an error
+  or a bad answer) also leaves an explicit `oxide outputs adopt` refusing with
+  nothing changed. On the automatic conversion the same answer is
+  ineligibility, not a failure: that build keeps its real local `target/`,
+  stays unconverted and prints one notice, so a throwaway stage outside Git
+  needs no preparation. `oxide init` warns with the exact non-directory rule
+  and never rewrites your `.gitignore`. Already-created links, `detach`,
+  `status`, `plan` and ordinary builds are unaffected.
 - A root whose checkout is gone is never cleaned automatically. Inspect it
   with `oxide outputs prune --dry-run`, which prints a bounded preview and its
   SHA-256 and changes nothing; a real run needs those exact bytes

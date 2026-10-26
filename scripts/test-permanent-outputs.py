@@ -35,10 +35,20 @@ The focused modes reuse this fixture and staging helpers:
 - `auto-adopt`: automatic first conversion (oxide#121).
 - `ignore-safety`: the first conversion's Git ignore prerequisite
   (oxide#125): a target link is published only when Git ignores its exact
-  non-directory repository-relative path, proven for explicit adopt, automatic
-  adoption and prepared first-conversion replay, with trailing-slash,
-  negated, unignored, tracked, missing-Git, timeout and malformed-answer
-  refusals that change nothing.
+  non-directory repository-relative path, proven for explicit adopt and
+  prepared first-conversion replay, with trailing-slash, negated, unignored,
+  tracked, missing-Git, timeout and malformed-answer refusals that change
+  nothing, and an eligible automatic conversion whose published link stays
+  invisible to Git.
+- `auto-ineligible` (oxide#154): expected automatic-adoption ineligibility is
+  not a build failure. A lease whose first conversion Git cannot confirm (no
+  repository, no Git, an unignored, directory-only, negated or tracked path, a
+  Git that does not answer) builds as an ordinary unconverted checkout: a real
+  local target, exactly one notice, no receipt, no owned link and no output
+  root. Explicit `oxide outputs adopt` still refuses with nothing changed;
+  corrupt and partially converted state still fails closed; `oxide init` names
+  the exact non-directory rule to add without rewriting any rule. The mode
+  also accepts `--diagnostic` (uncounted keep-going collection).
 
 Not a benchmark, not real-drive qualification and not full QA.
 """
@@ -1613,6 +1623,14 @@ def auto_notices(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if line.startswith(AUTO_NOTICE)]
 
 
+UNCONVERTED_NOTICE = "not converted to owned outputs"
+
+
+def unconverted_notices(stderr: str) -> list[str]:
+    """The one notice an unconverted checkout prints in permanent mode."""
+    return [line for line in stderr.splitlines() if UNCONVERTED_NOTICE in line]
+
+
 def receipt_file(pool: str, checkout: str) -> str:
     """Where a receipt is, present or not (`receipt_path` requires it)."""
     key = hashlib.sha256(checkout.encode()).hexdigest()
@@ -2063,8 +2081,11 @@ def ignore_run(proof: Proof, repo: str) -> None:
     non-directory repository-relative path, and refuses — changing nothing —
     for a trailing-slash (directory-only) rule, an unignored or negated path, a
     tracked path, no Git, no repository, a timeout, a command error and a
-    malformed answer. Explicit adopt, automatic adoption and the replay of a
-    prepared first conversion are all covered, and detach still works."""
+    malformed answer. Explicit adopt and the replay of a prepared first
+    conversion are covered, an eligible automatic conversion publishes an
+    ignored link, and detach still works. An automatic conversion that Git
+    cannot confirm is ineligibility rather than a refusal (oxide#154); the
+    focused `auto-ineligible` mode owns that matrix."""
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -2145,16 +2166,30 @@ def ignore_run(proof: Proof, repo: str) -> None:
         )
     for index, rule in enumerate(("/target/", "target/")):
         _, checkout = ignore_fixture(proof, root, f"auto-{index}", rule + "\n/.oxide-outputs/\n")
-        stderr = refused_untouched(
-            proof,
-            pool,
-            mount,
-            checkout,
-            f"automatic adoption with {rule!r}",
-            ["build"],
-            ("does not ignore", "matches directories only"),
+        before_roots = roots_on(mount)
+        code, _, stderr = proof.oxide(
+            ["build"], f"automatic adoption is ineligible for {rule!r}", checkout
         )
-        expect(not auto_notices(stderr), f"{rule!r}: a refused adoption printed its notice")
+        expect(
+            code == 0,
+            f"{rule!r}: ineligible automatic adoption failed the build: exit {code}: {stderr}",
+        )
+        expect(not auto_notices(stderr), f"{rule!r}: an ineligible adoption printed its notice")
+        expect(
+            len(unconverted_notices(stderr)) == 1,
+            f"{rule!r}: expected exactly one unconverted notice: {stderr}",
+        )
+        link = os.path.join(checkout, "target")
+        expect(
+            os.path.isdir(link) and not os.path.islink(link),
+            f"{rule!r}: the ineligible build did not keep a real local target",
+        )
+        expect(os.path.isfile(os.path.join(link, "debug", "poutputs")), f"{rule!r}: no local build")
+        expect(
+            not os.path.exists(receipt_file(pool, checkout)),
+            f"{rule!r}: an ineligible checkout wrote a receipt",
+        )
+        expect(roots_on(mount) == before_roots, f"{rule!r}: the drive's roots changed")
     proof.phase("after the trailing-slash matrix")
 
     # 2. A nested workspace names its exact repository-relative path.
@@ -2425,6 +2460,434 @@ def ignore_run(proof: Proof, repo: str) -> None:
     proof.detach()
 
 
+class IneligibleAbort(RuntimeError):
+    """An outcome the keep-going diagnostic must not continue past."""
+
+
+def guard_work_left() -> float:
+    """Seconds left before the supervised guard's own work deadline, less this
+    script's shutdown margin. Never a fresh process-relative budget."""
+    deadline = int(os.environ.get("OXIDE_PROOF_DEADLINE_NS", "0"))
+    if not deadline:
+        return 0.0
+    return (deadline - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9 - SHUTDOWN_MARGIN_S
+
+
+def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
+    """Focused ineligibility proof (oxide#154): expected automatic-adoption
+    ineligibility must not fail an ordinary build.
+
+    A first automatic conversion needs Git to confirm this checkout's exact
+    non-directory link path is ignored by a rule that covers a link. When Git
+    cannot confirm it — no repository, no Git on PATH, an unignored, negated,
+    directory-only or already-tracked path, or a Git that does not answer —
+    the command is an ordinary unconverted checkout: the build reaches Cargo
+    into a real local target, prints exactly one unconverted notice, and
+    writes no receipt, owned link, owned root or downgrade fence. Explicit
+    `oxide outputs adopt` still refuses with the target, receipt and drive
+    roots unchanged; a corrupt receipt and a partially converted checkout
+    still fail closed; and `oxide init` names the exact non-directory rule to
+    add without rewriting any rule. Every case uses its own checkout, so a
+    failure never taints another case's premise.
+
+    With `diagnostic` the same cases run keep-going: a recoverable oracle
+    failure is recorded and independent cases continue, an unclosed child or
+    an exhausted guard deadline aborts, and the receipt is `qualified=false`.
+    It is never a counted PASS.
+    """
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    name = "OxAi" + secrets.token_hex(4)
+    mount = f"/Volumes/{name}"
+    expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
+    print(
+        f"auto-ineligible proof {os.getpid()} source {source} "
+        f"({layout.source_facts(repo)}) mount {mount} diagnostic {diagnostic}"
+    )
+    proof.phase("start")
+    proof.binary = layout.stage_at(proof, repo, "oxide-auto-ineligible")
+    proof.phase("after staging")
+
+    root = proof.root
+    pool = os.path.join(root, "pool")
+    home = os.path.join(root, "home")
+    cargo_home = os.path.join(root, "cargo-home")
+    for path in (home, cargo_home):
+        os.makedirs(path, mode=0o700)
+    proof.env = proof_env(pool, home, cargo_home)
+
+    # The shared premises: an internal pool, then one owned 128 MiB image
+    # registered as the permanent removable pool. Without them no command
+    # selects a permanent removable pool, so nothing would be attempted.
+    maker = fresh_checkout(proof, root, "pool-maker")
+    code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
+    expect(code == 0, stderr)
+    mounted = attach_image(proof, root, name)
+    expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
+    code, stdout, stderr = proof.oxide(
+        [
+            "pool",
+            "register-removable",
+            mount,
+            "--reserve",
+            "16MiB",
+            "--cap",
+            "64MiB",
+            "--mode",
+            "permanent",
+        ],
+        "register permanent drive",
+        maker,
+    )
+    expect(code == 0 and "registered removable pool" in stdout, stderr)
+    proof.phase("after drive registration")
+
+    def ineligible(label: str, checkout: str, env: dict | None = None) -> None:
+        """One ineligible lease: the build reaches Cargo into a real local
+        target with exactly one notice and no owned-output effect."""
+        before = roots_on(mount)
+        if env is None:
+            code, _, stderr = proof.oxide(["build"], label, checkout)
+        else:
+            code, _, stderr = oxide_env(proof, ["build"], label, checkout, env)
+        expect(code == 0, f"{label}: ineligibility failed the build: exit {code}: {stderr}")
+        expect(not auto_notices(stderr), f"{label}: an ineligible checkout was adopted: {stderr}")
+        expect(
+            len(unconverted_notices(stderr)) == 1,
+            f"{label}: expected exactly one unconverted notice: {stderr}",
+        )
+        link = os.path.join(checkout, "target")
+        expect(
+            os.path.isdir(link) and not os.path.islink(link),
+            f"{label}: the build left no real local target",
+        )
+        expect(
+            os.path.isfile(os.path.join(link, "debug", "poutputs")),
+            f"{label}: the build produced no binary in the real local target",
+        )
+        expect(not os.path.exists(receipt_file(pool, checkout)), f"{label}: a receipt was written")
+        expect(roots_on(mount) == before, f"{label}: the drive's roots changed")
+
+    def no_repository() -> None:
+        _, checkout = ignore_fixture(proof, root, "ai-no-repository", None, git=False)
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            "no repository: explicit adopt still refuses",
+            ["outputs", "adopt"],
+            ("could not confirm",),
+        )
+        ineligible("no Git repository", checkout)
+
+    def no_git() -> None:
+        _, checkout = ignore_fixture(proof, root, "ai-no-git", "/target\n/.oxide-outputs/\n")
+        env = dict(proof.env, PATH=private_path(root))
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            "no Git on PATH: explicit adopt still refuses",
+            ["outputs", "adopt"],
+            ("could not confirm", "cannot run git"),
+            env=env,
+        )
+        ineligible("no Git binary on PATH", checkout, env)
+
+    def unignored() -> None:
+        _, checkout = ignore_fixture(proof, root, "ai-unignored", "/.oxide-outputs/\n")
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            "unignored target: explicit adopt still refuses",
+            ["outputs", "adopt"],
+            ("does not ignore",),
+        )
+        ineligible("an unignored target", checkout)
+
+    def directory_only() -> None:
+        _, checkout = ignore_fixture(proof, root, "ai-directory-only", "target/\n/.oxide-outputs/\n")
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            "directory-only rule: explicit adopt still refuses",
+            ["outputs", "adopt"],
+            ("does not ignore", "matches directories only"),
+        )
+        ineligible("a directory-only target rule", checkout)
+
+    def negated() -> None:
+        _, checkout = ignore_fixture(proof, root, "ai-negated", "target\n!/target\n/.oxide-outputs/\n")
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            "negated target rule: explicit adopt still refuses",
+            ["outputs", "adopt"],
+            ("re-includes",),
+        )
+        ineligible("a negated target rule", checkout)
+
+    def tracked() -> None:
+        _, checkout = ignore_fixture(proof, root, "ai-tracked", "/target\n/.oxide-outputs/\n")
+        with open(os.path.join(checkout, "target"), "wb") as handle:
+            handle.write(b"tracked")
+        added = proof.run(["git", "add", "-f", "target"], cwd=checkout, timeout=30)
+        expect(added.returncode == 0, f"git add failed: {added.stderr!r}")
+        os.remove(os.path.join(checkout, "target"))
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            "tracked target path: explicit adopt still refuses",
+            ["outputs", "adopt"],
+            ("already tracks",),
+        )
+        ineligible("an already tracked target path", checkout)
+
+    def git_timeout() -> None:
+        _, checkout = ignore_fixture(proof, root, "ai-slow-git", "/target\n/.oxide-outputs/\n")
+        slow_dir = fake_git(root, "ineligible-timeout", "#!/bin/sh\nexec sleep 30\n")
+        env = dict(proof.env, PATH=slow_dir + ":" + proof.env["PATH"])
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            "a Git that does not answer in time: explicit adopt still refuses",
+            ["outputs", "adopt"],
+            ("did not finish in time",),
+            env=env,
+        )
+        ineligible("a Git that does not answer in time", checkout, env)
+
+    def real_target_opt_out() -> None:
+        # The documented per-checkout opt-out: an existing real target is never
+        # adopted, whatever Git would say about the link path.
+        _, checkout = ignore_fixture(proof, root, "ai-real-target", "/.oxide-outputs/\n", empty=True)
+        before = roots_on(mount)
+        code, _, stderr = proof.oxide(["build"], "an existing real target is never adopted", checkout)
+        expect(code == 0, f"a real-target checkout failed to build: {stderr}")
+        expect(not auto_notices(stderr), stderr)
+        expect(
+            len(unconverted_notices(stderr)) == 1,
+            f"expected exactly one unconverted notice: {stderr}",
+        )
+        link = os.path.join(checkout, "target")
+        expect(
+            os.path.isdir(link) and not os.path.islink(link),
+            "the existing real target was replaced",
+        )
+        expect(not os.path.exists(receipt_file(pool, checkout)), "a real-target checkout wrote a receipt")
+        expect(roots_on(mount) == before, "the drive's roots changed")
+
+    def corrupt_receipt() -> None:
+        # An ineligible rule and a corrupt receipt together: the corrupt
+        # receipt is an error, never absence, so nothing is silently adopted
+        # and no local build is started past it.
+        checkout = ignore_fixture(proof, root, "ai-corrupt", "/.oxide-outputs/\n")[1]
+        os.makedirs(os.path.dirname(receipt_file(pool, checkout)), exist_ok=True)
+        corrupt = receipt_file(pool, checkout)
+        with open(corrupt, "wb") as handle:
+            handle.write(b"{not a receipt")
+        os.chmod(corrupt, 0o600)
+        before = roots_on(mount)
+        code, _, stderr = proof.oxide(["build"], "a corrupt receipt still fails closed", checkout)
+        expect(
+            code != 0 and "is invalid" in stderr,
+            f"a corrupt receipt was swallowed: exit {code}: {stderr}",
+        )
+        expect(not auto_notices(stderr), stderr)
+        expect(
+            not os.path.lexists(os.path.join(checkout, "target")),
+            "a corrupt receipt let a target appear",
+        )
+        expect(roots_on(mount) == before, "a corrupt receipt created a root")
+        os.remove(corrupt)
+
+    def partial_conversion() -> None:
+        # A partial conversion is never continued as a local build: an
+        # automatic first conversion stopped after its prepared receipt keeps
+        # that receipt and no link, a replay within a broken rule refuses, and
+        # the documented explicit adopt recovers it once the rule is restored.
+        _, checkout = ignore_fixture(proof, root, "ai-partial", "/target\n/.oxide-outputs/\n")
+        crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="prepared")
+        code, _, stderr = oxide_env(
+            proof, ["build"], "crash after the prepared receipt", checkout, crash_env
+        )
+        expect(code != 0 and "injected transition stop at prepared" in stderr, stderr)
+        link = os.path.join(checkout, "target")
+        expect(not os.path.lexists(link), "the crash published a link")
+        expect(read_json(receipt_file(pool, checkout))["state"] == "prepared", "no prepared receipt")
+        before = roots_on(mount)
+        with open(os.path.join(checkout, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("/.oxide-outputs/\n")
+        code, _, stderr = proof.oxide(
+            ["build"], "an interrupted conversion refuses within a broken rule", checkout
+        )
+        expect(
+            code != 0 and "does not ignore" in stderr,
+            f"a partially converted checkout was continued: exit {code}: {stderr}",
+        )
+        expect(not os.path.lexists(link), "the refused replay published a link")
+        expect(
+            read_json(receipt_file(pool, checkout))["state"] == "prepared",
+            "the refused replay rewrote the prepared receipt",
+        )
+        expect(roots_on(mount) == before, "the refused replay created a root")
+        with open(os.path.join(checkout, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("/target\n/.oxide-outputs/\n")
+        code, stdout, stderr = proof.oxide(
+            ["outputs", "adopt"], "the documented explicit adopt recovers the replay", checkout
+        )
+        expect(code == 0, f"the recovery adopt failed: exit {code}: {stdout}{stderr}")
+        expect(os.path.islink(link), "the recovery adopt published no link")
+        root_selected = os.readlink(link)
+        expect(
+            root_selected.startswith(os.path.join(mount, "oxide-outputs") + os.sep),
+            f"the recovered link selects {root_selected}, not a root on the drive",
+        )
+        expect(
+            read_json(receipt_file(pool, checkout))["state"] == "committed",
+            "the recovered receipt is not committed",
+        )
+
+    def init_diagnostic() -> None:
+        # A previous build's real `target/` beside a directory-only rule is the
+        # reported papercut. init names `/target` (the exact non-directory
+        # rule) and rewrites nothing.
+        repo_dir, checkout = ignore_fixture(proof, root, "ai-init-directory-only", "target/\n")
+        os.makedirs(os.path.join(checkout, "target"))
+        code, stdout, stderr = proof.oxide(["init"], "init names the directory-only rule", checkout)
+        expect(code == 0, f"oxide init failed: exit {code}: {stderr}")
+        expect(
+            "matches directories only" in stderr,
+            f"init did not diagnose the directory-only rule: {stderr}",
+        )
+        expect(
+            "`/target`" in stderr and "not `target/`" in stderr,
+            f"init did not name the exact non-slash rule: {stderr}",
+        )
+        expect(
+            "leaves every .gitignore rule exactly as it is" in stderr,
+            f"init did not promise not to rewrite: {stderr}",
+        )
+        expect(
+            read_bytes(os.path.join(repo_dir, ".gitignore")) == b"target/\n/.oxide-outputs/\n",
+            "oxide init rewrote the user's rule",
+        )
+        # A confirmed non-directory rule is silent and unchanged.
+        ready_repo, ready = ignore_fixture(proof, root, "ai-init-ready", "/target\n")
+        code, stdout, stderr = proof.oxide(["init"], "init is silent for a ready rule", ready)
+        expect(code == 0, f"oxide init failed on a ready checkout: {stderr}")
+        expect(
+            "does not ignore" not in stderr and "matches directories only" not in stderr,
+            f"init diagnosed a ready checkout: {stderr}",
+        )
+        expect(
+            read_bytes(os.path.join(ready_repo, ".gitignore")) == b"/target\n/.oxide-outputs/\n",
+            "init changed a ready rule",
+        )
+        # An unignored path gets the same exact rule named, and only init's own
+        # local-output line is added.
+        bare_repo, bare = ignore_fixture(proof, root, "ai-init-unignored", "")
+        code, stdout, stderr = proof.oxide(["init"], "init names the missing rule", bare)
+        expect(code == 0, f"oxide init failed on an unignored checkout: {stderr}")
+        expect(
+            "does not ignore `target`" in stderr and "`/target`" in stderr,
+            f"init did not name the missing non-directory rule: {stderr}",
+        )
+        expect(
+            read_bytes(os.path.join(bare_repo, ".gitignore")) == b"/.oxide-outputs/\n",
+            "init wrote a rule of its own",
+        )
+
+    cases = [
+        ("no-repository", no_repository),
+        ("no-git", no_git),
+        ("unignored", unignored),
+        ("directory-only", directory_only),
+        ("negated", negated),
+        ("tracked", tracked),
+        ("git-timeout", git_timeout),
+        ("real-target-opt-out", real_target_opt_out),
+        ("corrupt-receipt", corrupt_receipt),
+        ("partial-conversion", partial_conversion),
+        ("init-diagnostic", init_diagnostic),
+    ]
+
+    results: list[dict] = []
+    failures: list[dict] = []
+    aborted: str | None = None
+    for case_name, body in cases:
+        if aborted is not None:
+            results.append({"case": case_name, "result": "unexecuted"})
+            continue
+        if guard_work_left() <= 5:
+            fail("the guard's work deadline leaves no room for another case")
+        print(f"case {case_name}", flush=True)
+        try:
+            body()
+            if proof.unclosed:
+                raise IneligibleAbort(f"unclosed children {sorted(proof.unclosed)}")
+            results.append({"case": case_name, "result": "completed"})
+        except IneligibleAbort as fault:
+            aborted = f"{case_name}: {fault}"
+            results.append({"case": case_name, "result": "aborted", "fault": str(fault)[:600]})
+        except RuntimeError as fault:
+            # Fail-fast is the counted run's contract. Keep-going records a
+            # recoverable oracle failure, but an exhausted guard deadline is
+            # not recoverable and stops the collection.
+            if not diagnostic:
+                raise
+            if "deadline reached" in str(fault) or guard_work_left() <= 5:
+                raise
+            failures.append({"case": case_name, "fault": str(fault)[:600]})
+            results.append({"case": case_name, "result": "failed", "fault": str(fault)[:600]})
+        proof.phase(f"after {case_name}")
+
+    elapsed = time.monotonic() - layout.runner.STARTED
+    document = {
+        "proof": "rust:auto-adopt-ineligible",
+        "mode": "diagnostic" if diagnostic else "counted",
+        "source": source,
+        "binary_sha256": sha256_file(proof.binary),
+        "cases": results,
+        "failures": failures,
+        "aborted": aborted,
+        "observations": {
+            "elapsed_s": round(elapsed, 1),
+            "peak_owned_mib": proof.peak // MIB,
+            "host_free_min_mib": None if proof.low is None else proof.low // MIB,
+        },
+        "limits": {"wall_clock_s": 300, "scratch_mib": 512},
+    }
+    if diagnostic:
+        # This script's own collection receipt is never qualification evidence:
+        # the guard's receipt and the counted run decide that.
+        document["qualified"] = False
+    text = json.dumps(document, indent=2, sort_keys=True)[: 64 * 1024]
+    receipt = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "auto-ineligible-receipt.json")
+    with open(receipt, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    label = "qualified=false" if diagnostic else "counted"
+    print(f"auto-ineligible receipt {receipt} ({label})", flush=True)
+    if failures or aborted:
+        fail(
+            "auto-ineligible cases did not all complete: "
+            + json.dumps({"failures": failures, "aborted": aborted})
+        )
+
+
 def terminated(signum, frame) -> None:
     raise KeyboardInterrupt(f"signal {signum}")
 
@@ -2470,16 +2933,30 @@ def main() -> int:
         "not under the qualified shared proof supervisor",
     )
     # Each focused mode is one scenario on the same fixture: `auto-adopt`
-    # (oxide#121), `detach-permanent` (oxide#124) and `ignore-safety`
-    # (oxide#125). No argument runs the full #117 scenario.
+    # (oxide#121), `detach-permanent` (oxide#124), `ignore-safety` (oxide#125)
+    # and `auto-ineligible` (oxide#154). No argument runs the full #117
+    # scenario. `--diagnostic` is only the auto-ineligible mode's uncounted
+    # keep-going collection; every other mode keeps its unchanged command.
+    argv = list(sys.argv[1:])
+    diagnostic = bool(argv) and argv[-1] == "--diagnostic"
+    if diagnostic:
+        argv = argv[:-1]
     modes = {
         (): (run, "permanent-outputs"),
         ("auto-adopt",): (auto_run, "auto-adopt"),
         ("detach-permanent",): (detach_run, "detach-permanent"),
         ("ignore-safety",): (ignore_run, "ignore-safety"),
+        ("auto-ineligible",): (
+            lambda proof, repo: auto_ineligible_run(proof, repo, diagnostic),
+            "auto-ineligible",
+        ),
     }
-    expect(tuple(sys.argv[1:]) in modes, f"unknown mode {sys.argv[1:]!r}")
-    scenario, label = modes[tuple(sys.argv[1:])]
+    expect(tuple(argv) in modes, f"unknown mode {argv!r}")
+    expect(
+        not diagnostic or tuple(argv) == ("auto-ineligible",),
+        "--diagnostic is only the auto-ineligible mode's uncounted collection",
+    )
+    scenario, label = modes[tuple(argv)]
     root = tempfile.mkdtemp(prefix="permanent-outputs.", dir=scratch)
     repo = os.path.dirname(HERE)
     signal.signal(signal.SIGTERM, terminated)
@@ -2510,7 +2987,12 @@ def main() -> int:
         f"{proof.low // MIB} MiB; one owned 128 MiB scratch image, ordinary detach, "
         f"shared supervisor owns cleanup"
     )
-    record("result.txt", f"passed\n{summary_line}\n")
+    outcome = (
+        "diagnostic completed; uncounted, qualified=false"
+        if diagnostic
+        else "passed"
+    )
+    record("result.txt", f"{outcome}\n{summary_line}\n")
     print(summary_line)
     return 0
 

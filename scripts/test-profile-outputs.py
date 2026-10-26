@@ -36,8 +36,9 @@ positive control asserts the selected root is under
 `<mount>/oxide-outputs/` with no fallback warning before any external-root
 oracle. The fixture `.gitignore` uses `/target` (valid for a whole-target link
 and as a member parent rule) and a separate `/target/` parent-ignore control
-proves a directory-only rule refuses the legacy link but accepts profile member
-links. The top-level preservation control lives on its own checkout so the
+proves a directory-only rule makes the automatic whole-target conversion
+ineligible (the build stays an ordinary unconverted checkout) while it is
+accepted as a profile member parent rule. The top-level preservation control lives on its own checkout so the
 cleaned checkout carries no foreign entry. The selected-clean reserve stop runs
 on the internal directory-budget store while the pool's OWN recorded permanent
 registration still grants drive mode: the existing low-reserve pattern raises
@@ -303,6 +304,8 @@ def plan_only() -> int:
     print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
     print("  ignore          the fixture uses /target (valid for whole-target links and")
     print("                  member parents) plus a separate /target/ parent-ignore control")
+    print("                  proving automatic adoption is ineligible (ordinary unconverted")
+    print("                  build) while a profile member link accepts the parent rule")
     print("  peer keep       an injected committed peer receipt plus matching registry")
     print("                  rows (SYNTHETIC INJECTED AUTHORITY, not a bind-produced")
     print("                  receipt) keeps that root; a second, distinct eligible gone")
@@ -2944,48 +2947,61 @@ def run(proof: Proof, repo: str) -> None:
 
             # A separate parent-ignore control: a directory-only `/target/` rule
             # cannot cover the published non-directory link, so the automatic
-            # whole-target conversion refuses it. Git decides that question itself and
-            # answers "does not ignore `target`" while the path is still absent (a
-            # trailing-slash rule only matches a directory it can see), so the proof
-            # asserts THIS reachable refusal verbatim rather than a branch that the
-            # absent-target geometry never reaches. The same rule stays a valid parent
-            # ignore for profile members under the real target directory, which is why
-            # the real-empty explicit profile adopt that follows must succeed.
+            # whole-target conversion is INELIGIBLE for it (oxide#154). Expected
+            # ineligibility never fails the command: the build stays an ordinary
+            # unconverted checkout with a real local target and exactly one notice,
+            # and no receipt, owned link, owned root or output conversion appears.
+            # Git decides that question itself and answers "does not ignore
+            # `target`" while the path is still absent (a trailing-slash rule only
+            # matches a directory it can see).
             parent = make_checkout(proof, "parent-ignore", PARENT_IGNORE_APP)
             parent_target = os.path.join(parent, "target")
-            code, _, stderr = oxide(proof, ["build"], "parent-ignore auto-adopt", parent)
-            expect(code == 1, f"the uncovariable directory-only rule did not refuse with exit 1: {code}: {stderr}")
+            code, _, stderr = oxide(proof, ["build"], "parent-ignore ineligible auto-adopt", parent)
             expect(
-                f"refusing to convert {parent_target} to an owned link" in stderr,
-                f"the refusal did not name the whole-target link it declined: {stderr}",
+                code == 0,
+                f"an ineligible automatic conversion failed the build: exit {code}: {stderr}",
             )
             expect(
-                "Git does not ignore `target`" in stderr,
-                f"the refusal did not report Git's own non-directory answer: {stderr}",
+                stderr.count("not converted to owned outputs") == 1,
+                f"the unconverted build did not print exactly one notice: {stderr}",
+            )
+            expect("auto-adopted" not in stderr, f"an ineligible checkout was adopted: {stderr}")
+            expect(
+                is_real_dir(parent_target) and not os.path.islink(parent_target),
+                f"the ineligible conversion did not leave a real local target: {parent_target}",
             )
             expect(
-                "add `/target` (or `target`), not `target/`" in stderr,
-                f"the refusal did not name the non-directory remedy: {stderr}",
+                not os.path.exists(receipt_file(pool, parent)),
+                "an ineligible checkout wrote a receipt",
             )
-            expect("nothing was changed" in stderr, f"the refusal did not report that nothing changed: {stderr}")
-            # No authority change: no receipt, no link, no owned root, no target.
-            expect(not os.path.exists(receipt_file(pool, parent)), "the refused whole-target conversion wrote a receipt")
-            expect(not os.path.lexists(parent_target), f"the refused conversion left {parent_target} in place")
             expect(
                 not os.path.lexists(os.path.join(parent, ".oxide-outputs")),
-                "the refused conversion created a checkout-local owned root",
+                "the ineligible conversion created a checkout-local owned root",
             )
-            # The same checkout then succeeds through the explicitly requested profile
-            # conversion over a REAL empty target: the directory-only rule is a valid
-            # parent ignore where the member link really sits under a directory.
-            os.makedirs(parent_target)
-            adopt(proof, parent, "parent-ignore adopt")
-            parent_root = root_of(pool, parent)
-            expect_layout(parent, {"debug": f"link:{parent_root}"})
-            code, _, stderr = oxide(proof, ["build"], "parent-ignore build", parent)
+            # Explicit adoption still refuses: the local target the build left is
+            # non-empty, and the rule is still not a link rule. Nothing changes.
+            code, _, stderr = oxide(proof, ["outputs", "adopt"], "parent-ignore explicit adopt", parent)
+            expect(code != 0 and "never moves" in stderr, f"explicit adopt did not refuse the local target: {stderr}")
+            expect(
+                is_real_dir(parent_target) and not os.path.islink(parent_target),
+                "the refused explicit adopt replaced the local target",
+            )
+            expect(
+                not os.path.exists(receipt_file(pool, parent)),
+                "the refused explicit adopt wrote a receipt",
+            )
+            # The same rule stays a valid parent ignore for profile members under
+            # the real target directory, so a separate real-empty checkout adopts
+            # its member links through the explicitly requested profile conversion.
+            member_parent = make_checkout(proof, "parent-ignore-member", PARENT_IGNORE_APP)
+            os.makedirs(os.path.join(member_parent, "target"))
+            adopt(proof, member_parent, "parent-ignore-member adopt")
+            member_root = root_of(pool, member_parent)
+            expect_layout(member_parent, {"debug": f"link:{member_root}"})
+            code, _, stderr = oxide(proof, ["build"], "parent-ignore-member build", member_parent)
             expect(code == 0, f"the adopted parent-ignore checkout did not build: {stderr}")
-            expect("fallback" not in summary(stderr), f"parent-ignore: external placement unexpectedly fell back: {summary(stderr)}")
-            expect_layout(parent, {"debug": f"link:{parent_root}"})
+            expect("fallback" not in summary(stderr), f"parent-ignore-member: external placement unexpectedly fell back: {summary(stderr)}")
+            expect_layout(member_parent, {"debug": f"link:{member_root}"})
 
             # Nonvacuous top-level preservation on its own checkout, so the cleaned
             # `first` checkout never carries a foreign entry.

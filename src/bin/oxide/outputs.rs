@@ -3545,6 +3545,17 @@ fn selection_matches(captured: &Selected, current: &Selected) -> bool {
 /// with the missing-target-only transition. Any other state is left to the
 /// existing paths untouched. A metadata error refuses; it is never read as
 /// absence.
+///
+/// The first conversion's ignore prerequisite decides *eligibility*, not the
+/// command (oxide#154): when Git cannot confirm the checkout's exact
+/// non-directory link path is ignored by a rule that covers a link, this
+/// command is an ordinary unconverted checkout. Nothing is written — no
+/// receipt, root, link, notice or downgrade fence — so the build keeps its
+/// real local target and the binding prints its one unconverted warning. An
+/// explicit `oxide outputs adopt` still refuses with the exact fix, and the
+/// transition rechecks the same prerequisite before its first effect, so a
+/// concurrent change refuses rather than publishing a link Git does not
+/// cover.
 pub fn auto_adopt(
     store: &Store,
     checkout: &Path,
@@ -3578,6 +3589,13 @@ pub fn auto_adopt(
         target_absent: context.target()? == TargetState::Missing,
     };
     if !auto_adopts(&facts) {
+        return Ok(());
+    }
+    // Expected automatic-adoption ineligibility must leave the build usable
+    // (oxide#154). The prerequisite is asked before the barrier, the
+    // downgrade fence or the admission lock, so an ineligible checkout gets
+    // no side effect at all: it is exactly the checkout this command found.
+    if first_link_git_answer(&context, None).verdict != LinkGitVerdict::Eligible {
         return Ok(());
     }
     let mut waits = WaitAccounting::default();
@@ -6900,77 +6918,202 @@ fn refuse_link_git_exposure_at(
     suffix: Option<&str>,
 ) -> Result<(), String> {
     let link = link.to_path_buf();
-    let (root, relative) = git_link_path(context, suffix)
-        .map_err(|reason| link_git_unknown_refusal(&link, &reason, None))?;
-    let directory_rule_covers = suffix.is_some();
-    let gitignore = root.join(".gitignore");
+    let answer = first_link_git_answer(context, suffix);
+    let Some(fix) = answer.fix.as_deref() else {
+        let LinkGitVerdict::Unknown(reason) = &answer.verdict else {
+            // A confirmed work tree always yields the exact rule to add.
+            return Err("outputs: the ignore prerequisite answered without a fix".to_owned());
+        };
+        return Err(link_git_unknown_refusal(&link, reason, None));
+    };
+    let relative = answer.relative.as_deref().unwrap_or_default();
+    match &answer.verdict {
+        LinkGitVerdict::Eligible => Ok(()),
+        LinkGitVerdict::Tracked => Err(format!(
+            "outputs: refusing to convert {} to an owned link: Git already tracks `{relative}`, so the published link would be a tracked path. Remove it from the index (`git rm --cached {relative}`) and {fix}; nothing was changed",
+            link.display()
+        )),
+        LinkGitVerdict::Unignored => Err(format!(
+            "outputs: refusing to convert {} to an owned link: Git does not ignore `{relative}`, so the published link would appear as an untracked path. {fix}; nothing was changed",
+            link.display()
+        )),
+        LinkGitVerdict::Negated(rule) => Err(format!(
+            "outputs: refusing to convert {} to an owned link: Git's winning rule `{}` ({}:{}) re-includes `{relative}`. {fix}; nothing was changed",
+            link.display(),
+            rule.pattern,
+            rule.source,
+            rule.line
+        )),
+        LinkGitVerdict::DirectoryOnly(rule) => Err(format!(
+            "outputs: refusing to convert {} to an owned link: Git's winning rule `{}` ({}:{}) matches directories only, so it would not cover the published link. {fix}; nothing was changed",
+            link.display(),
+            rule.pattern,
+            rule.source,
+            rule.line
+        )),
+        LinkGitVerdict::Unknown(reason) => Err(link_git_unknown_refusal(&link, reason, Some(fix))),
+    }
+}
+
+/// One positive answer from the ignore prerequisite, with the exact rule to
+/// add and the repository-relative link path Git's work-tree answer makes
+/// available. Both are `None` only when the work tree itself could not be
+/// confirmed.
+#[derive(Debug)]
+struct LinkGitAnswer {
+    verdict: LinkGitVerdict,
+    relative: Option<String>,
+    fix: Option<String>,
+}
+
+/// What Git positively established about one exact non-directory link path.
+#[derive(Debug, Eq, PartialEq)]
+enum LinkGitVerdict {
+    /// Untracked, and its winning rule covers the link.
+    Eligible,
+    /// Git's index already tracks the path.
+    Tracked,
+    /// No rule ignores the path.
+    Unignored,
+    /// The winning rule re-includes the path.
+    Negated(IgnoreRule),
+    /// The winning rule matches directories only, so it never covers a link.
+    DirectoryOnly(IgnoreRule),
+    /// Git could not answer; unknown is never permission.
+    Unknown(String),
+}
+
+/// The ignore prerequisite's answer for one link path (oxide#125): the legacy
+/// whole-target link (`suffix` `None`) or one profile member below `target/`
+/// (`suffix` is the member). A profile member is a path inside the real
+/// `target` directory, so a winning parent rule such as `/target/` genuinely
+/// ignores it and is accepted; the legacy link is itself replaced, so a
+/// directory-only rule cannot cover it.
+///
+/// This is a positive answer rather than a message because three callers ask
+/// the same question with different consequences: a conversion refuses
+/// (oxide#125), an automatic first conversion treats it as ineligibility
+/// (oxide#154), and `oxide init` names the exact rule to add without editing
+/// anything (oxide#154).
+fn first_link_git_answer(context: &Context, suffix: Option<&str>) -> LinkGitAnswer {
+    let (root, relative) = match git_link_path(context, suffix) {
+        Ok(found) => found,
+        Err(reason) => {
+            return LinkGitAnswer {
+                verdict: LinkGitVerdict::Unknown(reason),
+                relative: None,
+                fix: None,
+            }
+        }
+    };
     let fix = format!(
         "Ignore the non-directory path: add `/{relative}` (or `{relative}`), not `{relative}/`, to {}",
-        gitignore.display()
+        root.join(".gitignore").display()
     );
+    let verdict = first_link_git_verdict(&root, &relative, suffix.is_some())
+        .unwrap_or_else(LinkGitVerdict::Unknown);
+    LinkGitAnswer {
+        verdict,
+        relative: Some(relative),
+        fix: Some(fix),
+    }
+}
+
+/// Ask Git about the exact non-directory path in a confirmed work tree. Every
+/// error is an unknown answer, never permission.
+fn first_link_git_verdict(
+    root: &Path,
+    relative: &str,
+    directory_rule_covers: bool,
+) -> Result<LinkGitVerdict, String> {
     // A tracked path would publish a tracked symlink once the link is there.
-    let tracked = git_probe(&root, &["ls-files", "-z", "--", &relative], &[], true)
-        .map_err(|reason| link_git_unknown_refusal(&link, &reason, Some(&fix)))?;
+    let tracked = git_probe(root, &["ls-files", "-z", "--", relative], &[], true)?;
     if tracked.code != Some(0) {
-        return Err(link_git_unknown_refusal(
-            &link,
-            &format!("git ls-files did not answer ({})", exit_label(tracked.code)),
-            Some(&fix),
+        return Err(format!(
+            "git ls-files did not answer ({})",
+            exit_label(tracked.code)
         ));
     }
     if !tracked.stdout.is_empty() {
-        return Err(format!(
-            "outputs: refusing to convert {} to an owned link: Git already tracks `{relative}`, so the published link would be a tracked path. Remove it from the index (`git rm --cached {relative}`) and {fix}; nothing was changed",
-            link.display()
-        ));
+        return Ok(LinkGitVerdict::Tracked);
     }
     // The exact non-directory path, decided by Git itself: `--no-index`
     // reads the rules rather than the index (tracked is refused above), and
     // `-v` names the winning rule, whose form is part of the answer.
     let input = format!("{relative}\0");
     let check = git_probe(
-        &root,
+        root,
         &["check-ignore", "--no-index", "-v", "-z", "--stdin"],
         input.as_bytes(),
         false,
-    )
-    .map_err(|reason| link_git_unknown_refusal(&link, &reason, Some(&fix)))?;
+    )?;
     let rule = match check.code {
-        Some(0) => parse_ignore_rule(&check.stdout, &relative)
-            .map_err(|reason| link_git_unknown_refusal(&link, &reason, Some(&fix)))?,
-        Some(1) => {
-            return Err(format!(
-                "outputs: refusing to convert {} to an owned link: Git does not ignore `{relative}`, so the published link would appear as an untracked path. {fix}; nothing was changed",
-                link.display()
-            ))
-        }
+        Some(0) => parse_ignore_rule(&check.stdout, relative)?,
+        Some(1) => return Ok(LinkGitVerdict::Unignored),
         code => {
-            return Err(link_git_unknown_refusal(
-                &link,
-                &format!("git check-ignore did not answer ({})", exit_label(code)),
-                Some(&fix),
+            return Err(format!(
+                "git check-ignore did not answer ({})",
+                exit_label(code)
             ))
         }
     };
     if rule.pattern.starts_with('!') {
-        return Err(format!(
-            "outputs: refusing to convert {} to an owned link: Git's winning rule `{}` ({}:{}) re-includes `{relative}`. {fix}; nothing was changed",
-            link.display(),
-            rule.pattern,
-            rule.source,
-            rule.line
-        ));
+        return Ok(LinkGitVerdict::Negated(rule));
     }
     if !directory_rule_covers && (rule.pattern.ends_with('/') || rule.pattern.ends_with("\\/")) {
-        return Err(format!(
-            "outputs: refusing to convert {} to an owned link: Git's winning rule `{}` ({}:{}) matches directories only, so it would not cover the published link. {fix}; nothing was changed",
-            link.display(),
-            rule.pattern,
-            rule.source,
-            rule.line
-        ));
+        return Ok(LinkGitVerdict::DirectoryOnly(rule));
     }
-    Ok(())
+    Ok(LinkGitVerdict::Eligible)
+}
+
+/// Why a published link would be unsafe for this exact path, as one sentence
+/// without the fix. `None` when Git positively confirmed the path.
+fn link_git_problem(answer: &LinkGitAnswer) -> Option<String> {
+    let relative = answer.relative.as_deref().unwrap_or("target");
+    Some(match &answer.verdict {
+        LinkGitVerdict::Eligible => return None,
+        LinkGitVerdict::Tracked => format!(
+            "Git already tracks `{relative}`, so the published link would be a tracked path; remove it from the index with `git rm --cached {relative}`"
+        ),
+        LinkGitVerdict::Unignored => format!(
+            "Git does not ignore `{relative}`, so the published link would appear as an untracked path"
+        ),
+        LinkGitVerdict::Negated(rule) => format!(
+            "Git's winning rule `{}` ({}:{}) re-includes `{relative}`",
+            rule.pattern, rule.source, rule.line
+        ),
+        LinkGitVerdict::DirectoryOnly(rule) => format!(
+            "Git's winning rule `{}` ({}:{}) matches directories only, so it would not cover the published link",
+            rule.pattern, rule.source, rule.line
+        ),
+        LinkGitVerdict::Unknown(reason) => format!(
+            "Git could not confirm its decision for the exact non-directory path ({reason})"
+        ),
+    })
+}
+
+/// `oxide init`'s `.gitignore` diagnostic for a first conversion (oxide#154).
+///
+/// A first permanent-drive conversion publishes an owned `<checkout>/target`
+/// link only when Git ignores that exact non-directory path, and a
+/// directory-only rule such as `target/` never covers the link. Rather than
+/// rewrite a user's rule, `oxide init` names the exact rule to add (for a
+/// nested workspace, its repository-relative spelling). It is effect-free:
+/// the same bounded Git probe the conversion uses, and no write of any kind.
+/// `None` when Git positively confirmed the path, or when this checkout is not
+/// inside a Git work tree at all (init adopts it outside Git, where nothing is
+/// ignored and nothing is converted).
+pub fn gitignore_diagnostic(workspace: &Path) -> Option<String> {
+    let context = Context::new(None, workspace.to_path_buf());
+    let link = context.link();
+    let answer = first_link_git_answer(&context, None);
+    // No fix means Git never confirmed a work tree for this checkout.
+    let fix = answer.fix.as_deref()?;
+    let problem = link_git_problem(&answer)?;
+    Some(format!(
+        "permanent-drive outputs will not convert {} yet: {problem}. {fix}. `oxide init` leaves every .gitignore rule exactly as it is",
+        link.display()
+    ))
 }
 
 fn link_git_unknown_refusal(link: &Path, reason: &str, fix: Option<&str>) -> String {
@@ -7043,6 +7186,7 @@ fn git_link_path(context: &Context, suffix: Option<&str>) -> Result<(PathBuf, St
 
 /// One winning ignore rule from `git check-ignore --no-index -v -z --stdin`:
 /// `<source>\0<line>\0<pattern>\0<pathname>\0`.
+#[derive(Debug, Eq, PartialEq)]
 struct IgnoreRule {
     source: String,
     line: u64,
@@ -10608,6 +10752,123 @@ mod tests {
         assert!(refused.contains("could not confirm"), "{refused}");
         assert!(!plain.local().root().exists());
         assert!(!os_symlink_exists(&plain.checkout.join("target")));
+    }
+
+    /// The automatic first conversion asks the same ignore prerequisite and
+    /// treats every non-`Eligible` answer as ineligibility (oxide#154): an
+    /// expected refusal must leave the build usable, so it cannot be a
+    /// transition error. Each class is the answer an explicit adopt refuses
+    /// with, so the two presentations cannot drift.
+    #[test]
+    fn automatic_adoption_is_ineligible_for_every_ignore_safety_refusal() {
+        let eligible = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        assert_eq!(
+            first_link_git_answer(&eligible.context(), None).verdict,
+            LinkGitVerdict::Eligible,
+            "the positive control is not eligible"
+        );
+        for (label, fixture, empty) in [
+            (
+                "unignored",
+                Fixture::in_tree("", "/.oxide-outputs/\n"),
+                false,
+            ),
+            (
+                "directory-only",
+                Fixture::in_tree("", "target/\n/.oxide-outputs/\n"),
+                true,
+            ),
+            (
+                "negated",
+                Fixture::in_tree("", "target\n!/target\n/.oxide-outputs/\n"),
+                false,
+            ),
+        ] {
+            if empty {
+                fs::create_dir(fixture.checkout.join("target")).unwrap();
+            }
+            let answer = first_link_git_answer(&fixture.context(), None);
+            assert_ne!(
+                answer.verdict,
+                LinkGitVerdict::Eligible,
+                "{label}: a refused conversion is eligible for automatic adoption"
+            );
+            assert!(answer.fix.is_some(), "{label}: no fix was derived");
+        }
+        // A non-repository has no work tree to confirm: unknown, never
+        // permission, and no fix is available because there is no root.
+        let plain = Fixture::without_git();
+        let answer = first_link_git_answer(&plain.context(), None);
+        assert!(
+            matches!(answer.verdict, LinkGitVerdict::Unknown(_)),
+            "{answer:?}"
+        );
+        assert!(answer.fix.is_none(), "{answer:?}");
+        assert!(
+            !plain.local().root().exists() && !os_symlink_exists(&plain.checkout.join("target")),
+            "the eligibility answer had an effect"
+        );
+    }
+
+    /// `oxide init` names the exact non-directory rule to add and never edits
+    /// the file (oxide#154): a directory-only rule is the reported papercut,
+    /// an unignored path needs the same rule, a nested workspace names its
+    /// repository-relative spelling, and a confirmed path is silent.
+    #[test]
+    fn the_init_diagnostic_names_the_exact_non_directory_rule() {
+        let ready = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        assert_eq!(gitignore_diagnostic(&ready.checkout), None);
+
+        let unignored = Fixture::in_tree("", "/.oxide-outputs/\n");
+        let warning = gitignore_diagnostic(&unignored.checkout).expect("no diagnostic");
+        assert!(warning.contains("`/target`"), "{warning}");
+        assert!(warning.contains("not `target/`"), "{warning}");
+        assert!(
+            warning.contains(&unignored.repo().join(".gitignore").display().to_string()),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("leaves every .gitignore rule exactly as it is"),
+            "{warning}"
+        );
+        assert_eq!(
+            fs::read(unignored.repo().join(".gitignore")).unwrap(),
+            b"/.oxide-outputs/\n",
+            "the diagnostic edited the file"
+        );
+
+        let empty = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        fs::create_dir(empty.checkout.join("target")).unwrap();
+        let warning = gitignore_diagnostic(&empty.checkout).expect("no diagnostic");
+        assert!(warning.contains("matches directories only"), "{warning}");
+        assert!(warning.contains("`/target`"), "{warning}");
+        assert!(
+            warning.contains("not `target/`"),
+            "the papercut's exact non-slash rule is not named: {warning}"
+        );
+
+        let nested = Fixture::in_tree("apps/farmyard", "/apps/farmyard/target/\n.oxide-outputs/\n");
+        let warning = gitignore_diagnostic(&nested.checkout).expect("no diagnostic");
+        assert!(warning.contains("`/apps/farmyard/target`"), "{warning}");
+        assert!(warning.contains("not `apps/farmyard/target/`"), "{warning}");
+
+        let tracked = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        fs::write(tracked.checkout.join("target"), b"tracked").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "-f", "target"])
+            .current_dir(&tracked.checkout)
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_file(tracked.checkout.join("target")).unwrap();
+        let warning = gitignore_diagnostic(&tracked.checkout).expect("no diagnostic");
+        assert!(warning.contains("already tracks"), "{warning}");
+        assert!(warning.contains("git rm --cached target"), "{warning}");
+
+        // Not a repository at all: init adopts it outside Git and there is
+        // nothing for a first conversion to ignore.
+        let plain = Fixture::without_git();
+        assert_eq!(gitignore_diagnostic(&plain.checkout), None);
     }
 
     #[test]
