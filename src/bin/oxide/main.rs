@@ -1804,9 +1804,32 @@ fn print_pool(
                 );
             }
         }
-        None => println!(
-            "  slot sizes: recorded observations only; `oxide status --measure` walks the payload and every slot without reconciling"
-        ),
+        None => {
+            println!(
+                "  recorded slot sizes (ledger): {}",
+                match report.recorded_total {
+                    Some(bytes) => format!(
+                        "{} across {} of {} idle slots{}; the admission basis, not free space",
+                        crate::cargo_home::size(bytes),
+                        report.recorded_slots,
+                        report.recorded_slots + report.unrecorded_slots,
+                        if report.unrecorded_slots > 0 {
+                            format!(
+                                " ({} unrecorded: a lower bound the next admission walks)",
+                                report.unrecorded_slots
+                            )
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    None =>
+                        "none recorded yet; the next admission walks the slots it needs".to_owned(),
+                }
+            );
+            println!(
+                "  slot sizes: recorded observations only (a separate diagnostic source from the ledger total above); `oxide status --measure` walks the payload and every slot without reconciling"
+            );
+        }
     }
     if !report.pending_reconciliation.is_empty() {
         let pending: Vec<String> = report

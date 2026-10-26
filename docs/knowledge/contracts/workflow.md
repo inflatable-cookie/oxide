@@ -957,10 +957,14 @@ explicit `recover` unless they adopt it.
   clean marks, latest use and flushes, and the registration's drive mode. It
   takes no pool lock, creates no lock, reconciles no recorded deletion, runs
   no accounting walk, invokes no Cargo, `tmutil` or `diskutil`, and writes
-  nothing. A slot's size is a recorded observation from the reuse walk of a
-  previous acquiring command, labelled with its age, source and lease, or
-  `not measured`; recorded facts are never summed into a pool total and never
-  establish free space or admission. A recorded `Evicting` slot is reported
+  nothing. It reports two **separately labelled** recorded sources that are
+  never added together: the ledger's closed per-slot observations
+  (oxide#146), shown as one `recorded slot sizes (ledger)` total over
+  `recorded n of m idle slots` with its unrecorded count as a stated lower
+  bound — this one *is* the admission basis — and, per slot, an oxide#128
+  sidecar fact from a previous acquiring command's reuse walk, labelled with
+  its age, source and lease, or `not measured`. Neither is free space, and a
+  recorded figure never itself establishes admission. A recorded `Evicting` slot is reported
   as a pending reconciliation, distinct from idle and held, and is left in
   place. Cargo-home and stray-output lines say not measured.
 - `oxide status --measure` runs the existing bounded walks once: the
@@ -1075,9 +1079,9 @@ it is not final output, final-output placement or a claim of saved writes.
   incarnation, a missing or unreadable marker, a link, another owner or
   device — is reported and kept, never deleted. The directory is created
   `0700`, refuses to follow a link, and lives inside the slot, so the
-  existing whole-payload accounting counts it exactly once (hard links
-  included), whole-slot eviction and crash recovery delete it with the slot
-  they already own, and a held, lost or quarantined slot keeps it.
+  slot's own recorded figure counts it exactly once (hard links included),
+  whole-slot eviction and crash recovery delete it with the slot they already
+  own, and a held, lost or quarantined slot keeps it.
 - **Lifecycle.** It is removed at release, after the command has seen its own
   process group empty and before the slot can go idle; a removable slot is
   flushed after that removal. A removal that cannot be positively completed
@@ -1537,7 +1541,12 @@ necessary.
   exclusion.
 - **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
-  with a 120 s wall limit and 64 MiB monitored scratch. Inside that scratch
+  with a 120 s wall limit and 64 MiB monitored scratch. Its selector names an
+  explicit `--root-parent /private/tmp` because two of its cases create a real
+  internal directory pool; the selected-volume default would be refused by the
+  product, exactly as for the other genuine internal-placement proofs, and this
+  is the same owner-accepted exception rather than a global default change.
+  Inside that scratch
   the script stages this HEAD's debug `oxide` with plain Cargo offline and the
   pinned 1.97.1, then deletes the staged target before the fixtures, so it
   creates no Oxide pool and touches no live pool, installed binary, install
@@ -1550,7 +1559,12 @@ necessary.
   not trigger; one hand-off with exact argv and environment plus the marker;
   marker refusal and inertness; foreign, path, hash, size, capability,
   ownership, `PATH`, same-inode and replacement refusals; skipped commands; and
-  a final-release error after effects that never executes anything. It never
+  a final-release error after effects that never executes anything. What it
+  exercises is a binary staged from this HEAD carrying control state version 5
+  with a compiled recording stub candidate that reports the newer version 6; it
+  is not a real installed version-4 binary handing off to version 5, and it
+  claims no host install. That real forward-fence hand-off stays behind the
+  separate QA-compatibility-window and receipt-matching install gate. It never
   touches the real `~/.local/bin/oxide`, a real install receipt or a live pool,
   and is not a benchmark or an alias for full QA.
 
@@ -1621,7 +1635,7 @@ identity lines.
 
 **Status.** The proof and validation tooling uses the selected-volume default
 described below, under the qualified supervisor bytes
-`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`; the owner
+`5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`; the owner
 accepted the narrow internal-root exception for genuine internal-placement
 proofs. Oxide#151 moves that default from a leaf at the drive root into the
 owned `<mount>/scratch/oxide` subtree and adds the owner marker and bounded
@@ -1775,11 +1789,14 @@ placement and retention; Oxide changes no consumer or daemon configuration.
   component.
 
 Supervisor SHA-256
-`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
-has independent exact-head source review and separate author and reviewer
-`proof:supervisor:qualify` receipts, each exercising all 175 cases with the
-selected-volume default and positive outer closure. Qualification is bound to
-those bytes and evidence; an older hash's receipts do not transfer to new bytes.
+`5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`
+is the current qualified source: oxide#147 source head
+`0adb0c4e9d24f104996013fe735030fb8f5e7e42`, merged at
+`93ce14cc4233cfa1d27a63bfa7c1f5135a4b545c`, has independent exact-head source
+review and separate author and reviewer `proof:supervisor:qualify` receipts with
+the selected-volume default and positive outer closure (oxide#147's own records
+hold the case counts, runs and events). Qualification is bound to those bytes
+and evidence; an older hash's receipts do not transfer to new bytes.
 
 **Internal-placement proofs (oxide#136, accepted narrow exception).** A proof
 whose subject is the *internal* directory pool cannot run over the
@@ -1926,34 +1943,48 @@ Operator source: Supervisor `7cc9444d-a355-463d-a2ca-3c135645a042`, Tom's
 verbatim "1. Yes 2. Yes 3. Yes", item 3. Existing proof bounds, unknown-writer
 handling, failure history and separate adoption/install gates remain.
 
-**Current qualified supervisor (oxide#145, merged `0520fc04`).** The shared
-supervisor bytes `a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b`
-are qualified: oxide#145 source head `4830c187` passed
-`proof:supervisor:qualify` 175/175 for the author (two runs) and 175/175 for the
-independent reviewer (one run), reviewed at event
-`50b6ba7105aac44f04634f9d9d25559bd033afea69351e4a5c446473ebdceb7a`. Its
-`test_supervisor.py` is `79031c195910175ef125f007edb39cbea75628a51bd12f511a4538ea1b87c7d0`
-and `qualify-supervisor.py` is
-`736f0cf0610339b66345f32f8aafbe6edbf945c5122f4a14e74c8f631de73e45`. It selects
+**Previously qualified supervisor (oxide#147, merged `93ce14cc`).** The shared
+supervisor bytes `5e5b66174fd9a92567436cfb6eff610063f316c4de4fadf93c1b995e05c971f2`
+are qualified: oxide#147 source head
+`0adb0c4e9d24f104996013fe735030fb8f5e7e42` carries independent exact-head source
+review and separate author and reviewer `proof:supervisor:qualify` receipts, each
+exercising every case with the selected-volume default and positive outer
+closure (oxide#147's own records hold the counts, runs and review event ids).
+Its `test_supervisor.py` is
+`25b706cc8fb9c7b30fe89005670edb20f0c2946c5f6228e73a3c96607ac8dbc3` and
+`qualify-supervisor.py` is
+`0789e18372b7d6f787dc8d9ba3357885f0facacee860c476ca5a012d4891a194`. It selects
 and monitors the volume the effect-free pool selection names, with the
 `/private/tmp` warning fallback described under
-[scratch placement](#temporary-scratch-placement). Earlier proofs keep the
-guard bytes they ran under as history; the prior qualified
-`961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052` is qualified
-only at its old bytes and no old run is retroactively migrated.
+[scratch placement](#temporary-scratch-placement), and its census settles a stop
+only on a census started after the leader was reaped with no member left. Earlier
+proofs keep the guard bytes they ran under as history: the previous qualified
+`a6d73326e897ef93f8b9a448b24889cc0a73bda894ea699de44858b1c6d2756b` (oxide#145,
+`test_supervisor.py` `79031c19…`, `qualify-supervisor.py` `736f0cf0…`) and the
+older `961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052` are
+qualified only at their own bytes, and no old run is retroactively migrated.
 
-**Selected-volume routing, owner markers and self-expiry (oxide#151,
-unqualified source).** The current `bounded-test.py` and
-`qualify-supervisor.py` route the default scratch parent to
-`<mount>/scratch/oxide`, prepare it in blocking setup, mark every run root
+**Current qualified supervisor (oxide#151, merged `af08749`).** The shared
+supervisor bytes are
+`bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924`
+(`qualify-supervisor.py`
+`585e33956b0e9b0cce2d45bc85726e1202952c1b500d64da6fa630ade78e4a95`,
+`test_supervisor.py`
+`37ea34f049341b28d7ca2ba4e87dd666527a0146d249e307f5c78b3461ccc9c7`). They are
+qualified at reviewed source `d9d998853a1ad292a4001801a41a59f947095d0a` by an
+independent exact-head source review, one uncounted keep-going diagnostic and
+separate author and independent reviewer `proof:supervisor:qualify` receipts of
+249 pure plus 40 real cases each with positive outer closure (oxide#151's own
+records hold the runs, counts and review event ids; its first reviewer failure
+and its retained nested unknowns stay history, not conclusion). The current
+`bounded-test.py` and `qualify-supervisor.py` route the default scratch parent
+to `<mount>/scratch/oxide`, prepare it in blocking setup, mark every run root
 there, run one bounded startup sweep for positively concluded roots older than
 seven days, and have the bootstrap verify the routing, sweep summary, marker
-conclusion and its own kept base. Those bytes are **unqualified**: they change
-both source files the qualification binds, so they need their own exact-head
-source review, uncounted keep-going diagnostic and separate author and
-independent reviewer `proof:supervisor:qualify` receipts, with fresh activation
-clocks. The `a6d73326` receipts above stay bound to their own bytes and no
-earlier run is migrated.
+conclusion and its own kept base. This qualifies these runner bytes only: it is
+no product, task or native evidence for any proof that uses them, and the
+`5e5b6617` (#147) and `a6d73326` (#145) receipts stay bound to their own bytes
+with no earlier run migrated.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -3791,13 +3822,18 @@ Rules:
   ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
   A compatible idle slot is reused first and kept warm; the half-budget
   recycling rule is retired. A new slot replaces the least-recently-used
-  eligible idle whole slot only at the 128-slot pool ceiling, the eight-slot
-  project ceiling, or when the whole-payload union is at or above the budget;
-  it remeasures after each deletion and refuses `Full` when only held slots
-  remain. Held, uncertain, foreign and unmeasurable slots are never eligible,
-  and a safety failure stops admission instead of skipping. Nothing enforces
-  the budget while a build writes; a build can pass it, and the next new slot
-  evicts.
+  eligible idle whole slot in two distinct cases: **count** pressure at the
+  128-slot pool ceiling or the eight-slot project ceiling, authorised on a
+  complete pool figure or a removable pool's bound-only unknown; and
+  **recorded byte** pressure, when the attributable pool sum — never the
+  shared volume's total — is at or above the budget. It remeasures after each
+  deletion and refuses `Full` when only held slots remain. A removable pool
+  whose own size is unknown takes the reserve/floor route instead of a byte-cap
+  comparison. Held, uncertain, foreign and unmeasurable slots are never
+  eligible, a safety failure stops admission instead of skipping, and the
+  audit walks behind `status --measure` are not admission input. Nothing
+  enforces the budget while a build writes; a build can pass it, and the next
+  new slot evicts.
 - **Watchdog.** Only on a directory pool, only while Oxide supervises a
   leased Cargo group (build and `run` build, `test` execution, building
   passthrough). It samples `statfs` `f_bavail` of the payload directory

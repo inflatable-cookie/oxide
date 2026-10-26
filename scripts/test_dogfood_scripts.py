@@ -389,5 +389,68 @@ class AccountHomeCustodyTests(unittest.TestCase):
         self.assertLessEqual((self.directory / "custody.json").stat().st_size, account_home.CUSTODY_MAX_BYTES)
         self.assertTrue(self.persisted()["truncated"])
 
+class HandoffSelectorTests(unittest.TestCase):
+    """The installed-handoff selector must keep its internal placement.
+
+    Two of that proof's cases create a real internal directory pool, and the
+    product refuses an internal pool on a selected external volume, so the
+    selector has to name `--root-parent /private/tmp` explicitly. This reads the
+    real manifest and drives the same predicate for a missing or wrong root, a
+    changed limit and a changed body - no child, Cargo or install runs here.
+    """
+
+    SELECTOR = "rust:installed-handoff"
+    BODY = "python3 scripts/test-installed-handoff.py"
+
+    def selector_line(self, manifest: str) -> str:
+        header = f'[tasks."{self.SELECTOR}"]'
+        self.assertIn(header, manifest)
+        section = manifest.split(header, 1)[1]
+        for line in section.splitlines()[1:]:
+            if line.startswith("[tasks."):
+                break
+            if line.startswith("run = "):
+                return line[len("run = "):].strip().strip('"')
+        self.fail(f"{self.SELECTOR} has no run line")
+
+    def problems(self, run_line: str) -> list[str]:
+        problems: list[str] = []
+        words = run_line.split()
+        if "--root-parent" not in words:
+            problems.append("no_root_parent")
+        elif words[words.index("--root-parent") + 1:][:1] != ["/private/tmp"]:
+            problems.append("root_parent_not_private_tmp")
+        for flag, value in (("--limit", "120"), ("--scratch-budget-mib", "64")):
+            if flag not in words:
+                problems.append(f"no_{flag.lstrip('-').replace('-', '_')}")
+            elif words[words.index(flag) + 1:][:1] != [value]:
+                problems.append(f"{flag.lstrip('-').replace('-', '_')}_changed")
+        if not run_line.endswith(self.BODY):
+            problems.append("body_changed")
+        return problems
+
+    def test_the_real_selector_keeps_the_internal_root_and_bounds(self):
+        manifest = (SCRIPTS.parent / "effigy.toml").read_text(encoding="utf-8")
+        line = self.selector_line(manifest)
+        self.assertEqual([], self.problems(line), line)
+
+    def test_a_missing_or_changed_root_parent_is_refused(self):
+        manifest = (SCRIPTS.parent / "effigy.toml").read_text(encoding="utf-8")
+        line = self.selector_line(manifest)
+        without_root = line.replace("--root-parent /private/tmp ", "", 1)
+        self.assertNotEqual(line, without_root)
+        self.assertIn("no_root_parent", self.problems(without_root))
+        wrong_root = line.replace("--root-parent /private/tmp", "--root-parent /tmp", 1)
+        self.assertIn("root_parent_not_private_tmp", self.problems(wrong_root))
+
+    def test_changed_limits_or_body_are_refused(self):
+        manifest = (SCRIPTS.parent / "effigy.toml").read_text(encoding="utf-8")
+        line = self.selector_line(manifest)
+        self.assertIn("limit_changed", self.problems(line.replace("--limit 120", "--limit 300", 1)))
+        self.assertIn("scratch_budget_mib_changed",
+                      self.problems(line.replace("--scratch-budget-mib 64", "--scratch-budget-mib 512", 1)))
+        self.assertIn("body_changed", self.problems(line.replace(self.BODY, "python3 scripts/test-recorded-slot-accounting.py", 1)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -297,27 +297,73 @@ defaults, which are unchanged. The callers:
 | Walk | Gate |
 | --- | --- |
 | The matching idle slot's own walk before reuse | Must be complete, or the lease refuses |
-| The whole-payload walk before a new slot, and again after eviction | Must be complete, or the lease refuses |
-| The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
+| The one slot a release or recovery closes (oxide#146) | Best effort: an incomplete walk publishes no record and never fails the release |
+| A slot with no current record, and every held slot, at admission | Must be complete, or the lease refuses (`unknown_accounting`) |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
 
-**Removable-volume fallback (2026-10-25 hotfix, Tom's ruling).** A
-removable `apfs-volume-v1` payload walks for at most 5 s before a new slot
-or a count replacement (`VOLUME_WALK_MS`). If that walk is incomplete and
-its only gaps are `elapsed_deadline` or `entry_limit`, the open caches that
-result. Admission then uses the volume's own used bytes (capacity less
-available, from the verified binding), which include everything else on the
-volume and so never undercount. Under the budget it admits and the command
-prints one warning naming the entries walked and the used and budget bytes.
-Over the budget it evicts least-recently-used idle whole slots one at a
-time, re-reading the volume after each, at most 8 times, then refuses with
-the original scan. Count replacements (the per-project and pool slot caps)
-proceed on the same bound-only result. Any other gap (unreadable, missing
-or unusable metadata, mount boundary, depth limit, root problems) still
-refuses, and the internal `directory-budget-v1` pool keeps every gate in
-the table above unchanged. Reason: a 127-slot USB pool could not be walked
-within 60 s, so every new-slot admission refused. Faster recorded
-accounting is the planned replacement.
+Admission itself no longer walks the payload: it sums the closed per-slot
+records plus one shallow scope pass over everything outside the slot roots
+([recorded per-slot accounting](#recorded-per-slot-accounting-oxide146-implemented-native-held)).
+When every record is current that is O(slots) metadata work and **zero
+inventory walks**; only a slot without a current record is walked, once, under
+the same bounds as any slot walk and one cumulative 60 s admission deadline.
+
+**Removable unknown-size route (2026-10-25, superseding the volume-used
+fallback).** A removable `apfs-volume-v1` payload bounds the walks its own
+figure needs with `VOLUME_WALK_MS` (5 s) for a new slot or a count
+replacement. When those walks are incomplete with **only** `elapsed_deadline`
+or `entry_limit` gaps, the pool size is genuinely unknown and the reserve
+route decides — never the volume's used bytes, and never a fixed eviction
+count:
+
+- free space **above** the registered reserve **and** at or above the 10 GiB
+  hard floor: admit with one bounded note, nothing evicted, cap unverified;
+- otherwise, while an eligible idle whole slot remains: retire the
+  least-recently-used one whole, re-verify the binding and re-read free space,
+  and repeat (bounded by the remaining eligible slots and the caller's
+  deadline);
+- with nothing left to prune: free space at or above the floor admits with a
+  warning naming the free, reserve and floor figures, and below the floor it
+  refuses with the original incomplete scan.
+
+The floor wins over a lower legacy reserve, so nothing admits below it merely
+because free space is above the reserve. Any other gap (unreadable, missing or
+unusable metadata, mount boundary, depth limit, root problems), every
+incomplete pool figure on the internal `directory-budget-v1` pool, and every
+mixed or non-bound gap refuses before anything is deleted. The reason the
+bound exists at all is unchanged: a 127-slot USB pool could not be walked
+within 60 s. Recorded per-slot accounting ([below](#recorded-per-slot-accounting-oxide146-implemented-native-held))
+means this route is reached only while some slot still lacks a current record.
+
+**Count limits are count pressure.** A per-project or pool slot-cap
+replacement may proceed when the pool figure is complete **or** when a
+removable pool's figure is unknown for bound gaps only; an internal, mixed or
+non-bound incompleteness refuses before any deletion. Count replacement
+authorisation never leaks into a byte-pressure decision.
+
+**The admission figure (oxide#146).** `Pool::recorded_total()` is
+`pool_scope()` plus one figure per ledger slot: a held slot is always walked
+fresh, a current idle record is used as it stands, and an idle slot with no
+current record is walked once and its figure published in one revised write
+*before* the admission decision, so progress survives a refusal. `pool_scope()`
+is a separate walker (`inventory::scope_directory`) that hard-stops at every
+recorded slot root — by ledger membership, for both the legacy `<id>` and the
+labelled `<folder>/<profile>-<id>` layouts — so each regular file is counted
+exactly once and out-of-slot metadata, strays and orphan regions are counted
+without granting ownership. Its debug-only observation is
+`OXIDE_TEST_SCOPE_LOG`, separate from the walk log, so "zero inventory walks"
+stays a checkable claim. Cross-slot hard links are counted once per slot: that
+overcount is accepted, so the sum is never below the inode union, equality
+holds for disjoint slots, and an idle slot may be evicted earlier than the
+union alone would require. A current record is a measurement at a closing
+transition, not proof of immutable bytes, writer closure or volume closure, and
+it is trusted until its generation changes or a held/recycle/evicting
+transition clears it. The pressure figure is that sum for **both** backings:
+a shared removable volume's other occupants are not this pool's usage, so they
+never move a pool toward its cap and never evict its idle slots. Free space on
+a removable volume is a separate reserve signal; the below-reserve *selection*
+fallback and the running-build reserve watchdog keep their current behaviour,
+and widening them is the approved follow-up rather than part of this change.
 
 **How one walk reads (oxide#141).** The walk itself is unchanged in scope,
 bounds, policy and refusal classes. Each enumerated regular file or directory
@@ -394,9 +440,10 @@ half-budget recycling rule is retired (oxide#118). Incomplete or unknown
 accounting refuses the lease. A held same-holder replay keeps its exact lease
 and path, and another holder remains busy without touching the held slot.
 Byte pressure is handled by admitting a new slot, not by discarding a
-compatible warm one: with the whole-payload union at or above the budget, the
-oldest eligible idle whole slot is removed until the union is under it, and
-`Full` refuses when only held slots remain.
+compatible warm one: with the attributable pool figure — the recorded per-slot
+sum plus the shallow scope pass, never the shared volume's total — at or above
+the budget, the oldest eligible idle whole slot is removed until that figure is
+under it, and `Full` refuses when only held slots remain.
 
 
 ### Ledger-only view for front-door membership (oxide#110, lead `e4c74399`)
@@ -547,9 +594,14 @@ retired-backed and unresolved `Evicting`. Compatible idle reuse stays first,
 with its complete target walk. Below both count ceilings and without byte
 pressure nothing is evicted, so the old 32/2 counts no longer churn slots.
 At the pool ceiling, the least-recently-used *eligible* idle whole slot is
-replaced and the new slot is built cold; a byte-pressure admission does the
-same using the global idle order and remeasures the inode union after each
-deletion. Each deletion must reduce membership and an admission is bounded by
+replaced and the new slot is built cold. That is **count** pressure, and it is
+authorised separately from bytes: a complete pool figure or a removable pool's
+bound-only unknown both suffice, while an internal, mixed or non-bound
+incompleteness refuses before any deletion. A **recorded byte-pressure**
+admission instead compares the attributable pool sum with the budget, uses the
+global idle order, and recomputes the recorded figure after each deletion; a
+removable pool whose own size is unknown takes the reserve/floor route and
+never a byte-cap comparison. Each deletion must reduce membership and an admission is bounded by
 the entries it saw initially. Held, retired, uncertain (live or unattributable
 lock), foreign and unmeasurable slots are never eligible, and a safety failure
 stops admission instead of skipping to another slot. With no safely eligible
@@ -557,9 +609,11 @@ idle slot, the lease refuses honestly; it does not promise a deletion through
 a failed safety gate. At the eight-slot project ceiling Oxide replaces that
 project's oldest eligible idle whole slot, which also frees pool capacity.
 The front door chooses that victim by recorded rank but asks the library to
-retire it as part of the same admission: complete whole-payload accounting and
-rank headroom are checked before any deletion, and a refusal leaves the victim
-and every metadata record in place.
+retire it as part of the same admission: the count-pressure gate of the
+previous paragraph and rank headroom are checked before any deletion, and a
+refusal leaves the victim and every metadata record in place. The whole-payload
+walk reported by `status --measure` remains an audit view, not admission
+input.
 A command waits only when a specific held compatible slot of its own checkout
 exists under the existing identity and freshness rules; an unrelated build's
 completion is not assumed to free a count or byte ceiling. The freshness loop
@@ -582,46 +636,585 @@ are unit tests in `effigy test rust`. Not covered natively: the nine-grant
 freshness bound is a bounded-loop inspection, and no large live inventory or
 physical multi-million-entry performance is claimed.
 
-### Recorded per-slot accounting (approved, not implemented)
+### Recorded per-slot accounting (oxide#146: implemented, native held)
 
 Tom's 2026-10-25 ruling, "We need a much faster way to do the accounting
 too" (Queue decision `8c6b8319-b20e-4a78-b987-c09dee69886c`), approves a
-different policy from the exact-cache proposal below. The removable-volume
-hotfix remains the implemented admission path until its reviewed replacement.
+different policy from the exact-cache proposal below. The sections below are
+both the reviewed design (frozen at `c4b6447`) and the implemented behaviour;
+where the implementation had to correct the design, it says so. The parked
+exact-union design further down stays history and is not resurrected: the
+accepted policy is the opposite one, cross-slot hard-link **overcount** and
+trust of a recorded idle slot until its generation changes.
 
-At release after writer closure, record unique allocated bytes by walking
-only that slot, bounded, with the record bound to its generation/incarnation.
-Admission and eviction use the sum of current slot records and walk only
-slots without a current record. A missing, crashed or legacy record grants no
-size estimate; an incomplete required walk keeps the existing refusal rules.
-Held/writer transitions invalidate closed records. Publication, flush,
-recovery, version fencing and crash ordering require an independently
-reviewed detailed design before implementation.
+**What shipped.** `SlotRecord.recorded` carries one closed observation, the
+`capacity_policy` fence is now **2** (version 1 stays readable and is upgraded
+by the next revised write), and the front door's control `STATE_VERSION` is
+**5** with the `oxide.accounting/1` fence written durably by the first
+mutating command's admission gate, before any library write can fence the
+ledger. `Pool::recorded_total()` replaces the whole-payload admission walk
+with `pool_scope()` (a new `inventory::scope_directory` entry point with a
+ledger-membership hard stop, observed on its own debug-only
+`OXIDE_TEST_SCOPE_LOG`) plus one figure per slot, and `Pool::pressure()` is
+that same pool figure for **both** backings: a shared removable volume's other
+occupants are not this pool's usage. `release_or_recover`
+measures the one slot it closes and publishes the record in the same atomic
+`Held -> Idle` replacement; every transition out of `Idle` clears it. Default
+`oxide status` reports the ledger's recorded total and per-slot record as the
+admission basis, separately from the oxide#128 sidecar, and `--measure` stays
+the full-walk audit.
 
-Cross-slot hard links may be counted more than once; that conservative
-overcount is accepted. This is not the old exact inode-union cache. A closed
-record is trusted until its generation changes or a held/crashed transition
-invalidates it: later changes inside an otherwise recorded idle slot need not
-be detected at each admission. That deliberate trust relaxation must remain
-explicit; a record does not prove immutable bytes or writer closure.
-Unrecorded slots still enforce ownership, unreadable-entry, foreign-entry and
-symlink refusals. Whole-slot eviction remains limited to positively owned
-idle slots, never active or uncertain writers or retained evidence.
+**Corrections the implementation made to this design.** (1) A *current* record
+is trusted at admission, so an entry that only a fresh walk would find
+unreadable no longer blocks a new-slot admission; the whole-idle-slot deletion
+then either succeeds or fails honestly and leaves a recorded `Evicting` slot
+for reconciliation. Reuse of that same idle slot still walks it and still
+refuses. (2) `pool_scope()` needed its own walker: `extra_depth` only raises
+`max_depth` and files at the bound are still counted, so any depth bound would
+either descend into legacy `slots/<id>` roots or report a `DepthLimit` gap at
+labelled `slots/<folder>/<profile>-<id>` roots. (3) The 5 s
+`VOLUME_WALK_MS` bound applies to the walks a removable pool's figure needs, so
+a pool too large to measure reaches the unknown-size reserve route instead of
+timing out mid-walk.
 
-Removable pools also bound admission by verified volume used bytes. The
-internal directory pool uses the recorded sum. Default status reports
-recorded totals with their provenance; `status --measure` keeps the full walk
-as an audit. The implementation must justify removing the hotfix's 5 s
-fallback or retaining it only for legacy pools.
+**Evidence state.** Source and unit regressions are in this change. The
+focused proof `scripts/test-recorded-slot-accounting.py` and its three
+selectors are **held**: no counted native has run, its fit is unmeasured, and
+the required uncounted diagnostic is separately activated. The ELEVATED
+author and independent reviewer natives remain outstanding.
 
-Acceptance requires O(slots) admission with no inventory walks when all
-records are current, fixture comparisons where the sum is at least the
-full-walk union, crash/legacy migration and bounded unknown handling. The
-focused proof uses tiny fixtures and debug-only controls, with a premise
-sweep or safe diagnostic before a counted run. Changes decide deletion under
-byte pressure, so validation is elevated; author and independent reviewer
-native sessions remain separately activated. No live-pool migration,
-cleanup, installation or consumer change follows from this design approval.
+#### Problem and final shape
+
+Before this change one ordinary command paid at least one whole-payload walk:
+`allocate` walked the payload before any eviction and again after it, a count
+replacement walked it before deleting, and `evict_idle_until` walked it before
+each deletion. A removable payload too large to walk inside 5 s then took the
+retired volume-used fallback, which compared the whole volume's used bytes with
+the pool cap. Measured cost is the one recorded for the outage: a 127-slot USB
+pool could not be walked within the 60 s bound, so every new-slot admission
+refused.
+
+After this design, admission and byte-pressure eviction are arithmetic over
+the ledger: **O(slots) metadata work, zero inventory walks when every slot's
+record is current**. Only a slot without a current record is walked, one
+bounded walk each, and only when that admission actually needs its number. No
+whole-payload admission, readiness or result-line scan survives.
+
+#### What is recorded
+
+One closed observation per slot, inside the existing ledger record (no second
+accounting file, no sidecar format):
+
+| Field | Meaning |
+| --- | --- |
+| `for_lease` | the slot's `last_lease_id` at the closing transition |
+| `unique_allocated_bytes` | the walk's `(device, inode)` union allocated bytes |
+| `logical_bytes` | the walk's logical bytes, reported only |
+| `entries` | entries visited, reported only |
+| `at_ms` | wall clock at measurement; an observation, never a validity input |
+
+The record is written **only** in the atomic ledger replacement that moves the
+slot `Held → Idle`, in the same JSON object as `state: Idle`, `lease_id: null`
+and the freshly stamped rank. It is cleared in the same replacement as every
+transition out of `Idle` (`take_idle`, `retire_idle_slot` → `Evicting`). It is
+never written for a `Held` slot and never adopted across incarnations.
+
+Size. `MAX_LEDGER_BYTES` stays 2 MiB and is not raised. The new record costs at
+most `128 × (``"recorded":{…}`` ≈ 960 escaped lease bytes + 4 × 20-digit
+integers)`, about 131 KiB at every bounded field's ceiling. Phase B extends the
+existing worst-valid-ledger unit proof (oxide#118) to include the record; if
+that proof cannot fit 2 MiB, a **fit blocker is reported** and the bound is not
+silently raised.
+
+#### Validity: what makes a record current
+
+A record is current only when all of these hold, evaluated under the pool
+lock in the same open that uses it:
+
+1. `slot.state == Idle` and `slot.lease_id.is_none()`;
+2. `record.for_lease == slot.last_lease_id` — the generation fence. Every
+   `Held` transition mints a new `last_lease_id`, so a leftover record can
+   never match a later generation even if a future edit forgot to clear it;
+3. the slot's recorded root still resolves: `<payload>/slots/<dir>` exists and
+   is a real directory (`symlink_metadata`, no follow). A root that is another
+   kind is counted by `pool_scope` exactly as today's whole-payload walk
+   counts it (never its target) and its record is never
+   published or used; a missing root is a complete zero, as today;
+4. the pool has no unresolved `Evicting` record and `reconciliation_blocked`
+   is false.
+
+Anything else is **not current**: never zero, never free space. A slot whose
+record is not current is walked before its number is used, and an incomplete
+walk keeps today's `unknown_accounting` refusal exactly.
+
+The one deliberate relaxation, restated because it is the whole point: a
+current record is trusted even though a same-UID process could have changed
+the slot's contents since it was written. The record is a size observation at
+release, **not** proof of immutable bytes, writer closure or volume closure.
+Newly unreadable entries, new Finder metadata and cross-slot link changes
+inside an otherwise recorded idle slot are not re-detected per admission. The
+invalidation paths are: the next lease and its release, `retire_idle_slot` /
+recycle / eviction, `oxide status --measure` (audit, below), and any crash or
+held transition. Nothing else claims to bound later same-user mutation.
+
+#### Lifecycle, locks and publication
+
+Admission walks already run under the pool lock (`Pool::open` takes it, then
+`allocate` walks), so **no lock order changes**: the internal admission
+barrier still precedes the removable one, nothing takes admission inside the
+pool lock, and no new lock or file is added. Recovery, retirement and recycle
+keep their existing order.
+
+| Event | Ledger result (one atomic replace + sync) | Crash before write | Crash after write |
+| --- | --- | --- | --- |
+| Allocate a new slot | `Held`; no record | previous state | `Held`, no record; recovery as today |
+| Same-holder replay | nothing written | — | — |
+| Reuse a compatible idle slot (own walk, unchanged) | `Held`, record **cleared**; the walk's figure is the result line's `measured` | still idle, record intact | `Held`, no record |
+| Release / recover after positive writer closure | `Idle`, rank stamped, plus the record if the walk completed, else no record | still `Held`; the next closure attempt walks again | `Idle` with (or honestly without) a record; an idle-lease replay writes nothing and keeps the record |
+| Removable flush fails (`flush_before_idle`) | retired / lost, **no record**; the lease stays held | unchanged | unchanged |
+| Admission refreshes missing records | one write carrying every record this admission completed, **before** the admission decision, so progress survives a refusal | no change | records durable |
+| Evict / recycle / reconciliation | `Evicting`, record cleared, then the record is removed after deletion as today | unchanged | as today |
+| `status --measure` | nothing written | — | — |
+| Upgrade a legacy ledger | `capacity_policy: 2` installed by the first revised write; held slots unaffected (always walked) | still legacy | one-way fence, below |
+
+**Release ordering with oxide#136 and removable flush.** The front door already
+does, in this order and with the admission lock held: positive group closure →
+`discard_scratch` (remove the owned `TMPDIR`) → `flush_before_idle` (flush the
+bound volume to the device with `volume::fsync_volume_np`; the volume stays
+mounted, and only a successful flush returns `true`) → `release(&pool,
+lease_id)` (`store.rs:1622-1638`). The record walk is inserted **after** that
+flush and **before** the `Held → Idle` replacement:
+
+1. bounded walk of that one slot (`inventory_sizes_with(slot_path, 0, limits)`,
+the same call `slot_accounting` uses), outside no lock it did not already hold;
+2. re-read the in-memory record and require `state == Held`,
+`lease_id` is ours, `last_lease_id` unchanged, `incarnation` unchanged;
+3. only then write `Idle` + rank + record in one replacement.
+
+Step 2 is the conditional publication: a slot that is no longer ours is never
+stamped with a figure. Because the slot is held by this command, its writers
+are positively closed, and a competing command cannot take or recover it, the
+walk observes quiescence to the same degree as `status`. That is a same-UID
+cooperative trust statement, not an isolation proof. A failed or incomplete
+walk publishes **no** record and **no diagnostic**: release still succeeds
+exactly as today, and `status` shows the slot as unrecorded. No persisted
+diagnostic is added, because it would be a second representation with no
+admission use.
+
+#### Admission and byte pressure
+
+The pool's pressure figure is `recorded_total()`:
+
+```
+recorded_total() = pool_scope() + Σ slot_bytes(slot)      over the ledger
+
+slot_bytes: Held                    -> fresh bounded slot walk (required complete)
+            Idle + current record   -> record.unique_allocated_bytes  (no walk)
+            Idle + missing/invalid  -> one bounded slot walk (required complete),
+                                       published before the decision
+            Evicting / blocked      -> unknown -> refuse (today's rules)
+```
+
+**`pool_scope()` is a new walker, not an `extra_depth` walk.** `extra_depth`
+(`pool.rs:2072-2078`) only adds to `max_depth`, and `max_depth` gates directory
+descent while files in a directory at the bound are still counted
+(`inventory.rs:640-716`). So `inventory_sizes_with(payload, 2, ..)` *is* today's
+whole-payload walk: it descends into legacy `slots/<id>` roots at depth 2, and a
+depth-2 bound would instead report a `DepthLimit` gap at labelled
+`slots/<folder>/<profile>-<id>` roots. Neither is the shallow figure this design
+needs, so Phase B adds a separate entry point with an explicit **stop
+predicate**, and `payload_accounting()` keeps its current call for
+`status --measure` only:
+
+1. read the payload root's entries; count each regular file (tolerated Finder
+   metadata such as `.DS_Store`/`._*`, and any stray file) into one
+   `(device, inode)` union;
+2. descend `slots/`, and one project-folder level below it, counting the files
+   directly at those levels;
+3. classify every directory entry it meets against **ledger membership**, not
+   record validity: a relative path equal to a recorded slot root — `<id>`
+   (legacy) or `<folder>/<profile>-<id>` — is a **hard stop**: not descended
+   into and not counted, because that slot's own walk or record owns its files;
+4. any other directory (a stray, an orphan, an unrecorded non-ledger region) is
+   descended and counted under the normal entry, depth and deadline bounds, so
+   nothing outside a slot can silently undercount.
+
+The classifier is path-based and layout-agnostic, so legacy and labelled roots
+are treated identically and no root is walked twice. Two consequences are
+stated rather than assumed. Directories contribute **no** allocated bytes to
+any union — both walks count only regular files
+(`inventory.rs:715-716`, `record_file`) — so a slot-root directory inode cannot
+be double-counted, only its files, and the hard stop is what prevents that.
+And the figure is a partition of the payload's files: every regular file under
+`<payload>` is counted exactly once, by `pool_scope` or by the one slot that
+owns it, with cross-slot hard links the only deliberate overcount.
+
+`pool_scope()` carries the same `InventoryLimits` as a slot walk and shares the
+admission's cumulative deadline. Any gap refuses exactly as today. It costs
+O(slots + metadata) and is not a payload walk. It is observed separately (see
+the proof oracles) so "zero inventory walks" stays a checkable claim.
+
+One cumulative `ACCOUNTING_MAX_ELAPSED_MS` (60 s) deadline covers every walk of
+one admission, via the existing `walk_limits`/`deadline` mechanism `measure`
+already uses, so a legacy 128-slot pool cannot turn one admission into 128
+fresh minutes. Slots the deadline leaves unmeasured stay unrecorded and the
+admission refuses `unknown_accounting` naming `elapsed_deadline` — today's
+refusal for the same pool, arrived at by slot walks instead of one union walk.
+
+Byte pressure then follows today's rules unchanged (`budget` from
+`LeaseRequest.budget_bytes` else the recorded cap): under budget, admit; at or
+over, evict the least-recently-used **eligible** idle whole slot, remeasure,
+and refuse `Full` when only held / retired / uncertain slots remain. One
+deletion must reduce the figure by at least the victim's recorded bytes; a
+non-reduction refuses `unknown_accounting` instead of looping. Held, foreign,
+symlinked, uncertain and unmeasurable slots are never candidates, and nothing
+here deletes held or unknown storage, active scratch, outputs or evidence.
+
+**Hard links.** A slot's own walk unions `(device, inode)`, so a link pair
+inside one slot counts once, as today. Across slots the recorded sum counts
+such an inode once per slot. That overcount is accepted: it can only make the
+figure larger, so pressure arrives earlier and an idle slot may be evicted
+earlier than the union would have required — never later, and never a smaller
+figure than reality. The invariant asserted in tests is `sum >= full inode
+union` for the same settled state, equality when the slots are disjoint.
+
+**Out-of-slot metadata.** Tolerated Finder metadata beside and between slots,
+stray non-slot entries and orphan directories under `<payload>` are counted by
+`pool_scope()` and attribute to no slot. They can therefore never silently
+undercount, and never grant ownership: they are not eviction candidates and
+the existing foreign-entry, symlink, root-identity and no-follow refusals are
+unchanged.
+
+#### Removable pools
+
+`apfs-volume-v1` admission uses the same **pool-scoped** figure as the
+directory backend: `recorded_total()` only. The bound volume's total used
+bytes are **not** pool usage — another tool's cache, scratch or Desktop files
+on the same volume are not this pool's bytes and can never push it over its cap
+or trigger an idle eviction (Tom, 2026-10-25, after a live outage where old
+byte accounting evicted warm slots for foreign growth). Free space on the
+volume is a separate signal: the existing below-reserve selection fallback and
+build-time reserve watchdog are unchanged.
+
+An unknown pool size is honest and never zero. When the pool's own walk stops
+at its own bounds (`ElapsedDeadline` or `EntryLimit` only), the reserve route
+applies and it **is** allowed to prune: free space above the reserve (and at or
+above the floor) admits with a bounded note and no eviction; free space at or
+below the reserve — and any free space below the hard floor while anything is
+left to prune — retires the eligible idle whole slots in the existing LRU order,
+re-reading free space and re-verifying the binding after each; with nothing left
+to prune, free space **at or above the 10 GiB hard floor** admits with a warning
+and below it refuses with the original incomplete scan. The floor is a
+fixed product constant for this change — not a registration field, selection or
+watchdog setting — and it wins over any lower legacy reserve, so nothing
+admits below it. Every other incomplete shape, an unverifiable binding, unknown
+free or reserve facts, and the internal directory pool's own incompleteness
+refuse exactly as before; a partial scan is never published as a record and the
+cap stays stated as unverified on this route.
+
+Provenance is printed (`recorded n/m slots`). Free space, the reserve and the
+hard floor are printed in binary GiB, the same units they are defined in, and
+the cap comparison never includes the volume's total used bytes. Unknown free or
+reserve facts refuse `unknown_accounting` on the unknown route, and an absent,
+mismatched or unverifiable backing still refuses before any effect. The
+below-reserve *selection* fallback and the running-build reserve watchdog keep
+their existing behaviour; widening them to prune and to use a registration floor
+field is the approved follow-up, not part of this change.
+
+**Fallback disposition.** The retired `admit_by_volume_usage` path, its
+decision type and its fixed eight-eviction loop are gone: the whole-volume-used
+figure is no longer a budget input anywhere. What remains is one pure decision,
+`unknown_removable_step`, and the pool-side loop that prunes eligible idle
+whole slots while free space is at or below the reserve or below the floor.
+The 5 s `VOLUME_WALK_MS` bound still applies to the walks a pool figure needs,
+so a huge removable pool reaches the unknown route rather than timing out
+mid-measurement.
+
+#### Status, audit and provenance
+
+Default `oxide status` (`managed::snapshot`) already walks nothing, takes no
+lock and reconciles nothing. It gains **display only** and must name its two
+sources, which are never mixed:
+
+| Source | What it is | Shown as |
+| --- | --- | --- |
+| **Ledger record** (this design) | the admission basis, written by releases and recorded admissions | per-slot bytes with `recorded` / `unrecorded`, and one pool `recorded total` over `recorded n of m slots` |
+| **`oxide-managed/status-observations.json`** (oxide#128) | a diagnostic reuse-walk fact, up to 256 KiB / 128 facts | the existing per-slot line with its age, source and lease, or `not measured` |
+
+The two are labelled separately and never summed into one number: the #128
+sidecar stays ineligible for a pool total, and the ledger total never borrows a
+sidecar fact. Only the ledger total carries admission meaning, and even it is a
+recorded observation — not free space, not a writer- or volume-closure claim.
+An `unrecorded` slot makes the total a stated lower bound. Default status never
+publishes, refreshes, reconciles or creates a lock, and a snapshot may still
+straddle a concurrent replacement and says so.
+
+**Owning sentence.** `workflow.md` used to state that default status reports
+recorded sidecar facts and that "recorded facts are never summed into a pool
+total". The same change rewrites exactly that sentence in
+[storage and space management](workflow.md#storage-and-space-management) to
+name the two sources above, because the binary now does show a ledger total:
+that older sentence was true of the sidecar only and would otherwise
+contradict the implementation.
+
+`oxide status --measure` keeps the full payload and per-slot walk as the
+audit: unchanged bounds, no lock, no publication, coverage/cause/elapsed
+reporting. Audit never mutates the ledger and never publishes a record.
+
+No `--verify` mode is added. Migration therefore converges through leases:
+releasing a slot publishes its record, and an admission publishes every record
+it completes. A pool of never-reused idle slots converges one admission at a
+time (each admission making durable progress and refusing honestly while the
+cumulative deadline leaves any slot unmeasured), or is cleaned/evicted by its
+owner. That cost is stated rather than hidden behind a background sweep, which
+this design does not add.
+
+#### Compatibility and version fencing
+
+`CAPACITY_POLICY_VERSION` becomes **2**, written by the first revised ledger
+replacement that also writes a record or reads a `2` ledger. Both representations
+fence the one-way step:
+
+- an older binary's `deny_unknown_fields` ledger parse rejects `recorded` and
+  refuses `unknown_accounting` (exit 3) before any write or deletion;
+- if a parse ever succeeded, `validate_ledger_read` already requires
+  `capacity_policy == CAPACITY_POLICY_VERSION`, so a `2` ledger refuses there;
+- a new binary reads a `capacity_policy: 1` or legacy ledger unchanged: every
+  slot is simply unrecorded, held slots are walked as today, and the first
+  revised write installs 2.
+
+The one-way switch needs ordering the ledger alone cannot provide, because the
+front door's hand-off trigger reads control `state.json` /
+`removable.json`, not the library ledger (oxide#122). Hand-off requires a
+peeked numeric version **greater than the running binary's**, so the value is
+this tree's `STATE_VERSION`, **5** (`store.rs:74`; 4 is the oxide#133
+owned-outputs fence an installed binary already writes). The 3 an earlier
+revision of this section proposed was a *downgrade* from that shipped 4 and
+would leave an installed version-4 binary exposed to `deny_unknown_fields` on
+`recorded`. The fence is installed by the front door's mutating-command
+admission gate, so it is durable before any library write can fence the
+ledger; an owned-outputs-only save still derives version 4. Phase B therefore writes control `version: 5` **before** the first
+recorded ledger write, so an installed version-4 binary hands off to a
+receipt-matching successor instead of refusing the pool it was just handed. A
+crash between the two writes leaves control 5 with a v1 ledger, which is a
+normal state for the new binary and a hand-off for the older one; the reverse
+order would strand it. The old binary's own refusal remains the honest
+fallback when no receipt-matching successor exists. This is the only
+cross-file ordering in the design, it changes one existing proof's input, and
+Phase B re-runs `rust:installed-handoff` for that reason — its
+version-3-trigger fixtures need a version-5 trigger and a version-4 control
+that keeps the existing refusal. Existing held IDs, lease-ID
+format, receipt and status fields, `MAX_SLOTS`, rank sequence, ledger bounds
+and every output contract are otherwise unchanged.
+
+**Lost replies.** A retried `release` after a lost reply hits the idle replay
+path, which writes nothing and keeps the record. A lost reply *before* the
+write means the retry performs the walk and transition again — same figure or
+an honestly absent one. A lost `allocate` reply leaves a `Held` slot with no
+record; the next recovery closes it and records it. No path treats a missing
+reply as a size.
+
+#### Source map (this tree)
+
+| Concern | Where |
+| --- | --- |
+| Ledger/config/limits, fences | `src/lease/mod.rs` (`LEASE_VERSION`, `CAPACITY_POLICY_VERSION`, `MAX_LEDGER_BYTES`, `MAX_SLOTS`) |
+| Record and ledger types | `pool.rs` `Ledger`, `SlotRecord`, `SlotPersistState` (`:153-201`) |
+| Admission | `Pool::attempt` reuse walk (`:865`), `Pool::allocate` (`:949-1051`), `payload_check` (`:1336`), `payload_accounting` (`:1536`), `slot_accounting` (`:1559`) |
+| Eviction | `evict_idle_until_under_cap` (`:1368`), `evict_one_idle` (`:1395`), `retire_idle_slot` (`:1420`), `evict_idle_until` (`:1282`), `replace_idle_slot_for_admission` (`:1260`) |
+| Release/recover | `Pool::release_or_recover` (`:1057`) |
+| Status/audit | `Pool::accounted` (`:1102`), `managed::snapshot`, `managed::measure` (`:446-492`) |
+| Removable unknown route | `unknown_removable_step`, `admit_unknown_removable`, `bound_gaps_only`, `pressure_known_or_bounded_removable`, `UNKNOWN_REMOVABLE_FLOOR_BYTES` (`10 * 1024^3`), `VOLUME_WALK_MS` |
+| Front-door release order | `store.rs` `release` (`:1622`), `unshare` (`:1640`), `discard_scratch` (`:1674`), `flush_before_idle` (`:1689`) |
+| Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
+| Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
+| Control state fence | `store.rs` `STATE_VERSION` (`:74`, 5 writes the recorded-accounting fence; an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4), `RECORDED_ACCOUNTING_FENCE`, hand-off trigger in `handoff.rs` |
+| Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
+
+#### Acceptance matrix
+
+Unit/regression (`effigy test rust`), against the real library entry points, not
+decision mocks where a real path exists:
+
+1. **Zero-walk admission.** All records current → `allocate` makes **no**
+   `inventory_directory` call at all, so the existing walk observer is empty,
+   and the figure equals the recorded sum plus `pool_scope()`. Because
+   `pool_scope()` is its own entry point it records on the separate debug-only
+   `OXIDE_TEST_SCOPE_LOG`; the oracle requires exactly one scope line naming
+   the payload root and zero walk-log lines. Without that split the "empty
+   observer" claim would be untestable: `inventory_directory` records every
+   root at `inventory.rs:438`, whichever caller asked.
+2. **Missing-only walks.** Two of five slots unrecorded → exactly those two
+   slot walks plus one `pool_scope()`, and no walk of the three recorded roots
+   (asserted per root, not by count alone); the completed figures are published
+   before the decision and survive a refusal.
+2b. **Scope classification.** Legacy `<id>` and labelled `<folder>/<profile>-<id>`
+   roots are both hard stops, a recorded root is never descended into, a stray
+   sibling directory is counted once, and swapping every slot's contents for a
+   different size changes the total by exactly the recorded deltas — the
+   regression that falsifies a depth-bounded substitute for the stop predicate.
+3. **Held isolation.** A held slot is always walked; a held slot never reports
+   an idle record and a record for a held slot is never published or used.
+4. **Invalidation.** Reuse, recycle, eviction and recovery clear the record in
+   the transition write; a leftover `for_lease` mismatch is never current;
+   `Evicting` / `reconciliation_blocked` refuses unknown.
+5. **Sum vs union.** Single-slot hard-link pair, cross-slot pair, duplicate
+   content in two slots and disjoint slots: `sum >= union`, equality when
+   disjoint, and the extra slots pressure the byte budget (non-vacuous: an
+   eviction that the union would not have caused).
+6. **Non-zero/zero discipline.** Malformed, oversized, unknown, stale,
+   mismatched-incarnation and unsupported records are never zero; a measured
+   zero stays a measured zero; an incomplete walk refuses with its gap kinds.
+7. **Serialization.** Worst-valid 128-record ledger round-trips under
+   `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
+8. **Compatibility.** `capacity_policy: 1`, legacy (no fence) and `2` ledgers;
+   held IDs preserved; the control fence is `STATE_VERSION` 5 written by the
+   admission gate before the ledger fence, an owned-outputs-only state derives
+   version 4 (proved on `save` directly, not through a path that takes
+   admission), a v4 control still hands off, and a v5 document without the
+   fence or with an unknown fence value refuses; old-binary refusal is
+   exercised as a ledger parse/validation refusal, not a mutation.
+9. **Removable combination.** The cap uses pool bytes only, so a volume whose
+   unrelated used bytes exceed the cap still admits with no eviction while the
+   pool is below it; the unknown-size route acts on free space against the
+   reserve and the 10 GiB floor (prune, warn-admit or refuse), never on
+   whole-volume usage, and only for bound-only gaps.
+10. **Release failure paths.** Incomplete walk, conditional-recheck mismatch and
+    a lost reply all leave the pool consistent and never publish a figure.
+
+Native (`effigy rust:recorded-slot-accounting`, one fixed script
+`scripts/test-recorded-slot-accounting.py`, the whole command of the qualified
+shared supervisor): tiny private fixtures only, debug staging with
+`debug_assertions` on, private `HOME`/`CARGO_HOME`, explicit `OXIDE_POOL`:
+
+- A: all-recorded new-slot admission with an empty `OXIDE_TEST_WALK_LOG` over
+  the admission phase and exactly one `OXIDE_TEST_SCOPE_LOG` line (zero
+  payload/slot walks), on a pool whose idle slot is large enough that a walk
+  would be visible. Every admission oracle in the proof is read while the
+  gated command is still `Held`, because a release always measures the slot it
+  closes; the release walk is then asserted separately, so neither claim can
+  be satisfied by the other phase. The
+  count-replacement branch of the same `evict_one_idle` / `retire_idle_slot`
+  code is proved by the library regression
+  `pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count`, which now
+  asserts an empty walk log: neither the 128-slot pool ceiling nor the 8-slot
+  project cap has a cheap CLI fixture, and `OXIDE_POOL_CAP` is a byte budget,
+  not a slot count. Byte pressure in the CLI proof comes from that documented
+  budget at pool creation, never from a proof-invented variable;
+- B: one unrecorded idle slot → exactly one slot walk, published, and the
+  second admission of the same shape walks nothing;
+- C: release publishes a record and the next reuse clears it, with the result
+  line's provenance text checked;
+- D: a non-vacuous byte-pressure eviction of one owned idle whole slot beside a
+  held slot and a foreign out-of-slot entry, both untouched byte-for-byte. D
+  first proves its own placement from the product's serialized `config.json`
+  (`backend: "directory-budget-v1"` and no `volume` entry) through
+  `recorded_backend()`, which refuses a missing, malformed, unknown or
+  removable backend by name; the ledger records no backend at all, so no case
+  may read one from there;
+- E: cross-slot hard-link overcount (sum ≥ union) plus a refusal case with
+  untouched bytes/inodes;
+- F: legacy ledger convergence across two admissions and one crash replay;
+- G: default `status` shows recorded totals and walks nothing; `--measure`
+  walks and still writes nothing.
+
+Every case applies the nine-item
+[proof-authoring premise checklist](workflow.md#proof-authoring-premise-checklist)
+with an executable location or a concrete not-applicable reason: the script
+records all nine in `PREMISE_CHECKLIST` (private HOME and rustup, account-home
+control, environment isolation, no adopting conversion, no external Cargo
+subcommand, no image, frozen compiler flags, the internal-root temporary
+storage, no `mktemp`), `--self-check` asserts the map is complete, and the
+diagnostic receipt carries it. The uncounted `--diagnostic` gate below runs
+before the first counted native. The
+brief's own six review subjects (recorded accounting, release observation and
+crash fencing, admission/eviction/ownership, migration/status/compatibility,
+proof source fit, exact-head natives) each map to a section above.
+
+**Diagnostic mode.** `scripts/test-recorded-slot-accounting.py --diagnostic`
+(selector `effigy rust:recorded-slot-accounting:diagnostic`, same supervisor
+bounds, separately activated) declares a step/dependency/shared-premise map,
+records recoverable oracle failures and continues only through
+cases whose prerequisites are intact, writes one uniquely named bounded
+receipt in the evidence root labelled `mode: diagnostic`,
+`qualified: false`, with reached/completed/failed/skipped/unexecuted counts,
+every reason, the taint set, the primary and secondary errors, and explicit
+incomplete counts at its bounds. Counted default stays fail-fast. Any unknown
+child/writer/device effect, pending custody, timeout, infrastructure or
+protocol failure aborts rather than continuing; nothing is repaired by
+assumption; a non-zero direct leader exit is never read as descendant closure.
+A case that dies of an unexpected exception is recorded as that case's
+failure before any state or receipt is computed and then aborts the
+collection, so a reached-but-crashed case is never reported as a pass and its
+successors are `not_run_aborted`; interrupts stay outside that handler. Every
+abort goes through the one `mark_abort()` state, so the durable receipt and
+the console cannot disagree about `aborted` or `collection_complete`. Pure
+counterfactuals drive the same dispatch/case/receipt logic for fail-fast
+unchanged, record-and-continue, dependency/taint skip, safety abort, an
+unexpected exception in a middle and in the last planned case, a pre-case
+setup failure, the shadowing-local abort regression and first-fault
+precedence.
+
+#### Phase and resource estimate (UNMEASURED)
+
+| Phase | Work | Wall (est.) | Scratch peak (est.) |
+| --- | --- | --- | --- |
+| P0 | premise self-check, fixture construction | 5 s | 5 MiB |
+| P1 | offline debug `oxide` staging with 1.97.1 using the reviewed oxide#140 recipe (4 Cargo jobs, 16 codegen units, `debug-assertions` on, `debug = 0`, opt-level `s`, incremental off, symbol-stripped, inside owned scratch) | 55 s | 90 MiB |
+| P2 | A/B/C/F/G cases | 90 s | 30 MiB |
+| P3 | D/E pressure, hard-link and refusal cases | 45 s | 30 MiB |
+| P4 | evidence write, cleanup | 15 s | 5 MiB |
+| | **total** | **210 s of a 270 s work window** | **~120 MiB of 512 MiB** |
+
+300 s total with the supervisor's 30 s stop margin and 512 MiB monitored
+scratch are unchanged; every write stays inside the owned root, no session,
+group or census is started. The qualified guard is **this tree's** supervisor,
+`scripts/bounded-test.py` sha256
+`bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924`
+(oxide#151, merged `af08749`; the current qualified source per
+[shared proof supervisor](workflow.md#shared-proof-supervisor)). The earlier
+oxide#147 `5e5b6617`, oxide#145 `a6d73326` and `961164e7` bytes are history and
+are not used.
+These figures
+are planning arithmetic, not measurements: the proof's own `--plan` prints them
+and any activation re-measures and reports a **fit blocker** rather than
+raising either bound. Both debug-only observation hooks — the existing walk log
+and the new scope log — are `debug_assertions`-gated, which the staging recipe
+keeps on and the fixture checks through the built-in capability probe before
+any case asserts a count, and a release build must refuse control presence at
+any value.
+
+**Recipe binding.** The proof needs a genuine internal `directory-budget-v1`
+pool, so both heavy commands pass `--root-parent /private/tmp` explicitly
+(Tom's answered internal-root exception); a pool under a selected volume would
+be refused by the product itself. Staging is one function with the real argv
+and environment, and `--self-check` mutates it (one job, one codegen unit,
+profile drift, a leaked encoded-flags value, a build directory outside the
+stage) so the pure check fails if the recipe regresses. Fixtures keep one Cargo
+job and run sequentially; the configured jobs are build parallelism, never a
+CPU cap or an admission-demand claim.
+
+#### Phase B envelope
+
+Files: `src/lease/mod.rs`, `src/lease/pool.rs`, `src/lease/tests.rs`,
+`src/inventory.rs` (the `pool_scope()` entry point and its debug-only scope
+log), `src/bin/oxide/store.rs` (control `STATE_VERSION` and release ordering),
+`src/bin/oxide/main.rs` / `describe.rs` (status and result-line provenance),
+`effigy.toml`, `scripts/test-recorded-slot-accounting.py`, this file, the
+`workflow.md` hotfix paragraph and its `storage-and-space-management` status
+sentence, and the `AGENTS.md` selector map. Covering
+selectors: `rust:compile`, `rust:compile-linux`, `rust:format`, `test rust`,
+`docs:check`, the re-run `rust:installed-handoff`, and the new
+`rust:recorded-slot-accounting` / `:diagnostic` / `proof:recorded-slot-accounting:test`.
+Validation is **ELEVATED** because byte pressure decides a deletion: one author
+native and one distinct independent reviewer native, each separately ROOT
+activated on exact clean published source, no shared allowance, and the
+uncounted diagnostic required before the first counted native. Failure or an
+unknown launch stops; no refund and no automatic re-run. The hand-off proof's
+version inputs moved to this tree's fence (control 5, newer-than-self 6, an
+equal 5 deliberately not a trigger) and it needs its own safe diagnostic before
+a counted rerun. No live-pool migration, cleanup, installation, release or
+consumer change follows from this implementation.
 
 ### Historical parked exact cache (lead `cbb2824d`)
 

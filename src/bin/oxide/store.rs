@@ -64,17 +64,25 @@ pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 /// permanent version-2 fence is actually written.
 const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Permanent control-state fence for revised Store mutations (oxide#118).
-/// Version 4 carries the profile-member owned-outputs fence (oxide#133);
-/// version 3 (the whole-target registry transaction) and version 2 remain
-/// readable until the forward fence upgrades them.
-pub(crate) const STATE_VERSION: u32 = 4;
-/// Version 3 (oxide#129) is the unfenced-shape successor of version 2: a pool
-/// with the whole-target `oxide.outputs/2` fence keeps it so a state-3 binary
-/// can still run.
-const PREVIOUS_STATE_VERSION: u32 = 3;
+/// Version 5 carries the recorded per-slot accounting fence (oxide#146): the
+/// library ledger's `capacity_policy: 2` refuses an older binary's strict
+/// parse, so this control fence must be durable *before* the first recorded
+/// ledger write, and a newer binary hands off before it reads that ledger.
+/// Version 4 (the profile-member owned-outputs fence, oxide#133), version 3
+/// (the whole-target registry transaction, oxide#129) and version 2
+/// (oxide#128) remain readable until a forward fence upgrades them.
+pub(crate) const STATE_VERSION: u32 = 5;
+/// Version 4 is the owned-outputs fence this version supersedes.
+const PREVIOUS_STATE_VERSION: u32 = 4;
+/// Version 3 is the unfenced-shape successor of version 2: a pool with the
+/// whole-target `oxide.outputs/2` fence keeps it so a state-3 binary can still
+/// run.
+const OLDER_STATE_VERSION: u32 = 3;
 /// Version 2 (oxide#128) is read with the same strict field bounds.
-const OLDER_STATE_VERSION: u32 = 2;
+const LEGACY_FIELDS_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
+/// The recorded-accounting fence value; see [`State::recorded_accounting`].
+pub(crate) const RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
 const MAX_IDENTITY_BYTES: usize = 64;
@@ -305,6 +313,13 @@ struct State {
     /// after the registry and its directory are durable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     outputs_init: Option<OutputsInit>,
+    /// Forward-only recorded-accounting fence (oxide#146), set durably before
+    /// any library write that can record a per-slot observation and never
+    /// cleared. The library ledger's `capacity_policy: 2` is unreadable to an
+    /// older binary, so this must be durable first: an older binary then hands
+    /// off to a receipt-matching successor instead of refusing the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded_accounting: Option<String>,
 }
 
 /// The durable initialization record shared by both pools of a pair.
@@ -342,6 +357,7 @@ impl Default for State {
             flushes: Vec::new(),
             owned_outputs: None,
             outputs_init: None,
+            recorded_accounting: None,
         }
     }
 }
@@ -809,6 +825,14 @@ pub enum SlotSize {
         source: ObservationSource,
         lease_id: Option<String>,
     },
+    /// The ledger's own closed observation for this idle slot generation
+    /// (oxide#146). It is the admission basis; the oxide#128 sidecar fact above
+    /// stays a separate diagnostic and the two are never summed.
+    LedgerRecorded {
+        allocated_bytes: u64,
+        age: RecordedAge,
+        entries: u64,
+    },
     NotMeasured(String),
 }
 
@@ -856,6 +880,24 @@ impl SlotSize {
                     "{} ({age}; {}{lease}); may have changed since measurement",
                     crate::cargo_home::size(*allocated_bytes),
                     source.label()
+                )
+            }
+            Self::LedgerRecorded {
+                allocated_bytes,
+                age,
+                entries,
+            } => {
+                let age = match age {
+                    RecordedAge::Ago(seconds) => {
+                        format!("recorded {} ago at slot release", age_text(*seconds))
+                    }
+                    RecordedAge::ClockSkew => {
+                        "recorded at a time ahead of this clock, so its age is unknown".to_owned()
+                    }
+                };
+                format!(
+                    "{} ({age} over {entries} entries; the admission basis, not free space); may have changed since measurement",
+                    crate::cargo_home::size(*allocated_bytes)
                 )
             }
             Self::NotMeasured(reason) => reason.clone(),
@@ -978,6 +1020,15 @@ pub struct Report {
     /// Why the control state could not be read. Slots, flushes, waits and
     /// holders then read as unknown, never as empty.
     pub state_error: Option<String>,
+    /// The sum of the ledger's current per-slot records (oxide#146), or `None`
+    /// when no idle slot has one. This is a recorded admission basis, not free
+    /// space, and never includes an oxide#128 sidecar fact.
+    pub recorded_total: Option<u64>,
+    /// Idle slots whose ledger record is current.
+    pub recorded_slots: usize,
+    /// Idle slots with no current ledger record: they make `recorded_total` a
+    /// stated lower bound.
+    pub unrecorded_slots: usize,
 }
 
 /// An existing lease-ticket record shown by `oxide status`.
@@ -2683,7 +2734,21 @@ impl Store {
                                     scan: pooled.accounting.clone(),
                                 },
                             ),
-                        None => recorded_size(&observations, &snapshot.store_id, slot, now),
+                        // A current ledger record is the admission basis, so it is
+                        // reported first and labelled as such; the oxide#128 sidecar
+                        // stays a separate diagnostic fact.
+                        None => match slot.recorded.filter(|fact| fact.current) {
+                            Some(fact) => SlotSize::LedgerRecorded {
+                                allocated_bytes: fact.unique_allocated_bytes,
+                                age: if fact.at_ms > now {
+                                    RecordedAge::ClockSkew
+                                } else {
+                                    RecordedAge::Ago((now - fact.at_ms) / 1000)
+                                },
+                                entries: fact.entries,
+                            },
+                            None => recorded_size(&observations, &snapshot.store_id, slot, now),
+                        },
                     },
                 }
             })
@@ -2729,6 +2794,9 @@ impl Store {
             slots,
             recoveries: state.recoveries,
             state_error,
+            recorded_total: snapshot.recorded_total,
+            recorded_slots: snapshot.recorded_slots,
+            unrecorded_slots: snapshot.unrecorded_slots,
         })
     }
 
@@ -3028,6 +3096,13 @@ impl Store {
             },
             holder: lease_holder,
             budget_bytes: self.budget,
+            // The registered removable volume's free-space reserve, when this
+            // pool is the removable one. It is a reserve/prune signal for an
+            // unknown-size admission, never a pool-budget input.
+            reserve_bytes: crate::removable::registration(self)
+                .ok()
+                .flatten()
+                .map(|registration| registration.reserve_bytes),
             layout: Some(SlotLayout {
                 folders,
                 same_repository,
@@ -3470,8 +3545,27 @@ impl Store {
         self.control.join("waiters").join(format!("{id}.lock"))
     }
 
+    /// The mutating-command gate. Taking it also makes the recorded-accounting
+    /// control fence durable, before this command can write a recorded library
+    /// ledger (oxide#146): `STATE_VERSION` 5 is the hand-off trigger an older
+    /// installed binary needs, because the ledger's `capacity_policy: 2` is
+    /// unreadable to it. The write is one-time per pool; a read-only command
+    /// never takes this gate and so never writes.
     fn admission(&self) -> Result<File, String> {
-        lock_admission(&self.control)
+        let lock = lock_admission(&self.control)?;
+        self.fence_recorded_accounting()?;
+        Ok(lock)
+    }
+
+    /// Make the version-5 recorded-accounting fence durable. Nothing is
+    /// written when it is already set.
+    fn fence_recorded_accounting(&self) -> Result<(), String> {
+        let mut state = self.load()?;
+        if state.recorded_accounting.as_deref() == Some(RECORDED_ACCOUNTING_FENCE) {
+            return Ok(());
+        }
+        state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+        self.save(&state)
     }
 
     fn load(&self) -> Result<State, String> {
@@ -3489,7 +3583,10 @@ impl Store {
             .map_err(|error| format!("Oxide state is invalid: {error}"))?;
         let legacy = match state.version {
             LEGACY_STATE_VERSION => true,
-            OLDER_STATE_VERSION | PREVIOUS_STATE_VERSION | STATE_VERSION => false,
+            LEGACY_FIELDS_STATE_VERSION
+            | OLDER_STATE_VERSION
+            | PREVIOUS_STATE_VERSION
+            | STATE_VERSION => false,
             _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
         };
         if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
@@ -3519,15 +3616,20 @@ impl Store {
         // version to 4. The published `/2` fence keeps version 3 so a state-3
         // binary still runs a pool it understands, and the released `/1` fence
         // advances nothing.
+        let recorded = fenced.recorded_accounting.is_some();
         let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
-        fenced.version = if successor {
+        fenced.version = if recorded {
+            // Version 5 is the recorded-accounting fence (oxide#146) and the
+            // hand-off trigger that must precede the ledger's policy-2 write.
             STATE_VERSION
-        } else if previous {
+        } else if successor {
             PREVIOUS_STATE_VERSION
-        } else {
+        } else if previous {
             OLDER_STATE_VERSION
+        } else {
+            LEGACY_FIELDS_STATE_VERSION
         };
         validate_state(&fenced, false)?;
         let bytes = serde_json::to_vec(&fenced).map_err(|error| error.to_string())?;
@@ -3560,9 +3662,27 @@ impl Store {
 fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
     if !matches!(
         state.version,
-        LEGACY_STATE_VERSION | OLDER_STATE_VERSION | PREVIOUS_STATE_VERSION | STATE_VERSION
+        LEGACY_STATE_VERSION
+            | LEGACY_FIELDS_STATE_VERSION
+            | OLDER_STATE_VERSION
+            | PREVIOUS_STATE_VERSION
+            | STATE_VERSION
     ) {
         return Err("Oxide state has an unsupported version".to_owned());
+    }
+    // A document at or above the recorded-accounting version must carry its
+    // fence; a fence value this binary does not know refuses rather than being
+    // guessed at.
+    match state.recorded_accounting.as_deref() {
+        None => {
+            if state.version >= STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
+        Some(fence) if fence == RECORDED_ACCOUNTING_FENCE => {}
+        Some(_) => {
+            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
+        }
     }
     if state
         .outputs_init
@@ -4660,7 +4780,8 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(OLDER_STATE_VERSION))
+            Some(u64::from(LEGACY_FIELDS_STATE_VERSION)),
+            "an ordinary unfenced save advanced the numeric state version"
         );
         // Neither released fence is consent to a successor numeric format.
         let released = State {
@@ -4673,7 +4794,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(OLDER_STATE_VERSION)),
+            Some(u64::from(LEGACY_FIELDS_STATE_VERSION)),
             "a released /1 fence advanced the numeric state version"
         );
         // The published whole-target fence keeps version 3, so a state-3
@@ -4692,7 +4813,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             doc["version"].as_u64(),
-            Some(u64::from(PREVIOUS_STATE_VERSION)),
+            Some(u64::from(OLDER_STATE_VERSION)),
             "the published /2 fence left its numeric version"
         );
         // A pool that has not opted into owned outputs initializes from a
@@ -5183,6 +5304,7 @@ mod tests {
             lease_id: Some(lease_id.to_owned()),
             dir: None,
             rank: 0,
+            recorded: None,
         }
     }
 
@@ -5424,8 +5546,11 @@ mod tests {
     #[test]
     fn worst_escaped_control_state_roundtrips_through_save_and_load() {
         let (root, store, _removable) = paired_controls("control-escaped");
+        // The current representation carries both forward fences, so this is
+        // the worst valid version-5 document and not an owned-outputs-only one.
         let mut state = State {
             owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
             ..State::default()
         };
         for id in 1..=MAX_RECORDS as u64 {
@@ -5491,7 +5616,11 @@ mod tests {
 
     #[test]
     fn worst_valid_control_state_fits_its_object_and_byte_caps() {
-        let mut state = State::default();
+        // The current representation, so the bound covers the version-5 fence.
+        let mut state = State {
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+            ..State::default()
+        };
         for id in 1..=MAX_RECORDS as u64 {
             state.records.push(worst_record(id));
         }
@@ -5578,10 +5707,50 @@ mod tests {
         bounded.records[0].checkout = Some(PathBuf::from("/checkout"));
         store.save(&bounded).expect("bounded legacy state saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], serde_json::json!(OLDER_STATE_VERSION));
+        assert_eq!(
+            stored["version"],
+            serde_json::json!(LEGACY_FIELDS_STATE_VERSION)
+        );
         assert!(stored.get("owned_outputs").is_none());
-        // Only the forward fence (or initialization) advances the numeric
-        // version.
+        // The version *derivation*, proved on `save` itself so it cannot
+        // depend on which caller reached it: an owned-outputs successor alone
+        // is version 4, and only the recorded-accounting fence (oxide#146)
+        // makes it 5.
+        let owned_only = State {
+            owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+            ..State::default()
+        };
+        store
+            .save(&owned_only)
+            .expect("an owned-outputs-only state saves");
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], serde_json::json!(PREVIOUS_STATE_VERSION));
+        assert_eq!(
+            stored["owned_outputs"],
+            serde_json::json!(OWNED_OUTPUTS_FENCE)
+        );
+        assert!(stored.get("recorded_accounting").is_none());
+        let both = State {
+            owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+            ..State::default()
+        };
+        store.save(&both).expect("a doubly fenced state saves");
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
+        assert_eq!(
+            stored["recorded_accounting"],
+            serde_json::json!(RECORDED_ACCOUNTING_FENCE)
+        );
+        store
+            .save(&State::default())
+            .expect("an unfenced state saves");
+
+        // The *path* truth: `fence_owned_outputs` is a mutating command, so it
+        // takes the admission gate, which makes the recorded-accounting fence
+        // durable first. That is the ordering the design requires — the
+        // control hand-off must precede any incompatible ledger write — and it
+        // is why this path ends at version 5 with both fences.
         store
             .fence_owned_outputs()
             .expect("the forward fence saves");
@@ -5591,6 +5760,31 @@ mod tests {
             stored["owned_outputs"],
             serde_json::json!(OWNED_OUTPUTS_FENCE)
         );
+        assert_eq!(
+            stored["recorded_accounting"],
+            serde_json::json!(RECORDED_ACCOUNTING_FENCE)
+        );
+        // A repeated recorded fence is idempotent.
+        let fenced = stored;
+        store
+            .fence_recorded_accounting()
+            .expect("a repeated fence is a no-op");
+        store
+            .fence_recorded_accounting()
+            .expect("a repeated fence is a no-op");
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, fenced, "a repeated fence rewrote the state");
+        // Version 5 without the fence, and an unknown fence, both refuse.
+        let mut unfenced = fenced.clone();
+        unfenced["recorded_accounting"] = serde_json::Value::Null;
+        write_private(&path, &serde_json::to_vec(&unfenced).unwrap());
+        let error = store.load().unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
+        let mut unknown = fenced.clone();
+        unknown["recorded_accounting"] = serde_json::json!("oxide.accounting/9");
+        write_private(&path, &serde_json::to_vec(&unknown).unwrap());
+        let error = store.load().unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5632,6 +5826,7 @@ mod tests {
             lease_id: None,
             dir: dir.map(str::to_owned),
             rank: 0,
+            recorded: None,
         }
     }
 

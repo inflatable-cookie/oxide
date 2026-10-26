@@ -268,6 +268,9 @@ pub struct InventoryReport {
     /// This diagnostic does not claim their inode allocation was reclaimed.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub vanished: u64,
+    /// Hard-stopped subtrees, counted only by a [`scope_directory`] walk.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stopped: u64,
     pub limits: InventoryLimits,
     pub elapsed_ms: u64,
     pub entries_visited: u64,
@@ -436,6 +439,39 @@ pub fn inventory_directory(
 ) -> Result<InventoryReport, InventoryError> {
     #[cfg(debug_assertions)]
     walk_observer::record(root);
+    inventory_with(root, limits, &[])
+}
+
+/// Walk `root` but skip the subtrees named by `stops`, which are paths
+/// relative to `root`.
+///
+/// A stop is a **hard stop**: the named directory is neither descended into nor
+/// counted, so a caller that owns those subtrees elsewhere (a pool's recorded
+/// slot roots) can account for them exactly once. Stops are matched by relative
+/// path name only, so they express no ownership: the caller must verify each
+/// stop's own root identity before passing it. Entries that are not a stopped
+/// directory are walked exactly as [`inventory_directory`] walks them, so a
+/// stray region still counts and a stop that is a symlink or a file is counted
+/// as the ordinary walk counts it (symlinks never contribute bytes).
+///
+/// This is a *different* entry point from `inventory_directory` on purpose: it
+/// records on the separate [`walk_observer::SCOPE_LOG_ENV`] log, so "no payload
+/// walk happened" stays a checkable claim while the scope pass is observable.
+pub fn scope_directory(
+    root: &Path,
+    stops: &[PathBuf],
+    limits: InventoryLimits,
+) -> Result<InventoryReport, InventoryError> {
+    #[cfg(debug_assertions)]
+    walk_observer::record_scope(root);
+    inventory_with(root, limits, stops)
+}
+
+fn inventory_with(
+    root: &Path,
+    limits: InventoryLimits,
+    stops: &[PathBuf],
+) -> Result<InventoryReport, InventoryError> {
     limits.validate()?;
     let canonical = fs::canonicalize(root).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
@@ -460,7 +496,7 @@ pub fn inventory_directory(
     let root_device = root_metadata.dev();
     let root_inode = root_metadata.ino();
     let started = Instant::now();
-    let mut walker = Walker::new(&canonical, root_device, root_inode, limits, started);
+    let mut walker = Walker::new(&canonical, root_device, root_inode, limits, started, stops);
     walker.run()?;
     walker.verify_root()?;
     let filesystem_free = probe_filesystem_free(&canonical, root_device);
@@ -498,6 +534,9 @@ enum DirectoryGuard {
 
 struct Walker<'a> {
     root: &'a Path,
+    /// Relative paths whose subtrees belong to another owner: hard stops.
+    stops: &'a [PathBuf],
+    stopped: u64,
     limits: InventoryLimits,
     started: Instant,
     root_device: u64,
@@ -525,9 +564,12 @@ impl<'a> Walker<'a> {
         root_inode: u64,
         limits: InventoryLimits,
         started: Instant,
+        stops: &'a [PathBuf],
     ) -> Self {
         Self {
             root,
+            stops,
+            stopped: 0,
             limits,
             started,
             root_device,
@@ -669,6 +711,12 @@ impl<'a> Walker<'a> {
                     }
                 };
                 let relative = path.strip_prefix(self.root).unwrap_or(&path);
+                // A hard stop owns its subtree elsewhere: neither descend nor
+                // count it, so the caller's other accounting is the only one.
+                if file_type.is_dir() && self.stops.iter().any(|stop| stop == relative) {
+                    self.stopped += 1;
+                    continue;
+                }
                 let class_path = if file_type.is_dir() {
                     relative
                 } else {
@@ -979,6 +1027,7 @@ impl<'a> Walker<'a> {
             root: self.root.to_path_buf(),
             coverage,
             vanished: self.vanished,
+            stopped: self.stopped,
             limits: self.limits,
             elapsed_ms,
             entries_visited: self.entries_visited,
@@ -1363,11 +1412,16 @@ pub mod walk_observer {
 
     /// An absolute file path: each walk appends its root as one line.
     pub const LOG_ENV: &str = "OXIDE_TEST_WALK_LOG";
+    /// An absolute file path: each `scope_directory` call appends its root as
+    /// one line. Separate from [`LOG_ENV`] so a caller can prove that no
+    /// `inventory_directory` walk ran while its shallow scope pass still did.
+    pub const SCOPE_LOG_ENV: &str = "OXIDE_TEST_SCOPE_LOG";
     #[cfg(not(test))]
     const MUTATIONS_ENV: &str = "OXIDE_TEST_WALK_MUTATIONS";
 
     thread_local! {
         static RECORDED: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+        static RECORDED_SCOPE: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
         #[cfg(test)]
         static TEST_MUTATIONS: RefCell<Option<String>> = const { RefCell::new(None) };
         #[cfg(test)]
@@ -1613,6 +1667,16 @@ pub mod walk_observer {
         (result, walked)
     }
 
+    /// Run `body` and return the roots this thread scope-walked during it.
+    pub fn observe_scopes<T>(body: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+        let outer = RECORDED_SCOPE.with(|cell| cell.replace(Some(Vec::new())));
+        let result = body();
+        let walked = RECORDED_SCOPE
+            .with(|cell| cell.replace(outer))
+            .unwrap_or_default();
+        (result, walked)
+    }
+
     /// Test-only: whether the current thread's injection is accepted.
     #[cfg(test)]
     pub(crate) fn injection_accepted() -> bool {
@@ -1625,7 +1689,23 @@ pub mod walk_observer {
                 walked.push(root.to_path_buf());
             }
         });
-        let Some(log) = std::env::var_os(LOG_ENV) else {
+        append_log(LOG_ENV, root);
+    }
+
+    /// Record one shallow scope pass. It is deliberately not pushed onto the
+    /// walk recorder: the walk log answers "did any inventory walk run".
+    pub(super) fn record_scope(root: &Path) {
+        RECORDED_SCOPE.with(|cell| {
+            if let Some(walked) = cell.borrow_mut().as_mut() {
+                walked.push(root.to_path_buf());
+            }
+        });
+        append_log(SCOPE_LOG_ENV, root);
+    }
+
+    /// Append one root to an absolute log file, if one is named.
+    fn append_log(variable: &str, root: &Path) {
+        let Some(log) = std::env::var_os(variable) else {
             return;
         };
         let log = Path::new(&log);
@@ -1852,6 +1932,65 @@ mod tests {
 
     /// The debug-only delay action is strictly bounded, scoped, one-shot and
     /// can drive a real walk deadline. It never exists outside debug builds.
+    #[test]
+    fn scope_directory_hard_stops_at_named_subtrees_and_counts_everything_else() {
+        // A payload-shaped tree: `slots/` holds one legacy root and one
+        // labelled root, plus out-of-slot metadata, a stray file and a stray
+        // subtree that belongs to no slot. Logical bytes are exact file sizes,
+        // so they are the deterministic oracle here.
+        let fixture = Fixture::new("scope");
+        fixture.file("slots/3/build/blob", 40_000);
+        fixture.file("slots/oxide-ab/quick-7/build/blob", 50_000);
+        fixture.file("slots/.DS_Store", 1_000);
+        fixture.file("slots/stray.bin", 20_000);
+        fixture.file("slots/orphan/nested/blob", 30_000);
+        fixture.file(".DS_Store", 2_000);
+        let outside = 20_000 + 30_000 + 1_000 + 2_000;
+        let inside = 40_000 + 50_000;
+        let stops = [
+            PathBuf::from("slots/3"),
+            PathBuf::from("slots/oxide-ab/quick-7"),
+        ];
+
+        let scoped = scope_directory(fixture.path(), &stops, InventoryLimits::default())
+            .expect("the scope root is a directory");
+        assert!(scoped.coverage.complete, "{:?}", scoped.coverage.gaps);
+        assert_eq!(scoped.stopped, 2, "both stop predicates must be live");
+        assert_eq!(
+            scoped.total.logical_bytes_by_name, outside,
+            "the scope pass did not count exactly the out-of-slot files"
+        );
+        assert_eq!(
+            scoped.total.files, 4,
+            "the scope pass counted stopped content"
+        );
+
+        // Without the stops the same tree counts the slot content too, so the
+        // stop predicate is exactly what makes the two figures a partition.
+        let whole = scope_directory(fixture.path(), &[], InventoryLimits::default())
+            .expect("the scope root is a directory");
+        assert!(whole.coverage.complete);
+        assert_eq!(whole.stopped, 0);
+        assert_eq!(whole.total.logical_bytes_by_name, outside + inside);
+        assert_eq!(
+            whole.total.logical_bytes_by_name - scoped.total.logical_bytes_by_name,
+            inside,
+            "the stopped content is not exactly the difference"
+        );
+
+        // A stop that names a path which is not a directory stops nothing and
+        // changes no figure: it is walked as the ordinary pass walks it.
+        let absent = [PathBuf::from("slots/absent")];
+        let unchanged = scope_directory(fixture.path(), &absent, InventoryLimits::default())
+            .expect("the scope root is a directory");
+        assert!(unchanged.coverage.complete);
+        assert_eq!(unchanged.stopped, 0);
+        assert_eq!(
+            unchanged.total.logical_bytes_by_name,
+            whole.total.logical_bytes_by_name
+        );
+    }
+
     #[test]
     fn debug_delay_injection_is_bounded_scoped_one_shot_and_reaches_the_deadline() {
         let fixture = Fixture::new("delay");
