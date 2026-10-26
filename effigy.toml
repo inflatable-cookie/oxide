@@ -67,7 +67,7 @@ default = false
 # a benchmark, a real-install qualification or an alias for full QA.
 [tasks."rust:installed-handoff"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- python3 scripts/test-installed-handoff.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --scratch-budget-mib 64 -- python3 scripts/test-installed-handoff.py"
 
 # Owned output links at profile directories (oxide#133): one fixed 20-case
 # script and the whole command of the qualified shared supervisor. The brief's

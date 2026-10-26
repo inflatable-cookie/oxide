@@ -1536,7 +1536,12 @@ necessary.
   exclusion.
 - **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
-  with a 120 s wall limit and 64 MiB monitored scratch. Inside that scratch
+  with a 120 s wall limit and 64 MiB monitored scratch. Its selector names an
+  explicit `--root-parent /private/tmp` because two of its cases create a real
+  internal directory pool; the selected-volume default would be refused by the
+  product, exactly as for the other genuine internal-placement proofs, and this
+  is the same owner-accepted exception rather than a global default change.
+  Inside that scratch
   the script stages this HEAD's debug `oxide` with plain Cargo offline and the
   pinned 1.97.1, then deletes the staged target before the fixtures, so it
   creates no Oxide pool and touches no live pool, installed binary, install
@@ -1549,7 +1554,12 @@ necessary.
   not trigger; one hand-off with exact argv and environment plus the marker;
   marker refusal and inertness; foreign, path, hash, size, capability,
   ownership, `PATH`, same-inode and replacement refusals; skipped commands; and
-  a final-release error after effects that never executes anything. It never
+  a final-release error after effects that never executes anything. What it
+  exercises is a binary staged from this HEAD carrying control state version 5
+  with a compiled recording stub candidate that reports the newer version 6; it
+  is not a real installed version-4 binary handing off to version 5, and it
+  claims no host install. That real forward-fence hand-off stays behind the
+  separate QA-compatibility-window and receipt-matching install gate. It never
   touches the real `~/.local/bin/oxide`, a real install receipt or a live pool,
   and is not a benchmark or an alias for full QA.
 
