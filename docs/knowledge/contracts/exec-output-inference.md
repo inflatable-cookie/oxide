@@ -163,7 +163,8 @@ are deliberately different:
 | Live entry at a candidate `target/<m>` | Plan | Authority |
 | --- | --- | --- |
 | receipt places `m` as selected; the entry is an owned link to `<root>/<m>` | planned owned link (keyed) | used |
-| receipt places `m` as selected; the entry is anything other than the exact owned link to `<root>/<m>` (missing, dangling, a real directory, another destination, unmarked/foreign) | not planned | **refuse** before Cargo (the existing binding and P4 rules); `exec` follows nothing and replaces nothing |
+| receipt places `m` as selected; the entry is the exact owned link to `<root>/<m>` whose **destination directory** is absent inside the verified, committed root (oxide#162) | planned owned link (keyed) | the permanent-mode binding creates that one directory under the existing writer custody; nothing is relinked, replaced or followed |
+| receipt places `m` as selected; the entry is anything other than the exact owned link to `<root>/<m>` (missing, a real directory, another destination, a link into a missing/unverified/foreign root or a different nonce) | not planned | **refuse** before Cargo (the existing binding and P4 rules); `exec` follows nothing and replaces nothing |
 | receipt records `m` unselected; the entry is a real directory | planned `selected = None` (keyed `real <m>`) | kept local, one bounded notice (existing grammar) |
 | receipt records `m` unselected; the entry is a link or a file | not planned | **refuse**: it contradicts the receipt |
 | receipt does not record `m`; the entry is a real directory | not planned, not keyed | ignored: local, no authority |
@@ -273,11 +274,14 @@ all **before** Cargo and before any authority write:
 
 `exec` performs **no** reservation (`outputs::reserve` is skipped: the keyed set
 is a subset of the receipt, so no root nonce and no member is new), never
-relinks, never converts a real directory, never deletes and never creates a
-member. The classified set is validation only: it cannot add a member, extend
-the key or authorize a write. There is no new "authority on refusal" path — a
-refusal leaves the link, receipt, root, marker, registry and slot exactly as
-they were (oxide#152's rule).
+relinks, never converts a real directory, never deletes, and never creates a
+member while it derives or classifies. The classified set is validation only:
+it cannot add a member, extend the key or authorize a write. The single later
+creation (oxide#162) is binding's: an absent member **directory** beneath the
+derivation's own verified, committed root is created under the same writer
+custody a member publication uses. There is no new "authority on refusal" path
+— a refusal leaves the link, receipt, root, marker, registry and slot exactly
+as they were (oxide#152's rule).
 
 ### Explicit `--output` (kept)
 
@@ -416,7 +420,8 @@ receipt, root, marker, registry, reservation and slot are unchanged.
 | receipt unchanged, links valid | plan, key, lease, bind, run |
 | receipt changed while queued (adopt, detach, relink, migration) | binding refuses the keyed plan: "run the command again"; no automatic retry |
 | `target` itself became a link | refuse (unowned/whole-target link in a profile checkout) |
-| member link dangling, wrong destination, unmarked root, another checkout's root | refuse, naming `oxide outputs adopt` |
+| member link whose destination directory is absent beneath the checkout's own committed, verified root (same root, nonce and volume) | the permanent-mode binding creates that one member directory under the existing writer custody (oxide#162) |
+| member link into a missing root, an unmarked root, another checkout's root, a different nonce, or the wrong destination | refuse, naming `oxide outputs adopt` |
 | member path holds a file or unknown entry type | refuse |
 | real nonempty member directory appeared between plan and bind at a **planned** member path | binding refuses "not the keyed placement" |
 | `oxide outputs prune` intent unsettled for this checkout | refuse (existing) |

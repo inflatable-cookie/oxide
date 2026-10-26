@@ -279,6 +279,12 @@ struct Migration {
     marker_pin: Option<MarkerPin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     marker_backup: Option<PathBuf>,
+    /// The member directories this migration created inside the root before it
+    /// could publish their links, recorded in the same durable phase write as
+    /// P1. A rollback removes exactly these, and only while each is still the
+    /// real empty directory the migration made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    created_members: Vec<String>,
     /// The receipt bytes this migration started from.
     prior_receipt_sha: String,
     /// The registry revision the journal was published at.
@@ -321,6 +327,15 @@ impl Migration {
         for member in &names {
             crate::layout::Member::parse(member)
                 .map_err(|reason| format!("a migrated member is unusable: {reason}"))?;
+        }
+        if let Some(unknown) = self
+            .created_members
+            .iter()
+            .find(|member| !names.contains(member))
+        {
+            return Err(format!(
+                "the layout migration records a created member directory it does not link: {unknown}"
+            ));
         }
         crate::layout::validate_set(&names, crate::layout::MAX_RECEIPT_MEMBERS)
             .map_err(|reason| format!("the migrated member set is unusable: {reason}"))?;
@@ -2221,6 +2236,7 @@ fn is_receipt_digest(value: &str) -> bool {
 struct MigrationPatch {
     stage: Option<(u64, u64)>,
     marker_backup: Option<PathBuf>,
+    created_members: Option<Vec<String>>,
 }
 
 /// Persist the journal with one new phase and the identities the step
@@ -2242,6 +2258,9 @@ fn advance_migration(
     }
     if let Some(backup) = &patch.marker_backup {
         transition.marker_backup = Some(backup.clone());
+    }
+    if let Some(created) = &patch.created_members {
+        transition.created_members = created.clone();
     }
     transition.updated_ms = process::now_ms();
     writing.updated_ms = process::now_ms();
@@ -2524,6 +2543,7 @@ fn migrate_layout(
         stage_ino: None,
         marker_pin,
         marker_backup: None,
+        created_members: Vec::new(),
         prior_receipt_sha: receipt_digest(control, &receipt)?,
         registry_revision: crate::prune::registry_revision(control)?,
         created_ms: process::now_ms(),
@@ -2616,7 +2636,7 @@ fn replay_migration(
             return rollback_migration(context, control, current, &migration);
         }
         let (next, patch) = match migration.phase {
-            MigrationPhase::Prepared => stage_migration(&parent, &migration)?,
+            MigrationPhase::Prepared => stage_migration(context, &parent, &migration)?,
             MigrationPhase::Staged if migration.marker_pin.is_some() => {
                 upgrade_marker(context, &migration)?
             }
@@ -2655,12 +2675,90 @@ fn pending_migration(migration: &Migration, reason: &str) -> String {
     )
 }
 
+/// The migration's root, positively verified as THIS checkout's unchanged
+/// owned root before anything is created inside it. A root/2 marker must carry
+/// the journal's nonce; a root/1 marker must be the exact legacy document the
+/// journal pinned (its upgrade happens only after P1). The root's kind and
+/// volume, its live device and ancestry are checked too, so a replaced or
+/// misplaced directory is never written into.
+fn verify_migration_root(context: &Context, migration: &Migration) -> Result<(), String> {
+    let root = &migration.root.root;
+    let binding = match migration.root.kind {
+        RootKind::External => Some(
+            binding_for(
+                context,
+                migration.root.volume_uuid.as_deref().unwrap_or_default(),
+            )
+            .map_err(|reason| pending_migration(migration, &reason))?,
+        ),
+        RootKind::Local => None,
+    };
+    validate_selected(
+        &context.workspace,
+        &context.checkout_id,
+        &migration.root,
+        binding.as_ref(),
+        migration.generation,
+    )
+    .map_err(|reason| pending_migration(migration, &reason))?;
+    let marker = read_marker(root)?;
+    check_marker(&marker, &context.workspace, &context.checkout_id)
+        .map_err(|reason| pending_migration(migration, &reason))?;
+    if marker.is_legacy() {
+        let Some(pin) = migration.marker_pin.as_ref() else {
+            return Err(pending_migration(
+                migration,
+                "the root still carries a legacy marker the journal never pinned",
+            ));
+        };
+        if file_digest(&root.join(MARKER))? != pin.sha256 {
+            return Err(pending_migration(
+                migration,
+                "the legacy root marker changed since the journal pin",
+            ));
+        }
+    } else if marker.nonce() != migration.root.nonce() {
+        return Err(pending_migration(
+            migration,
+            "the root does not carry the migrated nonce",
+        ));
+    }
+    Ok(())
+}
+
 /// P1: the transaction-owned staging directory with only classified member
 /// links into the same root.
+///
+/// No link is ever published to an absent member directory: every classified
+/// member's real directory inside the root exists (verified as this checkout's
+/// owned root carrying the journal's marker) before the staged link can name
+/// it. The directories this step had to create are recorded in the same P1
+/// phase write, so a rollback removes exactly those and nothing else.
 fn stage_migration(
+    context: &Context,
     parent: &Path,
     migration: &Migration,
 ) -> Result<(MigrationPhase, MigrationPatch), String> {
+    verify_migration_root(context, migration)?;
+    let mut created = Vec::new();
+    for member in &migration.members {
+        let destination = member_destination(&migration.root.root, member);
+        let absent = matches!(
+            fs::symlink_metadata(&destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        ensure_member_directory(&migration.root.root, member).map_err(|reason| {
+            format!(
+                "the migration cannot publish the member directory for {member}: {reason}; the journal and both layouts are kept exactly as they are"
+            )
+        })?;
+        if absent {
+            created.push(member.clone());
+        }
+    }
+    if !created.is_empty() {
+        sync_directory(&migration.root.root)?;
+    }
     match fs::symlink_metadata(&migration.stage) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(&migration.stage)
@@ -2730,6 +2828,7 @@ fn stage_migration(
         MigrationPatch {
             stage: Some((meta.dev(), meta.ino())),
             marker_backup: None,
+            created_members: Some(created),
         },
     ))
 }
@@ -2793,6 +2892,7 @@ fn upgrade_marker(
                 MigrationPatch {
                     stage: None,
                     marker_backup: Some(backup),
+                    created_members: None,
                 },
             ));
         }
@@ -2888,6 +2988,7 @@ fn upgrade_marker(
         MigrationPatch {
             stage: None,
             marker_backup: Some(backup),
+            created_members: None,
         },
     ))
 }
@@ -3030,6 +3131,20 @@ fn commit_migration(
             migration,
             "the root marker is ahead of the receipt",
         ));
+    }
+    // P4 never commits a link whose member directory is absent. P1 created
+    // them; this re-establishes the same invariant under the verified marker
+    // immediately before the receipt commits, so no committed placement can
+    // dangle.
+    for member in &migration.members {
+        ensure_member_directory(&migration.root.root, member).map_err(|reason| {
+            pending_migration(
+                migration,
+                &format!(
+                    "the committed member directory for {member} cannot be published: {reason}"
+                ),
+            )
+        })?;
     }
     let selected = migration
         .root
@@ -3328,6 +3443,35 @@ fn rollback_migration(
         fs::remove_dir(&migration.stage)
             .map_err(|error| format!("cannot remove the staging directory: {error}"))?;
         sync_directory(&context.workspace)?;
+    }
+    // 4b. The member directories this migration created inside the root go
+    //     back to absent, so the pre-migration state is restored exactly: only
+    //     the recorded ones, and only while each is still the real, empty
+    //     directory the migration made. A directory holding content, a link a
+    //     creator put there, or one the migration found already present is
+    //     kept untouched.
+    let mut removed = false;
+    for member in migration.created_members.iter().rev() {
+        let destination = member_destination(&migration.root.root, member);
+        let empty_real_directory = fs::symlink_metadata(&destination).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && fs::read_dir(&destination)
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or(false)
+        });
+        if empty_real_directory {
+            fs::remove_dir(&destination).map_err(|error| {
+                format!(
+                    "cannot remove the migration's member directory {}: {error}",
+                    destination.display()
+                )
+            })?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(&migration.root.root)?;
     }
     // 5. The receipt returns to its published /2 form with the whole-target
     //    placement selected and no journal.
@@ -3914,12 +4058,20 @@ const BINDING_POLL: Duration = Duration::from_millis(200);
 /// root generation. The command binds exactly that root and generation or
 /// refuses, so a slot and its uplifted artifacts never belong to different
 /// roots.
+///
+/// `repair_absent_members` is set by a derived `oxide exec` only (oxide#160's
+/// member inference, oxide#162): a receipt-recorded member link whose one
+/// defect is an absent destination directory beneath the committed, verified
+/// root has that directory created under this checkout's custody. Every other
+/// command keeps the existing refusal, so a dangling member link never
+/// transitions automatically.
 pub fn bind_for_command(
     store: &Store,
     checkout: &Path,
     own_record: u64,
     expected: Option<&Plan>,
     pool_fallback: Option<&str>,
+    repair_absent_members: bool,
 ) -> Result<OutputBinding, String> {
     let context = Context::new(
         Some(store.owner_control().to_path_buf()),
@@ -3984,7 +4136,14 @@ pub fn bind_for_command(
                 continue;
             }
         };
-        match bind_under_binding(&context, store, own_record, &receipt, expected) {
+        match bind_under_binding(
+            &context,
+            store,
+            own_record,
+            &receipt,
+            expected,
+            repair_absent_members,
+        ) {
             Bind::Bound(outcome) => {
                 return Ok(OutputBinding {
                     outcome,
@@ -4217,9 +4376,17 @@ fn bind_under_binding(
     own_record: u64,
     receipt: &Receipt,
     expected: Option<&Plan>,
+    repair_absent_members: bool,
 ) -> Bind {
     if receipt.layout() == LayoutKind::Profile {
-        return bind_profile(context, store, own_record, receipt, expected);
+        return bind_profile(
+            context,
+            store,
+            own_record,
+            receipt,
+            expected,
+            repair_absent_members,
+        );
     }
     let expected = expected.and_then(Plan::selected);
     let generation = receipt.generation;
@@ -4378,6 +4545,7 @@ fn bind_profile(
     own_record: u64,
     receipt: &Receipt,
     expected: Option<&Plan>,
+    repair_absent_members: bool,
 ) -> Bind {
     // A detached profile receipt owns no destination: the command runs locally
     // through real directories, exactly as the legacy detached state does
@@ -4421,6 +4589,7 @@ fn bind_profile(
         );
     }
     let mut needed: Vec<(String, Selected)> = Vec::new();
+    let mut absent: Vec<(String, Selected)> = Vec::new();
     let mut real: Vec<String> = Vec::new();
     let mut owned_root: Option<PathBuf> = None;
     for planned in &plan.members {
@@ -4509,6 +4678,41 @@ fn bind_profile(
                 needed.push((planned.member.clone(), wanted.clone()));
                 owned_root.get_or_insert_with(|| wanted.root.clone());
             }
+            (Some(wanted), TargetState::Dangling(destination))
+                if repair_absent_members
+                    && destination == &member_destination(&wanted.root, &planned.member) =>
+            {
+                // A derived `oxide exec` only (oxide#162): the link selects
+                // exactly this member's destination under the root this
+                // command's slot was keyed for, and the only defect is that the
+                // member directory inside that verified root is absent (the
+                // shape an older migration left: the link was published before
+                // its member directory existed). The directory is created under
+                // the root's own verified identity and this checkout's writer
+                // custody; nothing is relinked, replaced or followed. A
+                // missing, unverified or foreign root fails `check_bound_root`
+                // here and refuses below, and every other command keeps the
+                // existing never-transition-automatically refusal.
+                if wanted.kind == RootKind::External {
+                    if let Some(reason) = context.pool_fallback.as_deref() {
+                        return Bind::Refuse(format!(
+                            "outputs: this command's intermediate slot fell back to the internal pool ({reason}) while {} selects the external member root {}; the drive's removal is not supervised, so nothing was built. Restore the drive or run `oxide outputs adopt`",
+                            link.display(),
+                            wanted.root.display()
+                        ));
+                    }
+                }
+                if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
+                    return Bind::Refuse(format!(
+                        "outputs: {} links to {}, whose owned root {} is not verified ({reason}); an absent member directory is created only under this checkout's verified, committed root. Nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                        link.display(),
+                        destination.display(),
+                        wanted.root.display()
+                    ));
+                }
+                absent.push((planned.member.clone(), wanted.clone()));
+                owned_root.get_or_insert_with(|| wanted.root.clone());
+            }
             (Some(wanted), TargetState::Dangling(_)) => {
                 // Never transition automatically through a dangling link.
                 // With an internal-pool fallback slot this is the #117 refusal;
@@ -4540,6 +4744,55 @@ fn bind_profile(
                     link.display(),
                     state.label()
                 ))
+            }
+        }
+    }
+    if !absent.is_empty() {
+        // Directory creation inside the owned root is a write, so it takes the
+        // same writer custody as a relink: an unknown writer or a command that
+        // may still be writing refuses or waits before the first creation.
+        match store.checkout_custody(&context.workspace, own_record) {
+            Err(reason) => return Bind::Refuse(reason),
+            Ok(CheckoutCustody::Unknown(reason)) => {
+                return Bind::Refuse(format!(
+                    "outputs: refusing to create the absent profile member directory: {reason}. Nothing was changed"
+                ))
+            }
+            Ok(CheckoutCustody::Writers) => return Bind::Wait,
+            Ok(CheckoutCustody::Clear) => {}
+        }
+        for (member, wanted) in &absent {
+            // Re-verify immediately before the write: the root's marker,
+            // kind, volume, nonce, generation and device are all this
+            // command's, not merely a directory this path names.
+            if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
+                return Bind::Refuse(format!(
+                    "outputs: the absent profile member {member} is not created because {reason}; nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
+                ));
+            }
+            if let Err(reason) = ensure_member_directory(&wanted.root, member) {
+                return Bind::Refuse(format!(
+                    "outputs: cannot create the absent profile member directory for {member}: {reason}; nothing was built"
+                ));
+            }
+            // The link must still select exactly the directory just created:
+            // a link repointed in between is never written through.
+            let destination = member_destination(&wanted.root, member);
+            match link_state(
+                &link_path(&context.workspace, member),
+                &context.workspace,
+                &context.checkout_id,
+            ) {
+                Ok(TargetState::OwnedLink(live)) if live == destination => {}
+                Ok(state) => {
+                    return Bind::Refuse(format!(
+                        "outputs: the absent profile member directory {} was created, but {} is now {}; nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                        destination.display(),
+                        link_path(&context.workspace, member).display(),
+                        state.label()
+                    ))
+                }
+                Err(reason) => return Bind::Refuse(reason),
             }
         }
     }
@@ -5037,6 +5290,9 @@ fn exec_members(
     }
     candidates.sort();
     candidates.dedup();
+    // The absent-destination repair belongs to the permanent-mode binding's
+    // custody; every other mode keeps exactly today's refusal.
+    let permanent = context.mode()? == Some(DriveMode::Permanent);
     let mut members = Vec::new();
     for name in &candidates {
         let link = link_path(&context.workspace, name);
@@ -5052,6 +5308,26 @@ fn exec_members(
                     let destination = member_destination(&desired.root, name);
                     match &state {
                         TargetState::OwnedLink(root) if root == &destination => {
+                            members.push(name.clone());
+                        }
+                        // The only absent-directory case a derived exec may
+                        // place: the link selects exactly this member's
+                        // destination under the committed, verified root (same
+                        // root, nonce, volume and generation) and only that
+                        // member's directory is missing. The permanent-mode
+                        // binding creates it under the root's custody; a link
+                        // into a missing, unverified or foreign root still
+                        // refuses exactly as before (its root fails the check).
+                        state
+                            if permanent
+                                && absent_member_of_verified_root(
+                                    context,
+                                    receipt,
+                                    desired,
+                                    name,
+                                    state,
+                                ) =>
+                        {
                             members.push(name.clone());
                         }
                         state => {
@@ -5094,6 +5370,28 @@ fn exec_members(
         }
     }
     Ok(members)
+}
+
+/// Whether this member link's only defect is its ABSENT destination directory
+/// beneath the committed, desired owned root. The link must select exactly
+/// `<root>/<member>` and the root itself must pass the full bound check: this
+/// checkout's real marker, its kind and volume, the receipt's generation, the
+/// desired nonce and the live device/ancestry. Nothing is created here; the
+/// permanent-mode binding does that under the checkout's custody. A missing
+/// root, another root, another nonce and an unverified directory all fail,
+/// which keeps every existing refusal intact.
+fn absent_member_of_verified_root(
+    context: &Context,
+    receipt: &Receipt,
+    wanted: &Selected,
+    name: &str,
+    state: &TargetState,
+) -> bool {
+    let TargetState::Dangling(destination) = state else {
+        return false;
+    };
+    destination == &member_destination(&wanted.root, name)
+        && check_bound_root(context, receipt.generation, wanted).is_ok()
 }
 
 /// The destination rule itself: in permanent mode, external when the volume
@@ -8207,7 +8505,7 @@ mod tests {
         // The binding keeps `release` local and reports it once, in the
         // existing grammar.
         let store = pool_store(&fixture.root.join("pool"));
-        let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Bound(outcome) => outcome,
             Bind::Refuse(reason) => panic!("a recorded real member refused the command: {reason}"),
             Bind::Wait => panic!("a recorded real member waited"),
@@ -8246,7 +8544,7 @@ mod tests {
         .unwrap()
         .is_none());
         let store = pool_store(&fixture.root.join("pool"));
-        match bind_profile(&context, &store, 0, &receipt, None) {
+        match bind_profile(&context, &store, 0, &receipt, None, false) {
             Bind::Bound(outcome) => {
                 assert!(outcome.root.is_none());
                 assert_eq!(outcome.note.as_deref(), Some("outputs detached"));
@@ -8264,7 +8562,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            bind_profile(&context, &store, 0, &receipt, Some(&stale)),
+            bind_profile(&context, &store, 0, &receipt, Some(&stale), false),
             Bind::Refuse(_)
         ));
     }
@@ -8408,6 +8706,153 @@ mod tests {
         );
     }
 
+    /// oxide#162: a receipt-recorded member link whose destination directory is
+    /// absent inside the checkout's own verified, committed root is created by
+    /// the binding instead of being refused as "root not available". The
+    /// observed shape: a migration left `target/release` linked before the root
+    /// had ever held a release build.
+    ///
+    /// Counterfactual: reverting the derivation change makes `derived_exec`
+    /// return an error here, and reverting the binding change makes it refuse.
+    #[test]
+    fn exec_creates_an_absent_member_of_the_verified_owned_root() {
+        let fixture = Fixture::new();
+        register(&fixture, DriveMode::Permanent);
+        let (context, receipt, root) = placed_profile(&fixture, &["debug", "release"], &[]);
+        fs::remove_dir(root.join("release")).unwrap();
+        let link = fixture.checkout.join("target/release");
+        assert_eq!(fs::read_link(&link).unwrap(), root.join("release"));
+        assert!(!root.join("release").exists());
+        assert_eq!(
+            link_state(&link, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .code(),
+            "dangling-link"
+        );
+        let before = fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap();
+        assert_eq!(derived_exec(&fixture), ["debug", "release"]);
+        let declaration =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(destination_facts(Some(&plan)).contains("release"));
+        let store = pool_store(&fixture.root.join("pool"));
+        let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan), true) {
+            Bind::Bound(outcome) => outcome,
+            Bind::Refuse(reason) => {
+                panic!("an absent member of the verified root refused: {reason}")
+            }
+            Bind::Wait => panic!("an absent member of the verified root waited"),
+        };
+        assert_eq!(outcome.root.as_deref(), Some(root.as_path()));
+        let metadata = fs::symlink_metadata(root.join("release")).unwrap();
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "the binding did not create a real member directory"
+        );
+        assert!(fs::read_dir(root.join("release")).unwrap().next().is_none());
+        // Nothing was relinked and the receipt bytes are untouched.
+        assert_eq!(fs::read_link(&link).unwrap(), root.join("release"));
+        assert!(fs::metadata(&link).unwrap().is_dir());
+        assert_eq!(
+            fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap(),
+            before
+        );
+        // A second binding sees the member as an ordinary owned link.
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan), true) {
+            Bind::Bound(outcome) => assert_eq!(outcome.root.as_deref(), Some(root.as_path())),
+            Bind::Refuse(reason) => panic!("the created member refused a second binding: {reason}"),
+            Bind::Wait => panic!("the created member waited"),
+        }
+    }
+
+    /// The same shape with a keyed plan whose nonce the root does not carry: a
+    /// different root nonce is a contradiction, so nothing is created and the
+    /// link stays dangling. The receipt and the link are unchanged.
+    #[test]
+    fn exec_creates_no_member_directory_for_a_root_with_another_nonce() {
+        let fixture = Fixture::new();
+        register(&fixture, DriveMode::Permanent);
+        let (context, receipt, root) = placed_profile(&fixture, &["debug", "release"], &[]);
+        fs::remove_dir(root.join("release")).unwrap();
+        let declaration =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let mut plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        for member in &mut plan.members {
+            if let Some(selected) = &mut member.selected {
+                selected.nonce = Some("0123456789abcdef0123456789abcdef".to_owned());
+            }
+        }
+        let store = pool_store(&fixture.root.join("pool"));
+        let refused = match bind_profile(&context, &store, 0, &receipt, Some(&plan), true) {
+            Bind::Refuse(reason) => reason,
+            Bind::Bound(_) => panic!("another root nonce was accepted"),
+            Bind::Wait => panic!("another root nonce waited"),
+        };
+        assert!(refused.contains("nonce"), "{refused}");
+        assert!(!root.join("release").exists());
+        assert!(
+            fs::symlink_metadata(fixture.checkout.join("target/release"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// A link into an unverified root, or into a root that is gone, is still
+    /// refused by the derived `exec` before Cargo, and nothing is created.
+    #[test]
+    fn exec_still_refuses_an_absent_member_of_an_unverified_or_missing_root() {
+        // An unmarked directory is not this checkout's root: the link text
+        // names its own absent `release`, and no directory is created there.
+        let unverified = Fixture::new();
+        register(&unverified, DriveMode::Permanent);
+        let (unverified_context, _receipt, _root) =
+            placed_profile(&unverified, &["debug", "release"], &[]);
+        let outside = unverified.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = unverified.checkout.join("target/release");
+        fs::remove_file(&link).unwrap();
+        symlink(outside.join("release"), &link).unwrap();
+        let refused =
+            exec_declaration(Some(&unverified.control), &unverified.checkout, None).unwrap_err();
+        assert!(refused.contains("target/release"), "{refused}");
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        assert!(!outside.join("release").exists());
+        assert_eq!(fs::read_link(&link).unwrap(), outside.join("release"));
+        let _ = unverified_context;
+        // A root that is gone entirely: the link names its own destination,
+        // but the root no longer passes the bound check, so nothing is made.
+        let missing = Fixture::new();
+        register(&missing, DriveMode::Permanent);
+        let (missing_context, _receipt, missing_root) =
+            placed_profile(&missing, &["debug", "release"], &[]);
+        fs::remove_dir(missing_root.join("release")).unwrap();
+        fs::rename(&missing_root, missing.root.join("moved-root")).unwrap();
+        let refused =
+            exec_declaration(Some(&missing.control), &missing.checkout, None).unwrap_err();
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        assert!(!missing_root.exists());
+        assert_eq!(
+            fs::read_link(missing.checkout.join("target/release")).unwrap(),
+            missing_root.join("release")
+        );
+        let _ = missing_context;
+    }
+
     /// S1 counterfactual 9: more receipt members than one command binds refuse,
     /// naming the explicit detach.
     #[test]
@@ -8540,6 +8985,18 @@ mod tests {
             assert_eq!(
                 fs::read_link(&link).unwrap(),
                 member_destination(selected.root(), member)
+            );
+            // The first conversion creates the member's real directory before
+            // it publishes the link, so no link ever dangles (oxide#162).
+            let destination = selected.root().join(member);
+            let metadata = fs::symlink_metadata(&destination).unwrap();
+            assert!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "{member} is not a real member directory"
+            );
+            assert!(
+                fs::metadata(&link).unwrap().is_dir(),
+                "{member} is a dangling member link"
             );
         }
         assert!(selected.root().join(MARKER).is_file());
@@ -9157,6 +9614,60 @@ mod tests {
         );
     }
 
+    /// The observed defect (oxide#162): a migration that linked the host
+    /// `debug`/`release` pair published a `target/release` link into a root
+    /// that had never held a release build, so the link dangled. Publication
+    /// now creates every member directory before its link exists, and never
+    /// touches a member directory the root already holds.
+    ///
+    /// Counterfactual: without the creation step at P1 the `release`
+    /// destination is absent here and this test's first assertion fails.
+    #[test]
+    fn a_migration_creates_every_member_directory_before_its_link() {
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        // Only `debug` exists, with payload; the root has never held a release
+        // build, exactly the shape the live migrations had.
+        fs::create_dir(root.join("debug")).unwrap();
+        fs::write(root.join("debug").join("poutputs"), b"debug-only").unwrap();
+        assert!(!root.join("release").exists());
+        assert_eq!(
+            migration_members(&root).unwrap(),
+            vec!["debug".to_owned(), "release".to_owned()]
+        );
+        let (migrated, _, converted) =
+            migrate_layout(&context, &fixture.control, legacy.clone()).unwrap();
+        assert!(converted);
+        let target = context.link();
+        for member in ["debug", "release"] {
+            let destination = root.join(member);
+            let metadata = fs::symlink_metadata(&destination).unwrap();
+            assert!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "{member} is not a real directory after the migration"
+            );
+            let link = target.join(member);
+            assert_eq!(fs::read_link(&link).unwrap(), destination, "{member}");
+            // No published link dangles.
+            assert!(
+                fs::metadata(&link).unwrap().is_dir(),
+                "{member} is a dangling member link"
+            );
+            assert_eq!(
+                migrated.selected_for(member).map(Selected::root),
+                Some(root.as_path())
+            );
+        }
+        // The pre-existing member directory keeps its payload byte for byte;
+        // the created one starts empty.
+        assert_eq!(
+            fs::read(root.join("debug").join("poutputs")).unwrap(),
+            b"debug-only"
+        );
+        assert!(fs::read_dir(root.join("release")).unwrap().next().is_none());
+    }
+
     #[test]
     fn a_root_one_marker_is_upgraded_once_and_rolled_back_exactly() {
         let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
@@ -9271,11 +9782,32 @@ mod tests {
             // A replay commits from the recorded identities only.
             let done = replay_migration(&context, &fixture.control, stored).unwrap();
             assert_eq!(done.layout(), LayoutKind::Profile, "{boundary}");
+            // P1 created the member directories before it created their links,
+            // so a crash at either boundary leaves no dangling link behind and
+            // the replay publishes every member into a real directory.
+            let root = legacy.selected().unwrap().root().to_path_buf();
+            let target = fixture.checkout.join("target");
+            for member in ["debug", "release"] {
+                let destination = root.join(member);
+                let metadata = fs::symlink_metadata(&destination).unwrap();
+                assert!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "{boundary}: {member} is not a real directory"
+                );
+                assert_eq!(
+                    fs::read_link(target.join(member)).unwrap(),
+                    destination,
+                    "{boundary}: {member}"
+                );
+                assert!(
+                    fs::metadata(target.join(member)).unwrap().is_dir(),
+                    "{boundary}: {member} is a dangling member link"
+                );
+            }
             assert!(
                 done.transition.is_none(),
                 "{boundary}: the journal was kept"
             );
-            let target = fixture.checkout.join("target");
             assert!(fs::symlink_metadata(&target).unwrap().is_dir());
             assert!(
                 !fixture
@@ -9283,6 +9815,44 @@ mod tests {
                     .join(format!("{BACKUP_PREFIX}{}", done.generation))
                     .exists(),
                 "{boundary}: the target backup was kept"
+            );
+        }
+    }
+
+    /// The member directories belong to the transaction's PUBLICATION step:
+    /// a crash at P0 (the durable journal, before any target effect) leaves
+    /// every member directory absent, and the replay that follows creates them
+    /// together with their links.
+    #[test]
+    fn a_migration_creates_no_member_directory_before_the_journal() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        std::env::set_var(CRASH_ENVIRONMENT, "migration-p0");
+        let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
+        std::env::remove_var(CRASH_ENVIRONMENT);
+        assert!(stopped.is_err(), "the injected P0 stop did not stop");
+        assert!(!root.join("debug").exists(), "P0 created debug");
+        assert!(!root.join("release").exists(), "P0 created release");
+        let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, ReceiptState::Prepared);
+        assert!(fs::symlink_metadata(context.link())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let done = replay_migration(&context, &fixture.control, stored).unwrap();
+        assert_eq!(done.layout(), LayoutKind::Profile);
+        for member in ["debug", "release"] {
+            assert!(
+                fs::symlink_metadata(root.join(member)).unwrap().is_dir(),
+                "the replay left {member} absent"
+            );
+            assert!(
+                fs::metadata(context.link().join(member)).unwrap().is_dir(),
+                "the replay left {member} dangling"
             );
         }
     }
@@ -9563,6 +10133,7 @@ mod tests {
                 stage_ino: None,
                 marker_pin: None,
                 marker_backup: None,
+                created_members: Vec::new(),
                 prior_receipt_sha: receipt_digest(&fixture.control, &legacy).unwrap(),
                 registry_revision: crate::prune::registry_revision(&fixture.control).unwrap(),
                 created_ms: 1,
@@ -10089,7 +10660,7 @@ mod tests {
         // With an internal fallback slot the refusal names the fallback.
         let fallback = Context::new(Some(fixture.control.clone()), fixture.checkout.clone())
             .with_pool_fallback(Some("container mismatch"));
-        let refused = match bind_profile(&fallback, &store, 0, &receipt, Some(&plan)) {
+        let refused = match bind_profile(&fallback, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => reason,
             Bind::Bound(_) => panic!("a dangling member link was bound"),
             Bind::Wait => panic!("a dangling refusal waited"),
@@ -10098,7 +10669,7 @@ mod tests {
         assert!(refused.contains("fell back"), "{refused}");
         assert!(refused.contains("oxide outputs adopt"), "{refused}");
         // Without a fallback it still refuses rather than auto-transitioning.
-        let refused = match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        let refused = match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => reason,
             Bind::Bound(_) => panic!("a dangling member link was bound without a fallback"),
             Bind::Wait => panic!("a dangling refusal waited"),
@@ -10159,7 +10730,7 @@ mod tests {
         symlink(member_destination(&external.root, "debug"), &link).unwrap();
         let context = context.with_pool_fallback(Some("container mismatch"));
         let store = pool_store(&fixture.root.join("pool"));
-        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
                 assert!(
                     reason.contains("fell back to the internal pool"),
@@ -10216,7 +10787,7 @@ mod tests {
         let destination = member_destination(&external.root, "debug");
         symlink(&destination, &link).unwrap();
         let store = pool_store(&fixture.root.join("pool"));
-        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
                 assert!(
                     reason.contains(
@@ -10256,7 +10827,7 @@ mod tests {
         let fallback = fixture
             .context()
             .with_pool_fallback(Some("the volume is absent"));
-        match bind_profile(&fallback, &store, 0, &receipt, Some(&plan)) {
+        match bind_profile(&fallback, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
                 assert!(
                     reason.contains("fell back to the internal pool (the volume is absent)"),
@@ -10352,7 +10923,7 @@ mod tests {
             "the planner did not reuse the root nonce"
         );
         assert_eq!(wanted.generation, 1, "the planner moved the generation");
-        let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Bound(outcome) => outcome,
             Bind::Refuse(reason) => panic!("a new member of an owned root was refused: {reason}"),
             Bind::Wait => panic!("a new member of an owned root waited"),
@@ -10455,7 +11026,7 @@ mod tests {
             "the production planner did not fall back to the local spec"
         );
         let store = pool_store(&fixture.root.join("pool"));
-        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
                 assert!(
                     reason.contains(
@@ -10558,7 +11129,7 @@ mod tests {
             "the pre-lease reservation rewrote the committed receipt of a refusing command"
         );
         // The command still refuses for the exact P4 reason with no effect.
-        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
                 assert!(
                     reason.contains(
@@ -10782,7 +11353,7 @@ mod tests {
             ),
             "a whole-target local fallback lost its required reservation"
         );
-        match bind_under_binding(&context, &store, 0, &reserved, Some(&plan)) {
+        match bind_under_binding(&context, &store, 0, &reserved, Some(&plan), false) {
             Bind::Bound(outcome) => {
                 assert_eq!(
                     outcome.root.as_deref(),
@@ -12228,7 +12799,7 @@ mod tests {
         write_receipt(&fixture.control, &receipt).unwrap();
         let store = pool_store(&fixture.root.join("pool"));
         let plan = whole_target_plan(Some(expected.clone()));
-        match bind_under_binding(&context, &store, 0, &receipt, Some(&plan)) {
+        match bind_under_binding(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
                 assert!(reason.contains("committed receipt selects"), "{reason}")
             }
@@ -12469,10 +13040,11 @@ mod tests {
         let store = pool_store(&fixture.root.join("pool"));
         register_at(&fixture, store.owner_control(), DriveMode::Permanent);
         let context = fixture.context();
-        let bind = |label: &str| match bind_for_command(&store, &fixture.checkout, 0, None, None) {
-            Ok(_) => Ok(()),
-            Err(reason) => Err(format!("{label}: {reason}")),
-        };
+        let bind =
+            |label: &str| match bind_for_command(&store, &fixture.checkout, 0, None, None, false) {
+                Ok(_) => Ok(()),
+                Err(reason) => Err(format!("{label}: {reason}")),
+            };
         assert!(bind("missing").is_ok());
         fs::create_dir(context.link()).unwrap();
         assert!(bind("real").is_ok());
@@ -12528,7 +13100,7 @@ mod tests {
                 NonceAuthority::Unkeyed,
             )
             .unwrap();
-            match bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None) {
+            match bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None, false) {
                 Ok(_) => panic!("{mode:?}: bound an owned root with an unconverted slot key"),
                 Err(reason) => assert!(reason.contains("converted to owned outputs"), "{reason}"),
             }
@@ -12541,7 +13113,7 @@ mod tests {
             )
             .unwrap();
             assert!(rekeyed.is_some());
-            match bind_for_command(&store, &fixture.checkout, 0, rekeyed.as_ref(), None) {
+            match bind_for_command(&store, &fixture.checkout, 0, rekeyed.as_ref(), None, false) {
                 Ok(binding) => assert_eq!(
                     binding.outcome.root.as_deref(),
                     Some(fixture.local().root())
@@ -12578,7 +13150,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let binding = bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None)
+        let binding = bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None, false)
             .unwrap_or_else(|reason| panic!("{reason}"));
         // The mode switches to permanent and a relinker starts.
         register_at(&fixture, store.owner_control(), DriveMode::Permanent);
@@ -13095,7 +13667,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => assert!(reason.contains("not available now"), "{reason}"),
             _ => panic!("a dangling member bound"),
         }
@@ -13143,7 +13715,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        match bind_profile(&context, &store, 0, &committed, Some(&plan)) {
+        match bind_profile(&context, &store, 0, &committed, Some(&plan), false) {
             Bind::Bound(outcome) => assert_eq!(outcome.root, Some(root.clone())),
             Bind::Refuse(reason) => panic!("the recovered root did not bind: {reason}"),
             Bind::Wait => panic!("the recovered root waited"),

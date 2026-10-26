@@ -2539,6 +2539,9 @@ EXEC_CASES = [
     ("07+14", "exec on a detached checkout runs locally; detach restored real empty members and kept the root"),
     ("08", "an ineligible (empty-target) checkout is never converted"),
     ("09", "an existing whole-target checkout stays whole-target through a build and an exec"),
+    ("16", "a whole-target root holding only debug migrates so both member directories exist before any release build, and a derived exec runs"),
+    ("17", "an exec with no --output repairs a release member link an older migration left dangling, and its release build lands in the root"),
+    ("18", "a link into an unverified root still refuses and creates nothing"),
     ("10", "a foreign member link refuses before Cargo and changes nothing"),
     ("11", "a receipt changed while the command waits refuses"),
     ("12", "root drift refuses and names the explicit adoption"),
@@ -2746,8 +2749,17 @@ def exec_run(proof: Proof, repo: str) -> None:
     checkout that runs locally and the root it must not write, an existing
     whole-target checkout (case 09) that must stay whole-target beside the
     profile conversion, and an interrupted tool (case 15) whose surviving group
-    member must keep the lease held. `--plan` prints the same table and
-    allocation with no effect.
+    member must keep the lease held. The oxide#162 cases (16-18) reuse that
+    migrated whole-target checkout: 16 removes the root's `release` directory
+    so the fixture holds only `debug`, migrates, and proves both member
+    directories exist — with both committed links resolving — before any
+    release build, then runs a derived `exec`; 17 removes the root's `release`
+    directory the way the pre-fix migrations left it, leaves `target/release`
+    dangling, and proves a derived `exec` creates that one directory, builds
+    `--release` into it and changes neither the link nor the receipt; 18 points
+    `target/release` at an unverified root and proves the refusal creates
+    nothing there. `--plan` prints the same table and allocation with no
+    effect.
 
     The HIGH premise checklist is traced through the executable bodies:
 
@@ -3033,6 +3045,129 @@ def exec_run(proof: Proof, repo: str) -> None:
         "09: an exec rewrote the whole-target receipt",
     )
     phase(proof, "after the legacy whole-target fixture")
+
+    # 16 (oxide#162): the fixture's root holds only `debug`. The migration must
+    # create BOTH member directories before it publishes their links, so the
+    # receipt's `release` placement never dangles, and a derived `exec` runs
+    # before any release build.
+    os.rmdir(os.path.join(legacy_root, "release"))
+    expect(
+        os.path.isdir(os.path.join(legacy_root, "debug")),
+        "16: the fixture root has no debug directory",
+    )
+    expect(
+        not os.path.exists(os.path.join(legacy_root, "release")),
+        "16: the fixture root still has a release directory",
+    )
+    code, stdout, stderr = proof.oxide(
+        ["outputs", "adopt"], "16 migrate a debug-only whole-target root", legacy
+    )
+    expect(code == 0, stdout + stderr)
+    migrated_root = expect_profile_layout(pool, mount, legacy, "16 migration")
+    expect(migrated_root == legacy_root, f"16: the migration moved the root to {migrated_root}")
+    for member in ("debug", "release"):
+        destination = os.path.join(migrated_root, member)
+        expect(
+            os.path.isdir(destination) and not os.path.islink(destination),
+            f"16: {member} is not a real member directory after the migration",
+        )
+        expect(
+            member_link_target(legacy, member) == destination,
+            f"16: {member} does not select its migrated member destination",
+        )
+        expect(
+            os.path.isdir(os.path.join(legacy, "target", member)),
+            f"16: target/{member} dangles after the migration",
+        )
+    expect(
+        not os.path.exists(os.path.join(migrated_root, "release", "poutputs")),
+        "16: a release build happened before the derived exec",
+    )
+    code, _, stderr = proof.oxide(
+        ["exec", "--", build_tool], "16 a derived exec follows the migrated pair", legacy
+    )
+    expect(code == 0, stderr)
+    expect("through profile member links (debug, release)" in stderr, stderr)
+    expect(
+        os.path.isfile(os.path.join(migrated_root, "debug", "poutputs")),
+        "16: the derived exec built nothing through the migrated debug member",
+    )
+    expect(
+        not os.path.exists(os.path.join(migrated_root, "release", "poutputs")),
+        "16: the derived exec ran a release build",
+    )
+    phase(proof, "after the migration publication")
+
+    # 17 (oxide#162): the exact shape the live pre-fix migrations left behind —
+    # the member link published, the root's member directory absent. A derived
+    # exec creates that one directory under its verified root and builds
+    # through it; the link and the receipt do not change.
+    os.rmdir(os.path.join(migrated_root, "release"))
+    release_link = os.path.join(legacy, "target", "release")
+    expect(
+        os.path.islink(release_link),
+        "17: target/release is not the owned member link",
+    )
+    expect(
+        not os.path.exists(release_link),
+        "17: target/release does not dangle",
+    )
+    migrated_receipt = read_bytes(receipt_file(pool, legacy))
+    code, _, stderr = proof.oxide(
+        ["exec", "--", build_tool, "--release"],
+        "17 an exec repairs the absent release member",
+        legacy,
+    )
+    expect(code == 0, stderr)
+    expect(
+        os.path.isdir(os.path.join(migrated_root, "release"))
+        and not os.path.islink(os.path.join(migrated_root, "release")),
+        "17: the exec did not create the release member directory",
+    )
+    expect(
+        os.path.isfile(os.path.join(migrated_root, "release", "poutputs")),
+        "17: the release build did not land in the root member",
+    )
+    expect(
+        member_link_target(legacy, "release") == os.path.join(migrated_root, "release"),
+        "17: the repair relinked release",
+    )
+    expect(
+        read_bytes(receipt_file(pool, legacy)) == migrated_receipt,
+        "17: the repair changed the receipt",
+    )
+    phase(proof, "after the absent member repair")
+
+    # 18 (oxide#162): a link into a root that is not this checkout's verified,
+    # committed root still refuses before Cargo, and nothing is created there.
+    unverified = os.path.join(root, "unverified-output-root")
+    os.makedirs(unverified)
+    os.remove(release_link)
+    os.symlink(os.path.join(unverified, "release"), release_link)
+    migrated_receipt = read_bytes(receipt_file(pool, legacy))
+    code, _, stderr = proof.oxide(
+        ["exec", "--", build_tool], "18 an unverified root refuses", legacy
+    )
+    expect(code != 0, f"18: a link into an unverified root was accepted\n{stderr}")
+    expect("target/release" in stderr, stderr)
+    expect("oxide outputs adopt" in stderr, stderr)
+    expect(
+        not os.path.exists(os.path.join(unverified, "release")),
+        "18: the unverified root got a member directory",
+    )
+    expect(
+        os.readlink(release_link) == os.path.join(unverified, "release"),
+        "18: a refused exec relinked release",
+    )
+    expect(
+        read_bytes(receipt_file(pool, legacy)) == migrated_receipt,
+        "18: a refused exec changed the receipt",
+    )
+    expect(
+        os.path.isdir(os.path.join(migrated_root, "release")),
+        "18: a refused exec removed the root's member directory",
+    )
+    phase(proof, "after the unverified root refusal")
 
     # 13: a checkout path containing a space converts and runs end to end.
     spaced = fresh_checkout(proof, root, "exec spaced")
