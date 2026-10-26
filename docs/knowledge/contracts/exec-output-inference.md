@@ -612,15 +612,20 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   ids and never runs, so a failed case cannot taint an independent one's
   premise; a recoverable case-oracle failure is recorded and collection
   continues; an unknown outcome or unexpected exception, a lost resource or
-  writer custody (an unclosed child, a lost mount or drive registration) or an
-  exhausted guard deadline aborts and records every remaining case
-  `unexecuted`. Custody is checked after every case, including one whose own
-  oracle failed, because such a case can leave a writer or a lost mount behind
-  and no later case may run against that. Every case already reached keeps its
-  row even when a fault escapes the collection, and a receipt that cannot be
-  written ends the diagnostic instead of reporting success. The receipt is
-  written in every outcome, carries one row per declared case and is
-  `qualified: false`; a skipped or unexecuted case is never a pass.
+  writer custody (an unclosed child, a lost mount or drive registration), a
+  monitored-resource checkpoint over the 512 MiB scratch budget or under the
+  20 GiB host reserve, or an exhausted guard deadline aborts and records every
+  remaining case `unexecuted`. Custody and the run's own resource samples are
+  checked after every case, including one whose own oracle failed, because such
+  a case can leave a writer, a lost mount or an over-budget footprint behind and
+  no later case may run against that; the phase checkpoint's own limit failure
+  is raised as an abort rather than a recoverable oracle failure. Every case
+  already reached and every failure already recorded keeps its place in the
+  receipt even when the run is cancelled — the interrupted case is recorded
+  `aborted`, never `unexecuted` — and a receipt that cannot be written ends the
+  diagnostic instead of reporting success. The receipt is written in every
+  outcome, carries one row per declared case and is `qualified: false`; a
+  skipped or unexecuted case is never a pass.
   01 conversion via explicit adopt (host pair linked), asserted committed;
   02 `exec` with no `--output` runs a tiny fixture tool that calls the real
   `cargo build` → exit 0, `target/debug` still a link, the binary present under

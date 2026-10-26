@@ -2600,8 +2600,21 @@ PHASES: list[str] = []
 
 
 def phase(proof: Proof, label: str) -> None:
+    """Sample one phase checkpoint and record its label.
+
+    The shared `Proof.phase` reads the run's monitored resources and fails when
+    the host reserve is gone or the owned scratch is over its budget. That is a
+    resource failure of the RUN, never a case-oracle failure, so it is raised as
+    a `ProofAbort` here: a keep-going collection must stop, not spend another
+    case on a host or scratch state the supervisor would refuse.
+    """
     PHASES.append(label)
-    proof.phase(label)
+    try:
+        proof.phase(label)
+    except ProofAbort:
+        raise
+    except RuntimeError as fault:
+        raise ProofAbort(f"a monitored resource checkpoint failed at {label}: {fault}") from fault
 
 
 class ProofAbort(RuntimeError):
@@ -2617,6 +2630,24 @@ class IneligibleAbort(ProofAbort):
 
 # The work margin a collection keeps before it will start another case.
 CASE_RESERVE_S = 5.0
+
+
+class Collection:
+    """The bounded record of one exec-inference run: one outcome row per case,
+    the recoverable failures, the latched abort and the detach disposition.
+
+    It is filled IN PLACE, so a fault that ends the run early — a cancellation,
+    an interrupt, a fault that escapes the classification — still leaves every
+    case already reached and every failure already recorded for the receipt.
+    """
+
+    def __init__(self) -> None:
+        self.outcomes: dict[str, dict] = {}
+        self.failures: list[dict] = []
+        self.aborted: str | None = None
+        self.detached = "not attempted (the collection did not reach the detach decision)"
+        self.mount_present: bool | None = None
+        self.source: str | None = None
 
 
 def require_case_custody(*, unclosed, mount: str, registration: str, case: str) -> None:
@@ -2635,8 +2666,28 @@ def require_case_custody(*, unclosed, mount: str, registration: str, case: str) 
         raise ProofAbort(f"the drive registration is gone after {case}")
 
 
+def require_case_resources(*, peak_bytes: int, low_bytes: int | None, case: str) -> None:
+    """The run's own phase samples are checkpoints of its monitored resources.
+
+    The limits are the shared runner's own constants: owned scratch over the
+    512 MiB budget, or host free space below the 20 GiB reserve, is a resource
+    failure of the RUN — an abort, never a recoverable case-oracle failure — so
+    no later case may run against it. Read-only; it creates nothing.
+    """
+    limit = layout.runner.SCRATCH_LIMIT_BYTES
+    reserve = layout.runner.HOST_RESERVE_BYTES
+    if peak_bytes > limit:
+        raise ProofAbort(
+            f"owned scratch {peak_bytes // MIB} MiB exceeds the {limit // MIB} MiB budget after {case}"
+        )
+    if low_bytes is not None and low_bytes < reserve:
+        raise ProofAbort(
+            f"host free {low_bytes // MIB} MiB is below the {reserve // MIB} MiB reserve after {case}"
+        )
+
+
 def collect_cases(
-    cases, *, diagnostic: bool, work_left, after_case=None, note=None, outcomes=None
+    cases, *, diagnostic: bool, work_left, after_case=None, note=None, record=None
 ):
     """Run one case table, recording every case's outcome (oxide#165).
 
@@ -2646,83 +2697,96 @@ def collect_cases(
     recoverable case-oracle failure is recorded as `failed` and every case whose
     dependencies all completed still runs; a case with an incomplete dependency
     is recorded `skipped` with those ids and never runs; a `ProofAbort` (an
-    unknown outcome, a lost resource or custody, a tainted shared fixture) and
-    any other unexpected exception are recorded as `aborted` and every remaining
-    case is `unexecuted`, because no later case may be trusted after them. An
-    exhausted guard deadline aborts the same way in either mode.
+    unknown outcome, a lost resource or custody, a failed resource checkpoint, a
+    tainted shared fixture) and any other unexpected exception are recorded as
+    `aborted` and every remaining case is `unexecuted`, because no later case
+    may be trusted after them. An exhausted guard deadline aborts the same way
+    in either mode.
 
-    `after_case` is the run's shared post-case custody seam. It runs after EVERY
-    case that has not already aborted the collection, including a case whose own
-    oracle failed: an unclosed child, a lost mount or a vanished registration a
-    failed case left behind must stop the collection before another case runs.
+    `after_case` is the run's shared post-case seam: writer and device custody
+    plus the run's own resource samples. It runs after EVERY case that has not
+    already aborted the collection, including a case whose own oracle failed,
+    because such a case can leave an unclosed child, a lost mount or an
+    over-budget scratch footprint behind.
 
-    `outcomes` is the caller's accumulator and is filled in place, so a fault
-    that escapes this function (an interrupt, say) still leaves every case
-    already reached in it; rows a case never reached stay absent and are
-    rendered `unexecuted`. Returns `(outcomes, failures, aborted)`: `outcomes`
-    maps each reached case id to its row, `failures` lists the recorded
-    recoverable faults and `aborted` names the latched abort, if any. A case
-    whose oracle failed and which then broke custody is recorded `aborted` while
-    its oracle failure stays in `failures`.
+    `record` is the caller's `Collection` and is filled IN PLACE, so a fault that
+    ends the run early (a cancellation, an interrupt, anything that escapes the
+    classification) still leaves every case already reached and every failure
+    already recorded in it; a case whose outcome is unknown is rendered
+    `unexecuted` and is never a pass. The case a cancellation interrupted is
+    recorded `aborted` with its fault before the cancellation is re-raised, so an
+    executed case is never misreported as unexecuted. Returns the record.
     """
     if note is None:
         note = lambda text: print(text, flush=True)  # noqa: E731 - the default sink
-    if outcomes is None:
-        outcomes = {}
+    if record is None:
+        record = Collection()
 
-    failures: list[dict] = []
-    aborted: str | None = None
     completed: set[str] = set()
     for case, requires, body in cases:
-        if aborted is not None:
-            outcomes[case] = {"result": "unexecuted"}
+        if record.aborted is not None:
+            record.outcomes[case] = {"result": "unexecuted"}
             continue
         missing = [dependency for dependency in requires if dependency not in completed]
         if missing:
             note(f"case {case}: skipped (depends on {', '.join(missing)})")
-            outcomes[case] = {"result": "skipped", "because": missing}
+            record.outcomes[case] = {"result": "skipped", "because": missing}
             continue
         if work_left() <= CASE_RESERVE_S:
-            aborted = f"{case}: no guard work deadline left before the case started"
-            outcomes[case] = {"result": "aborted", "fault": aborted[:600]}
+            record.aborted = f"{case}: no guard work deadline left before the case started"
+            record.outcomes[case] = {"result": "aborted", "fault": record.aborted[:600]}
             continue
         note(f"case {case}")
         result: dict = {"result": "completed"}
         try:
-            body()
-        except ProofAbort as fault:
-            if not diagnostic:
-                raise
-            result = {"result": "aborted", "fault": str(fault)[:600]}
-        except RuntimeError as fault:
-            if not diagnostic:
-                raise
-            if "deadline reached" in str(fault) or work_left() <= CASE_RESERVE_S:
-                # An exhausted deadline is not a recoverable oracle failure.
-                result = {"result": "aborted", "fault": str(fault)[:600]}
-            else:
-                failures.append({"case": case, "fault": str(fault)[:600]})
-                result = {"result": "failed", "fault": str(fault)[:600]}
-        except Exception as fault:
-            # Any other exception is an unknown outcome, never a recoverable
-            # case-oracle failure, so it aborts like the custody seam below.
-            if not diagnostic:
-                raise
-            result = {"result": "aborted", "fault": f"unexpected {fault!r}"[:600]}
-        # Custody is checked after the case whatever its own oracle did.
-        if after_case is not None and result["result"] != "aborted":
             try:
-                after_case(case)
+                body()
             except ProofAbort as fault:
                 if not diagnostic:
                     raise
                 result = {"result": "aborted", "fault": str(fault)[:600]}
-        outcomes[case] = result
+            except RuntimeError as fault:
+                if not diagnostic:
+                    raise
+                if "deadline reached" in str(fault) or work_left() <= CASE_RESERVE_S:
+                    # An exhausted deadline is not a recoverable oracle failure.
+                    result = {"result": "aborted", "fault": str(fault)[:600]}
+                else:
+                    record.failures.append({"case": case, "fault": str(fault)[:600]})
+                    result = {"result": "failed", "fault": str(fault)[:600]}
+            except Exception as fault:
+                # Any other exception is an unknown outcome, never a recoverable
+                # case-oracle failure, so it aborts like the custody seam below.
+                if not diagnostic:
+                    raise
+                result = {"result": "aborted", "fault": f"unexpected {fault!r}"[:600]}
+            # Custody and the run's own resource samples are checked after the
+            # case, whatever its own oracle did.
+            if after_case is not None and result["result"] != "aborted":
+                try:
+                    after_case(case)
+                except ProofAbort as fault:
+                    if not diagnostic:
+                        raise
+                    result = {"result": "aborted", "fault": str(fault)[:600]}
+        except BaseException as fault:
+            # A cancellation (SIGTERM/SIGINT) or any fault that escapes the
+            # classification above ends the run. The case it interrupted is
+            # recorded as `aborted` and everything already recorded stays in the
+            # receipt; the fault itself is re-raised, because the run must still
+            # end the way the supervisor saw it.
+            record.outcomes[case] = {
+                "result": "aborted",
+                "fault": f"ended during the case: {fault!r}"[:600],
+            }
+            record.aborted = f"{case}: ended during the case: {fault!r}"
+            raise
+        record.outcomes[case] = result
         if result["result"] == "completed":
             completed.add(case)
         elif result["result"] == "aborted":
-            aborted = f"{case}: {result['fault']}"
-    return outcomes, failures, aborted
+            record.aborted = f"{case}: {result['fault']}"
+    return record
 
 
 def exec_case_rows(outcomes: dict[str, dict]) -> list[dict]:
@@ -2733,18 +2797,6 @@ def exec_case_rows(outcomes: dict[str, dict]) -> list[dict]:
         {"case": case, **outcomes.get(case, {"result": "unexecuted"})}
         for case, _requires, _text in EXEC_CASES
     ]
-
-
-class Collection:
-    """The keep-going diagnostic's bounded record for one exec-inference run."""
-
-    def __init__(self) -> None:
-        self.outcomes: dict[str, dict] = {}
-        self.failures: list[dict] = []
-        self.aborted: str | None = None
-        self.detached = "not attempted (the collection did not reach the detach decision)"
-        self.mount_present: bool | None = None
-        self.source: str | None = None
 
 
 def diagnostic_document(
@@ -2858,11 +2910,12 @@ def write_diagnostic(proof: Proof, collection: Collection) -> str:
 def exec_self_test() -> None:
     """The pure apparatus check of the keep-going collection.
 
-    It drives the real collector, the real case table and the real receipt
-    document builder with fake bodies and seams: no scratch, child, toolchain,
-    image, pool or supervisor is touched. A dispatch, dependency-skip,
-    keep-going, abort-latch or receipt regression is therefore found without
-    spending a native activation on it.
+    It drives the real collector, the real case table, the real custody and
+    resource gates and the real receipt document builder with fake bodies and
+    seams: no scratch, child, toolchain, image, pool or supervisor is touched. A
+    dispatch, dependency-skip, keep-going, abort-latch, cancellation,
+    resource-gate or receipt regression is therefore found without spending a
+    native activation on it.
     """
     ran: list[str] = []
 
@@ -2894,20 +2947,24 @@ def exec_self_test() -> None:
 
     always = lambda: 300.0  # noqa: E731 - a pure seam, never called for its value
 
+    def collect(cases, *, diagnostic=True, after_case=None, work_left=always):
+        """One collection on a fresh record, the way the run drives it."""
+        record = Collection()
+        collect_cases(
+            cases,
+            diagnostic=diagnostic,
+            work_left=work_left,
+            after_case=after_case,
+            note=quiet,
+            record=record,
+        )
+        return record
+
     # 1. The counted run is fail-fast: the first fault propagates unchanged and
     #    no later case runs.
     ran.clear()
     try:
-        collect_cases(
-            table(
-                ("a", (), {}),
-                ("b", (), {"fault": "oracle b"}),
-                ("c", (), {}),
-            ),
-            diagnostic=False,
-            work_left=always,
-            note=quiet,
-        )
+        collect(table(("a", (), {}), ("b", (), {"fault": "oracle b"}), ("c", (), {})), diagnostic=False)
         raise AssertionError("the counted collection continued past a fault")
     except RuntimeError as fault:
         expect("oracle b" in str(fault), f"the counted fault changed: {fault!r}")
@@ -2916,48 +2973,49 @@ def exec_self_test() -> None:
     # 2. Keep-going records the failure, runs the cases that do not depend on it
     #    and skips the dependents (transitively) with the failed ids.
     ran.clear()
-    outcomes, failures, aborted = collect_cases(
+    record = collect(
         table(
             ("a", (), {}),
             ("b", (), {"fault": "oracle b"}),
             ("c", ("b",), {}),
             ("d", (), {}),
             ("e", ("c",), {}),
-        ),
-        diagnostic=True,
-        work_left=always,
-        note=quiet,
+        )
     )
     expect(ran == ["a", "b", "d"], f"keep-going ran {ran}")
-    expect(outcomes["a"]["result"] == "completed", f"{outcomes['a']}")
-    expect(outcomes["b"]["result"] == "failed", f"{outcomes['b']}")
-    expect("oracle b" in outcomes["b"]["fault"], f"{outcomes['b']}")
-    expect(outcomes["c"]["result"] == "skipped" and outcomes["c"]["because"] == ["b"], f"{outcomes['c']}")
-    expect(outcomes["d"]["result"] == "completed", f"{outcomes['d']}")
-    expect(outcomes["e"]["result"] == "skipped" and outcomes["e"]["because"] == ["c"], f"{outcomes['e']}")
-    expect([failure["case"] for failure in failures] == ["b"], f"{failures}")
-    expect(aborted is None, f"a recoverable failure aborted the collection: {aborted}")
+    expect(record.outcomes["a"]["result"] == "completed", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "failed", f"{record.outcomes['b']}")
+    expect("oracle b" in record.outcomes["b"]["fault"], f"{record.outcomes['b']}")
+    expect(
+        record.outcomes["c"]["result"] == "skipped"
+        and record.outcomes["c"]["because"] == ["b"],
+        f"{record.outcomes['c']}",
+    )
+    expect(record.outcomes["d"]["result"] == "completed", f"{record.outcomes['d']}")
+    expect(
+        record.outcomes["e"]["result"] == "skipped"
+        and record.outcomes["e"]["because"] == ["c"],
+        f"{record.outcomes['e']}",
+    )
+    expect([failure["case"] for failure in record.failures] == ["b"], f"{record.failures}")
+    expect(record.aborted is None, f"a recoverable failure aborted the collection: {record.aborted}")
 
     # 3. An unknown outcome aborts: the case is recorded `aborted`, nothing
     #    later runs, even an independent case, and every remaining case is
     #    `unexecuted` — never a pass.
     ran.clear()
-    outcomes, failures, aborted = collect_cases(
-        table(
-            ("a", (), {"abort": "unknown writer custody"}),
-            ("b", (), {}),
-            ("c", (), {}),
-        ),
-        diagnostic=True,
-        work_left=always,
-        note=quiet,
+    record = collect(
+        table(("a", (), {"abort": "unknown writer custody"}), ("b", (), {}), ("c", (), {}))
     )
     expect(ran == ["a"], f"an aborting collection ran {ran}")
-    expect(outcomes["a"]["result"] == "aborted", f"{outcomes['a']}")
-    expect(outcomes["b"]["result"] == "unexecuted", f"{outcomes['b']}")
-    expect(outcomes["c"]["result"] == "unexecuted", f"{outcomes['c']}")
-    expect(failures == [], f"an abort was recorded as a recoverable failure: {failures}")
-    expect(aborted is not None and "unknown writer custody" in aborted, f"{aborted}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+    expect(record.outcomes["c"]["result"] == "unexecuted", f"{record.outcomes['c']}")
+    expect(record.failures == [], f"an abort was recorded as a recoverable failure: {record.failures}")
+    expect(
+        record.aborted is not None and "unknown writer custody" in record.aborted,
+        f"{record.aborted}",
+    )
 
     # 4. A lost resource or custody after a case (an unclosed child, a lost
     #    mount) is the abort seam, not a case-oracle failure.
@@ -2966,17 +3024,27 @@ def exec_self_test() -> None:
     def lost(case: str) -> None:
         raise ProofAbort(f"lost custody after {case}")
 
-    outcomes, failures, aborted = collect_cases(
-        table(("a", (), {}), ("b", (), {})),
-        diagnostic=True,
-        work_left=always,
-        after_case=lost,
-        note=quiet,
-    )
+    record = collect(table(("a", (), {}), ("b", (), {})), after_case=lost)
     expect(ran == ["a"], f"the lost-custody collection ran {ran}")
-    expect(outcomes["a"]["result"] == "aborted", f"{outcomes['a']}")
-    expect(outcomes["b"]["result"] == "unexecuted", f"{outcomes['b']}")
-    expect(aborted is not None and "lost custody" in aborted, f"{aborted}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+    expect(record.aborted is not None and "lost custody" in record.aborted, f"{record.aborted}")
+
+    # 4a. The real post-case custody check aborts on each lost resource and
+    #     accepts a run where all three are present. It is read-only: "/" is an
+    #     existing mount point and an existing path stands in for the
+    #     registration, so nothing is created.
+    for kwargs, expected in (
+        ({"unclosed": {"123"}, "mount": "/", "registration": "/"}, "unclosed children"),
+        ({"unclosed": set(), "mount": "/nonexistent-oxide-165", "registration": "/"}, "no longer mounted"),
+        ({"unclosed": set(), "mount": "/", "registration": "/nonexistent-oxide-165"}, "registration is gone"),
+    ):
+        try:
+            require_case_custody(case="x", **kwargs)
+            raise AssertionError(f"the custody check accepted {kwargs}")
+        except ProofAbort as fault:
+            expect(expected in str(fault), f"the custody abort changed: {fault}")
+    require_case_custody(unclosed=set(), mount="/", registration="/", case="x")
 
     # 4b. The custody seam runs after a case whose own oracle FAILED, and it is
     #     still an abort: a failed case can leave an unclosed child or a lost
@@ -2990,81 +3058,128 @@ def exec_self_test() -> None:
         if case == "b":
             raise ProofAbort("unclosed child after the failed case")
 
-    outcomes, failures, aborted = collect_cases(
-        table(
-            ("a", (), {}),
-            ("b", (), {"fault": "oracle b"}),
-            ("c", (), {}),
-            ("d", (), {}),
-        ),
-        diagnostic=True,
-        work_left=always,
+    record = collect(
+        table(("a", (), {}), ("b", (), {"fault": "oracle b"}), ("c", (), {}), ("d", (), {})),
         after_case=custody_after_failure,
-        note=quiet,
     )
     expect(
         custody_seen == ["a", "b"],
         f"the custody seam did not run after the failed case: {custody_seen}",
     )
     expect(ran == ["a", "b"], f"a case ran after the failed case's custody check: {ran}")
-    expect(outcomes["b"]["result"] == "aborted", f"{outcomes['b']}")
-    expect("unclosed child" in outcomes["b"]["fault"], f"{outcomes['b']}")
+    expect(record.outcomes["b"]["result"] == "aborted", f"{record.outcomes['b']}")
+    expect("unclosed child" in record.outcomes["b"]["fault"], f"{record.outcomes['b']}")
     expect(
-        [failure["case"] for failure in failures] == ["b"],
-        f"the failed case's oracle failure was lost: {failures}",
+        [failure["case"] for failure in record.failures] == ["b"],
+        f"the failed case's oracle failure was lost: {record.failures}",
     )
     expect(
-        outcomes["c"]["result"] == "unexecuted" and outcomes["d"]["result"] == "unexecuted",
-        f"{outcomes['c']} {outcomes['d']}",
+        record.outcomes["c"]["result"] == "unexecuted"
+        and record.outcomes["d"]["result"] == "unexecuted",
+        f"{record.outcomes['c']} {record.outcomes['d']}",
     )
-    expect(aborted is not None and "unclosed child" in aborted, f"{aborted}")
+    expect(record.aborted is not None and "unclosed child" in record.aborted, f"{record.aborted}")
 
     # 4c. An unexpected exception is an unknown outcome, not a recoverable
     #     oracle failure: it aborts, and every case already reached keeps its
     #     row.
     ran.clear()
-    outcomes, failures, aborted = collect_cases(
-        table(
-            ("a", (), {}),
-            ("b", (), {"raises": KeyError("boom")}),
-            ("c", (), {}),
-        ),
-        diagnostic=True,
-        work_left=always,
-        note=quiet,
+    record = collect(
+        table(("a", (), {}), ("b", (), {"raises": KeyError("boom")}), ("c", (), {}))
     )
     expect(ran == ["a", "b"], f"an unexpected exception did not abort: {ran}")
-    expect(outcomes["a"]["result"] == "completed", f"{outcomes['a']}")
-    expect(outcomes["b"]["result"] == "aborted", f"{outcomes['b']}")
-    expect("KeyError" in outcomes["b"]["fault"], f"{outcomes['b']}")
-    expect(outcomes["c"]["result"] == "unexecuted", f"{outcomes['c']}")
-    expect(failures == [], f"an unexpected exception was recorded as recoverable: {failures}")
-    expect(aborted is not None and "KeyError" in aborted, f"{aborted}")
+    expect(record.outcomes["a"]["result"] == "completed", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "aborted", f"{record.outcomes['b']}")
+    expect("KeyError" in record.outcomes["b"]["fault"], f"{record.outcomes['b']}")
+    expect(record.outcomes["c"]["result"] == "unexecuted", f"{record.outcomes['c']}")
+    expect(record.failures == [], f"an unexpected exception was recorded as recoverable: {record.failures}")
+    expect(record.aborted is not None and "KeyError" in record.aborted, f"{record.aborted}")
 
-    # 4d. A fault that escapes the collector entirely (an interrupt) must not
-    #     erase the cases already reached: the accumulator is filled in place,
-    #     and a case whose outcome is unknown stays absent (never a pass).
-    shared: dict = {}
+    # 4d. An actual monitored-resource failure aborts: the run's own phase
+    #     samples are checkpoints, so a sample over the 512 MiB scratch budget or
+    #     under the 20 GiB host reserve must stop the collection instead of
+    #     spending another case. Both directions, plus the healthy control.
+    budget = layout.runner.SCRATCH_LIMIT_BYTES
+    reserve = layout.runner.HOST_RESERVE_BYTES
+    require_case_resources(peak_bytes=budget, low_bytes=reserve, case="healthy")
+    for peak, low, expected in (
+        (budget + MIB, reserve, "exceeds the 512 MiB budget"),
+        (MIB, reserve - 1, "is below the 20480 MiB reserve"),
+        (MIB, 0, "is below the 20480 MiB reserve"),
+    ):
+        try:
+            require_case_resources(peak_bytes=peak, low_bytes=low, case="x")
+            raise AssertionError(f"the resource gate accepted peak {peak} low {low}")
+        except ProofAbort as fault:
+            expect(expected in str(fault), f"the resource abort changed: {fault}")
+    ran.clear()
+    samples = {"peak": MIB, "low": reserve}
+
+    def overspent(case: str) -> None:
+        samples["peak"] = budget + MIB
+        require_case_resources(peak_bytes=samples["peak"], low_bytes=samples["low"], case=case)
+
+    record = collect(table(("a", (), {}), ("b", (), {}), ("c", (), {})), after_case=overspent)
+    expect(ran == ["a"], f"the collection continued past an over-budget sample: {ran}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect("512 MiB budget" in record.outcomes["a"]["fault"], f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+
+    # 4e. The phase seam turns the shared runner's resource failure into that
+    #     same abort, so the real `Proof.phase` checkpoints cannot be mistaken
+    #     for recoverable case-oracle failures.
+    class ResourcePhase:
+        def __init__(self, fault: str | None) -> None:
+            self.fault = fault
+
+        def phase(self, _label: str) -> None:
+            if self.fault is not None:
+                raise RuntimeError(self.fault)
+
+    before = len(PHASES)
+    phase(ResourcePhase(None), "healthy checkpoint")
+    expect(len(PHASES) == before + 1, "the phase seam recorded no label")
+    try:
+        phase(
+            ResourcePhase("host free 0 MiB is below the 20 GiB reserve at case 20"),
+            "unhealthy checkpoint",
+        )
+        raise AssertionError("the phase seam passed a resource failure through")
+    except ProofAbort as fault:
+        expect("monitored resource checkpoint failed" in str(fault), f"{fault}")
+    del PHASES[before:]
+
+    # 4f. A cancellation records the case it interrupted as `aborted` (an
+    #     executed case is never misreported as unexecuted) and keeps every
+    #     outcome and failure already recorded, while still ending the run.
+    ran.clear()
+    record = Collection()
     try:
         collect_cases(
             table(
-                ("a", (), {}),
+                ("a", (), {"fault": "oracle a"}),
                 ("b", (), {"raises": KeyboardInterrupt()}),
                 ("c", (), {}),
             ),
             diagnostic=True,
             work_left=always,
             note=quiet,
-            outcomes=shared,
+            record=record,
         )
-        raise AssertionError("an interrupt escaped the collector")
+        raise AssertionError("a cancellation did not end the collection")
     except KeyboardInterrupt:
         pass
-    expect(shared.get("a", {}).get("result") == "completed", f"{shared}")
-    expect("b" not in shared, f"an interrupted case was recorded as reached: {shared}")
-    expect("c" not in shared, f"an unreached case was recorded: {shared}")
+    expect(record.outcomes["a"]["result"] == "failed", f"{record.outcomes.get('a')}")
+    expect(
+        [failure["case"] for failure in record.failures] == ["a"],
+        f"the accumulated failure history was lost: {record.failures}",
+    )
+    expect(record.outcomes["b"]["result"] == "aborted", f"{record.outcomes.get('b')}")
+    expect("KeyboardInterrupt" in record.outcomes["b"]["fault"], f"{record.outcomes.get('b')}")
+    expect("c" not in record.outcomes, f"an unreached case was recorded: {record.outcomes}")
+    expect(record.aborted is not None and "KeyboardInterrupt" in record.aborted, f"{record.aborted}")
 
-    # 4e. A diagnostic whose receipt was not written is not a completed
+    # 4g. A diagnostic whose receipt was not written is not a completed
     #     collection: the receipt failure ends the run when it is the only
     #     fault, and is secondary (reported, primary preserved) when a case
     #     fault is already in flight.
@@ -3104,25 +3219,17 @@ def exec_self_test() -> None:
     #    a `deadline reached` fault inside a case is an abort, never a
     #    recoverable oracle failure.
     ran.clear()
-    outcomes, failures, aborted = collect_cases(
-        table(("a", (), {})), diagnostic=True, work_left=lambda: 0.0, note=quiet
-    )
+    record = collect(table(("a", (), {})), work_left=lambda: 0.0)
     expect(ran == [], f"a case ran without a work deadline: {ran}")
-    expect(outcomes["a"]["result"] == "aborted", f"{outcomes['a']}")
-    expect(aborted is not None and "deadline" in aborted, f"{aborted}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.aborted is not None and "deadline" in record.aborted, f"{record.aborted}")
     ran.clear()
-    outcomes, failures, aborted = collect_cases(
-        table(
-            ("a", (), {"fault": "work deadline reached (SIGALRM fallback)"}),
-            ("b", (), {}),
-        ),
-        diagnostic=True,
-        work_left=always,
-        note=quiet,
+    record = collect(
+        table(("a", (), {"fault": "work deadline reached (SIGALRM fallback)"}), ("b", (), {}))
     )
-    expect(outcomes["a"]["result"] == "aborted", f"{outcomes['a']}")
-    expect(outcomes["b"]["result"] == "unexecuted", f"{outcomes['b']}")
-    expect(failures == [], f"a deadline was recorded as recoverable: {failures}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+    expect(record.failures == [], f"a deadline was recorded as recoverable: {record.failures}")
 
     # 6. Receipt rows follow the declared table, and a case the collection never
     #    reached is `unexecuted` — a partial collection is never implied to have
@@ -3137,7 +3244,7 @@ def exec_self_test() -> None:
                 f"{case} depends on the later case {dependency}",
             )
     rows = exec_case_rows({"01": {"result": "completed"}})
-    expect([row["case"] for row in rows] == ids, f"the receipt rows are not in table order")
+    expect([row["case"] for row in rows] == ids, "the receipt rows are not in table order")
     expect(
         [row["result"] for row in rows if row["case"] != "01"] == ["unexecuted"] * (len(ids) - 1),
         f"undone cases are not unexecuted: {rows}",
@@ -3249,7 +3356,6 @@ def exec_self_test() -> None:
             body_map[case] == "case_" + case.replace("+", "_"),
             f"{case} is bound to {body_map[case]}",
         )
-
     for nested in inference.body:
         if not isinstance(nested, ast.FunctionDef) or not nested.name.startswith("case_"):
             continue
@@ -3265,30 +3371,17 @@ def exec_self_test() -> None:
             f"{nested.name} assigns the shared {sorted(leaked)} without nonlocal",
         )
 
-    # 8. The real post-case custody check aborts on each lost resource and
-    #    accepts a run where all three are present. It is read-only: "/" is an
-    #    existing mount point and an existing path stands in for the
-    #    registration, so nothing is created.
-    for kwargs, expected in (
-        ({"unclosed": {"123"}, "mount": "/", "registration": "/"}, "unclosed children"),
-        ({"unclosed": set(), "mount": "/nonexistent-oxide-165", "registration": "/"}, "no longer mounted"),
-        ({"unclosed": set(), "mount": "/", "registration": "/nonexistent-oxide-165"}, "registration is gone"),
-    ):
-        try:
-            require_case_custody(case="x", **kwargs)
-            raise AssertionError(f"the custody check accepted {kwargs}")
-        except ProofAbort as fault:
-            expect(expected in str(fault), f"the custody abort changed: {fault}")
-    require_case_custody(unclosed=set(), mount="/", registration="/", case="x")
-
-    # 9. The collection is wired to the mode, not merely capable of it: the
-    #    diagnostic flag and the real custody seam are `exec_inference`'s own
-    #    call arguments, and `exec_run` passes the flag through.
+    # 8. The collection is wired to the mode, not merely capable of it: the
+    #    diagnostic flag, the real post-case seam and the in-place record are
+    #    `exec_inference`'s own call arguments, and `exec_run` passes the flag
+    #    through.
     collect_calls = [
         inner
         for statement in inference.body
         for inner in ast.walk(statement)
-        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "collect_cases"
+        if isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "collect_cases"
     ]
     expect(len(collect_calls) == 1, f"exec_inference calls collect_cases {len(collect_calls)} times")
     keywords = {keyword.arg: keyword.value for keyword in collect_calls[0].keywords}
@@ -3303,13 +3396,10 @@ def exec_self_test() -> None:
         and keywords["after_case"].test.id == "diagnostic",
         "the custody seam is not scoped to the diagnostic run",
     )
-    accumulator = keywords.get("outcomes")
+    accumulator = keywords.get("record")
     expect(
-        isinstance(accumulator, ast.Attribute)
-        and accumulator.attr == "outcomes"
-        and isinstance(accumulator.value, ast.Name)
-        and accumulator.value.id == "collection",
-        "the collection does not fill the run's receipt accumulator in place",
+        isinstance(accumulator, ast.Name) and accumulator.id == "collection",
+        "the collection does not fill the run's receipt record in place",
     )
     wrapper = next(
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "exec_run"
@@ -3317,7 +3407,9 @@ def exec_self_test() -> None:
     forwarded = [
         inner
         for inner in ast.walk(wrapper)
-        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "exec_inference"
+        if isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "exec_inference"
     ]
     expect(len(forwarded) == 1, "exec_run does not call exec_inference exactly once")
     expect(
@@ -3326,8 +3418,21 @@ def exec_self_test() -> None:
         and forwarded[0].args[2].id == "diagnostic",
         "exec_run does not forward the diagnostic flag",
     )
+    # The real seam must run both gates for every case.
+    seam = next(
+        node
+        for node in inference.body
+        if isinstance(node, ast.FunctionDef) and node.name == "after_case"
+    )
+    seam_calls = [
+        inner.func.id
+        for inner in ast.walk(seam)
+        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+    ]
+    for gate in ("require_case_custody", "require_case_resources"):
+        expect(gate in seam_calls, f"the post-case seam does not call {gate}")
 
-    # 10. The receipt document itself: `qualified: false`, counted outcomes,
+    # 9. The receipt document itself: `qualified: false`, counted outcomes,
     #    a skipped case never counted as completed, and the limitation stated.
     document = diagnostic_document(
         source="source",
@@ -4532,30 +4637,31 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             registration=registration_path(pool),
             case=case,
         )
+        require_case_resources(peak_bytes=proof.peak, low_bytes=proof.low, case=case)
 
-    outcomes, failures, aborted = collect_cases(
+    # Filled in place: a fault that escapes the collector still leaves every
+    # case already reached and every failure already recorded in the receipt.
+    collect_cases(
         cases,
         diagnostic=diagnostic,
         work_left=guard_work_left,
         after_case=after_case if diagnostic else None,
-        # Filled in place: a fault that escapes the collector still leaves every
-        # case already reached in the receipt, instead of erasing them.
-        outcomes=collection.outcomes,
+        record=collection,
     )
     if not diagnostic:
         # The counted run is fail-fast: a fault has already propagated, so a
         # clean return means every case completed.
-        expect(not failures and aborted is None, "the counted collection did not complete")
+        expect(
+            not collection.failures and collection.aborted is None,
+            "the counted collection did not complete",
+        )
         proof.detach()
         return
-    collection.outcomes = outcomes
-    collection.failures = failures
-    collection.aborted = aborted
     # The owned image is this run's custody. A collection that recorded no
     # failure and did not abort makes exactly one ordinary detach and verifies
     # the mount is gone; a failed detach raises into the existing failure
     # cleanup, which makes that same single attempt and keeps the evidence.
-    if not failures and aborted is None:
+    if not collection.failures and collection.aborted is None:
         proof.detach()
         expect(
             not os.path.ismount(mount),
@@ -4567,10 +4673,16 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         )
         collection.detached = "ordinary detach through Proof.detach; mount absent"
         collection.mount_present = os.path.lexists(mount)
-    if failures or aborted:
+    if collection.failures or collection.aborted:
         fail(
             "exec-inference cases did not all complete: "
-            + json.dumps({"failures": failures, "aborted": aborted, "cases": outcomes})
+            + json.dumps(
+                {
+                    "failures": collection.failures,
+                    "aborted": collection.aborted,
+                    "cases": collection.outcomes,
+                }
+            )
         )
 
 
