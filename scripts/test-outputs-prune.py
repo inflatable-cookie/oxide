@@ -238,8 +238,8 @@ Image custody (oxide#152, corrected after diagnostics 3 and 5): the one owned
 never-auto-cleaned `OXIDE_PROOF_EVIDENCE` directory, never in the scratch the
 supervisor may clean. That path is verified BEFORE any effect against the
 qualified guard's own published topology (`scripts/bounded-test.py`): the guard
-creates one 0700 owned run root, `os.mkdir(<root>/scratch)` 0700 and
-`os.makedirs(<root>/evidence)` at the umask default (0755 in practice, its own
+creates one 0700 owned run root, `os.mkdir(<root>/scratch)` and
+`os.makedirs(<root>/evidence)` without explicit modes (umask default, 0755 in practice; its own
 receipts 0644), and its shared-ancestor contract accepts a directory with no
 group or other WRITE bit. So the evidence directory must be this user's real
 canonical directory that is NOT group/other writable (`mode & 0o022 == 0`; 0755
@@ -252,8 +252,18 @@ directory). The custody record is written 0600 before the create effect; after
 the image is created and immediately BEFORE attach, the backing is positively
 re-verified as a real regular file this user owns, not group/other writable,
 canonically inside the evidence directory and on its device, and its identity
-(device, inode, size) is recorded with the attach facts. Exactly ONE ordinary
-detach disposition (attempted / refused:not-attached / refused:unclosed-sessions
+(device, inode, size) is recorded with the attach facts. The raw
+`hdiutil attach -plist` document is retained 0600 in the evidence directory
+BEFORE it is parsed: a real APFS attach returns FOUR system entities for one
+image (physical, partition, synthesized and mounted), so exactly one entity must
+carry both a mount-point and a dev-entry, that entity's device is the one the
+positive post-detach check uses, its mount must be this run's expected owned
+`/Volumes/<name>`, and every returned entity is preserved as custody evidence.
+A malformed or oversized document, no image or entity, zero or several mounted
+entities, a mounted entity without its device, or a foreign mount refuses with
+UNKNOWN and keeps the backing, the raw document and the returned facts; a parse
+error never implies that nothing was attached. Exactly ONE ordinary detach
+disposition (attempted / refused:not-attached / refused:unclosed-sessions
 / unknown / completed) runs in `main()`'s finally path and is never replayed;
 the backing is removed only after a completed detach whose mount and device are
 positively gone, and every other disposition keeps it. Automatic
@@ -710,6 +720,91 @@ EVIDENCE_ENV = "OXIDE_PROOF_EVIDENCE"
 CUSTODY_VERSION = "oxide.outputs-prune.image-custody/1"
 
 
+MAX_ATTACH_PLIST_BYTES = 256 * 1024
+MAX_ATTACH_ENTITIES = 64
+
+
+def parse_attach_entities(document: bytes, expected_mount: str) -> dict:
+    """Parse one hdiutil attach plist into the custody facts.
+
+    A real APFS attach returns FOUR system entities for ONE owned image - the
+    physical device, its partition, the synthesized device and the mounted
+    volume (the preserved custody evidence for this proof shows /dev/disk8,
+    /dev/disk8s1, /dev/disk9 and the mounted /dev/disk9s1). Exactly ONE entity
+    must carry BOTH a mount-point and a dev-entry; that entity's device is the
+    one the positive post-detach check uses, and it must be the expected owned
+    mount. EVERY returned entity is preserved as bounded custody evidence.
+
+    Both platform document shapes are accepted: `attach -plist` puts
+    `system-entities` at the top level, while `info -plist` nests exactly one
+    image's entities. A malformed or oversized document, no image or entity,
+    zero or several mounted entities, a mounted entity without its device, or a
+    mount other than the expected owned mount refuses with UNKNOWN: the caller
+    keeps the backing and the raw returned document, and a parse error never
+    implies that nothing was attached.
+    """
+    if not document:
+        raise RuntimeError("the attach produced no plist document; attachment is unknown")
+    if len(document) > MAX_ATTACH_PLIST_BYTES:
+        raise RuntimeError(
+            f"the attach plist exceeds {MAX_ATTACH_PLIST_BYTES} bytes; attachment is unknown"
+        )
+    try:
+        root = plistlib.loads(document)
+    except Exception as error:
+        raise RuntimeError(
+            f"the attach plist is malformed ({type(error).__name__}); attachment is unknown"
+        ) from error
+    if not isinstance(root, dict):
+        raise RuntimeError("the attach plist is not a dictionary; attachment is unknown")
+    entities = root.get("system-entities")
+    if entities is None:
+        images = root.get("images")
+        if not isinstance(images, list) or len(images) != 1:
+            raise RuntimeError(
+                "the attach plist does not name exactly one image; attachment is unknown"
+            )
+        if not isinstance(images[0], dict):
+            raise RuntimeError("the attach plist carries a malformed image; attachment is unknown")
+        entities = images[0].get("system-entities")
+    if not isinstance(entities, list) or not entities:
+        raise RuntimeError("the attach plist carries no system entities; attachment is unknown")
+    if len(entities) > MAX_ATTACH_ENTITIES:
+        raise RuntimeError(
+            f"the attach plist carries more than {MAX_ATTACH_ENTITIES} entities; attachment is unknown"
+        )
+    facts = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            raise RuntimeError("the attach plist carries a malformed entity; attachment is unknown")
+        facts.append(
+            {
+                "dev_entry": entity.get("dev-entry"),
+                "mount_point": entity.get("mount-point"),
+                "content_hint": entity.get("content-hint"),
+                "potentially_mountable": entity.get("potentially-mountable"),
+            }
+        )
+    mounted = [fact for fact in facts if fact["mount_point"] and fact["dev_entry"]]
+    if len(mounted) != 1:
+        raise RuntimeError(
+            f"the attach plist carries {len(mounted)} mounted entities with a device, not one;"
+            " attachment is unknown"
+        )
+    chosen = mounted[0]
+    if chosen["mount_point"] != expected_mount:
+        raise RuntimeError(
+            f"the attached mount {chosen['mount_point']!r} is not the expected owned"
+            f" {expected_mount!r}; attachment is unknown"
+        )
+    return {
+        "mount": chosen["mount_point"],
+        "device": chosen["dev_entry"],
+        "entities": facts,
+        "device_entries": [fact["dev_entry"] for fact in facts if fact["dev_entry"]],
+    }
+
+
 class CustodyEffects:
     """The filesystem and hdiutil effects image custody needs, so the pure
     selector can drive this real seam with in-memory stubs."""
@@ -743,7 +838,7 @@ class CustodyEffects:
         if created.returncode:
             raise RuntimeError(f"image creation failed: {created.stderr!r}")
 
-    def attach(self, path: str) -> dict:
+    def attach_raw(self, path: str) -> bytes:
         attached = subprocess.run(
             ["/usr/bin/hdiutil", "attach", "-nobrowse", "-owners", "on", "-plist", path],
             capture_output=True,
@@ -751,12 +846,14 @@ class CustodyEffects:
         )
         if attached.returncode:
             raise RuntimeError(f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}")
-        entities = plistlib.loads(attached.stdout)["system-entities"]
-        mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
-        devices = [entity["dev-entry"] for entity in entities if entity.get("dev-entry")]
-        if len(mounts) != 1 or len(devices) != 1:
-            raise RuntimeError(f"expected one mount and device, got {mounts} / {devices}")
-        return {"mount": mounts[0], "device": devices[0]}
+        return attached.stdout
+
+    def retain_attach_document(self, path: str, document: bytes) -> None:
+        with open(path, "wb") as handle:
+            handle.write(document)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o600)
 
     def detach(self, mount: str) -> tuple:
         detached = subprocess.run(
@@ -779,8 +876,8 @@ def verify_evidence_root(evidence: str, scratch: str, effects=REAL_CUSTODY_EFFEC
 
     Source basis (`scripts/bounded-test.py`, the merged oxide#151 supervisor):
     the guard creates one owned run root (`/private/tmp/oxide-proof.<id>`, 0700,
-    this user), then `os.mkdir(<root>/scratch)` (0700) and
-    `os.makedirs(<root>/evidence, exist_ok=True)` with the umask default (0755
+    this user), then `os.mkdir(<root>/scratch)` and
+    `os.makedirs(<root>/evidence, exist_ok=True)` WITHOUT explicit modes (umask default; 0755
     in practice; its own receipt/result files there are 0644). The same file's
     shared `<mount>/scratch` ancestor contract requires "no group or other
     WRITE bit (0755 passes)" and states that a sticky bit is not a substitute,
@@ -841,9 +938,11 @@ class ImageCustody:
     def __init__(self, name: str, effects=REAL_CUSTODY_EFFECTS):
         self.name = name
         self.effects = effects
+        self.expected_mount = f"/Volumes/{name}"
         self.evidence = ""
         self.backing = ""
         self.record = ""
+        self.attach_document = ""
         self.mount = ""
         self.device = ""
         self.state = "unallocated"
@@ -869,7 +968,12 @@ class ImageCustody:
         self.evidence = verify_evidence_root(evidence, scratch, self.effects)
         self.backing = os.path.join(self.evidence, f"152-image-{self.name}.sparseimage")
         self.record = os.path.join(self.evidence, f"152-image-{self.name}-custody.json")
-        if self.effects.exists(self.backing) or self.effects.exists(self.record):
+        self.attach_document = os.path.join(self.evidence, f"152-image-{self.name}-attach.plist")
+        if (
+            self.effects.exists(self.backing)
+            or self.effects.exists(self.record)
+            or self.effects.exists(self.attach_document)
+        ):
             raise Aborted(
                 f"image custody for {self.name} already exists in {self.evidence}; it is never overwritten"
             )
@@ -905,14 +1009,23 @@ class ImageCustody:
         try:
             self.effects.create_image(self.backing, self.name)
             identity = self.verify_backing()
-            facts = self.effects.attach(self.backing)
+            document = self.effects.attach_raw(self.backing)
+            # The raw returned document is custody evidence BEFORE parsing, so a
+            # parse refusal keeps exactly what the platform reported.
+            self.effects.retain_attach_document(self.attach_document, document)
+            facts = parse_attach_entities(document, self.expected_mount)
         except BaseException as error:
             self.notes.append(f"attach: {type(error).__name__}: {error}")
             self._write("unknown", attach_failed=str(error)[:400])
             raise Aborted(f"image attach is unknown; backing kept: {error}") from error
         self.mount = facts["mount"]
         self.device = facts["device"]
-        self._write("attached", backing_identity=identity)
+        self._write(
+            "attached",
+            backing_identity=identity,
+            attach_entities=facts["entities"],
+            attach_device_entries=facts["device_entries"],
+        )
         return self.mount
 
     def detach_once(self, sessions_closed: bool) -> str:
@@ -1505,7 +1618,7 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
     DIAG.source = source
     name = custody.name
-    mount = f"/Volumes/{name}"
+    mount = custody.expected_mount
     expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
     print(f"outputs-prune proof {os.getpid()} source {source} mount {mount}", flush=True)
     proof.phase("start")
@@ -2688,6 +2801,26 @@ def self_test() -> int:
     check("receipt field paths", receipt_field_paths)
 
     def image_custody() -> None:
+        def realistic_attach_document(mount: str = "/Volumes/OxMem1") -> bytes:
+            """The real APFS attach topology for ONE owned image, taken from this
+            proof's preserved custody evidence: the physical device, its
+            partition, the synthesized device and the mounted volume."""
+            return plistlib.dumps(
+                {
+                    "system-entities": [
+                        {"dev-entry": "/dev/disk8", "content-hint": "GUID_partition_scheme"},
+                        {"dev-entry": "/dev/disk8s1", "content-hint": "7C3457EF-0000-11AA-AA11"},
+                        {"dev-entry": "/dev/disk9", "content-hint": "EF57347C-0000-11AA-AA11"},
+                        {
+                            "dev-entry": "/dev/disk9s1",
+                            "mount-point": mount,
+                            "content-hint": "41504653-0000-11AA-AA11",
+                            "potentially-mountable": True,
+                        },
+                    ]
+                }
+            )
+
         class MemoryCustody(CustodyEffects):
             """In-memory stand-in for the real custody effects: directories and
             the image backing are entries carrying kind/mode/uid/dev/ino/size."""
@@ -2727,6 +2860,7 @@ def self_test() -> int:
                 self.detach_result = (0, "")
                 self.leave_mount = False
                 self.backing_override: dict | None = None
+                self.attach_document: bytes | None = None
 
             def realpath(self, path: str) -> str:
                 return path if self.canonical else path + "/..escaped"
@@ -2775,12 +2909,25 @@ def self_test() -> int:
                     entry.update(self.backing_override)
                 self.entries[path] = entry
 
-            def attach(self, path: str) -> dict:
+            def attach_raw(self, path: str) -> bytes:
                 if self.fail_attach:
                     raise RuntimeError("attach boom")
                 self.attached.append(path)
                 self.mounted = True
-                return {"mount": "/Volumes/OxMem1", "device": "/dev/disk9s1"}
+                if self.attach_document is not None:
+                    return self.attach_document
+                return realistic_attach_document()
+
+            def retain_attach_document(self, path: str, document: bytes) -> None:
+                self.records.append(path)
+                self.entries[path] = {
+                    "kind": "file",
+                    "mode": 0o600,
+                    "uid": 501,
+                    "dev": 1,
+                    "ino": 10,
+                    "size": len(document),
+                }
 
             def detach(self, mount: str) -> tuple:
                 self.detached.append(mount)
@@ -2794,7 +2941,7 @@ def self_test() -> int:
                 self.entries.pop(path, None)
 
         def allocate_refuses(effects: MemoryCustody, evidence: str = "/root/evidence", scratch: str = "/root/scratch", label: str = "") -> None:
-            custody = ImageCustody("cap", effects)
+            custody = ImageCustody("OxMem1", effects)
             try:
                 custody.allocate(evidence, scratch)
             except Aborted:
@@ -2810,7 +2957,7 @@ def self_test() -> int:
         # exactly that directory, so the positive fixture proves the fix.
         assert 0o755 & 0o077, "the old owner-only predicate would have accepted 0755"
         effects = MemoryCustody(evidence_mode=0o755)
-        custody = ImageCustody("cap", effects)
+        custody = ImageCustody("OxMem1", effects)
         custody.allocate("/root/evidence", "/root/scratch")
         assert effects.created == [] and effects.attached == [] and effects.records
         assert effects.records[0] == custody.record
@@ -2851,7 +2998,7 @@ def self_test() -> int:
         ):
             effects = MemoryCustody()
             effects.backing_override = override
-            custody = ImageCustody("cap", effects)
+            custody = ImageCustody("OxMem1", effects)
             custody.allocate("/root/evidence", "/root/scratch")
             try:
                 custody.attach()
@@ -2868,7 +3015,7 @@ def self_test() -> int:
         # writable, inside the evidence directory on its device) attaches, and
         # the one-shot detach outcomes below still hold.
         effects = MemoryCustody(evidence_mode=0o755)
-        custody = ImageCustody("cap", effects)
+        custody = ImageCustody("OxMem1", effects)
         custody.allocate("/root/evidence", "/root/scratch")
         mount = custody.attach()
         assert mount == "/Volumes/OxMem1" and effects.attached and effects.created
@@ -2879,7 +3026,7 @@ def self_test() -> int:
 
         # refused-before-OS-call: unclosed sessions keep the backing, no replay
         effects = MemoryCustody()
-        custody = ImageCustody("cap", effects)
+        custody = ImageCustody("OxMem1", effects)
         custody.allocate("/root/evidence", "/root/scratch")
         custody.attach()
         assert custody.detach_once(False) == "refused:unclosed-sessions"
@@ -2892,7 +3039,7 @@ def self_test() -> int:
             effects = MemoryCustody()
             effects.detach_result = configured
             effects.leave_mount = configured[0] == 0
-            custody = ImageCustody("cap", effects)
+            custody = ImageCustody("OxMem1", effects)
             custody.allocate("/root/evidence", "/root/scratch")
             custody.attach()
             assert custody.detach_once(True) == "unknown", configured
@@ -2901,13 +3048,13 @@ def self_test() -> int:
 
         # no attachment, no detach; an attach failure keeps the backing
         effects = MemoryCustody()
-        custody = ImageCustody("cap", effects)
+        custody = ImageCustody("OxMem1", effects)
         custody.allocate("/root/evidence", "/root/scratch")
         assert custody.detach_once(True) == "refused:not-attached"
         assert effects.detached == [] and effects.removed == []
         failing = MemoryCustody()
         failing.fail_attach = True
-        broken = ImageCustody("cap", failing)
+        broken = ImageCustody("OxMem1", failing)
         broken.allocate("/root/evidence", "/root/scratch")
         try:
             broken.attach()
@@ -2924,7 +3071,12 @@ def self_test() -> int:
         assert "0o022" in seam and "0o077" not in seam, seam
         assert "the owned root" in seam and "scratch root" in seam, seam
         attach_source = inspect.getsource(ImageCustody.attach)
-        assert attach_source.index("self.verify_backing()") < attach_source.index("self.effects.attach(")
+        assert attach_source.index("self.verify_backing()") < attach_source.index("self.effects.attach_raw(")
+        # The raw platform document is retained BEFORE it is parsed, so a parse
+        # refusal keeps exactly what was returned.
+        assert attach_source.index("self.effects.retain_attach_document(") < attach_source.index(
+            "parse_attach_entities("
+        )
         backing_source = inspect.getsource(ImageCustody.verify_backing)
         assert "S_ISREG" in backing_source and "S_ISLNK" in backing_source and "0o022" in backing_source
         run_source = inspect.getsource(run)
@@ -2934,6 +3086,126 @@ def self_test() -> int:
         assert "proof.detach()" not in run_source and "cleanup_after_failure" not in main_source
 
     check("image custody", image_custody)
+
+    def attach_entities() -> None:
+        def document(entity_list) -> bytes:
+            return plistlib.dumps({"system-entities": entity_list})
+
+        four = [
+            {"dev-entry": "/dev/disk8", "content-hint": "GUID_partition_scheme"},
+            {"dev-entry": "/dev/disk8s1", "content-hint": "7C3457EF-0000-11AA-AA11"},
+            {"dev-entry": "/dev/disk9", "content-hint": "EF57347C-0000-11AA-AA11"},
+            {
+                "dev-entry": "/dev/disk9s1",
+                "mount-point": "/Volumes/OxReal1",
+                "content-hint": "41504653-0000-11AA-AA11",
+                "potentially-mountable": True,
+            },
+        ]
+        # (a) The real four-entity APFS topology for ONE image parses, selects
+        # the mounted entity's device and retains every entity. Counterfactual:
+        # the old "exactly one device entry" rule fails this same fixture.
+        facts = parse_attach_entities(document(four), "/Volumes/OxReal1")
+        assert facts["mount"] == "/Volumes/OxReal1" and facts["device"] == "/dev/disk9s1"
+        assert facts["device_entries"] == ["/dev/disk8", "/dev/disk8s1", "/dev/disk9", "/dev/disk9s1"]
+        assert len(facts["entities"]) == 4 and facts["entities"][-1]["mount_point"] == "/Volumes/OxReal1"
+        assert len(facts["device_entries"]) != 1, "the old single-device rule would have accepted a real attach"
+        # The info -plist shape (one image nesting the same entities) parses too.
+        nested = plistlib.dumps({"images": [{"system-entities": four}]})
+        assert parse_attach_entities(nested, "/Volumes/OxReal1")["device"] == "/dev/disk9s1"
+
+        # (b) Every refusal below leaves attachment UNKNOWN; the caller keeps the
+        # backing and the raw document (asserted through the real seam in (c)).
+        def refuses(document_bytes, expected: str, label: str) -> None:
+            try:
+                parse_attach_entities(document_bytes, expected)
+            except RuntimeError as error:
+                assert "attachment is unknown" in str(error), (label, error)
+            else:
+                raise AssertionError(f"{label}: an unclassifiable attach parsed as attached")
+
+        refuses(document([]), "/Volumes/OxReal1", "no entities")
+        refuses(
+            document([{"dev-entry": "/dev/disk8", "content-hint": "GUID_partition_scheme"}]),
+            "/Volumes/OxReal1",
+            "no mounted entity",
+        )
+        refuses(
+            document([{"mount-point": "/Volumes/OxReal1"}]),
+            "/Volumes/OxReal1",
+            "mounted entity without its device",
+        )
+        refuses(
+            document(four + [{"dev-entry": "/dev/disk10s1", "mount-point": "/Volumes/Other"}]),
+            "/Volumes/OxReal1",
+            "two mounted entities",
+        )
+        refuses(document(four), "/Volumes/OxExpected", "unexpected mount")
+        refuses(b"{not a plist", "/Volumes/OxReal1", "malformed document")
+        refuses(plistlib.dumps({"system-entities": "nope"}), "/Volumes/OxReal1", "malformed entities")
+        refuses(plistlib.dumps({"images": []}), "/Volumes/OxReal1", "no image")
+        refuses(plistlib.dumps({"images": [{}, {}]}), "/Volumes/OxReal1", "several images")
+        refuses(b"x" * (MAX_ATTACH_PLIST_BYTES + 1), "/Volumes/OxReal1", "oversized document")
+
+        # (c) The real seam keeps the raw returned document and records UNKNOWN
+        # on a parse refusal, with nothing detached and the backing kept.
+        class UnsafeAttach(CustodyEffects):
+            def __init__(self, raw: bytes):
+                self.raw = raw
+                self.attached: list[str] = []
+                self.records: list[str] = []
+                self.retained: list[str] = []
+
+            def realpath(self, path: str) -> str:
+                return path
+
+            def stat(self, path: str):
+                if path.endswith(".sparseimage"):
+                    mode, ino, size = stat.S_IFREG | 0o644, 2, 1
+                else:
+                    modes = {"/root/evidence": 0o755, "/root/scratch": 0o755, "/root": 0o700}
+                    if path not in modes:
+                        raise FileNotFoundError(path)
+                    mode, ino, size = stat.S_IFDIR | modes[path], 1, 0
+                return type(
+                    "Facts",
+                    (),
+                    {"st_mode": mode, "st_uid": 501, "st_dev": 1, "st_ino": ino, "st_size": size},
+                )()
+
+            def exists(self, path: str) -> bool:
+                return path in ("/root/evidence", "/root/scratch", "/root")
+
+            def write_record(self, path: str, text: str) -> None:
+                self.records.append(path)
+
+            def create_image(self, path: str, name: str) -> None:
+                pass
+
+            def attach_raw(self, path: str) -> bytes:
+                self.attached.append(path)
+                return self.raw
+
+            def retain_attach_document(self, path: str, document: bytes) -> None:
+                self.retained.append(path)
+
+        mismatched = [dict(entity) for entity in four]
+        mismatched[-1]["mount-point"] = "/Volumes/Other"
+        effects = UnsafeAttach(document(mismatched))
+        custody = ImageCustody("OxReal1", effects)
+        custody.allocate("/root/evidence", "/root/scratch")
+        try:
+            custody.attach()
+        except Aborted:
+            pass
+        else:
+            raise AssertionError("an unexpected mount was reported as attached")
+        assert effects.retained, "the raw attach document was not retained before parsing"
+        assert custody.state == "unknown"
+        assert custody.detach_once(True) == "refused:not-attached"
+        assert any("expected owned" in note for note in custody.notes), custody.notes
+
+    check("attach entity parsing", attach_entities)
 
     def success_path_names() -> None:
         # The clean-finish summaries and the failure record must only read
