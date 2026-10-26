@@ -359,6 +359,23 @@ def reattach_after_case(*, completed: bool, reattach, reason: str) -> str:
     return "ordinary re-attach after the completed case"
 
 
+def restore_after_case(*, completed: bool, restore) -> str:
+    """Restore a fixture's pool state ONLY when its case COMPLETED.
+
+    Mirrors `reattach_after_case`. A restoration issued after an abort (or any
+    failure) is a command against a pool whose writer or device custody is
+    unknown: it mutates the shared fixture and can replace the first fault with
+    its own. So a case that did not complete retains the fixture's state exactly
+    as it is — the collection aborts and the receipt names the retention — and
+    only a completed case runs `restore()`. A restore failure is its own fault
+    and cannot mask an earlier one, because on this path there is none.
+    """
+    if not completed:
+        return "retained fixture state: the case did not complete"
+    restore()
+    return "fixture state restored after the completed case"
+
+
 def require_confirmed_closure(label: str, stderr) -> None:
     """Abort when Oxide explicitly reports UNCONFIRMED writer custody.
 
@@ -2689,7 +2706,7 @@ EXEC_CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("22", (), "an external subcommand in a profile checkout whose receipt records a real member (detach, content, re-adopt) prints that one bounded unplaced-member notice naming only the receipt's member, beside the separate tool-directories notice for its own directory"),
     ("23", (), "the same external subcommand is unchanged in a whole-target checkout (link and receipt bytes), and a foreign member link still refuses before the tool runs"),
     ("24", (), "a whole-target checkout whose root is gone plans a FUTURE root, and the external subcommand reserves that root's keyed nonce first and binds the local fallback instead of refusing with no nonce"),
-    ("25", (), "the tool-directory notice appears only on the receipt-derived profile layout: a never-converted real target and an ephemeral real target run the external subcommand, write their own directory locally, and print no tool-directories notice"),
+    ("25", (), "the tool-directory notice appears only on the receipt-derived profile layout: a never-converted real target and an ephemeral real target run the external subcommand, write their own directory locally, and print no tool-directories notice; the ephemeral drive mode is restored only after the child and every oracle completed, and a fault retains the fixture state and the first abort"),
 ]
 
 
@@ -4193,6 +4210,89 @@ def exec_self_test() -> None:
         f"{retained_collection.detached}",
     )
     shutil.rmtree(retained_tail.root, ignore_errors=True)
+
+    # 7i. Case 25's fixture-mode restoration (oxide#164 review): the ephemeral
+    #     drive mode may be restored ONLY after the external child and every
+    #     oracle completed. A fault retains the fixture's state and propagates as
+    #     the FIRST fault; a restoration failure on the clean path is its own
+    #     fault and cannot mask an earlier one, because there is none.
+    restored: list[str] = []
+
+    def restore_ok() -> None:
+        restored.append("restore")
+
+    expect(
+        restore_after_case(completed=False, restore=restore_ok)
+        == "retained fixture state: the case did not complete",
+        "an incomplete case restored the fixture state",
+    )
+    expect(restored == [], f"an incomplete case restored the fixture state: {restored}")
+
+    restored.clear()
+    expect(
+        restore_after_case(completed=True, restore=restore_ok)
+        == "fixture state restored after the completed case",
+        "a completed case did not restore the fixture state",
+    )
+    expect(restored == ["restore"], f"a completed case did not restore once: {restored}")
+
+    # The shape case 25 uses: the body runs to completion, then the restoration.
+    # A body fault propagates unchanged and the restoration is never attempted.
+    def run_case_then_restore(body, restore) -> None:
+        body()
+        restore_after_case(completed=True, restore=restore)
+
+    restored.clear()
+    first = ProofAbort("unknown writer custody during the ephemeral case")
+    try:
+        run_case_then_restore(
+            lambda: (_ for _ in ()).throw(first), restore_ok
+        )
+        raise AssertionError("an aborting case did not propagate its fault")
+    except ProofAbort as fault:
+        expect(fault is first, f"the first abort was replaced: {fault!r}")
+    expect(
+        restored == [],
+        f"a pool command ran after an abort: {restored}",
+    )
+
+    # A restoration failure is reported as its own fault (nothing earlier exists
+    # on that path), never hidden.
+    class RestoreFault(RuntimeError):
+        pass
+
+    restore_fault = RestoreFault("set-mode failed")
+    try:
+        run_case_then_restore(
+            lambda: restored.append("body"),
+            lambda: (_ for _ in ()).throw(restore_fault),
+        )
+        raise AssertionError("a failing restoration was swallowed")
+    except RestoreFault as fault:
+        expect(fault is restore_fault, f"the restore fault changed: {fault!r}")
+    expect(restored == ["body"], f"the body did not complete before the restore: {restored}")
+
+    # Case 25 has no `finally` and restores only after its oracles: AST-checked so
+    # a reintroduced recovery restore fails the pure check.
+    case_25_node = next(
+        node
+        for node in _ast.walk(_ast.parse(module_source))
+        if isinstance(node, _ast.FunctionDef) and node.name == "case_25"
+    )
+    expect(
+        not [
+            node
+            for node in _ast.walk(case_25_node)
+            if isinstance(node, _ast.Try) and node.finalbody
+        ],
+        "case 25 regained a try/finally that can restore the pool after an abort",
+    )
+    case_25_source = _ast.get_source_segment(module_source, case_25_node) or ""
+    expect(
+        case_25_source.index('set_mode(proof, "permanent"')
+        > case_25_source.index('unchanged_layout(ephemeral, "25 ephemeral"'),
+        "case 25 restores the drive mode before its ephemeral oracles held",
+    )
 
     # 9. The receipt document itself: `qualified: false`, counted outcomes,
     #    a skipped case never counted as completed, and the limitation stated.
@@ -5958,12 +6058,15 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         unchanged_layout(unconverted, "25 unconverted", real_target_first=True)
 
         # b) Ephemeral drive mode: the command's own build creates a real target.
+        # The mode is restored ONLY after the external child and every oracle
+        # above completed: a `finally` would issue a pool command while writer or
+        # device custody is unknown and could mask the first abort.
         set_mode(proof, "ephemeral", maker)
-        try:
-            ephemeral = fresh_checkout(proof, root, "external-ephemeral")
-            unchanged_layout(ephemeral, "25 ephemeral", real_target_first=False)
-        finally:
-            set_mode(proof, "permanent", maker)
+        ephemeral = fresh_checkout(proof, root, "external-ephemeral")
+        unchanged_layout(ephemeral, "25 ephemeral", real_target_first=False)
+        restore_after_case(
+            completed=True, restore=lambda: set_mode(proof, "permanent", maker)
+        )
         phase(proof, "after the unchanged-layout notice controls")
 
     bodies = {

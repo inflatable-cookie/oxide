@@ -361,7 +361,9 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # keyed nonce and binds the first local fallback; 25 keeps a never-converted real
 # target and an ephemeral real target unchanged: the tool-directories notice
 # appears only on the receipt-derived profile layout, so those layouts print
-# exactly their previous stderr.
+# exactly their previous stderr, and the ephemeral drive mode is restored only
+# after the child and every oracle completed (a fault retains the fixture state
+# and the first abort, with no recovery restore).
 # The HIGH premise checklist is traced in the mode's docstring: private
 # HOME/rustup, OXIDE_TEST_HOME_FROM_ENV, the OXIDE_/XDG_/CARGO_*/GIT_ scrub,
 # an explicitly created unconverted control, Cargo's external-subcommand argv
