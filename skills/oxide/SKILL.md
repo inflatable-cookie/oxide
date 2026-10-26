@@ -204,16 +204,20 @@ macOS, and there is no deadline inheritance for nested `oxide` calls.
   `oxide outputs adopt` converts a detached checkout again, but only when its
   `target` is missing or empty; a nonempty real target is refused and kept.
 - A first conversion (`oxide outputs adopt`, or the automatic one on a fresh
-  checkout's first build in permanent mode) publishes the owned
-  `<workspace>/target` link only when Git ignores that exact non-directory
-  path. A `target/`, `/target/` or `**/target/` rule ignores directories only
-  and refuses; add `/target` (or `target`), not `target/`, to the repository
-  `.gitignore`. A nested workspace needs its exact repository-relative rule,
-  for example `/rust/target`. A tracked `target`, an unignored or negated
-  path, or a Git decision Oxide cannot confirm (no repository, no `git`, a
-  timeout, an error or a bad answer) also refuse, and nothing changes.
-  Already-created links, `detach`, `status`, `plan` and ordinary builds are
-  unaffected.
+  checkout's first build in permanent mode) publishes owned
+  `<workspace>/target/<member>` links only when Git ignores each exact
+  repository-relative path. `/target`, `target`, and the directory-only
+  `target/`, `/target/` or `**/target/` all cover the member links; a nested
+  workspace needs its exact repository-relative spelling, for example
+  `/rust/target`. A tracked member, an unignored or re-included path, or a Git
+  decision Oxide cannot confirm (no repository, no `git`, a timeout, an error
+  or a bad answer) leaves an explicit `oxide outputs adopt` refusing with
+  nothing changed. On the automatic conversion the same answer is
+  ineligibility, not a failure: that build keeps its real local `target/`,
+  stays unconverted and prints one notice, so a throwaway stage outside Git
+  needs no preparation. `oxide init` warns with the rule that covers the
+  member links and never rewrites your `.gitignore`. Already-created links,
+  `detach`, `status`, `plan` and ordinary builds are unaffected.
 - A root whose checkout is gone is never cleaned automatically. Inspect it
   with `oxide outputs prune --dry-run`, which prints a bounded preview and its
   SHA-256 and changes nothing; a real run needs those exact bytes

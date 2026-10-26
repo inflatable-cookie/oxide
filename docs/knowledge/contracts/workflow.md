@@ -1396,7 +1396,7 @@ Tom ruled on 2026-10-25 that every Rust project in `~/Dev/projects` moves fully 
 - **Selectors.** Every ordinary build, check, clippy, test, nextest and format route calls `oxide`. There are no `:cargo` sibling selectors and no per-project escape variables. The one machine-wide escape is Effigy's per-program fallback (effigy#250) in the user config `~/.effigy/config.toml`: `[programs.oxide] fallback = "cargo"`. It is installed with `force = false`, so it acts only when `oxide` is missing from `PATH`; while `oxide` is broken, set `force = true` and set it back afterwards. It runs `cargo` with the exact arguments, so it covers Cargo-shaped commands only, not `oxide exec` or Oxide-only flags. Effigy's built-in test route also honours `EFFIGY_OXIDE_ESCAPE=cargo`. Otherwise, run `cargo` by hand.
 - **CI-aware rule.** When CI or release workflows call the same Effigy selectors and the runners lack `oxide`, the selector runs `cargo` under `GITHUB_ACTIONS=true` and `oxide` otherwise. Locally, a missing `oxide` fails loudly and names the escape; it never falls back silently. Workflow files do not change. Installing `oxide` on runners waits on publication (Q-005).
 - **Tools and private target directories.** A tool that runs Cargo itself (the Tauri CLI, packaging scripts, Python or TypeScript drivers), or a script that chooses its own `--target-dir` or `CARGO_TARGET_DIR`, runs under [`oxide exec`](#oxide-exec-cargo-wrapping-tools). Its inner Cargo keeps its own target directory for final outputs when the tool passes `--target-dir` or sets `CARGO_TARGET_DIR` itself, and its intermediates go to the held slot through the inherited build directory. A `CARGO_TARGET_DIR` set in the environment of the `oxide exec` call itself does not survive: exec exports `<workspace>/target` in its place. Move such a value into the tool's own command (`--target-dir`) or its child environment.
-- **Disposable staged workspaces** (interim, until correction lead `755757db` ships): an automatic first conversion refuses a stage that Git cannot confirm, and the refusal currently fails the command. Create an empty real `target/` in each stage before `oxide exec --manifest-path <stage>/Cargo.toml -- …`. An existing real target is the per-checkout opt-out: no conversion and no Git check. Final outputs stay in the stage, intermediates go to the slot, and no output root is created. Keep stages under the drive's `scratch/<project>/` or `OXIDE_TASK_SCRATCH_ROOT`.
+- **Disposable staged workspaces.** A stage outside Git, or one whose `.gitignore` Git cannot confirm for the member links a first conversion publishes (`target/debug`, `target/release`), is simply an unconverted checkout: the leased command builds into the stage's real local `target/`, intermediates go to the slot, no output root is created and exactly one unconverted notice is printed. No prepared target is needed (oxide#154 removed the interim recipe that pre-created an empty `target/`). An existing real target is still the per-checkout opt-out: it is never adopted, with or without Git. Keep stages under the drive's `scratch/<project>/` or `OXIDE_TASK_SCRATCH_ROOT`.
 - **Named proof exceptions.** Only a proof whose subject is Cargo's own target layout (for example a scanner that reads `target/<profile>/deps`) or that must build without any shared intermediate state may set its own build directory. It runs under `oxide exec`, places that private directory under the drive's `scratch/<project>/` or the proof's `OXIDE_TASK_SCRATCH_ROOT` (never `/var/folders`, `~` or a drive root), removes it afterwards, and is listed by name in the project as an intentional proof exception.
 - **Stays on Cargo:** CI and release workflows (above), container builds inside Linux images without `oxide`, product code that runs Cargo as part of its own behaviour, and test fixtures.
   - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user; #106 moved only the final outputs to `target/debug/`. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
@@ -4073,6 +4073,34 @@ migration and consumer adoption remain separate gates.
   exact repository-relative rule). A committed link, `detach`, `status`,
   `plan` and ordinary builds are unaffected, and no already-created link is
   cleaned up automatically.
+- **Eligibility versus refusal (oxide#154).** The same prerequisite decides
+  *eligibility* for an automatic first conversion, asked for every member link
+  that conversion would publish (`target/debug`, `target/release`; oxide#160),
+  because that is what its creator checks before it creates the real `target`
+  directory. When Git cannot confirm one of them — no repository, no Git, an
+  unignored or negated path, an already-tracked member, a timeout, a command
+  error or malformed output — the leased command is an ordinary unconverted
+  checkout: it builds into the real local `target/`, intermediates stay in the
+  slot, and exactly one unconverted notice is printed. Nothing else happens:
+  no receipt, root, member link, prepared transition or downgrade fence is
+  written, and the check runs before the barrier and the admission lock. A
+  covering rule still converts, and because the published paths are members
+  under the real target directory a directory-only rule such as `target/`
+  genuinely covers them and is accepted. That is ineligibility, not a
+  swallowed failure: explicit `oxide outputs adopt`, the replay of a prepared
+  first conversion and every other conversion path still refuse with the exact
+  fix, a corrupt or unreadable receipt is still an error, and a refusal after
+  partial effects still stops with the prepared receipt and no member link
+  rather than continuing as a local build.
+- **`oxide init` diagnostic (oxide#154).** After its guidance and local-output
+  work, `oxide init` asks the same effect-free probe for the first member link
+  this conversion publishes and, inside a Git work tree, warns with the rule
+  that covers them all (`/target`, or the workspace's repository-relative
+  spelling such as `/rust/target`) when that path is unignored, tracked, or
+  Git cannot answer. A directory-only rule such as `/target/` really does cover
+  the member links, so it is not diagnosed. `oxide init` never edits or
+  rewrites a user's `.gitignore` rule and adds no `target` rule of its own; a
+  covering rule and a checkout outside Git are silent.
 - **Keyed state and the binding mutex.** A command keys its slot with or
   without an owned destination when it starts. If the checkout was converted
   or detached while it waited for admission, binding refuses before Cargo
@@ -4241,7 +4269,13 @@ migration and consumer adoption remain separate gates.
   follows it, and `oxide outputs adopt` converts it again through the
   existing preconditions. To opt a checkout out before its first build, create
   a real empty `<workspace>/target` directory first: it is never adopted, and
-  Oxide never converts an existing real target automatically.
+  Oxide never converts an existing real target automatically. The first
+  conversion's Git ignore prerequisite is part of this rule as *eligibility*
+  (oxide#154): when it cannot be positively established, the command is an
+  ordinary unconverted checkout with a real local target and one notice rather
+  than a failed build — see [#125](#final-outputs-on-the-permanent-drive-oxide117).
+  A new notice-bearing conversion still prints its one `oxide: auto-adopted`
+  line; ineligibility prints no such line and no second notice.
 - **Clean.** Resolves the receipt to the selected real root, requires it to be
   the current owned link and to sit on the volume the receipt names *now*
   (a replaced drive at the same mount point is refused), and applies the
@@ -4752,28 +4786,65 @@ target missing; ephemeral mode; an absent drive; a recorded-UUID fallback);
 crash replay after the sibling point, where a creator at the target is
 refused and kept, and after the prepared point, which rolls back to detached;
 and a committed adoption that survives a failed build. The no-replace publish
-is a macOS unit test in `effigy test rust`. Its fixtures ignore `/target`
-(not `target/`) because a first conversion requires Git to ignore the exact
-non-directory link path. Not a benchmark, real-drive qualification or an
-alias for full QA.
+is a macOS unit test in `effigy test rust`. Its fixtures ignore `/target`,
+which covers the member links a first conversion publishes. Not a benchmark,
+real-drive qualification or an alias for full QA.
 
 **Proof (oxide#125).** `effigy rust:outputs-ignore-safety` runs
 `scripts/test-permanent-outputs.py ignore-safety`, the focused ignore-safety
 mode of the same fixture, as the whole command of the qualified shared
 supervisor (300 s, 512 MiB monitored scratch, ordinary detach) over one owned
 128 MiB scratch image. It covers, for explicit adopt, automatic adoption and
-prepared first-conversion replay: `/target/`, `target/` and `**/target/`
-refusing for missing and real empty targets (a real empty target proving the
-directory-only winning rule is recognised), `/target` and `target` publishing
-an owned link, a nested workspace's `/rust/target` accepted while its slash
-forms refuse, and negated, unignored and tracked paths, no repository, no
-Git on `PATH`, a Git that does not answer in time, a failing Git call and a
-malformed verbose answer all refusing with the target, receipt and drive
-roots unchanged and the non-slash fix named. Accepted publications are
-invisible to `git status` and `git ls-files`, and `detach` still restores a
-real directory. Not a benchmark, real-drive qualification or an alias for
-full QA. The native run is held for owner activation; the guard's rule
-parsing and decisions are unit-tested in `effigy test rust`.
+prepared first-conversion replay, the member links a conversion publishes
+(`target/debug`, `target/release`): `/target/`, `target/`, `**/target/`,
+`/target` and `target` all publish, because a directory-only rule genuinely
+covers a member path inside the real target directory (oxide#160), and a
+nested workspace's `/rust/target/` publishes while an unignored nested
+checkout refuses. A rule that re-includes a member, an unignored path, a
+tracked member, no repository, no Git on `PATH`, a Git that does not answer in
+time, a failing Git call and a malformed verbose answer all refuse with the
+target, receipt and drive roots unchanged (not even the real target directory
+is created). An automatic conversion Git cannot confirm is ineligibility
+rather than a refusal (oxide#154), so those cases assert an unconverted build
+with one notice instead. Accepted publications are invisible to `git status`
+and `git ls-files`, and `detach` still restores a real directory. Not a
+benchmark, real-drive qualification or an alias for full QA. The native run is
+held for owner activation; the guard's rule parsing and decisions are
+unit-tested in `effigy test rust`.
+
+**Proof (oxide#154).** `effigy rust:auto-adopt-ineligible` runs
+`scripts/test-permanent-outputs.py auto-ineligible`, a focused mode of the
+same fixture, as the whole command of the same qualified shared supervisor
+(300 s, 512 MiB monitored scratch, ordinary detach) over one owned 128 MiB
+scratch image attached with ownership enabled, with `--root-parent
+/private/tmp` — the owner-accepted internal-placement exception (decision
+bd357a4c), because the fixture needs a genuine internal directory-budget pool
+that the product correctly refuses on an external volume; the supervisor
+monitors that same root. It proves expected ineligibility leaves the build
+usable: for no repository, no Git on `PATH`, an unignored path, a negated
+rule, an already-tracked member and a Git that does not answer, the leased
+build exits 0 into a real local `target/` whose `debug` member is a real
+directory holding the built binary, prints exactly one unconverted notice and
+no auto-adopted line, and writes no receipt, owned member link, owned root or
+downgrade fence. Explicit adoption over a real empty target still refuses each
+class with the target bytes, receipt and drive roots unchanged; a corrupt
+receipt is still an error that creates no target; an automatic conversion
+stopped after its prepared member receipt keeps that receipt and no member
+link, refuses a replay within a broken rule, and recovers only through the
+documented explicit adopt (which then publishes the committed profile
+layout); an existing real target stays the per-checkout opt-out; and
+`oxide init` names the rule that covers the member links for an unignored or
+tracked path, stays silent for a covering rule (including a directory-only
+one), and leaves every rule byte-exactly as it was. Each case uses its own
+checkout, so one failure never taints another premise. Its `:diagnostic` twin
+is the same fixed guard, mode and limits with `--diagnostic` appended: an
+uncounted keep-going collection that records reached/completed/failed/
+unexecuted cases and the latched first fault in a bounded `qualified=false`
+receipt beside the guard's evidence, continues only into independent cases,
+aborts on an unclosed child or an exhausted deadline, and makes one ordinary
+detach of the run's owned image with the mount's absence recorded before that
+receipt. Each native run needs its own owner activation. Not a benchmark,
+real-drive qualification or an alias for full QA.
 
 **Proof (oxide#124).** `effigy rust:outputs-detach-permanent` runs
 `scripts/test-permanent-outputs.py detach-permanent`, the focused mode of the
