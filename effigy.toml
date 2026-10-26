@@ -372,10 +372,22 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # with the same 300 s limit and the same ordinary detach. It is not a limit
 # change or a different scratch location.
 # `rust:exec-output-inference:diagnostic` appends `--diagnostic`: the same
-# bounded guard, uncounted, aborting at the first fault and writing a bounded
-# `qualified: false` receipt (it has no keep-going collection). Each run needs
-# its own owner activation, and only a counted run at the exact merge head can
+# bounded guard and the same cases, uncounted, run keep-going. Every declared
+# case is recorded as completed, failed, skipped because a dependency did not
+# complete, aborted or unexecuted; a recoverable case-oracle failure is recorded
+# and the cases that do not depend on it still run, while an unknown outcome, a
+# lost resource or writer custody (an unclosed child, a lost mount or drive
+# registration) or an exhausted guard deadline aborts and leaves the rest
+# unexecuted. Its bounded `qualified: false` receipt is written in every
+# outcome, and a skipped or unexecuted case is never a pass. Each run needs its
+# own owner activation, and only a counted run at the exact merge head can
 # pass. Not a benchmark, real-drive qualification or an alias for full QA.
+#
+# `proof:exec-inference:test` is the pure apparatus check of that collection:
+# the real case table, collector and receipt builder with fake bodies and seams.
+# It stages nothing, starts no child and touches no scratch, image, pool or
+# supervisor, so a dispatch, dependency-skip, keep-going, abort-latch or receipt
+# regression costs no native activation.
 [tasks."rust:exec-output-inference"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference"
@@ -383,6 +395,9 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 [tasks."rust:exec-output-inference:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference --diagnostic"
+
+[tasks."proof:exec-inference:test"]
+run = "python3 scripts/test-permanent-outputs.py exec-inference --self-test"
 
 # Automatic-adoption ineligibility (oxide#154): the focused `auto-ineligible`
 # mode of the #117 fixture under the same qualified shared supervisor (300 s,

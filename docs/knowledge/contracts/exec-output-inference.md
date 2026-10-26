@@ -580,7 +580,10 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
 
 - **Selector:** `effigy rust:exec-output-inference` (heavy admission), plus an
   uncounted twin `effigy rust:exec-output-inference:diagnostic` appending
-  `--diagnostic`.
+  `--diagnostic` and a pure apparatus check `effigy proof:exec-inference:test`
+  (`--self-test`: the real case table, collector and receipt builder with fake
+  bodies and seams; it stages nothing, starts no child and touches no scratch,
+  image, pool or supervisor).
 - **Tier:** ELEVATED (member binding in the external-root path; the fixture
   writes to a modelled removable volume). Author native and a distinct
   independent reviewer native, each separately activated.
@@ -602,7 +605,27 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   fixtures 48 MiB + evidence 32 MiB + margin 16 MiB = 512 MiB; 4 Cargo jobs for
   the single staging, 1 per fixture child, sequential, at most one Cargo child
   at a time → peak 4 concurrent Cargo jobs; planning demand 4 CPU / 6 GiB.
-- **Cases (fixed table, fail-fast; `--plan` prints it effect-free):**
+- **Cases (fixed table; `--plan` prints it effect-free):** the counted run is
+  fail-fast, and the uncounted diagnostic runs the same table keep-going
+  (oxide#165's apparatus correction). Each case declares the cases it depends
+  on: a case whose dependency did not complete is recorded `skipped` with those
+  ids and never runs, so a failed case cannot taint an independent one's
+  premise; a recoverable case-oracle failure is recorded and collection
+  continues; an unknown outcome or unexpected exception, a lost resource or
+  writer custody (an unclosed child, a lost mount or drive registration), a
+  monitored-resource checkpoint over the 512 MiB scratch budget or under the
+  20 GiB host reserve, or an exhausted guard deadline aborts and records every
+  remaining case `unexecuted`. Custody and the run's own resource samples are
+  checked after every case, including one whose own oracle failed, because such
+  a case can leave a writer, a lost mount or an over-budget footprint behind and
+  no later case may run against that; the phase checkpoint's own limit failure
+  is raised as an abort rather than a recoverable oracle failure. Every case
+  already reached and every failure already recorded keeps its place in the
+  receipt even when the run is cancelled — the interrupted case is recorded
+  `aborted`, never `unexecuted` — and a receipt that cannot be written ends the
+  diagnostic instead of reporting success. The receipt is written in every
+  outcome, carries one row per declared case and is `qualified: false`; a
+  skipped or unexecuted case is never a pass.
   01 conversion via explicit adopt (host pair linked), asserted committed;
   02 `exec` with no `--output` runs a tiny fixture tool that calls the real
   `cargo build` → exit 0, `target/debug` still a link, the binary present under
@@ -648,6 +671,13 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   creation timestamp is preserved, the old output still visible through the
   migrated member link, and a following `build` and `exec` succeeding without
   relinking or rewriting the upgraded receipt.
+  20 a converted checkout's whole `target` directory deleted (oxide#165): the
+  next leased build recreates that real directory exclusively and republishes
+  the member it places through the unchanged per-member transition into the
+  SAME root, whose payload is intact and whose committed placement (root and
+  nonce) the receipt still records, and a derived `exec` after it places the
+  whole owned pair there; before the fix every leased command failed with
+  ENOENT while creating the transition link inside the absent directory.
 - **Oracles** are positive-path plus a control that must fail: cases 02/03 and
   case 10 differ only in the link's destination, so case 02's oracles fail if
   the classification is removed; no case is satisfied by "no output".
@@ -676,9 +706,12 @@ script, to be traced through the executable case bodies (not this prose):
 
 1. source + unit/regression coverage, `effigy rust:compile`,
    `effigy rust:format`, `effigy test rust`, `effigy docs:check`;
-2. one **uncounted** `rust:exec-output-inference:diagnostic` under the qualified
-   guard, its bounded `qualified: false` receipt kept, dependency/taint skips
-   recorded honestly;
+2. one **uncounted**, clean `rust:exec-output-inference:diagnostic` under the
+   qualified guard: keep-going, every declared case recorded (`completed`,
+   `failed`, `skipped` with its failed dependency, `aborted` or `unexecuted`),
+   its bounded `qualified: false` receipt kept and dependency/taint skips
+   recorded honestly. The pure `proof:exec-inference:test` apparatus check runs
+   before the activation;
 3. counted author native (fresh activation), then a distinct independent
    reviewer native (fresh activation);
 4. independent exact-head source/fit review of the published head.

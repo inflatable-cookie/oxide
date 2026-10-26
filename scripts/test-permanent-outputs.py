@@ -2541,28 +2541,33 @@ def owners_honored(proof: Proof, mount: str, label: str) -> None:
     )
 
 
-# The fixed exec-inference case table. `--plan` prints exactly this and touches
-# nothing; `exec_run` executes the same labels in this order.
-EXEC_CASES = [
-    ("s4b", "a fresh eligible checkout's first leased build creates the profile layout, an exec with no --output places its output in the root, and an existing whole-target fixture (case 09) stays whole-target"),
-    ("01", "explicit adoption publishes the same profile layout"),
-    ("02", "exec without --output runs a tool that builds through the owned pair"),
-    ("03", "a repeat reuses the same warm slot and relinks nothing"),
-    ("04", "the tool's release build is placed under the same root"),
-    ("05", "the declared --output override reaches the same keyed slot and placement"),
-    ("06", "a member the receipt does not place stays real and local"),
-    ("07+14", "exec on a detached checkout runs locally; detach restored real empty members and kept the root"),
-    ("08", "an ineligible (empty-target) checkout is never converted"),
-    ("09", "an existing whole-target checkout stays whole-target through a build and an exec"),
-    ("16", "a whole-target root holding only debug migrates so both member directories exist before any release build, and a derived exec runs"),
-    ("17", "an exec with no --output repairs a release member link an older migration left dangling, and its release build lands in the root"),
-    ("18", "a link into an unverified root still refuses and creates nothing"),
-    ("10", "a foreign member link refuses before Cargo and changes nothing"),
-    ("11", "a receipt changed while the command waits refuses"),
-    ("12", "root drift refuses and names the explicit adoption"),
-    ("13", "a checkout path containing a space converts and runs end to end"),
-    ("15", "Ctrl-C reaches the tool group, the lease holds until the group closes, then releases"),
-    ("19", "a committed version-1 whole-target receipt makes every failing reader refuse naming adopt (recorded status reads nothing; --measure reports outputs unknown naming adopt), an explicit adopt upgrades it through the shipped migration with the old outputs intact, and a noncommitted version-1 control keeps its bytes"),
+# The fixed exec-inference case table: `(case, dependencies, description)`.
+# `--plan` prints exactly this and touches nothing. `exec_run` binds one body
+# to each case id and runs them in this order; the dependencies decide what a
+# keep-going diagnostic must skip, so a case whose dependency did not complete
+# is recorded `skipped` and never runs against a premise its dependency was
+# supposed to establish (oxide#165's apparatus correction).
+EXEC_CASES: list[tuple[str, tuple[str, ...], str]] = [
+    ("s4b", (), "a fresh eligible checkout's first leased build creates the profile layout, an exec with no --output places its output in the root, and an existing whole-target fixture (case 09) stays whole-target"),
+    ("01", (), "explicit adoption publishes the same profile layout"),
+    ("02", ("01",), "exec without --output runs a tool that builds through the owned pair"),
+    ("03", ("02",), "a repeat reuses the same warm slot and relinks nothing"),
+    ("04", ("01",), "the tool's release build is placed under the same root"),
+    ("05", ("02",), "the declared --output override reaches the same keyed slot and placement"),
+    ("06", ("01",), "a member the receipt does not place stays real and local"),
+    ("07+14", ("01",), "exec on a detached checkout runs locally; detach restored real empty members and kept the root"),
+    ("08", (), "an ineligible (empty-target) checkout is never converted"),
+    ("09", (), "an existing whole-target checkout stays whole-target through a build and an exec"),
+    ("16", ("09",), "a whole-target root holding only debug migrates so both member directories exist before any release build, and a derived exec runs"),
+    ("17", ("16",), "an exec with no --output repairs a release member link an older migration left dangling, and its release build lands in the root"),
+    ("18", ("17",), "a link into an unverified root still refuses and creates nothing"),
+    ("13", (), "a checkout path containing a space converts and runs end to end"),
+    ("10", (), "a foreign member link refuses before Cargo and changes nothing"),
+    ("12", (), "root drift refuses and names the explicit adoption"),
+    ("11", (), "a receipt changed while the command waits refuses"),
+    ("15", (), "Ctrl-C reaches the tool group, the lease holds until the group closes, then releases"),
+    ("19", (), "a committed version-1 whole-target receipt makes every failing reader refuse naming adopt (recorded status reads nothing; --measure reports outputs unknown naming adopt), an explicit adopt upgrades it through the shipped migration with the old outputs intact, and a noncommitted version-1 control keeps its bytes"),
+    ("20", (), "a converted checkout whose target directory was deleted recreates it: the next leased build exits 0 with its own member link back inside the same root and the root's old outputs intact, a derived exec then places the whole pair there, and the receipt still names that root"),
 ]
 
 
@@ -2582,9 +2587,10 @@ def plan_exec_inference() -> None:
     print("        as the operating pool afterwards")
     print("fixture work, sequential, one Cargo child at a time: 4 Cargo jobs for the single")
     print("        staging and 1 per fixture child; planning demand 4 CPU / 6 GiB")
-    print("cases (fail-fast, in this order):")
-    for label, text in EXEC_CASES:
-        print(f"  {label}: {text}")
+    print("cases (counted fail-fast; the diagnostic records each one, in this order):")
+    for case, requires, text in EXEC_CASES:
+        depends = f" [depends on {', '.join(requires)}]" if requires else ""
+        print(f"  {case}: {text}{depends}")
     print("nothing was created, mounted, spawned or written")
 
 
@@ -2594,36 +2600,892 @@ PHASES: list[str] = []
 
 
 def phase(proof: Proof, label: str) -> None:
+    """Sample one phase checkpoint and record its label.
+
+    The shared `Proof.phase` reads the run's monitored resources and fails when
+    the host reserve is gone or the owned scratch is over its budget. That is a
+    resource failure of the RUN, never a case-oracle failure, so it is raised as
+    a `ProofAbort` here: a keep-going collection must stop, not spend another
+    case on a host or scratch state the supervisor would refuse.
+    """
     PHASES.append(label)
-    proof.phase(label)
+    try:
+        proof.phase(label)
+    except ProofAbort:
+        raise
+    except RuntimeError as fault:
+        raise ProofAbort(f"a monitored resource checkpoint failed at {label}: {fault}") from fault
 
 
-def write_diagnostic(proof: Proof, label: str, fault: str | None) -> str:
-    """The uncounted diagnostic's bounded receipt: `qualified: false`, the
-    phases reached and the first fault. It claims no closure and no PASS."""
-    receipt = {
+class ProofAbort(RuntimeError):
+    """An outcome a keep-going collection must not continue past: an unknown
+    result, a lost resource or writer custody, a tainted shared fixture, or an
+    exhausted guard deadline. A recoverable case-oracle failure is the ordinary
+    `RuntimeError` an `expect` raises, which does not stop the collection."""
+
+
+class IneligibleAbort(ProofAbort):
+    """The auto-ineligible mode's historical name for the abort class above."""
+
+
+# The work margin a collection keeps before it will start another case.
+CASE_RESERVE_S = 5.0
+
+
+class Collection:
+    """The bounded record of one exec-inference run: one outcome row per case,
+    the recoverable failures, the latched abort and the detach disposition.
+
+    It is filled IN PLACE, so a fault that ends the run early — a cancellation,
+    an interrupt, a fault that escapes the classification — still leaves every
+    case already reached and every failure already recorded for the receipt.
+    """
+
+    def __init__(self) -> None:
+        self.outcomes: dict[str, dict] = {}
+        self.failures: list[dict] = []
+        self.aborted: str | None = None
+        self.detached = "not attempted (the collection did not reach the detach decision)"
+        self.mount_present: bool | None = None
+        self.source: str | None = None
+
+
+def require_case_custody(*, unclosed, mount: str, registration: str, case: str) -> None:
+    """The shared post-case custody check of a keep-going collection.
+
+    An unclosed child still holds the lease, a lost mount is a lost resource and
+    a vanished drive registration is lost custody: each is a `ProofAbort`, never
+    a recoverable case-oracle failure, because no later case may be trusted
+    after it. Read-only; it creates nothing.
+    """
+    if unclosed:
+        raise ProofAbort(f"unclosed children after {case}: {sorted(unclosed)}")
+    if not os.path.ismount(mount):
+        raise ProofAbort(f"the owned image is no longer mounted at {mount} after {case}")
+    if not os.path.exists(registration):
+        raise ProofAbort(f"the drive registration is gone after {case}")
+
+
+def require_case_resources(*, peak_bytes: int, low_bytes: int | None, case: str) -> None:
+    """The run's own phase samples are checkpoints of its monitored resources.
+
+    The limits are the shared runner's own constants: owned scratch over the
+    512 MiB budget, or host free space below the 20 GiB reserve, is a resource
+    failure of the RUN — an abort, never a recoverable case-oracle failure — so
+    no later case may run against it. Read-only; it creates nothing.
+    """
+    limit = layout.runner.SCRATCH_LIMIT_BYTES
+    reserve = layout.runner.HOST_RESERVE_BYTES
+    if peak_bytes > limit:
+        raise ProofAbort(
+            f"owned scratch {peak_bytes // MIB} MiB exceeds the {limit // MIB} MiB budget after {case}"
+        )
+    if low_bytes is not None and low_bytes < reserve:
+        raise ProofAbort(
+            f"host free {low_bytes // MIB} MiB is below the {reserve // MIB} MiB reserve after {case}"
+        )
+
+
+def collect_cases(
+    cases, *, diagnostic: bool, work_left, after_case=None, note=None, record=None
+):
+    """Run one case table, recording every case's outcome (oxide#165).
+
+    `cases` is the ordered `(case, dependencies, body)` list the proof declares.
+    The counted run is fail-fast: the first fault propagates unchanged, exactly
+    as the proof's counted contract requires. `diagnostic` mode keeps going: a
+    recoverable case-oracle failure is recorded as `failed` and every case whose
+    dependencies all completed still runs; a case with an incomplete dependency
+    is recorded `skipped` with those ids and never runs; a `ProofAbort` (an
+    unknown outcome, a lost resource or custody, a failed resource checkpoint, a
+    tainted shared fixture) and any other unexpected exception are recorded as
+    `aborted` and every remaining case is `unexecuted`, because no later case
+    may be trusted after them. An exhausted guard deadline aborts the same way
+    in either mode.
+
+    `after_case` is the run's shared post-case seam: writer and device custody
+    plus the run's own resource samples. It runs after EVERY case that has not
+    already aborted the collection, including a case whose own oracle failed,
+    because such a case can leave an unclosed child, a lost mount or an
+    over-budget scratch footprint behind.
+
+    `record` is the caller's `Collection` and is filled IN PLACE, so a fault that
+    ends the run early (a cancellation, an interrupt, anything that escapes the
+    classification) still leaves every case already reached and every failure
+    already recorded in it; a case whose outcome is unknown is rendered
+    `unexecuted` and is never a pass. The case a cancellation interrupted is
+    recorded `aborted` with its fault before the cancellation is re-raised, so an
+    executed case is never misreported as unexecuted. Returns the record.
+    """
+    if note is None:
+        note = lambda text: print(text, flush=True)  # noqa: E731 - the default sink
+    if record is None:
+        record = Collection()
+
+    completed: set[str] = set()
+    for case, requires, body in cases:
+        if record.aborted is not None:
+            record.outcomes[case] = {"result": "unexecuted"}
+            continue
+        missing = [dependency for dependency in requires if dependency not in completed]
+        if missing:
+            note(f"case {case}: skipped (depends on {', '.join(missing)})")
+            record.outcomes[case] = {"result": "skipped", "because": missing}
+            continue
+        if work_left() <= CASE_RESERVE_S:
+            record.aborted = f"{case}: no guard work deadline left before the case started"
+            record.outcomes[case] = {"result": "aborted", "fault": record.aborted[:600]}
+            continue
+        note(f"case {case}")
+        result: dict = {"result": "completed"}
+        try:
+            try:
+                body()
+            except ProofAbort as fault:
+                if not diagnostic:
+                    raise
+                result = {"result": "aborted", "fault": str(fault)[:600]}
+            except RuntimeError as fault:
+                if not diagnostic:
+                    raise
+                if "deadline reached" in str(fault) or work_left() <= CASE_RESERVE_S:
+                    # An exhausted deadline is not a recoverable oracle failure.
+                    result = {"result": "aborted", "fault": str(fault)[:600]}
+                else:
+                    record.failures.append({"case": case, "fault": str(fault)[:600]})
+                    result = {"result": "failed", "fault": str(fault)[:600]}
+            except Exception as fault:
+                # Any other exception is an unknown outcome, never a recoverable
+                # case-oracle failure, so it aborts like the custody seam below.
+                if not diagnostic:
+                    raise
+                result = {"result": "aborted", "fault": f"unexpected {fault!r}"[:600]}
+            # Custody and the run's own resource samples are checked after the
+            # case, whatever its own oracle did.
+            if after_case is not None and result["result"] != "aborted":
+                try:
+                    after_case(case)
+                except ProofAbort as fault:
+                    if not diagnostic:
+                        raise
+                    result = {"result": "aborted", "fault": str(fault)[:600]}
+        except BaseException as fault:
+            # A cancellation (SIGTERM/SIGINT) or any fault that escapes the
+            # classification above ends the run. The case it interrupted is
+            # recorded as `aborted` and everything already recorded stays in the
+            # receipt; the fault itself is re-raised, because the run must still
+            # end the way the supervisor saw it.
+            record.outcomes[case] = {
+                "result": "aborted",
+                "fault": f"ended during the case: {fault!r}"[:600],
+            }
+            record.aborted = f"{case}: ended during the case: {fault!r}"
+            raise
+        record.outcomes[case] = result
+        if result["result"] == "completed":
+            completed.add(case)
+        elif result["result"] == "aborted":
+            record.aborted = f"{case}: {result['fault']}"
+    return record
+
+
+def exec_case_rows(outcomes: dict[str, dict]) -> list[dict]:
+    """One row per declared case, in table order. A case with no recorded
+    outcome — a collection that never started, or one an abort cut short — is
+    `unexecuted`, which is never a pass."""
+    return [
+        {"case": case, **outcomes.get(case, {"result": "unexecuted"})}
+        for case, _requires, _text in EXEC_CASES
+    ]
+
+
+def diagnostic_document(
+    *,
+    source: str | None,
+    rows: list[dict],
+    failures: list[dict],
+    aborted: str | None,
+    detached: str,
+    mount_present: bool | None,
+    elapsed_s: float,
+    peak_owned_mib: int,
+    host_free_min_mib: int | None,
+    unclosed: list[str],
+) -> dict:
+    """The uncounted diagnostic's bounded receipt. It is `qualified: false` and
+    never a counted native PASS: it records every declared case's outcome, the
+    recoverable failures, the latched abort (if any) and this run's detach
+    disposition so a later counted run has evidence of what actually ran."""
+    summary = {
+        result: sum(1 for row in rows if row["result"] == result)
+        for result in ("completed", "failed", "skipped", "aborted", "unexecuted")
+    }
+    return {
         "qualified": False,
-        "mode": label,
-        "kind": "uncounted diagnostic: first-fault abort, no keep-going",
+        "mode": "exec-inference",
+        "kind": (
+            "uncounted keep-going collection: independent cases continue after a "
+            "recoverable case-oracle failure"
+        ),
+        "source": source,
+        "cases": rows,
+        "summary": summary,
+        "failures": failures,
+        "aborted": aborted,
         "phases": PHASES,
-        "first_fault": fault,
-        "reached_every_case": fault is None,
+        "observations": {
+            "elapsed_s": elapsed_s,
+            "peak_owned_mib": peak_owned_mib,
+            "host_free_min_mib": host_free_min_mib,
+            "detach": detached,
+            "mount_path_present_after_detach": mount_present,
+            "unclosed_children": unclosed,
+        },
         "limits": {
             "scratch_root": os.environ.get("OXIDE_TASK_SCRATCH_ROOT"),
             "work_deadline_ns": os.environ.get("OXIDE_PROOF_DEADLINE_NS"),
             "supervisor_scratch_budget_mib": 512,
+            "wall_clock_s": 300,
         },
         "limitation": (
-            "This diagnostic aborts at the first fault. It does not keep going "
-            "into dependency-independent cases, so its unchecked cases are "
-            "reported as unexecuted, never as passing, and it is never a "
-            "counted native PASS."
+            "A recoverable case-oracle failure is recorded and the cases that do "
+            "not depend on it still run; a case with a failed dependency is "
+            "skipped, and an abort leaves every remaining case unexecuted. A "
+            "skipped or unexecuted case is never a pass, and this receipt is "
+            "never a counted native PASS."
         ),
     }
-    name = f"{label}-diagnostic.json"
-    with open(os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], name), "w", encoding="utf-8") as handle:
-        json.dump(receipt, handle, indent=2)
+
+
+def finish_diagnostic(proof: Proof, collection: Collection, failure, writer=None) -> None:
+    """Write the bounded receipt of one diagnostic run, in every outcome.
+
+    A diagnostic whose receipt was not written is NOT a completed collection, so
+    a receipt failure ends the run when it is the only fault. When a case fault
+    is already in flight the receipt failure cannot replace it: it is reported
+    and the primary failure is preserved.
+    """
+    write = write_diagnostic if writer is None else writer
+    try:
+        write(proof, collection)
+    except BaseException as receipt_failure:  # noqa: BLE001 - decided below
+        if failure is None:
+            raise
+        print(
+            f"exec-inference diagnostic receipt was not written: {receipt_failure!r} "
+            f"(the primary failure is preserved)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def write_diagnostic(proof: Proof, collection: Collection) -> str:
+    """Write the bounded receipt of one keep-going collection, in every outcome,
+    including an abort or a setup failure before the first case ran."""
+    document = diagnostic_document(
+        source=collection.source,
+        rows=exec_case_rows(collection.outcomes),
+        failures=collection.failures,
+        aborted=collection.aborted,
+        detached=collection.detached,
+        mount_present=collection.mount_present,
+        elapsed_s=round(time.monotonic() - layout.runner.STARTED, 1),
+        peak_owned_mib=proof.peak // MIB,
+        host_free_min_mib=None if proof.low is None else proof.low // MIB,
+        unclosed=sorted(proof.unclosed),
+    )
+    text = json.dumps(document, indent=2, sort_keys=True)[: 64 * 1024]
+    name = "exec-inference-diagnostic.json"
+    handle = open(os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], name), "w", encoding="utf-8")
+    with handle:
+        handle.write(text)
+    print(
+        f"exec-inference diagnostic receipt {os.environ['OXIDE_PROOF_EVIDENCE']}/{name} "
+        f"(qualified=false, {document['summary']})",
+        flush=True,
+    )
     return name
+
+
+def exec_self_test() -> None:
+    """The pure apparatus check of the keep-going collection.
+
+    It drives the real collector, the real case table, the real custody and
+    resource gates and the real receipt document builder with fake bodies and
+    seams: no scratch, child, toolchain, image, pool or supervisor is touched. A
+    dispatch, dependency-skip, keep-going, abort-latch, cancellation,
+    resource-gate or receipt regression is therefore found without spending a
+    native activation on it.
+    """
+    ran: list[str] = []
+
+    def quiet(_text: str) -> None:
+        return None
+
+    def table(*rows):
+        def body(
+            case: str,
+            *,
+            fault: str | None = None,
+            abort: str | None = None,
+            raises: BaseException | None = None,
+        ):
+            def run() -> None:
+                ran.append(case)
+                if abort is not None:
+                    raise ProofAbort(abort)
+                if raises is not None:
+                    raise raises
+                if fault is not None:
+                    raise RuntimeError(fault)
+
+            return run
+
+        return [
+            (case, requires, body(case, **faults)) for case, requires, faults in rows
+        ]
+
+    always = lambda: 300.0  # noqa: E731 - a pure seam, never called for its value
+
+    def collect(cases, *, diagnostic=True, after_case=None, work_left=always):
+        """One collection on a fresh record, the way the run drives it."""
+        record = Collection()
+        collect_cases(
+            cases,
+            diagnostic=diagnostic,
+            work_left=work_left,
+            after_case=after_case,
+            note=quiet,
+            record=record,
+        )
+        return record
+
+    # 1. The counted run is fail-fast: the first fault propagates unchanged and
+    #    no later case runs.
+    ran.clear()
+    try:
+        collect(table(("a", (), {}), ("b", (), {"fault": "oracle b"}), ("c", (), {})), diagnostic=False)
+        raise AssertionError("the counted collection continued past a fault")
+    except RuntimeError as fault:
+        expect("oracle b" in str(fault), f"the counted fault changed: {fault!r}")
+    expect(ran == ["a", "b"], f"the counted collection ran {ran}")
+
+    # 2. Keep-going records the failure, runs the cases that do not depend on it
+    #    and skips the dependents (transitively) with the failed ids.
+    ran.clear()
+    record = collect(
+        table(
+            ("a", (), {}),
+            ("b", (), {"fault": "oracle b"}),
+            ("c", ("b",), {}),
+            ("d", (), {}),
+            ("e", ("c",), {}),
+        )
+    )
+    expect(ran == ["a", "b", "d"], f"keep-going ran {ran}")
+    expect(record.outcomes["a"]["result"] == "completed", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "failed", f"{record.outcomes['b']}")
+    expect("oracle b" in record.outcomes["b"]["fault"], f"{record.outcomes['b']}")
+    expect(
+        record.outcomes["c"]["result"] == "skipped"
+        and record.outcomes["c"]["because"] == ["b"],
+        f"{record.outcomes['c']}",
+    )
+    expect(record.outcomes["d"]["result"] == "completed", f"{record.outcomes['d']}")
+    expect(
+        record.outcomes["e"]["result"] == "skipped"
+        and record.outcomes["e"]["because"] == ["c"],
+        f"{record.outcomes['e']}",
+    )
+    expect([failure["case"] for failure in record.failures] == ["b"], f"{record.failures}")
+    expect(record.aborted is None, f"a recoverable failure aborted the collection: {record.aborted}")
+
+    # 3. An unknown outcome aborts: the case is recorded `aborted`, nothing
+    #    later runs, even an independent case, and every remaining case is
+    #    `unexecuted` — never a pass.
+    ran.clear()
+    record = collect(
+        table(("a", (), {"abort": "unknown writer custody"}), ("b", (), {}), ("c", (), {}))
+    )
+    expect(ran == ["a"], f"an aborting collection ran {ran}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+    expect(record.outcomes["c"]["result"] == "unexecuted", f"{record.outcomes['c']}")
+    expect(record.failures == [], f"an abort was recorded as a recoverable failure: {record.failures}")
+    expect(
+        record.aborted is not None and "unknown writer custody" in record.aborted,
+        f"{record.aborted}",
+    )
+
+    # 4. A lost resource or custody after a case (an unclosed child, a lost
+    #    mount) is the abort seam, not a case-oracle failure.
+    ran.clear()
+
+    def lost(case: str) -> None:
+        raise ProofAbort(f"lost custody after {case}")
+
+    record = collect(table(("a", (), {}), ("b", (), {})), after_case=lost)
+    expect(ran == ["a"], f"the lost-custody collection ran {ran}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+    expect(record.aborted is not None and "lost custody" in record.aborted, f"{record.aborted}")
+
+    # 4a. The real post-case custody check aborts on each lost resource and
+    #     accepts a run where all three are present. It is read-only: "/" is an
+    #     existing mount point and an existing path stands in for the
+    #     registration, so nothing is created.
+    for kwargs, expected in (
+        ({"unclosed": {"123"}, "mount": "/", "registration": "/"}, "unclosed children"),
+        ({"unclosed": set(), "mount": "/nonexistent-oxide-165", "registration": "/"}, "no longer mounted"),
+        ({"unclosed": set(), "mount": "/", "registration": "/nonexistent-oxide-165"}, "registration is gone"),
+    ):
+        try:
+            require_case_custody(case="x", **kwargs)
+            raise AssertionError(f"the custody check accepted {kwargs}")
+        except ProofAbort as fault:
+            expect(expected in str(fault), f"the custody abort changed: {fault}")
+    require_case_custody(unclosed=set(), mount="/", registration="/", case="x")
+
+    # 4b. The custody seam runs after a case whose own oracle FAILED, and it is
+    #     still an abort: a failed case can leave an unclosed child or a lost
+    #     mount behind, and no later case may run against that. Its recoverable
+    #     oracle failure stays in `failures`.
+    ran.clear()
+    custody_seen: list[str] = []
+
+    def custody_after_failure(case: str) -> None:
+        custody_seen.append(case)
+        if case == "b":
+            raise ProofAbort("unclosed child after the failed case")
+
+    record = collect(
+        table(("a", (), {}), ("b", (), {"fault": "oracle b"}), ("c", (), {}), ("d", (), {})),
+        after_case=custody_after_failure,
+    )
+    expect(
+        custody_seen == ["a", "b"],
+        f"the custody seam did not run after the failed case: {custody_seen}",
+    )
+    expect(ran == ["a", "b"], f"a case ran after the failed case's custody check: {ran}")
+    expect(record.outcomes["b"]["result"] == "aborted", f"{record.outcomes['b']}")
+    expect("unclosed child" in record.outcomes["b"]["fault"], f"{record.outcomes['b']}")
+    expect(
+        [failure["case"] for failure in record.failures] == ["b"],
+        f"the failed case's oracle failure was lost: {record.failures}",
+    )
+    expect(
+        record.outcomes["c"]["result"] == "unexecuted"
+        and record.outcomes["d"]["result"] == "unexecuted",
+        f"{record.outcomes['c']} {record.outcomes['d']}",
+    )
+    expect(record.aborted is not None and "unclosed child" in record.aborted, f"{record.aborted}")
+
+    # 4c. An unexpected exception is an unknown outcome, not a recoverable
+    #     oracle failure: it aborts, and every case already reached keeps its
+    #     row.
+    ran.clear()
+    record = collect(
+        table(("a", (), {}), ("b", (), {"raises": KeyError("boom")}), ("c", (), {}))
+    )
+    expect(ran == ["a", "b"], f"an unexpected exception did not abort: {ran}")
+    expect(record.outcomes["a"]["result"] == "completed", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "aborted", f"{record.outcomes['b']}")
+    expect("KeyError" in record.outcomes["b"]["fault"], f"{record.outcomes['b']}")
+    expect(record.outcomes["c"]["result"] == "unexecuted", f"{record.outcomes['c']}")
+    expect(record.failures == [], f"an unexpected exception was recorded as recoverable: {record.failures}")
+    expect(record.aborted is not None and "KeyError" in record.aborted, f"{record.aborted}")
+
+    # 4d. An actual monitored-resource failure aborts: the run's own phase
+    #     samples are checkpoints, so a sample over the 512 MiB scratch budget or
+    #     under the 20 GiB host reserve must stop the collection instead of
+    #     spending another case. Both directions, plus the healthy control.
+    budget = layout.runner.SCRATCH_LIMIT_BYTES
+    reserve = layout.runner.HOST_RESERVE_BYTES
+    require_case_resources(peak_bytes=budget, low_bytes=reserve, case="healthy")
+    for peak, low, expected in (
+        (budget + MIB, reserve, "exceeds the 512 MiB budget"),
+        (MIB, reserve - 1, "is below the 20480 MiB reserve"),
+        (MIB, 0, "is below the 20480 MiB reserve"),
+    ):
+        try:
+            require_case_resources(peak_bytes=peak, low_bytes=low, case="x")
+            raise AssertionError(f"the resource gate accepted peak {peak} low {low}")
+        except ProofAbort as fault:
+            expect(expected in str(fault), f"the resource abort changed: {fault}")
+    ran.clear()
+    samples = {"peak": MIB, "low": reserve}
+
+    def overspent(case: str) -> None:
+        samples["peak"] = budget + MIB
+        require_case_resources(peak_bytes=samples["peak"], low_bytes=samples["low"], case=case)
+
+    record = collect(table(("a", (), {}), ("b", (), {}), ("c", (), {})), after_case=overspent)
+    expect(ran == ["a"], f"the collection continued past an over-budget sample: {ran}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect("512 MiB budget" in record.outcomes["a"]["fault"], f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+
+    # 4e. The phase seam turns the shared runner's resource failure into that
+    #     same abort, so the real `Proof.phase` checkpoints cannot be mistaken
+    #     for recoverable case-oracle failures.
+    class ResourcePhase:
+        def __init__(self, fault: str | None) -> None:
+            self.fault = fault
+
+        def phase(self, _label: str) -> None:
+            if self.fault is not None:
+                raise RuntimeError(self.fault)
+
+    before = len(PHASES)
+    phase(ResourcePhase(None), "healthy checkpoint")
+    expect(len(PHASES) == before + 1, "the phase seam recorded no label")
+    try:
+        phase(
+            ResourcePhase("host free 0 MiB is below the 20 GiB reserve at case 20"),
+            "unhealthy checkpoint",
+        )
+        raise AssertionError("the phase seam passed a resource failure through")
+    except ProofAbort as fault:
+        expect("monitored resource checkpoint failed" in str(fault), f"{fault}")
+    del PHASES[before:]
+
+    # 4f. A cancellation records the case it interrupted as `aborted` (an
+    #     executed case is never misreported as unexecuted) and keeps every
+    #     outcome and failure already recorded, while still ending the run.
+    ran.clear()
+    record = Collection()
+    try:
+        collect_cases(
+            table(
+                ("a", (), {"fault": "oracle a"}),
+                ("b", (), {"raises": KeyboardInterrupt()}),
+                ("c", (), {}),
+            ),
+            diagnostic=True,
+            work_left=always,
+            note=quiet,
+            record=record,
+        )
+        raise AssertionError("a cancellation did not end the collection")
+    except KeyboardInterrupt:
+        pass
+    expect(record.outcomes["a"]["result"] == "failed", f"{record.outcomes.get('a')}")
+    expect(
+        [failure["case"] for failure in record.failures] == ["a"],
+        f"the accumulated failure history was lost: {record.failures}",
+    )
+    expect(record.outcomes["b"]["result"] == "aborted", f"{record.outcomes.get('b')}")
+    expect("KeyboardInterrupt" in record.outcomes["b"]["fault"], f"{record.outcomes.get('b')}")
+    expect("c" not in record.outcomes, f"an unreached case was recorded: {record.outcomes}")
+    expect(record.aborted is not None and "KeyboardInterrupt" in record.aborted, f"{record.aborted}")
+
+    # 4g. A diagnostic whose receipt was not written is not a completed
+    #     collection: the receipt failure ends the run when it is the only
+    #     fault, and is secondary (reported, primary preserved) when a case
+    #     fault is already in flight.
+    import contextlib
+    import io
+
+    def broken_writer(_proof, _collection) -> str:
+        raise OSError("evidence directory full")
+
+    wrote: list[str] = []
+
+    def good_writer(_proof, _collection) -> str:
+        wrote.append("written")
+        return "receipt.json"
+
+    try:
+        finish_diagnostic(object(), Collection(), None, writer=broken_writer)
+        raise AssertionError("a missing diagnostic receipt was reported as success")
+    except OSError as fault:
+        expect("evidence directory full" in str(fault), f"{fault}")
+    finish_diagnostic(object(), Collection(), None, writer=good_writer)
+    expect(wrote == ["written"], f"the receipt writer did not run: {wrote}")
+    noise = io.StringIO()
+    primary = RuntimeError("a case failed")
+    with contextlib.redirect_stderr(noise):
+        finish_diagnostic(object(), Collection(), primary, writer=broken_writer)
+    expect(
+        "receipt was not written" in noise.getvalue(),
+        f"the secondary receipt failure was not reported: {noise.getvalue()!r}",
+    )
+    expect(
+        "primary failure is preserved" in noise.getvalue(),
+        f"the report did not name the preserved primary failure: {noise.getvalue()!r}",
+    )
+
+    # 5. An exhausted guard deadline before a case aborts it and runs nothing;
+    #    a `deadline reached` fault inside a case is an abort, never a
+    #    recoverable oracle failure.
+    ran.clear()
+    record = collect(table(("a", (), {})), work_left=lambda: 0.0)
+    expect(ran == [], f"a case ran without a work deadline: {ran}")
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.aborted is not None and "deadline" in record.aborted, f"{record.aborted}")
+    ran.clear()
+    record = collect(
+        table(("a", (), {"fault": "work deadline reached (SIGALRM fallback)"}), ("b", (), {}))
+    )
+    expect(record.outcomes["a"]["result"] == "aborted", f"{record.outcomes['a']}")
+    expect(record.outcomes["b"]["result"] == "unexecuted", f"{record.outcomes['b']}")
+    expect(record.failures == [], f"a deadline was recorded as recoverable: {record.failures}")
+
+    # 6. Receipt rows follow the declared table, and a case the collection never
+    #    reached is `unexecuted` — a partial collection is never implied to have
+    #    passed.
+    ids = [case for case, _requires, _text in EXEC_CASES]
+    expect(len(ids) == len(set(ids)), f"duplicate exec-inference case id in {ids}")
+    for case, requires, _text in EXEC_CASES:
+        for dependency in requires:
+            expect(dependency in ids, f"{case} depends on the unknown case {dependency}")
+            expect(
+                ids.index(dependency) < ids.index(case),
+                f"{case} depends on the later case {dependency}",
+            )
+    rows = exec_case_rows({"01": {"result": "completed"}})
+    expect([row["case"] for row in rows] == ids, "the receipt rows are not in table order")
+    expect(
+        [row["result"] for row in rows if row["case"] != "01"] == ["unexecuted"] * (len(ids) - 1),
+        f"undone cases are not unexecuted: {rows}",
+    )
+
+    # 7. The case bodies share values through exec_inference's own scope with
+    #    `nonlocal`. A body that assigns one of those names WITHOUT the
+    #    declaration would silently read the placeholder its dependency left
+    #    behind, so the mechanism and every assignment are checked here (AST
+    #    only: nothing is imported from the run).
+    import ast
+
+    shared = {
+        "app",
+        "app_root",
+        "debug_link",
+        "release_link",
+        "receipt_before",
+        "root_before",
+        "slot",
+        "legacy",
+        "legacy_root",
+        "legacy_target",
+        "legacy_receipt",
+        "migrated_root",
+        "migrated_receipt",
+    }
+    cellvars = set(exec_inference.__code__.co_cellvars)
+    expect(
+        shared <= cellvars,
+        f"the shared case values are not captured cells: {sorted(shared - cellvars)}",
+    )
+    with open(__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    inference = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "exec_inference"
+    )
+
+    def assigned_names(node) -> set:
+        names: set = set()
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Assign):
+                continue
+            targets = list(inner.targets)
+            while targets:
+                target = targets.pop()
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+                elif isinstance(target, ast.Tuple):
+                    targets.extend(target.elts)
+        return names
+
+    # The shared fixture setup must actually be there: the bodies depend on it
+    # and a mechanical rewrite that dropped it would otherwise only fail
+    # natively. It is the top-level statements before the first case body.
+    setup_statements = []
+    for statement in inference.body:
+        if isinstance(statement, ast.FunctionDef) and statement.name.startswith("case_"):
+            break
+        setup_statements.append(statement)
+    setup_names = assigned_names(ast.Module(body=setup_statements, type_ignores=[]))
+    required = {"root", "pool", "home", "cargo_home", "maker", "mount", "name", "source", "tools"}
+    expect(
+        required <= setup_names,
+        f"the shared fixture setup is missing {sorted(required - setup_names)}",
+    )
+    calls = set()
+    for statement in setup_statements:
+        for inner in ast.walk(statement):
+            if not isinstance(inner, ast.Call):
+                continue
+            if isinstance(inner.func, ast.Name):
+                calls.add(inner.func.id)
+            elif isinstance(inner.func, ast.Attribute):
+                calls.add(inner.func.attr)
+    for call in (
+        "write_tools",
+        "attach_image",
+        "owners_honored",
+        "proof_env",
+        "fresh_checkout",
+        "stage_at",
+        "freeze_compiler_flags",
+    ):
+        expect(call in calls, f"the shared fixture setup no longer calls {call}")
+
+    # The bodies map is the runtime binding the proof itself asserts; checking
+    # it here means a dropped or renamed body is found before a native run.
+    body_map = {}
+    for statement in inference.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "bodies" for target in statement.targets):
+            continue
+        expect(isinstance(statement.value, ast.Dict), "the bodies map is not a literal")
+        body_map = {
+            key.value: value.id
+            for key, value in zip(statement.value.keys, statement.value.values)
+            if isinstance(key, ast.Constant) and isinstance(value, ast.Name)
+        }
+    expect(
+        sorted(body_map) == sorted(case for case, _requires, _text in EXEC_CASES),
+        f"the bodies map and the case table disagree: {sorted(set(body_map) ^ set(case for case, _r, _t in EXEC_CASES))}",
+    )
+    for case, _requires, _text in EXEC_CASES:
+        expect(
+            body_map[case] == "case_" + case.replace("+", "_"),
+            f"{case} is bound to {body_map[case]}",
+        )
+    for nested in inference.body:
+        if not isinstance(nested, ast.FunctionDef) or not nested.name.startswith("case_"):
+            continue
+        declared = {
+            name
+            for statement in nested.body
+            if isinstance(statement, ast.Nonlocal)
+            for name in statement.names
+        }
+        leaked = (assigned_names(nested) & shared) - declared
+        expect(
+            not leaked,
+            f"{nested.name} assigns the shared {sorted(leaked)} without nonlocal",
+        )
+
+    # 8. The collection is wired to the mode, not merely capable of it: the
+    #    diagnostic flag, the real post-case seam and the in-place record are
+    #    `exec_inference`'s own call arguments, and `exec_run` passes the flag
+    #    through.
+    collect_calls = [
+        inner
+        for statement in inference.body
+        for inner in ast.walk(statement)
+        if isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "collect_cases"
+    ]
+    expect(len(collect_calls) == 1, f"exec_inference calls collect_cases {len(collect_calls)} times")
+    keywords = {keyword.arg: keyword.value for keyword in collect_calls[0].keywords}
+    expect(
+        isinstance(keywords.get("diagnostic"), ast.Name)
+        and keywords["diagnostic"].id == "diagnostic",
+        "the collection does not receive this run's diagnostic flag",
+    )
+    expect(
+        isinstance(keywords.get("after_case"), ast.IfExp)
+        and isinstance(keywords["after_case"].test, ast.Name)
+        and keywords["after_case"].test.id == "diagnostic",
+        "the custody seam is not scoped to the diagnostic run",
+    )
+    accumulator = keywords.get("record")
+    expect(
+        isinstance(accumulator, ast.Name) and accumulator.id == "collection",
+        "the collection does not fill the run's receipt record in place",
+    )
+    wrapper = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "exec_run"
+    )
+    forwarded = [
+        inner
+        for inner in ast.walk(wrapper)
+        if isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "exec_inference"
+    ]
+    expect(len(forwarded) == 1, "exec_run does not call exec_inference exactly once")
+    expect(
+        len(forwarded[0].args) == 4
+        and isinstance(forwarded[0].args[2], ast.Name)
+        and forwarded[0].args[2].id == "diagnostic",
+        "exec_run does not forward the diagnostic flag",
+    )
+    # The real seam must run both gates for every case.
+    seam = next(
+        node
+        for node in inference.body
+        if isinstance(node, ast.FunctionDef) and node.name == "after_case"
+    )
+    seam_calls = [
+        inner.func.id
+        for inner in ast.walk(seam)
+        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+    ]
+    for gate in ("require_case_custody", "require_case_resources"):
+        expect(gate in seam_calls, f"the post-case seam does not call {gate}")
+
+    # 9. The receipt document itself: `qualified: false`, counted outcomes,
+    #    a skipped case never counted as completed, and the limitation stated.
+    document = diagnostic_document(
+        source="source",
+        rows=exec_case_rows(
+            {
+                "01": {"result": "completed"},
+                "02": {"result": "failed", "fault": "x"},
+                "03": {"result": "skipped", "because": ["02"]},
+            }
+        ),
+        failures=[{"case": "02", "fault": "x"}],
+        aborted=None,
+        detached="not attempted",
+        mount_present=None,
+        elapsed_s=1.0,
+        peak_owned_mib=1,
+        host_free_min_mib=2,
+        unclosed=[],
+    )
+    expect(document["qualified"] is False, "the diagnostic receipt qualified itself")
+    expect(
+        document["summary"]
+        == {
+            "completed": 1,
+            "failed": 1,
+            "skipped": 1,
+            "aborted": 0,
+            "unexecuted": len(ids) - 3,
+        },
+        f"{document['summary']}",
+    )
+    expect("skipped" in document["limitation"], document["limitation"])
+    expect("never a counted native PASS" in document["limitation"], document["limitation"])
+    expect(
+        json.dumps(document) and document["cases"][0]["case"] == ids[0],
+        "the receipt document does not serialise",
+    )
+    # A run that failed before the first case still reports every case
+    # unexecuted and keeps the abort reason.
+    closed = diagnostic_document(
+        source=None,
+        rows=exec_case_rows({}),
+        failures=[],
+        aborted="setup failed",
+        detached="not attempted",
+        mount_present=None,
+        elapsed_s=0.0,
+        peak_owned_mib=0,
+        host_free_min_mib=None,
+        unclosed=[],
+    )
+    expect(closed["summary"]["unexecuted"] == len(ids), f"{closed['summary']}")
+    expect(closed["aborted"] == "setup failed", f"{closed['aborted']}")
 
 
 EXEC_TOOLS = {
@@ -2849,7 +3711,7 @@ def detached_version_one(pool: str, checkout: str) -> str:
     return path
 
 
-def exec_run(proof: Proof, repo: str) -> None:
+def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collection) -> None:
     """Focused exec-output-inference proof (oxide#160): S1 derives an `exec`
     member set from the checkout's committed placement, and S4b makes the
     automatic first conversion create that profile layout.
@@ -2869,8 +3731,21 @@ def exec_run(proof: Proof, repo: str) -> None:
     dangling, and proves a derived `exec` creates that one directory, builds
     `--release` into it and changes neither the link nor the receipt; 18 points
     `target/release` at an unverified root and proves the refusal creates
-    nothing there. `--plan` prints the same table and allocation with no
-    effect.
+    nothing there. Case 20 (oxide#165) deletes a converted checkout's whole
+    `target` directory — what a task-local build-output cleanup does — and
+    proves the next leased build recreates it exclusively and republishes the
+    member that build places into the SAME root, whose payload and committed
+    placement survive, and that a derived `exec` then places the whole owned
+    pair there. `--plan` prints the same table and allocation with no effect.
+
+    With `diagnostic` the same cases run keep-going (oxide#165's apparatus
+    correction): a recoverable case-oracle failure is recorded and the cases
+    that do not depend on it still run, a case whose dependency did not complete
+    is recorded `skipped` and never runs, and an unknown outcome, a lost
+    resource or custody (an unclosed child, a lost mount, a vanished drive
+    registration) or an exhausted guard deadline aborts and leaves the rest
+    unexecuted. Every declared case is recorded, and a skipped or unexecuted
+    case is never a pass. It is never a counted native PASS.
 
     The HIGH premise checklist is traced through the executable bodies:
 
@@ -2914,6 +3789,7 @@ def exec_run(proof: Proof, repo: str) -> None:
        inside it; no fixture or tool calls `mktemp`.
     """
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    collection.source = source
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
     name = "OxEx" + secrets.token_hex(4)
@@ -2975,617 +3851,867 @@ def exec_run(proof: Proof, repo: str) -> None:
     )
     expect(code == 0 and "registered removable pool" in stdout, stderr)
 
-    # S4b: a fresh eligible checkout's first leased build creates the profile
-    # layout, and an `exec` with no `--output` places its output in that root.
-    first = fresh_checkout(proof, root, "first-conversion")
-    code, _, stderr = proof.oxide(["build"], "S4b first leased build converts", first)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    first_root = expect_profile_layout(pool, mount, first, "S4b conversion")
-    expect(
-        os.path.isfile(os.path.join(first, "target", "debug", "poutputs")),
-        "S4b: the build wrote no binary through the owned pair",
-    )
-    expect(
-        os.path.isdir(os.path.join(first_root, "release")),
-        "S4b: the conversion left the release member directory out",
-    )
-    code, _, stderr = proof.oxide(["exec", "--", build_tool], "S4b exec after the conversion", first)
-    expect(code == 0, stderr)
-    expect("through profile member links" in stderr, stderr)
-    expect(
-        member_link_target(first, "debug") == os.path.join(first_root, "debug"),
-        "S4b: the exec relinked debug",
-    )
-    expect(
-        os.path.isfile(os.path.join(first_root, "debug", "poutputs")),
-        "S4b: the exec's output is not in the owned root",
-    )
-    phase(proof, "after the first conversion")
+    # Values one case publishes for the cases the table says depend on it. A
+    # dependent case is skipped when its dependency did not complete, so no body
+    # ever reads a placeholder.
+    app = ""
+    app_root = ""
+    debug_link = ""
+    release_link = ""
+    receipt_before = b""
+    root_before: dict = {}
+    slot = ""
+    legacy = ""
+    legacy_root = ""
+    legacy_target = ""
+    legacy_receipt = b""
+    migrated_root = ""
+    migrated_receipt = b""
 
-    # 01: an explicit adoption of a fresh checkout publishes the same layout.
-    app = fresh_checkout(proof, root, "exec-adopted")
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "01 explicit adoption", app)
-    expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
-    app_root = expect_profile_layout(pool, mount, app, "01 adoption")
-    debug_link = member_link_target(app, "debug")
-    release_link = member_link_target(app, "release")
-    receipt_before = read_bytes(receipt_file(pool, app))
-
-    # 02: exec with no --output runs a tool that builds through the pair.
-    code, _, stderr = proof.oxide(["exec", "--", build_tool], "02 exec without --output", app)
-    expect(code == 0, stderr)
-    expect(member_link_target(app, "debug") == debug_link, "02: the exec relinked debug")
-    expect(member_link_target(app, "release") == release_link, "02: the exec relinked release")
-    expect(
-        os.path.isfile(os.path.join(app_root, "debug", "poutputs")),
-        "02: the tool's output is not in the owned debug member",
-    )
-    expect("through profile member links (debug, release)" in stderr, stderr)
-    slot, _ = slot_state(stderr)
-
-    # 03: a repeat reuses the same warm slot and relinks nothing.
-    code, _, stderr = proof.oxide(["exec", "--", build_tool], "03 repeat exec", app)
-    expect(code == 0, stderr)
-    again, state = slot_state(stderr)
-    expect(again == slot and state == "warm", f"03: slot {again} {state}\n{stderr}")
-    expect(member_link_target(app, "debug") == debug_link, "03: the repeat relinked debug")
-
-    # 04: the tool's release build is placed under the same root.
-    code, _, stderr = proof.oxide(
-        ["exec", "--", build_tool, "--release"], "04 exec release build", app
-    )
-    expect(code == 0, stderr)
-    expect(
-        os.path.isfile(os.path.join(app_root, "release", "poutputs")),
-        "04: the release output is not in the owned release member",
-    )
-
-    # 05: the declared override reaches the same keyed slot and placement.
-    code, _, stderr = proof.oxide(
-        ["exec", "--output", "debug", "--output", "release", "--", build_tool],
-        "05 declared parity",
-        app,
-    )
-    expect(code == 0, stderr)
-    declared_slot, declared_state = slot_state(stderr)
-    expect(
-        declared_slot == slot and declared_state == "warm",
-        f"05: the declared set did not share the derived key: {declared_slot} "
-        f"{declared_state}\n{stderr}",
-    )
-    expect(member_link_target(app, "debug") == debug_link, "05: the declared override relinked debug")
-    expect(read_bytes(receipt_file(pool, app)) == receipt_before, "05: an exec changed the receipt")
-    phase(proof, "after the derived and declared runs")
-
-    # 06: a member the receipt does not place stays real and local.
-    root_before = tree_digest(app_root)
-    receipt_before = read_bytes(receipt_file(pool, app))
-    code, _, stderr = proof.oxide(["exec", "--", staging_tool], "06 unrecorded member", app)
-    expect(code == 0, stderr)
-    staging = os.path.join(app, "target", "staging")
-    expect(
-        os.path.isdir(staging) and not os.path.islink(staging),
-        "06: the unrecorded member is not a real directory",
-    )
-    expect(read_bytes(os.path.join(staging, "out")) == b"local", "06: the tool's write was lost")
-    expect(tree_digest(app_root) == root_before, "06: an unrecorded member reached the owned root")
-    expect(
-        read_bytes(receipt_file(pool, app)) == receipt_before,
-        "06: an unrecorded member changed the receipt",
-    )
-    phase(proof, "after the unrecorded member")
-
-    # 07 + 14: detach restores real empty members and keeps the root (the
-    # shipped detach, reused); an exec on the detached checkout then runs
-    # locally and writes nothing into the root.
-    code, _, stderr = proof.oxide(["outputs", "detach"], "07 detach", app)
-    expect(code == 0, stderr)
-    target = os.path.join(app, "target")
-    expect(os.path.isdir(target) and not os.path.islink(target), "07: detach left a link")
-    for member in ("debug", "release"):
-        path = os.path.join(target, member)
+    def case_s4b() -> None:
+        # S4b: a fresh eligible checkout's first leased build creates the profile
+        # layout, and an `exec` with no `--output` places its output in that root.
+        first = fresh_checkout(proof, root, "first-conversion")
+        code, _, stderr = proof.oxide(["build"], "S4b first leased build converts", first)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        first_root = expect_profile_layout(pool, mount, first, "S4b conversion")
         expect(
-            os.path.isdir(path) and not os.path.islink(path),
-            f"07: {member} is not a real directory after detach",
-        )
-        expect(os.listdir(path) == [], f"07: {member} is not empty after detach")
-    expect(receipt_state(pool, app) == "detached", "07: the receipt is not detached")
-    expect(os.path.isdir(app_root), "07: detach deleted the owned root")
-    root_before = tree_digest(app_root)
-    code, _, stderr = proof.oxide(["exec", "--", build_tool], "07 exec on a detached checkout", app)
-    expect(code == 0, stderr)
-    expect(
-        os.path.isdir(os.path.join(target, "debug"))
-        and not os.path.islink(os.path.join(target, "debug")),
-        "07: the detached exec linked a member",
-    )
-    expect(
-        os.path.isfile(os.path.join(target, "debug", "poutputs")),
-        "07: the detached exec built nothing locally",
-    )
-    expect(tree_digest(app_root) == root_before, "07: a detached exec wrote into the root")
-    phase(proof, "after the detached run")
-
-    # 08: a checkout whose first conversion is ineligible is never converted.
-    plain = fresh_checkout(proof, root, "exec-unconverted")
-    os.makedirs(os.path.join(plain, "target"))
-    code, _, stderr = proof.oxide(["exec", "--", build_tool], "08 unconverted exec", plain)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(
-        not os.path.islink(os.path.join(plain, "target")),
-        "08: an unconverted target became a link",
-    )
-    expect(not os.path.exists(receipt_file(pool, plain)), "08: an unconverted checkout got a receipt")
-
-    # 09: an EXISTING whole-target checkout stays whole-target through a build
-    # and through an exec. This is also the S4b "existing whole-target fixture
-    # is untouched" half of the brief's native case.
-    legacy = fresh_checkout(proof, root, "legacy-whole-target")
-    legacy_root = legacy_whole_target(proof, pool, mount, legacy, "09 legacy fixture")
-    legacy_target = os.path.join(legacy, "target")
-    expect(os.path.islink(legacy_target), "09: the fixture's target is not the legacy link")
-    legacy_receipt = read_bytes(receipt_file(pool, legacy))
-    legacy_report = plan(proof, legacy, "09 the legacy fixture plans the whole target")
-    expect(
-        legacy_report["layout"] == "whole-target",
-        f"09: the product does not read the fixture as a whole-target checkout: {legacy_report}",
-    )
-    code, _, stderr = proof.oxide(["build"], "09 a build keeps the whole-target link", legacy)
-    expect(code == 0, stderr)
-    expect(os.path.islink(legacy_target), "09: a build replaced the whole-target link")
-    expect(os.readlink(legacy_target) == legacy_root, "09: a build relinked the whole target")
-    expect(
-        os.path.isfile(os.path.join(legacy_target, "debug", "poutputs")),
-        "09: the build wrote no binary through the whole-target link",
-    )
-    expect(
-        read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
-        "09: a build rewrote the whole-target receipt",
-    )
-    code, _, stderr = proof.oxide(
-        ["exec", "--", build_tool], "09 an exec keeps the whole-target link", legacy
-    )
-    expect(code == 0, stderr)
-    expect(os.path.islink(legacy_target), "09: an exec replaced the whole-target link")
-    expect(
-        os.readlink(legacy_target) == legacy_root,
-        "09: an exec relinked the whole target",
-    )
-    expect(
-        read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
-        "09: an exec rewrote the whole-target receipt",
-    )
-    phase(proof, "after the legacy whole-target fixture")
-
-    # 16 (oxide#162): the fixture's root holds only `debug`. The migration must
-    # create BOTH member directories before it publishes their links, so the
-    # receipt's `release` placement never dangles, and a derived `exec` runs
-    # before any release build.
-    os.rmdir(os.path.join(legacy_root, "release"))
-    expect(
-        os.path.isdir(os.path.join(legacy_root, "debug")),
-        "16: the fixture root has no debug directory",
-    )
-    expect(
-        not os.path.exists(os.path.join(legacy_root, "release")),
-        "16: the fixture root still has a release directory",
-    )
-    code, stdout, stderr = proof.oxide(
-        ["outputs", "adopt"], "16 migrate a debug-only whole-target root", legacy
-    )
-    expect(code == 0, stdout + stderr)
-    migrated_root = expect_profile_layout(pool, mount, legacy, "16 migration")
-    expect(migrated_root == legacy_root, f"16: the migration moved the root to {migrated_root}")
-    for member in ("debug", "release"):
-        destination = os.path.join(migrated_root, member)
-        expect(
-            os.path.isdir(destination) and not os.path.islink(destination),
-            f"16: {member} is not a real member directory after the migration",
+            os.path.isfile(os.path.join(first, "target", "debug", "poutputs")),
+            "S4b: the build wrote no binary through the owned pair",
         )
         expect(
-            member_link_target(legacy, member) == destination,
-            f"16: {member} does not select its migrated member destination",
+            os.path.isdir(os.path.join(first_root, "release")),
+            "S4b: the conversion left the release member directory out",
+        )
+        code, _, stderr = proof.oxide(["exec", "--", build_tool], "S4b exec after the conversion", first)
+        expect(code == 0, stderr)
+        expect("through profile member links" in stderr, stderr)
+        expect(
+            member_link_target(first, "debug") == os.path.join(first_root, "debug"),
+            "S4b: the exec relinked debug",
         )
         expect(
-            os.path.isdir(os.path.join(legacy, "target", member)),
-            f"16: target/{member} dangles after the migration",
+            os.path.isfile(os.path.join(first_root, "debug", "poutputs")),
+            "S4b: the exec's output is not in the owned root",
         )
-    expect(
-        not os.path.exists(os.path.join(migrated_root, "release", "poutputs")),
-        "16: a release build happened before the derived exec",
-    )
-    code, _, stderr = proof.oxide(
-        ["exec", "--", build_tool], "16 a derived exec follows the migrated pair", legacy
-    )
-    expect(code == 0, stderr)
-    expect("through profile member links (debug, release)" in stderr, stderr)
-    expect(
-        os.path.isfile(os.path.join(migrated_root, "debug", "poutputs")),
-        "16: the derived exec built nothing through the migrated debug member",
-    )
-    expect(
-        not os.path.exists(os.path.join(migrated_root, "release", "poutputs")),
-        "16: the derived exec ran a release build",
-    )
-    phase(proof, "after the migration publication")
+        phase(proof, "after the first conversion")
 
-    # 17 (oxide#162): the exact shape the live pre-fix migrations left behind —
-    # the member link published, the root's member directory absent. A derived
-    # exec creates that one directory under its verified root and builds
-    # through it; the link and the receipt do not change.
-    os.rmdir(os.path.join(migrated_root, "release"))
-    release_link = os.path.join(legacy, "target", "release")
-    expect(
-        os.path.islink(release_link),
-        "17: target/release is not the owned member link",
-    )
-    expect(
-        not os.path.exists(release_link),
-        "17: target/release does not dangle",
-    )
-    migrated_receipt = read_bytes(receipt_file(pool, legacy))
-    code, _, stderr = proof.oxide(
-        ["exec", "--", build_tool, "--release"],
-        "17 an exec repairs the absent release member",
-        legacy,
-    )
-    expect(code == 0, stderr)
-    expect(
-        os.path.isdir(os.path.join(migrated_root, "release"))
-        and not os.path.islink(os.path.join(migrated_root, "release")),
-        "17: the exec did not create the release member directory",
-    )
-    expect(
-        os.path.isfile(os.path.join(migrated_root, "release", "poutputs")),
-        "17: the release build did not land in the root member",
-    )
-    expect(
-        member_link_target(legacy, "release") == os.path.join(migrated_root, "release"),
-        "17: the repair relinked release",
-    )
-    expect(
-        read_bytes(receipt_file(pool, legacy)) == migrated_receipt,
-        "17: the repair changed the receipt",
-    )
-    phase(proof, "after the absent member repair")
+    def case_01() -> None:
+        nonlocal app, app_root, debug_link, release_link, receipt_before
+        # 01: an explicit adoption of a fresh checkout publishes the same layout.
+        app = fresh_checkout(proof, root, "exec-adopted")
+        code, stdout, stderr = proof.oxide(["outputs", "adopt"], "01 explicit adoption", app)
+        expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
+        app_root = expect_profile_layout(pool, mount, app, "01 adoption")
+        debug_link = member_link_target(app, "debug")
+        release_link = member_link_target(app, "release")
+        receipt_before = read_bytes(receipt_file(pool, app))
 
-    # 18 (oxide#162): a link into a root that is not this checkout's verified,
-    # committed root still refuses before Cargo, and nothing is created there.
-    unverified = os.path.join(root, "unverified-output-root")
-    os.makedirs(unverified)
-    os.remove(release_link)
-    os.symlink(os.path.join(unverified, "release"), release_link)
-    migrated_receipt = read_bytes(receipt_file(pool, legacy))
-    code, _, stderr = proof.oxide(
-        ["exec", "--", build_tool], "18 an unverified root refuses", legacy
-    )
-    expect(code != 0, f"18: a link into an unverified root was accepted\n{stderr}")
-    expect("target/release" in stderr, stderr)
-    expect("oxide outputs adopt" in stderr, stderr)
-    expect(
-        not os.path.exists(os.path.join(unverified, "release")),
-        "18: the unverified root got a member directory",
-    )
-    expect(
-        os.readlink(release_link) == os.path.join(unverified, "release"),
-        "18: a refused exec relinked release",
-    )
-    expect(
-        read_bytes(receipt_file(pool, legacy)) == migrated_receipt,
-        "18: a refused exec changed the receipt",
-    )
-    expect(
-        os.path.isdir(os.path.join(migrated_root, "release")),
-        "18: a refused exec removed the root's member directory",
-    )
-    phase(proof, "after the unverified root refusal")
+    def case_02() -> None:
+        nonlocal slot
+        # 02: exec with no --output runs a tool that builds through the pair.
+        code, _, stderr = proof.oxide(["exec", "--", build_tool], "02 exec without --output", app)
+        expect(code == 0, stderr)
+        expect(member_link_target(app, "debug") == debug_link, "02: the exec relinked debug")
+        expect(member_link_target(app, "release") == release_link, "02: the exec relinked release")
+        expect(
+            os.path.isfile(os.path.join(app_root, "debug", "poutputs")),
+            "02: the tool's output is not in the owned debug member",
+        )
+        expect("through profile member links (debug, release)" in stderr, stderr)
+        slot, _ = slot_state(stderr)
 
-    # 13: a checkout path containing a space converts and runs end to end.
-    spaced = fresh_checkout(proof, root, "exec spaced")
-    code, _, stderr = proof.oxide(["exec", "--", build_tool], "13 spaced path exec", spaced)
-    expect(code == 0, stderr)
-    spaced_root = expect_profile_layout(pool, mount, spaced, "13 spaced path")
-    expect(
-        os.path.isfile(os.path.join(spaced_root, "debug", "poutputs")),
-        "13: the tool's output is not in the spaced checkout's root",
-    )
+    def case_03() -> None:
+        # 03: a repeat reuses the same warm slot and relinks nothing.
+        code, _, stderr = proof.oxide(["exec", "--", build_tool], "03 repeat exec", app)
+        expect(code == 0, stderr)
+        again, state = slot_state(stderr)
+        expect(again == slot and state == "warm", f"03: slot {again} {state}\n{stderr}")
+        expect(member_link_target(app, "debug") == debug_link, "03: the repeat relinked debug")
 
-    # 10: a foreign member link refuses before Cargo and changes nothing.
-    foreign = fresh_checkout(proof, root, "exec-foreign")
-    code, _, stderr = proof.oxide(["build"], "10 foreign fixture adopts", foreign)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    expect_profile_layout(pool, mount, foreign, "10 adoption")
-    outside = os.path.join(root, "outside-exec")
-    os.makedirs(outside)
-    with open(os.path.join(outside, "sentinel"), "wb") as handle:
-        handle.write(b"foreign")
-    foreign_debug = member_link_target(foreign, "debug")
-    foreign_receipt = read_bytes(receipt_file(pool, foreign))
-    os.remove(os.path.join(foreign, "target", "release"))
-    os.symlink(outside, os.path.join(foreign, "target", "release"))
-    code, _, stderr = proof.oxide(
-        ["exec", "--", build_tool], "10 a foreign member link refuses", foreign
-    )
-    expect(code != 0, f"10: a foreign member link was followed\n{stderr}")
-    expect("target/release" in stderr, stderr)
-    expect("oxide outputs adopt" in stderr, stderr)
-    expect(
-        read_bytes(os.path.join(outside, "sentinel")) == b"foreign",
-        "10: the foreign referent mutated",
-    )
-    expect(member_link_target(foreign, "debug") == foreign_debug, "10: a refused exec relinked debug")
-    expect(
-        read_bytes(receipt_file(pool, foreign)) == foreign_receipt,
-        "10: a refused exec changed the receipt",
-    )
-    phase(proof, "after the foreign member link")
+    def case_04() -> None:
+        # 04: the tool's release build is placed under the same root.
+        code, _, stderr = proof.oxide(
+            ["exec", "--", build_tool, "--release"], "04 exec release build", app
+        )
+        expect(code == 0, stderr)
+        expect(
+            os.path.isfile(os.path.join(app_root, "release", "poutputs")),
+            "04: the release output is not in the owned release member",
+        )
 
-    # 12: root drift (this checkout's own root marker removed) refuses and
-    # names the explicit adoption.
-    drift = fresh_checkout(proof, root, "exec-drift")
-    code, _, stderr = proof.oxide(["build"], "12 drift fixture adopts", drift)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    drift_root = expect_profile_layout(pool, mount, drift, "12 adoption")
-    os.remove(os.path.join(drift_root, MARKER))
-    drift_debug = member_link_target(drift, "debug")
-    code, _, stderr = proof.oxide(["exec", "--", build_tool], "12 root drift refuses", drift)
-    expect(code != 0 and "oxide outputs adopt" in stderr, stderr)
-    expect(member_link_target(drift, "debug") == drift_debug, "12: a refused exec relinked debug")
-    phase(proof, "after root drift")
+    def case_05() -> None:
+        # 05: the declared override reaches the same keyed slot and placement.
+        code, _, stderr = proof.oxide(
+            ["exec", "--output", "debug", "--output", "release", "--", build_tool],
+            "05 declared parity",
+            app,
+        )
+        expect(code == 0, stderr)
+        declared_slot, declared_state = slot_state(stderr)
+        expect(
+            declared_slot == slot and declared_state == "warm",
+            f"05: the declared set did not share the derived key: {declared_slot} "
+            f"{declared_state}\n{stderr}",
+        )
+        expect(member_link_target(app, "debug") == debug_link, "05: the declared override relinked debug")
+        expect(read_bytes(receipt_file(pool, app)) == receipt_before, "05: an exec changed the receipt")
+        phase(proof, "after the derived and declared runs")
 
-    # 11: a receipt changed while the command waits refuses rather than
-    # building into a placement the receipt no longer selects.
-    waiting = fresh_checkout(proof, root, "exec-changed")
-    code, _, stderr = proof.oxide(["build"], "11 wait fixture adopts", waiting)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    expect_profile_layout(pool, mount, waiting, "11 adoption")
-    gate = os.path.join(root, "exec-pause")
-    pause_env = dict(proof.env, OXIDE_TEST_PAUSE="keyed:" + gate)
-    child = start_child(proof, [proof.binary, "exec", "--", build_tool], waiting, pause_env)
-    try:
-        wait_for(f"{gate}.keyed-{child.pid}", "11 the exec command's key pause")
-        receipt = read_json(receipt_file(pool, waiting))
-        receipt["state"] = "detached"
-        for placement in receipt["links"]:
-            placement["selected"] = None
-            placement.pop("prepared", None)
-        with open(receipt_file(pool, waiting), "w", encoding="utf-8") as handle:
-            json.dump(receipt, handle, indent=2)
-        with open(gate, "wb") as handle:
-            handle.write(b"release")
-        code, _, stderr = finish_child(proof, child, "11 the waiting exec")
-        child = None
-    finally:
-        if child is not None and child.poll() is None:
-            child.kill()
-        if not os.path.exists(gate):
+    def case_06() -> None:
+        nonlocal root_before, receipt_before
+        # 06: a member the receipt does not place stays real and local.
+        root_before = tree_digest(app_root)
+        receipt_before = read_bytes(receipt_file(pool, app))
+        code, _, stderr = proof.oxide(["exec", "--", staging_tool], "06 unrecorded member", app)
+        expect(code == 0, stderr)
+        staging = os.path.join(app, "target", "staging")
+        expect(
+            os.path.isdir(staging) and not os.path.islink(staging),
+            "06: the unrecorded member is not a real directory",
+        )
+        expect(read_bytes(os.path.join(staging, "out")) == b"local", "06: the tool's write was lost")
+        expect(tree_digest(app_root) == root_before, "06: an unrecorded member reached the owned root")
+        expect(
+            read_bytes(receipt_file(pool, app)) == receipt_before,
+            "06: an unrecorded member changed the receipt",
+        )
+        phase(proof, "after the unrecorded member")
+
+    def case_07_14() -> None:
+        nonlocal root_before
+        # 07 + 14: detach restores real empty members and keeps the root (the
+        # shipped detach, reused); an exec on the detached checkout then runs
+        # locally and writes nothing into the root.
+        code, _, stderr = proof.oxide(["outputs", "detach"], "07 detach", app)
+        expect(code == 0, stderr)
+        target = os.path.join(app, "target")
+        expect(os.path.isdir(target) and not os.path.islink(target), "07: detach left a link")
+        for member in ("debug", "release"):
+            path = os.path.join(target, member)
+            expect(
+                os.path.isdir(path) and not os.path.islink(path),
+                f"07: {member} is not a real directory after detach",
+            )
+            expect(os.listdir(path) == [], f"07: {member} is not empty after detach")
+        expect(receipt_state(pool, app) == "detached", "07: the receipt is not detached")
+        expect(os.path.isdir(app_root), "07: detach deleted the owned root")
+        root_before = tree_digest(app_root)
+        code, _, stderr = proof.oxide(["exec", "--", build_tool], "07 exec on a detached checkout", app)
+        expect(code == 0, stderr)
+        expect(
+            os.path.isdir(os.path.join(target, "debug"))
+            and not os.path.islink(os.path.join(target, "debug")),
+            "07: the detached exec linked a member",
+        )
+        expect(
+            os.path.isfile(os.path.join(target, "debug", "poutputs")),
+            "07: the detached exec built nothing locally",
+        )
+        expect(tree_digest(app_root) == root_before, "07: a detached exec wrote into the root")
+        phase(proof, "after the detached run")
+
+    def case_08() -> None:
+        # 08: a checkout whose first conversion is ineligible is never converted.
+        plain = fresh_checkout(proof, root, "exec-unconverted")
+        os.makedirs(os.path.join(plain, "target"))
+        code, _, stderr = proof.oxide(["exec", "--", build_tool], "08 unconverted exec", plain)
+        expect(code == 0 and not auto_notices(stderr), stderr)
+        expect(
+            not os.path.islink(os.path.join(plain, "target")),
+            "08: an unconverted target became a link",
+        )
+        expect(not os.path.exists(receipt_file(pool, plain)), "08: an unconverted checkout got a receipt")
+
+    def case_09() -> None:
+        nonlocal legacy, legacy_root, legacy_target, legacy_receipt
+        # 09: an EXISTING whole-target checkout stays whole-target through a build
+        # and through an exec. This is also the S4b "existing whole-target fixture
+        # is untouched" half of the brief's native case.
+        legacy = fresh_checkout(proof, root, "legacy-whole-target")
+        legacy_root = legacy_whole_target(proof, pool, mount, legacy, "09 legacy fixture")
+        legacy_target = os.path.join(legacy, "target")
+        expect(os.path.islink(legacy_target), "09: the fixture's target is not the legacy link")
+        legacy_receipt = read_bytes(receipt_file(pool, legacy))
+        legacy_report = plan(proof, legacy, "09 the legacy fixture plans the whole target")
+        expect(
+            legacy_report["layout"] == "whole-target",
+            f"09: the product does not read the fixture as a whole-target checkout: {legacy_report}",
+        )
+        code, _, stderr = proof.oxide(["build"], "09 a build keeps the whole-target link", legacy)
+        expect(code == 0, stderr)
+        expect(os.path.islink(legacy_target), "09: a build replaced the whole-target link")
+        expect(os.readlink(legacy_target) == legacy_root, "09: a build relinked the whole target")
+        expect(
+            os.path.isfile(os.path.join(legacy_target, "debug", "poutputs")),
+            "09: the build wrote no binary through the whole-target link",
+        )
+        expect(
+            read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
+            "09: a build rewrote the whole-target receipt",
+        )
+        code, _, stderr = proof.oxide(
+            ["exec", "--", build_tool], "09 an exec keeps the whole-target link", legacy
+        )
+        expect(code == 0, stderr)
+        expect(os.path.islink(legacy_target), "09: an exec replaced the whole-target link")
+        expect(
+            os.readlink(legacy_target) == legacy_root,
+            "09: an exec relinked the whole target",
+        )
+        expect(
+            read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
+            "09: an exec rewrote the whole-target receipt",
+        )
+        phase(proof, "after the legacy whole-target fixture")
+
+    def case_16() -> None:
+        nonlocal migrated_root
+        # 16 (oxide#162): the fixture's root holds only `debug`. The migration must
+        # create BOTH member directories before it publishes their links, so the
+        # receipt's `release` placement never dangles, and a derived `exec` runs
+        # before any release build.
+        os.rmdir(os.path.join(legacy_root, "release"))
+        expect(
+            os.path.isdir(os.path.join(legacy_root, "debug")),
+            "16: the fixture root has no debug directory",
+        )
+        expect(
+            not os.path.exists(os.path.join(legacy_root, "release")),
+            "16: the fixture root still has a release directory",
+        )
+        code, stdout, stderr = proof.oxide(
+            ["outputs", "adopt"], "16 migrate a debug-only whole-target root", legacy
+        )
+        expect(code == 0, stdout + stderr)
+        migrated_root = expect_profile_layout(pool, mount, legacy, "16 migration")
+        expect(migrated_root == legacy_root, f"16: the migration moved the root to {migrated_root}")
+        for member in ("debug", "release"):
+            destination = os.path.join(migrated_root, member)
+            expect(
+                os.path.isdir(destination) and not os.path.islink(destination),
+                f"16: {member} is not a real member directory after the migration",
+            )
+            expect(
+                member_link_target(legacy, member) == destination,
+                f"16: {member} does not select its migrated member destination",
+            )
+            expect(
+                os.path.isdir(os.path.join(legacy, "target", member)),
+                f"16: target/{member} dangles after the migration",
+            )
+        expect(
+            not os.path.exists(os.path.join(migrated_root, "release", "poutputs")),
+            "16: a release build happened before the derived exec",
+        )
+        code, _, stderr = proof.oxide(
+            ["exec", "--", build_tool], "16 a derived exec follows the migrated pair", legacy
+        )
+        expect(code == 0, stderr)
+        expect("through profile member links (debug, release)" in stderr, stderr)
+        expect(
+            os.path.isfile(os.path.join(migrated_root, "debug", "poutputs")),
+            "16: the derived exec built nothing through the migrated debug member",
+        )
+        expect(
+            not os.path.exists(os.path.join(migrated_root, "release", "poutputs")),
+            "16: the derived exec ran a release build",
+        )
+        phase(proof, "after the migration publication")
+
+    def case_17() -> None:
+        nonlocal release_link, migrated_receipt
+        # 17 (oxide#162): the exact shape the live pre-fix migrations left behind —
+        # the member link published, the root's member directory absent. A derived
+        # exec creates that one directory under its verified root and builds
+        # through it; the link and the receipt do not change.
+        os.rmdir(os.path.join(migrated_root, "release"))
+        release_link = os.path.join(legacy, "target", "release")
+        expect(
+            os.path.islink(release_link),
+            "17: target/release is not the owned member link",
+        )
+        expect(
+            not os.path.exists(release_link),
+            "17: target/release does not dangle",
+        )
+        migrated_receipt = read_bytes(receipt_file(pool, legacy))
+        code, _, stderr = proof.oxide(
+            ["exec", "--", build_tool, "--release"],
+            "17 an exec repairs the absent release member",
+            legacy,
+        )
+        expect(code == 0, stderr)
+        expect(
+            os.path.isdir(os.path.join(migrated_root, "release"))
+            and not os.path.islink(os.path.join(migrated_root, "release")),
+            "17: the exec did not create the release member directory",
+        )
+        expect(
+            os.path.isfile(os.path.join(migrated_root, "release", "poutputs")),
+            "17: the release build did not land in the root member",
+        )
+        expect(
+            member_link_target(legacy, "release") == os.path.join(migrated_root, "release"),
+            "17: the repair relinked release",
+        )
+        expect(
+            read_bytes(receipt_file(pool, legacy)) == migrated_receipt,
+            "17: the repair changed the receipt",
+        )
+        phase(proof, "after the absent member repair")
+
+    def case_18() -> None:
+        nonlocal migrated_receipt
+        # 18 (oxide#162): a link into a root that is not this checkout's verified,
+        # committed root still refuses before Cargo, and nothing is created there.
+        unverified = os.path.join(root, "unverified-output-root")
+        os.makedirs(unverified)
+        os.remove(release_link)
+        os.symlink(os.path.join(unverified, "release"), release_link)
+        migrated_receipt = read_bytes(receipt_file(pool, legacy))
+        code, _, stderr = proof.oxide(
+            ["exec", "--", build_tool], "18 an unverified root refuses", legacy
+        )
+        expect(code != 0, f"18: a link into an unverified root was accepted\n{stderr}")
+        expect("target/release" in stderr, stderr)
+        expect("oxide outputs adopt" in stderr, stderr)
+        expect(
+            not os.path.exists(os.path.join(unverified, "release")),
+            "18: the unverified root got a member directory",
+        )
+        expect(
+            os.readlink(release_link) == os.path.join(unverified, "release"),
+            "18: a refused exec relinked release",
+        )
+        expect(
+            read_bytes(receipt_file(pool, legacy)) == migrated_receipt,
+            "18: a refused exec changed the receipt",
+        )
+        expect(
+            os.path.isdir(os.path.join(migrated_root, "release")),
+            "18: a refused exec removed the root's member directory",
+        )
+        phase(proof, "after the unverified root refusal")
+
+    def case_13() -> None:
+        # 13: a checkout path containing a space converts and runs end to end.
+        spaced = fresh_checkout(proof, root, "exec spaced")
+        code, _, stderr = proof.oxide(["exec", "--", build_tool], "13 spaced path exec", spaced)
+        expect(code == 0, stderr)
+        spaced_root = expect_profile_layout(pool, mount, spaced, "13 spaced path")
+        expect(
+            os.path.isfile(os.path.join(spaced_root, "debug", "poutputs")),
+            "13: the tool's output is not in the spaced checkout's root",
+        )
+
+    def case_10() -> None:
+        # 10: a foreign member link refuses before Cargo and changes nothing.
+        foreign = fresh_checkout(proof, root, "exec-foreign")
+        code, _, stderr = proof.oxide(["build"], "10 foreign fixture adopts", foreign)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        expect_profile_layout(pool, mount, foreign, "10 adoption")
+        outside = os.path.join(root, "outside-exec")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "sentinel"), "wb") as handle:
+            handle.write(b"foreign")
+        foreign_debug = member_link_target(foreign, "debug")
+        foreign_receipt = read_bytes(receipt_file(pool, foreign))
+        os.remove(os.path.join(foreign, "target", "release"))
+        os.symlink(outside, os.path.join(foreign, "target", "release"))
+        code, _, stderr = proof.oxide(
+            ["exec", "--", build_tool], "10 a foreign member link refuses", foreign
+        )
+        expect(code != 0, f"10: a foreign member link was followed\n{stderr}")
+        expect("target/release" in stderr, stderr)
+        expect("oxide outputs adopt" in stderr, stderr)
+        expect(
+            read_bytes(os.path.join(outside, "sentinel")) == b"foreign",
+            "10: the foreign referent mutated",
+        )
+        expect(member_link_target(foreign, "debug") == foreign_debug, "10: a refused exec relinked debug")
+        expect(
+            read_bytes(receipt_file(pool, foreign)) == foreign_receipt,
+            "10: a refused exec changed the receipt",
+        )
+        phase(proof, "after the foreign member link")
+
+    def case_12() -> None:
+        # 12: root drift (this checkout's own root marker removed) refuses and
+        # names the explicit adoption.
+        drift = fresh_checkout(proof, root, "exec-drift")
+        code, _, stderr = proof.oxide(["build"], "12 drift fixture adopts", drift)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        drift_root = expect_profile_layout(pool, mount, drift, "12 adoption")
+        os.remove(os.path.join(drift_root, MARKER))
+        drift_debug = member_link_target(drift, "debug")
+        code, _, stderr = proof.oxide(["exec", "--", build_tool], "12 root drift refuses", drift)
+        expect(code != 0 and "oxide outputs adopt" in stderr, stderr)
+        expect(member_link_target(drift, "debug") == drift_debug, "12: a refused exec relinked debug")
+        phase(proof, "after root drift")
+
+    def case_11() -> None:
+        # 11: a receipt changed while the command waits refuses rather than
+        # building into a placement the receipt no longer selects.
+        waiting = fresh_checkout(proof, root, "exec-changed")
+        code, _, stderr = proof.oxide(["build"], "11 wait fixture adopts", waiting)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        expect_profile_layout(pool, mount, waiting, "11 adoption")
+        gate = os.path.join(root, "exec-pause")
+        pause_env = dict(proof.env, OXIDE_TEST_PAUSE="keyed:" + gate)
+        child = start_child(proof, [proof.binary, "exec", "--", build_tool], waiting, pause_env)
+        try:
+            wait_for(f"{gate}.keyed-{child.pid}", "11 the exec command's key pause")
+            receipt = read_json(receipt_file(pool, waiting))
+            receipt["state"] = "detached"
+            for placement in receipt["links"]:
+                placement["selected"] = None
+                placement.pop("prepared", None)
+            with open(receipt_file(pool, waiting), "w", encoding="utf-8") as handle:
+                json.dump(receipt, handle, indent=2)
             with open(gate, "wb") as handle:
                 handle.write(b"release")
-    expect(code != 0 and "Run the command again" in stderr, stderr)
-    phase(proof, "after the changed receipt")
+            code, _, stderr = finish_child(proof, child, "11 the waiting exec")
+            child = None
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill()
+            if not os.path.exists(gate):
+                with open(gate, "wb") as handle:
+                    handle.write(b"release")
+        expect(code != 0 and "Run the command again" in stderr, stderr)
+        phase(proof, "after the changed receipt")
 
-    # 15: Ctrl-C reaches the tool's group; the lease stays held while a group
-    # member outlives the leader, and the slot is released once the group is
-    # empty and a later build proceeds.
-    interrupted = fresh_checkout(proof, root, "exec-interrupt")
-    code, _, stderr = proof.oxide(["build"], "15 interrupt fixture adopts", interrupted)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    expect_profile_layout(pool, mount, interrupted, "15 adoption")
-    gate = os.path.join(root, "interrupt-gate")
-    exec_child = start_child(
-        proof,
-        [proof.binary, "exec", "--", gated_tool, gate],
-        interrupted,
-        proof.env,
-    )
-    try:
-        wait_for(f"{gate}.started", "15 the gated tool started")
-        exec_child.send_signal(signal.SIGINT)
-        # The leader exits on the forwarded signal; the surviving group member
-        # ignores it, so the exec process must still be running and `status`
-        # must still name the holder.
-        deadline = time.monotonic() + min(40, work_left())
-        held = False
-        while time.monotonic() < deadline:
-            code, stdout, stderr = proof.oxide(
-                ["status"], "15 status while the group member lives", interrupted
-            )
-            expect(code == 0, stderr)
-            if "exec " in stdout:
-                held = True
-                break
-            time.sleep(0.2)
-        expect(
-            held,
-            "15: the interrupted exec's lease was not held while its group member lived",
+    def case_15() -> None:
+        # 15: Ctrl-C reaches the tool's group; the lease stays held while a group
+        # member outlives the leader, and the slot is released once the group is
+        # empty and a later build proceeds.
+        interrupted = fresh_checkout(proof, root, "exec-interrupt")
+        code, _, stderr = proof.oxide(["build"], "15 interrupt fixture adopts", interrupted)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        expect_profile_layout(pool, mount, interrupted, "15 adoption")
+        gate = os.path.join(root, "interrupt-gate")
+        exec_child = start_child(
+            proof,
+            [proof.binary, "exec", "--", gated_tool, gate],
+            interrupted,
+            proof.env,
         )
-        expect(exec_child.poll() is None, "15: the exec returned before its group closed")
-        with open(f"{gate}.release", "wb") as handle:
-            handle.write(b"release")
-        code, stdout, stderr = finish_child(proof, exec_child, "15 the interrupted exec")
-        exec_child = None
-    finally:
-        if not os.path.exists(f"{gate}.release"):
+        try:
+            wait_for(f"{gate}.started", "15 the gated tool started")
+            exec_child.send_signal(signal.SIGINT)
+            # The leader exits on the forwarded signal; the surviving group member
+            # ignores it, so the exec process must still be running and `status`
+            # must still name the holder.
+            deadline = time.monotonic() + min(40, work_left())
+            held = False
+            while time.monotonic() < deadline:
+                code, stdout, stderr = proof.oxide(
+                    ["status"], "15 status while the group member lives", interrupted
+                )
+                expect(code == 0, stderr)
+                if "exec " in stdout:
+                    held = True
+                    break
+                time.sleep(0.2)
+            expect(
+                held,
+                "15: the interrupted exec's lease was not held while its group member lived",
+            )
+            expect(exec_child.poll() is None, "15: the exec returned before its group closed")
             with open(f"{gate}.release", "wb") as handle:
                 handle.write(b"release")
-        if exec_child is not None and exec_child.poll() is None:
-            exec_child.kill()
-    expect(code != 0, f"15: an interrupted exec reported success: {stdout}")
-    code, _, stderr = proof.oxide(["build"], "15 the slot is released after the group closes", interrupted)
-    expect(code == 0, stderr)
-    phase(proof, "after the interrupt control")
+            code, stdout, stderr = finish_child(proof, exec_child, "15 the interrupted exec")
+            exec_child = None
+        finally:
+            if not os.path.exists(f"{gate}.release"):
+                with open(f"{gate}.release", "wb") as handle:
+                    handle.write(b"release")
+            if exec_child is not None and exec_child.poll() is None:
+                exec_child.kill()
+        expect(code != 0, f"15: an interrupted exec reported success: {stdout}")
+        code, _, stderr = proof.oxide(["build"], "15 the slot is released after the group closes", interrupted)
+        expect(code == 0, stderr)
+        phase(proof, "after the interrupt control")
 
-    # 19: a live checkout whose receipt is still the committed version-1
-    # whole-target shape (oxide#163). Every failing reader refuses it and names
-    # adopt, `status` reports the same refusal in its own report grammar, and
-    # the one explicit adopt upgrades it through the shipped layout migration
-    # with the old outputs intact.
-    live = fresh_checkout(proof, root, "legacy-v1")
-    (v1_root, v1_created_ms, v1_generation) = version_one_whole_target(
-        proof, pool, mount, live, "19 v1 fixture"
-    )
-    v1_target = os.path.join(live, "target")
-    v1_receipt = receipt_file(pool, live)
-    v1_before = file_proof(v1_receipt)
-    root_before = tree_digest(v1_root)
-    for arguments, reader in (
-        (["build"], "bind/lease"),
-        (["outputs", "detach"], "detach"),
-        (["clean"], "clean"),
-    ):
-        code, _, stderr = proof.oxide(
-            arguments, f"19 {reader} refuses a version-1 receipt", live
+    def case_19() -> None:
+        nonlocal root_before, debug_link, release_link
+        # 19: a live checkout whose receipt is still the committed version-1
+        # whole-target shape (oxide#163). Every failing reader refuses it and names
+        # adopt, `status` reports the same refusal in its own report grammar, and
+        # the one explicit adopt upgrades it through the shipped layout migration
+        # with the old outputs intact.
+        live = fresh_checkout(proof, root, "legacy-v1")
+        (v1_root, v1_created_ms, v1_generation) = version_one_whole_target(
+            proof, pool, mount, live, "19 v1 fixture"
         )
-        expect(code != 0, f"19: {reader} accepted a version-1 receipt\n{stderr}")
+        v1_target = os.path.join(live, "target")
+        v1_receipt = receipt_file(pool, live)
+        v1_before = file_proof(v1_receipt)
+        root_before = tree_digest(v1_root)
+        for arguments, reader in (
+            (["build"], "bind/lease"),
+            (["outputs", "detach"], "detach"),
+            (["clean"], "clean"),
+        ):
+            code, _, stderr = proof.oxide(
+                arguments, f"19 {reader} refuses a version-1 receipt", live
+            )
+            expect(code != 0, f"19: {reader} accepted a version-1 receipt\n{stderr}")
+            expect(
+                "unsupported version" in stderr and "oxide.outputs.transition/1" in stderr,
+                f"19: {reader} did not name the version: {stderr}",
+            )
+            expect(
+                "oxide outputs adopt" in stderr,
+                f"19: {reader} did not name the fix: {stderr}",
+            )
+            expect(file_proof(v1_receipt) == v1_before, f"19: {reader} rewrote the receipt")
+            expect(tree_digest(v1_root) == root_before, f"19: {reader} changed the root")
+            expect(
+                os.path.islink(v1_target) and os.readlink(v1_target) == v1_root,
+                f"19: {reader} changed the whole-target link",
+            )
+        # `status` never fails on an unreadable receipt: recorded status reads no
+        # checkout state at all (it says so), and measured status renders the same
+        # refusal as unknown outputs. Both exit 0 and change nothing.
+        code, stdout, stderr = proof.oxide(
+            ["status"], "19 recorded status does not read the version-1 receipt", live
+        )
+        expect(code == 0, f"19: recorded status exited {code}: {stdout}{stderr}")
         expect(
-            "unsupported version" in stderr and "oxide.outputs.transition/1" in stderr,
-            f"19: {reader} did not name the version: {stderr}",
+            "outputs: not measured by status" in stdout,
+            f"19: recorded status read the checkout receipt: {stdout}{stderr}",
         )
         expect(
-            "oxide outputs adopt" in stderr,
-            f"19: {reader} did not name the fix: {stderr}",
+            "unsupported version" not in stdout + stderr,
+            f"19: recorded status reported the receipt: {stdout}{stderr}",
         )
-        expect(file_proof(v1_receipt) == v1_before, f"19: {reader} rewrote the receipt")
-        expect(tree_digest(v1_root) == root_before, f"19: {reader} changed the root")
+        code, stdout, stderr = proof.oxide(
+            ["status", "--measure"], "19 measured status reports the version-1 refusal", live
+        )
+        expect(code == 0, f"19: measured status exited {code}: {stdout}{stderr}")
+        expect(
+            "outputs: unknown" in stdout,
+            f"19: measured status did not report unknown outputs: {stdout}{stderr}",
+        )
+        expect(
+            "unsupported version" in stdout and "oxide.outputs.transition/1" in stdout,
+            f"19: measured status did not name the version: {stdout}{stderr}",
+        )
+        expect(
+            "oxide outputs adopt" in stdout,
+            f"19: measured status did not name the fix: {stdout}{stderr}",
+        )
+        expect(file_proof(v1_receipt) == v1_before, "19: status rewrote the receipt")
+        expect(tree_digest(v1_root) == root_before, "19: status changed the root")
         expect(
             os.path.islink(v1_target) and os.readlink(v1_target) == v1_root,
-            f"19: {reader} changed the whole-target link",
+            "19: status changed the whole-target link",
         )
-    # `status` never fails on an unreadable receipt: recorded status reads no
-    # checkout state at all (it says so), and measured status renders the same
-    # refusal as unknown outputs. Both exit 0 and change nothing.
-    code, stdout, stderr = proof.oxide(
-        ["status"], "19 recorded status does not read the version-1 receipt", live
-    )
-    expect(code == 0, f"19: recorded status exited {code}: {stdout}{stderr}")
-    expect(
-        "outputs: not measured by status" in stdout,
-        f"19: recorded status read the checkout receipt: {stdout}{stderr}",
-    )
-    expect(
-        "unsupported version" not in stdout + stderr,
-        f"19: recorded status reported the receipt: {stdout}{stderr}",
-    )
-    code, stdout, stderr = proof.oxide(
-        ["status", "--measure"], "19 measured status reports the version-1 refusal", live
-    )
-    expect(code == 0, f"19: measured status exited {code}: {stdout}{stderr}")
-    expect(
-        "outputs: unknown" in stdout,
-        f"19: measured status did not report unknown outputs: {stdout}{stderr}",
-    )
-    expect(
-        "unsupported version" in stdout and "oxide.outputs.transition/1" in stdout,
-        f"19: measured status did not name the version: {stdout}{stderr}",
-    )
-    expect(
-        "oxide outputs adopt" in stdout,
-        f"19: measured status did not name the fix: {stdout}{stderr}",
-    )
-    expect(file_proof(v1_receipt) == v1_before, "19: status rewrote the receipt")
-    expect(tree_digest(v1_root) == root_before, "19: status changed the root")
-    expect(
-        os.path.islink(v1_target) and os.readlink(v1_target) == v1_root,
-        "19: status changed the whole-target link",
-    )
-    phase(proof, "after the version-1 refusals")
+        phase(proof, "after the version-1 refusals")
 
-    # The noncommitted version-1 control: no adopt, no target, no byte change.
-    uncommitted = fresh_checkout(proof, root, "legacy-v1-detached")
-    uncommitted_receipt = detached_version_one(pool, uncommitted)
-    uncommitted_before = file_proof(uncommitted_receipt)
-    code, _, stderr = proof.oxide(
-        ["outputs", "adopt"], "19 adopt refuses a noncommitted version-1 receipt", uncommitted
-    )
-    expect(code != 0, f"19: adopt accepted a noncommitted version-1 receipt\n{stderr}")
-    expect(
-        "only a committed version-1 receipt can be upgraded" in stderr and "detached" in stderr,
-        stderr,
-    )
-    expect(
-        file_proof(uncommitted_receipt) == uncommitted_before,
-        "19: the refused adopt rewrote the noncommitted receipt",
-    )
-    expect(
-        not os.path.lexists(os.path.join(uncommitted, "target")),
-        "19: the refused adopt created a target",
-    )
-    phase(proof, "after the noncommitted version-1 control")
+        # The noncommitted version-1 control: no adopt, no target, no byte change.
+        uncommitted = fresh_checkout(proof, root, "legacy-v1-detached")
+        uncommitted_receipt = detached_version_one(pool, uncommitted)
+        uncommitted_before = file_proof(uncommitted_receipt)
+        code, _, stderr = proof.oxide(
+            ["outputs", "adopt"], "19 adopt refuses a noncommitted version-1 receipt", uncommitted
+        )
+        expect(code != 0, f"19: adopt accepted a noncommitted version-1 receipt\n{stderr}")
+        expect(
+            "only a committed version-1 receipt can be upgraded" in stderr and "detached" in stderr,
+            stderr,
+        )
+        expect(
+            file_proof(uncommitted_receipt) == uncommitted_before,
+            "19: the refused adopt rewrote the noncommitted receipt",
+        )
+        expect(
+            not os.path.lexists(os.path.join(uncommitted, "target")),
+            "19: the refused adopt created a target",
+        )
+        phase(proof, "after the noncommitted version-1 control")
 
-    # The upgrade: one explicit adopt, the shipped migration, the current
-    # receipt, the same root and the old outputs still there.
-    code, stdout, stderr = proof.oxide(
-        ["outputs", "adopt"], "19 explicit adopt upgrades the version-1 receipt", live
-    )
-    expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
-    upgraded_root = expect_profile_layout(pool, mount, live, "19 upgrade")
-    expect(
-        upgraded_root == v1_root,
-        f"19: the upgrade selected {upgraded_root}, not the recorded root {v1_root}",
-    )
-    marker = read_json(os.path.join(v1_root, MARKER))
-    expect(marker["version"] == "oxide.outputs.root/2", f"19: the marker is {marker}")
-    expect(
-        isinstance(marker.get("nonce"), str) and len(marker["nonce"]) == 32,
-        f"19: the upgraded marker has no 128-bit nonce: {marker}",
-    )
-    expect(
-        marker["created_ms"] == v1_created_ms,
-        "19: the upgrade rewrote the root's creation timestamp",
-    )
-    receipt = read_json(v1_receipt)
-    expect(
-        receipt["version"] == "oxide.outputs.transition/3"
-        and receipt["layout"] == "profile"
-        and receipt["state"] == "committed",
-        f"19: the upgraded receipt is not the current profile shape: {receipt}",
-    )
-    expect(
-        receipt["generation"] == v1_generation + 1,
-        f"19: the upgrade advanced {v1_generation} to {receipt['generation']}",
-    )
-    expect(
-        sorted(placement["member"] for placement in receipt["links"]) == ["debug", "release"],
-        f"19: the upgraded receipt places {receipt['links']}",
-    )
-    expect(
-        read_bytes(os.path.join(v1_root, "sentinel")) == b"root",
-        "19: the upgrade lost the root's old payload",
-    )
-    expect(
-        read_bytes(os.path.join(v1_target, "debug", "old-artifact")) == b"old",
-        "19: the old output is not visible through the migrated member link",
-    )
-    debug_link = member_link_target(live, "debug")
-    release_link = member_link_target(live, "release")
-    receipt_after = read_bytes(v1_receipt)
+        # The upgrade: one explicit adopt, the shipped migration, the current
+        # receipt, the same root and the old outputs still there.
+        code, stdout, stderr = proof.oxide(
+            ["outputs", "adopt"], "19 explicit adopt upgrades the version-1 receipt", live
+        )
+        expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
+        upgraded_root = expect_profile_layout(pool, mount, live, "19 upgrade")
+        expect(
+            upgraded_root == v1_root,
+            f"19: the upgrade selected {upgraded_root}, not the recorded root {v1_root}",
+        )
+        marker = read_json(os.path.join(v1_root, MARKER))
+        expect(marker["version"] == "oxide.outputs.root/2", f"19: the marker is {marker}")
+        expect(
+            isinstance(marker.get("nonce"), str) and len(marker["nonce"]) == 32,
+            f"19: the upgraded marker has no 128-bit nonce: {marker}",
+        )
+        expect(
+            marker["created_ms"] == v1_created_ms,
+            "19: the upgrade rewrote the root's creation timestamp",
+        )
+        receipt = read_json(v1_receipt)
+        expect(
+            receipt["version"] == "oxide.outputs.transition/3"
+            and receipt["layout"] == "profile"
+            and receipt["state"] == "committed",
+            f"19: the upgraded receipt is not the current profile shape: {receipt}",
+        )
+        expect(
+            receipt["generation"] == v1_generation + 1,
+            f"19: the upgrade advanced {v1_generation} to {receipt['generation']}",
+        )
+        expect(
+            sorted(placement["member"] for placement in receipt["links"]) == ["debug", "release"],
+            f"19: the upgraded receipt places {receipt['links']}",
+        )
+        expect(
+            read_bytes(os.path.join(v1_root, "sentinel")) == b"root",
+            "19: the upgrade lost the root's old payload",
+        )
+        expect(
+            read_bytes(os.path.join(v1_target, "debug", "old-artifact")) == b"old",
+            "19: the old output is not visible through the migrated member link",
+        )
+        debug_link = member_link_target(live, "debug")
+        release_link = member_link_target(live, "release")
+        receipt_after = read_bytes(v1_receipt)
 
-    # A leased build and an exec now work in the upgraded checkout, without
-    # relinking anything and without rewriting the receipt.
-    code, _, stderr = proof.oxide(["build"], "19 the upgraded checkout builds", live)
-    expect(code == 0, stderr)
-    expect(
-        member_link_target(live, "debug") == debug_link
-        and member_link_target(live, "release") == release_link,
-        "19: the build relinked an upgraded member",
-    )
-    expect(
-        os.path.isfile(os.path.join(v1_target, "debug", "poutputs")),
-        "19: the build wrote no binary through the upgraded member link",
-    )
-    expect(
-        read_bytes(os.path.join(v1_target, "debug", "old-artifact")) == b"old",
-        "19: the build lost the old output",
-    )
-    code, _, stderr = proof.oxide(["exec", "--", "/usr/bin/true"], "19 the upgraded checkout execs", live)
-    expect(code == 0, stderr)
-    expect("through profile member links" in stderr, stderr)
-    expect(read_bytes(v1_receipt) == receipt_after, "19: a command rewrote the upgraded receipt")
-    plan_report = plan(proof, live, "19 the upgraded checkout plans the profile layout")
-    expect(plan_report["layout"] == "profile", f"19: the plan reports {plan_report['layout']}")
-    phase(proof, "after the version-1 upgrade")
+        # A leased build and an exec now work in the upgraded checkout, without
+        # relinking anything and without rewriting the receipt.
+        code, _, stderr = proof.oxide(["build"], "19 the upgraded checkout builds", live)
+        expect(code == 0, stderr)
+        expect(
+            member_link_target(live, "debug") == debug_link
+            and member_link_target(live, "release") == release_link,
+            "19: the build relinked an upgraded member",
+        )
+        expect(
+            os.path.isfile(os.path.join(v1_target, "debug", "poutputs")),
+            "19: the build wrote no binary through the upgraded member link",
+        )
+        expect(
+            read_bytes(os.path.join(v1_target, "debug", "old-artifact")) == b"old",
+            "19: the build lost the old output",
+        )
+        code, _, stderr = proof.oxide(["exec", "--", "/usr/bin/true"], "19 the upgraded checkout execs", live)
+        expect(code == 0, stderr)
+        expect("through profile member links" in stderr, stderr)
+        expect(read_bytes(v1_receipt) == receipt_after, "19: a command rewrote the upgraded receipt")
+        plan_report = plan(proof, live, "19 the upgraded checkout plans the profile layout")
+        expect(plan_report["layout"] == "profile", f"19: the plan reports {plan_report['layout']}")
+        phase(proof, "after the version-1 upgrade")
 
-    proof.detach()
+    def case_20() -> None:
+        # 20 (oxide#165): a converted checkout whose `target` directory was deleted
+        # — what a task-local build-output cleanup, or a manual `rm -rf target`,
+        # does — must not be a checkout that can never build again. Every leased
+        # command used to fail before compiling with ENOENT while creating the
+        # transition link inside the absent directory. The binding now recreates
+        # that one real directory exclusively and republishes the owned pair
+        # through the existing transition, into the SAME root: the receipt's
+        # committed root and nonce and the root's payload survive.
+        deleted = fresh_checkout(proof, root, "deleted-target")
+        code, _, stderr = proof.oxide(["build"], "20 deleted-target fixture adopts", deleted)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        deleted_root = expect_profile_layout(pool, mount, deleted, "20 adoption")
+        with open(os.path.join(deleted_root, "sentinel"), "wb") as handle:
+            handle.write(b"kept")
+        with open(os.path.join(deleted_root, "debug", "old-output"), "wb") as handle:
+            handle.write(b"old")
+        deleted_receipt = read_json(receipt_file(pool, deleted))
+        deleted_selected = next(
+            (
+                placement["selected"]
+                for placement in deleted_receipt["links"]
+                if placement.get("selected")
+            ),
+            None,
+        )
+        expect(deleted_selected is not None, "20: the fixture's receipt selects no root")
+        deleted_target = os.path.join(deleted, "target")
+        expect(
+            os.path.isdir(deleted_target) and not os.path.islink(deleted_target),
+            "20: the fixture's target is not a real directory",
+        )
+        shutil.rmtree(deleted_target)
+        expect(not os.path.lexists(deleted_target), "20: the fixture's target was not deleted")
+        code, _, stderr = proof.oxide(
+            ["build"], "20 a build recreates the deleted target directory", deleted
+        )
+        expect(code == 0, f"20: a leased build failed on the deleted target directory: {stderr}")
+        expect(
+            "through profile member links" in stderr,
+            f"20: the build did not bind the owned profile members: {stderr}",
+        )
+        # The deleted directory is back as a real directory, and this command's own
+        # `debug` member is republished into the SAME root the receipt records.
+        # `release` is not this build's member: the derived `exec` below places it.
+        expect(
+            os.path.isdir(deleted_target) and not os.path.islink(deleted_target),
+            "20: the build did not recreate a real target directory",
+        )
+        expect(
+            member_link_target(deleted, "debug") == os.path.join(deleted_root, "debug"),
+            f"20: the recreated debug link does not select the recorded root: "
+            f"{os.readlink(os.path.join(deleted_target, 'debug'))}",
+        )
+        expect(
+            os.path.isfile(os.path.join(deleted_root, "debug", "poutputs")),
+            "20: the build wrote no binary through the recreated member link",
+        )
+        expect(
+            read_bytes(os.path.join(deleted_root, "sentinel")) == b"kept",
+            "20: the recreation lost the root's old file",
+        )
+        expect(
+            read_bytes(os.path.join(deleted_root, "debug", "old-output")) == b"old",
+            "20: the recreation lost the root's old output",
+        )
+        recreated_receipt = read_json(receipt_file(pool, deleted))
+        expect(
+            recreated_receipt["layout"] == "profile" and recreated_receipt["state"] == "committed",
+            f"20: the receipt is not a committed profile receipt: {recreated_receipt}",
+        )
+        for placement in recreated_receipt["links"]:
+            expect(
+                placement.get("selected") is not None
+                and placement["selected"]["root"] == deleted_selected["root"]
+                and placement["selected"].get("nonce") == deleted_selected.get("nonce"),
+                f"20: {placement['member']} moved off the recorded root or nonce: {placement}",
+            )
+        code, _, stderr = proof.oxide(
+            ["exec", "--", "/usr/bin/true"], "20 an exec after the recreation", deleted
+        )
+        expect(code == 0, f"20: an exec failed after the recreation: {stderr}")
+        expect("through profile member links" in stderr, stderr)
+        # The derived `exec` places every member its receipt records through the
+        # recreated directory, so the whole owned pair is live again in one root.
+        exec_root = expect_profile_layout(pool, mount, deleted, "20 recreation")
+        expect(
+            exec_root == deleted_root,
+            f"20: the exec bound {exec_root}, not the recorded root {deleted_root}",
+        )
+        expect(
+            read_bytes(os.path.join(deleted_root, "debug", "old-output")) == b"old",
+            "20: the exec lost the root's old output",
+        )
+        phase(proof, "after the deleted target recreation")
+
+    bodies = {
+        "s4b": case_s4b,
+        "01": case_01,
+        "02": case_02,
+        "03": case_03,
+        "04": case_04,
+        "05": case_05,
+        "06": case_06,
+        "07+14": case_07_14,
+        "08": case_08,
+        "09": case_09,
+        "16": case_16,
+        "17": case_17,
+        "18": case_18,
+        "13": case_13,
+        "10": case_10,
+        "12": case_12,
+        "11": case_11,
+        "15": case_15,
+        "19": case_19,
+        "20": case_20,
+    }
+    expect(
+        sorted(bodies) == sorted(case for case, _requires, _text in EXEC_CASES),
+        "the exec-inference case table and the case bodies disagree",
+    )
+    cases = [(case, requires, bodies[case]) for case, requires, _text in EXEC_CASES]
+
+    def after_case(case: str) -> None:
+        require_case_custody(
+            unclosed=proof.unclosed,
+            mount=mount,
+            registration=registration_path(pool),
+            case=case,
+        )
+        require_case_resources(peak_bytes=proof.peak, low_bytes=proof.low, case=case)
+
+    # Filled in place: a fault that escapes the collector still leaves every
+    # case already reached and every failure already recorded in the receipt.
+    collect_cases(
+        cases,
+        diagnostic=diagnostic,
+        work_left=guard_work_left,
+        after_case=after_case if diagnostic else None,
+        record=collection,
+    )
+    if not diagnostic:
+        # The counted run is fail-fast: a fault has already propagated, so a
+        # clean return means every case completed.
+        expect(
+            not collection.failures and collection.aborted is None,
+            "the counted collection did not complete",
+        )
+        proof.detach()
+        return
+    # The owned image is this run's custody. A collection that recorded no
+    # failure and did not abort makes exactly one ordinary detach and verifies
+    # the mount is gone; a failed detach raises into the existing failure
+    # cleanup, which makes that same single attempt and keeps the evidence.
+    if not collection.failures and collection.aborted is None:
+        proof.detach()
+        expect(
+            not os.path.ismount(mount),
+            f"the owned image is still mounted at {mount} after its ordinary detach",
+        )
+        expect(
+            not proof.unclosed,
+            f"unclosed children after detach: {sorted(proof.unclosed)}",
+        )
+        collection.detached = "ordinary detach through Proof.detach; mount absent"
+        collection.mount_present = os.path.lexists(mount)
+    if collection.failures or collection.aborted:
+        fail(
+            "exec-inference cases did not all complete: "
+            + json.dumps(
+                {
+                    "failures": collection.failures,
+                    "aborted": collection.aborted,
+                    "cases": collection.outcomes,
+                }
+            )
+        )
+
+
+def exec_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
+    """One exec-inference run. The counted run is fail-fast and detaches once at
+    the end; the uncounted diagnostic collects every case, detaches only when it
+    recorded no failure and did not abort, and always writes its bounded receipt
+    — including when the run fails or aborts before the first case ran."""
+    collection = Collection()
+    failure: BaseException | None = None
+    try:
+        exec_inference(proof, repo, diagnostic, collection)
+    except BaseException as error:
+        failure = error
+        if diagnostic and collection.aborted is None:
+            # The collection latches its own abort and records its own failures;
+            # anything that escaped it (an interrupt, staging, the image, the
+            # drive registration, the detach check) is named here, so the
+            # receipt never implies a clean run.
+            where = (
+                "after the last recorded case"
+                if collection.outcomes
+                else "before the first case"
+            )
+            collection.aborted = f"{where}: {error!r}"
+        raise
+    finally:
+        if diagnostic:
+            finish_diagnostic(proof, collection, failure)
 
 
 UNCONVERTED_NOTICE = "not converted to owned outputs"
@@ -3594,10 +4720,6 @@ UNCONVERTED_NOTICE = "not converted to owned outputs"
 def unconverted_notices(stderr: str) -> list[str]:
     """The one notice an unconverted checkout prints in permanent mode."""
     return [line for line in stderr.splitlines() if UNCONVERTED_NOTICE in line]
-
-
-class IneligibleAbort(RuntimeError):
-    """An outcome the keep-going diagnostic must not continue past."""
 
 
 def guard_work_left() -> float:
@@ -4093,6 +5215,20 @@ def main() -> int:
         )
         plan_exec_inference()
         return 0
+    # `--self-test` is the pure apparatus check of the keep-going collection: it
+    # stages nothing, starts no child and touches no scratch, image or pool.
+    if "--self-test" in sys.argv[1:]:
+        expect(
+            [argument for argument in sys.argv[1:] if argument != "--self-test"] == ["exec-inference"],
+            "only the exec-inference mode has a --self-test",
+        )
+        exec_self_test()
+        print(
+            "exec-inference apparatus self-test passed: case outcomes, dependency "
+            "skips, keep-going, abort latching and the receipt document "
+            "(no scratch, child, toolchain or image)"
+        )
+        return 0
     if sys.platform != "darwin":
         fail("the permanent-outputs proof requires macOS")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
@@ -4108,8 +5244,9 @@ def main() -> int:
     # (oxide#121), `detach-permanent` (oxide#124), `ignore-safety` (oxide#125),
     # `exec-inference` (oxide#160) and `auto-ineligible` (oxide#154). No
     # argument runs the full #117 scenario. `--diagnostic` appends the
-    # uncounted collection to `exec-inference` (first-fault) or to
-    # `auto-ineligible` (keep-going); it is never a counted native PASS.
+    # uncounted keep-going collection to `exec-inference` or to
+    # `auto-ineligible`; it is never a counted native PASS. `--self-test` is the
+    # pure apparatus check of that collection and touches nothing.
     arguments = list(sys.argv[1:])
     diagnostic = "--diagnostic" in arguments
     if diagnostic:
@@ -4123,7 +5260,10 @@ def main() -> int:
         ("auto-adopt",): (auto_run, "auto-adopt"),
         ("detach-permanent",): (detach_run, "detach-permanent"),
         ("ignore-safety",): (ignore_run, "ignore-safety"),
-        ("exec-inference",): (exec_run, "exec-inference"),
+        ("exec-inference",): (
+            lambda proof, repo: exec_run(proof, repo, diagnostic),
+            "exec-inference",
+        ),
         ("auto-ineligible",): (
             lambda proof, repo: auto_ineligible_run(proof, repo, diagnostic),
             "auto-ineligible",
@@ -4137,34 +5277,6 @@ def main() -> int:
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
-    if diagnostic and tuple(arguments) == ("exec-inference",):
-        try:
-            scenario(proof, repo)
-        except BaseException as failure:
-            receipt = write_diagnostic(proof, label, repr(failure))
-            cleanup = cleanup_after_failure(proof)
-            record(
-                "result.txt",
-                f"diagnostic failed (uncounted): {failure!r}\n"
-                f"bounded receipt: {receipt}\nunclosed children: {sorted(proof.unclosed)}\n"
-                f"root: {root}\ncleanup: {cleanup}\n",
-            )
-            print(
-                f"{label} uncounted diagnostic stopped at the first fault; "
-                f"bounded receipt {receipt} in the evidence directory; "
-                f"scratch {root} left to the shared supervisor",
-                file=sys.stderr,
-            )
-            raise
-        receipt = write_diagnostic(proof, label, None)
-        elapsed = time.monotonic() - layout.runner.STARTED
-        line = (
-            f"{label} uncounted diagnostic reached every case ({elapsed:.0f} s); "
-            f"bounded receipt {receipt}; qualified: false - never a counted PASS"
-        )
-        record("result.txt", f"{line}\n")
-        print(line)
-        return 0
     try:
         scenario(proof, repo)
     except BaseException as failure:

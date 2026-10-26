@@ -928,9 +928,22 @@ fn ensure_member_ancestors(context: &Context, link: &Path) -> Result<(), String>
     let target = context.link();
     // The legacy whole-target placement IS the target directory, and a
     // one-component profile member sits directly in it: neither needs an
-    // ancestor.
+    // ancestor, but every profile member is published inside the real target
+    // directory, so that root itself is inspected first (oxide#165).
     if link == target.as_path() {
         return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&target).map_err(|error| {
+        format!(
+            "cannot inspect {}: {error}; a profile member is placed only inside a real target directory",
+            target.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} is not a real directory; a profile member is placed only inside one",
+            target.display()
+        ));
     }
     let Some(parent) = link.parent() else {
         return Ok(());
@@ -945,18 +958,6 @@ fn ensure_member_ancestors(context: &Context, link: &Path) -> Result<(), String>
             target.display()
         )
     })?;
-    let metadata = fs::symlink_metadata(&target).map_err(|error| {
-        format!(
-            "cannot inspect {}: {error}; a profile member is placed only inside a real target directory",
-            target.display()
-        )
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(format!(
-            "{} is not a real directory; a profile member is placed only inside one",
-            target.display()
-        ));
-    }
     let mut current = target.clone();
     for component in relative.components() {
         current.push(component.as_os_str());
@@ -1003,6 +1004,103 @@ fn ensure_member_ancestors(context: &Context, link: &Path) -> Result<(), String>
             Err(error) => return Err(format!("cannot inspect {}: {error}", current.display())),
         }
     }
+    Ok(())
+}
+
+/// Recreate a profile checkout's real `target` directory when it is
+/// positively absent (oxide#165).
+///
+/// The profile layout keeps `<checkout>/target` itself a real directory and
+/// publishes its owned member links inside it, so a checkout whose `target`
+/// was deleted (a manual `rm -rf target`, a task-local build-output cleanup)
+/// would otherwise fail every leased command with ENOENT while creating the
+/// transition link, and never recreate the directory. The create is one
+/// exclusive `mkdirat` beneath the checkout's own directory descriptor, so the
+/// final component is never followed and an entry that appeared since the
+/// caller's classification is never replaced; only a real directory counts as
+/// that concurrent creator's result. The caller holds this checkout's binding
+/// mutex and has cleared writer custody, so no cooperative command can be
+/// racing this, and the missing-member transitions run immediately after it.
+fn recreate_target_directory(checkout: &Path) -> Result<(), String> {
+    let target = checkout.join("target");
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(checkout)
+        .map_err(|error| format!("cannot open {}: {error}", checkout.display()))?;
+    let named = fs::symlink_metadata(checkout)
+        .map_err(|error| format!("cannot inspect {}: {error}", checkout.display()))?;
+    let opened = directory
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", checkout.display()))?;
+    // A checkout path swapped for another directory between the classification
+    // and this open is refused: the new directory is never written into.
+    if !opened.is_dir() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(format!(
+            "{} changed while it was being opened",
+            checkout.display()
+        ));
+    }
+    let name = std::ffi::CString::new("target").expect("the fixed name has no NUL");
+    // SAFETY: `directory` is a live descriptor for the checkout directory and
+    // `name` is a live NUL-terminated string that outlives the call.
+    let status = unsafe {
+        libc::mkdirat(
+            std::os::unix::io::AsRawFd::as_raw_fd(&directory),
+            name.as_ptr(),
+            0o700,
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("cannot create {}: {error}", target.display()));
+        }
+        // Something appeared between the classification and this exclusive
+        // create. It is the same state the classification accepts when it is
+        // already there — a real directory — or a refusal; a link, a file or
+        // any other entry is never replaced or followed.
+        return match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+            Ok(_) => Err(format!(
+                "{} appeared while the missing target directory was being recreated and is not a real directory; it is never replaced",
+                target.display()
+            )),
+            Err(error) => Err(format!("cannot inspect {}: {error}", target.display())),
+        };
+    }
+    // Widen to the mode a conversion creates (oxide#121, oxide#133), through
+    // the new directory's own descriptor so nothing else at that path is ever
+    // chmod'ed.
+    // SAFETY: `directory` is a live descriptor and the path is a fixed,
+    // NUL-terminated single component.
+    let created = unsafe {
+        libc::openat(
+            std::os::unix::io::AsRawFd::as_raw_fd(&directory),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if created < 0 {
+        return Err(format!(
+            "cannot open the recreated {}: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `created` is a newly owned descriptor.
+    let created = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(created) };
+    if unsafe { libc::fchmod(std::os::unix::io::AsRawFd::as_raw_fd(&created), 0o755) } != 0 {
+        return Err(format!(
+            "cannot set permissions on the recreated {}: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    drop(created);
+    directory
+        .sync_all()
+        .map_err(|error| format!("cannot sync {}: {error}", checkout.display()))?;
     Ok(())
 }
 
@@ -4622,6 +4720,27 @@ fn bind_profile(
     let mut absent: Vec<(String, Selected)> = Vec::new();
     let mut real: Vec<String> = Vec::new();
     let mut owned_root: Option<PathBuf> = None;
+    // oxide#165: the profile layout keeps `<checkout>/target` itself a real
+    // directory, and its owned member links are published inside it. A
+    // committed profile receipt whose target directory was deleted (a manual
+    // `rm -rf target`, a task-local build-output cleanup) must never be a
+    // checkout whose every command fails with ENOENT from the transition link:
+    // the binding recreates that one real directory exclusively before the
+    // first missing-member transition publishes into it. Anything else at that
+    // path — a link of any kind, a file or another type — still refuses and is
+    // never replaced or followed.
+    let recreate_target = match context.target() {
+        Ok(TargetState::RealEmpty | TargetState::RealNonEmpty) => false,
+        Ok(TargetState::Missing) => true,
+        Ok(state) => {
+            return Bind::Refuse(format!(
+                "outputs: this checkout places outputs at profile members inside a real target directory, but {} is {}; it is never replaced or followed. Nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                context.link().display(),
+                state.label()
+            ))
+        }
+        Err(reason) => return Bind::Refuse(reason),
+    };
     for planned in &plan.members {
         let link = link_path(&context.workspace, &planned.member);
         let state = match link_state(&link, &context.workspace, &context.checkout_id) {
@@ -4836,6 +4955,18 @@ fn bind_profile(
             }
             Ok(CheckoutCustody::Writers) => return Bind::Wait,
             Ok(CheckoutCustody::Clear) => {}
+        }
+        // The missing member links live inside the target directory this layout
+        // keeps real, so a positively absent one is recreated before the first
+        // transition publishes inside it (oxide#165). The create is exclusive
+        // and never replaces or follows anything that appeared meanwhile.
+        if recreate_target {
+            if let Err(reason) = recreate_target_directory(&context.workspace) {
+                return Bind::Refuse(format!(
+                    "outputs: this checkout's profile members are placed inside the real target directory {}, which is absent and was not recreated: {reason}. Nothing was built",
+                    context.link().display()
+                ));
+            }
         }
         let mut current = receipt.clone();
         for (member, wanted) in &needed {
@@ -5284,9 +5415,12 @@ pub fn exec_declaration(
 
 /// Classify every candidate profile member of a profile-layout checkout for a
 /// derived `exec` plan. Only this checkout's own owned links at the receipt's
-/// committed destinations are accepted; a real member the receipt keeps local
-/// is planned `real`; everything else that occupies a member-shaped path
-/// refuses before Cargo, with the link, receipt and root unchanged.
+/// committed destinations are accepted, plus the two absent-link shapes the
+/// permanent-mode binding repairs (an absent member directory beneath a
+/// verified root, oxide#162, and an absent member link of a verified root whose
+/// real `target` directory went with it, oxide#165); a real member the receipt
+/// keeps local is planned `real`; everything else that occupies a member-shaped
+/// path refuses before Cargo, with the link, receipt and root unchanged.
 fn exec_members(
     context: &Context,
     receipt: &Receipt,
@@ -5338,6 +5472,21 @@ fn exec_members(
                     let destination = member_destination(&desired.root, name);
                     match &state {
                         TargetState::OwnedLink(root) if root == &destination => {
+                            members.push(name.clone());
+                        }
+                        // oxide#165: the member link is positively ABSENT
+                        // while its committed destination's root fully
+                        // verifies — the shape a deleted `<checkout>/target`
+                        // directory leaves, because the member links live
+                        // inside it. The permanent-mode binding recreates that
+                        // real directory and publishes this member through the
+                        // unchanged transition (which creates the member
+                        // directory inside the root first). A missing,
+                        // unverified or other root keeps the refusal below.
+                        TargetState::Missing
+                            if permanent
+                                && missing_member_of_verified_root(context, receipt, desired) =>
+                        {
                             members.push(name.clone());
                         }
                         // The only absent-directory case a derived exec may
@@ -5400,6 +5549,22 @@ fn exec_members(
         }
     }
     Ok(members)
+}
+
+/// Whether a member link is positively ABSENT while the receipt's committed
+/// placement for it is a root that fully verifies right now (oxide#165). This
+/// is the shape a deleted `<checkout>/target` directory leaves: the member
+/// links lived inside it, so they are gone with it, while the owned root, its
+/// marker, its nonce and its payload are untouched. The permanent-mode binding
+/// recreates the target directory and publishes such a member; nothing is
+/// replaced or followed here. A missing, another-nonce or unverified root
+/// fails this check and keeps the existing refusal.
+fn missing_member_of_verified_root(
+    context: &Context,
+    receipt: &Receipt,
+    wanted: &Selected,
+) -> bool {
+    check_bound_root(context, receipt.generation, wanted).is_ok()
 }
 
 /// Whether this member link's only defect is its ABSENT destination directory
@@ -9280,6 +9445,90 @@ mod tests {
         }
     }
 
+    /// oxide#165: a converted checkout's whole `target` directory was deleted,
+    /// so every member link is positively absent while the owned root verifies.
+    /// The derived `exec` plans the receipt's members and the binding recreates
+    /// the real directory and republishes the pair into the same root; an
+    /// unverified root still refuses and creates nothing.
+    #[test]
+    fn exec_plans_deleted_member_links_of_the_verified_owned_root() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        register(&fixture, DriveMode::Permanent);
+        let context = fixture.context();
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (committed, selected, _) = adopt_profile(&context, receipt).unwrap();
+        let root = selected.root().to_path_buf();
+        fs::remove_dir_all(fixture.checkout.join("target")).unwrap();
+        assert_eq!(
+            target_state(&fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Missing
+        );
+        assert_eq!(derived_exec(&fixture), ["debug", "release"]);
+        let declaration =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            plan.members.iter().all(|member| member.selected.is_some()),
+            "the derived plan did not key the owned members"
+        );
+        let store = pool_store(&fixture.root.join("pool"));
+        let outcome = match bind_profile(&context, &store, 0, &committed, Some(&plan), true) {
+            Bind::Bound(outcome) => outcome,
+            Bind::Refuse(reason) => panic!("a deleted target directory refused: {reason}"),
+            Bind::Wait => panic!("a deleted target directory waited"),
+        };
+        assert_eq!(outcome.root.as_deref(), Some(root.as_path()));
+        let target = fixture.checkout.join("target");
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "the binding did not recreate a real target directory"
+        );
+        for member in ["debug", "release"] {
+            assert_eq!(
+                fs::read_link(target.join(member)).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
+            assert!(
+                root.join(member).is_dir(),
+                "{member}: the member directory is not real"
+            );
+        }
+
+        // Control: with the root's marker gone the root is not verified, so the
+        // absent links still refuse and nothing is created.
+        let unverified = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        register(&unverified, DriveMode::Permanent);
+        let unverified_context = unverified.context();
+        let unverified_receipt = Receipt::first_with(
+            &unverified.checkout,
+            &unverified_context.checkout_id,
+            LayoutKind::Profile,
+        );
+        let (_committed, unverified_selected, _) =
+            adopt_profile(&unverified_context, unverified_receipt).unwrap();
+        fs::remove_dir_all(unverified.checkout.join("target")).unwrap();
+        fs::remove_file(unverified_selected.root().join(MARKER)).unwrap();
+        let refused =
+            exec_declaration(Some(&unverified.control), &unverified.checkout, None).unwrap_err();
+        assert!(refused.contains("target/debug"), "{refused}");
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        assert_eq!(
+            target_state(&unverified.checkout, &unverified_context.checkout_id).unwrap(),
+            TargetState::Missing,
+            "a refused derived exec created the target directory"
+        );
+    }
+
     /// The same shape with a keyed plan whose nonce the root does not carry: a
     /// different root nonce is a contradiction, so nothing is created and the
     /// link stays dangling. The receipt and the link are unchanged.
@@ -11466,6 +11715,272 @@ mod tests {
             members.push(member);
         }
         assert_eq!(committed.links.len(), 3, "{members:?}");
+    }
+
+    /// oxide#165 counterfactual: with no recreate step, a converted checkout
+    /// whose `target` directory was deleted (`rm -rf target`, a task-local
+    /// build-output cleanup) fails inside the member transition with ENOENT on
+    /// the path beneath the absent directory and never recreates it. This is
+    /// the exact path the binding fix guards, driven directly here so the
+    /// failure mode stays recorded: the target is still absent afterwards and
+    /// the receipt is left prepared, which is why every later command kept
+    /// retrying and failing the same way.
+    #[test]
+    fn a_deleted_target_directory_fails_the_member_transition_with_enoent() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (committed, selected, _) = adopt_profile(&context, receipt).unwrap();
+        fs::remove_dir_all(context.link()).unwrap();
+        assert_eq!(
+            target_state(&fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Missing
+        );
+        let refused = transition_at(
+            &context,
+            &committed,
+            "debug",
+            &spec_for(&selected),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .expect_err("a member transition published a link inside an absent target");
+        assert!(refused.contains("No such file or directory"), "{refused}");
+        assert!(
+            refused.contains(&context.link().display().to_string()),
+            "{refused}"
+        );
+        assert_eq!(
+            target_state(&fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Missing,
+            "the failed transition recreated the target directory"
+        );
+        let after = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state,
+            ReceiptState::Prepared,
+            "the write-ahead receipt is gone"
+        );
+    }
+
+    /// oxide#165: a converted checkout's `target` directory was deleted. The
+    /// binding recreates that one real directory exclusively and publishes the
+    /// owned member links through the existing transition, into the SAME root:
+    /// the root's payload, the committed root and nonce are kept and nothing is
+    /// relinked to a new place.
+    #[test]
+    fn a_deleted_target_directory_is_recreated_and_both_members_bind() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let store = pool_store(&fixture.root.join("pool"));
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (committed, selected, _) = adopt_profile(&context, receipt).unwrap();
+        let root = selected.root().to_path_buf();
+        fs::write(root.join("sentinel"), b"root").unwrap();
+        fs::write(
+            member_destination(&root, "debug").join("old-output"),
+            b"old",
+        )
+        .unwrap();
+        let declaration =
+            crate::layout::declared(&["debug".to_owned(), "release".to_owned()]).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        fs::remove_dir_all(context.link()).unwrap();
+        assert_eq!(
+            target_state(&fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Missing
+        );
+        let outcome = match bind_profile(&context, &store, 0, &committed, Some(&plan), false) {
+            Bind::Bound(outcome) => outcome,
+            Bind::Refuse(reason) => panic!("a deleted target directory was refused: {reason}"),
+            Bind::Wait => panic!("a deleted target directory waited"),
+        };
+        let target = context.link();
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "the recreated target is not a real directory"
+        );
+        assert_eq!(
+            metadata.mode() & 0o777,
+            0o755,
+            "the recreated target does not carry the conversion's mode"
+        );
+        assert_eq!(outcome.root, Some(root.clone()));
+        assert!(
+            outcome
+                .note
+                .unwrap_or_default()
+                .contains("profile member links"),
+            "the binding did not report the owned profile members"
+        );
+        for member in ["debug", "release"] {
+            assert_eq!(
+                fs::read_link(target.join(member)).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
+        }
+        // The owned root is the same one: its payload and the old output are
+        // exactly as they were.
+        assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"root");
+        assert_eq!(
+            fs::read(member_destination(&root, "debug").join("old-output")).unwrap(),
+            b"old"
+        );
+        let after = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, ReceiptState::Committed);
+        assert!(after.generation > committed.generation);
+        for member in ["debug", "release"] {
+            let placed = after
+                .selected_for(member)
+                .unwrap_or_else(|| panic!("the receipt lost {member}"));
+            assert_eq!(placed.root, root, "{member}");
+            assert_eq!(placed.nonce(), selected.nonce(), "{member}");
+        }
+    }
+
+    /// oxide#165 refusals: an `target` that is a file or a foreign link still
+    /// refuses before Cargo even when the command was keyed while the target
+    /// directory was real, and nothing at that path or behind a link is
+    /// replaced, followed or written into.
+    #[test]
+    fn a_file_or_foreign_link_at_the_target_refuses_a_profile_binding() {
+        for outside in [false, true] {
+            let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+            let context = fixture.context();
+            let store = pool_store(&fixture.root.join("pool"));
+            let receipt =
+                Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+            let (committed, _selected, _) = adopt_profile(&context, receipt).unwrap();
+            let declaration =
+                crate::layout::declared(&["debug".to_owned(), "release".to_owned()]).unwrap();
+            let plan = planned_destination(
+                Some(&fixture.control),
+                &fixture.checkout,
+                &declaration,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let target = context.link();
+            let proof = receipt_proof(&fixture);
+            fs::remove_dir_all(&target).unwrap();
+            let referent = fixture.root.join("elsewhere");
+            fs::create_dir(&referent).unwrap();
+            fs::write(referent.join("sentinel"), b"foreign").unwrap();
+            if outside {
+                symlink(&referent, &target).unwrap();
+            } else {
+                fs::write(&target, b"file").unwrap();
+            }
+            let refused = match bind_profile(&context, &store, 0, &committed, Some(&plan), false) {
+                Bind::Refuse(reason) => reason,
+                Bind::Bound(_) => panic!("a target that is not a real directory was bound"),
+                Bind::Wait => panic!("a target that is not a real directory waited"),
+            };
+            assert!(
+                refused.contains("is never replaced or followed"),
+                "{refused}"
+            );
+            assert!(refused.contains("Nothing was changed"), "{refused}");
+            // The path is exactly what it was, and nothing was written behind
+            // a link.
+            if outside {
+                assert_eq!(fs::read_link(&target).unwrap(), referent);
+                assert_eq!(fs::read(referent.join("sentinel")).unwrap(), b"foreign");
+                assert_eq!(fs::read_dir(&referent).unwrap().count(), 1);
+            } else {
+                assert_eq!(fs::read(&target).unwrap(), b"file");
+            }
+            // The refusal changed no receipt byte.
+            assert_eq!(receipt_proof(&fixture), proof);
+        }
+    }
+
+    /// oxide#165 race and scope: a `target` that appears while the absent
+    /// directory is being recreated is kept — only a real directory is accepted
+    /// as the creator's result, a file or a link is refused, never replaced —
+    /// and the recreate belongs to the profile layout alone, so a whole-target
+    /// checkout's deleted link is still recreated by the legacy transition and
+    /// a never-converted checkout is left with no target at all.
+    #[test]
+    fn a_concurrent_creator_is_kept_and_whole_target_is_unchanged() {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let target = fixture.checkout.join("target");
+        recreate_target_directory(&fixture.checkout).unwrap();
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.mode() & 0o777, 0o755);
+        // The creator that already made the real directory wins: its content is
+        // left exactly as it is.
+        fs::write(target.join("sentinel"), b"creator").unwrap();
+        recreate_target_directory(&fixture.checkout).unwrap();
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"creator");
+        // Anything else at that path is refused and kept.
+        fs::remove_dir_all(&target).unwrap();
+        fs::write(&target, b"file").unwrap();
+        let refused = recreate_target_directory(&fixture.checkout).unwrap_err();
+        assert!(refused.contains("is not a real directory"), "{refused}");
+        assert_eq!(fs::read(&target).unwrap(), b"file");
+        fs::remove_file(&target).unwrap();
+        let referent = fixture.root.join("elsewhere");
+        fs::create_dir(&referent).unwrap();
+        fs::write(referent.join("sentinel"), b"foreign").unwrap();
+        symlink(&referent, &target).unwrap();
+        let refused = recreate_target_directory(&fixture.checkout).unwrap_err();
+        assert!(refused.contains("is not a real directory"), "{refused}");
+        assert_eq!(fs::read_link(&target).unwrap(), referent);
+        assert_eq!(fs::read(referent.join("sentinel")).unwrap(), b"foreign");
+
+        // Scope: a committed whole-target checkout whose owned link was
+        // deleted still binds its own root through the legacy transition.
+        let whole = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let context = whole.context();
+        let store = pool_store(&whole.root.join("pool"));
+        let receipt = transition(
+            &context,
+            &whole.receipt(),
+            &whole.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
+        let whole_target = context.link();
+        fs::remove_file(&whole_target).unwrap();
+        let wanted = desired_selection(&context, &receipt).unwrap().unwrap();
+        let plan = whole_target_plan(Some(wanted));
+        match bind_under_binding(&context, &store, 0, &receipt, Some(&plan), false) {
+            Bind::Bound(outcome) => {
+                assert_eq!(outcome.root.as_deref(), Some(whole.local().root()))
+            }
+            Bind::Refuse(reason) => panic!("a deleted whole-target link refused: {reason}"),
+            Bind::Wait => panic!("a deleted whole-target link waited"),
+        }
+        assert_eq!(fs::read_link(&whole_target).unwrap(), whole.local().root());
+
+        // Scope: a never-converted checkout keeps no target, no receipt and no
+        // owned root — the recreate is never reached.
+        let plain = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let plain_store = pool_store(&plain.root.join("pool"));
+        let binding =
+            bind_for_command(&plain_store, &plain.checkout, 0, None, None, false).unwrap();
+        assert_eq!(binding.outcome.root, None);
+        assert!(!plain.checkout.join("target").exists());
+        assert!(!receipt_path(plain_store.control(), &context_id(&plain)).exists());
     }
 
     /// P4, ROOT check: the same refusal through the PRODUCTION planning path.
