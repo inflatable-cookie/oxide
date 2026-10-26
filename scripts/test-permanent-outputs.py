@@ -5899,12 +5899,28 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             "OXIDE_EXTERNAL_MARKER": tool_marker,
         }
 
-        def unchanged_layout(checkout: str, label: str) -> None:
+        def unchanged_layout(checkout: str, label: str, *, real_target_first: bool) -> None:
+            """Run the external subcommand FIRST, then assert this layout's
+            expected outcome: a real local target with the tool's own directory,
+            no receipt, and no tool-directories notice.
+
+            `real_target_first` states the premise of the never-converted
+            control (a real target directory with no receipt is the per-checkout
+            opt-out, so it exists before the command). The ephemeral checkout
+            starts with NO target: that command's own Cargo build creates the
+            real local one, which is exactly the unchanged behaviour to prove.
+            """
             target = os.path.join(checkout, "target")
-            expect(
-                os.path.isdir(target) and not os.path.islink(target),
-                f"{label}: the checkout's target is not a real directory",
-            )
+            if real_target_first:
+                expect(
+                    os.path.isdir(target) and not os.path.islink(target),
+                    f"{label}: the never-converted control has no real target",
+                )
+            else:
+                expect(
+                    not os.path.lexists(target),
+                    f"{label}: the ephemeral fixture already has a target",
+                )
             if os.path.exists(tool_marker):
                 os.remove(tool_marker)
             code, _, stderr = oxide_env(
@@ -5917,7 +5933,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             )
             expect(
                 os.path.isdir(target) and not os.path.islink(target),
-                f"{label}: the checkout's target changed layout",
+                f"{label}: the checkout's target is not a real local directory",
             )
             expect(
                 os.path.isfile(os.path.join(target, "oxfixture", "out")),
@@ -5939,13 +5955,13 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         # a) Never converted: a real target with no receipt at all.
         unconverted = fresh_checkout(proof, root, "external-unconverted")
         os.makedirs(os.path.join(unconverted, "target"))
-        unchanged_layout(unconverted, "25 unconverted")
+        unchanged_layout(unconverted, "25 unconverted", real_target_first=True)
 
-        # b) Ephemeral drive mode: outputs stay in the real checkout target.
+        # b) Ephemeral drive mode: the command's own build creates a real target.
         set_mode(proof, "ephemeral", maker)
         try:
             ephemeral = fresh_checkout(proof, root, "external-ephemeral")
-            unchanged_layout(ephemeral, "25 ephemeral")
+            unchanged_layout(ephemeral, "25 ephemeral", real_target_first=False)
         finally:
             set_mode(proof, "permanent", maker)
         phase(proof, "after the unchanged-layout notice controls")
