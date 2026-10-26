@@ -2635,7 +2635,9 @@ def require_case_custody(*, unclosed, mount: str, registration: str, case: str) 
         raise ProofAbort(f"the drive registration is gone after {case}")
 
 
-def collect_cases(cases, *, diagnostic: bool, work_left, after_case=None, note=None):
+def collect_cases(
+    cases, *, diagnostic: bool, work_left, after_case=None, note=None, outcomes=None
+):
     """Run one case table, recording every case's outcome (oxide#165).
 
     `cases` is the ordered `(case, dependencies, body)` list the proof declares.
@@ -2644,19 +2646,30 @@ def collect_cases(cases, *, diagnostic: bool, work_left, after_case=None, note=N
     recoverable case-oracle failure is recorded as `failed` and every case whose
     dependencies all completed still runs; a case with an incomplete dependency
     is recorded `skipped` with those ids and never runs; a `ProofAbort` (an
-    unknown outcome, a lost resource or custody, a tainted shared fixture) is
-    recorded as `aborted` and every remaining case is `unexecuted`, because no
-    later case may be trusted after it. An exhausted guard deadline aborts the
-    same way in either mode. `after_case` performs the run's shared post-case
-    custody checks and is the only seam that can turn an unclosed child or a
-    lost mount into an abort. Returns `(outcomes, failures, aborted)`:
-    `outcomes` maps each reached case id to its row, `failures` lists the
-    recorded recoverable faults and `aborted` names the latched abort, if any.
+    unknown outcome, a lost resource or custody, a tainted shared fixture) and
+    any other unexpected exception are recorded as `aborted` and every remaining
+    case is `unexecuted`, because no later case may be trusted after them. An
+    exhausted guard deadline aborts the same way in either mode.
+
+    `after_case` is the run's shared post-case custody seam. It runs after EVERY
+    case that has not already aborted the collection, including a case whose own
+    oracle failed: an unclosed child, a lost mount or a vanished registration a
+    failed case left behind must stop the collection before another case runs.
+
+    `outcomes` is the caller's accumulator and is filled in place, so a fault
+    that escapes this function (an interrupt, say) still leaves every case
+    already reached in it; rows a case never reached stay absent and are
+    rendered `unexecuted`. Returns `(outcomes, failures, aborted)`: `outcomes`
+    maps each reached case id to its row, `failures` lists the recorded
+    recoverable faults and `aborted` names the latched abort, if any. A case
+    whose oracle failed and which then broke custody is recorded `aborted` while
+    its oracle failure stays in `failures`.
     """
     if note is None:
         note = lambda text: print(text, flush=True)  # noqa: E731 - the default sink
+    if outcomes is None:
+        outcomes = {}
 
-    outcomes: dict[str, dict] = {}
     failures: list[dict] = []
     aborted: str | None = None
     completed: set[str] = set()
@@ -2674,27 +2687,41 @@ def collect_cases(cases, *, diagnostic: bool, work_left, after_case=None, note=N
             outcomes[case] = {"result": "aborted", "fault": aborted[:600]}
             continue
         note(f"case {case}")
+        result: dict = {"result": "completed"}
         try:
             body()
-            if after_case is not None:
-                after_case(case)
-            outcomes[case] = {"result": "completed"}
-            completed.add(case)
         except ProofAbort as fault:
             if not diagnostic:
                 raise
-            aborted = f"{case}: {fault}"
-            outcomes[case] = {"result": "aborted", "fault": str(fault)[:600]}
+            result = {"result": "aborted", "fault": str(fault)[:600]}
         except RuntimeError as fault:
             if not diagnostic:
                 raise
             if "deadline reached" in str(fault) or work_left() <= CASE_RESERVE_S:
                 # An exhausted deadline is not a recoverable oracle failure.
-                aborted = f"{case}: {fault}"
-                outcomes[case] = {"result": "aborted", "fault": str(fault)[:600]}
-                continue
-            failures.append({"case": case, "fault": str(fault)[:600]})
-            outcomes[case] = {"result": "failed", "fault": str(fault)[:600]}
+                result = {"result": "aborted", "fault": str(fault)[:600]}
+            else:
+                failures.append({"case": case, "fault": str(fault)[:600]})
+                result = {"result": "failed", "fault": str(fault)[:600]}
+        except Exception as fault:
+            # Any other exception is an unknown outcome, never a recoverable
+            # case-oracle failure, so it aborts like the custody seam below.
+            if not diagnostic:
+                raise
+            result = {"result": "aborted", "fault": f"unexpected {fault!r}"[:600]}
+        # Custody is checked after the case whatever its own oracle did.
+        if after_case is not None and result["result"] != "aborted":
+            try:
+                after_case(case)
+            except ProofAbort as fault:
+                if not diagnostic:
+                    raise
+                result = {"result": "aborted", "fault": str(fault)[:600]}
+        outcomes[case] = result
+        if result["result"] == "completed":
+            completed.add(case)
+        elif result["result"] == "aborted":
+            aborted = f"{case}: {result['fault']}"
     return outcomes, failures, aborted
 
 
@@ -2778,6 +2805,28 @@ def diagnostic_document(
     }
 
 
+def finish_diagnostic(proof: Proof, collection: Collection, failure, writer=None) -> None:
+    """Write the bounded receipt of one diagnostic run, in every outcome.
+
+    A diagnostic whose receipt was not written is NOT a completed collection, so
+    a receipt failure ends the run when it is the only fault. When a case fault
+    is already in flight the receipt failure cannot replace it: it is reported
+    and the primary failure is preserved.
+    """
+    write = write_diagnostic if writer is None else writer
+    try:
+        write(proof, collection)
+    except BaseException as receipt_failure:  # noqa: BLE001 - decided below
+        if failure is None:
+            raise
+        print(
+            f"exec-inference diagnostic receipt was not written: {receipt_failure!r} "
+            f"(the primary failure is preserved)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def write_diagnostic(proof: Proof, collection: Collection) -> str:
     """Write the bounded receipt of one keep-going collection, in every outcome,
     including an abort or a setup failure before the first case ran."""
@@ -2821,11 +2870,19 @@ def exec_self_test() -> None:
         return None
 
     def table(*rows):
-        def body(case: str, *, fault: str | None = None, abort: str | None = None):
+        def body(
+            case: str,
+            *,
+            fault: str | None = None,
+            abort: str | None = None,
+            raises: BaseException | None = None,
+        ):
             def run() -> None:
                 ran.append(case)
                 if abort is not None:
                     raise ProofAbort(abort)
+                if raises is not None:
+                    raise raises
                 if fault is not None:
                     raise RuntimeError(fault)
 
@@ -2920,6 +2977,128 @@ def exec_self_test() -> None:
     expect(outcomes["a"]["result"] == "aborted", f"{outcomes['a']}")
     expect(outcomes["b"]["result"] == "unexecuted", f"{outcomes['b']}")
     expect(aborted is not None and "lost custody" in aborted, f"{aborted}")
+
+    # 4b. The custody seam runs after a case whose own oracle FAILED, and it is
+    #     still an abort: a failed case can leave an unclosed child or a lost
+    #     mount behind, and no later case may run against that. Its recoverable
+    #     oracle failure stays in `failures`.
+    ran.clear()
+    custody_seen: list[str] = []
+
+    def custody_after_failure(case: str) -> None:
+        custody_seen.append(case)
+        if case == "b":
+            raise ProofAbort("unclosed child after the failed case")
+
+    outcomes, failures, aborted = collect_cases(
+        table(
+            ("a", (), {}),
+            ("b", (), {"fault": "oracle b"}),
+            ("c", (), {}),
+            ("d", (), {}),
+        ),
+        diagnostic=True,
+        work_left=always,
+        after_case=custody_after_failure,
+        note=quiet,
+    )
+    expect(
+        custody_seen == ["a", "b"],
+        f"the custody seam did not run after the failed case: {custody_seen}",
+    )
+    expect(ran == ["a", "b"], f"a case ran after the failed case's custody check: {ran}")
+    expect(outcomes["b"]["result"] == "aborted", f"{outcomes['b']}")
+    expect("unclosed child" in outcomes["b"]["fault"], f"{outcomes['b']}")
+    expect(
+        [failure["case"] for failure in failures] == ["b"],
+        f"the failed case's oracle failure was lost: {failures}",
+    )
+    expect(
+        outcomes["c"]["result"] == "unexecuted" and outcomes["d"]["result"] == "unexecuted",
+        f"{outcomes['c']} {outcomes['d']}",
+    )
+    expect(aborted is not None and "unclosed child" in aborted, f"{aborted}")
+
+    # 4c. An unexpected exception is an unknown outcome, not a recoverable
+    #     oracle failure: it aborts, and every case already reached keeps its
+    #     row.
+    ran.clear()
+    outcomes, failures, aborted = collect_cases(
+        table(
+            ("a", (), {}),
+            ("b", (), {"raises": KeyError("boom")}),
+            ("c", (), {}),
+        ),
+        diagnostic=True,
+        work_left=always,
+        note=quiet,
+    )
+    expect(ran == ["a", "b"], f"an unexpected exception did not abort: {ran}")
+    expect(outcomes["a"]["result"] == "completed", f"{outcomes['a']}")
+    expect(outcomes["b"]["result"] == "aborted", f"{outcomes['b']}")
+    expect("KeyError" in outcomes["b"]["fault"], f"{outcomes['b']}")
+    expect(outcomes["c"]["result"] == "unexecuted", f"{outcomes['c']}")
+    expect(failures == [], f"an unexpected exception was recorded as recoverable: {failures}")
+    expect(aborted is not None and "KeyError" in aborted, f"{aborted}")
+
+    # 4d. A fault that escapes the collector entirely (an interrupt) must not
+    #     erase the cases already reached: the accumulator is filled in place,
+    #     and a case whose outcome is unknown stays absent (never a pass).
+    shared: dict = {}
+    try:
+        collect_cases(
+            table(
+                ("a", (), {}),
+                ("b", (), {"raises": KeyboardInterrupt()}),
+                ("c", (), {}),
+            ),
+            diagnostic=True,
+            work_left=always,
+            note=quiet,
+            outcomes=shared,
+        )
+        raise AssertionError("an interrupt escaped the collector")
+    except KeyboardInterrupt:
+        pass
+    expect(shared.get("a", {}).get("result") == "completed", f"{shared}")
+    expect("b" not in shared, f"an interrupted case was recorded as reached: {shared}")
+    expect("c" not in shared, f"an unreached case was recorded: {shared}")
+
+    # 4e. A diagnostic whose receipt was not written is not a completed
+    #     collection: the receipt failure ends the run when it is the only
+    #     fault, and is secondary (reported, primary preserved) when a case
+    #     fault is already in flight.
+    import contextlib
+    import io
+
+    def broken_writer(_proof, _collection) -> str:
+        raise OSError("evidence directory full")
+
+    wrote: list[str] = []
+
+    def good_writer(_proof, _collection) -> str:
+        wrote.append("written")
+        return "receipt.json"
+
+    try:
+        finish_diagnostic(object(), Collection(), None, writer=broken_writer)
+        raise AssertionError("a missing diagnostic receipt was reported as success")
+    except OSError as fault:
+        expect("evidence directory full" in str(fault), f"{fault}")
+    finish_diagnostic(object(), Collection(), None, writer=good_writer)
+    expect(wrote == ["written"], f"the receipt writer did not run: {wrote}")
+    noise = io.StringIO()
+    primary = RuntimeError("a case failed")
+    with contextlib.redirect_stderr(noise):
+        finish_diagnostic(object(), Collection(), primary, writer=broken_writer)
+    expect(
+        "receipt was not written" in noise.getvalue(),
+        f"the secondary receipt failure was not reported: {noise.getvalue()!r}",
+    )
+    expect(
+        "primary failure is preserved" in noise.getvalue(),
+        f"the report did not name the preserved primary failure: {noise.getvalue()!r}",
+    )
 
     # 5. An exhausted guard deadline before a case aborts it and runs nothing;
     #    a `deadline reached` fault inside a case is an abort, never a
@@ -3123,6 +3302,14 @@ def exec_self_test() -> None:
         and isinstance(keywords["after_case"].test, ast.Name)
         and keywords["after_case"].test.id == "diagnostic",
         "the custody seam is not scoped to the diagnostic run",
+    )
+    accumulator = keywords.get("outcomes")
+    expect(
+        isinstance(accumulator, ast.Attribute)
+        and accumulator.attr == "outcomes"
+        and isinstance(accumulator.value, ast.Name)
+        and accumulator.value.id == "collection",
+        "the collection does not fill the run's receipt accumulator in place",
     )
     wrapper = next(
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "exec_run"
@@ -4351,6 +4538,9 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         diagnostic=diagnostic,
         work_left=guard_work_left,
         after_case=after_case if diagnostic else None,
+        # Filled in place: a fault that escapes the collector still leaves every
+        # case already reached in the receipt, instead of erasing them.
+        outcomes=collection.outcomes,
     )
     if not diagnostic:
         # The counted run is fail-fast: a fault has already propagated, so a
@@ -4390,29 +4580,26 @@ def exec_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     recorded no failure and did not abort, and always writes its bounded receipt
     — including when the run fails or aborts before the first case ran."""
     collection = Collection()
+    failure: BaseException | None = None
     try:
         exec_inference(proof, repo, diagnostic, collection)
-    except BaseException as failure:
-        if diagnostic:
+    except BaseException as error:
+        failure = error
+        if diagnostic and collection.aborted is None:
             # The collection latches its own abort and records its own failures;
-            # anything that escaped before the first case (staging, the image,
-            # the drive registration) or after the collection (the detach check)
-            # is named here, so the receipt never implies a clean run.
-            if not collection.outcomes:
-                collection.aborted = f"before the first case: {failure!r}"
-            elif not collection.failures and collection.aborted is None:
-                collection.aborted = f"after the collection: {failure!r}"
+            # anything that escaped it (an interrupt, staging, the image, the
+            # drive registration, the detach check) is named here, so the
+            # receipt never implies a clean run.
+            where = (
+                "after the last recorded case"
+                if collection.outcomes
+                else "before the first case"
+            )
+            collection.aborted = f"{where}: {error!r}"
         raise
     finally:
         if diagnostic:
-            try:
-                write_diagnostic(proof, collection)
-            except BaseException as receipt_failure:  # noqa: BLE001 - keep the primary failure
-                print(
-                    f"exec-inference diagnostic receipt was not written: {receipt_failure!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            finish_diagnostic(proof, collection, failure)
 
 
 UNCONVERTED_NOTICE = "not converted to owned outputs"
