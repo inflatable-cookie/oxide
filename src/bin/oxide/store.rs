@@ -115,6 +115,18 @@ pub(crate) const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3";
 /// transaction. Version 1 is the released original.
 const LEGACY_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/2";
 const RELEASED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
+
+/// A fence this binary accepts as a legitimate predecessor of
+/// [`OWNED_OUTPUTS_FENCE`]: the published whole-target `/2` fence and the
+/// released `/1` fence it superseded. Every branch that meets a paired
+/// removable control accepts exactly this set — plus an absent fence where the
+/// control may be new — so a pool fenced by the released binary can never be
+/// migrated by one branch and refused as unknown by another (oxide#159).
+/// [`Store::load`] is the validation gate for every other value.
+fn predecessor_owned_outputs_fence(fence: &str) -> bool {
+    fence == LEGACY_OWNED_OUTPUTS_FENCE || fence == RELEASED_OWNED_OUTPUTS_FENCE
+}
+
 const MAX_INIT_TRANSACTION_BYTES: usize = 64;
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
@@ -1941,9 +1953,10 @@ impl Store {
             let _admission = store.admission()?;
             let mut state = store.load()?;
             if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
-                if state.owned_outputs.as_deref() != Some(LEGACY_OWNED_OUTPUTS_FENCE)
-                    && state.owned_outputs.as_deref() != Some(RELEASED_OWNED_OUTPUTS_FENCE)
-                    && state.owned_outputs.is_some()
+                if state
+                    .owned_outputs
+                    .as_deref()
+                    .is_some_and(|fence| !predecessor_owned_outputs_fence(fence))
                 {
                     return Err(format!(
                         "Oxide state in {} carries an unknown owned-outputs fence; refusing",
@@ -1952,7 +1965,7 @@ impl Store {
                 }
                 if state.outputs_init.is_some() {
                     return Err(format!(
-                        "Oxide state in {} already records an output-registry transaction but not the version-2 fence; refusing",
+                        "Oxide state in {} already records an output-registry transaction but not the successor fence; refusing",
                         store.control.display()
                     ));
                 }
@@ -1972,8 +1985,9 @@ impl Store {
 
     /// Run the owned-outputs initialization protocol exactly once
     /// (oxide#129). The internal control is durable first
-    /// (`initializing` + the version-2 fence), then the paired removable
-    /// control, then `create(transaction)` creates and syncs the registry,
+    /// (`initializing` + the successor `oxide.outputs/3` fence), then the
+    /// paired removable control, then `create(transaction)` creates and syncs
+    /// the registry,
     /// then both controls record `ready`. A crash resumes only the recorded
     /// transaction; an unknown or contradicting record refuses before any
     /// registry effect.
@@ -2035,10 +2049,11 @@ impl Store {
                             if transaction == &recorded =>
                         {
                             if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
-                                if state.owned_outputs.as_deref().is_some_and(|fence| {
-                                    fence != LEGACY_OWNED_OUTPUTS_FENCE
-                                        && fence != RELEASED_OWNED_OUTPUTS_FENCE
-                                }) {
+                                if state
+                                    .owned_outputs
+                                    .as_deref()
+                                    .is_some_and(|fence| !predecessor_owned_outputs_fence(fence))
+                                {
                                     return Err(
                                             "the paired pool carries an unknown owned-outputs fence; refusing"
                                                 .to_owned(),
@@ -2067,10 +2082,13 @@ impl Store {
                             sibling.save(&state)?;
                         }
                         None => {
+                            // Parity with the `Ready` arm above: the released
+                            // `/1` fence is a legitimate predecessor here too,
+                            // not an unknown value (oxide#159).
                             if state
                                 .owned_outputs
                                 .as_deref()
-                                .is_some_and(|fence| fence != LEGACY_OWNED_OUTPUTS_FENCE)
+                                .is_some_and(|fence| !predecessor_owned_outputs_fence(fence))
                             {
                                 return Err(
                                     "the paired pool carries an unknown owned-outputs fence; refusing"
@@ -2090,7 +2108,7 @@ impl Store {
                     }
                     if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
                         return Err(
-                            "the paired pool does not carry the version-2 output fence; refusing"
+                            "the paired pool does not carry the successor output fence; refusing"
                                 .to_owned(),
                         );
                     }
@@ -2164,7 +2182,7 @@ impl Store {
             }
             if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
                 return Err(
-                    "the paired pool does not carry the version-2 output fence; refusing"
+                    "the paired pool does not carry the successor output fence; refusing"
                         .to_owned(),
                 );
             }
@@ -2211,7 +2229,7 @@ impl Store {
             return Ok(());
         }
         match internal_state.owned_outputs.as_deref() {
-            Some(LEGACY_OWNED_OUTPUTS_FENCE) | Some(RELEASED_OWNED_OUTPUTS_FENCE) => {}
+            Some(fence) if predecessor_owned_outputs_fence(fence) => {}
             None => {
                 return Err(
                     "the internal control records a ready output registry without an owned-outputs fence; refusing"
@@ -2257,9 +2275,8 @@ impl Store {
                     )
                 }
                 None => match state.owned_outputs.as_deref() {
-                    None
-                    | Some(LEGACY_OWNED_OUTPUTS_FENCE)
-                    | Some(RELEASED_OWNED_OUTPUTS_FENCE) => {}
+                    None => {}
+                    Some(fence) if predecessor_owned_outputs_fence(fence) => {}
                     Some(_) => {
                         return Err(
                             "the paired pool carries an unknown owned-outputs fence; refusing"
@@ -3593,9 +3610,7 @@ impl Store {
             return Err("Oxide state exceeds its byte limit".to_owned());
         }
         if state.owned_outputs.as_deref().is_some_and(|fence| {
-            fence != OWNED_OUTPUTS_FENCE
-                && fence != LEGACY_OWNED_OUTPUTS_FENCE
-                && fence != RELEASED_OWNED_OUTPUTS_FENCE
+            fence != OWNED_OUTPUTS_FENCE && !predecessor_owned_outputs_fence(fence)
         }) {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
         }
@@ -4917,6 +4932,189 @@ mod tests {
             ));
             assert_eq!(state.owned_outputs.as_deref(), Some(OWNED_OUTPUTS_FENCE));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A paired removable control fenced by the released `oxide.outputs/1`
+    /// binary or by the published `/2` fence carries no registry transaction
+    /// on a host that last ran the released binary. Both predecessors migrate
+    /// under the internal control's exact recorded transaction; an unknown
+    /// fence and an open writer still refuse with both controls unchanged
+    /// (oxide#159).
+    #[test]
+    fn a_paired_pool_fenced_by_a_predecessor_migrates_under_the_recorded_transaction() {
+        let transaction = "c".repeat(32);
+        // One definition decides the accepted predecessor set, so no branch
+        // can narrow it back to `/2`-only.
+        assert!(predecessor_owned_outputs_fence(LEGACY_OWNED_OUTPUTS_FENCE));
+        assert!(predecessor_owned_outputs_fence(
+            RELEASED_OWNED_OUTPUTS_FENCE
+        ));
+        assert!(!predecessor_owned_outputs_fence(OWNED_OUTPUTS_FENCE));
+        assert!(!predecessor_owned_outputs_fence("oxide.outputs/9"));
+        // Counterfactual: this is the paired `None` arm's condition before
+        // oxide#159, which accepted only an absent or `/2` fence. It refuses
+        // exactly the `/1` input migrated below, so a revert fails there too.
+        let refused_before =
+            |fence: Option<&str>| fence.is_some_and(|fence| fence != LEGACY_OWNED_OUTPUTS_FENCE);
+        assert!(refused_before(Some(RELEASED_OWNED_OUTPUTS_FENCE)));
+        assert!(!refused_before(Some(LEGACY_OWNED_OUTPUTS_FENCE)));
+        assert!(!refused_before(None));
+
+        // The released host state records both fences at numeric version 5;
+        // the published `/2` predecessor keeps version 3.
+        for (label, fence, recorded_accounting) in [
+            (
+                "paired-released",
+                RELEASED_OWNED_OUTPUTS_FENCE,
+                Some(RECORDED_ACCOUNTING_FENCE),
+            ),
+            ("paired-published", LEGACY_OWNED_OUTPUTS_FENCE, None),
+        ] {
+            let (root, internal, removable) = paired_controls(label);
+            internal
+                .save(&State {
+                    owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+                    outputs_init: Some(OutputsInit::Ready {
+                        transaction: transaction.clone(),
+                        ready_ms: 1,
+                    }),
+                    recorded_accounting: recorded_accounting.map(str::to_owned),
+                    ..State::default()
+                })
+                .unwrap();
+            removable
+                .save(&State {
+                    owned_outputs: Some(fence.to_owned()),
+                    recorded_accounting: recorded_accounting.map(str::to_owned),
+                    ..State::default()
+                })
+                .unwrap();
+            let before = removable.load().unwrap();
+            assert_eq!(before.owned_outputs.as_deref(), Some(fence), "{label}");
+            assert!(before.outputs_init.is_none(), "{label}");
+            assert_eq!(
+                before.version,
+                if recorded_accounting.is_some() {
+                    STATE_VERSION
+                } else {
+                    OLDER_STATE_VERSION
+                },
+                "{label}: unexpected fixture state version"
+            );
+
+            let created = std::cell::Cell::new(0);
+            let outcome = internal
+                .initialize_outputs(&transaction, None, &|recorded, may_create| {
+                    assert!(!may_create, "{label}: a ready control created a registry");
+                    assert_eq!(recorded, transaction, "{label}");
+                    created.set(created.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(outcome, "{label}");
+            assert_eq!(created.get(), 1, "{label}");
+
+            let internal_state = internal.load().unwrap();
+            assert_eq!(
+                internal_state.owned_outputs.as_deref(),
+                Some(OWNED_OUTPUTS_FENCE),
+                "{label}"
+            );
+            let paired_state = removable.load().unwrap();
+            assert_eq!(
+                paired_state.owned_outputs.as_deref(),
+                Some(OWNED_OUTPUTS_FENCE),
+                "{label}: the paired fence was not upgraded"
+            );
+            for (side, state) in [("internal", internal_state), ("paired", paired_state)] {
+                match &state.outputs_init {
+                    Some(OutputsInit::Ready {
+                        transaction: recorded,
+                        ..
+                    }) => assert_eq!(
+                        recorded, &transaction,
+                        "{label}: the {side} control lost the recorded transaction"
+                    ),
+                    other => panic!("{label}: the {side} control is not ready: {other:?}"),
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// An unknown paired fence refuses at the shared state parser before any
+    /// branch acts, and a released `/1` fence with an open writer still
+    /// refuses through writer closure: neither case changes either control
+    /// (oxide#159).
+    #[test]
+    fn an_unknown_paired_fence_and_an_open_writer_still_refuse() {
+        let transaction = "d".repeat(32);
+        // Both fixtures already carry the recorded-accounting fence, because a
+        // control's own admission publishes it before this path reads either
+        // state; that durability step is not part of what a refused migration
+        // may change.
+        let ready_internal = |internal: &Store| {
+            internal
+                .save(&State {
+                    owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+                    outputs_init: Some(OutputsInit::Ready {
+                        transaction: transaction.clone(),
+                        ready_ms: 1,
+                    }),
+                    recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+                    ..State::default()
+                })
+                .unwrap();
+        };
+        let snapshot = |side: &Store| fs::read(side.control.join("state.json")).unwrap();
+        let refuses = |internal: &Store, removable: &Store, label: &str| {
+            let (internal_before, paired_before) = (snapshot(internal), snapshot(removable));
+            let error = internal
+                .initialize_outputs(&transaction, None, &|_, _| -> Result<(), String> {
+                    panic!("{label}: a refusing control created a registry")
+                })
+                .unwrap_err();
+            assert_eq!(snapshot(internal), internal_before, "{label}");
+            assert_eq!(snapshot(removable), paired_before, "{label}");
+            error
+        };
+
+        let (root, internal, removable) = paired_controls("paired-unknown-fence");
+        ready_internal(&internal);
+        // `Store::load` is the single validation gate for every fence value
+        // outside the accepted set, so this refuses before any branch can
+        // read it as an empty record.
+        removable
+            .save(&State {
+                owned_outputs: Some("oxide.outputs/9".to_owned()),
+                recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+                ..State::default()
+            })
+            .unwrap();
+        let error = refuses(&internal, &removable, "unknown paired fence");
+        assert!(
+            error.contains("unsupported version"),
+            "unknown paired fence: {error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, internal, removable) = paired_controls("paired-released-writer");
+        ready_internal(&internal);
+        let mut active = State {
+            owned_outputs: Some(RELEASED_OWNED_OUTPUTS_FENCE.to_owned()),
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+            ..State::default()
+        };
+        active
+            .records
+            .push(record(Phase::Running, Some(i32::MAX), Some("v1.a.1.1.1")));
+        removable.save(&active).unwrap();
+        let error = refuses(&internal, &removable, "released fence with an open writer");
+        assert!(
+            error.contains("the paired pool holds an active command record"),
+            "released fence with an open writer: {error}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
