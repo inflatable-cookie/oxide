@@ -812,17 +812,17 @@ fn remove_tree_owned_at(
     // that private name, so nothing a racer does to the original name can
     // redirect a delete.
     let observed = observe_entry(parent, name).map_err(io_error)?;
-    if observed.mode == libc::S_IFLNK {
+    if observed.file_type() == libc::S_IFLNK {
         if observed.uid != current_uid() {
             return Err(LeaseError::UnsafePath(
                 "refusing to delete a foreign symlink",
             ));
         }
-    } else if observed.mode == libc::S_IFREG {
+    } else if observed.file_type() == libc::S_IFREG {
         if observed.uid != current_uid() {
             return Err(LeaseError::UnsafePath("refusing to delete a foreign file"));
         }
-    } else if observed.mode == libc::S_IFDIR {
+    } else if observed.file_type() == libc::S_IFDIR {
         // Containment was proved once for the whole tree from its recorded
         // path; this level is authorized by the held parent plus the captured
         // identity check below.
@@ -844,7 +844,7 @@ fn remove_tree_owned_at(
             LeaseError::UnknownAccounting
         });
     }
-    if observed.mode != libc::S_IFDIR {
+    if observed.file_type() != libc::S_IFDIR {
         // A captured file or link is removed by its private name only; a link's
         // referent is never touched.
         return unlink_captured(parent, &capture).map_err(io_error);
@@ -891,21 +891,32 @@ fn remove_tree_owned_at(
             "the verified directory was replaced before it was opened",
         ));
     }
-    let mode = observed.mode_bits();
-    if mode & 0o700 != 0o700 {
+    // The owner's original mode is kept exactly, so any refusal can put the
+    // directory back as it was. Nothing is widened before the capture and its
+    // verification above.
+    let original_mode = observed.mode_bits();
+    let widened = original_mode & 0o700 != 0o700;
+    if widened {
         // SAFETY: `child` is a live descriptor for the verified directory.
-        if unsafe { libc::fchmod(child.as_raw_fd(), mode | 0o700) } != 0 {
+        if unsafe { libc::fchmod(child.as_raw_fd(), original_mode | 0o700) } != 0 {
             let _ = put_back(parent, &capture);
             return Err(io_error(std::io::Error::last_os_error()));
         }
     }
+    let restore = |child: BorrowedFd<'_>| {
+        if widened {
+            // SAFETY: the descriptor is live for the call.
+            unsafe { libc::fchmod(child.as_raw_fd(), original_mode) };
+        }
+    };
     for entry in names_of(child.as_fd()).map_err(io_error)? {
         let entry =
             std::ffi::CString::new(entry.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
         let entry_path = path.join(std::ffi::OsStr::from_bytes(entry.as_bytes()));
         if let Err(error) = remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path) {
-            // Leave the captured directory under its original name where the
-            // racer has not taken it, and keep the private name otherwise.
+            // Restore the owner's own mode, then leave the captured directory
+            // under its original name where the racer has not taken it.
+            restore(child.as_fd());
             let _ = put_back(parent, &capture);
             return Err(error);
         }
@@ -928,6 +939,7 @@ fn remove_tree_owned_at(
         outcome,
         crate::owned_delete::Rmdir::Removed | crate::owned_delete::Rmdir::Vanished
     ) {
+        restore(child.as_fd());
         let restored = put_back(parent, &capture).is_ok();
         if !restored {
             return Err(LeaseError::Io(

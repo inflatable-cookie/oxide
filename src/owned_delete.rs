@@ -77,10 +77,6 @@ pub const CAPTURE_TAG_BYTES: usize = 16;
 /// Every captured name carries this prefix, so a leftover capture is
 /// recognisable in a directory listing.
 pub const CAPTURE_PREFIX: &str = ".oxide-capture-";
-/// Tolerated Finder metadata is small; a captured regular file larger than
-/// this is not treated as metadata and is put back.
-pub const FINDER_METADATA_MAX_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Most names one re-list may see and unlink. Recreated Finder metadata is one
 /// or two entries; a directory that gained more content than this is not this
 /// race and is refused.
@@ -346,22 +342,29 @@ pub struct Capture {
 pub struct EntryFacts {
     pub device: u64,
     pub inode: u64,
+    /// The full `st_mode`: file type *and* permission bits, so a caller can
+    /// restore exactly the mode it changed.
     pub mode: libc::mode_t,
     pub uid: u32,
     pub size: u64,
 }
 
 impl EntryFacts {
+    /// The file type alone (`S_IFMT` mask).
+    pub fn file_type(&self) -> libc::mode_t {
+        self.mode & libc::S_IFMT
+    }
+
     pub fn is_regular(&self) -> bool {
-        self.mode == libc::S_IFREG
+        self.file_type() == libc::S_IFREG
     }
 
     pub fn is_directory(&self) -> bool {
-        self.mode == libc::S_IFDIR
+        self.file_type() == libc::S_IFDIR
     }
 
     pub fn is_symlink(&self) -> bool {
-        self.mode == libc::S_IFLNK
+        self.file_type() == libc::S_IFLNK
     }
 
     /// The permission bits of the observed entry.
@@ -454,7 +457,7 @@ pub fn observe_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryFacts>
     Ok(EntryFacts {
         device: stat_device(&stat),
         inode: stat_ino(&stat),
-        mode: stat_mode(&stat),
+        mode: stat.st_mode,
         uid: stat_uid(&stat),
         size: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
     })
@@ -474,7 +477,7 @@ pub fn verify_captured(
     if captured.inode != observed.inode {
         return Err("captured object is not the observed entry");
     }
-    if captured.mode != observed.mode {
+    if captured.file_type() != observed.file_type() {
         return Err("captured object changed type");
     }
     Ok(captured)
@@ -601,10 +604,7 @@ fn drain_finder_metadata(
         // a racer could still be holding.
         let mismatch = match verify_captured(dir, &capture, &observed) {
             Ok(facts)
-                if facts.is_regular()
-                    && facts.device == device
-                    && facts.uid == caller_uid()
-                    && facts.size <= FINDER_METADATA_MAX_BYTES =>
+                if facts.is_regular() && facts.device == device && facts.uid == caller_uid() =>
             {
                 None
             }

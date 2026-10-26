@@ -3467,3 +3467,43 @@ fn the_previous_following_repair_would_have_chmodded_the_referent() {
     fs::set_permissions(slot.join("locked-moved"), fs::Permissions::from_mode(0o700))
         .expect("fixture cleanup");
 }
+
+/// The 4 MiB capture-era cap is gone: the #105 predicate alone decides, so a
+/// large tolerated `.DS_Store` is still removed like any other metadata.
+#[test]
+fn a_large_tolerated_metadata_file_is_still_removed() {
+    let fixture = Fixture::new("metadata-no-size-cap");
+    let slot = fixture.dir("slot");
+    fs::write(slot.join(".DS_Store"), vec![b'd'; 5 * 1024 * 1024]).expect("large metadata");
+    remove_tree_owned(fixture.path(), &slot).expect("the owned tree is removed");
+    assert!(
+        !slot.exists(),
+        "a large tolerated metadata file does not block deletion"
+    );
+}
+
+/// An owner's directory mode is preserved exactly when a refusal after the
+/// owner-access repair puts the directory back.
+#[test]
+fn a_refused_repair_restores_the_original_directory_mode() {
+    let fixture = Fixture::new("repair-mode-roundtrip");
+    let slot = fixture.dir("slot");
+    let inner = slot.join("locked");
+    fs::create_dir(&inner).expect("locked directory");
+    fs::write(inner.join("data"), b"x").expect("data");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o100)).expect("search-only mode");
+    // The finder race seam fires in the slot's own drain; a foreign entry left
+    // there keeps the deletion unfinished after the repair widened the mode.
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("locked"), "foreign", true);
+    assert!(remove_tree_owned(fixture.path(), &slot).is_err());
+    assert_eq!(
+        fs::symlink_metadata(&inner)
+            .expect("kept directory")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o100,
+        "the owner's original mode was not restored"
+    );
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
+}
