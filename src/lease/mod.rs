@@ -16,7 +16,7 @@ mod pool;
 use crate::owned_delete::{
     capture_entry, capture_planned, descriptor_identity, names_of, observe_entry,
     open_directory_at, plan_root_capture, put_back, remove_captured_directory, unlink_captured,
-    verify_captured, RootCaptureJournal,
+    verify_captured, Capture, CaptureContext, RootCaptureJournal,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -809,18 +809,18 @@ fn remove_tree_owned(
     let parent = open_verified_directory(parent_path)?;
     let name =
         std::ffi::CString::new(name.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
-    remove_tree_owned_at(root, parent.as_fd(), &name, path, journal)
+    let mut context = CaptureContext {
+        chain: Vec::new(),
+        journal,
+    };
+    remove_tree_owned_at(root, parent.as_fd(), &name, path, &mut context, true)
 }
 
 /// Put a captured entry back under its observed name and return the caller's
 /// own cause. The journal record is deliberately kept: only a completed
-/// deletion or a later two-name reconciliation clears it, so a crash or a
-/// failed put-back never loses the only name that can find the object.
-fn abort_capture(
-    parent: BorrowedFd<'_>,
-    capture: &crate::owned_delete::Capture,
-    cause: LeaseError,
-) -> LeaseError {
+/// deletion or a later replay clears it, so a crash or a failed put-back never
+/// loses the only name that can find the object.
+fn abort_capture(parent: BorrowedFd<'_>, capture: &Capture, cause: LeaseError) -> LeaseError {
     match put_back(parent, capture) {
         Ok(()) => cause,
         Err(error) => LeaseError::Io(format!(
@@ -838,14 +838,60 @@ fn restore_mode(dir: BorrowedFd<'_>, mode: libc::mode_t) {
     unsafe { libc::fchmod(dir.as_raw_fd(), mode) };
 }
 
+/// Restores one captured directory's exact mode on **every** exit path —
+/// explicit refusals, `?` returns and panics — so a widened mode never outlives
+/// the step that widened it. The same mode is in the durable record, which is
+/// what a crash restores it from.
+struct WidenedMode<'a> {
+    dir: &'a std::os::fd::OwnedFd,
+    original: libc::mode_t,
+    widened: bool,
+}
+
+impl Drop for WidenedMode<'_> {
+    fn drop(&mut self) {
+        if self.widened {
+            // SAFETY: the descriptor is live for the guard's whole scope.
+            unsafe { libc::fchmod(self.dir.as_raw_fd(), self.original) };
+        }
+    }
+}
+
+/// The durable record of one capture inside the tree, built from the verified
+/// observation and the captured private name.
+fn capture_record(
+    context: &CaptureContext<'_>,
+    capture: &Capture,
+    observed: &crate::owned_delete::EntryFacts,
+) -> crate::owned_delete::CaptureRecord {
+    crate::owned_delete::CaptureRecord {
+        path: context.chain.clone(),
+        private: String::from_utf8_lossy(capture.private.as_bytes()).into_owned(),
+        original: String::from_utf8_lossy(capture.original.as_bytes()).into_owned(),
+        device: observed.device,
+        inode: observed.inode,
+        mode: u32::try_from(observed.mode).unwrap_or(u32::MAX),
+    }
+}
+
 /// One entry, named in the held `parent`, of the tree rooted at `root`.
 fn remove_tree_owned_at(
     root: &Path,
     parent: BorrowedFd<'_>,
     name: &std::ffi::CString,
     path: &Path,
-    journal: Option<&mut dyn RootCaptureJournal>,
+    context: &mut CaptureContext<'_>,
+    root_level: bool,
 ) -> Result<(), LeaseError> {
+    // A private capture name is never ordinary content: it is either a recorded
+    // capture (replay reconciles it) or an unrecorded one, which is kept.
+    if !root_level
+        && crate::owned_delete::is_capture_name(std::ffi::OsStr::from_bytes(name.as_bytes()))
+    {
+        return Err(LeaseError::UnsafePath(
+            "a private capture name that no record names is kept",
+        ));
+    }
     // Observe the entry first, then *capture* it under a private name this
     // process just created. Every later check and the removal itself act on
     // that private name, so nothing a racer does to the original name can
@@ -874,22 +920,24 @@ fn remove_tree_owned_at(
     } else {
         return Err(LeaseError::UnknownAccounting);
     }
-    // A tree root is journaled intent-first: the planned private name, its own
-    // identity, the verified parent's identity and its full mode are durable
-    // before the rename and before any permission change.
-    let is_root = journal.is_some();
-    #[cfg(not(test))]
-    let _ = is_root;
-    let mut journal = journal;
+    // The tree root is journaled intent-first: the planned private name, its
+    // own identity, the verified parent's identity and its full mode are
+    // durable before the rename and before any permission change. A nested
+    // entry is recorded durably as `captured` right after its rename, which is
+    // the narrow residual: a crash between those two leaves an unrecorded
+    // private name that replay keeps and reports, never removes.
     let mut plan = None;
-    if let Some(sink) = journal.take() {
-        let observed_plan = plan_root_capture(parent, &observed).map_err(io_error)?;
-        sink.planned(&observed_plan).map_err(LeaseError::Io)?;
-        plan = Some(observed_plan);
-        journal = Some(sink);
+    if root_level && context.has_journal() {
+        let planned = plan_root_capture(parent, &observed).map_err(io_error)?;
+        if let Err(reason) = context.planned(&planned) {
+            return Err(LeaseError::Io(format!(
+                "the root capture could not be recorded durably ({reason})"
+            )));
+        }
+        plan = Some(planned);
     }
     #[cfg(test)]
-    if is_root {
+    if root_level {
         crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::Planned);
     }
     let capture = match plan.as_ref() {
@@ -897,14 +945,11 @@ fn remove_tree_owned_at(
         None => capture_entry(parent, name).map_err(io_error)?,
     };
     #[cfg(test)]
-    if is_root {
+    if root_level {
         crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::Renamed);
     }
-    // The captured phase is durable before the captured object is verified or
-    // removed, so no record ever describes a location the object has already
-    // left. A failure here puts the root back and keeps the record.
-    if let (Some(plan_ref), Some(sink)) = (plan.as_ref(), journal.take()) {
-        if let Err(reason) = sink.captured(plan_ref) {
+    if let Some(plan) = plan.as_ref() {
+        if let Err(reason) = context.captured(plan) {
             return Err(abort_capture(
                 parent,
                 &capture,
@@ -922,9 +967,34 @@ fn remove_tree_owned_at(
         ));
     }
     if observed.file_type() != libc::S_IFDIR {
+        // A captured file or link is recorded before it is removed and its
+        // removal is recorded before it counts as work done, so a crash is
+        // always resolved by replay rather than assumed.
+        let record = capture_record(context, &capture, &observed);
+        if let Err(reason) = context.record_captured(&record) {
+            return Err(abort_capture(
+                parent,
+                &capture,
+                LeaseError::Io(format!("a captured entry could not be recorded ({reason})")),
+            ));
+        }
         // A captured file or link is removed by its private name only; a link's
         // referent is never touched.
-        return unlink_captured(parent, &capture).map_err(io_error);
+        match unlink_captured(parent, &capture) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LeaseError::Io(
+                    "a recorded capture vanished before its removal".to_owned(),
+                ))
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        if let Err(reason) = context.record_removed(&record) {
+            return Err(LeaseError::Io(format!(
+                "a captured entry's removal could not be recorded ({reason})"
+            )));
+        }
+        return Ok(());
     }
     // The owner's exact mode is restored on every refusal after a repair, so a
     // kept directory never stays widened just because a later step refused.
@@ -1004,9 +1074,18 @@ fn remove_tree_owned_at(
         ));
     }
     drop(repaired);
-    // The owner's original mode is kept exactly, so any refusal can put the
-    // directory back as it was. Nothing is widened before the capture and its
-    // verification above.
+    // The record keeps the owner's original mode and is durable before the mode
+    // ever changes, so a crash can always restore exactly the owner's mode.
+    let record = capture_record(context, &capture, &observed);
+    if let Err(reason) = context.record_captured(&record) {
+        return Err(abort_capture(
+            parent,
+            &capture,
+            LeaseError::Io(format!(
+                "a captured directory could not be recorded ({reason})"
+            )),
+        ));
+    }
     let original_mode = observed.mode_bits();
     let widened = original_mode & 0o700 != 0o700;
     if widened {
@@ -1019,8 +1098,15 @@ fn remove_tree_owned_at(
             ));
         }
     }
+    // From here the widened mode is restored on every exit path, including a
+    // `?` return or a panic.
+    let _mode = WidenedMode {
+        dir: &child,
+        original: original_mode,
+        widened,
+    };
     #[cfg(test)]
-    if is_root {
+    if root_level {
         crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::ModeWidened);
     }
     let restore = |child: BorrowedFd<'_>| {
@@ -1029,18 +1115,31 @@ fn remove_tree_owned_at(
             unsafe { libc::fchmod(child.as_raw_fd(), original_mode) };
         }
     };
-    for entry in names_of(child.as_fd()).map_err(io_error)? {
+    context.chain.push(record.private.clone());
+    let names = match names_of(child.as_fd()) {
+        Ok(names) => names,
+        Err(error) => {
+            context.chain.pop();
+            restore(child.as_fd());
+            return Err(abort_capture(parent, &capture, io_error(error)));
+        }
+    };
+    for entry in names {
         let entry =
             std::ffi::CString::new(entry.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
         let entry_path = path.join(std::ffi::OsStr::from_bytes(entry.as_bytes()));
-        if let Err(error) = remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path, None) {
+        if let Err(error) =
+            remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path, context, false)
+        {
             // Restore the owner's own mode, then leave the captured directory
-            // under its original name where the racer has not taken it.
+            // under its original name where the racer has not taken it. The
+            // nested records stay: an aborted root keeps their uncertainty.
+            context.chain.pop();
             restore(child.as_fd());
             return Err(abort_capture(parent, &capture, error));
         }
         #[cfg(test)]
-        if is_root {
+        if root_level {
             crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::MidDelete);
         }
     }
@@ -1053,8 +1152,10 @@ fn remove_tree_owned_at(
         &capture.private,
         child.as_fd(),
         label,
+        context,
         &mut || Ok::<(), crate::owned_delete::DrainStop>(()),
     );
+    context.chain.pop();
     // Anything but a positive removal restores the recorded name, so a refused
     // or pending slot is never left under a capture name the ledger cannot
     // name.
@@ -1071,13 +1172,36 @@ fn remove_tree_owned_at(
         }
     }
     match outcome {
-        crate::owned_delete::Rmdir::Removed | crate::owned_delete::Rmdir::Vanished => Ok(()),
+        crate::owned_delete::Rmdir::Removed => {
+            // The directory's own removal is durable before it counts, and the
+            // root's `removed` phase is what lets a replay conclude instead of
+            // guessing from two absent names.
+            if let Err(reason) = context.record_removed(&record) {
+                return Err(LeaseError::Io(format!(
+                    "a captured directory's removal could not be recorded ({reason})"
+                )));
+            }
+            if let Some(plan) = plan.as_ref() {
+                if let Err(reason) = context.record_root_removed(plan) {
+                    return Err(LeaseError::Io(format!(
+                        "the captured root's removal could not be recorded ({reason})"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        // A vanished name is never this caller's success: the ledger keeps its
+        // pending deletion and a replay decides conservatively.
+        crate::owned_delete::Rmdir::Vanished => Err(LeaseError::Io(
+            "a recorded capture vanished before its removal could be proved".to_owned(),
+        )),
         crate::owned_delete::Rmdir::Failed { error } => Err(io_error(error)),
         crate::owned_delete::Rmdir::Replaced { entry }
         | crate::owned_delete::Rmdir::Refused { entry } => Err(LeaseError::UnexpectedEntry {
             place: "slot directory",
             entry,
         }),
+        crate::owned_delete::Rmdir::Unproven { reason } => Err(LeaseError::Io(reason)),
         crate::owned_delete::Rmdir::Mismatch {
             original,
             private,

@@ -1382,18 +1382,24 @@ may return exit 5 without touching any new holder. Do not treat an unknown
 or mistyped ID as evidence that the intended writer ended. A held compatible
 project/profile returns busy rather than allowing a concurrent writer.
 
-A recorded deletion also journals its root capture (oxide#155). The slot's
-ledger record carries the planned private name, the root's `(device, inode)`,
-the verified parent's `(device, inode)` and the root's full `st_mode` before the
-exclusive rename, and then the captured phase after it. The next open reconciles
-the recorded original name and the recorded private name: the root is put back
-under its recorded name with exactly the recorded mode when it is under the
-private one, the record goes when neither name holds the tree or the recorded
-name still does, and a parent or name that is not the recorded object (or both
-names holding something) keeps the record and both objects. A capture record on
-anything but an `Evicting` slot, or in a shape no writer produces, refuses the
-ledger read. That write is atomic and synced with the rest of the ledger, so a
-crash between any two steps leaves the plan findable.
+A recorded deletion also journals every capture it makes (oxide#155). The slot's
+ledger record carries the root plan — the planned private name, the root's
+`(device, inode)`, the verified parent's `(device, inode)` and the root's full
+`st_mode`, written before the exclusive rename, then the captured phase after it
+and a `removed` phase only once the root's own removal completed — beside a
+record for every nested capture: its private and observed names, its verified
+`(device, inode)` and full mode, and the chain of captured private names that
+locates its parent. A `removed` record follows each successful unlink, and a
+capture that is not the observed object is recorded as a foreign capture before
+any put-back attempt. Replay never unlinks: it restores the recorded modes, puts
+every recorded capture back under its observed name deepest-first, then puts the
+root back with its recorded mode and retries the deletion. Only a recorded root
+removal completes the record; two absent names without it stay pending, as does
+an unrecorded private name or any recorded foreign capture, and new leases stay
+refused. A record on anything but an `Evicting` slot, or in a shape no writer
+produces, refuses the ledger read. Every journal write is atomic and synced with
+the rest of the ledger, so a crash between any two steps leaves the records
+findable.
 
 If an interrupted `Evicting` deletion cannot safely remove its recorded slot
 root or an owned entry, the generation remains `Evicting` and unavailable.

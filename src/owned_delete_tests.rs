@@ -16,6 +16,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(1);
 
+/// The seam's caller context for these tests: no capture journal of its own.
+fn context<'a>() -> CaptureContext<'a> {
+    CaptureContext {
+        chain: Vec::new(),
+        journal: None,
+    }
+}
+
 struct Fixture {
     path: PathBuf,
 }
@@ -102,6 +110,7 @@ fn a_plain_removal_fails_on_the_raced_state_the_seam_completes() {
         &name,
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Removed => {}
@@ -125,6 +134,7 @@ fn finder_metadata_recreated_before_the_removal_is_drained() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Removed => {}
@@ -148,6 +158,7 @@ fn a_foreign_entry_is_refused_by_name_and_untouched() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Refused { entry } => assert_eq!(entry, "foreign.txt"),
@@ -175,6 +186,7 @@ fn a_metadata_named_link_is_refused_and_never_followed() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Refused { entry } => assert_eq!(entry, ".DS_Store"),
@@ -204,6 +216,7 @@ fn a_metadata_named_directory_is_refused() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Refused { entry } => assert_eq!(entry, ".DS_Store"),
@@ -227,6 +240,7 @@ fn repeated_recreation_exhausts_the_fixed_bound() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Exhausted { entries } => {
@@ -262,6 +276,7 @@ fn more_names_than_one_pass_is_refused_without_deleting() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::RefusedMany { entries } => {
@@ -328,6 +343,7 @@ fn a_rebound_name_is_neither_removed_nor_drained() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Replaced { entry } => assert_eq!(entry, "slot"),
@@ -357,6 +373,7 @@ fn an_entry_that_vanishes_before_its_unlink_does_not_fail_the_round() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Removed => {}
@@ -389,6 +406,7 @@ fn replacements_before_a_capture_remove_no_foreign_object_and_stop_at_the_first(
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Mismatch {
@@ -469,6 +487,7 @@ fn a_symlink_swapped_before_the_capture_is_not_followed() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Mismatch { restored, .. } => assert!(restored),
@@ -504,6 +523,7 @@ fn a_directory_swapped_before_the_capture_is_not_recursed() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut || Ok(()),
     ) {
         Rmdir::Mismatch { restored, .. } => assert!(restored),
@@ -576,6 +596,7 @@ fn a_caller_stop_after_one_unlink_keeps_the_rest_of_the_drain() {
         &name("slot"),
         dir.as_fd(),
         OsStr::new("slot"),
+        &mut context(),
         &mut between,
     ) {
         Rmdir::Stopped { reason } => {

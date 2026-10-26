@@ -15,13 +15,14 @@ use super::{
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
 use crate::owned_delete::{
-    reconcile_root_capture, restore_root_capture, RootCaptureJournal, RootCapturePhase,
-    RootCapturePlan, RootCaptureState,
+    descriptor_identity, open_directory_at, put_back, reconcile_root_capture,
+    restore_captured_mode, restore_root_capture, Capture, CaptureRecord, ForeignCapture,
+    RootCaptureJournal, RootCapturePhase, RootCapturePlan, RootCaptureState,
 };
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -207,13 +208,11 @@ struct SlotRecord {
     /// cleared by every transition out of `Idle`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recorded: Option<RecordedSize>,
-    /// The journaled root capture of this recorded deletion (oxide#155). The
-    /// plan is written durably before the slot root's exclusive rename and its
-    /// captured phase after it, so a crash never leaves the tree under a
-    /// private name this ledger does not name. Only an `Evicting` record may
-    /// carry one.
+    /// The journaled captures of this recorded deletion (oxide#155): the root
+    /// plan, every outstanding nested capture and every capture that was not
+    /// the observed object. Only an `Evicting` record may carry one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    capture: Option<RootCapturePlan>,
+    capture: Option<DeletionJournal>,
 }
 
 /// One closed size observation. It is a measurement at a closing transition,
@@ -231,6 +230,38 @@ struct RecordedSize {
     entries: u64,
     at_ms: u64,
 }
+
+/// The durable journal of one recorded whole-tree deletion (oxide#155).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeletionJournal {
+    /// The tree root: planned before its exclusive rename, captured after it,
+    /// and removed only once its own removal completed.
+    pub(super) root: RootCapturePlan,
+    /// Captures recorded and not yet recorded removed, deepest last.
+    pub(super) captures: Vec<CaptureRecord>,
+    /// Captures that were not the observed object. Replay never removes a name
+    /// these name, and the deletion never completes while one exists.
+    pub(super) foreign: Vec<ForeignCapture>,
+}
+
+impl DeletionJournal {
+    fn is_valid(&self) -> bool {
+        self.root.is_valid()
+            && self.captures.len() <= MAX_OUTSTANDING_CAPTURES
+            && self.captures.iter().all(CaptureRecord::is_valid)
+            && self.foreign.len() <= MAX_FOREIGN_CAPTURES
+            && self.foreign.iter().all(ForeignCapture::is_valid)
+    }
+}
+
+/// Most captures one deletion may have recorded and not yet removed. A
+/// whole-tree recursion holds at most one capture per level plus the entry it
+/// is finishing, and a deeper tree is refused before it is captured.
+const MAX_OUTSTANDING_CAPTURES: usize = 96;
+/// Most mismatched captures one deletion may record. A refusal already keeps
+/// the deletion pending; the cap only bounds the ledger.
+const MAX_FOREIGN_CAPTURES: usize = 32;
 
 fn is_zero_rank(rank: &u64) -> bool {
     *rank == 0
@@ -691,8 +722,29 @@ pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), Le
 /// The journaled root capture recorded for one slot, read straight from the
 /// ledger so a test can inspect a modelled crash state without opening (and
 /// therefore reconciling) the pool.
+/// Write a modelled crash state's journal straight into the ledger, without
+/// opening (and therefore reconciling) the pool.
 #[cfg(test)]
-pub(super) fn capture_record_injected(pool: &Path, slot_id: u64) -> Option<RootCapturePlan> {
+pub(super) fn write_capture_record_injected(
+    pool: &Path,
+    slot_id: u64,
+    journal: super::pool::DeletionJournal,
+) -> Result<(), LeaseError> {
+    let mut ledger = read_ledger(pool)?;
+    let slot = ledger
+        .slots
+        .iter_mut()
+        .find(|slot| slot.id == slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if slot.state != SlotPersistState::Evicting {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    slot.capture = Some(journal);
+    write_ledger(pool, &ledger)
+}
+
+#[cfg(test)]
+pub(super) fn capture_record_injected(pool: &Path, slot_id: u64) -> Option<DeletionJournal> {
     read_ledger(pool)
         .ok()?
         .slots
@@ -1849,18 +1901,16 @@ impl Pool {
         Ok(())
     }
 
-    /// Reconcile one recorded deletion's journaled root capture, deciding only
-    /// from the two names and the recorded identities. The record is cleared
-    /// only by a positive outcome: the root is back at its recorded name, it
-    /// was just put back there, or neither name holds it at all. Anything
-    /// uncertain keeps both the record and the object, and the pool keeps
-    /// refusing new leases.
+    /// Reconcile one recorded deletion's journal, deciding only from the
+    /// records and the live names. The deletion is complete **only** when the
+    /// record says its root was removed; every other state is either rolled
+    /// back and retried, or kept pending.
     fn reconcile_slot_capture(
         &mut self,
         id: u64,
         path: &Path,
     ) -> Result<CaptureDisposition, LeaseError> {
-        let Some(plan) = self.slot(id).and_then(|slot| slot.capture.clone()) else {
+        let Some(journal) = self.slot(id).and_then(|slot| slot.capture.clone()) else {
             return Ok(CaptureDisposition::Resume);
         };
         self.checked_slot_scope(path)?;
@@ -1869,44 +1919,61 @@ impl Pool {
         let leaf = path.file_name().ok_or(LeaseError::UnknownAccounting)?;
         let name =
             std::ffi::CString::new(leaf.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
-        match reconcile_root_capture(parent.as_fd(), &name, &plan) {
-            RootCaptureState::Original => {
-                self.record_slot_capture(id, None).map_err(LeaseError::Io)?;
-                Ok(CaptureDisposition::Resume)
-            }
-            RootCaptureState::Private => {
-                restore_root_capture(parent.as_fd(), &name, &plan).map_err(LeaseError::Io)?;
-                self.record_slot_capture(id, None).map_err(LeaseError::Io)?;
-                Ok(CaptureDisposition::Resume)
-            }
-            RootCaptureState::Absent => {
-                // Neither name holds the captured tree, so nothing of this
-                // slot remains in the payload under either name: the ledger
-                // record goes, exactly as the pre-capture rule did for a
-                // positively absent slot path.
-                Ok(CaptureDisposition::Concluded)
-            }
-            RootCaptureState::Uncertain { .. } => Ok(CaptureDisposition::Blocked),
+        // A durably recorded root removal is the only positive completion
+        // proof. Two absent names without it may be a move, never completion.
+        if journal.root.phase == RootCapturePhase::Removed {
+            self.record_slot_capture(id, None).map_err(LeaseError::Io)?;
+            return Ok(CaptureDisposition::Concluded);
         }
+        // A recorded mismatch keeps the deletion pending: replay never removes
+        // a name one of those records names.
+        let foreign = !journal.foreign.is_empty();
+        match reconcile_root_capture(parent.as_fd(), &name, &journal.root) {
+            RootCaptureState::Private => {
+                // The root is under its recorded private name, so the chain is
+                // resolved through that name.
+                let private = std::ffi::CString::new(journal.root.private.as_str())
+                    .map_err(|_| LeaseError::UnknownAccounting)?;
+                if rollback_captures(parent.as_fd(), &private, &journal).is_err() {
+                    return Ok(CaptureDisposition::Blocked);
+                }
+                if restore_root_capture(parent.as_fd(), &name, &journal.root).is_err() {
+                    return Ok(CaptureDisposition::Blocked);
+                }
+            }
+            RootCaptureState::Original => {
+                if rollback_captures(parent.as_fd(), &name, &journal).is_err() {
+                    return Ok(CaptureDisposition::Blocked);
+                }
+            }
+            RootCaptureState::Absent | RootCaptureState::Uncertain { .. } => {
+                return Ok(CaptureDisposition::Blocked)
+            }
+        }
+        if foreign {
+            return Ok(CaptureDisposition::Blocked);
+        }
+        self.record_slot_capture(id, None).map_err(LeaseError::Io)?;
+        Ok(CaptureDisposition::Resume)
     }
 
-    /// Write one slot's capture record durably. The ledger replacement is
+    /// Write one slot's deletion journal durably. The ledger replacement is
     /// atomic and synced, so a crash after this returns leaves exactly this
-    /// record.
+    /// journal.
     fn record_slot_capture(
         &mut self,
         id: u64,
-        capture: Option<RootCapturePlan>,
+        capture: Option<DeletionJournal>,
     ) -> Result<(), String> {
-        if let Some(plan) = &capture {
-            if !plan.is_valid() {
-                return Err("the capture plan is not one a writer produces".to_owned());
+        if let Some(journal) = &capture {
+            if !journal.is_valid() {
+                return Err("the capture journal is not one a writer produces".to_owned());
             }
         }
         {
             let slot = self.slot_mut(id).ok_or("the recorded slot disappeared")?;
             if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
-                return Err("a capture record belongs to a recorded deletion".to_owned());
+                return Err("a capture journal belongs to a recorded deletion".to_owned());
             }
             if slot.capture == capture {
                 return Ok(());
@@ -2265,6 +2332,90 @@ fn validate_lease_payload_entries(
 /// Deletion is limited to recorded owned slot paths: directly under the
 /// slots root (legacy), or under one project folder that is a real
 /// owner-only directory of the caller on the slots root's device.
+/// A recorded private/original name as a C string.
+fn recorded_name(name: &str) -> Result<std::ffi::CString, String> {
+    std::ffi::CString::new(name).map_err(|_| "a recorded capture name holds a NUL".to_owned())
+}
+
+fn recorded_type(record: &CaptureRecord) -> libc::mode_t {
+    (record.mode & u32::from(libc::S_IFMT)) as libc::mode_t
+}
+
+/// One recorded capture must still be the object the record describes.
+fn verify_recorded(
+    base: BorrowedFd<'_>,
+    private: &std::ffi::CStr,
+    record: &CaptureRecord,
+) -> Result<(), String> {
+    let facts = crate::owned_delete::observe_entry(base, private)
+        .map_err(|error| format!("a recorded capture cannot be read ({error})"))?;
+    if facts.device != record.device
+        || facts.inode != record.inode
+        || facts.file_type() != recorded_type(record)
+    {
+        return Err("a recorded capture is not the object it recorded".to_owned());
+    }
+    Ok(())
+}
+
+/// Roll back every recorded capture inside one held tree root: each recorded
+/// object is put back under its observed name, deepest first, so every put-back
+/// sees a live parent. A captured directory's own recorded mode is restored
+/// before it is put back, and never before its contents are resolved (a
+/// search-only mode would make that rollback impossible).
+fn rollback_captures(
+    parent: BorrowedFd<'_>,
+    root_name: &std::ffi::CStr,
+    journal: &DeletionJournal,
+) -> Result<(), String> {
+    let root = open_directory_at(parent, root_name)
+        .map_err(|error| format!("the held tree root cannot be opened ({error})"))?;
+    let identity = descriptor_identity(root.as_fd())
+        .map_err(|error| format!("the held tree root's identity cannot be read ({error})"))?;
+    if identity != (journal.root.device, journal.root.inode) {
+        return Err("the held tree root is not the recorded root".to_owned());
+    }
+    restore_captures_in(root.as_fd(), &[], &journal.captures)
+}
+
+fn restore_captures_in(
+    base: BorrowedFd<'_>,
+    chain: &[String],
+    records: &[CaptureRecord],
+) -> Result<(), String> {
+    let here: Vec<&CaptureRecord> = records
+        .iter()
+        .filter(|record| record.path == chain)
+        .collect();
+    for record in here.iter().filter(|record| record.is_directory()) {
+        let private = recorded_name(&record.private)?;
+        verify_recorded(base, &private, record)?;
+        let child = open_directory_at(base, &private)
+            .map_err(|error| format!("a recorded captured directory cannot be opened ({error})"))?;
+        let mut inner = chain.to_vec();
+        inner.push(record.private.clone());
+        restore_captures_in(child.as_fd(), &inner, records)?;
+        restore_recorded(base, record)?;
+    }
+    for record in here.iter().filter(|record| !record.is_directory()) {
+        restore_recorded(base, record)?;
+    }
+    Ok(())
+}
+
+/// Put one recorded capture back under its observed name, restoring a captured
+/// directory's recorded mode first. Nothing is ever unlinked here.
+fn restore_recorded(base: BorrowedFd<'_>, record: &CaptureRecord) -> Result<(), String> {
+    let private = recorded_name(&record.private)?;
+    verify_recorded(base, &private, record)?;
+    if record.is_directory() {
+        restore_captured_mode(base, &private, record.device, record.inode, record.mode)?;
+    }
+    let original = recorded_name(&record.original)?;
+    put_back(base, &Capture { private, original })
+        .map_err(|error| format!("a recorded capture cannot be put back ({error})"))
+}
+
 fn require_slot_parent(path: &Path, slots_root: &Path) -> Result<(), LeaseError> {
     let refuse = || LeaseError::UnsafePath("deletion is limited to recorded owned slot paths");
     let parent = path.parent().ok_or_else(refuse)?;
@@ -2285,37 +2436,172 @@ fn require_slot_parent(path: &Path, slots_root: &Path) -> Result<(), LeaseError>
     Ok(())
 }
 
-/// What reconciling one recorded deletion's journaled root capture settled.
+/// What reconciling one recorded deletion's journal settled.
 enum CaptureDisposition {
     /// The recorded path may be deleted now.
     Resume,
-    /// Neither the recorded name nor the private name holds the tree: nothing
-    /// of the slot remains in the payload, so its ledger record goes.
+    /// The recorded root's own removal completed: nothing of the slot remains.
     Concluded,
-    /// The two names and the record do not agree well enough to act. Both the
-    /// record and the object are kept and the pool keeps its refusal.
+    /// The names, the records and the objects do not agree well enough to act.
+    /// Every record and object is kept and the pool keeps its refusal.
     Blocked,
 }
 
-/// The lease's journal for one slot root's capture. The `Evicting` slot record
-/// carries the plan from before the exclusive rename until a completed deletion
-/// or a two-name reconciliation clears it.
+/// The lease's journal for one slot deletion. The `Evicting` slot record
+/// carries the root plan, the outstanding captures and the foreign captures,
+/// written with the same atomic, synced replacement as every other ledger write
+/// before each capture acts and after each removal completes.
 struct SlotCaptureJournal<'a> {
     pool: &'a mut Pool,
     id: u64,
 }
 
+impl SlotCaptureJournal<'_> {
+    fn update<T>(
+        &mut self,
+        change: impl FnOnce(&mut DeletionJournal) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let (outcome, changed) = {
+            let slot = self
+                .pool
+                .slot_mut(self.id)
+                .ok_or("the recorded slot disappeared")?;
+            if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
+                return Err("a capture journal belongs to a recorded deletion".to_owned());
+            }
+            let journal = slot
+                .capture
+                .as_mut()
+                .ok_or("the recorded deletion has no journal")?;
+            let before = journal.clone();
+            let outcome = change(journal)?;
+            if !journal.is_valid() {
+                *journal = before;
+                return Err("the capture journal would not be one a writer produces".to_owned());
+            }
+            (outcome, *journal != before)
+        };
+        if changed {
+            self.pool.persist().map_err(|error| error.to_string())?;
+        }
+        Ok(outcome)
+    }
+}
+
+impl SlotCaptureJournal<'_> {
+    /// Open the journal for this generation's first capture. The plan is
+    /// durable before the exclusive rename, so a crash can never leave the tree
+    /// under a private name the ledger does not name.
+    fn begin(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
+        let journal = DeletionJournal {
+            root: plan.clone(),
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        };
+        if !journal.is_valid() {
+            return Err("the capture journal is not one a writer produces".to_owned());
+        }
+        {
+            let slot = self
+                .pool
+                .slot_mut(self.id)
+                .ok_or("the recorded slot disappeared")?;
+            if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
+                return Err("a capture journal belongs to a recorded deletion".to_owned());
+            }
+            if slot.capture.is_some() {
+                return Err("the recorded deletion already has a journal".to_owned());
+            }
+            slot.capture = Some(journal);
+        }
+        self.pool.persist().map_err(|error| error.to_string())
+    }
+}
+
 impl RootCaptureJournal for SlotCaptureJournal<'_> {
     fn planned(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        self.pool.record_slot_capture(self.id, Some(plan.clone()))
+        if self
+            .pool
+            .slot(self.id)
+            .is_some_and(|slot| slot.capture.is_none())
+        {
+            return self.begin(plan);
+        }
+        self.update(|journal| {
+            journal.root = plan.clone();
+            Ok(())
+        })
     }
 
     fn captured(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        let captured = RootCapturePlan {
-            phase: RootCapturePhase::Captured,
-            ..plan.clone()
-        };
-        self.pool.record_slot_capture(self.id, Some(captured))
+        self.update(|journal| {
+            journal.root = RootCapturePlan {
+                phase: RootCapturePhase::Captured,
+                ..plan.clone()
+            };
+            Ok(())
+        })
+    }
+
+    fn record_captured(&mut self, record: &CaptureRecord) -> Result<(), String> {
+        self.update(|journal| {
+            if journal
+                .captures
+                .iter()
+                .any(|existing| existing.private == record.private)
+            {
+                return Err("a capture record already names this private name".to_owned());
+            }
+            if journal.captures.len() >= MAX_OUTSTANDING_CAPTURES {
+                return Err(
+                    "the deletion has more outstanding captures than it may record".to_owned(),
+                );
+            }
+            journal.captures.push(record.clone());
+            Ok(())
+        })
+    }
+
+    fn record_removed(&mut self, record: &CaptureRecord) -> Result<(), String> {
+        self.update(|journal| {
+            let position = journal
+                .captures
+                .iter()
+                .position(|existing| {
+                    existing.private == record.private && existing.path == record.path
+                })
+                .ok_or("the recorded capture is not the one this deletion recorded")?;
+            journal.captures.remove(position);
+            Ok(())
+        })
+    }
+
+    fn record_foreign(&mut self, capture: &ForeignCapture) -> Result<(), String> {
+        self.update(|journal| {
+            if let Some(existing) = journal
+                .foreign
+                .iter_mut()
+                .find(|existing| existing.private == capture.private)
+            {
+                *existing = capture.clone();
+                return Ok(());
+            }
+            if journal.foreign.len() >= MAX_FOREIGN_CAPTURES {
+                return Err("the deletion has more foreign captures than it may record".to_owned());
+            }
+            journal.foreign.push(capture.clone());
+            Ok(())
+        })
+    }
+
+    fn record_root_removed(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
+        self.update(|journal| {
+            journal.root = RootCapturePlan {
+                phase: RootCapturePhase::Removed,
+                ..plan.clone()
+            };
+            Ok(())
+        })
     }
 }
 
@@ -2895,7 +3181,7 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         // and only in the exact shape the seam writes.
         if slot.capture.is_some()
             && (slot.state != SlotPersistState::Evicting
-                || !slot.capture.as_ref().is_some_and(RootCapturePlan::is_valid))
+                || !slot.capture.as_ref().is_some_and(DeletionJournal::is_valid))
         {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -3898,7 +4184,12 @@ mod recorded_ledger_tests {
             0o040500,
         );
         assert!(written.is_valid(), "the recorded shape is a writer's shape");
-        evicting.slots[0].capture = Some(written.clone());
+        let journal = |root: crate::owned_delete::RootCapturePlan| super::DeletionJournal {
+            root,
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        };
+        evicting.slots[0].capture = Some(journal(written.clone()));
         assert!(validate_ledger_read(&evicting).is_ok());
 
         // The same record on an idle or held slot refuses.
@@ -3906,7 +4197,7 @@ mod recorded_ledger_tests {
             let mut other = ledger(None, 0, state, false);
             other.capacity_policy = Some(CAPACITY_POLICY_VERSION);
             other.next_rank = Some(1);
-            other.slots[0].capture = Some(written.clone());
+            other.slots[0].capture = Some(journal(written.clone()));
             assert!(validate_ledger_read(&other).is_err());
         }
         // A near-miss name, a missing random tag and a non-directory mode all
@@ -3922,7 +4213,7 @@ mod recorded_ledger_tests {
             let mut refused = ledger(None, 0, SlotPersistState::Evicting, false);
             refused.capacity_policy = Some(CAPACITY_POLICY_VERSION);
             refused.next_rank = Some(1);
-            refused.slots[0].capture = Some(bad);
+            refused.slots[0].capture = Some(journal(bad));
             assert!(validate_ledger_read(&refused).is_err());
         }
     }

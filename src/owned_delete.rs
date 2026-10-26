@@ -91,6 +91,10 @@ pub const CAPTURE_PREFIX: &str = ".oxide-capture-";
 /// race and is refused.
 pub const FINDER_RACE_MAX_NAMES: usize = 64;
 
+/// Deepest captured-parent chain one record may name. A tree deeper than this
+/// is refused before it is captured, so the journal and its replay stay bounded.
+pub const MAX_CAPTURE_DEPTH: usize = 64;
+
 /// Longest entry name, in bytes, a diagnostic prints before eliding.
 const MAX_ENTRY_LABEL_BYTES: usize = 64;
 
@@ -200,6 +204,10 @@ pub enum Rmdir {
     /// A capture rename failed, so nothing was removed and the caller stops
     /// pending.
     CaptureFailed { error: io::Error },
+    /// The drain could not durably prove one captured entry's removal — its
+    /// journal write failed, or the captured private name vanished before that
+    /// write. Nothing was assumed: the caller keeps its pending intent.
+    Unproven { reason: String },
     /// The caller's between-entries check stopped the drain. The entries it
     /// unlinked before stopping stay deleted; every remaining entry, and the
     /// directory itself, are left exactly as they were found.
@@ -218,6 +226,7 @@ pub fn rmdir_draining_finder_metadata(
     name: &CStr,
     dir: BorrowedFd<'_>,
     label: &OsStr,
+    context: &mut CaptureContext<'_>,
     between: &mut dyn FnMut() -> Result<(), DrainStop>,
 ) -> Rmdir {
     hook::race(dir, label);
@@ -262,7 +271,7 @@ pub fn rmdir_draining_finder_metadata(
         Ok(device) => device,
         Err(error) => return Rmdir::Failed { error },
     };
-    match drain_finder_metadata(parent, name, dir, device, between) {
+    match drain_finder_metadata(parent, name, dir, device, context, between) {
         Ok(entries) => Rmdir::Drained { entries },
         Err(outcome) => outcome,
     }
@@ -275,6 +284,7 @@ pub fn rmdir_retrying_finder_metadata(
     name: &CStr,
     dir: BorrowedFd<'_>,
     label: &OsStr,
+    context: &mut CaptureContext<'_>,
     between: &mut dyn FnMut() -> Result<(), DrainStop>,
 ) -> Rmdir {
     let mut attempt = 0;
@@ -284,7 +294,7 @@ pub fn rmdir_retrying_finder_metadata(
         if attempt > 1 {
             std::thread::sleep(FINDER_RACE_PAUSE);
         }
-        match rmdir_draining_finder_metadata(parent, name, dir, label, between) {
+        match rmdir_draining_finder_metadata(parent, name, dir, label, context, between) {
             Rmdir::Drained { entries } => {
                 drained += entries;
                 if attempt >= FINDER_RACE_ATTEMPTS {
@@ -392,6 +402,10 @@ pub enum RootCapturePhase {
     Planned,
     /// The exclusive rename to the recorded private name is durable.
     Captured,
+    /// The captured root's own removal completed and was durably recorded. Only
+    /// this phase proves the recorded deletion finished; its absence is never
+    /// treated as completion.
+    Removed,
 }
 
 /// The caller's durable record of one tree-root capture (oxide#155).
@@ -445,6 +459,231 @@ impl RootCapturePlan {
     }
 }
 
+/// One outstanding capture below the root: a verified object moved to a private
+/// name inside the tree, recorded durably before it is removed so a replay can
+/// find it again (oxide#155).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRecord {
+    /// The private names of the captured directories between the root and this
+    /// entry's parent, outermost first. Each one is itself an outstanding
+    /// capture, so replay resolves and verifies the whole chain. Empty for a
+    /// direct child of the captured root.
+    pub path: Vec<String>,
+    /// The private name this entry was moved to in its parent.
+    pub private: String,
+    /// The name it was observed under, for diagnostics and the put-back.
+    pub original: String,
+    /// The identity and full mode the captured object was verified with.
+    pub device: u64,
+    pub inode: u64,
+    pub mode: u32,
+}
+
+impl CaptureRecord {
+    pub fn mode_bits(&self) -> libc::mode_t {
+        (self.mode & 0o7777) as libc::mode_t
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.mode & u32::from(libc::S_IFMT) == u32::from(libc::S_IFDIR)
+    }
+
+    /// A record only this module's writer produces.
+    pub fn is_valid(&self) -> bool {
+        let private = self.private.as_bytes();
+        let type_bits = self.mode & u32::from(libc::S_IFMT);
+        private.len() > CAPTURE_PREFIX.len()
+            && private.len() <= CAPTURE_PREFIX.len() + 2 * CAPTURE_TAG_BYTES
+            && private.starts_with(CAPTURE_PREFIX.as_bytes())
+            && private[CAPTURE_PREFIX.len()..]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+            && !self.original.is_empty()
+            && self.path.len() <= MAX_CAPTURE_DEPTH
+            && self.path.iter().all(|name| {
+                name.len() > CAPTURE_PREFIX.len()
+                    && name.starts_with(CAPTURE_PREFIX)
+                    && name[CAPTURE_PREFIX.len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            })
+            && self.device != 0
+            && self.inode != 0
+            && (type_bits == u32::from(libc::S_IFDIR)
+                || type_bits == u32::from(libc::S_IFREG)
+                || type_bits == u32::from(libc::S_IFLNK))
+            && self.mode & !(u32::from(libc::S_IFMT) | 0o7777) == 0
+    }
+}
+
+/// One capture that was **not** the observed object, durably recorded before
+/// any put-back attempt. Replay never removes a name one of these names, and
+/// the recorded deletion never completes while one exists.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForeignCapture {
+    pub path: Vec<String>,
+    pub private: String,
+    pub original: String,
+    /// What the observation expected.
+    pub expected_device: u64,
+    pub expected_inode: u64,
+    pub expected_mode: u32,
+    /// What the private name actually held, as a short no-follow description.
+    pub found: String,
+    /// Whether the exclusive put-back to `original` succeeded.
+    pub restored: bool,
+}
+
+impl ForeignCapture {
+    pub fn is_valid(&self) -> bool {
+        let private = self.private.as_bytes();
+        private.len() > CAPTURE_PREFIX.len()
+            && private.starts_with(CAPTURE_PREFIX.as_bytes())
+            && private[CAPTURE_PREFIX.len()..]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+            && !self.original.is_empty()
+            && !self.found.is_empty()
+            && self.path.len() <= MAX_CAPTURE_DEPTH
+    }
+}
+
+/// Whether `name` is one of the private capture names this module creates. A
+/// deletion never treats such a name as ordinary content: it is either a
+/// recorded capture (replay reconciles it) or an unrecorded one, which is
+/// reported and kept, never removed.
+pub fn is_capture_name(name: &OsStr) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > CAPTURE_PREFIX.len()
+        && bytes.starts_with(CAPTURE_PREFIX.as_bytes())
+        && bytes[CAPTURE_PREFIX.len()..]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
+}
+
+/// Where one directory sits inside a journaled whole-tree deletion (oxide#155):
+/// the chain of captured private names from the root down to it, and the
+/// caller's durable journal. A caller with no journal of its own (the prune
+/// quarantine pass) leaves `journal` empty and is documented as a narrower
+/// caller whose captured residue is never consumed.
+pub struct CaptureContext<'a> {
+    pub chain: Vec<String>,
+    pub journal: Option<&'a mut dyn RootCaptureJournal>,
+}
+
+impl CaptureContext<'_> {
+    /// Durably record one captured entry before it is removed.
+    pub fn record_captured(&mut self, record: &CaptureRecord) -> Result<(), String> {
+        match self.journal.as_mut() {
+            Some(journal) => (**journal).record_captured(record),
+            None => Ok(()),
+        }
+    }
+
+    /// Durably record one captured entry's own removal.
+    pub fn record_removed(&mut self, record: &CaptureRecord) -> Result<(), String> {
+        match self.journal.as_mut() {
+            Some(journal) => (**journal).record_removed(record),
+            None => Ok(()),
+        }
+    }
+
+    /// Durably record a capture that was not the observed object, before any
+    /// put-back attempt.
+    pub fn record_foreign(&mut self, capture: &ForeignCapture) -> Result<(), String> {
+        match self.journal.as_mut() {
+            Some(journal) => (**journal).record_foreign(capture),
+            None => Ok(()),
+        }
+    }
+
+    pub fn record_root_removed(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
+        match self.journal.as_mut() {
+            Some(journal) => (**journal).record_root_removed(plan),
+            None => Ok(()),
+        }
+    }
+
+    pub fn planned(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
+        match self.journal.as_mut() {
+            Some(journal) => (**journal).planned(plan),
+            None => Ok(()),
+        }
+    }
+
+    pub fn captured(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
+        match self.journal.as_mut() {
+            Some(journal) => (**journal).captured(plan),
+            None => Ok(()),
+        }
+    }
+
+    pub fn has_journal(&self) -> bool {
+        self.journal.is_some()
+    }
+}
+
+/// A short no-follow description of one observed entry, for a foreign-capture
+/// record. It never authorizes an effect.
+pub fn describe_entry(facts: &EntryFacts) -> String {
+    let class = if facts.is_directory() {
+        "directory"
+    } else if facts.is_regular() {
+        "regular file"
+    } else if facts.is_symlink() {
+        "symbolic link"
+    } else {
+        "other object"
+    };
+    format!(
+        "{class} device {} inode {} mode {:o} owner {}",
+        facts.device, facts.inode, facts.mode, facts.uid
+    )
+}
+
+/// Restore one captured directory's exact recorded mode through a search-only,
+/// no-follow descriptor of that very entry, after revalidating its identity.
+pub fn restore_captured_mode(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    device: u64,
+    inode: u64,
+    mode: u32,
+) -> Result<(), String> {
+    let held = open_directory_for_repair(parent, name)
+        .map_err(|error| format!("the captured directory cannot be opened ({error})"))?;
+    match descriptor_identity(held.as_fd()) {
+        Ok(identity) if identity == (device, inode) => {}
+        Ok(_) => {
+            return Err(
+                "the captured directory was replaced before its mode was restored".to_owned(),
+            )
+        }
+        Err(error) => {
+            return Err(format!(
+                "the captured directory's identity cannot be read ({error})"
+            ))
+        }
+    }
+    let bits = (mode & 0o7777) as libc::mode_t;
+    // SAFETY: `held` is a live descriptor for the verified directory.
+    if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
+        return Err(format!(
+            "the captured directory's recorded mode cannot be restored ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fsync(held.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "the restored mode cannot be synced ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// A caller's durable journal for the capture of one tree root. The seam calls
 /// `planned` after it has generated the private name and read the identities
 /// but before the exclusive rename, and `captured` with that same plan after the
@@ -454,6 +693,15 @@ impl RootCapturePlan {
 pub trait RootCaptureJournal {
     fn planned(&mut self, plan: &RootCapturePlan) -> Result<(), String>;
     fn captured(&mut self, plan: &RootCapturePlan) -> Result<(), String>;
+    /// Durably record one captured entry before it is removed.
+    fn record_captured(&mut self, record: &CaptureRecord) -> Result<(), String>;
+    /// Durably record that one captured entry's own removal completed.
+    fn record_removed(&mut self, record: &CaptureRecord) -> Result<(), String>;
+    /// Durably record a capture that was not the observed object, before any
+    /// put-back attempt.
+    fn record_foreign(&mut self, capture: &ForeignCapture) -> Result<(), String>;
+    /// Durably record that the captured root itself was removed.
+    fn record_root_removed(&mut self, plan: &RootCapturePlan) -> Result<(), String>;
 }
 
 /// What the two names of one journaled root capture hold right now.
@@ -821,6 +1069,7 @@ fn drain_finder_metadata(
     name: &CStr,
     dir: BorrowedFd<'_>,
     device: u64,
+    context: &mut CaptureContext<'_>,
     between: &mut dyn FnMut() -> Result<(), DrainStop>,
 ) -> Result<u64, Rmdir> {
     // Revalidate the directory binding one last time before anything in it is
@@ -911,7 +1160,37 @@ fn drain_finder_metadata(
             Err(reason) => Some(reason),
         };
         if let Some(kind) = mismatch {
+            // Durably record the mismatch *before* the put-back: the private
+            // name must never hold an object no record names, and replay never
+            // removes a name recorded here.
+            let found = observe_entry(dir, &capture.private)
+                .map(|facts| describe_entry(&facts))
+                .unwrap_or_else(|error| format!("unreadable capture ({error})"));
+            let mut foreign = ForeignCapture {
+                path: context.chain.clone(),
+                private: String::from_utf8_lossy(capture.private.as_bytes()).into_owned(),
+                original: String::from_utf8_lossy(entry.name.as_bytes()).into_owned(),
+                expected_device: entry.device,
+                expected_inode: entry.inode,
+                expected_mode: u32::from(libc::S_IFREG),
+                found,
+                restored: false,
+            };
+            if let Err(reason) = context.record_foreign(&foreign) {
+                // Without the record the put-back is still the conservative
+                // action; the caller stops pending either way.
+                let restored = put_back(dir, &capture).is_ok();
+                return Err(Rmdir::Unproven {
+                    reason: format!(
+                        "a mismatched capture could not be recorded ({reason}); put back: {restored}"
+                    ),
+                });
+            }
             let restored = put_back(dir, &capture).is_ok();
+            if restored {
+                foreign.restored = true;
+                let _ = context.record_foreign(&foreign);
+            }
             return Err(Rmdir::Mismatch {
                 original: entry_label(OsStr::from_bytes(entry.name.to_bytes())),
                 private: entry_label(OsStr::from_bytes(capture.private.to_bytes())),
@@ -937,11 +1216,36 @@ fn drain_finder_metadata(
                 return Err(Rmdir::Failed { error });
             }
         }
+        // Durable record before the effect: replay can then find this capture
+        // by name and identity, and never treats the name as ordinary content.
+        let record = CaptureRecord {
+            path: context.chain.clone(),
+            private: String::from_utf8_lossy(capture.private.as_bytes()).into_owned(),
+            original: String::from_utf8_lossy(entry.name.as_bytes()).into_owned(),
+            device: entry.device,
+            inode: entry.inode,
+            mode: u32::from(libc::S_IFREG),
+        };
+        if let Err(reason) = context.record_captured(&record) {
+            let _ = put_back(dir, &capture);
+            return Err(Rmdir::Unproven {
+                reason: format!("the captured entry could not be recorded ({reason})"),
+            });
+        }
         #[cfg(test)]
         crate::test_fs::run_before_unlink();
         // Only the private name this process created is removed.
         let status = unsafe { libc::unlinkat(dir.as_raw_fd(), capture.private.as_ptr(), 0) };
         if status == 0 {
+            // Durable proof of this capture's removal before anything else
+            // counts it as work done.
+            if let Err(reason) = context.record_removed(&record) {
+                return Err(Rmdir::Unproven {
+                    reason: format!(
+                        "the captured entry's removal could not be recorded ({reason})"
+                    ),
+                });
+            }
             entries += 1;
             // The caller's own bounded check runs after *every* metadata unlink,
             // never once per batch: a reserve, volume or deadline failure stops
@@ -953,8 +1257,12 @@ fn drain_finder_metadata(
         }
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::NotFound {
-            // It vanished again between the revalidation and the unlink.
-            continue;
+            // The captured private name vanished between its record and its
+            // removal. That is never this drain's success: the caller keeps
+            // its pending intent and replay decides conservatively.
+            return Err(Rmdir::Unproven {
+                reason: "a recorded capture vanished before its removal".to_owned(),
+            });
         }
         return Err(Rmdir::Failed { error });
     }

@@ -23,8 +23,8 @@ use crate::removable;
 use crate::store::{self, CheckoutCustody, Store};
 use oxide_storage::inventory::{self, InventoryLimits};
 use oxide_storage::owned_delete::{
-    only_finder_metadata, rmdir_draining_finder_metadata, DrainStop, Rmdir, FINDER_RACE_ATTEMPTS,
-    FINDER_RACE_PAUSE,
+    only_finder_metadata, rmdir_draining_finder_metadata, CaptureContext, DrainStop, Rmdir,
+    FINDER_RACE_ATTEMPTS, FINDER_RACE_PAUSE,
 };
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
@@ -3336,11 +3336,16 @@ impl RootSession {
             // The leaf drain recovers metadata too, so it runs the same caller
             // check after every unlink it performs, not a no-op.
             let mut between = || check().map_err(DrainStop::Stopped);
+            let mut context = CaptureContext {
+                chain: Vec::new(),
+                journal: None,
+            };
             let outcome = rmdir_draining_finder_metadata(
                 self.outputs.as_fd(),
                 &name,
                 self.root.as_fd(),
                 std::ffi::OsStr::new(quarantine),
+                &mut context,
                 &mut between,
             );
             match &outcome {
@@ -3359,6 +3364,7 @@ impl RootSession {
                 | Rmdir::Stopped { .. }
                 | Rmdir::Mismatch { .. }
                 | Rmdir::CaptureFailed { .. }
+                | Rmdir::Unproven { .. }
                 | Rmdir::Failed { .. } => {
                     return Err(race_pending("the quarantine leaf", &outcome))
                 }
@@ -3516,11 +3522,16 @@ fn remove_quarantined_directory(
                 .check()
                 .map_err(|stop| DrainStop::Stopped(stop_text(stop)))
         };
+        let mut context = CaptureContext {
+            chain: Vec::new(),
+            journal: None,
+        };
         let outcome = rmdir_draining_finder_metadata(
             parent,
             name_c,
             child,
             std::ffi::OsStr::new(name),
+            &mut context,
             &mut between,
         );
         match &outcome {
@@ -3543,6 +3554,7 @@ fn remove_quarantined_directory(
             | Rmdir::Exhausted { .. }
             | Rmdir::Mismatch { .. }
             | Rmdir::CaptureFailed { .. }
+            | Rmdir::Unproven { .. }
             | Rmdir::Failed { .. } => {
                 return Err(Stop::Pending(race_pending(
                     "a quarantined directory",
@@ -3594,6 +3606,7 @@ fn race_pending(what: &str, outcome: &Rmdir) -> String {
         Rmdir::CaptureFailed { error } => {
             format!("{what} could not capture an entry ({error}); it is kept")
         }
+        Rmdir::Unproven { reason } => format!("{what} could not durably prove a capture's removal ({reason}); it is kept"),
         Rmdir::Failed { error } => format!("cannot remove {what} ({error}); it is kept"),
         // Completed or retryable outcomes are handled by every caller before
         // this function; reaching them here is still a pending intent, never
@@ -3632,6 +3645,16 @@ fn delete_contents_at(
         if Instant::now() > deleter.deadline {
             return Err(Stop::Pending(
                 "the delete batch exceeded its time window; the quarantine is kept".to_owned(),
+            ));
+        }
+        // A private capture name is never ordinary content. This caller keeps
+        // no capture journal of its own, so a leftover private name here is
+        // unrecorded: it is kept and the intent stays pending, never unlinked
+        // by name.
+        if oxide_storage::owned_delete::is_capture_name(std::ffi::OsStr::new(&name)) {
+            return Err(Stop::Pending(
+                "the quarantine holds a private capture name no record names; it is kept"
+                    .to_owned(),
             ));
         }
         let name_c = std::ffi::CString::new(name.as_bytes())
