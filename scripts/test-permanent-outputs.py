@@ -515,8 +515,12 @@ def run(proof: Proof, repo: str) -> None:
         "a refused adopt created the local root",
     )
 
-    mounted = attach_image(proof, root, name)
+    # Premise 6: this proof's own image is attached with filesystem owners on
+    # and observed read-only; the product registration that follows is the
+    # second control (it refuses an ignore-ownership mount).
+    mounted = attach_image(proof, root, name, owners=True)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
+    owners_honored(proof, mount, "exec-inference attach")
     code, stdout, stderr = proof.oxide(
         [
             "pool",
@@ -2485,6 +2489,81 @@ def ignore_run(proof: Proof, repo: str) -> None:
     proof.detach()
 
 
+# Premise 7 (HIGH checklist): the staged binary and every fixture child build
+# under ONE frozen compiler-flag environment. `layout.stage_at` copies
+# `os.environ`, so the freeze is applied to the process environment before
+# staging and then to the fixture environment, which is built from the same
+# values. `CARGO_ENCODED_RUSTFLAGS` is removed everywhere: it takes precedence
+# over `RUSTFLAGS`, so an inherited value would unfreeze the "empty" flag set.
+FROZEN_RUSTFLAGS = ""
+
+
+def freeze_compiler_flags(env) -> None:
+    env.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    env["RUSTFLAGS"] = FROZEN_RUSTFLAGS
+
+
+# Premise 6 (HIGH checklist): every attach and reattach of this proof's own
+# image requests filesystem owners. The product registration that follows is
+# the second control: it refuses an ignore-ownership mount.
+def owners_honored(proof: Proof, mount: str, label: str) -> None:
+    """Bounded read-only observation that the private image's mounted root does
+    not carry the ignore-ownership flag."""
+    result = proof.run(["/sbin/mount"], timeout=30)
+    expect(result.returncode == 0, f"{label}: mount listing failed: {result.stderr!r}")
+    line = next(
+        (
+            entry
+            for entry in result.stdout.decode(errors="replace").splitlines()
+            if f" on {mount} " in entry
+        ),
+        None,
+    )
+    expect(line is not None, f"{label}: {mount} is not in the mount listing")
+    expect(
+        "noowners" not in line,
+        f"{label}: {mount} was mounted with owners ignored (MNT_IGNORE_OWNERSHIP): {line}",
+    )
+
+
+# The fixed exec-inference case table. `--plan` prints exactly this and touches
+# nothing; `exec_run` executes the same labels in this order.
+EXEC_CASES = [
+    ("s4b", "a fresh eligible checkout's first leased build creates the profile layout, an exec with no --output places its output in the root, and an existing whole-target fixture (case 09) stays whole-target"),
+    ("01", "explicit adoption publishes the same profile layout"),
+    ("02", "exec without --output runs a tool that builds through the owned pair"),
+    ("03", "a repeat reuses the same warm slot and relinks nothing"),
+    ("04", "the tool's release build is placed under the same root"),
+    ("05", "the declared --output override reaches the same keyed slot and placement"),
+    ("06", "a member the receipt does not place stays real and local"),
+    ("07+14", "exec on a detached checkout runs locally; detach restored real empty members and kept the root"),
+    ("08", "an ineligible (empty-target) checkout is never converted"),
+    ("09", "an existing whole-target checkout stays whole-target through a build and an exec"),
+    ("10", "a foreign member link refuses before Cargo and changes nothing"),
+    ("11", "a receipt changed while the command waits refuses"),
+    ("12", "root drift refuses and names the explicit adoption"),
+    ("13", "a checkout path containing a space converts and runs end to end"),
+    ("15", "Ctrl-C reaches the tool group, the lease holds until the group closes, then releases"),
+]
+
+
+def plan_exec_inference() -> None:
+    """The effect-free table and allocation, printed by `--plan`."""
+    print("exec-inference (oxide#160): S1 derived exec member sets + S4b profile first conversion")
+    print(
+        "supervisor: python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- "
+        "python3 scripts/test-permanent-outputs.py exec-inference"
+    )
+    print("limits: 300 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
+    print("        attached with hdiutil -owners on, ordinary detach, selected-volume scratch")
+    print("fixture work, sequential, one Cargo child at a time: 4 Cargo jobs for the single")
+    print("        staging and 1 per fixture child; planning demand 4 CPU / 6 GiB")
+    print("cases (fail-fast, in this order):")
+    for label, text in EXEC_CASES:
+        print(f"  {label}: {text}")
+    print("nothing was created, mounted, spawned or written")
+
+
 # Phase labels this script reached, for the uncounted diagnostic's bounded
 # receipt. The counted run uses the proof's own phase checks.
 PHASES: list[str] = []
@@ -2533,6 +2612,21 @@ EXEC_TOOLS = {
         '#!/bin/sh\nset -eu\n'
         'mkdir -p target/staging\n'
         'printf local > target/staging/out\n'
+    ),
+    # A gated tool whose LEADER exits on the forwarded interrupt while a group
+    # member that ignores it keeps waiting for the release file, so the lease
+    # must stay held until that member closes (case 15).
+    "tool-gated.sh": (
+        '#!/bin/sh\nset -eu\n'
+        'gate="$1"\n'
+        'printf started > "$gate.started"\n'
+        '(\n'
+        "  trap '' INT TERM\n"
+        '  while [ ! -f "$gate.release" ]; do sleep 0.05; done\n'
+        ') &\n'
+        "trap 'exit 0' INT TERM\n"
+        'while [ ! -f "$gate.release" ]; do sleep 0.05; done\n'
+        'wait\n'
     ),
 }
 
@@ -2591,6 +2685,48 @@ def expect_profile_layout(pool: str, mount: str, checkout: str, label: str) -> s
     return root
 
 
+def legacy_whole_target(proof: Proof, pool: str, mount: str, checkout: str, label: str) -> str:
+    """An EXISTING whole-target checkout, built without hand-computing any
+    marker fact: the product's own explicit conversion creates the root and its
+    `oxide.outputs.root/2` marker for this checkout, and the fixture then
+    records the legacy version-2 whole-target receipt that selects that same
+    root and replaces the real `target` with the legacy owned link. The root
+    keeps the payload and the marker; only the layout the receipt records is
+    the pre-oxide#133 one."""
+    code, _, stderr = proof.oxide(
+        ["outputs", "adopt"], f"{label}: convert to obtain a real root and marker", checkout
+    )
+    expect(code == 0, stderr)
+    root = expect_profile_layout(pool, mount, checkout, label)
+    receipt = read_json(receipt_file(pool, checkout))
+    selected = next(
+        (placement["selected"] for placement in receipt["links"] if placement.get("selected")),
+        None,
+    )
+    expect(selected is not None, f"{label}: the conversion selected no root")
+    target = os.path.join(checkout, "target")
+    for member in ("debug", "release"):
+        path = os.path.join(target, member)
+        if os.path.islink(path):
+            os.remove(path)
+    os.rmdir(target)
+    os.symlink(root, target)
+    # The document copies the product's own `checkout` and `checkout_id` bytes,
+    # so no fixture-side path or digest derivation can disagree with it.
+    legacy = {
+        "version": "oxide.outputs.transition/2",
+        "checkout": receipt["checkout"],
+        "checkout_id": receipt["checkout_id"],
+        "generation": receipt["generation"],
+        "state": "committed",
+        "links": [{"member": "target", "selected": selected}],
+        "updated_ms": int(time.time() * 1000),
+    }
+    with open(receipt_file(pool, checkout), "w", encoding="utf-8") as handle:
+        json.dump(legacy, handle, indent=2)
+    return root
+
+
 def exec_run(proof: Proof, repo: str) -> None:
     """Focused exec-output-inference proof (oxide#160): S1 derives an `exec`
     member set from the checkout's committed placement, and S4b makes the
@@ -2599,15 +2735,45 @@ def exec_run(proof: Proof, repo: str) -> None:
     Every case is a positive oracle plus its own control: a real derived run
     and the foreign member link that differs only in destination, an
     unrecorded real member and the root bytes it must not reach, a detached
-    checkout that runs locally and the root it must not write. Cases 09 (a
-    hand-built legacy whole-target receipt) and 15 (an interrupted tool) are
-    NOT implemented here: the legacy whole-target plan and `exec` refusal are
-    asserted by the source units
-    (`exec_derives_nothing_for_a_whole_target_or_unconverted_checkout`,
-    `a_whole_target_receipt_is_untouched_by_a_build`), and the interrupt and
-    group-closure contract by the `rust:permanent-outputs` and
-    `rust:oxide-exec` modes. This mode therefore claims only the cases it
-    executes."""
+    checkout that runs locally and the root it must not write, an existing
+    whole-target checkout (case 09) that must stay whole-target beside the
+    profile conversion, and an interrupted tool (case 15) whose surviving group
+    member must keep the lease held. `--plan` prints the same table and
+    allocation with no effect.
+
+    The HIGH premise checklist is traced through the executable bodies:
+
+    1. private HOME and rustup: `proof_env` captures the invoking `RUSTUP_HOME`
+       before replacing `HOME`, pins `RUSTUP_TOOLCHAIN` 1.97.1 and sets
+       `RUSTUP_AUTO_INSTALL=0`; every fixture crate is std-only, so the only
+       `--locked` call is this repository's staging.
+    2. account-home control: `OXIDE_TEST_HOME_FROM_ENV=1` in `proof_env`.
+    3. environment isolation: `proof_env` scrubs `OXIDE_*`, `XDG_*`,
+       `CARGO_BUILD_*`, `CARGO_TARGET_*`, `GIT_*`, the wrapper variables and
+       `CARGO`, then sets only this fixture's values; the pause and crash hooks
+       are added per case.
+    4. automatic adoption: every case states its receipt premise, and case 08
+       positively creates an ineligible (real empty target) checkout and
+       asserts the receipt is absent.
+    5. Cargo external argv: not applicable. The fixture tools are invoked
+       directly (`oxide exec -- <tool>`); none is a Cargo subcommand, so no
+       external argv is modelled.
+    6. owned images: every attach goes through `attach_image(..., owners=True)`
+       and `owners_honored` observes the mount read-only; the product's own
+       `pool register-removable` is the second control, since it refuses an
+       ignore-ownership mount.
+    7. compiler flags: `freeze_compiler_flags` sets one `RUSTFLAGS` (empty) and
+       removes `CARGO_ENCODED_RUSTFLAGS` on `os.environ` BEFORE staging and on
+       the fixture environment afterwards, so the staged binary and every
+       fixture child build under the same flag set.
+    8. temporary storage: the supervisor's scratch and the fixture `TMPDIR`
+       are the same selected-volume directory (asserted), there is no
+       internal-root exception, and the guard is the qualified shared
+       supervisor.
+    9. macOS `mktemp`: every fixture temp root is `tempfile.mkdtemp` under
+       `OXIDE_TASK_SCRATCH_ROOT` and the gate/release paths are fixed names
+       inside it; no fixture or tool calls `mktemp`.
+    """
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -2619,6 +2785,8 @@ def exec_run(proof: Proof, repo: str) -> None:
         f"({layout.source_facts(repo)}) mount {mount}"
     )
     phase(proof, "start")
+    # Premise 7: staging copies os.environ, so the freeze must precede it.
+    freeze_compiler_flags(os.environ)
     proof.binary = layout.stage_at(proof, repo, "oxide-exec-inference")
     phase(proof, "after staging")
 
@@ -2629,9 +2797,18 @@ def exec_run(proof: Proof, repo: str) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
+    # The same frozen flag set for every fixture child (premise 7).
+    freeze_compiler_flags(proof.env)
+    expect(proof.env["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "the fixture environment is not frozen")
+    expect("CARGO_ENCODED_RUSTFLAGS" not in proof.env, "an encoded rustflags value survives")
+    # Premises 8 and 9: the fixture's own temp paths are templates under the
+    # supervisor's selected-volume scratch, and no fixture calls `mktemp`
+    # outside it.
+    expect(proof.env["TMPDIR"] == os.environ["OXIDE_TASK_SCRATCH_ROOT"], "the fixture TMPDIR is not the supervisor scratch")
     tools = write_tools(root)
     build_tool = os.path.join(tools, "tool-build.sh")
     staging_tool = os.path.join(tools, "tool-staging.sh")
+    gated_tool = os.path.join(tools, "tool-gated.sh")
 
     maker = fresh_checkout(proof, root, "pool-maker")
     code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
@@ -2755,8 +2932,9 @@ def exec_run(proof: Proof, repo: str) -> None:
     )
     phase(proof, "after the unrecorded member")
 
-    # 07: detach restores real empty members and keeps the root; an exec on the
-    # detached checkout then runs locally and writes nothing into the root.
+    # 07 + 14: detach restores real empty members and keeps the root (the
+    # shipped detach, reused); an exec on the detached checkout then runs
+    # locally and writes nothing into the root.
     code, _, stderr = proof.oxide(["outputs", "detach"], "07 detach", app)
     expect(code == 0, stderr)
     target = os.path.join(app, "target")
@@ -2795,6 +2973,46 @@ def exec_run(proof: Proof, repo: str) -> None:
         "08: an unconverted target became a link",
     )
     expect(not os.path.exists(receipt_file(pool, plain)), "08: an unconverted checkout got a receipt")
+
+    # 09: an EXISTING whole-target checkout stays whole-target through a build
+    # and through an exec. This is also the S4b "existing whole-target fixture
+    # is untouched" half of the brief's native case.
+    legacy = fresh_checkout(proof, root, "legacy-whole-target")
+    legacy_root = legacy_whole_target(proof, pool, mount, legacy, "09 legacy fixture")
+    legacy_target = os.path.join(legacy, "target")
+    expect(os.path.islink(legacy_target), "09: the fixture's target is not the legacy link")
+    legacy_receipt = read_bytes(receipt_file(pool, legacy))
+    legacy_report = plan(proof, legacy, "09 the legacy fixture plans the whole target")
+    expect(
+        legacy_report["layout"] == "whole-target",
+        f"09: the product does not read the fixture as a whole-target checkout: {legacy_report}",
+    )
+    code, _, stderr = proof.oxide(["build"], "09 a build keeps the whole-target link", legacy)
+    expect(code == 0, stderr)
+    expect(os.path.islink(legacy_target), "09: a build replaced the whole-target link")
+    expect(os.readlink(legacy_target) == legacy_root, "09: a build relinked the whole target")
+    expect(
+        os.path.isfile(os.path.join(legacy_target, "debug", "poutputs")),
+        "09: the build wrote no binary through the whole-target link",
+    )
+    expect(
+        read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
+        "09: a build rewrote the whole-target receipt",
+    )
+    code, _, stderr = proof.oxide(
+        ["exec", "--", build_tool], "09 an exec keeps the whole-target link", legacy
+    )
+    expect(code == 0, stderr)
+    expect(os.path.islink(legacy_target), "09: an exec replaced the whole-target link")
+    expect(
+        os.readlink(legacy_target) == legacy_root,
+        "09: an exec relinked the whole target",
+    )
+    expect(
+        read_bytes(receipt_file(pool, legacy)) == legacy_receipt,
+        "09: an exec rewrote the whole-target receipt",
+    )
+    phase(proof, "after the legacy whole-target fixture")
 
     # 13: a checkout path containing a space converts and runs end to end.
     spaced = fresh_checkout(proof, root, "exec spaced")
@@ -2880,6 +3098,57 @@ def exec_run(proof: Proof, repo: str) -> None:
     expect(code != 0 and "Run the command again" in stderr, stderr)
     phase(proof, "after the changed receipt")
 
+    # 15: Ctrl-C reaches the tool's group; the lease stays held while a group
+    # member outlives the leader, and the slot is released once the group is
+    # empty and a later build proceeds.
+    interrupted = fresh_checkout(proof, root, "exec-interrupt")
+    code, _, stderr = proof.oxide(["build"], "15 interrupt fixture adopts", interrupted)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    expect_profile_layout(pool, mount, interrupted, "15 adoption")
+    gate = os.path.join(root, "interrupt-gate")
+    exec_child = start_child(
+        proof,
+        [proof.binary, "exec", "--", gated_tool, gate],
+        interrupted,
+        proof.env,
+    )
+    try:
+        wait_for(f"{gate}.started", "15 the gated tool started")
+        exec_child.send_signal(signal.SIGINT)
+        # The leader exits on the forwarded signal; the surviving group member
+        # ignores it, so the exec process must still be running and `status`
+        # must still name the holder.
+        deadline = time.monotonic() + min(40, work_left())
+        held = False
+        while time.monotonic() < deadline:
+            code, stdout, stderr = proof.oxide(
+                ["status"], "15 status while the group member lives", interrupted
+            )
+            expect(code == 0, stderr)
+            if "exec " in stdout:
+                held = True
+                break
+            time.sleep(0.2)
+        expect(
+            held,
+            "15: the interrupted exec's lease was not held while its group member lived",
+        )
+        expect(exec_child.poll() is None, "15: the exec returned before its group closed")
+        with open(f"{gate}.release", "wb") as handle:
+            handle.write(b"release")
+        code, stdout, stderr = finish_child(proof, exec_child, "15 the interrupted exec")
+        exec_child = None
+    finally:
+        if not os.path.exists(f"{gate}.release"):
+            with open(f"{gate}.release", "wb") as handle:
+                handle.write(b"release")
+        if exec_child is not None and exec_child.poll() is None:
+            exec_child.kill()
+    expect(code != 0, f"15: an interrupted exec reported success: {stdout}")
+    code, _, stderr = proof.oxide(["build"], "15 the slot is released after the group closes", interrupted)
+    expect(code == 0, stderr)
+    phase(proof, "after the interrupt control")
+
     proof.detach()
 
 
@@ -2916,6 +3185,15 @@ def cleanup_after_failure(proof: Proof) -> str:
 
 
 def main() -> int:
+    # `--plan` is effect-free and needs no supervisor: it prints the fixed
+    # exec-inference table and allocation, then returns.
+    if "--plan" in sys.argv[1:]:
+        expect(
+            [argument for argument in sys.argv[1:] if argument != "--plan"] == ["exec-inference"],
+            "only the exec-inference mode has a --plan table",
+        )
+        plan_exec_inference()
+        return 0
     if sys.platform != "darwin":
         fail("the permanent-outputs proof requires macOS")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")

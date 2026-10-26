@@ -338,17 +338,25 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # first conversion (S4b): the focused `exec-inference` mode of the #117/#121
 # fixture, under the same qualified shared proof supervisor (300 s, 512 MiB
 # monitored scratch, ordinary detach) and one owned 128 MiB scratch image
-# attached with `hdiutil -owners on`. A fresh eligible checkout's first leased
-# build creates a real `target` holding owned `debug`/`release` member links
-# into one root, an `exec` with no `--output` derives its member set from that
-# committed receipt and places its tool's build in the root, a repeat reuses
-# the warm slot, the declared `--output` override reaches the same key, an
-# unrecorded member stays real and local, a detached and an unconverted
-# checkout run locally, a spaced checkout path works end to end, and a foreign
-# member link, root drift and a receipt changed while the command waits all
-# refuse with the links, receipt and roots unchanged. Cases 09 (a hand-built
-# legacy whole-target receipt) and 15 (an interrupted tool) are not implemented
-# in this mode and are covered by the source units and the #107/#117 modes.
+# attached with `hdiutil -owners on` on every attach. A fresh eligible
+# checkout's first leased build creates a real `target` holding owned
+# `debug`/`release` member links into one root, an `exec` with no `--output`
+# derives its member set from that committed receipt and places its tool's
+# build in the root, a repeat reuses the warm slot, the declared `--output`
+# override reaches the same key, an unrecorded member stays real and local, a
+# detached and an unconverted checkout run locally, a spaced checkout path
+# works end to end, an existing whole-target fixture (case 09) stays
+# whole-target through a build and an exec, and a foreign member link, root
+# drift, a receipt changed while the command waits and an interrupted tool
+# whose surviving group member holds the lease (case 15) all behave as
+# recorded with the links, receipt and roots unchanged where they must be.
+# The HIGH premise checklist is traced in the mode's docstring: private
+# HOME/rustup, OXIDE_TEST_HOME_FROM_ENV, the OXIDE_/XDG_/CARGO_*/GIT_ scrub,
+# an explicitly created unconverted control, `-owners on` plus a read-only
+# mount observation, one frozen RUSTFLAGS with CARGO_ENCODED_RUSTFLAGS
+# removed for staging and every fixture child, selected-volume scratch, and
+# mkdtemp-only fixture temp roots. `--plan` prints the fixed table and
+# allocation with no effect.
 # `rust:exec-output-inference:diagnostic` appends `--diagnostic`: the same
 # bounded guard, uncounted, aborting at the first fault and writing a bounded
 # `qualified: false` receipt (it has no keep-going collection). Each run needs
