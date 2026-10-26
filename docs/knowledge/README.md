@@ -18,4 +18,6 @@
 
 [Proof supervisor correction](contracts/proof-supervisor-correction.md) holds the reviewed correction design (revision 4) for oxide#109's shared proof supervisor under Tom's pinned-leader cooperative closure ruling; [workflow](contracts/workflow.md#shared-proof-supervisor) records the implementation.
 
+[`oxide exec` output-member inference](contracts/exec-output-inference.md) owns the proposed design that makes `oxide exec` need no `--output` declaration: Cargo's supported stable interface reports no pre-build output directories, so `exec` derives its complete member set from the checkout's committed placement, classifies every existing member-shaped entry before Cargo, and reports rather than guesses a member that placement does not cover. It is design only: no code, native, consumer or host effect.
+
 [Qualification findings](qualification-readiness.md) preserves the Cargo freshness, compiler path, cross-path, containment and capacity findings the workflow builds on. They grant no execution authority.
