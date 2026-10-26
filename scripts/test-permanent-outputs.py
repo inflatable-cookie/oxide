@@ -2523,7 +2523,10 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
     maker = fresh_checkout(proof, root, "pool-maker")
     code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
     expect(code == 0, stderr)
-    mounted = attach_image(proof, root, name)
+    # The registration premise needs ownership really honoured on the owned
+    # image; without `-owners on` this user's ownership does not apply to the
+    # mount and the product correctly refuses registration.
+    mounted = attach_image(proof, root, name, owners=True)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
     code, stdout, stderr = proof.oxide(
         [
