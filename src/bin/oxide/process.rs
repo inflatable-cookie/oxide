@@ -36,6 +36,47 @@ pub fn started_ms() -> u64 {
     *STARTED_MS.get_or_init(now_ms)
 }
 
+/// The current boot session's start, milliseconds since the epoch, read from
+/// the kernel (`kern.boottime`). `None` when the platform has no reading, the
+/// call fails or the value is unusable, so a closure decision that needs it
+/// stays unknown. Later clock adjustments move the kernel's boot time with
+/// the clock, so it is never a stale instant from boot.
+#[cfg(target_os = "macos")]
+pub fn boot_ms() -> Option<u64> {
+    let name = b"kern.boottime\0";
+    let mut value: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&value);
+    // SAFETY: `name` is NUL-terminated, `value` and `length` are writable, and
+    // no new value is supplied to sysctl.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            (&mut value as *mut libc::timeval).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || length != std::mem::size_of_val(&value) {
+        return None;
+    }
+    if value.tv_sec <= 0 || !(0..1_000_000).contains(&value.tv_usec) {
+        return None;
+    }
+    let seconds = u64::try_from(value.tv_sec).ok()?;
+    let micros = u64::try_from(value.tv_usec).ok()?;
+    seconds
+        .checked_mul(1_000)?
+        .checked_add(micros / 1_000)
+        .filter(|ms| *ms > 0)
+}
+
+/// The boot session is unavailable off macOS (compile-only target).
+#[cfg(not(target_os = "macos"))]
+pub fn boot_ms() -> Option<u64> {
+    None
+}
+
 extern "C" fn record_signal(signal: libc::c_int) {
     PENDING.store(signal, Ordering::SeqCst);
     RECEIVED.store(signal, Ordering::SeqCst);
@@ -362,6 +403,22 @@ mod tests {
         .expect("a budget clock");
         budget::arm_execution(Instant::now(), budget::Phase::PrimaryCargo);
         std::thread::sleep(Duration::from_millis(10));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_boot_session_start_is_read_from_the_kernel() {
+        let boot = boot_ms().expect("kern.boottime on macOS");
+        let now = now_ms();
+        assert!(boot > 0);
+        assert!(boot <= now + 1_000, "boot {boot} ms is after now {now} ms");
+        // The reading tracks the wall clock the rest of Oxide records, so the
+        // age it reports is the uptime's order of magnitude, not a stale 1970
+        // or a future instant.
+        assert!(
+            now - boot < 400 * 24 * 60 * 60 * 1_000,
+            "boot {boot} ms is implausibly old for now {now} ms"
+        );
     }
 
     #[test]

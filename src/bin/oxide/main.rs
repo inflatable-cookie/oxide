@@ -421,11 +421,20 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // the pre-lease reservation needs the same requested member set binding
     // will use, and a command this checkout refuses on layout or an unmodelled
     // command name now refuses before any authority write (oxide#133).
+    let derives_exec = invocation.command == "exec" && invocation.declared_outputs.is_empty();
     let declaration = if invocation.command == "exec" {
-        // The caller's declaration is the complete set of the tool's profile
-        // outputs; an opaque tool that declares none is refused in a profile
-        // checkout rather than guessed.
-        layout::declared(&invocation.declared_outputs)?
+        if invocation.declared_outputs.is_empty() {
+            // oxide#160 (S1): an `exec` that declares no output derives the
+            // member set from this checkout's committed placement. It never
+            // guesses a profile, never links, reserves or converts, and runs
+            // with no owned destination in a detached or unconverted checkout.
+            outputs::exec_declaration(Some(&output_control), &checkout, pool_fallback.as_deref())?
+        } else {
+            // The caller's `--output` declaration is the complete set of the
+            // tool's profile outputs, exactly as before; it stays an optional
+            // override and keeps its byte-identical slot key.
+            layout::declared(&invocation.declared_outputs)?
+        }
     } else if !cli::models_profile_outputs(&invocation.command) {
         // An external or unknown subcommand's output directories are opaque.
         // A profile checkout refuses it before Cargo rather than assuming its
@@ -455,14 +464,18 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     };
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
-    // released again before this command waits for a slot.
-    prep!(outputs::reserve(
-        &store,
-        Some(&output_control),
-        &checkout,
-        &declaration,
-        pool_fallback.as_deref(),
-    ));
+    // released again before this command waits for a slot. A derived `exec`
+    // plan is a subset of the receipt's own placements, so it reserves
+    // nothing: the root it binds already exists and no member is new.
+    if !derives_exec {
+        prep!(outputs::reserve(
+            &store,
+            Some(&output_control),
+            &checkout,
+            &declaration,
+            pool_fallback.as_deref(),
+        ));
+    }
     test_pause("reserved");
     if budget::admission_expired() {
         return Ok(stop_for_admission());

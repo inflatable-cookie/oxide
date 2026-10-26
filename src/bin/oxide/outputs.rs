@@ -3367,41 +3367,22 @@ fn rollback_migration(
 /// one root. A real nonempty member directory is never moved or converted; an
 /// empty one converts only here.
 fn adopt_profile(context: &Context, receipt: Receipt) -> Result<(Receipt, Selected, bool), String> {
-    let target = context.target()?;
-    match &target {
-        TargetState::Missing => {
-            // The lexical CARGO_TARGET_DIR stays real. Adoption creates it so
-            // Cargo's own top-level files land in a real directory.
-            create_owned_directory(&context.link())?;
-            fs::set_permissions(&context.link(), fs::Permissions::from_mode(0o755))
-                .map_err(|error| format!("cannot set permissions on the target: {error}"))?;
-            sync_directory(&context.workspace)?;
-        }
-        TargetState::RealEmpty | TargetState::RealNonEmpty => {}
-        TargetState::OwnedLink(root) => {
-            return Err(format!(
-                "outputs adopt refused: {} is an owned whole-target link to {}; it is kept exactly as it is. Migrating a whole-target checkout to profile members is a separate journaled transition and is refused by this build",
-                context.link().display(),
-                root.display()
-            ))
-        }
-        TargetState::Dangling(root) => {
-            return Err(format!(
-                "outputs adopt refused: {} links to {}, which is not available; it is left untouched",
-                context.link().display(),
-                root.display()
-            ))
-        }
-        TargetState::Foreign => {
-            return Err(format!(
-                "outputs adopt refused: {} is {}; Oxide never replaces it",
-                context.link().display(),
-                target.label()
-            ))
-        }
-    }
-    // The members adoption establishes: the host debug/release pair plus every
-    // member this receipt already places, sorted and prefix-free.
+    adopt_profile_from(context, receipt, Start::Adopt, None)
+}
+
+/// The ONE profile-layout creator, shared by the explicit `oxide outputs adopt`
+/// and by the automatic first conversion of a fresh checkout on the permanent
+/// drive (oxide#160, S4b). `start` is the only difference: explicit adoption
+/// may convert an empty real directory (and relink a stale one), while the
+/// automatic conversion creates its members only where nothing exists.
+fn adopt_profile_from(
+    context: &Context,
+    receipt: Receipt,
+    start: Start,
+    captured: Option<&RootSpec>,
+) -> Result<(Receipt, Selected, bool), String> {
+    // The members this conversion establishes: the host debug/release pair
+    // plus every member the receipt already places, sorted and prefix-free.
     let mut members = vec!["debug".to_owned(), "release".to_owned()];
     for placement in receipt.links() {
         members.push(placement.member().to_owned());
@@ -3411,18 +3392,101 @@ fn adopt_profile(context: &Context, receipt: Receipt) -> Result<(Receipt, Select
         .map(|name| crate::layout::Member::parse(name))
         .collect::<Result<Vec<_>, _>>()?;
     let declaration = crate::layout::Declaration::new(parsed)?;
-    let usable = usable_external(context);
-    let desired = match desired_selection(context, &receipt)? {
-        Some(desired) => desired,
-        None => {
-            let spec = match &usable {
-                Ok(registration) => external_spec(registration, &context.workspace),
-                Err(_) => local_spec(&context.workspace),
+    let target = context.target()?;
+    let action = if start == Start::Adopt {
+        "outputs adopt"
+    } else {
+        "auto-adopt"
+    };
+    match &target {
+        TargetState::Missing => {
+            // The first conversion's ignore prerequisite (oxide#125) is checked
+            // for EVERY member link it is about to publish before the real
+            // target directory exists, so a refused conversion changes nothing
+            // at all (oxide#152's rule). `transition_at` rechecks each one
+            // under its own prepared receipt.
+            for member in declaration.members() {
+                refuse_link_git_exposure_at(
+                    context,
+                    &link_path(&context.workspace, member.name()),
+                    Some(member.name()),
+                )?;
+            }
+            // The lexical CARGO_TARGET_DIR stays real. Adoption creates it so
+            // Cargo's own top-level files land in a real directory.
+            create_owned_directory(&context.link())?;
+            fs::set_permissions(&context.link(), fs::Permissions::from_mode(0o755))
+                .map_err(|error| format!("cannot set permissions on the target: {error}"))?;
+            sync_directory(&context.workspace)?;
+        }
+        TargetState::RealEmpty | TargetState::RealNonEmpty if start == Start::Adopt => {}
+        TargetState::OwnedLink(root) => {
+            return Err(format!(
+                "{action} refused: {} is an owned whole-target link to {}; it is kept exactly as it is. Migrating a whole-target checkout to profile members is a separate journaled transition and is refused by this build",
+                context.link().display(),
+                root.display()
+            ))
+        }
+        TargetState::Dangling(root) => {
+            return Err(format!(
+                "{action} refused: {} links to {}, which is not available; it is left untouched",
+                context.link().display(),
+                root.display()
+            ))
+        }
+        TargetState::Foreign => {
+            return Err(format!(
+                "{action} refused: {} is {}; Oxide never replaces it",
+                context.link().display(),
+                target.label()
+            ))
+        }
+        // The automatic first conversion creates its members only where
+        // nothing exists: an empty or populated real directory appearing where
+        // `target` was positively absent is not adopted, converted or kept.
+        state => {
+            return Err(format!(
+                "{action} refused: {} is {}; an automatic first conversion creates no member where anything exists. Nothing was changed. Run `oxide outputs adopt` yourself if you accept converting an empty directory",
+                context.link().display(),
+                state.label()
+            ))
+        }
+    }
+    // The explicit adoption decides its own place from the live registration.
+    // The automatic conversion uses exactly the root it captured and verified
+    // twice before this point, so it can never be redirected to the
+    // checkout-local fallback behind the owner's back.
+    let desired = match start {
+        Start::MissingOnly => None,
+        Start::Any | Start::Adopt => desired_selection(context, &receipt)?,
+    };
+    let spec = match (start, captured) {
+        (Start::MissingOnly, Some(spec)) => spec.clone(),
+        (Start::MissingOnly, None) => {
+            return Err(
+                "outputs: auto-adopt has no captured root selection; nothing was changed"
+                    .to_owned(),
+            )
+        }
+        (_, _) => {
+            let desired = match &desired {
+                Some(desired) => desired.clone(),
+                None => {
+                    let usable = usable_external(context);
+                    let spec = match &usable {
+                        Ok(registration) => external_spec(registration, &context.workspace),
+                        Err(_) => local_spec(&context.workspace),
+                    };
+                    spec.selected(receipt.generation.saturating_add(1))
+                }
             };
-            spec.selected(receipt.generation.saturating_add(1))
+            spec_for(&desired)
         }
     };
-    let spec = spec_for(&desired);
+    let wanted = match &desired {
+        Some(desired) => Some(desired.clone()),
+        None => Some(spec.selected(receipt.generation.saturating_add(1))),
+    };
     let mut committed = receipt;
     let mut converted = false;
     let mut kept = Vec::new();
@@ -3430,27 +3494,40 @@ fn adopt_profile(context: &Context, receipt: Receipt) -> Result<(Receipt, Select
         let link = link_path(&context.workspace, member.name());
         let state = link_state(&link, &context.workspace, &context.checkout_id)?;
         match state {
-            TargetState::RealNonEmpty => {
+            // A real nonempty member is kept local, but only an explicit
+            // adoption may do that; the automatic conversion never leaves a
+            // half-converted member behind.
+            TargetState::RealNonEmpty if start == Start::Adopt => {
                 kept.push(member.name().to_owned());
                 continue;
             }
-            TargetState::RealEmpty => {}
+            TargetState::RealEmpty if start == Start::Adopt => {}
             TargetState::Missing => {}
             TargetState::OwnedLink(root)
-                if root == member_destination(&desired.root, member.name())
-                    && committed
-                        .selected_for(member.name())
-                        .is_some_and(|selected| selected.same_place(&desired)) =>
+                if start == Start::Adopt
+                    && wanted.as_ref().is_some_and(|desired| {
+                        root == member_destination(&desired.root, member.name())
+                            && committed
+                                .selected_for(member.name())
+                                .is_some_and(|selected| selected.same_place(desired))
+                    }) =>
             {
                 // Already the desired destination this adoption would select:
                 // idempotent, nothing is written. A link that still matches an
                 // older receipt but not the desired place is relinked below.
                 continue;
             }
-            TargetState::OwnedLink(_) | TargetState::Dangling(_) => {}
+            TargetState::OwnedLink(_) | TargetState::Dangling(_) if start == Start::Adopt => {}
             TargetState::Foreign => {
                 return Err(format!(
-                    "outputs adopt refused: {} is {}; it is never followed or replaced",
+                    "{action} refused: {} is {}; it is never followed or replaced",
+                    link.display(),
+                    state.label()
+                ))
+            }
+            state => {
+                return Err(format!(
+                    "{action} refused: {} is {}; an automatic first conversion creates no member where anything exists. Nothing was changed. Run `oxide outputs adopt` yourself if you accept converting an empty directory",
                     link.display(),
                     state.label()
                 ))
@@ -3461,12 +3538,15 @@ fn adopt_profile(context: &Context, receipt: Receipt) -> Result<(Receipt, Select
             &committed,
             member.name(),
             &spec,
-            Start::Adopt,
+            start,
             NonceAuthority::Unkeyed,
         )?;
         converted = true;
     }
-    let selected = committed.selected().cloned().unwrap_or(desired.clone());
+    let selected = match committed.selected().cloned().or(desired) {
+        Some(selected) => selected,
+        None => return Err("the adoption committed no root".to_owned()),
+    };
     if converted {
         ensure_root(context, &spec, committed.generation)?;
     }
@@ -3536,6 +3616,10 @@ fn selection_matches(captured: &Selected, current: &Selected) -> bool {
     captured.same_place(current)
 }
 
+/// The member links an automatic first conversion publishes: `debug` and
+/// `release` (`adopt_profile_from`'s declaration for a fresh receipt).
+const AUTO_ADOPT_MEMBERS: [&str; 2] = ["debug", "release"];
+
 /// Automatic first conversion (oxide#121), run once per leased command before
 /// its destination is planned, its key is built or its slot is taken. The
 /// command's own selection must be a removable permanent one, and the volume
@@ -3547,15 +3631,21 @@ fn selection_matches(captured: &Selected, current: &Selected) -> bool {
 /// absence.
 ///
 /// The first conversion's ignore prerequisite decides *eligibility*, not the
-/// command (oxide#154): when Git cannot confirm the checkout's exact
-/// non-directory link path is ignored by a rule that covers a link, this
-/// command is an ordinary unconverted checkout. Nothing is written — no
-/// receipt, root, link, notice or downgrade fence — so the build keeps its
-/// real local target and the binding prints its one unconverted warning. An
-/// explicit `oxide outputs adopt` still refuses with the exact fix, and the
-/// transition rechecks the same prerequisite before its first effect, so a
-/// concurrent change refuses rather than publishing a link Git does not
-/// cover.
+/// command (oxide#154): when Git cannot confirm a link path this conversion
+/// would publish is ignored by a rule that covers it, the command is an
+/// ordinary unconverted checkout. Nothing is written — no receipt, root,
+/// link, notice or downgrade fence — so the build keeps its real local
+/// target and the binding prints its one unconverted warning. An explicit
+/// `oxide outputs adopt` still refuses with the exact fix, and the transition
+/// rechecks the same prerequisite before its first effect, so a concurrent
+/// change refuses rather than publishing a link Git does not cover.
+///
+/// Since oxide#160 the first conversion creates the profile layout, so
+/// eligibility is asked for every member link it would publish
+/// (`adopt_profile_from`'s declaration for a fresh receipt), exactly as that
+/// creator checks them before it creates the real `target` directory. Asking
+/// the member paths also keeps a directory-only rule such as `target/`
+/// eligible, because it genuinely covers `target/<member>`.
 pub fn auto_adopt(
     store: &Store,
     checkout: &Path,
@@ -3595,12 +3685,17 @@ pub fn auto_adopt(
     // (oxide#154). The prerequisite is asked before the barrier, the
     // downgrade fence or the admission lock, so an ineligible checkout gets
     // no side effect at all: it is exactly the checkout this command found.
-    if first_link_git_answer(&context, None).verdict != LinkGitVerdict::Eligible {
-        return Ok(());
+    // It asks every member link the profile-layout first conversion would
+    // publish (oxide#160), the same set `adopt_profile_from` checks before it
+    // creates the real target directory.
+    for member in AUTO_ADOPT_MEMBERS {
+        if first_link_git_answer(&context, Some(member)).verdict != LinkGitVerdict::Eligible {
+            return Ok(());
+        }
     }
     let mut waits = WaitAccounting::default();
     let guard = barrier(store, checkout, &mut waits)?;
-    let outcome = (|| {
+    let outcome: Result<Option<Selected>, String> = (|| {
         refuse_unknown_custody(store, checkout, "auto-adopt")?;
         // Fence a pre-feature Oxide out of both pools before any link can be
         // published, as an explicit adopt does for a missing target.
@@ -3621,19 +3716,16 @@ pub fn auto_adopt(
         if !selection_matches(&captured, &spec.selected(0)) {
             return Ok(None);
         }
-        let receipt = Receipt::first(checkout, &context.checkout_id);
-        let committed = transition(
-            &context,
-            &receipt,
-            &spec,
-            Start::MissingOnly,
-            NonceAuthority::Unkeyed,
-        )?;
-        committed
-            .selected()
-            .cloned()
-            .map(Some)
-            .ok_or_else(|| "the transition committed no root".to_owned())
+        // The first conversion creates the profile layout through the SAME
+        // creator an explicit `oxide outputs adopt` uses, with the
+        // missing-target-only start this path has always required (oxide#160,
+        // S4b): a real `target` directory holding an owned `debug`/`release`
+        // pair into one new owned root, and a receipt and root marker
+        // identical in form to a fresh explicit adoption.
+        let receipt = Receipt::first_with(checkout, &context.checkout_id, LayoutKind::Profile);
+        let (_committed, selected, _converted) =
+            adopt_profile_from(&context, receipt, Start::MissingOnly, Some(&spec))?;
+        Ok(Some(selected))
     })();
     release_barrier(store, guard)?;
     if let Some(selected) = outcome? {
@@ -4320,6 +4412,29 @@ fn bind_profile(
     receipt: &Receipt,
     expected: Option<&Plan>,
 ) -> Bind {
+    // A detached profile receipt owns no destination: the command runs locally
+    // through real directories, exactly as the legacy detached state does
+    // (oxide#160, S1). Nothing is planned, so nothing may be keyed as owned,
+    // and a link at `target` is still never followed.
+    if receipt.state == ReceiptState::Detached {
+        if expected.is_some_and(|plan| !plan.members.is_empty()) {
+            return Bind::Refuse(
+                "outputs: the receipt says this checkout is detached but its slot was keyed for an owned root; nothing was built. Run the command again"
+                    .to_owned(),
+            );
+        }
+        return match refuse_unowned_link(context, "outputs") {
+            Err(reason) => Bind::Refuse(reason),
+            Ok(()) => Bind::Bound(Outcome {
+                warnings: vec![
+                    "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
+                        .to_owned(),
+                ],
+                note: Some("outputs detached".to_owned()),
+                root: None,
+            }),
+        };
+    }
     let Some(plan) = expected else {
         return Bind::Refuse(
             "outputs: this checkout places outputs at profile members but this command's slot was keyed with no owned destination; nothing was built. Run the command again"
@@ -4780,6 +4895,15 @@ pub fn planned_destination(
     let Some(receipt) = context.receipt()? else {
         return Ok(None);
     };
+    // A detached profile checkout owns no destination at all: its command runs
+    // locally through real directories, exactly as an unconverted checkout
+    // does. Planning the receipt's (unselected) members as owned placements is
+    // what used to make this state refuse; oxide#160 (S1) removes that
+    // over-refusal, so the key carries no destination and the binding accepts
+    // no link.
+    if receipt.layout() == LayoutKind::Profile && receipt.state == ReceiptState::Detached {
+        return Ok(None);
+    }
     match receipt.layout() {
         LayoutKind::WholeTarget => {
             let Some(selected) = desired_selection(&context, &receipt)? else {
@@ -4795,6 +4919,10 @@ pub fn planned_destination(
         }
         LayoutKind::Profile => {
             if declaration.is_empty() {
+                // A committed profile receipt is always planned from a member
+                // set: `oxide exec` derives one from the receipt itself
+                // (oxide#160), so an empty set here is a caller bug, not a
+                // checkout state.
                 return Err("outputs: this checkout places outputs at profile members, but this command declares none; declare its outputs with `oxide exec --output <member>` or run `oxide outputs detach`"
                     .to_owned());
             }
@@ -4831,6 +4959,174 @@ pub fn planned_destination(
             }))
         }
     }
+}
+
+/// The profile member set `oxide exec` derives when the caller declares none
+/// (oxide#160, S1; design `exec-output-inference.md`).
+///
+/// The keyed set is exactly what this checkout's committed receipt places,
+/// plus every receipt-recorded member it keeps real; a member-shaped path the
+/// receipt does not record is never planned, keyed or converted. Every
+/// candidate path is classified read-only, with the shipped
+/// [`migration_members`] traversal and [`link_state`] pair: neither follows a
+/// link target, lists a payload or walks a third level, and the classification
+/// can only refuse. Nothing here creates, links, reserves or deletes anything.
+///
+/// `Ok(Declaration::empty())` is the honest answer for a checkout with no
+/// owned placement (never converted, legacy whole target, or detached): those
+/// commands run exactly as they do today, with no owned destination in the
+/// key.
+pub fn exec_declaration(
+    control: Option<&Path>,
+    checkout: &Path,
+    pool_fallback: Option<&str>,
+) -> Result<crate::layout::Declaration, String> {
+    let Some(control) = control else {
+        return Ok(crate::layout::Declaration::empty());
+    };
+    let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf())
+        .with_pool_fallback(pool_fallback);
+    let Some(receipt) = context.receipt()? else {
+        return Ok(crate::layout::Declaration::empty());
+    };
+    if receipt.layout() != LayoutKind::Profile {
+        // A legacy whole-target checkout's declaration is never consulted.
+        return Ok(crate::layout::Declaration::empty());
+    }
+    match receipt.state {
+        ReceiptState::Committed | ReceiptState::Detached => {}
+        ReceiptState::Prepared => {
+            return Err("outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before running an exec tool".to_owned())
+        }
+        ReceiptState::Pruning => {
+            return Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned())
+        }
+        ReceiptState::Pruned => {
+            return Err("outputs: this checkout's owned output root was pruned; run `oxide outputs adopt` to convert it again".to_owned())
+        }
+    }
+    // The destination the plan will use, computed exactly as
+    // `planned_destination` computes it: a receipt-selected member must already
+    // be this checkout's owned link AT THAT destination, so a derived `exec`
+    // never relinks, not even between two roots the receipt knows.
+    let desired = desired_selection(&context, &receipt)?;
+    let members = exec_members(&context, &receipt, desired.as_ref())?;
+    if receipt.state == ReceiptState::Detached {
+        // A detached checkout owns no destination: its command runs locally
+        // through real directories, so the derived set is empty and the key
+        // carries no destination. The classification above still refused any
+        // member-shaped link or file it must not write through.
+        return Ok(crate::layout::Declaration::empty());
+    }
+    if members.len() > crate::layout::MAX_MEMBERS {
+        return Err(format!(
+            "outputs: this checkout places {} profile output members, more than the {} one command binds; run `oxide outputs detach` for a real target directory, or declare the members this tool writes with `oxide exec --output <member>`. Nothing was changed",
+            members.len(),
+            crate::layout::MAX_MEMBERS
+        ));
+    }
+    let parsed = members
+        .iter()
+        .map(|name| crate::layout::Member::parse(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::layout::Declaration::new(parsed)
+}
+
+/// Classify every candidate profile member of a profile-layout checkout for a
+/// derived `exec` plan. Only this checkout's own owned links at the receipt's
+/// committed destinations are accepted; a real member the receipt keeps local
+/// is planned `real`; everything else that occupies a member-shaped path
+/// refuses before Cargo, with the link, receipt and root unchanged.
+fn exec_members(
+    context: &Context,
+    receipt: &Receipt,
+    desired: Option<&Selected>,
+) -> Result<Vec<String>, String> {
+    let live_target = target_state(&context.workspace, &context.checkout_id)?;
+    let mut candidates: Vec<String> = Vec::new();
+    match &live_target {
+        TargetState::RealEmpty | TargetState::RealNonEmpty => {
+            // The shipped migration traversal: member names are matched first
+            // and `file_type()` never follows a link, so no profile payload is
+            // listed and no linked entry is descended.
+            candidates = migration_members(&context.link())?;
+        }
+        TargetState::Missing => {}
+        state => {
+            return Err(format!(
+                "outputs: {} is {}; a checkout that places outputs at profile members keeps a real target directory, so an exec tool never writes through it. Nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                context.link().display(),
+                state.label()
+            ))
+        }
+    }
+    // Every recorded placement is a candidate too: a member the receipt places
+    // but whose path is absent still has to be checked, and it refuses below
+    // rather than being guessed into the plan.
+    for placement in receipt.links() {
+        if !candidates.iter().any(|name| name == placement.member()) {
+            candidates.push(placement.member().to_owned());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    let mut members = Vec::new();
+    for name in &candidates {
+        let link = link_path(&context.workspace, name);
+        let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+        match receipt.placement(name) {
+            Some(placement) => match placement.selected_ref() {
+                Some(_) => {
+                    let Some(desired) = desired else {
+                        return Err(format!(
+                            "outputs: this checkout's receipt places the profile member {name} at a root this command would no longer select; an exec command never relinks it. Nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
+                        ));
+                    };
+                    let destination = member_destination(&desired.root, name);
+                    match &state {
+                        TargetState::OwnedLink(root) if root == &destination => {
+                            members.push(name.clone());
+                        }
+                        state => {
+                            return Err(format!(
+                                "outputs: this checkout's receipt places the profile member {name} at {}, but {} is {}; an exec command never relinks, converts or replaces it. Nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs, then run the command again",
+                                destination.display(),
+                                link.display(),
+                                state.label()
+                            ))
+                        }
+                    }
+                }
+                None => match &state {
+                    TargetState::RealEmpty | TargetState::RealNonEmpty => {
+                        members.push(name.clone());
+                    }
+                    TargetState::Missing => {}
+                    state => {
+                        return Err(format!(
+                            "outputs: this checkout's receipt records the profile member {name} as a real directory, but {} is {}; an exec command never relinks, replaces or writes through it. Nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                            link.display(),
+                            state.label()
+                        ))
+                    }
+                },
+            },
+            None => match &state {
+                // A real member outside the receipt is local and path-stable:
+                // it is not planned and not keyed, and the tool writes into it
+                // as it is.
+                TargetState::RealEmpty | TargetState::RealNonEmpty | TargetState::Missing => {}
+                state => {
+                    return Err(format!(
+                        "outputs: {} is {}, and this checkout's receipt does not place it; an exec command never writes through a link or file it does not own. Remove it or run `oxide outputs adopt` to record the placement, then run the command again. Nothing was changed",
+                        link.display(),
+                        state.label()
+                    ))
+                }
+            },
+        }
+    }
+    Ok(members)
 }
 
 /// The destination rule itself: in permanent mode, external when the volume
@@ -6964,6 +7260,9 @@ struct LinkGitAnswer {
     verdict: LinkGitVerdict,
     relative: Option<String>,
     fix: Option<String>,
+    /// The repository `.gitignore` the fix names, when Git confirmed the work
+    /// tree. `None` only with an unconfirmed work tree.
+    gitignore: Option<PathBuf>,
 }
 
 /// What Git positively established about one exact non-directory link path.
@@ -7003,6 +7302,7 @@ fn first_link_git_answer(context: &Context, suffix: Option<&str>) -> LinkGitAnsw
                 verdict: LinkGitVerdict::Unknown(reason),
                 relative: None,
                 fix: None,
+                gitignore: None,
             }
         }
     };
@@ -7016,6 +7316,7 @@ fn first_link_git_answer(context: &Context, suffix: Option<&str>) -> LinkGitAnsw
         verdict,
         relative: Some(relative),
         fix: Some(fix),
+        gitignore: Some(root.join(".gitignore")),
     }
 }
 
@@ -7094,25 +7395,33 @@ fn link_git_problem(answer: &LinkGitAnswer) -> Option<String> {
 
 /// `oxide init`'s `.gitignore` diagnostic for a first conversion (oxide#154).
 ///
-/// A first permanent-drive conversion publishes an owned `<checkout>/target`
-/// link only when Git ignores that exact non-directory path, and a
-/// directory-only rule such as `target/` never covers the link. Rather than
-/// rewrite a user's rule, `oxide init` names the exact rule to add (for a
-/// nested workspace, its repository-relative spelling). It is effect-free:
-/// the same bounded Git probe the conversion uses, and no write of any kind.
-/// `None` when Git positively confirmed the path, or when this checkout is not
-/// inside a Git work tree at all (init adopts it outside Git, where nothing is
-/// ignored and nothing is converted).
+/// A first permanent-drive conversion publishes owned `<checkout>/target/<member>`
+/// links only when Git ignores each exact repository-relative path, so this
+/// asks the same prerequisite for the first member link the automatic
+/// conversion would publish (`target/debug`) — the same question the creator
+/// asks, which is why a directory-only rule such as `target/` that covers the
+/// member is accepted and stays silent. Rather than rewrite a user's rule,
+/// `oxide init` names the exact rule to add (for a nested workspace, its
+/// repository-relative spelling). It is effect-free: the same bounded Git
+/// probe the conversion uses, and no write of any kind. `None` when Git
+/// positively confirmed the path, or when this checkout is not inside a Git
+/// work tree at all (init adopts it outside Git, where nothing is ignored and
+/// nothing is converted).
 pub fn gitignore_diagnostic(workspace: &Path) -> Option<String> {
     let context = Context::new(None, workspace.to_path_buf());
     let link = context.link();
-    let answer = first_link_git_answer(&context, None);
-    // No fix means Git never confirmed a work tree for this checkout.
-    let fix = answer.fix.as_deref()?;
+    let answer = first_link_git_answer(&context, Some(AUTO_ADOPT_MEMBERS[0]));
     let problem = link_git_problem(&answer)?;
+    // No relative path or .gitignore means Git never confirmed a work tree.
+    let member = answer.relative.as_deref()?;
+    let gitignore = answer.gitignore.as_deref()?;
+    // The rule that covers every member link this first conversion publishes:
+    // the member's parent path (`/target`, or a nested `/rust/target`).
+    let parent = member.rsplit_once('/').map_or(member, |(parent, _)| parent);
     Some(format!(
-        "permanent-drive outputs will not convert {} yet: {problem}. {fix}. `oxide init` leaves every .gitignore rule exactly as it is",
-        link.display()
+        "permanent-drive outputs will not convert {} yet: {problem}. Add `/{parent}` (or `{parent}`) to {}: it covers the `{member}` member link this first conversion publishes. `oxide init` leaves every .gitignore rule exactly as it is",
+        link.display(),
+        gitignore.display()
     ))
 }
 
@@ -7945,6 +8254,627 @@ mod tests {
         assert_eq!(transition.state, ReceiptState::Prepared);
         assert!(transition.prepared_ref().is_some());
         assert!(transition.current().is_some());
+    }
+
+    /// A committed profile receipt over the fixture's own local root: every
+    /// `placed` member is a live owned link into one root and every
+    /// `unselected` member is recorded without a selection (the state a
+    /// per-member history keeps after a partial detach).
+    fn placed_profile(
+        fixture: &Fixture,
+        placed: &[&str],
+        unselected: &[&str],
+    ) -> (Context, Receipt, PathBuf) {
+        let context = fixture.context();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let selected = spec.selected(1);
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        for member in placed {
+            receipt.place_member(member).selected = Some(selected.clone());
+            let destination = member_destination(spec.root(), member);
+            fs::create_dir_all(&destination).unwrap();
+            let link = fixture.checkout.join("target").join(member);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(&destination, &link).unwrap();
+        }
+        for member in unselected {
+            receipt.place_member(member).selected = None;
+        }
+        write_receipt(&fixture.control, &receipt).unwrap();
+        (context, receipt, spec.root().to_path_buf())
+    }
+
+    /// The derived `exec` member names of one fixture, in declaration order.
+    fn derived_exec(fixture: &Fixture) -> Vec<String> {
+        exec_declaration(Some(&fixture.control), &fixture.checkout, None)
+            .unwrap()
+            .members()
+            .iter()
+            .map(|member| member.name().to_owned())
+            .collect()
+    }
+
+    fn declaration_of(names: &[String]) -> crate::layout::Declaration {
+        crate::layout::Declaration::new(
+            names
+                .iter()
+                .map(|name| crate::layout::Member::parse(name).unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// S1 counterfactual 1 + 10: the derived set is the receipt's placement,
+    /// rendered exactly as the equivalent complete declaration is, so the two
+    /// share one slot key.
+    #[test]
+    fn exec_derives_the_receipt_pair_and_matches_a_complete_declaration() {
+        let fixture = Fixture::new();
+        placed_profile(&fixture, &["debug", "release"], &[]);
+        assert_eq!(derived_exec(&fixture), ["debug", "release"]);
+        let declaration =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let facts = destination_facts(Some(&plan));
+        assert_eq!(facts.lines().count(), 2, "{facts}");
+        assert!(
+            facts.lines().all(|line| line.starts_with("outputs-3 ")),
+            "{facts}"
+        );
+        assert!(facts.contains(" debug"), "{facts}");
+        assert!(facts.contains(" release"), "{facts}");
+        let declared =
+            crate::layout::declared(&["debug".to_owned(), "release".to_owned()]).unwrap();
+        let declared_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(destination_facts(Some(&declared_plan)), facts);
+    }
+
+    /// S1 counterfactual 2 + 15: a receipt-recorded unselected member is
+    /// planned `real`, an unrecorded real member is in neither the plan nor the
+    /// key, and the existing bounded notice names the real directory.
+    #[test]
+    fn exec_keeps_a_recorded_real_member_local_and_ignores_an_unrecorded_one() {
+        let fixture = Fixture::new();
+        let (context, receipt, _root) = placed_profile(&fixture, &["debug"], &["release"]);
+        fs::create_dir(fixture.checkout.join("target/release")).unwrap();
+        // An unrecorded real triple member is local and path-stable: a
+        // declared command would key it, a derived one never does.
+        let triple = "x86_64-unknown-linux-gnu/debug";
+        fs::create_dir_all(fixture.checkout.join("target").join(triple)).unwrap();
+        assert_eq!(derived_exec(&fixture), ["debug", "release"]);
+        let declaration =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let facts = destination_facts(Some(&plan));
+        assert!(facts.contains("real release"), "{facts}");
+        assert!(!facts.contains(triple), "{facts}");
+        assert_eq!(facts.lines().count(), 2, "{facts}");
+        let declared = crate::layout::declared(&[triple.to_owned()]).unwrap();
+        let declared_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
+                .unwrap()
+                .unwrap();
+        assert!(destination_facts(Some(&declared_plan)).contains(triple));
+        // The binding keeps `release` local and reports it once, in the
+        // existing grammar.
+        let store = pool_store(&fixture.root.join("pool"));
+        let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Bound(outcome) => outcome,
+            Bind::Refuse(reason) => panic!("a recorded real member refused the command: {reason}"),
+            Bind::Wait => panic!("a recorded real member waited"),
+        };
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("release") && warning.contains("real")),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
+    /// S1 counterfactual 3: a detached profile receipt owns no destination, so
+    /// the derived set is empty, the plan is `None` and binding runs locally
+    /// with no link.
+    #[test]
+    fn a_detached_profile_receipt_plans_no_destination_and_binds_locally() {
+        let fixture = Fixture::new();
+        let (context, mut receipt, _root) = placed_profile(&fixture, &["debug", "release"], &[]);
+        for member in ["debug", "release"] {
+            fs::remove_file(fixture.checkout.join("target").join(member)).unwrap();
+            fs::create_dir(fixture.checkout.join("target").join(member)).unwrap();
+            receipt.place_member(member).selected = None;
+        }
+        receipt.state = ReceiptState::Detached;
+        write_receipt(&fixture.control, &receipt).unwrap();
+        assert!(derived_exec(&fixture).is_empty());
+        assert!(planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &crate::layout::Declaration::empty(),
+            None
+        )
+        .unwrap()
+        .is_none());
+        let store = pool_store(&fixture.root.join("pool"));
+        match bind_profile(&context, &store, 0, &receipt, None) {
+            Bind::Bound(outcome) => {
+                assert!(outcome.root.is_none());
+                assert_eq!(outcome.note.as_deref(), Some("outputs detached"));
+            }
+            Bind::Refuse(reason) => panic!("a detached exec was refused: {reason}"),
+            Bind::Wait => panic!("a detached exec waited"),
+        }
+        // A slot keyed while the checkout was still committed refuses rather
+        // than running through a link the receipt no longer selects.
+        let stale = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "debug".to_owned(),
+                selected: None,
+            }],
+        };
+        assert!(matches!(
+            bind_profile(&context, &store, 0, &receipt, Some(&stale)),
+            Bind::Refuse(_)
+        ));
+    }
+
+    /// S1 counterfactual 4: a receipt in any custody state other than committed
+    /// or detached refuses the derivation, naming the existing rule.
+    #[test]
+    fn exec_refuses_a_pending_or_pruned_profile_receipt() {
+        let fixture = Fixture::new();
+        let (_, receipt, _root) = placed_profile(&fixture, &["debug"], &[]);
+        let spec = fixture.local();
+        let mut prepared = receipt.clone();
+        prepared.state = ReceiptState::Prepared;
+        prepared.place_member("debug").prepared = Some(Prepared {
+            generation: 2,
+            to: spec.selected(2),
+            link: fixture.checkout.join("target/debug"),
+        });
+        prepared.generation = 1;
+        let mut pruning = receipt.clone();
+        pruning.state = ReceiptState::Pruning;
+        pruning.pruned = Some(PruneRecord {
+            intent: "9".repeat(32),
+            outcome: "pruning".to_owned(),
+            at_ms: 1,
+        });
+        let mut pruned = receipt.clone();
+        pruned.state = ReceiptState::Pruned;
+        for (candidate, expected) in [
+            (prepared, "interrupted"),
+            (pruning, "being pruned"),
+            (pruned, "was pruned"),
+        ] {
+            let label = candidate.state;
+            write_receipt(&fixture.control, &candidate).unwrap();
+            let refused =
+                exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap_err();
+            assert!(refused.contains(expected), "{label:?}: {refused}");
+        }
+        // The unmodified committed receipt still derives: a control.
+        write_receipt(&fixture.control, &receipt).unwrap();
+        assert_eq!(derived_exec(&fixture), ["debug"]);
+    }
+
+    /// S1 counterfactuals 5 and 6: a whole-target receipt and a checkout with
+    /// no receipt derive nothing, so their behaviour is unchanged.
+    #[test]
+    fn exec_derives_nothing_for_a_whole_target_or_unconverted_checkout() {
+        let fixture = Fixture::new();
+        // Never converted.
+        assert!(derived_exec(&fixture).is_empty());
+        assert!(planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &crate::layout::Declaration::empty(),
+            None
+        )
+        .unwrap()
+        .is_none());
+        let context = fixture.context();
+        let committed = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
+        assert_eq!(committed.layout(), LayoutKind::WholeTarget);
+        assert!(derived_exec(&fixture).is_empty());
+        // A modelled command keeps the legacy plan and key, untouched.
+        let declaration = declaration_of(&["debug".to_owned()]);
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.whole_target);
+        let facts = destination_facts(Some(&plan));
+        assert_eq!(facts.lines().count(), 1, "{facts}");
+        assert!(facts.starts_with("outputs-2 "), "{facts}");
+        // A legacy key renders only `outputs-2` lines. The check is on the line
+        // prefix, not a substring: a fixture path may contain `outputs-3`.
+        assert!(
+            facts.lines().all(|line| line.starts_with("outputs-2 ")),
+            "{facts}"
+        );
+    }
+
+    /// S1 counterfactuals 7, 8, 13 and 16: the classification is non-vacuous.
+    /// An owned member link is accepted while the same path with another
+    /// destination, a link the receipt does not place, and a member-shaped
+    /// regular file all refuse before Cargo with nothing changed.
+    #[test]
+    fn exec_refuses_every_member_shaped_path_it_does_not_own() {
+        // The accepted control first.
+        let accepted = Fixture::new();
+        placed_profile(&accepted, &["debug"], &[]);
+        assert_eq!(derived_exec(&accepted), ["debug"]);
+        // Another destination, everything else identical.
+        let elsewhere = Fixture::new();
+        let (_, receipt, root) = placed_profile(&elsewhere, &["debug"], &[]);
+        let outside = elsewhere.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = elsewhere.checkout.join("target/debug");
+        fs::remove_file(&link).unwrap();
+        symlink(&outside, &link).unwrap();
+        let refused =
+            exec_declaration(Some(&elsewhere.control), &elsewhere.checkout, None).unwrap_err();
+        assert!(refused.contains("target/debug"), "{refused}");
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        assert_eq!(fs::read_link(&link).unwrap(), outside);
+        assert!(root.join("debug").read_dir().unwrap().next().is_none());
+        let _ = receipt;
+        // A link the receipt does not place refuses as well, owned or foreign.
+        let unplaced = Fixture::new();
+        let (context, _receipt, root) = placed_profile(&unplaced, &["debug"], &[]);
+        fs::create_dir_all(member_destination(&root, "release")).unwrap();
+        symlink(
+            &member_destination(&root, "release"),
+            &unplaced.checkout.join("target/release"),
+        )
+        .unwrap();
+        let refused =
+            exec_declaration(Some(&unplaced.control), &unplaced.checkout, None).unwrap_err();
+        assert!(refused.contains("target/release"), "{refused}");
+        assert!(refused.contains("does not place it"), "{refused}");
+        let _ = context;
+        // A member-shaped regular file refuses too.
+        let filed = Fixture::new();
+        let (_context, _receipt, _root) = placed_profile(&filed, &["debug"], &[]);
+        fs::write(filed.checkout.join("target/release"), b"file").unwrap();
+        let refused = exec_declaration(Some(&filed.control), &filed.checkout, None).unwrap_err();
+        assert!(refused.contains("target/release"), "{refused}");
+        assert_eq!(
+            fs::read(filed.checkout.join("target/release")).unwrap(),
+            b"file"
+        );
+    }
+
+    /// S1 counterfactual 9: more receipt members than one command binds refuse,
+    /// naming the explicit detach.
+    #[test]
+    fn exec_refuses_a_checkout_placing_more_members_than_one_command_binds() {
+        let fixture = Fixture::new();
+        let names = (0..9)
+            .map(|index| format!("t{index}/debug"))
+            .collect::<Vec<_>>();
+        let borrowed = names.iter().map(String::as_str).collect::<Vec<_>>();
+        placed_profile(&fixture, &borrowed, &[]);
+        let refused =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap_err();
+        assert!(refused.contains("oxide outputs detach"), "{refused}");
+        assert!(refused.contains('9'), "{refused}");
+        // The explicit override still declares a bounded subset.
+        let declared = crate::layout::declared(&["t0/debug".to_owned()]).unwrap();
+        assert_eq!(declared.members().len(), 1);
+    }
+
+    /// S1 counterfactuals 11 and 12: an explicit `--output` set stays complete
+    /// and may name a member the receipt does not place, while a checkout path
+    /// containing a space derives exactly the same set.
+    #[test]
+    fn exec_declarations_stay_complete_and_derivation_ignores_the_checkout_path() {
+        let fixture = Fixture::new();
+        let (_, _receipt, root) = placed_profile(&fixture, &["debug"], &[]);
+        // The derived set never invents the unplaced member.
+        assert_eq!(derived_exec(&fixture), ["debug"]);
+        // A declared override is still complete: it names the member the
+        // receipt does not place and plans the owned root for it.
+        let declared = crate::layout::declared(&["release".to_owned()]).unwrap();
+        let plan = planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.members.len(), 1);
+        assert_eq!(plan.selected().map(Selected::root), Some(root.as_path()));
+        // A checkout path with a space changes nothing: member names carry no
+        // checkout path.
+        let spaced = Fixture::in_tree("check out", "/target\n.oxide-outputs/\n");
+        placed_profile(&spaced, &["debug", "release"], &[]);
+        assert_eq!(derived_exec(&spaced), ["debug", "release"]);
+        assert_eq!(
+            destination_facts(
+                planned_destination(
+                    Some(&spaced.control),
+                    &spaced.checkout,
+                    &exec_declaration(Some(&spaced.control), &spaced.checkout, None).unwrap(),
+                    None
+                )
+                .unwrap()
+                .as_ref()
+            )
+            .lines()
+            .count(),
+            2
+        );
+    }
+
+    /// S1 counterfactual 14: member names are matched before triple descent, so
+    /// a real or linked `target/debug` is never enumerated as a triple ancestor
+    /// and its payload is never listed.
+    #[test]
+    fn a_real_member_directory_is_never_treated_as_a_triple_ancestor() {
+        let fixture = Fixture::new();
+        placed_profile(&fixture, &["release"], &[]);
+        let debug = fixture.checkout.join("target/debug");
+        fs::create_dir(&debug).unwrap();
+        fs::write(debug.join("profileapp"), b"payload").unwrap();
+        fs::create_dir(debug.join("debug")).unwrap();
+        fs::create_dir(debug.join("release")).unwrap();
+        let members = migration_members(&fixture.checkout.join("target")).unwrap();
+        assert!(members.contains(&"debug".to_owned()), "{members:?}");
+        assert!(
+            !members
+                .iter()
+                .any(|name| name == "debug/debug" || name == "debug/release"),
+            "{members:?}"
+        );
+        // The derived set neither lists the payload as a member nor plans it.
+        assert_eq!(derived_exec(&fixture), ["release"]);
+        let declaration =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let facts = destination_facts(Some(&plan));
+        assert!(!facts.contains("debug/debug"), "{facts}");
+        assert!(!facts.contains("debug/release"), "{facts}");
+    }
+
+    /// S4b: the automatic first conversion creates the profile layout through
+    /// the same creator an explicit adoption uses, so both publish one receipt
+    /// form and one root marker.
+    #[test]
+    fn automatic_first_conversion_creates_the_profile_layout() {
+        let automatic = Fixture::new();
+        let context = automatic.context();
+        let (_committed, selected, converted) = adopt_profile_from(
+            &context,
+            Receipt::first_with(
+                &automatic.checkout,
+                &context.checkout_id,
+                LayoutKind::Profile,
+            ),
+            Start::MissingOnly,
+            Some(&automatic.local()),
+        )
+        .unwrap();
+        assert!(converted);
+        let target = automatic.checkout.join("target");
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        assert!(!fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        for member in ["debug", "release"] {
+            let link = target.join(member);
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{member} is not an owned link"
+            );
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                member_destination(selected.root(), member)
+            );
+        }
+        assert!(selected.root().join(MARKER).is_file());
+        let stored = read_receipt(
+            &automatic.control,
+            &automatic.checkout,
+            &context.checkout_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.state, ReceiptState::Committed);
+        // The explicit adoption of a twin checkout publishes the same form.
+        let explicit = Fixture::new();
+        let explicit_context = explicit.context();
+        let (explicit_receipt, explicit_selected, _) = adopt_profile(
+            &explicit_context,
+            Receipt::first_with(
+                &explicit.checkout,
+                &explicit_context.checkout_id,
+                LayoutKind::Profile,
+            ),
+        )
+        .unwrap();
+        assert_eq!(stored.version, explicit_receipt.version);
+        assert_eq!(stored.layout, explicit_receipt.layout);
+        assert_eq!(
+            stored
+                .links()
+                .iter()
+                .map(|placement| placement.member().to_owned())
+                .collect::<Vec<_>>(),
+            explicit_receipt
+                .links()
+                .iter()
+                .map(|placement| placement.member().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(stored.generation, explicit_receipt.generation);
+        assert_eq!(selected.kind, explicit_selected.kind);
+        // Every placed member shares the root's one nonce, as explicit adoption
+        // does, and the marker is the same recipe and format.
+        let nonces = stored
+            .links()
+            .iter()
+            .filter_map(|placement| placement.selected_ref())
+            .map(|selected| selected.nonce().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let explicit_nonces = explicit_receipt
+            .links()
+            .iter()
+            .filter_map(|placement| placement.selected_ref())
+            .map(|selected| selected.nonce().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(nonces.len(), 2);
+        assert!(nonces.iter().all(|nonce| nonce.is_some()));
+        assert_eq!(nonces[0], nonces[1], "the pair shares one root nonce");
+        // Explicit adoption publishes the same one-nonce pair (the nonce value
+        // itself is random per conversion).
+        assert_eq!(explicit_nonces.len(), 2);
+        assert_eq!(explicit_nonces[0], explicit_nonces[1]);
+        let marker = read_marker(selected.root()).unwrap();
+        let explicit_marker = read_marker(explicit_selected.root()).unwrap();
+        assert_eq!(marker.version, explicit_marker.version);
+        assert_eq!(marker.recipe, explicit_marker.recipe);
+        assert_eq!(marker.kind, explicit_marker.kind);
+        // The next leased build keys exactly the derived member set.
+        assert_eq!(derived_exec(&automatic), ["debug", "release"]);
+    }
+
+    /// S4b: the automatic conversion never converts or keeps anything that
+    /// already exists, and it never falls back to another root.
+    #[test]
+    fn automatic_first_conversion_refuses_an_ineligible_checkout() {
+        // An empty real target is not a first conversion.
+        let empty = Fixture::new();
+        fs::create_dir(empty.checkout.join("target")).unwrap();
+        let context = empty.context();
+        let refused = adopt_profile_from(
+            &context,
+            Receipt::first_with(&empty.checkout, &context.checkout_id, LayoutKind::Profile),
+            Start::MissingOnly,
+            Some(&empty.local()),
+        )
+        .unwrap_err();
+        assert!(refused.contains("auto-adopt refused"), "{refused}");
+        assert!(
+            fs::read_dir(empty.checkout.join("target"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "a refused conversion wrote into the target"
+        );
+        assert!(
+            read_receipt(&empty.control, &empty.checkout, &context.checkout_id)
+                .unwrap()
+                .is_none(),
+            "a refused conversion wrote a receipt"
+        );
+        assert!(!empty.local().root().exists());
+        // An owned whole-target link is left exactly as it is.
+        let linked = Fixture::new();
+        let linked_context = linked.context();
+        transition(
+            &linked_context,
+            &linked.receipt(),
+            &linked.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
+        let before = fs::read_link(linked.checkout.join("target")).unwrap();
+        let refused = adopt_profile_from(
+            &linked_context,
+            Receipt::first_with(
+                &linked.checkout,
+                &linked_context.checkout_id,
+                LayoutKind::Profile,
+            ),
+            Start::MissingOnly,
+            Some(&linked.local()),
+        )
+        .unwrap_err();
+        assert!(refused.contains("whole-target link"), "{refused}");
+        assert_eq!(
+            fs::read_link(linked.checkout.join("target")).unwrap(),
+            before
+        );
+    }
+
+    /// S4b: a whole-target receipt is untouched by a build and by a derived
+    /// `exec`; only an explicit adoption migrates it.
+    #[test]
+    fn a_whole_target_receipt_is_untouched_by_a_build() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let committed = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
+        assert_eq!(committed.layout(), LayoutKind::WholeTarget);
+        let path = receipt_path(&fixture.control, &context.checkout_id);
+        let before = fs::read(&path).unwrap();
+        assert!(derived_exec(&fixture).is_empty());
+        let declaration = declaration_of(&["debug".to_owned(), "release".to_owned()]);
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.whole_target);
+        assert!(destination_facts(Some(&plan)).starts_with("outputs-2 "));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            fs::read_link(fixture.checkout.join("target")).unwrap(),
+            fixture.local().root()
+        );
     }
 
     /// A document that uses a successor-only surface under the version-1 label
@@ -10754,40 +11684,34 @@ mod tests {
         assert!(!os_symlink_exists(&plain.checkout.join("target")));
     }
 
-    /// The automatic first conversion asks the same ignore prerequisite and
-    /// treats every non-`Eligible` answer as ineligibility (oxide#154): an
-    /// expected refusal must leave the build usable, so it cannot be a
-    /// transition error. Each class is the answer an explicit adopt refuses
-    /// with, so the two presentations cannot drift.
+    /// The automatic first conversion asks the same ignore prerequisite for
+    /// every member link it publishes (oxide#160) and treats every
+    /// non-`Eligible` answer as ineligibility (oxide#154): an expected refusal
+    /// must leave the build usable, so it cannot be a transition error. Each
+    /// class is the answer an explicit adoption refuses with, so the two
+    /// presentations cannot drift.
     #[test]
     fn automatic_adoption_is_ineligible_for_every_ignore_safety_refusal() {
-        let eligible = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
-        assert_eq!(
-            first_link_git_answer(&eligible.context(), None).verdict,
-            LinkGitVerdict::Eligible,
-            "the positive control is not eligible"
-        );
-        for (label, fixture, empty) in [
-            (
-                "unignored",
-                Fixture::in_tree("", "/.oxide-outputs/\n"),
-                false,
-            ),
-            (
-                "directory-only",
-                Fixture::in_tree("", "target/\n/.oxide-outputs/\n"),
-                true,
-            ),
+        // Rules that genuinely cover `target/debug` are eligible, including
+        // the directory-only forms the partner link cannot use.
+        for rule in ["/target", "target", "target/", "/target/", "**/target/"] {
+            let fixture = Fixture::in_tree("", &format!("{rule}\n/.oxide-outputs/\n"));
+            for member in ["debug", "release"] {
+                assert_eq!(
+                    first_link_git_answer(&fixture.context(), Some(member)).verdict,
+                    LinkGitVerdict::Eligible,
+                    "{rule} {member}: a covering rule is not eligible"
+                );
+            }
+        }
+        for (label, fixture) in [
+            ("unignored", Fixture::in_tree("", "/.oxide-outputs/\n")),
             (
                 "negated",
                 Fixture::in_tree("", "target\n!/target\n/.oxide-outputs/\n"),
-                false,
             ),
         ] {
-            if empty {
-                fs::create_dir(fixture.checkout.join("target")).unwrap();
-            }
-            let answer = first_link_git_answer(&fixture.context(), None);
+            let answer = first_link_git_answer(&fixture.context(), Some("debug"));
             assert_ne!(
                 answer.verdict,
                 LinkGitVerdict::Eligible,
@@ -10795,10 +11719,17 @@ mod tests {
             );
             assert!(answer.fix.is_some(), "{label}: no fix was derived");
         }
+        // A tracked member link is never eligible.
+        let tracked = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        create_tracked_member(&tracked.checkout);
+        assert_eq!(
+            first_link_git_answer(&tracked.context(), Some("debug")).verdict,
+            LinkGitVerdict::Tracked
+        );
         // A non-repository has no work tree to confirm: unknown, never
         // permission, and no fix is available because there is no root.
         let plain = Fixture::without_git();
-        let answer = first_link_git_answer(&plain.context(), None);
+        let answer = first_link_git_answer(&plain.context(), Some("debug"));
         assert!(
             matches!(answer.verdict, LinkGitVerdict::Unknown(_)),
             "{answer:?}"
@@ -10810,19 +11741,39 @@ mod tests {
         );
     }
 
-    /// `oxide init` names the exact non-directory rule to add and never edits
-    /// the file (oxide#154): a directory-only rule is the reported papercut,
-    /// an unignored path needs the same rule, a nested workspace names its
-    /// repository-relative spelling, and a confirmed path is silent.
+    /// Track `target/debug` in the index while the working tree has neither
+    /// the file nor the `target` directory.
+    fn create_tracked_member(checkout: &Path) {
+        fs::create_dir_all(checkout.join("target")).unwrap();
+        fs::write(checkout.join("target").join("debug"), b"tracked").unwrap();
+        let added = Command::new("git")
+            .args(["add", "-f", "target/debug"])
+            .current_dir(checkout)
+            .status()
+            .unwrap();
+        assert!(added.success());
+        fs::remove_file(checkout.join("target").join("debug")).unwrap();
+        fs::remove_dir(checkout.join("target")).unwrap();
+    }
+
+    /// `oxide init` names the rule that covers the member links a first
+    /// conversion publishes and never edits the file (oxide#154): an
+    /// unignored path gets the exact non-slash rule, a nested workspace names
+    /// its repository-relative spelling, a tracked member is named, and a
+    /// covering rule (including a directory-only one, which genuinely covers
+    /// `target/<member>`) is silent.
     #[test]
     fn the_init_diagnostic_names_the_exact_non_directory_rule() {
         let ready = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
         assert_eq!(gitignore_diagnostic(&ready.checkout), None);
+        // A directory-only parent rule covers the member link, so it is not
+        // diagnosed (oxide#160's profile layout).
+        let directory_only = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        assert_eq!(gitignore_diagnostic(&directory_only.checkout), None);
 
         let unignored = Fixture::in_tree("", "/.oxide-outputs/\n");
         let warning = gitignore_diagnostic(&unignored.checkout).expect("no diagnostic");
         assert!(warning.contains("`/target`"), "{warning}");
-        assert!(warning.contains("not `target/`"), "{warning}");
         assert!(
             warning.contains(&unignored.repo().join(".gitignore").display().to_string()),
             "{warning}"
@@ -10837,33 +11788,22 @@ mod tests {
             "the diagnostic edited the file"
         );
 
-        let empty = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
-        fs::create_dir(empty.checkout.join("target")).unwrap();
-        let warning = gitignore_diagnostic(&empty.checkout).expect("no diagnostic");
-        assert!(warning.contains("matches directories only"), "{warning}");
-        assert!(warning.contains("`/target`"), "{warning}");
-        assert!(
-            warning.contains("not `target/`"),
-            "the papercut's exact non-slash rule is not named: {warning}"
-        );
-
-        let nested = Fixture::in_tree("apps/farmyard", "/apps/farmyard/target/\n.oxide-outputs/\n");
+        let nested = Fixture::in_tree("apps/farmyard", "/.oxide-outputs/\n");
         let warning = gitignore_diagnostic(&nested.checkout).expect("no diagnostic");
         assert!(warning.contains("`/apps/farmyard/target`"), "{warning}");
-        assert!(warning.contains("not `apps/farmyard/target/`"), "{warning}");
+        assert!(
+            warning.contains("`apps/farmyard/target/debug`"),
+            "{warning}"
+        );
 
         let tracked = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
-        fs::write(tracked.checkout.join("target"), b"tracked").unwrap();
-        assert!(Command::new("git")
-            .args(["add", "-f", "target"])
-            .current_dir(&tracked.checkout)
-            .status()
-            .unwrap()
-            .success());
-        fs::remove_file(tracked.checkout.join("target")).unwrap();
+        create_tracked_member(&tracked.checkout);
         let warning = gitignore_diagnostic(&tracked.checkout).expect("no diagnostic");
         assert!(warning.contains("already tracks"), "{warning}");
-        assert!(warning.contains("git rm --cached target"), "{warning}");
+        assert!(
+            warning.contains("git rm --cached target/debug"),
+            "{warning}"
+        );
 
         // Not a repository at all: init adopts it outside Git and there is
         // nothing for a first conversion to ignore.
@@ -10927,6 +11867,9 @@ mod tests {
         let replayed = replay(&context, receipt).unwrap();
         assert_eq!(replayed.state, ReceiptState::Committed);
         assert_eq!(replayed.generation, 1);
+        // A prepared whole-target first conversion keeps its recorded layout
+        // (oxide#160, S4b): replay never rewrites it into a profile receipt.
+        assert_eq!(replayed.layout(), LayoutKind::WholeTarget);
         assert_eq!(fs::read_link(context.link()).unwrap(), prepared.to.root);
         assert!(!sibling_link(&prepared.link, 1).exists());
     }
@@ -10968,6 +11911,7 @@ mod tests {
         write_receipt(&fixture.control, &receipt).unwrap();
         let replayed = replay(&context, receipt).unwrap();
         assert_eq!(replayed.state, ReceiptState::Detached);
+        assert_eq!(replayed.layout(), LayoutKind::WholeTarget);
         assert_eq!(replayed.generation, 0);
         assert_eq!(replayed.roots.len(), 1);
         assert!(!context.link().exists());

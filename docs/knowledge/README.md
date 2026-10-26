@@ -14,8 +14,14 @@
 
 [Local lease](contracts/local-lease.md) owns the retained library lease semantics `oxide` uses (pool, ledger, finite limits, idle-only eviction, the control directory) and the history of the retired standalone CLI and its Nucleus handover. [Workflow](contracts/workflow.md#budget-only-default-pool-and-user-configuration) owns the budget-only default pool, soft budget and user configuration.
 
+[Nested lease](contracts/nested-lease.md) owns the **proposed, independently design-reviewed (comment `6412288358`) and unimplemented** design for a nested `oxide` joining its outer lease (no new slot or host permit) and for a different-workspace nested command borrowing the outer host permit: the lease token and its validation, writer tickets and closure, permit accounting, nested deadlock rules, alternatives and the proof plan. It changes no shipped behaviour; the current truth that a nested call takes an independent lease stays in [workflow](contracts/workflow.md#what-one-command-does-local-executor).
+
 [Project adoption](contracts/project-adoption.md) owns the consumer integration boundary, the reviewed cross-worktree result and the owner-reported Nucleus lease use. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing. [Opt-in stable Cargo profiles](contracts/stable-cargo-profiles.md) owns Oxide's own `oxide-light`/`oxide-full-debug` recipes, their debugging tradeoff, the focused profile-proof selectors and the no-go disposition of the comparison observations.
 
 [Proof supervisor correction](contracts/proof-supervisor-correction.md) holds the reviewed correction design (revision 4) for oxide#109's shared proof supervisor under Tom's pinned-leader cooperative closure ruling; [workflow](contracts/workflow.md#shared-proof-supervisor) records the implementation.
 
+[`oxide exec` output-member inference](contracts/exec-output-inference.md) owns the proposed design that makes `oxide exec` need no `--output` declaration: Cargo's supported stable interface reports no pre-build output directories, so `exec` derives its complete member set from the checkout's committed placement, classifies every existing member-shaped entry before Cargo, and reports rather than guesses a member that placement does not cover. It is design only: no code, native, consumer or host effect.
+
 [Qualification findings](qualification-readiness.md) preserves the Cargo freshness, compiler path, cross-path, containment and capacity findings the workflow builds on. They grant no execution authority.
+
+The [idle exec sessions and run-slot custody design](contracts/idle-exec-sessions.md) is a proposal, not current truth: it owns the before-work interception analysis, the slot-versus-permit split, the `run` custody alternatives and the open operator dispositions. It grants no implementation or native authority and changes no behaviour.

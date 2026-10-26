@@ -571,6 +571,17 @@ root. A new Cargo release needs this check before it joins the table.
    unknown-accounting refusal are unchanged. Two slots of one checkout share
    `<workspace>/target`: Cargo serializes the brief final-output uplift on
    `target/<profile>` and the latest final artifact wins.
+
+   A nested `oxide` today takes an independent lease under that second-slot
+   rule. Tom approved a design-first change in which a nested command with
+   the same workspace, recipe and toolchain joins the outer lease (no new
+   slot or host permit) and one with a different key takes its own slot but
+   borrows the outer host permit; the
+   [nested lease design](nested-lease.md) owns the proposed token,
+   validation, closure, accounting, deadlock and idle-exec composition rules;
+   its independent design review passed (comment `6412288358`) and the
+   operator's design freeze is pending. Nothing above changes until that
+   design is frozen and implemented.
 3. Run the freshness gate when the slot's last origin differs.
 4. Run the real Cargo as the leader of a new process group, with:
    - the build directory pointed at the slot;
@@ -818,6 +829,13 @@ unverified here. No Tauri build-directory or output-discovery compatibility,
 performance or saving is claimed. The proof runs under the old
 `scripts/bounded-test.py` on route B (Tom, 2026-10-21) with its documented
 gaps, which do not qualify that script or any shared runner.
+
+**Host-permit lifetime.** An exec session's slot reservation and its host
+active-build permit are one record today, so an open session that is not
+compiling still consumes a host unit. The interception analysis, the supported
+boundary and the open operator dispositions for separating them are in the
+[proposed idle-session design](idle-exec-sessions.md); the current session
+still holds its permit throughout.
 
 ### Inherited rustc wrapper
 
@@ -1109,6 +1127,12 @@ it is not final output, final-output placement or a claim of saved writes.
   scratch, Queue worktrees, container scratch, `$HOME` and host or global
   settings are untouched, and no other-platform default is guessed.
 
+The host permit a long-lived `run` program holds is a separate axis, and the
+successor alternatives for its slot and temp custody are analysed in the
+[proposed idle-session design](idle-exec-sessions.md). Nothing there is
+implemented: this guarantee stays current until an independently reviewed
+successor design establishes equivalence.
+
 **Proof.** `effigy rust:pool-temp-scratch` is one fixed script,
 `scripts/test-pool-temp-scratch.py`, and the whole command of the qualified
 shared proof supervisor (`bounded-test.py --limit 300
@@ -1372,7 +1396,7 @@ Tom ruled on 2026-10-25 that every Rust project in `~/Dev/projects` moves fully 
 - **Selectors.** Every ordinary build, check, clippy, test, nextest and format route calls `oxide`. There are no `:cargo` sibling selectors and no per-project escape variables. The one machine-wide escape is Effigy's per-program fallback (effigy#250) in the user config `~/.effigy/config.toml`: `[programs.oxide] fallback = "cargo"`. It is installed with `force = false`, so it acts only when `oxide` is missing from `PATH`; while `oxide` is broken, set `force = true` and set it back afterwards. It runs `cargo` with the exact arguments, so it covers Cargo-shaped commands only, not `oxide exec` or Oxide-only flags. Effigy's built-in test route also honours `EFFIGY_OXIDE_ESCAPE=cargo`. Otherwise, run `cargo` by hand.
 - **CI-aware rule.** When CI or release workflows call the same Effigy selectors and the runners lack `oxide`, the selector runs `cargo` under `GITHUB_ACTIONS=true` and `oxide` otherwise. Locally, a missing `oxide` fails loudly and names the escape; it never falls back silently. Workflow files do not change. Installing `oxide` on runners waits on publication (Q-005).
 - **Tools and private target directories.** A tool that runs Cargo itself (the Tauri CLI, packaging scripts, Python or TypeScript drivers), or a script that chooses its own `--target-dir` or `CARGO_TARGET_DIR`, runs under [`oxide exec`](#oxide-exec-cargo-wrapping-tools). Its inner Cargo keeps its own target directory for final outputs when the tool passes `--target-dir` or sets `CARGO_TARGET_DIR` itself, and its intermediates go to the held slot through the inherited build directory. A `CARGO_TARGET_DIR` set in the environment of the `oxide exec` call itself does not survive: exec exports `<workspace>/target` in its place. Move such a value into the tool's own command (`--target-dir`) or its child environment.
-- **Disposable staged workspaces.** A stage outside Git, or one whose `.gitignore` Git cannot confirm for the exact non-directory `target` path, is simply an unconverted checkout: the leased command builds into the stage's real local `target/`, intermediates go to the slot, no output root is created and exactly one unconverted notice is printed. No prepared target is needed (oxide#154 removed the interim recipe that pre-created an empty `target/`). An existing real target is still the per-checkout opt-out: it is never adopted, with or without Git. Keep stages under the drive's `scratch/<project>/` or `OXIDE_TASK_SCRATCH_ROOT`.
+- **Disposable staged workspaces.** A stage outside Git, or one whose `.gitignore` Git cannot confirm for the member links a first conversion publishes (`target/debug`, `target/release`), is simply an unconverted checkout: the leased command builds into the stage's real local `target/`, intermediates go to the slot, no output root is created and exactly one unconverted notice is printed. No prepared target is needed (oxide#154 removed the interim recipe that pre-created an empty `target/`). An existing real target is still the per-checkout opt-out: it is never adopted, with or without Git. Keep stages under the drive's `scratch/<project>/` or `OXIDE_TASK_SCRATCH_ROOT`.
 - **Named proof exceptions.** Only a proof whose subject is Cargo's own target layout (for example a scanner that reads `target/<profile>/deps`) or that must build without any shared intermediate state may set its own build directory. It runs under `oxide exec`, places that private directory under the drive's `scratch/<project>/` or the proof's `OXIDE_TASK_SCRATCH_ROOT` (never `/var/folders`, `~` or a drive root), removes it afterwards, and is listed by name in the project as an intentional proof exception.
 - **Stays on Cargo:** CI and release workflows (above), container builds inside Linux images without `oxide`, product code that runs Cargo as part of its own behaviour, and test fixtures.
   - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user; #106 moved only the final outputs to `target/debug/`. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
@@ -3950,14 +3974,16 @@ Sources: `fstatfs(2)` / `sys/mount.h`; `getattrlist(2)` / `sys/attr.h` (`ATTR_VO
 
 - **A build whose volume vanishes fails; Oxide stops its own group.** Cargo's and rustc's later writes into the slot fail (the mount point is gone and `/Volumes` is not writable by the user). A program whose executable lived on the volume may not fail: in the author's first native run a build script running from the slot spun at full CPU after a forced detach and never exited, so Cargo and Oxide waited indefinitely. While a removable command runs, Oxide therefore checks about once a second that the mount root still opens as the device it started on (the reserve watchdog's loop, with no space trigger). When it does not, Oxide sends TERM to its own Cargo (or exec tool) group, KILL after 2 s, and waits up to 10 s more for the group to be empty. The command ends with the build's failure (at least 1); nothing is replayed. If the group is not observed empty in time, the slot is quarantined and the command exits 1.
 - **Lost-volume record.** Releasing the slot flushes the volume first (part 1). When that flush fails and the mount root no longer opens as a mount root, the slot is recorded lost: the record is retired with a `lost` entry (slot ID, time, closure), the lease stays held, and the slot is never reused. The command prints `oxide: removable volume gone; slot <n> is …` and, after its summary, that the next command uses the internal pool. A flush failure with the volume still present stays the part-1 retirement, never deleted.
-- **Positive writer closure decides deletion.** The holding command has seen its own process group empty before releasing. Closure is still not positive, and the slot is quarantined, when the record belongs to another `oxide` process, the command was `oxide exec` (a tool may start processes outside its group), `OXIDE_ALLOW_RUSTC_WRAPPER=1` let Cargo run an inherited rustc wrapper (a wrapper server may outlive the build), or `RUSTC_WORKSPACE_WRAPPER` / `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` was set. A workspace wrapper set only in a Cargo config file is not read here; a process that left Cargo's group (for example through `setsid`) is outside this check, as in crash recovery. Such an escaped daemon can still be writing when the lost slot is deleted; group closure is the cooperative boundary, not proof that every external helper has stopped. Device disappearance, elapsed time and PID absence are never taken as closure.
-- **Re-attach.** The next leased command that selects the removable pool, under its admission lock and before admission: each lost slot whose closure was positive, whose record lock is free and whose recorded group is still empty is released and deleted whole through the volume-bound library (`oxide: deleted slot <n> held when the removable volume was lost (…)`). A reused group or a live holder leaves it for a later command. A failed lost-slot deletion returns an error before admission. Its persisted retired record remains until whole-slot eviction succeeds: crash recovery skips that record, reuse excludes it, and the next admission retries its deletion before taking a lease. This prevents the temporary idle ledger state between recovery and eviction from becoming reusable through the Oxide command front door. A quarantined slot stays held with its bytes counted: never reused, recovered or deleted; `recover-interrupted` refuses it. Idle slots, flushed at release, stay warm across the removal.
+- **Positive writer closure decides deletion.** The holding command has seen its own process group empty before releasing. Closure is still not positive, and the slot is quarantined, when the record belongs to another `oxide` process, the command was `oxide exec` (a tool may start processes outside its group), `OXIDE_ALLOW_RUSTC_WRAPPER=1` let Cargo run an inherited rustc wrapper (a wrapper server may outlive the build), or `RUSTC_WORKSPACE_WRAPPER` / `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` was set. A workspace wrapper set only in a Cargo config file is not read here; a process that left Cargo's group (for example through `setsid`) is outside this check, as in crash recovery. Such an escaped daemon can still be writing when the lost slot is deleted; group closure is the cooperative boundary, not proof that every external helper has stopped. Device disappearance, elapsed time and PID absence are never taken as closure. **A restart is one more positive-closure fact (oxide#161):** every process ends, so a quarantined record whose holder started before the current boot session is closed. The boot session's start is read through an OS-layer function (`sysctl kern.boottime` on macOS; unknown, never inferred, off macOS) and compared with the record's holder start. An unreadable or zero boot time, a missing or zero holder start, or a start inside a fixed 60 s safety margin stays unknown, so the slot stays quarantined. The margin covers the early-boot clock set and millisecond truncation, and the kernel's boot time follows later clock adjustments with the clock, so a holder of the current session never falls behind it. This fact decides lost-slot handling only, and a record from the current boot keeps exactly its previous behaviour.
+- **Re-attach.** The next leased command that selects the removable pool, under its admission lock and before admission: each lost slot whose closure was positive — the holding command saw its own group empty, or the holder predates this boot session — whose record lock is free and whose recorded group (for a current-session holder) is still empty is released and deleted whole through the volume-bound library, with the existing failure handling. It reports once: `oxide: deleted slot <n> held when the removable volume was lost (…)`, or for the restart fact `oxide: deleted slot <n> lost before this boot (holder started <s> s before boot; a restart ends every process)`. A group number recorded in an earlier boot session is not checked, because it may belong to an unrelated process now. A reused group or a live holder leaves it for a later command. A failed lost-slot deletion returns an error before admission. Its persisted retired record remains until whole-slot eviction succeeds: crash recovery skips that record, reuse excludes it, and the next admission retries its deletion before taking a lease. This prevents the temporary idle ledger state between recovery and eviction from becoming reusable through the Oxide command front door. A quarantined slot from the current boot session stays held with its bytes counted: never reused, recovered or deleted; `recover-interrupted` refuses it. Once a later boot session has begun it is closed and deleted as above. Idle slots, flushed at release, stay warm across the removal.
 - **Fallback.** While the volume is absent, selection falls back to the internal pool exactly as in part 1; a lost slot is not an active command, so it does not count toward the host-wide build limit. Interrupted `run` and `test` commands are not replayed; the next `run` or `test` builds through the internal slot and executes the checkout's `target` output.
 - **Final outputs.** `CARGO_TARGET_DIR` stays `<checkout>/target` whatever pool holds the intermediates, so binaries built while docked remain at the checkout after the drive is removed. No opt-in to follow the pool exists; selecting another pool never moves or deletes outputs.
-- **Status.** With the volume present, a lost slot reads `retired and held, never reused (lost with the removable volume; deleted whole when the volume returns)` or `(quarantined: …)`. With the volume absent, the removable block lists each lost slot from the internal control state, read-only.
+- **Status.** With the volume present, a lost slot reads `retired and held, never reused (lost with the removable volume; deleted whole when the volume returns)` or `(quarantined: …)`; a quarantined record whose holder predates the current boot session reads `(lost with the removable volume and …; its holder predates this boot session, so it is deleted whole when the volume returns)`. With the volume absent, the removable block lists each lost slot from the internal control state, read-only, with the same boot-session wording.
 - **State.** The lost entry adds an optional `lost` field to the record and a `lost` flag to the flush log in the removable pool's internal `state.json`. An `oxide` binary built before part 2 refuses that state (unknown field) rather than reusing a lost slot.
 
 **Proof.** `effigy rust:oxide-removable-removal` (heavy) runs `scripts/test-oxide-removable-removal.py` as the whole command of the qualified shared proof supervisor (`bounded-test.py --limit 300 --scratch-budget-mib 512`, oxide#109): writes and evidence stay under its scratch and evidence directories, work stops 30 s before its deadline and the supervisor decides closure and cleanup. The script reuses the #104 script's child runner and staging. It stages this clean HEAD's `oxide` offline with 1.97.1 under an empty `RUSTC_WRAPPER`, then, with a private `HOME`, `CARGO_HOME` and budget-only internal pool, registers one owned 128 MiB scratch APFS image at a unique `/Volumes/<name>`. The mounted payload is counted through the image's backing file in the scratch. Surprise removal is `hdiutil detach -force` of that image's own whole-disk device, positively bound just before (image path owns device and mount, mount is the recorded volume UUID), in three predeclared cases: an idle flushed slot survives removal and re-attach warm with an internal fallback build in between; a build whose build script blocks in its slot (its executable on the volume) is ended by the removal stop and fails, a late file write and directory creation into its slot path (by the build script when it gets that far, and by the unprivileged proof script) fail, the slot is recorded lost, `status` lists it with the volume absent, internal fallback `build`, `run` and `test` use checkout-local outputs, and after re-attach the next build deletes the lost slot whole and keeps the idle one; the same with `OXIDE_ALLOW_RUSTC_WRAPPER=1` is quarantined, kept with its bytes after re-attach and not deleted. After each removal `/Volumes` is root-owned without group or other write, the mount point is gone (or root-owned and not writable), and an unprivileged create under it is refused without creating anything. A checkout binary built while docked runs after removal. Cleanup is an ordinary detach. The forced detach never targets anything but the recorded scratch image. Not a benchmark or real-drive qualification: a real USB/Thunderbolt disconnect and a long-lived wrapper server are not exercised.
+
+**Boot-session closure proof (oxide#161).** `effigy rust:oxide-removable-boot-closure` (heavy) is the same script's focused `--boot-closure` mode under the qualified shared proof supervisor (`bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512`); the explicit internal root is the owner-accepted internal-placement exception because the fixture's directory-budget internal pool is genuinely internal, and it stays inside the same monitored 512 MiB root. It stages this HEAD's debug `oxide` offline with 1.97.1 (the one allowed seam is the debug-only `OXIDE_TEST_BOOT_MS` override, honored only under the supervisor's own canonical scratch/evidence/deadline layout and absent from release builds), registers one owned 128 MiB scratch APFS image at a unique `/Volumes/<name>` in permanent mode with a private `HOME` and `CARGO_HOME`, and makes every quarantine with the product's own removal path (`oxide exec` on a blocking tool, `hdiutil detach -force` of the image's positively bound device: the removal stop ends the tool and the release flush fails with the mount gone, so the lost record names the exec holder and is quarantined); no state file is edited and no other debug seam is used. Three independent cases run over separate checkouts: a quarantined `exec` slot whose override boot time follows its holder start is reported closed by `status`, an explicit `outputs adopt` of a whole-target fixture then migrates, and the next admission deletes the slot whole with the boot-session line and no record left (the oracle names the slot's own leaf, never the project-label folder, and checks the leaf gone with the folder still present); a slot whose override boot time precedes its holder start stays kept with its directory, record and status line; an unreadable override stays kept. Cleanup is an ordinary detach, and only the recorded scratch image is ever detached. `effigy rust:oxide-removable-boot-closure:diagnostic` is the same guard, root and limits with `--diagnostic` appended: the uncounted collection mode records reached, completed and failed cases, continues into the independent cases, stops on any child, volume, device or custody outcome it cannot classify, and writes one bounded `qualified: false` receipt beside the guard's; it is never a counted native PASS. `effigy rust:oxide-removable-boot-closure:test` runs only the script's pure `--self-check` (no child, pool, image or device): it pins the full fixture environment every boot-closure child receives, `status` included, against a child handed only the override; the deletion oracle's slot-leaf resolution — the slot's own `<profile>-<id>` leaf, resolved by the recorded id, inside its project folder and never that folder, with a counterfactual in which a resolver returning `slots/<folder>` is refused; the bounded, unqualified diagnostic receipt and its `json` document; the argument dispatch; and the product's own deletion line the candidate marker quotes. The first exact-head review found the missing `json` import and reported a partial `status` environment; both apparatus defects are fixed and pinned there before any native activation. The second found the before-boot deletion oracle naming the project-label directory `slots/<folder>` rather than the slot leaf — the deleting admission creates a fresh slot of the same project in that folder, so the folder could neither prove nor disprove whole-slot deletion. That oracle now resolves the leaf before the build from the recorded id alone, requires the leaf (not the folder) to be present before the deletion, and, after the admission, requires the leaf gone, the project folder still present and the state record removed. No native run of either selector has happened yet, so its fit is unmeasured. Not a benchmark, real-drive qualification or an alias for full QA.
 
 Author evidence (2026-10-22, two submissions, both spent), both under the oxide#109 guard (`bounded-test.py` SHA-256 `8e379c93…`); the selector now runs the merged oxide#114 guard (`d89115f1…`). The independent reviewer ran the proof once at final head `78b21f8` under that guard: supervisor closed with exit 0, all three removal cases passed, script time 74 s, owned peak 66.0 MiB of 512 MiB and sampled host free minimum 668.1 GiB. The held build stopped with exit 143, its slot was deleted after re-attach, the idle slot stayed warm, the quarantined slot was retained, and checkout-local fallback `run` and `test` passed. All four exact-head review gates passed. This is reviewer evidence at the final head; the author runs below retain their original heads and guard hashes. The branch was then merged with main (#114, #115) and the covering checks rerun at that head. The first, at `ef45b07` (before the removal stop), failed: the held build did not exit within 60 s after the forced detach because its build script, running from the removed volume, spun at full CPU; the supervisor reported `UNCLOSED` and kept the scratch, and SIGTERM to that build script then ended it and its Cargo. The second, at `7b45a2a`, passed in 57 s of script time (supervisor `closed`, owned bytes peak 65.4 MiB of 512 MiB, host free minimum 667.9 GiB). The removal stop sent TERM 24 ms after it sampled the missing volume, the held and quarantined builds exited 143 (Cargo ended by TERM), the lost slot's directory was still on the image after re-attach and was deleted, the quarantined slot's directory was kept, and the idle slot was reused warm. A forced detach of a disk image flushed more than a yanked cable may; neither persistence result is a claim about real drives.
 
@@ -3986,7 +4012,7 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - A build whose volume vanishes fails like any I/O error, and its lease is marked lost-volume.
 - **On releasing an external slot, Oxide flushes the volume** (`sync_volume_np` with full-sync-and-wait, or an equivalent the implementation cites). So a released slot's writes are on the device before it can be reused.
 - A flush failure makes the slot held and non-reusable. It does not authorize deletion while writers are unknown.
-- After an unclean disappearance, slots held at that moment are non-reusable. Discard them only after positive writer closure; otherwise quarantine and retain accounting. A vanished device, or Oxide's Cargo group ending while an inherited sccache server may still write, is not sufficient closure. Idle, flushed slots are kept.
+- After an unclean disappearance, slots held at that moment are non-reusable. Discard them only after positive writer closure; otherwise quarantine and retain accounting. A vanished device, or Oxide's Cargo group ending while an inherited sccache server may still write, is not sufficient closure. A restart is a positive-closure fact for a holder that started before the current boot session, with the 60 s margin above; a device that merely disappeared is not. Idle, flushed slots are kept.
 - The ledger never lives on the removable volume.
 
 **Final outputs stay checkout-local by default.** `CARGO_TARGET_DIR` remains `<checkout>/target` regardless of where slot intermediates live, keeping built binaries at the expected checkout path when undocked (Tom, 2026-10-20). The one exception is an explicit per-checkout conversion under permanent drive mode, below: `target` stays the lexical `CARGO_TARGET_DIR`, but it becomes an Oxide-owned link whose real root may be on the volume.
@@ -4048,27 +4074,33 @@ migration and consumer adoption remain separate gates.
   `plan` and ordinary builds are unaffected, and no already-created link is
   cleaned up automatically.
 - **Eligibility versus refusal (oxide#154).** The same prerequisite decides
-  *eligibility* for an automatic first conversion. When Git cannot confirm the
-  exact non-directory link path — no repository, no Git, an unignored,
-  negated, directory-only or already-tracked path, a timeout, a command error
-  or malformed output — the leased command is an ordinary unconverted
+  *eligibility* for an automatic first conversion, asked for every member link
+  that conversion would publish (`target/debug`, `target/release`; oxide#160),
+  because that is what its creator checks before it creates the real `target`
+  directory. When Git cannot confirm one of them — no repository, no Git, an
+  unignored or negated path, an already-tracked member, a timeout, a command
+  error or malformed output — the leased command is an ordinary unconverted
   checkout: it builds into the real local `target/`, intermediates stay in the
   slot, and exactly one unconverted notice is printed. Nothing else happens:
-  no receipt, root, link, prepared transition or downgrade fence is written,
-  and the check runs before the barrier and the admission lock. That is
-  ineligibility, not a swallowed failure: explicit `oxide outputs adopt`, the
-  replay of a prepared first conversion and every other conversion path still
-  refuse with the exact fix, a corrupt or unreadable receipt is still an
-  error, and a refusal after partial effects still stops with the prepared
-  receipt and no link rather than continuing as a local build.
+  no receipt, root, member link, prepared transition or downgrade fence is
+  written, and the check runs before the barrier and the admission lock. A
+  covering rule still converts, and because the published paths are members
+  under the real target directory a directory-only rule such as `target/`
+  genuinely covers them and is accepted. That is ineligibility, not a
+  swallowed failure: explicit `oxide outputs adopt`, the replay of a prepared
+  first conversion and every other conversion path still refuse with the exact
+  fix, a corrupt or unreadable receipt is still an error, and a refusal after
+  partial effects still stops with the prepared receipt and no member link
+  rather than continuing as a local build.
 - **`oxide init` diagnostic (oxide#154).** After its guidance and local-output
-  work, `oxide init` asks the same effect-free probe and, inside a Git work
-  tree, warns with the exact non-directory rule to add (`/target`, or the
-  workspace's repository-relative spelling such as `/rust/target`) when the
-  link path is unignored, won by a directory-only or negated rule, tracked, or
-  Git cannot answer. It never edits or rewrites a user's `.gitignore` rule and
-  adds no `target` rule of its own; a confirmed rule and a checkout outside
-  Git are silent.
+  work, `oxide init` asks the same effect-free probe for the first member link
+  this conversion publishes and, inside a Git work tree, warns with the rule
+  that covers them all (`/target`, or the workspace's repository-relative
+  spelling such as `/rust/target`) when that path is unignored, tracked, or
+  Git cannot answer. A directory-only rule such as `/target/` really does cover
+  the member links, so it is not diagnosed. `oxide init` never edits or
+  rewrites a user's `.gitignore` rule and adds no `target` rule of its own; a
+  covering rule and a checkout outside Git are silent.
 - **Keyed state and the binding mutex.** A command keys its slot with or
   without an owned destination when it starts. If the checkout was converted
   or detached while it waited for admission, binding refuses before Cargo
@@ -4125,8 +4157,10 @@ migration and consumer adoption remain separate gates.
   Generations are exact `u64`s; receipt paths are absolute and `..`-free. No
   step recreates an absent mount point, follows a link, or unlinks by path
   text. Unknown writer custody — a lost slot whose writers were never
-  positively closed, in either pool — refuses any relink or clean for that
-  checkout until it is resolved. Record IDs are per pool, so a command is
+  positively closed, in either pool, and whose holder started in this boot
+  session — refuses any relink or clean for that checkout until it is
+  resolved. A record whose holder predates this boot session is closed by
+  the restart. Record IDs are per pool, so a command is
   exempt only from its own record in its own pool; an equal ID in the other
   pool is another command.
 - **Crash replay.** Only the exact prepared/old generations replay, and a
@@ -4193,9 +4227,9 @@ migration and consumer adoption remain separate gates.
   empty `<checkout>/target` directory and keeps every root in either drive
   mode (oxide#124): it is the per-checkout opt-out, and it refuses a foreign
   link or unknown writer custody without change. `status` is read-only.
-- **Automatic first conversion (oxide#121).** A leased command (build, run,
-  test, exec) converts a fresh checkout before its destination is keyed and
-  before its slot is taken, when all of these hold: the command's selected pool is the
+- **Automatic first conversion (oxide#121, profile layout since oxide#160).**
+  A leased command (build, run, test, exec) converts a fresh checkout before
+  its destination is keyed and before its slot is taken, when all of these hold: the command's selected pool is the
   registered permanent drive as selected at its start (not the internal
   fallback; the registration it selected must be permanent, and the volume
   and root in force now must be that same selection, so a switch is a no-op);
@@ -4206,14 +4240,26 @@ migration and consumer adoption remain separate gates.
   with a missing-target-only transition, and releases the barrier before the
   slot is taken. Every fact is rechecked under the admission lock. A concurrent
   receipt, creator, mode or volume change makes it a no-op, and the existing
-  path decides. Everything else keeps today's behaviour and is never touched:
+  path decides. The conversion creates the PROFILE layout (oxide#160, S4b):
+  it runs the same creator an explicit `oxide outputs adopt` runs for a fresh
+  checkout, so it publishes a real `target` directory holding owned
+  `debug`/`release` member links into one new owned root, with the same
+  receipt format and root marker, and every member's Git-ignore prerequisite
+  is checked before the real target directory exists, so a refusal changes
+  nothing at all. It never converts or keeps anything that already exists: an
+  empty or populated directory, a link or a member-shaped entry appearing
+  where a member must be created refuses, and the missing-target-only
+  transition is unchanged. Existing whole-target checkouts are untouched and
+  migrate only through an explicit `oxide outputs adopt`; crash replay keeps
+  the layout a prepared conversion recorded. Everything else keeps today's
+  behaviour and is never touched:
   a real target (empty or not), a foreign or dangling link, a file, an
   unreadable or corrupt receipt (an error, never absence), a detached
   checkout (its receipt stays, so a missing target beside it is excluded),
   ephemeral mode, an absent or unusable drive and internal fallback. A
   preparation that published nothing rolls back to a detached receipt, which
-  excludes it from automatic adoption; `oxide outputs adopt` still converts
-  it. Exactly one stderr notice, `oxide: auto-adopted <target> -> <root> for
+  excludes it from automatic adoption and whose commands then run locally;
+  `oxide outputs adopt` still converts it. Exactly one stderr notice, `oxide: auto-adopted <target> -> <root> for
   permanent-drive outputs; no existing outputs moved`, follows the durable
   commit; replays and later builds print none. A committed adoption persists
   when a later admission, build or cancellation fails. No persisted format
@@ -4404,13 +4450,29 @@ author and reviewer native remain unactivated.
   unchanged. `oxide exec --output <member>` is repeatable and COMPLETE: the
   caller declares the tool's entire profile-output set, only the four member
   forms are accepted, the same validation and eight-total cap apply, and the
-  tool's argv after `--` is untouched. A tool that supplies its own `--target`
-  needs the matching `<triple>/…` declaration in that project's selector; this
-  task changes no consumer selector. A profile checkout with any owned member
-  link refuses a command that declares none before Cargo, naming `oxide exec
-  --output` and `oxide outputs detach`; an unlinked checkout runs it locally as
-  before. Legacy whole-target checkouts keep today's behaviour until explicit
-  migration.
+  tool's argv after `--` is untouched. It is OPTIONAL (oxide#160, S1): an
+  `exec` that declares nothing derives its member set from this checkout's
+  committed receipt instead — exactly the receipt's recorded placements,
+  rendered with the same `outputs-3` lines, so the derived set and an equal
+  declaration share one slot key
+  ([design](exec-output-inference.md)). The derived path is read-only and
+  fail-closed: the member-shaped paths under the real `target` are enumerated
+  with the shipped `migration_members` traversal (member names first, so a
+  real `target/debug` payload is never listed; `file_type()` and `read_link`
+  only, so no link target is resolved or descended), a receipt-selected
+  member must already be this checkout's owned link at the recorded
+  destination (a missing, dangling, real or foreign entry refuses with
+  `oxide outputs adopt` named), a receipt-recorded real member stays `real`
+  with the existing notice, a link or file the receipt does not place
+  refuses, and a checkout placing more than eight members refuses naming
+  `oxide outputs detach`. The derived path reserves nothing, relinks nothing,
+  converts nothing and creates no member. A detached profile receipt plans no
+  destination at all, so its `exec` runs locally through real directories; a
+  legacy whole-target receipt and an unconverted checkout are unchanged (the
+  declaration is not consulted), and a prepared, pruning or pruned receipt
+  refuses. A tool that supplies its own `--target` needs the matching
+  `<triple>/…` declaration in that project's selector; this task changes no
+  consumer selector.
 - **Custody, keys and binding.** Every create, relink, fallback return,
   detach, clean, migration and replay waits for all checkout writers under the
   existing barrier, binding mutex and positive cross-pool closure; an unknown
@@ -4692,62 +4754,65 @@ target missing; ephemeral mode; an absent drive; a recorded-UUID fallback);
 crash replay after the sibling point, where a creator at the target is
 refused and kept, and after the prepared point, which rolls back to detached;
 and a committed adoption that survives a failed build. The no-replace publish
-is a macOS unit test in `effigy test rust`. Its fixtures ignore `/target`
-(not `target/`) because a first conversion requires Git to ignore the exact
-non-directory link path. Not a benchmark, real-drive qualification or an
-alias for full QA.
+is a macOS unit test in `effigy test rust`. Its fixtures ignore `/target`,
+which covers the member links a first conversion publishes. Not a benchmark,
+real-drive qualification or an alias for full QA.
 
 **Proof (oxide#125).** `effigy rust:outputs-ignore-safety` runs
 `scripts/test-permanent-outputs.py ignore-safety`, the focused ignore-safety
 mode of the same fixture, as the whole command of the qualified shared
 supervisor (300 s, 512 MiB monitored scratch, ordinary detach) over one owned
-128 MiB scratch image. It covers, for explicit adopt and prepared
-first-conversion replay: `/target/`, `target/` and `**/target/`
-refusing for missing and real empty targets (a real empty target proving the
-directory-only winning rule is recognised), `/target` and `target` publishing
-an owned link, a nested workspace's `/rust/target` accepted while its slash
-forms refuse, and negated, unignored and tracked paths, no repository, no
-Git on `PATH`, a Git that does not answer in time, a failing Git call and a
-malformed verbose answer all refusing with the target, receipt and drive
-roots unchanged and the non-slash fix named. An automatic conversion Git
-cannot confirm is ineligibility rather than a refusal (oxide#154), so those
-cases assert an unconverted build with one notice instead. Accepted
-publications are invisible to `git status` and `git ls-files`, and `detach`
-still restores a real directory. Not a benchmark, real-drive qualification or
-an alias for full QA. The native run is held for owner activation; the
-guard's rule parsing and decisions are unit-tested in `effigy test rust`.
+128 MiB scratch image. It covers, for explicit adopt, automatic adoption and
+prepared first-conversion replay, the member links a conversion publishes
+(`target/debug`, `target/release`): `/target/`, `target/`, `**/target/`,
+`/target` and `target` all publish, because a directory-only rule genuinely
+covers a member path inside the real target directory (oxide#160), and a
+nested workspace's `/rust/target/` publishes while an unignored nested
+checkout refuses. A rule that re-includes a member, an unignored path, a
+tracked member, no repository, no Git on `PATH`, a Git that does not answer in
+time, a failing Git call and a malformed verbose answer all refuse with the
+target, receipt and drive roots unchanged (not even the real target directory
+is created). An automatic conversion Git cannot confirm is ineligibility
+rather than a refusal (oxide#154), so those cases assert an unconverted build
+with one notice instead. Accepted publications are invisible to `git status`
+and `git ls-files`, and `detach` still restores a real directory. Not a
+benchmark, real-drive qualification or an alias for full QA. The native run is
+held for owner activation; the guard's rule parsing and decisions are
+unit-tested in `effigy test rust`.
 
 **Proof (oxide#154).** `effigy rust:auto-adopt-ineligible` runs
 `scripts/test-permanent-outputs.py auto-ineligible`, a focused mode of the
 same fixture, as the whole command of the same qualified shared supervisor
 (300 s, 512 MiB monitored scratch, ordinary detach) over one owned 128 MiB
-scratch image, with `--root-parent /private/tmp` — the owner-accepted
-internal-placement exception (decision bd357a4c), because the fixture needs a
-genuine internal directory-budget pool that the product correctly refuses on
-an external volume; the supervisor monitors that same root. It proves expected ineligibility leaves the build usable: for
-no repository, no Git on `PATH`, an unignored path, a directory-only rule, a
-negated rule, an already-tracked path and a Git that does not answer, the
-leased build exits 0 into a real local `target/` holding the built binary,
-prints exactly one unconverted notice and no auto-adopted line, and writes no
-receipt, owned link, owned root or downgrade fence. An explicit whole-target
-adoption — a detached whole-target receipt, the state the automatic conversion
-publishes — still refuses each class with the target, receipt bytes and drive
-roots unchanged; a fresh explicit adopt instead selects the profile layout,
-whose member paths a directory-only parent rule legitimately covers (oxide#133);
-a corrupt receipt is still an error that creates no target; an automatic conversion stopped after its prepared receipt keeps that
-receipt and no link, refuses a replay within a broken rule, and recovers only
-through the documented explicit adopt; an existing real target stays the
-per-checkout opt-out; and `oxide init` names the exact non-directory rule
-(`/target`, nested spelling included) for a directory-only, unignored or
-tracked path while leaving every rule byte-exactly as it was, staying silent
-for a confirmed rule. Each case uses its own checkout, so one failure never
-taints another premise. Its `:diagnostic` twin is the same fixed guard, mode
-and limits with `--diagnostic` appended: an uncounted keep-going collection
-that records reached/completed/failed/unexecuted cases and the latched first
-fault in a bounded `qualified=false` receipt beside the guard's evidence,
-continues only into independent cases, and aborts on an unclosed child or an
-exhausted deadline. Each native run needs its own owner activation. Not a
-benchmark, real-drive qualification or an alias for full QA.
+scratch image attached with ownership enabled, with `--root-parent
+/private/tmp` — the owner-accepted internal-placement exception (decision
+bd357a4c), because the fixture needs a genuine internal directory-budget pool
+that the product correctly refuses on an external volume; the supervisor
+monitors that same root. It proves expected ineligibility leaves the build
+usable: for no repository, no Git on `PATH`, an unignored path, a negated
+rule, an already-tracked member and a Git that does not answer, the leased
+build exits 0 into a real local `target/` whose `debug` member is a real
+directory holding the built binary, prints exactly one unconverted notice and
+no auto-adopted line, and writes no receipt, owned member link, owned root or
+downgrade fence. Explicit adoption over a real empty target still refuses each
+class with the target bytes, receipt and drive roots unchanged; a corrupt
+receipt is still an error that creates no target; an automatic conversion
+stopped after its prepared member receipt keeps that receipt and no member
+link, refuses a replay within a broken rule, and recovers only through the
+documented explicit adopt (which then publishes the committed profile
+layout); an existing real target stays the per-checkout opt-out; and
+`oxide init` names the rule that covers the member links for an unignored or
+tracked path, stays silent for a covering rule (including a directory-only
+one), and leaves every rule byte-exactly as it was. Each case uses its own
+checkout, so one failure never taints another premise. Its `:diagnostic` twin
+is the same fixed guard, mode and limits with `--diagnostic` appended: an
+uncounted keep-going collection that records reached/completed/failed/
+unexecuted cases and the latched first fault in a bounded `qualified=false`
+receipt beside the guard's evidence, continues only into independent cases,
+aborts on an unclosed child or an exhausted deadline, and makes one ordinary
+detach of the run's owned image with the mount's absence recorded before that
+receipt. Each native run needs its own owner activation. Not a benchmark,
+real-drive qualification or an alias for full QA.
 
 **Proof (oxide#124).** `effigy rust:outputs-detach-permanent` runs
 `scripts/test-permanent-outputs.py detach-permanent`, the focused mode of the
@@ -4823,7 +4888,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 - **Operator list.** `--operator-list` is a JSON array of absolute, duplicate-free root paths (at most 512 and 256 KiB). It waives only the receipt-history completeness for exactly those listed legacy roots. It still requires a well-formed owner marker, the actual absent checkout, closed writers, no current registry selection, a complete registry and custody snapshot, and the verified volume. A legacy recorded checkout below `/Volumes` is kept. Elsewhere the proof is volume-based, not a path prefix: the checkout's nearest existing ancestor must be on the same device and APFS volume UUID as the boot Data volume (`/System/Volumes/Data`), and the no-follow walk must end in a leaf `ENOENT`; any other or unverifiable volume is kept. A moved-but-live checkout loses regenerable outputs by explicit operator choice; its next command safely re-adopts with a fresh nonce or refuses a missing root.
 - **Quarantine and deletion.** Each root first gets a durable `oxide.outputs.prune-intent/1` journal entry with a fresh random 128-bit intent ID (the root's own nonce is separate and immutable). The verified root is then renamed exclusively inside the `oxide-outputs` tree to a `.prune-<intent>` leaf, deleted only through the held descriptor of the verified device. A resumed deletion opens the quarantine leaf only when its device and inode both equal the recorded root's (no-follow traversal, links unlinked but never followed, a cross-device or changed entry stops the batch), and the owner marker is unlinked last. The prune worker monitors itself (no Cargo group is assumed): the registered volume's identity and reserve and the host reserve of the internal control volume are checked at fixed points (before the rename, before the first and after the last deletion of every run or replay, every 512 deleted entries) and, once at least 1 s has elapsed since the previous check, before each directory enumeration, every 512 names while a directory is listed (at most 200,000 names per directory) and after each unlink; after each directory's names are sorted, and before the marker and the quarantine leaf are removed, a check always runs before the next write. A single directory listing or system call is not interrupted, and one delete pass has a 120 s deadline; this is cooperative checking, not a hard 1 s watchdog. Any loss stops further writes and leaves the intent pending; unknown free space is not above a reserve and stops too. The admission lock is not held during long deletes; the checkout binding barrier is. Before each root's intent, under that root's clean barrier and binding lock, the run rereads the ready registry and the root's receipt and re-runs every eligibility predicate for its row (writer custody and command records in both pools, the caller's own barrier excepted; the root's device, inode, marker, nonce and generation unchanged). The intent is then published only if the registry revision still equals the one that reread saw; one changed revision gets one more locked reread, and a second keeps the root. Every registry write, including each intent phase, holds the internal publication lock. Replaying an unfinished intent (rollback, resumed deletion or a terminal receipt) takes the same checkout barrier and binding lock.
 - **Journal order.** `intent` → `renamed` → `deleting` → `marker_last` → `deleted`; every phase is durable before its effect. While a transition is prepared, the registry keeps the committed root selected and adds the proposed root as pending; a missing reference is never read as non-selection. The registry terminal state (row no longer selected, `pruned_ms`) is durable before the checkout's `oxide.outputs.transition/2` receipt records `deleted`, and diagnostic observations are best-effort afterwards. The intent then records that its receipt committed; until it does, a `deleted` or `resolved` intent is still unfinished, so adopt refuses, prune replays the receipt step and `resolve-intent` finishes only that step (exit 3 if it fails). A missing quarantine or marker without positive deletion proof, or an unknown volume, is `pending` (exit 3), never inferred as done. `oxide outputs resolve-intent <intent-id>` is the only settlement verb: it never initializes the format, and it takes the checkout's clean barrier and binding lock for the recheck through the committed terminal transaction. Both leaves must be positively absent under the verified volume descriptor, the registry must be complete with the intent's exact blocking row, the checkout must select no other root, and no recorded writer may hold it in either pool. It publishes a durable `oxide.outputs.prune-resolution/1` receipt and records `resolved-by-operator` in the checkout receipt under the same custody ordering. Completed resolution rows are removed from live selection only after that proof; unfinished intents and resolutions are safety journals that are never compacted.
-- **Forward format.** Prune establishes the shared forward fence first: numeric state version 3 with `owned_outputs: "oxide.outputs/2"`, receipt `oxide.outputs.transition/2` (one `target` placement member in this tranche) and marker `oxide.outputs.root/2` with the root nonce. The internal control records `initializing` then `ready` durably before the paired removable control, and only then is `outputs/registry.json` (`oxide.outputs.registry/1`, numeric schema 1) created exclusively. Version-2 root markers also record the checkout's volume UUID. Initialization, and resuming an `initializing` record, first requires positive writer closure across both pools with both admission locks held together: no active or held command record, no lost slot with unclosed writers and no clean barrier other than the initializing checkout's own. An older binary's in-flight command is a record in the same state, so it must close first; otherwise initialization refuses and nothing is written. A newly paired or reappearing removable control is fenced under the same check. A missing, unreadable, foreign or sticky-incomplete registry refuses mutation and keeps every root; it is never rebuilt from markers. Version-1 state and the version-1 receipt shape remain readable as legacy, the latter only on the prune paths above; a legacy root has no nonce and is never given one from a missing root's receipt. A prune publishes a kept root's receipt never, and a pruned root's receipt only through its existing terminal transaction (see the version-1 bullet). The numeric state version advances only with the `oxide.outputs/2` fence or its initialization record: an ordinary mutation of a pool that has not opted into owned outputs keeps the previous numeric version, and a released `oxide.outputs/1` fence does not itself advance it, so an older binary is not refused merely because a build ran. A pool whose state records `ready` but whose registry file is missing refuses every mutation and prune keeps every root; the registry is never recreated from markers or receipts. A pool adopted before this format has no registry: `oxide outputs adopt` and `oxide outputs detach` with an existing receipt initialize it behind the fence (under that closure rule) before their first receipt write, and a command's own transition or replay refuses before any effect, naming that upgrade, because a command holding a slot is itself an open writer.
+- **Forward format.** Prune establishes the shared forward fence first: numeric state version 3 with `owned_outputs: "oxide.outputs/2"`, receipt `oxide.outputs.transition/2` (one `target` placement member in this tranche) and marker `oxide.outputs.root/2` with the root nonce. The internal control records `initializing` then `ready` durably before the paired removable control, and only then is `outputs/registry.json` (`oxide.outputs.registry/1`, numeric schema 1) created exclusively. Version-2 root markers also record the checkout's volume UUID. Initialization, and resuming an `initializing` record, first requires positive writer closure across both pools with both admission locks held together: no active or held command record, no lost slot with unclosed writers and no clean barrier other than the initializing checkout's own. A quarantined lost slot whose holder predates the current boot session is closed by the restart and does not block initialization; it is released and deleted whole at the next admission, through the same volume-bound path (oxide#161). An older binary's in-flight command is a record in the same state, so it must close first; otherwise initialization refuses and nothing is written. A newly paired or reappearing removable control is fenced under the same check. Every paired-control branch accepts exactly the released `oxide.outputs/1` fence and the published `oxide.outputs/2` fence as predecessors of the successor fence, plus an absent fence where the control may be new, so a pool fenced by a released binary is never migrated by one branch and refused as unknown by another; any other value refuses at the shared state parser before any effect (oxide#159). A missing, unreadable, foreign or sticky-incomplete registry refuses mutation and keeps every root; it is never rebuilt from markers. Version-1 state and the version-1 receipt shape remain readable as legacy, the latter only on the prune paths above; a legacy root has no nonce and is never given one from a missing root's receipt. A prune publishes a kept root's receipt never, and a pruned root's receipt only through its existing terminal transaction (see the version-1 bullet). The numeric state version advances only with the `oxide.outputs/2` fence or its initialization record: an ordinary mutation of a pool that has not opted into owned outputs keeps the previous numeric version, and a released `oxide.outputs/1` fence does not itself advance it, so an older binary is not refused merely because a build ran. A pool whose state records `ready` but whose registry file is missing refuses every mutation and prune keeps every root; the registry is never recreated from markers or receipts. A pool adopted before this format has no registry: `oxide outputs adopt` and `oxide outputs detach` with an existing receipt initialize it behind the fence (under that closure rule) before their first receipt write, and a command's own transition or replay refuses before any effect, naming that upgrade, because a command holding a slot is itself an open writer.
 - **Nonces and keys.** Every root creation or recreation draws a fresh random 128-bit lowercase-hex nonce. The output destination key includes the nonce, root, volume UUID and recipe; legacy `outputs-1` keys stay distinct and no recreated root claims a warm legacy root. An existing root keeps its marker's nonce.
 - **Registry and overflow.** Rows are keyed by checkout, placement member and root; revision advances before every changed receipt, selection or root effect, and the registry is read as one bounded whole snapshot (8192 files, 64 MiB, 10 s). The live registry is capped at 4096 rows and 4 MiB. Before a cap-exceeding unindexed selection the registry records sticky incompleteness durably; that write failing refuses adoption before its effect, and prune then keeps every root with an explicit reason. The incomplete flag is never cleared by this tranche.
 - **Status.** Default `oxide status` reads only the bounded recorded `outputs/prune-observations.json` (`oxide.outputs.prune-observations/1`, at most 256 KiB and 512 roots) in the pool section. It performs no root walk, replay, lock or reconciliation. Coverage, source and time are explicit; a partial observation never becomes a global orphan total. `--measure` does not scan output roots for prune.

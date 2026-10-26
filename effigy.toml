@@ -318,21 +318,71 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # The first conversion's Git ignore prerequisite (oxide#125): the focused
 # `ignore-safety` mode of the #117 fixture, under the same qualified shared
 # supervisor (300 s, 512 MiB monitored scratch, ordinary detach) and one owned
-# 128 MiB scratch image. A `<checkout>/target` link is published only when Git
-# ignores its exact non-directory repository-relative path: trailing-slash,
-# negated, unignored and tracked paths, no repository, no Git, a timeout, a
-# command error and a malformed answer all refuse with the target, receipt and
-# roots unchanged, for explicit adopt and prepared first-conversion replay; an
-# eligible automatic conversion publishes an ignored link, accepted automatic,
-# explicit and nested publications stay invisible to `git status` and
-# `git ls-files`, and detach still works. An automatic conversion Git cannot
-# confirm is ineligibility, not a refusal (oxide#154): the focused
-# `rust:auto-adopt-ineligible` mode owns that matrix. Its native run needs an
-# owner activation before submission. It is not a benchmark, real-drive
-# qualification or an alias for full QA.
+# 128 MiB scratch image. A first conversion publishes owned
+# `<checkout>/target/<member>` links only when Git ignores the exact
+# repository-relative path of the link it is about to publish, and refuses
+# with nothing changed for a rule that re-includes the member, an unignored
+# path, a tracked member, no repository, no Git, a timeout, a command error and
+# a malformed answer, for explicit adopt, automatic adoption and prepared
+# first-conversion replay; a directory-only rule such as `/target/` genuinely
+# covers a profile member inside the real target directory and is accepted
+# (oxide#160, S4b); accepted automatic, explicit and nested publications stay
+# invisible to `git status` and `git ls-files`; detach still works. Its native
+# run needs an owner activation before submission. It is not a benchmark,
+# real-drive qualification or an alias for full QA.
 [tasks."rust:outputs-ignore-safety"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py ignore-safety"
+
+# Exec output inference (oxide#160, S1) plus the profile-layout automatic
+# first conversion (S4b): the focused `exec-inference` mode of the #117/#121
+# fixture, under the same qualified shared proof supervisor (300 s, 512 MiB
+# monitored scratch, ordinary detach) and one owned 128 MiB scratch image
+# attached with `hdiutil -owners on` on every attach. A fresh eligible
+# checkout's first leased build creates a real `target` holding owned
+# `debug`/`release` member links into one root, an `exec` with no `--output`
+# derives its member set from that committed receipt and places its tool's
+# build in the root, a repeat reuses the warm slot, the declared `--output`
+# override reaches the same key, an unrecorded member stays real and local, a
+# detached and an unconverted checkout run locally, a spaced checkout path
+# works end to end, an existing whole-target fixture (case 09) stays
+# whole-target through a build and an exec, and a foreign member link, root
+# drift, a receipt changed while the command waits and an interrupted tool
+# whose surviving group member holds the lease (case 15) all behave as
+# recorded with the links, receipt and roots unchanged where they must be.
+# The HIGH premise checklist is traced in the mode's docstring: private
+# HOME/rustup, OXIDE_TEST_HOME_FROM_ENV, the OXIDE_/XDG_/CARGO_*/GIT_ scrub,
+# an explicitly created unconverted control, `-owners on` plus a read-only
+# mount observation, one frozen RUSTFLAGS with CARGO_ENCODED_RUSTFLAGS
+# removed for staging and every fixture child, the internal monitored scratch
+# root described below, and mkdtemp-only fixture temp roots.
+# `--plan` prints the fixed table and allocation with no effect.
+#
+# `--root-parent /private/tmp` is the owner-accepted internal-placement
+# exception (decision bd357a4c, Tom-approved apparatus correction 2026-10-26),
+# exactly as `rust:profile-outputs`, `rust:command-budgets`,
+# `rust:pool-temp-scratch`, `rust:recorded-slot-accounting` and
+# `rust:outputs-prune` use it: this fixture's control pool is a genuine
+# internal `directory-budget` pool, which the product correctly refuses on the
+# selected external volume (the diagnostic at 171ae6fb failed there before
+# attaching its image). The internal pool, the supervisor's monitored root,
+# the image backing and every fixture temp path stay inside the same monitored
+# 512 MiB root, and the owned 128 MiB image is attached with `-owners on` and
+# registered as the operating removable pool after the internal-pool fixture,
+# with the same 300 s limit and the same ordinary detach. It is not a limit
+# change or a different scratch location.
+# `rust:exec-output-inference:diagnostic` appends `--diagnostic`: the same
+# bounded guard, uncounted, aborting at the first fault and writing a bounded
+# `qualified: false` receipt (it has no keep-going collection). Each run needs
+# its own owner activation, and only a counted run at the exact merge head can
+# pass. Not a benchmark, real-drive qualification or an alias for full QA.
+[tasks."rust:exec-output-inference"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference"
+
+[tasks."rust:exec-output-inference:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference --diagnostic"
 
 # Automatic-adoption ineligibility (oxide#154): the focused `auto-ineligible`
 # mode of the #117 fixture under the same qualified shared supervisor (300 s,
@@ -342,20 +392,24 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # genuine internal directory-budget pool (`OXIDE_POOL` at the directory
 # default), and the product correctly refuses that backend on an external
 # volume. The supervisor monitors that same root, so the image, fixtures and
-# evidence stay inside one 512 MiB budget. An expected ignore-safety ineligibility (no repository, no Git on
-# PATH, an unignored, negated, directory-only or already-tracked path, a Git
-# that does not answer) leaves the build an ordinary unconverted checkout: a
-# real local target holding the built binary, exactly one unconverted notice,
-# and no receipt, owned link, owned root or downgrade fence. An explicit
-# whole-target adoption (a detached whole-target receipt) still refuses with the
-# target, receipt bytes and drive roots unchanged; a corrupt receipt and a
-# partially converted checkout still fail closed; an existing
-# real target stays the documented opt-out; and `oxide init` names the exact
-# non-directory rule to add without rewriting any rule. Each case uses its own
-# checkout, so a failure never taints another case's premise. Its case table
-# and dependency-free dispatch are driven by `--diagnostic`, the uncounted
-# keep-going collection below. Each native run needs its own owner activation.
-# Not a benchmark, real-drive qualification or an alias for full QA.
+# evidence stay inside one 512 MiB budget. The first conversion publishes
+# owned `target/<member>` links (oxide#160), so eligibility is asked per
+# member: an expected ignore-safety ineligibility (no repository, no Git on
+# `PATH`, an unignored or negated path, an already-tracked member, a Git that
+# does not answer) leaves the build an ordinary unconverted checkout - a real
+# local target holding the built binary, exactly one unconverted notice, and no
+# receipt, owned member link, owned root or downgrade fence - while a covering
+# rule, including a directory-only one that genuinely covers the member, still
+# converts. An explicit adoption over a real empty target still refuses with
+# the target bytes, receipt bytes and drive roots unchanged; a corrupt receipt
+# and a partially converted checkout still fail closed; an existing real target
+# stays the documented opt-out; and `oxide init` names the exact rule that
+# covers the member links without rewriting any rule. Each case uses its own
+# checkout, so a failure never taints another case's premise. `--diagnostic`
+# is the uncounted keep-going collection below; it records one ordinary image
+# detach and the mount's absence before its receipt. Each native run needs its
+# own owner activation. Not a benchmark, real-drive qualification or an alias
+# for full QA.
 [tasks."rust:auto-adopt-ineligible"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-ineligible"
@@ -489,6 +543,45 @@ run = "python3 scripts/test-oxide-removable-pool.py"
 [tasks."rust:oxide-removable-removal"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py"
+
+# Boot-session closure (oxide#161): the removable-removal proof's focused
+# mode. A restart ends every process, so a quarantined lost slot whose holder
+# started before the current boot session is positively closed. Stages this
+# HEAD's debug `oxide` offline with 1.97.1 and, over one owned 128 MiB scratch
+# APFS image at a unique /Volumes/<name> (`-owners on`) with a private HOME
+# and CARGO_HOME, proves three independent cases: a quarantined `exec` slot
+# (the product's own removal path: the removal stop ends the blocked tool and
+# its release flush fails with the mount gone) whose debug-only override
+# boot time follows its holder start is reported closed by `status`, an
+# explicit adopt of a whole-target fixture then migrates, and the next
+# admission deletes the slot whole; a slot whose override boot time precedes
+# its holder start stays kept with its bytes; an unreadable override stays
+# kept. The explicit internal root is the owner-accepted exception for this
+# fixture's genuine directory-budget internal pool (a pool under /Volumes
+# refuses). 300 s, 512 MiB monitored scratch, ordinary detach. No reinstall,
+# live pool or live slot mutation. Not a benchmark or full QA.
+[tasks."rust:oxide-removable-boot-closure"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure"
+
+# The uncounted diagnostic twin of the same focused mode (oxide#161): the same
+# guard, root and limits with `--diagnostic` appended. It records reached,
+# completed and failed cases and stops on any outcome it cannot classify, and
+# writes ONE bounded `qualified: false` receipt beside the guard's. It is never
+# a counted native PASS.
+[tasks."rust:oxide-removable-boot-closure:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure --diagnostic"
+
+# The pure apparatus check of the boot-closure mode (oxide#161): no child,
+# pool, image, device or supervisor, and no gate credit. It pins the two
+# defects the first exact-head review found before a native activation (the
+# diagnostic receipt's `json` dependency and a boot-closure child handed only
+# the override instead of the full fixture environment), plus the argument
+# dispatch and the product's own deletion line the candidate marker quotes.
+# It runs before the uncounted diagnostic and is not native evidence.
+[tasks."rust:oxide-removable-boot-closure:test"]
+run = "python3 scripts/test-oxide-removable-removal.py --self-check"
 
 # Budget-only default pool (oxide#102): the removable-pool proof's guarded
 # session, preceded by the default-pool cases over a scratch HOME (legacy
