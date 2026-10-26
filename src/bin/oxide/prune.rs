@@ -3304,12 +3304,15 @@ impl RootSession {
             // Immediately before the leaf's own removal: the volume, reserve
             // and host control volume are checked again.
             check()?;
+            // The leaf drain recovers metadata too, so it runs the same caller
+            // check after every unlink it performs, not a no-op.
+            let mut between = || check().map_err(DrainStop::Stopped);
             let outcome = rmdir_draining_finder_metadata(
                 self.outputs.as_fd(),
                 &name,
                 self.root.as_fd(),
                 std::ffi::OsStr::new(quarantine),
-                &mut || Ok(()),
+                &mut between,
             );
             match &outcome {
                 Rmdir::Removed => return sync_fd(&self.outputs),
@@ -3423,6 +3426,15 @@ struct Deleter<'a> {
 
 impl Deleter<'_> {
     fn check(&mut self) -> Result<(), Stop> {
+        // One bounded check: the delete pass's own deadline first, then the
+        // registered volume and both reserves. Every caller of `check` — the
+        // per-unlink drain check, the quarantine leaf's recheck and the
+        // terminal recheck — therefore tests the deadline too.
+        if Instant::now() > self.deadline {
+            return Err(Stop::Pending(
+                "the delete batch exceeded its time window; the quarantine is kept".to_owned(),
+            ));
+        }
         self.session.check(self.control, self.entries)?;
         self.checked = Instant::now();
         Ok(())
@@ -3457,6 +3469,10 @@ fn remove_quarantined_directory(
         // unlink, not once per batch: a reserve, volume or deadline failure
         // stops the drain at that entry and keeps the intent pending.
         let mut between = || {
+            // This entry was unlinked *before* the check that follows it, so the
+            // deleter's entry count (and any entry-count trigger) advances one
+            // recovered unlink at a time.
+            deleter.entries += 1;
             deleter
                 .check()
                 .map_err(|stop| DrainStop::Stopped(stop_text(stop)))
@@ -3471,11 +3487,9 @@ fn remove_quarantined_directory(
         match &outcome {
             Rmdir::Removed => return Ok(()),
             Rmdir::Drained { entries } => {
-                // Recovered entries are deleted work: the existing entry
-                // cadence and reserve check stay honest.
+                // Each recovered entry was already counted and checked by the
+                // between-unlinks callback; only this pass's tally remains.
                 drained += entries;
-                deleter.entries += entries;
-                deleter.check()?;
             }
             // A mid-drain stop already ran the caller's check and carries its
             // reason: the intent stays pending, nothing is cleared.

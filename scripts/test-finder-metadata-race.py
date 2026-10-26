@@ -1094,18 +1094,19 @@ def settle_case(
         require_fired(case, mark, "Metadata")
         return f"{case}: deleted, exit {real.returncode}"
 
+    if case == "prune_completion_fault":
+        return settle_completion_fault(oxide, env, base, case, mark, real, outputs, plan, digest)
+
     if real.returncode != 3:
         fail(
             f"{case}: an unsettled deletion did not exit 3 "
             f"(exit {real.returncode}: {real.stderr[-1500:]})"
         )
-    if not quarantined and case != "prune_completion_fault":
+    if not quarantined:
         fail(f"{case}: the pending intent left no quarantined leaf")
     if kept_root:
         fail(f"{case}: the root is still under its live name while a quarantine exists")
-    leaf = os.path.join(outputs, quarantined[0]) if quarantined else os.path.join(
-        outputs, "_missing"
-    )
+    leaf = os.path.join(outputs, quarantined[0])
     document, intent = intent_for(env, leaf)
     phase = intent.get("phase")
     if phase not in UNFINISHED_PHASES:
@@ -1116,38 +1117,23 @@ def settle_case(
         fail(f"{case}: the journal reached a terminal phase {phase!r}")
 
     if case == "prune_drain_fault":
-        if not [
+        # The intended injected stop: the product's low-reserve reading fired on
+        # the first check after one recovered unlink, so the drain stopped with
+        # the remaining tolerated metadata still there.
+        if "prune-low-reserve-fired" not in os.listdir(evidence_dir()):
+            fail(f"{case}: the low-reserve injection did not record a firing")
+        survivors = [
             path
             for path in tree_files(leaf)
             if os.path.basename(path) == ".DS_Store"
             or os.path.basename(path).startswith("._")
-        ]:
+        ]
+        if not survivors:
             fail(f"{case}: the mid-drain stop deleted every recovered metadata entry")
+        if phase not in UNFINISHED_PHASES:
+            fail(f"{case}: the journal phase is {phase!r}, not the pending one the stop leaves")
         require_fired(case, mark, "Metadata")
         return f"{case}: pending mid-drain, quarantine {quarantined[0]}, phase {phase}"
-
-    if case == "prune_completion_fault":
-        if quarantined:
-            fail(f"{case}: the pre-completion fault left a quarantined leaf")
-        if kept_root:
-            fail(f"{case}: the root is still under its live name")
-        if phase != "deleted" or intent.get("receipt_settled") is not False:
-            fail(
-                f"{case}: expected an unfinished `deleted` intent, got phase {phase!r} "
-                f"receipt_settled {intent.get('receipt_settled')!r}"
-            )
-        replay = run(
-            [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
-            cwd=base,
-            env=env,
-        )
-        if replay.returncode:
-            fail(f"{case}: the receipt-step replay did not settle: {replay.stderr[-1500:]}")
-        document, _ = registry(env)
-        if json.dumps(document.get("intents") or []).find(leaf) >= 0:
-            fail(f"{case}: the settled intent is still in the live registry")
-        require_fired(case, mark, "Metadata")
-        return f"{case}: pending pre-completion (phase deleted, receipt unsettled), replayed to settled"
 
     if case == "prune_foreign":
         if not [
@@ -1239,6 +1225,77 @@ def self_check() -> int:
         return 1
     print("self-check: fixture layout budget holds, old layouts still refused")
     return 0
+
+
+def unsettled_intent(env: dict, outputs: str) -> dict:
+    """The single unfinished prune intent whose quarantine is under `outputs`."""
+    _, document = registry(env)
+    prefix = os.path.join(outputs, ".prune-")
+    intents = [
+        intent
+        for intent in document.get("intents") or []
+        if isinstance(intent, dict)
+        and isinstance(intent.get("quarantine"), str)
+        and intent["quarantine"].startswith(prefix)
+    ]
+    if len(intents) != 1:
+        fail(f"the registry holds {len(intents)} unfinished intents under {outputs}, expected one")
+    return intents[0]
+
+
+def settle_completion_fault(
+    oxide: str,
+    env: dict,
+    base: str,
+    case: str,
+    mark: int,
+    real,
+    outputs: str,
+    plan: str,
+    digest: str,
+) -> str:
+    """The pre-completion fault: the leaf and the registry terminal write commit,
+    the checkout receipt does not settle, and a *clean* replay settles it.
+
+    The product's terminal crash point is one-shot only in the sense that it
+    fires whenever its environment variable is set, so the replay runs without
+    it: replaying the same one-shot injection would just crash again and prove
+    nothing about the receipt step.
+    """
+    if real.returncode != 3:
+        fail(
+            f"{case}: the pre-completion fault did not exit 3 "
+            f"(exit {real.returncode}: {real.stderr[-1500:]})"
+        )
+    leaf_dir = [
+        entry for entry in sorted(os.listdir(outputs)) if entry.startswith(".prune-")
+    ] if os.path.isdir(outputs) else []
+    if leaf_dir:
+        fail(f"{case}: the pre-completion fault left a quarantined leaf: {leaf_dir}")
+    intent = unsettled_intent(env, outputs)
+    phase = intent.get("phase")
+    if phase != "deleted":
+        fail(f"{case}: expected the journal phase `deleted`, got {phase!r}")
+    if intent.get("receipt_settled") is not False:
+        fail(f"{case}: the intent claims a settled receipt: {intent.get('receipt_settled')!r}")
+    leaf = intent["quarantine"]
+    if os.path.exists(leaf):
+        fail(f"{case}: the recorded quarantine path still exists: {leaf}")
+
+    replay_env = dict(env)
+    replay_env.pop("OXIDE_TEST_PRUNE_CRASH", None)
+    replay = run(
+        [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
+        cwd=base,
+        env=replay_env,
+    )
+    if replay.returncode:
+        fail(f"{case}: the receipt-step replay did not settle: {replay.stderr[-1500:]}")
+    _, document = registry(env)
+    if json.dumps(document.get("intents") or []).find(leaf) >= 0:
+        fail(f"{case}: the settled intent is still in the live registry")
+    require_fired(case, mark, "Metadata")
+    return f"{case}: pending pre-completion (phase deleted, receipt unsettled), clean replay settled it"
 
 
 def plan() -> int:
