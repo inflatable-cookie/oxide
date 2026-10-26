@@ -681,6 +681,14 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py --diagnostic"
 
+# The pure fixture-layout check for both selectors above (oxide#155): every
+# prune image volume name and case slug must keep the product's per-command
+# temporary path inside its 91-byte Unix-socket bound, and the layouts the first
+# owner-activated diagnostic refused (92/102/103 bytes) must still be refused.
+# No scratch, child, image or attachment; it stages nothing.
+[tasks."rust:finder-metadata-race:test"]
+run = "python3 scripts/test-finder-metadata-race.py --self-check"
+
 # Project-named slots and pool status (oxide#104), under the qualified shared
 # proof supervisor (oxide#109): 300 s absolute, 512 MiB monitored scratch,
 # children kept in its session, writes and evidence under its scratch and

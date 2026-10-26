@@ -7,6 +7,7 @@ supervisor:
 
     effigy rust:finder-metadata-race
     effigy rust:finder-metadata-race:diagnostic
+    effigy rust:finder-metadata-race:test
 
 whose recipes are `python3 scripts/bounded-test.py --root-parent /private/tmp
 --limit 300 --scratch-budget-mib 512 -- python3
@@ -111,7 +112,12 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    mount's `st_dev`. The image is created with `-volname <this run's unique
    name>` (hdiutil's default volume name would mount at `/Volumes/untitled`),
    an explicit `-mountpoint` is passed when that path already exists, and any
-   other resulting mount point is unknown custody. Before detaching it revalidates that attachment (the mount
+   other resulting mount point is unknown custody. That name is the short
+   `o155-<slug>-<4 hex>`, because the product refuses a per-command temporary
+   directory longer than its 91-byte Unix-socket bound and a prune checkout on
+   the image cannot keep an inherited same-volume `TMPDIR`; the fixture asserts
+   its worst-case path before any effect and the pure `--self-check` keeps the
+   layouts the first diagnostic refused (92/102/103 bytes) as a counterfactual. Before detaching it revalidates that attachment (the mount
    is a real directory on that recorded device, the device entry is the same
    block device), and after detaching it accepts absence only from `ENOENT`:
    a failed metadata read is unknown, our device still mounted is unknown, and
@@ -153,6 +159,44 @@ SHUTDOWN_MARGIN_SECONDS = 25
 MUTED = ("OXIDE_", "XDG_", "CARGO_", "GIT_", "RUSTUP_", "RUSTC", "RUSTFLAGS")
 MANAGED_NAME = "oxide-managed"
 REGISTRY_RELATIVE = ("outputs", "registry.json")
+# The product refuses a per-command temporary directory whose path is longer
+# than its Unix-socket bound of 91 bytes.
+SOCKET_PATH_BUDGET = 91
+# Every prune checkout lives on the removable image, so the product cannot keep
+# an inherited same-volume `TMPDIR` and instead makes an owned per-command
+# directory inside the slot. Its longest path is
+# `<mount>/oxide-pool/slots/<checkout label>/<profile>-<slot>/scratch`, where the
+# label carries the per-slot 8-hex nonce and the leaf a small slot number. The
+# volume name must therefore stay short: `o155-<slug>-<4 hex>`.
+PRUNE_SLUGS = {
+    "prune_metadata": "meta",
+    "prune_foreign": "frgn",
+    "prune_exhaust": "exh",
+    "prune_missing_quarantine": "miss",
+    "prune_replaced_quarantine": "repl",
+}
+SLOT_FOLDER_HEX = "0" * 8
+SLOT_LEAF_WORST = "quick-999"
+# The exact layouts the first owner-activated diagnostic refused, with the byte
+# counts the product reported (evidence `155-diagnostic1-7572541-owner`). They
+# are the counterfactual the pure check must keep refusing.
+OBSERVED_OVERLONG = (
+    (
+        "prune_metadata",
+        "/Volumes/oxide155-prune_metadata-2d11c435/oxide-pool/slots/checkout-ed114324/quick-1/scratch",
+        92,
+    ),
+    (
+        "prune_missing_quarantine",
+        "/Volumes/oxide155-prune_missing_quarantine-6dcacb61/oxide-pool/slots/checkout-2635d603/quick-1/scratch",
+        102,
+    ),
+    (
+        "prune_replaced_quarantine",
+        "/Volumes/oxide155-prune_replaced_quarantine-38ec9486/oxide-pool/slots/checkout-11b186d0/quick-1/scratch",
+        103,
+    ),
+)
 TERMINAL_PHASES = {"deleted", "resolved"}
 UNFINISHED_PHASES = {"intent", "renamed", "deleting", "marker_last"}
 CRATE = {
@@ -298,6 +342,43 @@ def run(command: list, *, cwd: str, env: dict, timeout: float = 120.0):
     except subprocess.TimeoutExpired:
         # A child that outlived its bound has unknown closure: never continue.
         unknown(f"child {command[0]} timed out after {bound:.0f}s; closure is unknown")
+
+
+def prune_volume_name(case: str) -> str:
+    """This case's short, unique APFS volume name."""
+    slug = PRUNE_SLUGS.get(case)
+    if slug is None:
+        fail(f"{case}: no prune slug is declared")
+    return f"o155-{slug}-{secrets.token_hex(2)}"
+
+
+def prune_temp_budget(volume: str) -> tuple[str, int]:
+    """The longest per-command temporary path this fixture can produce."""
+    path = os.path.join(
+        f"/Volumes/{volume}",
+        "oxide-pool",
+        "slots",
+        "checkout-" + SLOT_FOLDER_HEX,
+        SLOT_LEAF_WORST,
+        "scratch",
+    )
+    return path, len(path.encode())
+
+
+def assert_prune_path_budget(case: str, volume: str) -> None:
+    """Refuse an overlong fixture layout before it has any effect.
+
+    A build on an over-budget layout would fail deep inside the product with
+    its own socket-bound refusal, which this proof must not confuse with a
+    product finding: the fixture layout is the proof's own premise.
+    """
+    path, size = prune_temp_budget(volume)
+    if size > SOCKET_PATH_BUDGET:
+        fail(
+            f"{case}: the fixture's per-command temporary path would be {size} bytes "
+            f"({path}), over the product's {SOCKET_PATH_BUDGET}-byte Unix-socket bound; "
+            "the fixture layout is refused before any effect"
+        )
 
 
 def lstat_state(path: str) -> tuple[str, object]:
@@ -609,16 +690,18 @@ class ImageCustody:
 
     def __init__(self, case: str):
         self.case = case
+        self.name = prune_volume_name(case)
+        self.expected_mount = f"/Volumes/{self.name}"
+        # Before any effect: the layout must fit the product's socket bound.
+        assert_prune_path_budget(case, self.name)
         directory = os.path.join(evidence_dir(), "images")
         os.makedirs(directory, mode=0o700, exist_ok=True)
         facts = os.stat(directory)
         if facts.st_uid != os.getuid() or facts.st_mode & 0o077:
             unknown(f"image custody directory {directory} is not owner-only")
         self.directory = directory
-        self.name = f"oxide155-{case}-{secrets.token_hex(4)}"
         self.backing = os.path.join(directory, f"{self.name}.sparseimage")
         self.record = os.path.join(directory, f"{self.name}-custody.json")
-        self.expected_mount = f"/Volumes/{self.name}"
         self.mount = None
         self.device_entry = None
         self.device = None
@@ -1052,6 +1135,51 @@ def settle_case(
     return f"{case}: pending after replay, phase {phase}"
 
 
+def self_check() -> int:
+    """Pure check of the fixture layout budget: no scratch, child or image."""
+    problems = []
+    # Counterfactual: the layouts the first diagnostic refused, with the byte
+    # counts the product reported. They must still exceed the bound, and every
+    # one of those cases must now have a short slug.
+    for case, path, size in OBSERVED_OVERLONG:
+        actual = len(path.encode())
+        if actual != size:
+            problems.append(f"{case}: counterfactual path is {actual} bytes, evidence says {size}")
+        if actual <= SOCKET_PATH_BUDGET:
+            problems.append(
+                f"{case}: counterfactual path {actual} does not exceed {SOCKET_PATH_BUDGET}"
+            )
+        if case not in PRUNE_SLUGS:
+            problems.append(f"{case}: no short prune slug is declared")
+    # Every prune case's current naming must fit with margin, for many draws of
+    # the random suffix.
+    for case in PRUNE_SLUGS:
+        worst = 0
+        for _ in range(64):
+            path, size = prune_temp_budget(prune_volume_name(case))
+            worst = max(worst, size)
+            if size > SOCKET_PATH_BUDGET:
+                problems.append(f"{case}: current layout is {size} bytes ({path})")
+                break
+        print(f"  {case:<26} worst temp path {worst} bytes of {SOCKET_PATH_BUDGET}")
+    if set(PRUNE_SLUGS) - set(CASES):
+        problems.append(f"slugs declared for unknown cases: {sorted(set(PRUNE_SLUGS) - set(CASES))}")
+    if {case for case in CASES if case.startswith("prune_")} != set(PRUNE_SLUGS):
+        problems.append("every prune case needs exactly one slug")
+    # An overlong volume name must be refused, not attached.
+    try:
+        assert_prune_path_budget("counterfactual", "oxide155-" + "x" * 40)
+        problems.append("an overlong volume name was accepted")
+    except Recoverable:
+        pass
+    if problems:
+        for problem in problems:
+            print(f"self-check: {problem}", file=sys.stderr)
+        return 1
+    print("self-check: fixture layout budget holds, old layouts still refused")
+    return 0
+
+
 def plan() -> int:
     print("cases:")
     for case in CASES:
@@ -1064,6 +1192,12 @@ def plan() -> int:
         "the guard's evidence directory, one attached at a time and ordinarily "
         "detached, staged debug oxide in owned scratch"
     )
+    print("prune fixture layout (product Unix-socket bound %d bytes):" % SOCKET_PATH_BUDGET)
+    for case in CASES:
+        if case in PRUNE_SLUGS:
+            name = f"o155-{PRUNE_SLUGS[case]}-xxxx"
+            path, size = prune_temp_budget(name)
+            print(f"  {case:<26} volume {name:<16} worst temp path {size} bytes")
     print("premises: 9 traced in this script's docstring")
     print("diagnostic: recoverable failures continue; unknown custody/device/writer/deadline aborts")
     return 0
@@ -1097,10 +1231,12 @@ def write_receipt(state: dict) -> str:
 def main(argv: list) -> int:
     if argv == ["--plan"]:
         return plan()
+    if argv == ["--self-check"]:
+        return self_check()
     diagnostic = False
     if argv:
         if argv != ["--diagnostic"]:
-            fail(f"unknown argument {argv[0]!r}; known: --plan, --diagnostic")
+            fail(f"unknown argument {argv[0]!r}; known: --plan, --self-check, --diagnostic")
         diagnostic = True
 
     state = {
