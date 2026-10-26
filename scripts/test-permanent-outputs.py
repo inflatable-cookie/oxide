@@ -2563,7 +2563,7 @@ EXEC_CASES = [
     ("13", "a checkout path containing a space converts and runs end to end"),
     ("15", "Ctrl-C reaches the tool group, the lease holds until the group closes, then releases"),
     ("19", "a committed version-1 whole-target receipt makes every failing reader refuse naming adopt (recorded status reads nothing; --measure reports outputs unknown naming adopt), an explicit adopt upgrades it through the shipped migration with the old outputs intact, and a noncommitted version-1 control keeps its bytes"),
-    ("20", "a converted checkout whose target directory was deleted recreates it: the next leased build exits 0 with the owned pair back in the same root, the root's old outputs intact and the receipt still committed to that root, and an exec then runs"),
+    ("20", "a converted checkout whose target directory was deleted recreates it: the next leased build exits 0 with its own member link back inside the same root and the root's old outputs intact, a derived exec then places the whole pair there, and the receipt still names that root"),
 ]
 
 
@@ -2873,9 +2873,9 @@ def exec_run(proof: Proof, repo: str) -> None:
     nothing there. Case 20 (oxide#165) deletes a converted checkout's whole
     `target` directory — what a task-local build-output cleanup does — and
     proves the next leased build recreates it exclusively and republishes the
-    owned pair into the SAME root, whose payload and committed placement
-    survive, and that an exec then runs. `--plan` prints the same table and
-    allocation with no effect.
+    member that build places into the SAME root, whose payload and committed
+    placement survive, and that a derived `exec` then places the whole owned
+    pair there. `--plan` prints the same table and allocation with no effect.
 
     The HIGH premise checklist is traced through the executable bodies:
 
@@ -3623,16 +3623,25 @@ def exec_run(proof: Proof, repo: str) -> None:
     )
     shutil.rmtree(deleted_target)
     expect(not os.path.lexists(deleted_target), "20: the fixture's target was not deleted")
-    code, _, stderr = proof.oxide(["build"], "20 a build recreates the deleted target directory", deleted)
+    code, _, stderr = proof.oxide(
+        ["build"], "20 a build recreates the deleted target directory", deleted
+    )
     expect(code == 0, f"20: a leased build failed on the deleted target directory: {stderr}")
     expect(
         "through profile member links" in stderr,
         f"20: the build did not bind the owned profile members: {stderr}",
     )
-    recreated_root = expect_profile_layout(pool, mount, deleted, "20 recreation")
+    # The deleted directory is back as a real directory, and this command's own
+    # `debug` member is republished into the SAME root the receipt records.
+    # `release` is not this build's member: the derived `exec` below places it.
     expect(
-        recreated_root == deleted_root,
-        f"20: the build bound {recreated_root}, not the recorded root {deleted_root}",
+        os.path.isdir(deleted_target) and not os.path.islink(deleted_target),
+        "20: the build did not recreate a real target directory",
+    )
+    expect(
+        member_link_target(deleted, "debug") == os.path.join(deleted_root, "debug"),
+        f"20: the recreated debug link does not select the recorded root: "
+        f"{os.readlink(os.path.join(deleted_target, 'debug'))}",
     )
     expect(
         os.path.isfile(os.path.join(deleted_root, "debug", "poutputs")),
@@ -3663,9 +3672,12 @@ def exec_run(proof: Proof, repo: str) -> None:
     )
     expect(code == 0, f"20: an exec failed after the recreation: {stderr}")
     expect("through profile member links" in stderr, stderr)
+    # The derived `exec` places every member its receipt records through the
+    # recreated directory, so the whole owned pair is live again in one root.
+    exec_root = expect_profile_layout(pool, mount, deleted, "20 recreation")
     expect(
-        member_link_target(deleted, "debug") == os.path.join(deleted_root, "debug"),
-        "20: the exec relinked debug",
+        exec_root == deleted_root,
+        f"20: the exec bound {exec_root}, not the recorded root {deleted_root}",
     )
     expect(
         read_bytes(os.path.join(deleted_root, "debug", "old-output")) == b"old",

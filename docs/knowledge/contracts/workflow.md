@@ -4449,10 +4449,11 @@ author and reviewer native remain unactivated.
   nothing more. A leased command with a committed profile receipt recreates
   that one real directory with a single exclusive `mkdir` under the checkout's
   own directory descriptor, at the mode a conversion creates (0755), and then
-  republishes the missing owned member links through the unchanged per-member
-  transition into the same root the receipt commits to: the root, its marker,
-  its nonce and its payload are untouched and the receipt only advances its
-  generation. The create runs under the checkout's binding mutex after the
+  republishes the missing owned member links this command places — its own
+  declared members, and for a derived `oxide exec` every member the receipt
+  records — through the unchanged per-member transition into the same root the
+  receipt commits to: the root, its marker, its nonce and its payload are
+  untouched and the receipt only advances its generation. The create runs under the checkout's binding mutex after the
   same writer-custody clearance as a relink, so no cooperative command can
   race it; an entry that appears meanwhile is never replaced or followed —
   only a real directory is accepted as that creator's result, and a file or
