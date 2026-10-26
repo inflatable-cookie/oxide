@@ -568,7 +568,8 @@ precedent) so image custody, registration and staging are reused rather than
 rebuilt:
 
 ```sh
-python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- \
+python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
+  --scratch-budget-mib 512 -- \
   python3 scripts/test-permanent-outputs.py exec-inference
 ```
 

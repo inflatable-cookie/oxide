@@ -2618,9 +2618,12 @@ EXEC_TOOLS = {
         'mkdir -p target/staging\n'
         'printf local > target/staging/out\n'
     ),
-    # A gated tool whose LEADER exits on the forwarded interrupt while a group
-    # member that ignores it keeps waiting for the release file, so the lease
-    # must stay held until that member closes (case 15).
+    # A gated tool whose LEADER exits 130 on the forwarded interrupt (the
+    # shell's own "terminated by SIGINT" convention, so the interruption is
+    # visible in the tool's status and in Oxide's propagated exit code) while a
+    # group member that ignores the signal keeps waiting for the release file,
+    # so the lease must stay held until that member closes (case 15). The
+    # nonzero status oracle is preserved, not weakened.
     "tool-gated.sh": (
         '#!/bin/sh\nset -eu\n'
         'gate="$1"\n'
@@ -2629,7 +2632,7 @@ EXEC_TOOLS = {
         "  trap '' INT TERM\n"
         '  while [ ! -f "$gate.release" ]; do sleep 0.05; done\n'
         ') &\n'
-        "trap 'exit 0' INT TERM\n"
+        "trap 'exit 130' INT TERM\n"
         'while [ ! -f "$gate.release" ]; do sleep 0.05; done\n'
         'wait\n'
     ),
@@ -2815,8 +2818,8 @@ def exec_run(proof: Proof, repo: str) -> None:
     expect(proof.env["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "the fixture environment is not frozen")
     expect("CARGO_ENCODED_RUSTFLAGS" not in proof.env, "an encoded rustflags value survives")
     # Premises 8 and 9: the fixture's own temp paths are templates under the
-    # supervisor's selected-volume scratch, and no fixture calls `mktemp`
-    # outside it.
+    # supervisor's monitored root (`--root-parent /private/tmp`), and no fixture
+    # calls `mktemp` outside it.
     expect(proof.env["TMPDIR"] == os.environ["OXIDE_TASK_SCRATCH_ROOT"], "the fixture TMPDIR is not the supervisor scratch")
     tools = write_tools(root)
     build_tool = os.path.join(tools, "tool-build.sh")
