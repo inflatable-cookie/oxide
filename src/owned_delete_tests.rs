@@ -470,3 +470,56 @@ fn a_caller_stop_after_one_unlink_keeps_the_rest_of_the_drain() {
     );
     assert!(tree.is_dir(), "the stopped directory is kept");
 }
+
+/// The accepted boundary: a same-user process that races into the directory at
+/// the last verified entry can lose at most that one entry **name**. A symlink
+/// swapped in at that moment has its name unlinked and its referent survives,
+/// because the removal is by name and never follows a link; the next step then
+/// stops on the content the racer left behind.
+#[test]
+fn a_link_swapped_in_at_the_last_boundary_keeps_its_referent_and_the_next_step_stops() {
+    let fx = Fixture::new("seam-last-swap");
+    let outside = fx.dir("outside");
+    let referent = outside.join("referent");
+    fs::write(&referent, b"keep").expect("referent");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"x").expect("metadata");
+    fs::write(tree.join("._z"), b"y").expect("metadata");
+    let dir = open(&tree);
+    let (tree_path, referent_path) = (tree.clone(), referent.clone());
+    let _swap = crate::test_fs::before_unlink_at(2, move || {
+        fs::remove_file(tree_path.join("._z")).expect("remove the last verified entry");
+        symlink(&referent_path, tree_path.join("._z")).expect("swap in a link");
+        fs::write(tree_path.join("stray"), b"racer content").expect("foreign entry");
+    });
+    // The drain loses only the swapped name; the retry then refuses the foreign
+    // content the racer left, so the deletion stays unfinished.
+    match rmdir_retrying_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+        &mut || Ok(()),
+    ) {
+        Rmdir::Refused { entry } => assert_eq!(entry, "stray"),
+        other => panic!("the next step must stop on the racer's content: {other:?}"),
+    }
+    assert_eq!(
+        fs::read(&referent).expect("referent kept"),
+        b"keep",
+        "the removal followed the swapped link"
+    );
+    assert!(
+        !tree.join("._z").exists(),
+        "the swapped entry name is the one the accepted bound may lose"
+    );
+    assert_eq!(
+        fs::read(tree.join("stray")).expect("foreign entry kept"),
+        b"racer content"
+    );
+    assert!(
+        tree.is_dir(),
+        "the directory stays while content is unverified"
+    );
+}

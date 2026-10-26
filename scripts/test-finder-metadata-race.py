@@ -148,7 +148,9 @@ import sys
 
 sys.dont_write_bytecode = True
 
+from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 import os
 import plistlib
@@ -1052,22 +1054,23 @@ def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
             entry for entry in os.listdir(outputs) if entry.startswith(".prune-")
         )
         kept_root = os.path.isdir(root_path)
-        result = settle_case(
-            oxide,
-            env,
-            base,
-            case,
-            mark,
-            low_mark,
-            real,
-            outputs,
-            root_path,
-            members,
-            quarantined,
-            kept_root,
-            plan,
-            digest,
+        settle = Settle(
+            oxide=oxide,
+            env=env,
+            base=base,
+            case=case,
+            mark=mark,
+            low_mark=low_mark,
+            real=real,
+            outputs=outputs,
+            root_path=root_path,
+            members=members,
+            quarantined=quarantined,
+            kept_root=kept_root,
+            plan=plan,
+            digest=digest,
         )
+        result = settle_target(case)(settle)
         custody.detach()
         return result
     except Unknown as error:
@@ -1085,22 +1088,49 @@ def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
         raise
 
 
-def settle_case(
-    oxide: str,
-    env: dict,
-    base: str,
-    case: str,
-    mark: int,
-    low_mark: int,
-    real,
-    outputs: str,
-    root_path: str,
-    members: list,
-    quarantined: list,
-    kept_root: bool,
-    plan: str,
-    digest: str,
-) -> str:
+@dataclass
+class Settle:
+    """One real prune run's inputs for the settle oracles.
+
+    A single bundle rather than a long positional list: a dispatch that drifts
+    from a handler's parameters would otherwise raise `TypeError` inside the
+    case instead of failing a pure check.
+    """
+
+    oxide: str
+    env: dict
+    base: str
+    case: str
+    mark: int
+    low_mark: int
+    real: object
+    outputs: str
+    root_path: str
+    members: list
+    quarantined: list
+    kept_root: bool
+    plan: str
+    digest: str
+
+
+def settle_target(case: str):
+    """The settle handler this case's real run routes to."""
+    return settle_completion_fault if case == "prune_completion_fault" else settle_case
+
+
+def settle_case(settle: Settle) -> str:
+    env = settle.env
+    base = settle.base
+    case = settle.case
+    mark = settle.mark
+    low_mark = settle.low_mark
+    real = settle.real
+    outputs = settle.outputs
+    root_path = settle.root_path
+    quarantined = settle.quarantined
+    kept_root = settle.kept_root
+    plan = settle.plan
+    digest = settle.digest
     if case == "prune_metadata":
         if real.returncode:
             fail(f"{case}: the prune did not complete: {real.stderr[-1500:]}")
@@ -1117,7 +1147,7 @@ def settle_case(
         return f"{case}: deleted, exit {real.returncode}"
 
     if case == "prune_completion_fault":
-        return settle_completion_fault(oxide, env, base, case, mark, real, outputs, plan, digest)
+        return settle_completion_fault(settle)
 
     if real.returncode != 3:
         fail(
@@ -1241,6 +1271,37 @@ def self_check() -> int:
         problems.append(f"slugs declared for unknown cases: {sorted(set(PRUNE_SLUGS) - set(CASES))}")
     if {case for case in CASES if case.startswith("prune_")} != set(PRUNE_SLUGS):
         problems.append("every prune case needs exactly one slug")
+    # The settle dispatch, executed for real: every case's handler must accept
+    # the exact bundle the dispatch site builds, and the completion-fault case
+    # must route to its own handler. An arity or routing drift fails here
+    # instead of raising TypeError inside a native case.
+    probe = Settle(
+        oxide="oxide",
+        env={},
+        base="/nonexistent",
+        case="prune_completion_fault",
+        mark=0,
+        low_mark=0,
+        real=None,
+        outputs="/nonexistent/out",
+        root_path="/nonexistent/root",
+        members=[],
+        quarantined=[],
+        kept_root=False,
+        plan="/nonexistent/plan.json",
+        digest="0" * 64,
+    )
+    for case in CASES:
+        handler = settle_target(case)
+        try:
+            inspect.signature(handler).bind(probe)
+        except TypeError as error:
+            problems.append(f"{case}: the settle handler rejects the dispatch bundle ({error})")
+    if settle_target("prune_completion_fault") is not settle_completion_fault:
+        problems.append("the completion-fault case does not route to its own handler")
+    if settle_target("prune_metadata") is not settle_case:
+        problems.append("an ordinary prune case does not route to the shared settle handler")
+    print(f"  settle dispatch: {len(CASES)} cases bind one {Settle.__name__} bundle")
     # An overlong volume name must be refused, not attached.
     try:
         assert_prune_path_budget("counterfactual", "oxide155-" + "x" * 40)
@@ -1271,18 +1332,16 @@ def unsettled_intent(env: dict, outputs: str) -> dict:
     return intents[0]
 
 
-def settle_completion_fault(
-    oxide: str,
-    env: dict,
-    base: str,
-    case: str,
-    mark: int,
-    low_mark: int,
-    real,
-    outputs: str,
-    plan: str,
-    digest: str,
-) -> str:
+def settle_completion_fault(settle: Settle) -> str:
+    oxide = settle.oxide
+    env = settle.env
+    base = settle.base
+    case = settle.case
+    mark = settle.mark
+    real = settle.real
+    outputs = settle.outputs
+    plan = settle.plan
+    digest = settle.digest
     """The pre-completion fault: the leaf and the registry terminal write commit,
     the checkout receipt does not settle, and a *clean* replay settles it.
 

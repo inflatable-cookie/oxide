@@ -223,8 +223,14 @@ pub(crate) fn race_firing(label: &std::ffi::OsStr) -> Option<&'static str> {
     })
 }
 
+struct ArmedUnlink {
+    /// Unlinks still to skip before the action fires.
+    remaining: u32,
+    action: Box<dyn FnOnce()>,
+}
+
 thread_local! {
-    static BEFORE_UNLINK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static BEFORE_UNLINK: RefCell<Option<ArmedUnlink>> = const { RefCell::new(None) };
 }
 
 /// Run `action` once, inside the deletion seam, immediately before its first
@@ -236,12 +242,22 @@ pub(crate) struct BeforeUnlinkGuard {
 }
 
 pub(crate) fn before_unlink(action: impl FnOnce() + 'static) -> BeforeUnlinkGuard {
+    before_unlink_at(1, action)
+}
+
+/// The same, armed for the `index`-th per-entry unlink of the drain (1-based),
+/// so a test can swap the *last* verified entry for something else and observe
+/// the accepted boundary.
+pub(crate) fn before_unlink_at(index: u32, action: impl FnOnce() + 'static) -> BeforeUnlinkGuard {
     BEFORE_UNLINK.with(|cell| {
         assert!(
             cell.borrow().is_none(),
             "overlapping before-unlink injections"
         );
-        *cell.borrow_mut() = Some(Box::new(action));
+        *cell.borrow_mut() = Some(ArmedUnlink {
+            remaining: index.max(1),
+            action: Box::new(action),
+        });
     });
     BeforeUnlinkGuard {
         _thread_bound: PhantomData,
@@ -259,7 +275,16 @@ impl Drop for BeforeUnlinkGuard {
 /// Fire the armed action, if any. Called by the seam before each per-entry
 /// unlink; a no-op everywhere else.
 pub(crate) fn run_before_unlink() {
-    let action = BEFORE_UNLINK.with(|cell| cell.borrow_mut().take());
+    let action = BEFORE_UNLINK.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let armed = cell.as_mut()?;
+        armed.remaining = armed.remaining.saturating_sub(1);
+        if armed.remaining == 0 {
+            cell.take().map(|armed| armed.action)
+        } else {
+            None
+        }
+    });
     if let Some(action) = action {
         action();
     }
