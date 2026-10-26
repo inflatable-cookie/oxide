@@ -20,7 +20,7 @@
 //! - `link`: a `.DS_Store`-named symbolic link to `.` (the directory itself);
 //! - `directory`: a `.DS_Store`-named directory;
 //! - `repeat`: tolerated Finder metadata on every attempt, so the fixed bound
-//!   is exercised. `repeat` without the suffix fires on every round.
+//!   is exercised. `repeat` and any `<kind>:repeat` fire on every round.
 //!
 //! Unit tests reach the same seam through `crate::test_fs`, which arms one
 //! firing in-process instead of through the environment.
@@ -75,12 +75,20 @@ fn planned(label: &OsStr) -> Option<(Kind, Mode)> {
     for spec in specs.split(',') {
         let mut parts = spec.split(':');
         let pattern = parts.next()?;
-        let kind = parse_kind(parts.next()?)?;
-        let mode = match parts.next() {
-            Some("repeat") => Mode::Every,
-            Some(_) => return None,
-            None => Mode::Once,
+        let kind_text = parts.next()?.trim();
+        let kind = parse_kind(kind_text)?;
+        // `repeat` is the metadata kind that recreates on every attempt, so
+        // the fixed bound is exercised; the suffix does the same for any kind.
+        let mut mode = if kind_text == "repeat" {
+            Mode::Every
+        } else {
+            Mode::Once
         };
+        match parts.next() {
+            None => {}
+            Some("repeat") => mode = Mode::Every,
+            Some(_) => return None,
+        }
         if parts.next().is_some() {
             return None;
         }

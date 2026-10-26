@@ -826,7 +826,22 @@ fn remove_tree_owned_at(
             "refusing to delete a foreign directory",
         ));
     }
-    let child = open_directory_at(parent, name).map_err(io_error)?;
+    // An owned directory a build or test left read-only (Effigy fixtures make
+    // `.effigy/state/objects/<hash>` read-only under a slot's child scratch)
+    // cannot have its entries removed. Restore the owner's own access first;
+    // it is already verified as an owned real directory inside the slot. A
+    // directory the owner made unreadable cannot even be opened, so that
+    // restore happens through the held parent and the identity is revalidated
+    // on the re-open.
+    let child = match open_directory_at(parent, name) {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            crate::owned_delete::restore_owner_access(parent, name, stat.st_mode & 0o7777)
+                .map_err(io_error)?;
+            open_directory_at(parent, name).map_err(io_error)?
+        }
+        Err(error) => return Err(io_error(error)),
+    };
     // Revalidate identity at the effect boundary: the descriptor must still be
     // the entry this recursion inspected, not a replacement under the same
     // name.
@@ -836,10 +851,6 @@ fn remove_tree_owned_at(
             "the verified directory was replaced before it was opened",
         ));
     }
-    // An owned directory a build or test left read-only (Effigy fixtures make
-    // `.effigy/state/objects/<hash>` read-only under a slot's child scratch)
-    // cannot have its entries removed. Restore the owner's own access first;
-    // it is already verified as an owned real directory inside the slot.
     let mode = stat.st_mode & 0o7777;
     if mode & 0o700 != 0o700 {
         // SAFETY: `child` is a live descriptor for the verified directory.
@@ -855,15 +866,12 @@ fn remove_tree_owned_at(
         remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path)?;
     }
     match crate::owned_delete::rmdir_retrying_finder_metadata(parent, name, child.as_fd(), label) {
-        // A directory that vanished under us is already removed.
-        crate::owned_delete::Rmdir::Removed => Ok(()),
-        crate::owned_delete::Rmdir::Failed { error }
-            if error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            Ok(())
-        }
+        // A directory that is gone is removed, and this slot's recorded
+        // deletion can be cleared: nothing of it remains.
+        crate::owned_delete::Rmdir::Removed | crate::owned_delete::Rmdir::Vanished => Ok(()),
         crate::owned_delete::Rmdir::Failed { error } => Err(io_error(error)),
-        crate::owned_delete::Rmdir::Refused { entry } => Err(LeaseError::UnexpectedEntry {
+        crate::owned_delete::Rmdir::Replaced { entry }
+        | crate::owned_delete::Rmdir::Refused { entry } => Err(LeaseError::UnexpectedEntry {
             place: "slot directory",
             entry,
         }),

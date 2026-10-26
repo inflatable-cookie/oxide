@@ -665,9 +665,21 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-front-door-accountin
 admission = "heavy"
 run = "python3 scripts/test-oxide-finder-metadata.py"
 
+# Bounded Finder-metadata deletion race (oxide#155), under the qualified shared
+# supervisor. `--root-parent /private/tmp` is the owner-accepted
+# internal-placement exception (decision bd357a4c v4): every fixture pool is a
+# genuine internal directory-budget pool, which the product correctly refuses
+# on an external volume. 300 s and 512 MiB monitored scratch; one owned 128 MiB
+# image per prune case, attached -owners on and ordinarily detached. Held: no
+# counted native or uncounted diagnostic has run, so the fit is UNMEASURED and
+# each run needs its own owner activation.
 [tasks."rust:finder-metadata-race"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py"
+
+[tasks."rust:finder-metadata-race:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py --diagnostic"
 
 # Project-named slots and pool status (oxide#104), under the qualified shared
 # proof supervisor (oxide#109): 300 s absolute, 512 MiB monitored scratch,

@@ -3287,7 +3287,9 @@ impl RootSession {
 
     /// Remove the quarantine leaf itself. Finder metadata recreated in it after
     /// the delete pass is drained under the shared fixed bound (oxide#155);
-    /// anything else and an exhausted bound keep the intent pending.
+    /// anything else and an exhausted bound keep the intent pending. A leaf
+    /// that is simply missing is NOT positive deletion proof for a journaled
+    /// intent, so it stays pending here.
     fn remove_quarantine(&self, quarantine: &str) -> Result<(), String> {
         let name =
             std::ffi::CString::new(quarantine.as_bytes()).map_err(|error| error.to_string())?;
@@ -3295,18 +3297,28 @@ impl RootSession {
             if attempt > 1 {
                 std::thread::sleep(FINDER_RACE_PAUSE);
             }
-            match rmdir_draining_finder_metadata(
+            let outcome = rmdir_draining_finder_metadata(
                 self.outputs.as_fd(),
                 &name,
                 self.root.as_fd(),
                 std::ffi::OsStr::new(quarantine),
-            ) {
+            );
+            match &outcome {
                 Rmdir::Removed => return sync_fd(&self.outputs),
                 Rmdir::Drained { .. } => continue,
-                other => match race_pending("the quarantine leaf", &other) {
-                    Some(reason) => return Err(reason),
-                    None => return sync_fd(&self.outputs),
-                },
+                Rmdir::Vanished => {
+                    return Err(
+                        "the quarantine leaf is missing without positive deletion proof; the intent stays pending"
+                            .to_owned(),
+                    )
+                }
+                Rmdir::Replaced { .. }
+                | Rmdir::Refused { .. }
+                | Rmdir::RefusedMany { .. }
+                | Rmdir::Exhausted { .. }
+                | Rmdir::Failed { .. } => {
+                    return Err(race_pending("the quarantine leaf", &outcome))
+                }
             }
         }
         Err(format!(
@@ -3434,7 +3446,7 @@ fn remove_quarantined_directory(
         }
         let outcome =
             rmdir_draining_finder_metadata(parent, name_c, child, std::ffi::OsStr::new(name));
-        match outcome {
+        match &outcome {
             Rmdir::Removed => return Ok(()),
             Rmdir::Drained { entries } => {
                 // Recovered entries are deleted work: the existing entry
@@ -3443,11 +3455,20 @@ fn remove_quarantined_directory(
                 deleter.entries += entries;
                 deleter.check()?;
             }
-            other => match race_pending("a quarantined directory", &other) {
-                Some(reason) => return Err(Stop::Pending(reason)),
-                // A directory that vanished under us is already removed.
-                None => return Ok(()),
-            },
+            // A nested directory that vanished under us is finished work
+            // inside this bounded pass; unlike the quarantine leaf, its
+            // absence never proves the intent's deletion.
+            Rmdir::Vanished => return Ok(()),
+            Rmdir::Replaced { .. }
+            | Rmdir::Refused { .. }
+            | Rmdir::RefusedMany { .. }
+            | Rmdir::Exhausted { .. }
+            | Rmdir::Failed { .. } => {
+                return Err(Stop::Pending(race_pending(
+                    "a quarantined directory",
+                    &outcome,
+                )))
+            }
         }
     }
     Err(Stop::Pending(format!(
@@ -3456,21 +3477,29 @@ fn remove_quarantined_directory(
 }
 
 /// The pending reason for a Finder-metadata race outcome that did not remove
-/// the directory, or `None` when it completed or may be retried. Every terminal
-/// race outcome keeps the intent pending: an unfinished deletion never becomes
-/// a success, and no intent phase is rewritten or cleared to recover it.
-fn race_pending(what: &str, outcome: &Rmdir) -> Option<String> {
+/// the directory. Every terminal race outcome keeps the intent pending: an
+/// unfinished deletion never becomes a success, an intent phase is never
+/// rewritten or cleared to recover it, and a name that is no longer the
+/// verified directory is never treated as that directory's removal.
+fn race_pending(what: &str, outcome: &Rmdir) -> String {
     match outcome {
-        Rmdir::Removed | Rmdir::Drained { .. } => None,
         // The name is already escaped by the seam.
-        Rmdir::Refused { entry } => Some(format!(
+        Rmdir::Refused { entry } => format!(
             "{what} holds an entry that is not tolerated Finder metadata ({entry}); deletion stops and the intent stays pending"
-        )),
-        Rmdir::RefusedMany { .. } | Rmdir::Exhausted { .. } => Some(format!(
+        ),
+        Rmdir::Replaced { entry } => format!(
+            "{what} is no longer the verified directory ({entry}); nothing was removed and the intent stays pending"
+        ),
+        Rmdir::RefusedMany { .. } | Rmdir::Exhausted { .. } => format!(
             "{what} gained more content than {FINDER_RACE_ATTEMPTS} Finder-metadata attempts may recover; it is kept"
-        )),
-        Rmdir::Failed { error } if error.kind() == std::io::ErrorKind::NotFound => None,
-        Rmdir::Failed { error } => Some(format!("cannot remove {what} ({error}); it is kept")),
+        ),
+        Rmdir::Failed { error } => format!("cannot remove {what} ({error}); it is kept"),
+        // Completed or retryable outcomes are handled by every caller before
+        // this function; reaching them here is still a pending intent, never
+        // a success.
+        Rmdir::Removed | Rmdir::Drained { .. } | Rmdir::Vanished => format!(
+            "{what} was not positively removed by this step; the intent stays pending"
+        ),
     }
 }
 
@@ -5443,28 +5472,30 @@ mod tests {
 
     /// oxide#155: a Finder-metadata race that did not remove the quarantine is
     /// a pending intent for every caller, never a completed deletion. The
-    /// journal phases are not rewritten to recover it.
+    /// journal phases are not rewritten to recover it, and a name that is
+    /// missing is not positive deletion proof.
     #[test]
     fn every_terminal_finder_race_outcome_keeps_the_intent_pending() {
         let pending = |outcome: Rmdir| race_pending("the quarantine leaf", &outcome);
-        assert!(pending(Rmdir::Removed).is_none());
-        assert!(pending(Rmdir::Drained { entries: 2 }).is_none());
         let refused = pending(Rmdir::Refused {
             entry: "stray\\x07".to_owned(),
-        })
-        .expect("a foreign entry is pending");
+        });
         assert!(refused.contains("stray\\x07"), "{refused}");
-        assert!(pending(Rmdir::RefusedMany { entries: 65 }).is_some());
-        assert!(pending(Rmdir::Exhausted { entries: 6 }).is_some());
-        assert!(pending(Rmdir::Failed {
+        assert!(pending(Rmdir::Replaced {
+            entry: "leaf".to_owned()
+        })
+        .contains("no longer the verified directory"));
+        assert!(!pending(Rmdir::RefusedMany { entries: 65 }).is_empty());
+        assert!(!pending(Rmdir::Exhausted { entries: 6 }).is_empty());
+        assert!(!pending(Rmdir::Failed {
             error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         })
-        .is_some());
-        // A directory that is already gone is not a race at all.
-        assert!(pending(Rmdir::Failed {
-            error: std::io::Error::from(std::io::ErrorKind::NotFound),
-        })
-        .is_none());
+        .is_empty());
+        // Absence is uncertainty, never completion: a missing quarantine leaf
+        // and a removal this seam did not positively make both stay pending.
+        assert!(!pending(Rmdir::Vanished).is_empty());
+        assert!(!pending(Rmdir::Removed).is_empty());
+        assert!(!pending(Rmdir::Drained { entries: 1 }).is_empty());
     }
     use std::sync::atomic::{AtomicU64, Ordering};
 

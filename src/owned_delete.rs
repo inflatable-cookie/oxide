@@ -14,11 +14,16 @@
 //!   directory, the child's name in it, and the verified child itself. Nothing
 //!   is reopened or rebound by a path, so a name replaced during the race is
 //!   never mistaken for the verified directory;
+//! - the name is revalidated against the held descriptor at every effect
+//!   boundary — before the removal, again before the drain, and again before
+//!   each entry's unlink. A replacement is reported, never removed and never
+//!   drained;
 //! - only entries that are already tolerated Finder metadata by the oxide#105
 //!   rule ([`is_finder_metadata`] and a no-follow regular file, on the
 //!   directory's device, owned by the caller — never a link, a directory,
 //!   another device, another owner or a near-miss name). Each is verified by
-//!   `fstatat` against the held descriptor and then unlinked by name;
+//!   `fstatat`, its `(device, inode)` identity is kept, and it is verified
+//!   again immediately before its own unlink;
 //! - only within one fixed finite bound: [`FINDER_RACE_ATTEMPTS`] removal
 //!   attempts with [`FINDER_RACE_PAUSE`] between them, and at most
 //!   [`FINDER_RACE_MAX_NAMES`] names in one re-list.
@@ -45,6 +50,16 @@ use std::time::Duration;
 #[cfg(debug_assertions)]
 #[path = "owned_delete_hook.rs"]
 mod hook;
+
+/// Release builds carry no injection at all: the seam behaves exactly as
+/// production, with no hook module, no environment read and no extra code.
+#[cfg(not(debug_assertions))]
+mod hook {
+    use std::ffi::OsStr;
+    use std::os::fd::BorrowedFd;
+
+    pub(super) fn race(_dir: BorrowedFd<'_>, _label: &OsStr) {}
+}
 
 #[cfg(test)]
 #[path = "owned_delete_tests.rs"]
@@ -121,16 +136,23 @@ pub enum Rmdir {
     /// only by [`rmdir_retrying_finder_metadata`]; a caller that owns its own
     /// bound reports exhaustion from its own attempt count.
     Exhausted { entries: u64 },
+    /// The name does not exist any more. What that means is the caller's
+    /// decision: a directory already gone inside a bounded pass is finished
+    /// work, while a journaled quarantine leaf that is missing without
+    /// positive deletion proof is never completion.
+    Vanished,
+    /// The name no longer names the held, verified directory (another inode,
+    /// another device or another kind of entry). Nothing was removed and
+    /// nothing was drained.
+    Replaced { entry: String },
     /// `ENOTEMPTY` and the directory holds a newly observed entry that is not
-    /// tolerated Finder metadata, or whose identity could not be verified.
-    /// Its escaped name is reported and nothing beyond verified metadata was
-    /// deleted.
+    /// tolerated Finder metadata, or whose identity could not be verified or
+    /// changed before its own unlink. Its escaped name is reported.
     Refused { entry: String },
     /// `ENOTEMPTY` and one re-list saw more than [`FINDER_RACE_MAX_NAMES`]
     /// names: more new content than this race explains. Nothing was deleted.
     RefusedMany { entries: u64 },
-    /// The removal failed for any other reason. `NotFound` means the directory
-    /// is already gone.
+    /// The removal failed for any other reason.
     Failed { error: io::Error },
 }
 
@@ -148,6 +170,18 @@ pub fn rmdir_draining_finder_metadata(
     label: &OsStr,
 ) -> Rmdir {
     hook::race(dir, label);
+    // The name must still name exactly the held, verified directory before any
+    // effect is attempted, so a replacement is never removed.
+    match held_name(parent, name, dir) {
+        Ok(HeldName::Held) => {}
+        Ok(HeldName::Vanished) => return Rmdir::Vanished,
+        Ok(HeldName::Different) => {
+            return Rmdir::Replaced {
+                entry: entry_label(label),
+            }
+        }
+        Err(error) => return Rmdir::Failed { error },
+    }
     // SAFETY: `parent` and the C string are live for the call; the flag asks
     // for the directory `name` itself and never for its contents.
     let status = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
@@ -155,8 +189,23 @@ pub fn rmdir_draining_finder_metadata(
         return Rmdir::Removed;
     }
     let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        return Rmdir::Vanished;
+    }
     if error.raw_os_error() != Some(libc::ENOTEMPTY) {
         return Rmdir::Failed { error };
+    }
+    // Revalidate at the drain boundary: the entries about to be unlinked must
+    // belong to the held directory, not to a similar name.
+    match held_name(parent, name, dir) {
+        Ok(HeldName::Held) => {}
+        Ok(HeldName::Vanished) => return Rmdir::Vanished,
+        Ok(HeldName::Different) => {
+            return Rmdir::Replaced {
+                entry: entry_label(label),
+            }
+        }
+        Err(error) => return Rmdir::Failed { error },
     }
     let device = match directory_device(dir) {
         Ok(device) => device,
@@ -209,11 +258,23 @@ pub fn only_finder_metadata(dir: BorrowedFd<'_>) -> io::Result<bool> {
         }
     };
     for name in names {
-        if !tolerated_metadata(dir, &name, device) {
-            return Ok(false);
+        match metadata_identity(dir, &name, device) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(true)
+}
+
+/// One verified tolerated-metadata entry: its name and the exact
+/// `(device, inode)` identity that must still hold immediately before its
+/// unlink.
+struct VerifiedEntry {
+    name: CString,
+    device: u64,
+    inode: u64,
 }
 
 fn drain_finder_metadata(dir: BorrowedFd<'_>, device: u64) -> Result<u64, Rmdir> {
@@ -225,28 +286,53 @@ fn drain_finder_metadata(dir: BorrowedFd<'_>, device: u64) -> Result<u64, Rmdir>
     // Deterministic order: the first refusal names the same entry whatever the
     // filesystem's directory order is.
     names.sort();
-    // Verify every newly observed name before the first unlink. A name that is
-    // not tolerated metadata, or whose identity cannot be read, refuses the
-    // whole round with nothing deleted.
-    for name in &names {
-        if !tolerated_metadata(dir, name, device) {
-            return Err(Rmdir::Refused {
-                entry: entry_label(OsStr::from_bytes(name.to_bytes())),
-            });
+    // Verify every newly observed name before the first unlink, remembering
+    // the exact identity each one had. A name that is not tolerated metadata
+    // refuses the whole round with nothing deleted.
+    let mut verified = Vec::with_capacity(names.len());
+    for name in names {
+        match metadata_identity(dir, &name, device) {
+            Ok(Some(identity)) => verified.push(VerifiedEntry {
+                name,
+                device: identity.0,
+                inode: identity.1,
+            }),
+            Ok(None) => {
+                return Err(Rmdir::Refused {
+                    entry: entry_label(OsStr::from_bytes(name.to_bytes())),
+                })
+            }
+            // The writer's own entry vanished before we looked: not our
+            // deletion and not this round's work.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Rmdir::Failed { error }),
         }
     }
     let mut entries = 0;
-    for name in &names {
+    for entry in &verified {
+        // Revalidate the exact entry immediately before its unlink: a
+        // metadata-named replacement (a link, a directory, another device or
+        // another inode) is refused and left alone.
+        match metadata_identity(dir, &entry.name, device) {
+            Ok(Some((device, inode))) if device == entry.device && inode == entry.inode => {}
+            Ok(Some(_)) | Ok(None) => {
+                return Err(Rmdir::Refused {
+                    entry: entry_label(OsStr::from_bytes(entry.name.to_bytes())),
+                })
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(Rmdir::Failed { error }),
+        }
         // SAFETY: `dir` and the C string are live for the call. This unlinks
         // the name itself; a symlink is never followed by `unlinkat`.
-        let status = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        let status = unsafe { libc::unlinkat(dir.as_raw_fd(), entry.name.as_ptr(), 0) };
         if status == 0 {
             entries += 1;
             continue;
         }
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::NotFound {
-            // The writer's own entry vanished again: still nothing foreign.
+            // It vanished again between the revalidation and the unlink.
             continue;
         }
         return Err(Rmdir::Failed { error });
@@ -254,23 +340,54 @@ fn drain_finder_metadata(dir: BorrowedFd<'_>, device: u64) -> Result<u64, Rmdir>
     Ok(entries)
 }
 
-/// Whether one entry of `dir` is tolerated Finder metadata: a no-follow
-/// regular file, on this directory's device, owned by the caller, with a
-/// tolerated name. An unreadable entry is not tolerated.
-fn tolerated_metadata(dir: BorrowedFd<'_>, name: &CStr, device: u64) -> bool {
-    let Ok(stat) = stat_at(dir, name) else {
-        return false;
-    };
-    if !is_finder_metadata(OsStr::from_bytes(name.to_bytes())) {
-        return false;
+/// The identity of one entry of `dir` when it is tolerated Finder metadata: a
+/// no-follow regular file, on this directory's device, owned by the caller,
+/// with a tolerated name. `Ok(None)` means the name exists but is not
+/// tolerated; `NotFound` means it is gone.
+fn metadata_identity(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    device: u64,
+) -> io::Result<Option<(u64, u64)>> {
+    let stat = stat_at(dir, name)?;
+    if !is_finder_metadata(OsStr::from_bytes(name.to_bytes()))
+        || stat_mode(&stat) != libc::S_IFREG
+        || stat_device(&stat) != device
+        || stat_uid(&stat) != caller_uid()
+    {
+        return Ok(None);
     }
-    if stat_mode(&stat) != libc::S_IFREG {
-        return false;
+    Ok(Some((stat_device(&stat), stat_ino(&stat))))
+}
+
+/// What one name in a held parent currently denotes, relative to the held
+/// child descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeldName {
+    /// The name is that directory: same kind, device and inode.
+    Held,
+    /// The name is taken, but by something else.
+    Different,
+    /// The name is free.
+    Vanished,
+}
+
+fn held_name(parent: BorrowedFd<'_>, name: &CStr, dir: BorrowedFd<'_>) -> io::Result<HeldName> {
+    let (device, inode) = descriptor_identity(dir)?;
+    match stat_at(parent, name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(HeldName::Vanished),
+        Err(error) => Err(error),
+        Ok(stat) => Ok(
+            if stat_mode(&stat) == libc::S_IFDIR
+                && stat_device(&stat) == device
+                && stat_ino(&stat) == inode
+            {
+                HeldName::Held
+            } else {
+                HeldName::Different
+            },
+        ),
     }
-    if stat_device(&stat) != device {
-        return false;
-    }
-    stat_uid(&stat) == caller_uid()
 }
 
 enum Names {
@@ -372,6 +489,10 @@ fn stat_device(stat: &libc::stat) -> u64 {
     u64::try_from(stat.st_dev).unwrap_or(u64::MAX)
 }
 
+fn stat_ino(stat: &libc::stat) -> u64 {
+    u64::try_from(stat.st_ino).unwrap_or(u64::MAX)
+}
+
 fn stat_uid(stat: &libc::stat) -> u32 {
     // `uid_t` is `u32` on every supported target.
     stat.st_uid
@@ -395,17 +516,22 @@ pub fn open_directory_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<Owne
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// The `(device, inode)` identity of a held descriptor.
-pub fn descriptor_identity(fd: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` is live for the call.
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+/// Restore the owner's own access to `name` in `parent` so a directory the
+/// owner left unreadable can still be deleted, as before this seam. The caller
+/// has already verified the entry as an owned directory; the removed bits are
+/// exactly `0o700` on that entry, and the identity is revalidated after the
+/// re-open, so a replacement inside this window is refused rather than
+/// deleted.
+pub fn restore_owner_access(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    mode: libc::mode_t,
+) -> io::Result<()> {
+    // SAFETY: `parent` and the C string are live for the call.
+    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode | 0o700, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((
-        stat_device(&stat),
-        u64::try_from(stat.st_ino).unwrap_or(u64::MAX),
-    ))
+    Ok(())
 }
 
 /// Every name a held directory lists, in directory order, as a caller's own
@@ -422,4 +548,17 @@ pub fn names_of(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
             "directory entry count {count} exceeded its bound"
         ))),
     }
+}
+
+/// The `(device, inode)` identity of a held descriptor.
+pub fn descriptor_identity(fd: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is live for the call.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        stat_device(&stat),
+        u64::try_from(stat.st_ino).unwrap_or(u64::MAX),
+    ))
 }

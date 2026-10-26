@@ -3296,3 +3296,31 @@ fn a_foreign_entry_racing_an_evicting_reconciliation_keeps_the_record() {
     assert_eq!(after.slots[0].state, SlotOccupancy::Abandoned);
     assert!(slot_path.is_dir(), "the slot with foreign content is kept");
 }
+
+/// An owned directory the owner left unreadable (no read or search bit) is
+/// still deleted whole, as it was before the descriptor-relative seam: the
+/// owner's access is restored through the held parent and the identity is
+/// revalidated on the re-open.
+#[test]
+fn an_owned_directory_left_unreadable_is_still_deleted_whole() {
+    let fixture = Fixture::new("unreadable-tree");
+    let slot = fixture.dir("slot");
+    let inner = slot.join("locked");
+    fs::create_dir(&inner).expect("locked directory");
+    fs::write(inner.join("data"), b"x").expect("data");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).expect("unreadable directory");
+    remove_tree_owned(fixture.path(), &slot).expect("owned unreadable tree is removed");
+    assert!(!slot.exists(), "the whole slot is gone");
+}
+
+/// The same for a directory that keeps only write and search bits.
+#[test]
+fn an_owned_write_only_directory_is_still_deleted_whole() {
+    let fixture = Fixture::new("write-only-tree");
+    let slot = fixture.dir("slot");
+    let inner = slot.join("locked");
+    fs::create_dir(&inner).expect("locked directory");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o300)).expect("write-only directory");
+    remove_tree_owned(fixture.path(), &slot).expect("owned write-only tree is removed");
+    assert!(!slot.exists(), "the whole slot is gone");
+}

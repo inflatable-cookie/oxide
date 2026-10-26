@@ -297,3 +297,56 @@ fn the_metadata_rule_rejects_near_misses_and_other_kinds() {
     fs::create_dir(named_dir.join(".DS_Store")).expect("named dir");
     assert!(!only_finder_metadata(open(&named_dir).as_fd()).expect("lists"));
 }
+
+/// The held descriptor is the authority: when the name is rebound to a
+/// different directory, the seam refuses instead of draining the held tree or
+/// removing the replacement.
+#[test]
+fn a_rebound_name_is_neither_removed_nor_drained() {
+    let fx = Fixture::new("seam-rebound");
+    let parent = open(fx.path());
+    let held_path = fx.dir("slot");
+    let dir = open(&held_path);
+    fs::rename(&held_path, fx.path().join("slot-moved")).expect("rename");
+    let replacement = fx.dir("slot");
+    fs::write(replacement.join(".DS_Store"), b"x").expect("replacement metadata");
+
+    match rmdir_draining_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+    ) {
+        Rmdir::Replaced { entry } => assert_eq!(entry, "slot"),
+        other => panic!("a rebound name must be refused: {other:?}"),
+    }
+    assert!(
+        replacement.join(".DS_Store").is_file(),
+        "the replacement and its content are untouched"
+    );
+    assert!(held_path.is_dir() || fx.path().join("slot-moved").is_dir());
+}
+
+/// A metadata entry that vanishes between the listing and its own unlink is not
+/// our deletion and does not fail the round.
+#[test]
+fn an_entry_that_vanishes_before_its_unlink_does_not_fail_the_round() {
+    let fx = Fixture::new("seam-vanish");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"x").expect("metadata");
+    let dir = open(&tree);
+    // The round sees one tolerated entry; it is gone before the retry removes
+    // the now-empty directory, which is exactly the vanish path.
+    fs::remove_file(tree.join(".DS_Store")).expect("vanish");
+    match rmdir_retrying_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+    ) {
+        Rmdir::Removed => {}
+        other => panic!("an emptied directory is removed: {other:?}"),
+    }
+    assert!(!tree.exists());
+}
