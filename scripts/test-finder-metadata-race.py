@@ -13,8 +13,9 @@ whose recipes are `python3 scripts/bounded-test.py --root-parent /private/tmp
 scripts/test-finder-metadata-race.py [--diagnostic]`. Admission, the
 wall-clock limit, the host reserve, the owned scratch bound, child sessions and
 cleanup belong to the supervisor; this script starts no session, signals no
-group, and keeps no clock, reserve reading or scratch of its own. It writes only
-inside `OXIDE_TASK_SCRATCH_ROOT` and `OXIDE_PROOF_EVIDENCE`.
+group, and keeps no clock, reserve reading or scratch of its own. Fixture
+scratch is written only inside `OXIDE_TASK_SCRATCH_ROOT`; image backings and
+their custody records only inside `OXIDE_PROOF_EVIDENCE`.
 
 `--root-parent /private/tmp` is the owner-accepted internal-placement exception
 (decision `bd357a4c` v4): every fixture pool here is a genuine *internal*
@@ -23,7 +24,7 @@ volume. It stays inside the same monitored 512 MiB owned root.
 
 Stages this HEAD's debug `oxide` offline with the pinned 1.97.1 toolchain
 through plain Cargo, then drives the debug-only race injection
-(`OXIDE_TEST_FINDER_RACE`, absent from release builds and armed only under the
+(`OXIDE_TEST_FINDER_RACE`, absent from release builds, armed only under the
 supervisor's exported layout) at exactly the boundary the product documents —
 after the caller's listing, before the removal:
 
@@ -31,7 +32,7 @@ after the caller's listing, before the removal:
   first project's idle whole slot with no race armed. The slot *leaf* is gone
   and no deletion is pending. Fixture premise.
 - `lease_metadata`: the same eviction raced with `.DS_Store`/`._*`. The
-  eviction completes and the evidence directory records the firing.
+  eviction completes and the evidence records the firing.
 - `lease_foreign`: raced with an ordinary file. The admission refuses, the slot
   leaf and the new file stay, and `status` reports the recorded deletion as
   pending reconciliation.
@@ -40,19 +41,38 @@ after the caller's listing, before the removal:
 - `lease_exhaust`: raced with tolerated metadata on *every* attempt. The fixed
   bound is used up and the deletion stays pending; never a success.
 - `prune_metadata`: one owned 128 MiB APFS image, registered as the permanent
-  outputs drive, with one checkout built on it and then removed. `oxide outputs
-  prune` (exact preview plan) completes the deletion with metadata recreated in
-  the quarantine; no quarantined leaf is left.
-- `prune_foreign`: the same, raced with an ordinary file. The run exits 3 with
-  its intent pending, the quarantined leaf is kept and the file is untouched.
-- `prune_exhaust`: the same, raced with recreation on every attempt. The run
-  exits 3 and the leaf is kept.
+  outputs drive, with one real private Git checkout on it (ignored `target`)
+  whose first build is asserted to have adopted an owned root and member link.
+  The checkout is then removed and `oxide outputs prune` runs with exactly its
+  preview plan: the deletion completes, no quarantined leaf is left, the live
+  registry keeps no intent for that root and no row selects it.
+- `prune_foreign`: the same, raced with an ordinary file. The run exits 3, the
+  `.prune-<intent>` leaf is kept with the file untouched, and the registry's
+  intent for that quarantine is in a non-terminal phase with
+  `receipt_settled: false` and no `deleted`/`resolved` terminal state.
+- `prune_exhaust`: the same, raced with recreation on every attempt: exit 3 and
+  the leaf kept, with the same unfinished journal assertions.
+- `prune_missing_quarantine`: a pending intent whose quarantine leaf is then
+  removed by an "unknown writer" and replayed: the run exits 3, never reports
+  completion, and the intent stays unfinished.
+- `prune_replaced_quarantine`: a pending intent whose quarantine leaf is
+  replaced by a different directory (same name, new inode): the replay exits 3,
+  the replacement and its content are untouched, and the intent stays
+  unfinished.
 
 Limits, stated rather than implied: `oxide clean` is deliberately unchanged (it
 removes exactly its enumerated plan, so new content is left and counted) and has
 no case here. No run of this script has passed: its fit is UNMEASURED, and its
 uncounted diagnostic and both counted author and independent reviewer natives
 each need their own owner activation.
+
+Diagnostic safety (`--diagnostic`): only a *recoverable oracle* failure is
+recorded and followed by the next independent case. An unknown writer, device,
+custody, detach or deadline outcome aborts the whole collection immediately,
+retains every image backing and its custody record, and writes a bounded
+`qualified: false` receipt with reached, completed, failed, skipped and
+unexecuted cases plus the abort reason. `subprocess` timeouts are unknown
+closure, never a recoverable failure.
 
 Nine-premise checklist (docs/knowledge/contracts/workflow.md
 #proof-authoring-premise-checklist), traced to executable source:
@@ -70,14 +90,18 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_DEADLINE_NS`,
    `OXIDE_PROOF_EVIDENCE` (required for the hook guard) and, per case,
    `OXIDE_TEST_FINDER_RACE`.
-4. automatic adoption: the prune cases let the first build adopt the fresh
-   checkout and then assert the receipt state before deleting the checkout; the
-   lease cases adopt nothing.
+4. automatic adoption: `workspace()` makes a real private Git repository whose
+   `.gitignore` covers `target`, so the first conversion is eligible; each
+   prune case then asserts the adopted owned root, the checkout's member link
+   into it and the committed registry row before any race or prune.
 5. Cargo external argv: not applicable, no external subcommand is invoked.
-6. owned images: every prune case attaches its own sparse image with
-   `hdiutil attach -owners on`, parses the raw plist, requires exactly one
-   mounted entity carrying this run's expected mount point, and detaches it
-   ordinarily in a `finally` path.
+6. owned images: `ImageCustody` writes a custody record inside the guard's
+   evidence directory before its first effect, creates the backing there,
+   attaches it with `hdiutil attach -owners on`, parses the raw plist and
+   requires exactly one mounted entity whose mount point is this run's expected
+   `/Volumes/<name>` and whose device entry is a block device matching the
+   mount's `st_dev`; detach is ordinary only, and the backing is removed only
+   after the mount and device are positively gone.
 7. compiler flags: `RUSTFLAGS` is frozen for staging and every fixture child and
    `CARGO_ENCODED_RUSTFLAGS` is removed everywhere.
 8. temporary storage: scratch and `TMPDIR`/`TMP`/`TEMP` come from the
@@ -93,16 +117,18 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import glob
+import hashlib
 import json
 import os
 import plistlib
 import secrets
 import shutil
+import stat
 import subprocess
 import time
 
 MIB = 1024 * 1024
-GIB = 1024 * MIB
 BUILDER = "1.97.1"
 POOL_BUDGET = 1 * MIB
 IMAGE_MIB = 128
@@ -110,6 +136,8 @@ RESERVE = "16MiB"
 IMAGE_CAP = "64MiB"
 SHUTDOWN_MARGIN_SECONDS = 25
 MUTED = ("OXIDE_", "XDG_", "CARGO_", "GIT_", "RUSTUP_", "RUSTC", "RUSTFLAGS")
+TERMINAL_PHASES = {"deleted", "resolved"}
+UNFINISHED_PHASES = {"intent", "renamed", "deleting", "marker_last"}
 CRATE = {
     "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
     "src/lib.rs": "pub fn value() -> u32 {\n    7\n}\n",
@@ -127,6 +155,9 @@ CRATE = {
         "}\n"
     ),
 }
+# The first conversion publishes owned member links, so the checkout has to be
+# a real Git repository whose ignore rules cover them.
+GITIGNORE = "/target\n"
 CASES = (
     "lease_control",
     "lease_metadata",
@@ -136,6 +167,8 @@ CASES = (
     "prune_metadata",
     "prune_foreign",
     "prune_exhaust",
+    "prune_missing_quarantine",
+    "prune_replaced_quarantine",
 )
 # The race each case arms: `repeat` recreates on every attempt, so the fixed
 # bound is exercised; `None` is the unraced premise control.
@@ -148,34 +181,52 @@ RACES = {
     "prune_metadata": "*:metadata",
     "prune_foreign": "*:foreign",
     "prune_exhaust": "*:repeat",
+    "prune_missing_quarantine": "*:foreign",
+    "prune_replaced_quarantine": "*:foreign",
 }
+COMPLETING = {"lease_control", "lease_metadata", "prune_metadata"}
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INVOKING_RUSTUP_HOME = os.environ.get("RUSTUP_HOME") or os.path.join(
     os.environ.get("HOME", ""), ".rustup"
 )
 
 
+class Recoverable(Exception):
+    """An oracle failed. Only an independent case may follow."""
+
+
+class Unknown(Exception):
+    """Custody, device, writer or deadline uncertainty: abort, retain, report."""
+
+
 def fail(message: str) -> None:
-    raise RuntimeError(message)
+    raise Recoverable(message)
+
+
+def unknown(message: str) -> None:
+    raise Unknown(message)
 
 
 def scratch_root() -> str:
     root = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
     if not root:
-        fail("OXIDE_TASK_SCRATCH_ROOT is missing; run this through effigy")
+        unknown("OXIDE_TASK_SCRATCH_ROOT is missing; run this through effigy")
     root = os.path.abspath(root)
     if not os.path.isdir(root):
-        fail(f"owned scratch {root} is not a directory")
+        unknown(f"owned scratch {root} is not a directory")
     return root
 
 
 def evidence_dir() -> str:
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
     if not evidence:
-        fail("OXIDE_PROOF_EVIDENCE is missing; run this through effigy")
+        unknown("OXIDE_PROOF_EVIDENCE is missing; run this through effigy")
     evidence = os.path.abspath(evidence)
     if not os.path.isdir(evidence):
-        fail(f"evidence {evidence} is not a directory")
+        unknown(f"evidence {evidence} is not a directory")
+    facts = os.stat(evidence)
+    if facts.st_uid != os.getuid() or facts.st_mode & 0o022:
+        unknown(f"evidence {evidence} is not an owned, non-writable directory")
     return evidence
 
 
@@ -184,16 +235,16 @@ def work_left() -> float:
 
     `OXIDE_PROOF_DEADLINE_NS` is in the supervisor's own `CLOCK_UPTIME_RAW`
     domain, not wall time, so the remaining window is measured with the same
-    clock the guard used.
+    clock the guard used. A spent window is unknown closure, not a failure.
     """
     deadline = int(os.environ.get("OXIDE_PROOF_DEADLINE_NS", "0") or 0)
     if deadline <= 0:
-        fail("OXIDE_PROOF_DEADLINE_NS is missing; run this through effigy")
+        unknown("OXIDE_PROOF_DEADLINE_NS is missing; run this through effigy")
     left = (
         deadline - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
     ) / 1e9 - SHUTDOWN_MARGIN_SECONDS
     if left <= 5:
-        fail("the supervisor's work window is spent")
+        unknown("the supervisor's work window is spent")
     return left
 
 
@@ -217,13 +268,37 @@ def scrubbed(env_source: dict) -> dict:
 
 
 def run(command: list, *, cwd: str, env: dict, timeout: float = 120.0):
-    return subprocess.run(
-        command,
+    bound = min(timeout, work_left())
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=bound,
+        )
+    except subprocess.TimeoutExpired:
+        # A child that outlived its bound has unknown closure: never continue.
+        unknown(f"child {command[0]} timed out after {bound:.0f}s; closure is unknown")
+
+
+def git(env: dict, cwd: str, *args: str):
+    return run(
+        [
+            "git",
+            "-c",
+            "user.email=proof@oxide.invalid",
+            "-c",
+            "user.name=oxide proof",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+            *args,
+        ],
         cwd=cwd,
         env=env,
-        capture_output=True,
-        text=True,
-        timeout=min(timeout, work_left()),
     )
 
 
@@ -306,21 +381,24 @@ def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
     return env, base
 
 
-def workspace(base: str, name: str) -> str:
+def workspace(env: dict, base: str, name: str) -> str:
+    """A tiny private Git checkout whose ignore rule covers `target`."""
     path = os.path.join(base, "workspaces", name)
     os.makedirs(os.path.join(path, "src"), exist_ok=True)
     for relative, contents in CRATE.items():
         with open(os.path.join(path, relative), "w", encoding="utf-8") as handle:
             handle.write(contents)
+    with open(os.path.join(path, ".gitignore"), "w", encoding="utf-8") as handle:
+        handle.write(GITIGNORE)
+    for argv in (("init", "-q"), ("add", "-A"), ("commit", "-q", "-m", "fixture")):
+        result = git(env, path, *argv)
+        if result.returncode:
+            fail(f"cannot prepare the private Git fixture: {result.stderr[-800:]}")
     return path
 
 
 def slot_leaves(pool: str) -> dict:
-    """Every slot *leaf* (`<profile>-<n>`), never its project-label folder.
-
-    A slot lives at `payload/slots/<project folder>/<profile>-<n>`; the folder
-    is a label, and only the leaf inside it is one slot.
-    """
+    """Every slot *leaf* (`<profile>-<n>`), never its project-label folder."""
     root = os.path.join(pool, "payload", "slots")
     leaves = {}
     if not os.path.isdir(root):
@@ -359,30 +437,67 @@ def evidence_fired(mark: int) -> str:
         return handle.read()
 
 
+def require_fired(case: str, mark: int, kind: str) -> None:
+    if kind not in evidence_fired(mark):
+        fail(f"{case}: the armed {kind} race never fired; the case proves nothing")
+
+
+def registry(env: dict) -> tuple[str, dict]:
+    """The internal live registry this fixture's private store wrote."""
+    matches = glob.glob(
+        os.path.join(env["HOME"], "**", "outputs", "registry.json"), recursive=True
+    )
+    if len(matches) != 1:
+        fail(f"the fixture left {len(matches)} registries, expected one: {matches}")
+    path = matches[0]
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except Exception as error:  # noqa: BLE001 - one bounded failure line
+        fail(f"the fixture registry is unreadable ({error!r})")
+    if document.get("complete") is not True:
+        fail("the fixture registry is not complete")
+    return path, document
+
+
+def intent_for(env: dict, leaf: str) -> tuple[dict, dict]:
+    _, document = registry(env)
+    intents = [
+        intent
+        for intent in document.get("intents") or []
+        if intent.get("quarantine") == leaf
+    ]
+    if len(intents) != 1:
+        fail(f"the registry holds {len(intents)} intents for {leaf}, expected one")
+    return document, intents[0]
+
+
 def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
     env, base = case_env(root, case, race)
     mark = evidence_mark()
-    first = run([oxide, "check"], cwd=workspace(base, "a"), env=env)
+    first = run([oxide, "check"], cwd=workspace(env, base, "a"), env=env)
     if first.returncode:
         fail(f"{case}: the first admission failed: {first.stderr[-1500:]}")
     before = slot_leaves(env["OXIDE_POOL"])
     if len(before) != 1:
-        fail(f"{case}: the first admission left {len(before)} slot leaves, expected one: {sorted(before)}")
+        fail(
+            f"{case}: the first admission left {len(before)} slot leaves, expected one: {sorted(before)}"
+        )
     victim = next(iter(before))
-    second = run([oxide, "check"], cwd=workspace(base, "b"), env=env)
+    second = run([oxide, "check"], cwd=workspace(env, base, "b"), env=env)
     after = slot_leaves(env["OXIDE_POOL"])
     status = run([oxide, "status"], cwd=base, env=env)
     pending = "recorded deletion pending reconciliation" in status.stdout
 
-    if case in ("lease_control", "lease_metadata"):
+    if case == "lease_control" or case == "lease_metadata":
         if second.returncode:
             fail(f"{case}: the eviction did not complete: {second.stderr[-1500:]}")
         if victim in after:
             fail(f"{case}: the evicted slot leaf {victim} is still present")
         if pending:
             fail(f"{case}: a deletion stayed pending after a complete eviction")
-        if race is not None and "Metadata" not in evidence_fired(mark):
-            fail(f"{case}: the armed race never fired; the case proves nothing")
+        if race is not None:
+            require_fired(case, mark, "Metadata")
         return f"{case}: completed, victim {victim}, slots {len(before)}->{len(after)}"
 
     if second.returncode == 0:
@@ -402,69 +517,208 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
         if name == ".DS_Store" and os.path.islink(os.path.join(dirpath, name))
     ]:
         fail(f"{case}: the metadata-named link is gone")
-    expected = "Metadata" if case == "lease_exhaust" else ("Foreign" if case == "lease_foreign" else "Link")
-    if expected not in evidence_fired(mark):
-        fail(f"{case}: the armed race never fired; the case proves nothing")
+    require_fired(
+        case,
+        mark,
+        {"lease_foreign": "Foreign", "lease_link": "Link", "lease_exhaust": "Metadata"}[case],
+    )
     return f"{case}: pending, victim {victim}, exit {second.returncode}"
 
 
-def attach(root: str, case: str) -> tuple:
-    """One owned 128 MiB sparse image, attached with ownership enabled."""
-    backing = os.path.join(root, "images", f"{case}-{secrets.token_hex(4)}.sparseimage")
-    os.makedirs(os.path.dirname(backing), exist_ok=True)
-    create = run(
-        ["hdiutil", "create", "-size", f"{IMAGE_MIB}m", "-fs", "APFS", "-type", "SPARSE", "-quiet", backing],
-        cwd=os.path.dirname(backing),
-        env=scrubbed(os.environ),
-        timeout=60,
-    )
-    if create.returncode:
-        fail(f"{case}: cannot create the owned image: {create.stderr[-800:]}")
-    attached = run(
-        ["hdiutil", "attach", "-owners", "on", "-nobrowse", "-plist", backing],
-        cwd=os.path.dirname(backing),
-        env=scrubbed(os.environ),
-        timeout=60,
-    )
-    if attached.returncode:
-        fail(f"{case}: cannot attach the owned image: {attached.stderr[-800:]}")
-    try:
-        document = plistlib.loads(attached.stdout.encode())
-    except Exception as error:  # noqa: BLE001 - one bounded failure line
-        fail(f"{case}: the attach plist is unreadable ({error!r}); the backing is kept at {backing}")
-    mounted = [
-        entity
-        for entity in document.get("system-entities", [])
-        if entity.get("mount-point") and entity.get("dev-entry")
-    ]
-    if len(mounted) != 1:
-        fail(
-            f"{case}: the attach returned {len(mounted)} mounted entities, expected one; "
-            f"the backing is kept at {backing}"
+class ImageCustody:
+    """One owned sparse image whose backing and custody record live in the
+    guard's evidence directory, written before the first effect."""
+
+    def __init__(self, case: str):
+        self.case = case
+        directory = os.path.join(evidence_dir(), "images")
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        facts = os.stat(directory)
+        if facts.st_uid != os.getuid() or facts.st_mode & 0o077:
+            unknown(f"image custody directory {directory} is not owner-only")
+        self.directory = directory
+        self.name = f"oxide155-{case}-{secrets.token_hex(4)}"
+        self.backing = os.path.join(directory, f"{self.name}.sparseimage")
+        self.record = os.path.join(directory, f"{self.name}-custody.json")
+        self.expected_mount = f"/Volumes/{self.name}"
+        self.mount = None
+        self.device_entry = None
+        self.device = None
+        self.state = {"case": case, "backing": self.backing, "phases": []}
+        self.write("declared", expected_mount=self.expected_mount)
+
+    def write(self, phase: str, **facts) -> None:
+        self.state["phases"].append({"phase": phase, **facts})
+        with open(self.record, "w", encoding="utf-8") as handle:
+            json.dump(self.state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
+    def attach(self) -> str:
+        created = run(
+            [
+                "hdiutil",
+                "create",
+                "-size",
+                f"{IMAGE_MIB}m",
+                "-fs",
+                "APFS",
+                "-type",
+                "SPARSE",
+                "-quiet",
+                self.backing,
+            ],
+            cwd=self.directory,
+            env=scrubbed(os.environ),
+            timeout=60,
         )
-    mount = mounted[0]["mount-point"]
-    if not os.path.isdir(mount):
-        fail(f"{case}: the attached mount point {mount} is not a directory")
-    return backing, mount
+        if created.returncode:
+            unknown(f"{self.case}: cannot create the owned image: {created.stderr[-800:]}")
+        facts = os.lstat(self.backing)
+        if not stat.S_ISREG(facts.st_mode) or facts.st_uid != os.getuid():
+            unknown(f"{self.case}: the created backing is not an owned regular file")
+        self.write("created", size=facts.st_size, inode=facts.st_ino, device=facts.st_dev)
+        attached = run(
+            [
+                "hdiutil",
+                "attach",
+                "-owners",
+                "on",
+                "-nobrowse",
+                "-plist",
+                self.backing,
+            ],
+            cwd=self.directory,
+            env=scrubbed(os.environ),
+            timeout=60,
+        )
+        if attached.returncode:
+            unknown(f"{self.case}: cannot attach the owned image: {attached.stderr[-800:]}")
+        self.write(
+            "attach-raw",
+            plist_sha256=hashlib.sha256(attached.stdout.encode()).hexdigest(),
+        )
+        try:
+            document = plistlib.loads(attached.stdout.encode())
+        except Exception as error:  # noqa: BLE001 - custody is unknown here
+            unknown(f"{self.case}: the attach plist is unreadable ({error!r}); retained")
+        mounted = [
+            entity
+            for entity in document.get("system-entities", [])
+            if entity.get("mount-point") and entity.get("dev-entry")
+        ]
+        if len(mounted) != 1:
+            unknown(
+                f"{self.case}: the attach returned {len(mounted)} mounted entities, expected one; retained"
+            )
+        mount = mounted[0]["mount-point"]
+        entry = mounted[0]["dev-entry"]
+        if mount != self.expected_mount:
+            unknown(
+                f"{self.case}: the attach mounted {mount}, not the expected {self.expected_mount}; retained"
+            )
+        try:
+            mount_facts = os.stat(mount)
+            entry_facts = os.stat(entry)
+        except OSError as error:
+            unknown(f"{self.case}: cannot bind the mount to its device ({error}); retained")
+        if not stat.S_ISBLK(entry_facts.st_mode):
+            unknown(f"{self.case}: the mount's device entry {entry} is not a block device; retained")
+        if entry_facts.st_rdev != mount_facts.st_dev:
+            unknown(
+                f"{self.case}: the mount {mount} is device {mount_facts.st_dev}, "
+                f"not its recorded device entry {entry} ({entry_facts.st_rdev}); retained"
+            )
+        self.mount, self.device_entry, self.device = mount, entry, entry_facts.st_rdev
+        self.write(
+            "attached",
+            mount=mount,
+            device_entry=entry,
+            device=self.device,
+            mount_mode=oct(mount_facts.st_mode),
+        )
+        return mount
+
+    def detach(self) -> None:
+        """Ordinary detach only, then positive device/mount absence, then the
+        backing. Never forced, never retried."""
+        if self.mount is None:
+            self.write("detach-unnecessary")
+            return
+        attached = os.path.isdir(self.mount) and os.path.exists(self.device_entry)
+        result = run(
+            ["hdiutil", "detach", self.mount],
+            cwd="/",
+            env=scrubbed(os.environ),
+            timeout=60,
+        )
+        if result.returncode:
+            self.write("detach-failed", stderr=result.stderr[-400:], retained=True)
+            unknown(f"{self.case}: the ordinary detach of {self.mount} failed; retained")
+        if os.path.exists(self.mount) or os.path.exists(self.device_entry):
+            self.write("detach-unproven", retained=True)
+            unknown(
+                f"{self.case}: the mount or its device entry is still present after detach; retained"
+            )
+        self.write("detached", previously_attached=attached)
+        os.unlink(self.backing)
+        self.write("backing-removed")
+
+    def retain(self, reason: str) -> None:
+        self.write("retained", reason=reason[-400:])
 
 
-def detach(case: str, mount: str) -> None:
-    """Ordinary detach only; never forced, never retried."""
-    result = run(
-        ["hdiutil", "detach", mount],
-        cwd="/",
-        env=scrubbed(os.environ),
-        timeout=60,
-    )
-    if result.returncode:
-        fail(f"{case}: the ordinary detach of {mount} failed: {result.stderr[-800:]}")
+def adopt_and_assert(oxide: str, env: dict, checkout: str, mount: str) -> tuple:
+    """Build the fresh Git checkout and assert the conversion really happened."""
+    built = run([oxide, "check"], cwd=checkout, env=env)
+    if built.returncode:
+        fail(f"the fixture build on the drive failed: {built.stderr[-1500:]}")
+    outputs = os.path.join(mount, "oxide-outputs")
+    if not os.path.isdir(outputs):
+        fail("the first build published no owned outputs tree on the drive")
+    roots = [
+        entry
+        for entry in sorted(os.listdir(outputs))
+        if os.path.isdir(os.path.join(outputs, entry)) and not entry.startswith(".prune-")
+    ]
+    if len(roots) != 1:
+        fail(f"the build left {len(roots)} owned roots on the drive, expected one: {roots}")
+    root_path = os.path.join(outputs, roots[0])
+    link = os.path.join(checkout, "target")
+    if not os.path.islink(link):
+        fail(f"the converted checkout has no owned member link at {link}")
+    target = os.readlink(link)
+    if not target.startswith(root_path):
+        fail(f"the member link {link} points at {target}, not the owned root {root_path}")
+    _, document = registry(env)
+    rows = json.dumps(document.get("rows") or [])
+    if root_path not in rows:
+        fail(f"the committed registry names no row for the adopted root {root_path}")
+    return outputs, root_path
+
+
+def preview_plan(oxide: str, env: dict, base: str) -> tuple[str, str]:
+    preview = run([oxide, "outputs", "prune", "--dry-run"], cwd=base, env=env)
+    if preview.returncode:
+        fail(f"the prune dry run refused: {preview.stderr[-1500:]}")
+    digest = ""
+    for line in preview.stderr.splitlines():
+        for word in line.replace(":", " ").split():
+            if len(word) == 64 and all(c in "0123456789abcdef" for c in word):
+                digest = word
+    if not digest:
+        fail(f"the dry run printed no plan digest: {preview.stderr[-800:]}")
+    plan = os.path.join(base, "plan.json")
+    with open(plan, "w", encoding="utf-8", newline="") as handle:
+        handle.write(preview.stdout)
+    return plan, digest
 
 
 def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
     env, base = case_env(root, case, race)
     mark = evidence_mark()
-    backing, mount = attach(base, case)
+    custody = ImageCustody(case)
     try:
+        mount = custody.attach()
         register = run(
             [
                 oxide,
@@ -484,105 +738,177 @@ def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
         if register.returncode:
             fail(f"{case}: cannot register the owned drive: {register.stderr[-1500:]}")
         checkout = os.path.join(mount, "checkout")
-        shutil.copytree(
-            workspace(base, "a"),
-            checkout,
-        )
-        built = run([oxide, "check"], cwd=checkout, env=env)
-        if built.returncode:
-            fail(f"{case}: the fixture build on the drive failed: {built.stderr[-1500:]}")
-        outputs = os.path.join(mount, "oxide-outputs")
-        roots = [
-            entry
-            for entry in sorted(os.listdir(outputs))
-            if os.path.isdir(os.path.join(outputs, entry)) and not entry.startswith(".prune-")
-        ]
-        if len(roots) != 1:
-            fail(f"{case}: the build left {len(roots)} owned roots on the drive, expected one: {roots}")
-        root_path = os.path.join(outputs, roots[0])
+        shutil.copytree(workspace(env, base, "a"), checkout)
+        outputs, root_path = adopt_and_assert(oxide, env, checkout, mount)
         # The checkout must be positively gone before the root is eligible.
         shutil.rmtree(checkout)
         if os.path.exists(checkout):
             fail(f"{case}: the fixture checkout was not removed")
-        preview = run([oxide, "outputs", "prune", "--dry-run"], cwd=base, env=env)
-        if preview.returncode:
-            fail(f"{case}: the dry run refused: {preview.stderr[-1500:]}")
-        digest = ""
-        for line in preview.stderr.splitlines():
-            for word in line.replace(":", " ").split():
-                if len(word) == 64 and all(c in "0123456789abcdef" for c in word):
-                    digest = word
-        if not digest:
-            fail(f"{case}: the dry run printed no plan digest: {preview.stderr[-800:]}")
-        plan = os.path.join(base, "plan.json")
-        with open(plan, "w", encoding="utf-8", newline="") as handle:
-            handle.write(preview.stdout)
+        plan, digest = preview_plan(oxide, env, base)
         real = run(
             [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
             cwd=base,
             env=env,
         )
-        quarantined = [
-            entry
-            for entry in sorted(os.listdir(outputs))
-            if entry.startswith(".prune-")
-        ] if os.path.isdir(outputs) else []
+        quarantined = sorted(
+            entry for entry in os.listdir(outputs) if entry.startswith(".prune-")
+        )
         kept_root = os.path.isdir(root_path)
+        result = settle_case(
+            oxide,
+            env,
+            base,
+            case,
+            mark,
+            real,
+            outputs,
+            root_path,
+            quarantined,
+            kept_root,
+            plan,
+            digest,
+        )
+        custody.detach()
+        return result
+    except Unknown as error:
+        custody.retain(f"unknown outcome: {error}")
+        raise
+    except Recoverable as error:
+        # A recoverable oracle failure still means this fixture's image has to
+        # leave cleanly, or its absence is unknown: treat a failed detach as
+        # unknown.
+        try:
+            custody.detach()
+        except Unknown as detach_error:
+            custody.retain(f"after a recoverable failure: {detach_error}")
+            raise detach_error from error
+        raise
 
-        if case == "prune_metadata":
-            if real.returncode:
-                fail(f"{case}: the prune did not complete: {real.stderr[-1500:]}")
-            if quarantined:
-                fail(f"{case}: a quarantined leaf was left behind: {quarantined}")
-            if kept_root:
-                fail(f"{case}: the pruned root is still present")
-            if "Metadata" not in evidence_fired(mark):
-                fail(f"{case}: the armed race never fired; the case proves nothing")
-            return f"{case}: deleted, exit {real.returncode}"
 
-        if real.returncode != 3:
-            fail(f"{case}: an unsettled deletion did not exit 3 (exit {real.returncode}: {real.stderr[-1500:]})")
-        if not quarantined:
-            fail(f"{case}: the pending intent left no quarantined leaf")
+def settle_case(
+    oxide: str,
+    env: dict,
+    base: str,
+    case: str,
+    mark: int,
+    real,
+    outputs: str,
+    root_path: str,
+    quarantined: list,
+    kept_root: bool,
+    plan: str,
+    digest: str,
+) -> str:
+    if case == "prune_metadata":
+        if real.returncode:
+            fail(f"{case}: the prune did not complete: {real.stderr[-1500:]}")
+        if quarantined:
+            fail(f"{case}: a quarantined leaf was left behind: {quarantined}")
         if kept_root:
-            fail(f"{case}: the root is still under its live name while a quarantine exists")
-        leaf = os.path.join(outputs, quarantined[0])
-        if case == "prune_foreign" and not [
+            fail(f"{case}: the pruned root is still present")
+        _, document = registry(env)
+        if json.dumps(document.get("intents") or []).find(root_path) >= 0:
+            fail(f"{case}: the live registry still holds an intent for {root_path}")
+        if root_path in json.dumps(document.get("rows") or []):
+            fail(f"{case}: the live registry still selects the pruned root {root_path}")
+        require_fired(case, mark, "Metadata")
+        return f"{case}: deleted, exit {real.returncode}"
+
+    if real.returncode != 3:
+        fail(
+            f"{case}: an unsettled deletion did not exit 3 "
+            f"(exit {real.returncode}: {real.stderr[-1500:]})"
+        )
+    if not quarantined:
+        fail(f"{case}: the pending intent left no quarantined leaf")
+    if kept_root:
+        fail(f"{case}: the root is still under its live name while a quarantine exists")
+    leaf = os.path.join(outputs, quarantined[0])
+    document, intent = intent_for(env, leaf)
+    phase = intent.get("phase")
+    if phase not in UNFINISHED_PHASES:
+        fail(f"{case}: the journal phase is {phase!r}, not an unfinished one")
+    if intent.get("receipt_settled") is not False:
+        fail(f"{case}: the intent claims a settled receipt: {intent.get('receipt_settled')}")
+    if phase in TERMINAL_PHASES:
+        fail(f"{case}: the journal reached a terminal phase {phase!r}")
+
+    if case == "prune_foreign":
+        if not [
             path for path in tree_files(leaf) if os.path.basename(path) == "foreign.txt"
         ]:
             fail(f"{case}: the foreign entry was deleted instead of kept")
-        expected = "Foreign" if case == "prune_foreign" else "Metadata"
-        if expected not in evidence_fired(mark):
-            fail(f"{case}: the armed race never fired; the case proves nothing")
-        return f"{case}: pending, quarantine {quarantined[0]}, exit {real.returncode}"
-    finally:
-        detach(case, mount)
+        require_fired(case, mark, "Foreign")
+        return f"{case}: pending, quarantine {quarantined[0]}, phase {phase}"
+
+    if case == "prune_exhaust":
+        require_fired(case, mark, "Metadata")
+        return f"{case}: pending, quarantine {quarantined[0]}, phase {phase}"
+
+    # The two replay cases start from this pending intent and mutate its
+    # quarantine the way an unknown writer would.
+    if case == "prune_missing_quarantine":
+        shutil.rmtree(leaf)
+        if os.path.exists(leaf):
+            fail(f"{case}: cannot remove the quarantine for this control")
+    elif case == "prune_replaced_quarantine":
+        moved = leaf + ".moved"
+        os.rename(leaf, moved)
+        os.makedirs(leaf)
+        with open(os.path.join(leaf, "replacement.txt"), "w", encoding="utf-8") as handle:
+            handle.write("replacement\n")
+    else:
+        fail(f"{case}: unknown prune case")
+
+    replay = run(
+        [oxide, "outputs", "prune", "--plan", plan, "--plan-sha256", digest],
+        cwd=base,
+        env=env,
+    )
+    if replay.returncode != 3:
+        fail(
+            f"{case}: a replay over a mutated quarantine did not exit 3 "
+            f"(exit {replay.returncode}: {replay.stderr[-1500:]})"
+        )
+    document, intent = intent_for(env, leaf)
+    phase = intent.get("phase")
+    if phase in TERMINAL_PHASES:
+        fail(f"{case}: the replay declared completion ({phase!r})")
+    if case == "prune_replaced_quarantine":
+        if not os.path.isfile(os.path.join(leaf, "replacement.txt")):
+            fail(f"{case}: the replacement directory or its content was removed")
+    return f"{case}: pending after replay, phase {phase}"
 
 
 def plan() -> int:
     print("cases:")
     for case in CASES:
         race = RACES[case]
-        print(f"  {case:<16} race {race or 'none (control)'}")
+        print(f"  {case:<26} race {race or 'none (control)'}")
     print(
         "allocation: 5 internal 1 MiB directory pools on the boot Data volume "
         "(the selector's internal-placement exception), one private HOME/CARGO_HOME "
-        "and TMPDIR per case, 3 owned 128 MiB sparse images attached -owners on "
-        "one at a time and ordinarily detached, staged debug oxide in owned scratch"
+        "and TMPDIR per case, 5 owned 128 MiB sparse images with custody records in "
+        "the guard's evidence directory, one attached at a time and ordinarily "
+        "detached, staged debug oxide in owned scratch"
     )
     print("premises: 9 traced in this script's docstring")
+    print("diagnostic: recoverable failures continue; unknown custody/device/writer/deadline aborts")
     return 0
 
 
-def diagnostic_receipt(completed: list, failed: list, faults: dict) -> str:
+def diagnostic_receipt(reached, completed, failed, skipped, unexecuted, abort) -> str:
     receipt = {
         "proof": "oxide#155-finder-metadata-race",
         "qualified": False,
         "mode": "diagnostic",
+        "reached": reached,
         "completed": completed,
         "failed": failed,
-        "unexecuted": [case for case in CASES if case not in completed and case not in failed],
-        "faults": {case: text[-800:] for case, text in faults.items()},
+        "skipped": skipped,
+        "unexecuted": unexecuted,
+        "aborted": abort is not None,
+        "abort": abort,
     }
     path = os.path.join(evidence_dir(), "finder-metadata-race-diagnostic.json")
     with open(path, "w", encoding="utf-8") as handle:
@@ -606,8 +932,10 @@ def main(argv: list) -> int:
     oxide = stage(root)
     print(f"staged oxide from this HEAD: {oxide}", flush=True)
 
-    completed, failed, faults = [], [], {}
-    for case in CASES:
+    reached, completed, failed, skipped = [], [], [], []
+    abort = None
+    for index, case in enumerate(CASES):
+        reached.append(case)
         try:
             line = (
                 lease_case(oxide, root, case, RACES[case])
@@ -616,22 +944,39 @@ def main(argv: list) -> int:
             )
             completed.append(case)
             print(line, flush=True)
-        except Exception as error:  # noqa: BLE001 - one bounded failure line per case
+        except Unknown as error:
+            abort = f"{case}: {type(error).__name__}: {error}"
+            skipped.extend(CASES[index + 1 :])
+            break
+        except Recoverable as error:
             text = f"{type(error).__name__}: {error}"
             if not diagnostic:
                 raise
             failed.append(case)
-            faults[case] = text
             print(f"{case}: FAILED {text}", flush=True)
+        except Exception as error:  # noqa: BLE001 - unknown outcome, never continued
+            abort = f"{case}: unexpected {type(error).__name__}: {error}"
+            skipped.extend(CASES[index + 1 :])
+            break
 
     if diagnostic:
-        receipt = diagnostic_receipt(completed, failed, faults)
+        receipt = diagnostic_receipt(
+            reached,
+            completed,
+            failed,
+            skipped,
+            [case for case in CASES if case not in reached],
+            abort,
+        )
         print(
-            f"diagnostic: qualified=false, {len(completed)} completed, "
-            f"{len(failed)} failed, receipt {receipt}",
+            f"diagnostic: qualified=false, reached {len(reached)}, completed "
+            f"{len(completed)}, failed {len(failed)}, skipped {len(skipped)}, "
+            f"aborted {abort is not None}, receipt {receipt}",
             flush=True,
         )
-        return 1 if failed else 0
+        return 0 if not failed and abort is None else 1
+    if abort is not None:
+        raise Unknown(abort)
     print(f"proof: {len(completed)} cases passed", flush=True)
     return 0
 
@@ -639,6 +984,12 @@ def main(argv: list) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except Exception as error:  # noqa: BLE001 - one bounded failure line
+    except Unknown as error:
+        print(f"proof aborted (unknown outcome, nothing continued): {error}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    except Recoverable as error:
         print(f"proof failed: {error}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    except Exception as error:  # noqa: BLE001 - one bounded failure line
+        print(f"proof failed (unexpected): {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         sys.exit(1)

@@ -3297,20 +3297,49 @@ fn a_foreign_entry_racing_an_evicting_reconciliation_keeps_the_record() {
     assert!(slot_path.is_dir(), "the slot with foreign content is kept");
 }
 
-/// An owned directory the owner left unreadable (no read or search bit) is
-/// still deleted whole, as it was before the descriptor-relative seam: the
-/// owner's access is restored through the held parent and the identity is
-/// revalidated on the re-open.
+/// An owned directory the owner left without read permission but with its own
+/// search bit (a build or test scratch directory) is still deleted whole: the
+/// repair takes a search-only descriptor of that entry, revalidates its
+/// identity, and changes only that entry's own mode.
 #[test]
-fn an_owned_directory_left_unreadable_is_still_deleted_whole() {
+fn an_owned_directory_left_without_read_permission_is_still_deleted_whole() {
     let fixture = Fixture::new("unreadable-tree");
     let slot = fixture.dir("slot");
     let inner = slot.join("locked");
     fs::create_dir(&inner).expect("locked directory");
     fs::write(inner.join("data"), b"x").expect("data");
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).expect("unreadable directory");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o100)).expect("search-only directory");
     remove_tree_owned(fixture.path(), &slot).expect("owned unreadable tree is removed");
     assert!(!slot.exists(), "the whole slot is gone");
+}
+
+/// A directory with no search bit cannot be reached by any descriptor as this
+/// user. Repairing it would need a chmod through its name, which could follow
+/// a replacement link, so the deletion refuses and keeps the tree instead of
+/// chmodding through a name.
+#[test]
+fn an_owned_unreachable_directory_is_kept_not_chmodded() {
+    let fixture = Fixture::new("unreachable-tree");
+    let slot = fixture.dir("slot");
+    let inner = slot.join("locked");
+    fs::create_dir(&inner).expect("locked directory");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).expect("unreachable directory");
+    assert_eq!(
+        remove_tree_owned(fixture.path(), &slot),
+        Err(LeaseError::UnsafePath(
+            "an owned directory that cannot be opened is kept, never chmodded through its name"
+        ))
+    );
+    assert_eq!(
+        fs::symlink_metadata(&inner)
+            .expect("kept directory")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o000,
+        "the kept directory's mode is unchanged"
+    );
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
 }
 
 /// The same for a directory that keeps only write and search bits.

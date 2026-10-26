@@ -836,8 +836,29 @@ fn remove_tree_owned_at(
     let child = match open_directory_at(parent, name) {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            crate::owned_delete::restore_owner_access(parent, name, stat.st_mode & 0o7777)
-                .map_err(io_error)?;
+            // A search-only descriptor of this very entry, its identity
+            // revalidated before the repair: no path and no link is involved,
+            // so an out-of-tree referent can never be chmodded.
+            let repair = match crate::owned_delete::open_directory_for_repair(parent, name) {
+                Ok(repair) => repair,
+                // A directory without its own search bit cannot be reached by
+                // any descriptor as this user. Repairing it would need a chmod
+                // through the name, which could follow a replacement link, so
+                // it is kept and the deletion refuses instead.
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Err(LeaseError::UnsafePath(
+                        "an owned directory that cannot be opened is kept, never chmodded through its name",
+                    ))
+                }
+                Err(error) => return Err(io_error(error)),
+            };
+            let repaired = descriptor_identity(repair.as_fd()).map_err(io_error)?;
+            if repaired != (stat_device(&stat), stat_ino(&stat)) {
+                return Err(LeaseError::UnsafePath(
+                    "the verified directory was replaced before its access was repaired",
+                ));
+            }
+            crate::owned_delete::restore_owner_access(repair.as_fd()).map_err(io_error)?;
             open_directory_at(parent, name).map_err(io_error)?
         }
         Err(error) => return Err(io_error(error)),

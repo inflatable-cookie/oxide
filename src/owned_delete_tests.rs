@@ -10,7 +10,7 @@ use crate::test_fs::arm_race;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::fd::AsFd;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -349,4 +349,87 @@ fn an_entry_that_vanishes_before_its_unlink_does_not_fail_the_round() {
         other => panic!("an emptied directory is removed: {other:?}"),
     }
     assert!(!tree.exists());
+}
+
+/// The directory binding is revalidated for *every* entry, not once per round:
+/// a name rebound just before an entry's unlink stops the drain and leaves the
+/// replacement untouched.
+#[test]
+fn a_rebind_during_the_drain_stops_it_before_the_next_unlink() {
+    let fx = Fixture::new("seam-drain-rebind");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    fs::write(tree.join(".DS_Store"), b"x").expect("metadata");
+    fs::write(tree.join("._member"), b"y").expect("metadata");
+    let dir = open(&tree);
+    let held = fx.path().join("slot-moved");
+    let replacement = fx.path().join("slot-replacement");
+    let (parent_path, replacement_path) = (fx.path().to_path_buf(), replacement.clone());
+    let _rebind = crate::test_fs::before_unlink(move || {
+        fs::rename(parent_path.join("slot"), parent_path.join("slot-moved")).expect("rename away");
+        fs::create_dir(&parent_path.join("slot")).expect("replacement directory");
+    });
+    match rmdir_draining_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+    ) {
+        Rmdir::Replaced { entry } => assert_eq!(entry, "slot"),
+        other => panic!("a rebound name must stop the drain: {other:?}"),
+    }
+    assert!(held.is_dir(), "the held directory is still there");
+    assert!(
+        fs::read_dir(fx.path().join("slot"))
+            .expect("replacement kept")
+            .count()
+            == 0,
+        "the replacement is untouched"
+    );
+    assert!(
+        !replacement_path.exists(),
+        "the control did not create an extra directory"
+    );
+}
+
+/// Permission repair never follows a link: a metadata-shaped replacement that
+/// is a symlink to an unreadable directory outside the tree must leave the
+/// referent's mode exactly as it was, and the deletion must refuse.
+#[test]
+fn unreadable_directory_repair_never_follows_a_link() {
+    let fx = Fixture::new("seam-repair-link");
+    let outside = fx.dir("outside");
+    let referent = outside.join("referent");
+    fs::create_dir(&referent).expect("referent");
+    fs::set_permissions(&referent, fs::Permissions::from_mode(0o000)).expect("referrant mode");
+    let before = fs::symlink_metadata(&referent)
+        .expect("referent metadata")
+        .permissions()
+        .mode();
+
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    let locked = tree.join("locked");
+    fs::create_dir(&locked).expect("locked");
+    // The verified entry is replaced by a link to the unreadable referent
+    // before the seam reaches it, so a following repair would chmod it.
+    fs::remove_dir(&locked).expect("remove");
+    symlink(&referent, &locked).expect("link");
+    let dir = open(&tree);
+
+    // The recursion refuses a link (it is unlinked, never followed), so the
+    // referent's mode is what proves nothing followed it.
+    let _ = rmdir_draining_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+    );
+    let after = fs::symlink_metadata(&referent)
+        .expect("referent metadata")
+        .permissions()
+        .mode();
+    assert_eq!(before & 0o777, after & 0o777, "the referent's mode changed");
+    // The fixture's own removal needs the referent readable again.
+    fs::set_permissions(&referent, fs::Permissions::from_mode(0o700)).expect("restore");
 }

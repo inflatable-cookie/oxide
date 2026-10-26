@@ -80,6 +80,17 @@ pub const FINDER_RACE_MAX_NAMES: usize = 64;
 /// Longest entry name, in bytes, a diagnostic prints before eliding.
 const MAX_ENTRY_LABEL_BYTES: usize = 64;
 
+/// The descriptor-only open flag that reaches a directory without requiring
+/// read permission: `O_SEARCH` on Darwin (it includes `O_DIRECTORY`), `O_PATH`
+/// on Linux. Both never follow a link with `O_NOFOLLOW`, so a repaired entry is
+/// always the entry itself. `fchmod` is supported on the Darwin descriptor; on
+/// Linux an `O_PATH` descriptor cannot be chmodded, so the repair returns that
+/// error and the caller keeps its refusal.
+#[cfg(target_os = "macos")]
+const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(target_os = "macos"))]
+const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+
 /// Finder metadata a verified tree tolerates: exactly `.DS_Store` (Finder's
 /// Desktop Services store; Apple's `com.apple.desktopservices`
 /// `DSDontWriteNetworkStores` / `DSDontWriteUSBStores` preferences govern where
@@ -211,7 +222,7 @@ pub fn rmdir_draining_finder_metadata(
         Ok(device) => device,
         Err(error) => return Rmdir::Failed { error },
     };
-    match drain_finder_metadata(dir, device) {
+    match drain_finder_metadata(parent, name, dir, device) {
         Ok(entries) => Rmdir::Drained { entries },
         Err(outcome) => outcome,
     }
@@ -277,7 +288,26 @@ struct VerifiedEntry {
     inode: u64,
 }
 
-fn drain_finder_metadata(dir: BorrowedFd<'_>, device: u64) -> Result<u64, Rmdir> {
+fn drain_finder_metadata(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    dir: BorrowedFd<'_>,
+    device: u64,
+) -> Result<u64, Rmdir> {
+    // Revalidate the directory binding one last time before anything in it is
+    // deleted, and again before every single unlink below: the entries must
+    // belong to the held directory the caller verified, not to a name that now
+    // points somewhere else.
+    match held_name(parent, name, dir) {
+        Ok(HeldName::Held) => {}
+        Ok(HeldName::Vanished) => return Err(Rmdir::Vanished),
+        Ok(HeldName::Different) => {
+            return Err(Rmdir::Replaced {
+                entry: entry_label(OsStr::from_bytes(name.to_bytes())),
+            })
+        }
+        Err(error) => return Err(Rmdir::Failed { error }),
+    }
     let mut names = match list_names(dir, FINDER_RACE_MAX_NAMES) {
         Ok(Names::Listed(names)) => names,
         Ok(Names::TooMany(entries)) => return Err(Rmdir::RefusedMany { entries }),
@@ -310,6 +340,19 @@ fn drain_finder_metadata(dir: BorrowedFd<'_>, device: u64) -> Result<u64, Rmdir>
     }
     let mut entries = 0;
     for entry in &verified {
+        // The directory binding is revalidated for every entry, not only once
+        // per round: a name rebound while the drain runs stops it before the
+        // next unlink.
+        match held_name(parent, name, dir) {
+            Ok(HeldName::Held) => {}
+            Ok(HeldName::Vanished) => return Err(Rmdir::Vanished),
+            Ok(HeldName::Different) => {
+                return Err(Rmdir::Replaced {
+                    entry: entry_label(OsStr::from_bytes(name.to_bytes())),
+                })
+            }
+            Err(error) => return Err(Rmdir::Failed { error }),
+        }
         // Revalidate the exact entry immediately before its unlink: a
         // metadata-named replacement (a link, a directory, another device or
         // another inode) is refused and left alone.
@@ -323,6 +366,8 @@ fn drain_finder_metadata(dir: BorrowedFd<'_>, device: u64) -> Result<u64, Rmdir>
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(Rmdir::Failed { error }),
         }
+        #[cfg(test)]
+        crate::test_fs::run_before_unlink();
         // SAFETY: `dir` and the C string are live for the call. This unlinks
         // the name itself; a symlink is never followed by `unlinkat`.
         let status = unsafe { libc::unlinkat(dir.as_raw_fd(), entry.name.as_ptr(), 0) };
@@ -516,19 +561,47 @@ pub fn open_directory_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<Owne
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Restore the owner's own access to `name` in `parent` so a directory the
-/// owner left unreadable can still be deleted, as before this seam. The caller
-/// has already verified the entry as an owned directory; the removed bits are
-/// exactly `0o700` on that entry, and the identity is revalidated after the
-/// re-open, so a replacement inside this window is refused rather than
-/// deleted.
-pub fn restore_owner_access(
-    parent: BorrowedFd<'_>,
-    name: &CStr,
-    mode: libc::mode_t,
-) -> io::Result<()> {
+/// Open `name` in `parent` as a directory *without* requiring read permission
+/// and without following a link (`O_SEARCH`, which is execute/search only).
+/// This is how an owned directory the owner left unreadable is reached at all:
+/// the descriptor names that entry itself, so nothing below ever repairs
+/// permissions through a path or a link.
+pub fn open_directory_for_repair(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
     // SAFETY: `parent` and the C string are live for the call.
-    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode | 0o700, 0) } != 0 {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            SEARCH_ONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a newly owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Restore the owner's own access through the already-held descriptor of that
+/// verified directory. Only this entry's own mode gains `0o700`, and a link is
+/// never involved: the descriptor cannot be a link and its identity has been
+/// revalidated by the caller. Where the platform refuses `fchmod` on a
+/// search-only descriptor, this returns that error and the caller keeps its
+/// refusal instead of repairing anything.
+pub fn restore_owner_access(dir: BorrowedFd<'_>) -> io::Result<()> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is live for the call.
+    if unsafe { libc::fstat(dir.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if stat_mode(&stat) != libc::S_IFDIR {
+        return Err(io::Error::other(
+            "a repaired directory descriptor is not a directory",
+        ));
+    }
+    let mode = (stat.st_mode & 0o7777) | 0o700;
+    // SAFETY: `dir` is a live descriptor for the verified directory.
+    if unsafe { libc::fchmod(dir.as_raw_fd(), mode) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

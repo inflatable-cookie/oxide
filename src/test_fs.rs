@@ -222,3 +222,45 @@ pub(crate) fn race_firing(label: &std::ffi::OsStr) -> Option<&'static str> {
         Some(arm.kind)
     })
 }
+
+thread_local! {
+    static BEFORE_UNLINK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Run `action` once, inside the deletion seam, immediately before its first
+/// per-entry unlink. This is how a unit test rebinds the directory name at
+/// exactly the boundary the seam revalidates, instead of racing on timing.
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct BeforeUnlinkGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn before_unlink(action: impl FnOnce() + 'static) -> BeforeUnlinkGuard {
+    BEFORE_UNLINK.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping before-unlink injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    BeforeUnlinkGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for BeforeUnlinkGuard {
+    fn drop(&mut self) {
+        BEFORE_UNLINK.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed action, if any. Called by the seam before each per-entry
+/// unlink; a no-op everywhere else.
+pub(crate) fn run_before_unlink() {
+    let action = BEFORE_UNLINK.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
