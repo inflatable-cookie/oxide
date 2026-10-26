@@ -5342,6 +5342,46 @@ pub fn planned_destination(
     }
 }
 
+/// The profile-output declaration one leased command uses (oxide#164).
+///
+/// An external subcommand is Cargo running `cargo-<name>`, which is exactly
+/// what `oxide exec -- cargo <name>` runs, so when the caller declares no
+/// `--output` both use the SAME derivation, [`exec_declaration`]: one member
+/// set, one slot key, one set of bindings and refusals. Nothing here adds a
+/// second path; `exec`'s explicit `--output` set and the classification of a
+/// modelled command or building built-in are unchanged, and a classification
+/// this layout cannot model (a JSON target specification) still refuses in a
+/// profile checkout.
+pub fn lease_declaration(
+    invocation: &crate::cli::Invocation,
+    control: Option<&Path>,
+    checkout: &Path,
+    pool_fallback: Option<&str>,
+) -> Result<crate::layout::Declaration, String> {
+    let command = invocation.command.as_str();
+    if crate::cli::derives_from_receipt(command, &invocation.declared_outputs) {
+        return exec_declaration(control, checkout, pool_fallback);
+    }
+    if command == "exec" {
+        // The caller's `--output` declaration is the complete set of the
+        // tool's profile outputs, exactly as before; it stays an optional
+        // override and keeps its byte-identical slot key.
+        return crate::layout::declared(&invocation.declared_outputs);
+    }
+    match crate::layout::classify(
+        command,
+        invocation.profile,
+        invocation.explicit_profile,
+        &invocation.targets,
+    ) {
+        crate::layout::Layout::Declared(declaration) => Ok(declaration),
+        crate::layout::Layout::Unknown(reason) => {
+            refuse_unknown_layout(control, checkout, &reason)?;
+            Ok(crate::layout::Declaration::empty())
+        }
+    }
+}
+
 /// The profile member set `oxide exec` derives when the caller declares none
 /// (oxide#160, S1; design `exec-output-inference.md`).
 ///
@@ -5691,6 +5731,115 @@ fn refuses_dangling_member(
     Ok(false)
 }
 
+/// Whether one leased command must durably reserve a future root nonce before
+/// its slot is keyed (oxide#129).
+///
+/// A derived plan over this checkout's committed placement is a subset of that
+/// placement, so it reserves nothing: the root it binds already exists and no
+/// member is new. A derived set that is EMPTY names no placement at all — a
+/// whole-target checkout, a detached receipt, an unconverted checkout — and a
+/// whole-target plan can still name a FUTURE root (the first local fallback to
+/// an absent root, oxide#117), which binding accepts only through the exact
+/// surviving reservation its slot was keyed with. Those keep the shipped
+/// reservation path, exactly as every command did before oxide#164: a derived
+/// `exec` in the same state now does too (oxide#164 review finding).
+///
+/// Callers pass whether the command derived its set
+/// ([`crate::cli::derives_from_receipt`]) and the declaration it will use.
+pub fn needs_reservation(derived: bool, declaration: &crate::layout::Declaration) -> bool {
+    !derived || declaration.is_empty()
+}
+
+/// Upper bound on the entries one bounded target observation considers.
+const TARGET_ENTRY_CAP: usize = 4096;
+/// Upper bound on the directory names one notice prints.
+const TOOL_DIRECTORY_CAP: usize = 8;
+/// Cargo's own top-level directory inside a real target. It is never a profile
+/// member and never a tool's output directory, so it is never reported.
+const CARGO_TARGET_TEMP: &str = "tmp";
+
+/// The entry names directly under one checkout's real target directory: one
+/// bounded, non-recursive listing that never follows a link.
+///
+/// `None` when `target` is not a real directory (the whole-target layout links
+/// it and an absent target holds nothing), when it cannot be read, or when it
+/// holds more than [`TARGET_ENTRY_CAP`] entries. An unexpected or oversized
+/// tree is left unreported rather than walked.
+pub fn target_entries(checkout: &Path) -> Option<Vec<String>> {
+    let target = checkout.join("target");
+    let metadata = fs::symlink_metadata(&target).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&target).ok()? {
+        if names.len() >= TARGET_ENTRY_CAP {
+            return None;
+        }
+        let entry = entry.ok()?;
+        names.push(entry.file_name().to_str()?.to_owned());
+    }
+    names.sort();
+    Some(names)
+}
+
+/// Whether one command's bound layout is the receipt-derived PROFILE-MEMBER
+/// layout, the only path that prints the tool-directory notice (oxide#164).
+///
+/// A derived command (`oxide exec` without `--output`, or an external
+/// subcommand) that planned profile members is the checkout shape the brief's
+/// "reported once" belongs to. Every other shape keeps its shipped stderr: a
+/// never-converted or ephemeral checkout plans nothing, a legacy whole-target
+/// checkout plans the whole target, a detached profile receipt plans no
+/// destination, and a modelled command or an explicit `--output` declaration is
+/// not a derived set. None of them gets the extra line.
+pub fn tool_notice_applies(derived: bool, plan: Option<&Plan>) -> bool {
+    // The checkout's layout decides, not which members this command happened to
+    // place: a profile plan whose member is a receipt-recorded real directory is
+    // still the profile layout, and the tool may create a non-member directory
+    // beside it.
+    derived && plan.is_some_and(|plan| !plan.whole_target && !plan.members.is_empty())
+}
+
+/// One bounded notice naming the directories a tool created directly under its
+/// real target that are NOT profile members — the tool's own `target/nextest`
+/// or `target/llvm-cov` (oxide#164). Callers print it only when
+/// [`tool_notice_applies`] holds, so an unconverted, ephemeral, whole-target or
+/// detached checkout keeps its previous stderr.
+///
+/// `before` is [`target_entries`] captured before the writer started. The
+/// comparison is two listings of ONE directory: no recursion, no payload walk,
+/// no link followed, and at most [`TOOL_DIRECTORY_CAP`] names are printed.
+/// Cargo's own top-level `tmp` is never reported, a member-shaped path is the
+/// member layout's business (never this notice's), and a `target` that is not a
+/// real directory is not observed at all.
+pub fn tool_directories_note(checkout: &Path, before: Option<&[String]>) -> Option<String> {
+    let before = before?;
+    let after = target_entries(checkout)?;
+    let mut created: Vec<String> = after
+        .into_iter()
+        .filter(|name| !before.iter().any(|known| known == name))
+        .filter(|name| name.as_str() != CARGO_TARGET_TEMP)
+        .filter(|name| crate::layout::Member::parse(name).is_err())
+        .filter(|name| {
+            fs::symlink_metadata(checkout.join("target").join(name))
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        })
+        .collect();
+    created.sort();
+    if created.is_empty() {
+        return None;
+    }
+    let shown = created.len().min(TOOL_DIRECTORY_CAP);
+    let mut list = created[..shown].join(", ");
+    if created.len() > shown {
+        list.push_str(&format!(" and {} more", created.len() - shown));
+    }
+    Some(format!(
+        "tool directories kept local ({list}): a directory that is not a profile member stays a real directory of this checkout and is never placed"
+    ))
+}
+
 /// Reserve the nonce of this command's future root before its slot is keyed
 /// (oxide#129). Runs after automatic adoption and before
 /// `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding
@@ -5875,9 +6024,13 @@ fn destination_generation(root: &Path, next: u64) -> u64 {
     read_marker(root).map_or(next, |marker| marker.generation)
 }
 
-/// Refuse a command whose profile outputs cannot be classified in a checkout
-/// that already places outputs at profile members. An unlinked checkout runs
-/// such a command locally exactly as before.
+/// Refuse a command whose profile outputs cannot be classified from its name
+/// in a checkout that already places outputs at profile members. An unlinked
+/// checkout runs such a command locally exactly as before. External
+/// subcommands no longer reach this refusal: they derive their member set from
+/// the receipt like `oxide exec` (oxide#164), so only a modelled command whose
+/// target or profile the layout cannot model (a JSON target specification)
+/// refuses here.
 pub fn refuse_unknown_layout(
     control: Option<&Path>,
     checkout: &Path,
@@ -9668,6 +9821,306 @@ mod tests {
         );
     }
 
+    /// oxide#164: an external subcommand (`cargo-<name>` run by Cargo) uses the
+    /// SAME derivation as a derived `oxide exec`, so it derives the receipt's
+    /// member set and renders a byte-identical slot key.
+    ///
+    /// Counterfactual: restoring the pre-#164 rule — derive only for
+    /// `exec`, and call `refuse_unknown_layout` for every other unmodelled
+    /// command — makes `lease_declaration` return an error here instead of a
+    /// declaration, so this test fails.
+    #[test]
+    fn an_external_subcommand_derives_the_receipt_pair_like_exec() {
+        let fixture = Fixture::new();
+        placed_profile(&fixture, &["debug", "release"], &[]);
+        // The real parser, so the routing input is the one the CLI produces:
+        // an external subcommand's argv is untouched and it declares nothing.
+        let external = crate::cli::parse_leased("oxfixture", &[OsString::from("run")]).unwrap();
+        assert_eq!(
+            external.cargo_args,
+            [OsString::from("oxfixture"), OsString::from("run")]
+        );
+        assert!(external.declared_outputs.is_empty());
+        assert!(crate::cli::derives_from_receipt(
+            &external.command,
+            &external.declared_outputs
+        ));
+        let declaration =
+            lease_declaration(&external, Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let names: Vec<&str> = declaration
+            .members()
+            .iter()
+            .map(crate::layout::Member::name)
+            .collect();
+        assert_eq!(names, ["debug", "release"]);
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap();
+        let facts = destination_facts(plan.as_ref());
+        assert_eq!(facts.lines().count(), 2, "{facts}");
+        assert!(
+            facts.lines().all(|line| line.starts_with("outputs-3 ")),
+            "{facts}"
+        );
+        // One derivation, one key: the shipped `exec` path renders the same
+        // bytes for the same checkout.
+        let exec = exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let exec_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &exec, None).unwrap();
+        assert_eq!(destination_facts(exec_plan.as_ref()), facts);
+        // The old refusal still exists for a classification this layout cannot
+        // model, and it would have refused this profile checkout — which is
+        // exactly why the routing no longer calls it here.
+        assert!(refuse_unknown_layout(
+            Some(&fixture.control),
+            &fixture.checkout,
+            "`oxfixture` is not a command whose profile outputs Oxide models",
+        )
+        .is_err());
+    }
+
+    /// oxide#164: a whole-target receipt and a never-converted checkout are
+    /// unchanged for an external subcommand: the derivation adds nothing, the
+    /// external command plans exactly the legacy whole-target key a modelled
+    /// command plans, and an unconverted checkout plans no destination at all.
+    #[test]
+    fn an_external_subcommand_is_unchanged_for_whole_target_and_unconverted_checkouts() {
+        let external = crate::cli::parse_leased("oxfixture", &[]).unwrap();
+        // Never converted: no declaration, no destination, no keyed member.
+        let plain = Fixture::new();
+        assert!(
+            lease_declaration(&external, Some(&plain.control), &plain.checkout, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(planned_destination(
+            Some(&plain.control),
+            &plain.checkout,
+            &crate::layout::Declaration::empty(),
+            None
+        )
+        .unwrap()
+        .is_none());
+        // A committed whole-target receipt: still empty, so the legacy plan
+        // and its `outputs-2` key are exactly a modelled command's.
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let committed = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+            NonceAuthority::Unkeyed,
+        )
+        .unwrap();
+        assert_eq!(committed.layout(), LayoutKind::WholeTarget);
+        let declaration =
+            lease_declaration(&external, Some(&fixture.control), &fixture.checkout, None).unwrap();
+        assert!(declaration.is_empty());
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.whole_target);
+        let facts = destination_facts(Some(&plan));
+        assert!(
+            facts.lines().all(|line| line.starts_with("outputs-2 ")),
+            "{facts}"
+        );
+        let modelled = declaration_of(&["debug".to_owned()]);
+        let modelled_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &modelled, None)
+                .unwrap();
+        assert_eq!(destination_facts(modelled_plan.as_ref()), facts);
+    }
+
+    /// oxide#164: the #162 absent-member repair is a property of the derivation,
+    /// not of the command name, so an external subcommand in the same shape
+    /// creates the one absent member directory under its verified root.
+    #[test]
+    fn an_external_subcommand_creates_an_absent_member_of_the_verified_owned_root() {
+        let fixture = Fixture::new();
+        register(&fixture, DriveMode::Permanent);
+        let (context, receipt, root) = placed_profile(&fixture, &["debug", "release"], &[]);
+        fs::remove_dir(root.join("release")).unwrap();
+        let external = crate::cli::parse_leased("oxfixture", &[]).unwrap();
+        let repair =
+            crate::cli::derives_from_receipt(&external.command, &external.declared_outputs);
+        assert!(
+            repair,
+            "an external subcommand is not routed through the derivation"
+        );
+        let declaration =
+            lease_declaration(&external, Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(destination_facts(Some(&plan)).contains("release"));
+        let store = pool_store(&fixture.root.join("pool"));
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan), repair) {
+            Bind::Bound(outcome) => assert_eq!(outcome.root.as_deref(), Some(root.as_path())),
+            Bind::Refuse(reason) => {
+                panic!("an absent member of the verified root refused: {reason}")
+            }
+            Bind::Wait => panic!("an absent member of the verified root waited"),
+        }
+        assert!(root.join("release").is_dir());
+        assert_eq!(
+            fs::read_link(fixture.checkout.join("target/release")).unwrap(),
+            root.join("release")
+        );
+    }
+
+    /// oxide#164: every derivation refusal is preserved for an external
+    /// subcommand — a foreign or unowned member link, a member-shaped file and
+    /// a receipt over the member cap all refuse before Cargo, with nothing
+    /// changed.
+    #[test]
+    fn an_external_subcommand_keeps_the_derivation_refusals() {
+        let external = crate::cli::parse_leased("oxfixture", &[]).unwrap();
+        // A foreign member link into another destination.
+        let foreign = Fixture::new();
+        let (_context, _receipt, _root) = placed_profile(&foreign, &["debug"], &[]);
+        let outside = foreign.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = foreign.checkout.join("target/debug");
+        fs::remove_file(&link).unwrap();
+        symlink(&outside, &link).unwrap();
+        let refused = lease_declaration(&external, Some(&foreign.control), &foreign.checkout, None)
+            .unwrap_err();
+        assert!(refused.contains("target/debug"), "{refused}");
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        assert_eq!(fs::read_link(&link).unwrap(), outside);
+        // A member-shaped regular file at a receipt-recorded member path.
+        let filed = Fixture::new();
+        let (_context, _receipt, _root) = placed_profile(&filed, &["debug"], &[]);
+        fs::write(filed.checkout.join("target/release"), b"file").unwrap();
+        let refused =
+            lease_declaration(&external, Some(&filed.control), &filed.checkout, None).unwrap_err();
+        assert!(refused.contains("target/release"), "{refused}");
+        assert_eq!(
+            fs::read(filed.checkout.join("target/release")).unwrap(),
+            b"file"
+        );
+        // More receipt members than one command binds.
+        let capped = Fixture::new();
+        let names = (0..9)
+            .map(|index| format!("t{index}/debug"))
+            .collect::<Vec<_>>();
+        let borrowed = names.iter().map(String::as_str).collect::<Vec<_>>();
+        placed_profile(&capped, &borrowed, &[]);
+        let refused = lease_declaration(&external, Some(&capped.control), &capped.checkout, None)
+            .unwrap_err();
+        assert!(refused.contains("oxide outputs detach"), "{refused}");
+        assert!(refused.contains('9'), "{refused}");
+    }
+
+    /// oxide#164: the tool-directory notice is bounded and precise. It names
+    /// only directories that APPEARED directly under a real target, never a
+    /// profile member, never Cargo's own `tmp`, never a file, and never through
+    /// a linked target; its list is capped.
+    #[test]
+    fn the_tool_directory_notice_names_only_new_non_member_directories() {
+        let fixture = Fixture::new();
+        placed_profile(&fixture, &["debug"], &[]);
+        let before = target_entries(&fixture.checkout).unwrap();
+        // Nothing new: no notice at all.
+        assert!(tool_directories_note(&fixture.checkout, Some(&before)).is_none());
+        // A tool's own directory is named, once.
+        fs::create_dir(fixture.checkout.join("target/nextest")).unwrap();
+        let note = tool_directories_note(&fixture.checkout, Some(&before)).unwrap();
+        assert!(note.contains("(nextest)"), "{note}");
+        assert_eq!(note.matches("nextest").count(), 1, "{note}");
+        // Cargo's own `tmp`, a member-shaped directory, and a file are not
+        // this notice's business.
+        fs::create_dir(fixture.checkout.join("target/tmp")).unwrap();
+        fs::create_dir(fixture.checkout.join("target/release")).unwrap();
+        fs::write(fixture.checkout.join("target/.rustc_info.json"), b"{}").unwrap();
+        let note = tool_directories_note(&fixture.checkout, Some(&before)).unwrap();
+        assert!(note.contains("(nextest)"), "{note}");
+        assert!(!note.contains("tmp"), "{note}");
+        assert!(!note.contains("release"), "{note}");
+        assert!(!note.contains("rustc_info"), "{note}");
+        // The printed list is capped at eight names plus a bounded remainder.
+        for index in 0..9 {
+            fs::create_dir(fixture.checkout.join(format!("target/tool{index}"))).unwrap();
+        }
+        let note = tool_directories_note(&fixture.checkout, Some(&before)).unwrap();
+        assert!(note.contains("and 2 more"), "{note}");
+        // A target that is a link (the whole-target layout) is not observed.
+        let linked = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let outside = linked.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, linked.checkout.join("target")).unwrap();
+        assert!(target_entries(&linked.checkout).is_none());
+        assert!(tool_directories_note(&linked.checkout, Some(&[])).is_none());
+        // An absent target is not observed either, and no observation means no
+        // notice.
+        assert!(target_entries(&linked.root.join("absent")).is_none());
+        assert!(tool_directories_note(&fixture.checkout, None).is_none());
+    }
+
+    /// oxide#164 review: the tool-directory notice belongs to the
+    /// receipt-derived PROFILE-MEMBER layout only. An unconverted, ephemeral,
+    /// whole-target or detached checkout plans nothing (or the whole target), a
+    /// modelled command and an explicit `--output` declaration are not derived,
+    /// so none of them may gain the extra line: their shipped stderr stays.
+    #[test]
+    fn the_tool_directory_notice_applies_only_to_a_derived_profile_plan() {
+        let fixture = Fixture::new();
+        let selected = fixture.local().selected(1);
+        let owned = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "debug".to_owned(),
+                selected: Some(selected),
+            }],
+        };
+        let real = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "release".to_owned(),
+                selected: None,
+            }],
+        };
+        let whole = Plan {
+            whole_target: true,
+            members: vec![PlannedMember {
+                member: MEMBER.to_owned(),
+                selected: Some(fixture.local().selected(1)),
+            }],
+        };
+        let empty = Plan {
+            whole_target: false,
+            members: Vec::new(),
+        };
+        // The profile layout, owned or receipt-recorded real.
+        assert!(tool_notice_applies(true, Some(&owned)));
+        assert!(tool_notice_applies(true, Some(&real)));
+        // Unconverted, ephemeral and detached checkouts plan nothing.
+        assert!(!tool_notice_applies(true, None));
+        // A legacy whole-target checkout plans the whole target.
+        assert!(!tool_notice_applies(true, Some(&whole)));
+        // An explicit `--output` declaration and every modelled command are not
+        // derived sets.
+        assert!(!tool_notice_applies(false, Some(&owned)));
+        // A plan with no member places nothing to report against.
+        assert!(!tool_notice_applies(true, Some(&empty)));
+    }
+
     /// S1 counterfactual 14: member names are matched before triple descent, so
     /// a real or linked `target/debug` is never enumerated as a triple ancestor
     /// and its payload is never listed.
@@ -12302,41 +12755,7 @@ mod tests {
     #[test]
     fn a_whole_target_local_fallback_keeps_its_reservation() {
         let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
-        let context = fixture.context();
-        register(&fixture, DriveMode::Permanent);
-        let external = Selected {
-            kind: RootKind::External,
-            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
-            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
-            nonce: Some("99999999999999999999999999999999".to_owned()),
-            generation: 1,
-        };
-        let mut receipt = Receipt::first(&fixture.checkout, &context.checkout_id);
-        receipt.state = ReceiptState::Committed;
-        receipt.generation = 1;
-        receipt.link_mut().selected = Some(external.clone());
-        write_receipt(&fixture.control, &receipt).unwrap();
-        fs::create_dir_all(&external.root).unwrap();
-        let marker = Marker {
-            version: MARKER_VERSION.to_owned(),
-            checkout: fixture.checkout.clone(),
-            checkout_id: context.checkout_id.clone(),
-            label: "checkout".to_owned(),
-            recipe: RECIPE.to_owned(),
-            kind: RootKind::External,
-            volume_uuid: external.volume_uuid.clone(),
-            nonce: external.nonce.clone(),
-            checkout_volume_uuid: None,
-            generation: 1,
-            created_ms: 1,
-        };
-        fs::write(
-            external.root.join(MARKER),
-            serde_json::to_vec_pretty(&marker).unwrap(),
-        )
-        .unwrap();
-        let legacy_link = fixture.checkout.join("target");
-        symlink(&external.root, &legacy_link).unwrap();
+        let (context, _external) = committed_whole_target_external(&fixture);
         let declaration =
             crate::layout::Declaration::new([crate::layout::Member::parse("debug").unwrap()])
                 .unwrap();
@@ -12386,6 +12805,125 @@ mod tests {
             }
             Bind::Refuse(reason) => panic!("the whole-target local fallback refused: {reason}"),
             Bind::Wait => panic!("the whole-target local fallback waited"),
+        }
+    }
+
+    /// The committed whole-target fixture both reservation tests start from: a
+    /// permanent-mode receipt selecting a marker-carrying EXTERNAL root with the
+    /// legacy `target` link published, so a later command's desired selection
+    /// falls back to the (absent) local root. Returns its context and selection.
+    fn committed_whole_target_external(fixture: &Fixture) -> (Context, Selected) {
+        let context = fixture.context();
+        register(fixture, DriveMode::Permanent);
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        let mut receipt = Receipt::first(&fixture.checkout, &context.checkout_id);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.link_mut().selected = Some(external.clone());
+        write_receipt(&fixture.control, &receipt).unwrap();
+        fs::create_dir_all(&external.root).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: external.volume_uuid.clone(),
+            nonce: external.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        let legacy_link = fixture.checkout.join("target");
+        symlink(&external.root, &legacy_link).unwrap();
+        (context, external)
+    }
+
+    /// oxide#164 review finding: an external subcommand derives an EMPTY set in
+    /// a whole-target checkout, and the shipped whole-target plan there can
+    /// name a FUTURE root (the first local fallback to an absent root,
+    /// oxide#117). The reservation must therefore still happen, or binding
+    /// refuses the keyed plan with no nonce.
+    ///
+    /// Counterfactual: skipping the reservation for every derived command (the
+    /// oxide#164 head `87d9ff1`) makes this test's binding refuse.
+    #[test]
+    fn an_external_subcommand_reserves_a_future_whole_target_root() {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (context, _external) = committed_whole_target_external(&fixture);
+        let external = crate::cli::parse_leased("oxfixture", &[]).unwrap();
+        let declaration =
+            lease_declaration(&external, Some(&fixture.control), &fixture.checkout, None).unwrap();
+        assert!(
+            declaration.is_empty(),
+            "a whole-target checkout derived a member set"
+        );
+        // The decision main.rs makes: an empty derived set keeps the shipped
+        // reservation path, a non-empty derived set skips it.
+        assert!(needs_reservation(true, &declaration));
+        assert!(!needs_reservation(
+            true,
+            &declaration_of(&["debug".to_owned()])
+        ));
+        assert!(needs_reservation(false, &declaration));
+        let store = pool_store(&fixture.root.join("pool"));
+        // Production order: reservation, then plan, then bind.
+        reserve(
+            &store,
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            Some("the registered volume is away"),
+        )
+        .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            Some("the registered volume is away"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            plan.whole_target,
+            "the legacy checkout planned a profile layout"
+        );
+        assert_eq!(
+            plan.selected().map(Selected::kind),
+            Some(RootKind::Local),
+            "the production planner did not fall back to the local spec"
+        );
+        let reserved = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            reserved.reserved().is_some_and(
+                |reservation| Some(reservation.kind) == plan.selected().map(Selected::kind)
+            ),
+            "the external subcommand's future whole-target root has no reservation"
+        );
+        match bind_under_binding(&context, &store, 0, &reserved, Some(&plan), false) {
+            Bind::Bound(outcome) => assert_eq!(
+                outcome.root.as_deref(),
+                Some(fixture.local().root()),
+                "the whole-target fallback did not bind the local root"
+            ),
+            Bind::Refuse(reason) => {
+                panic!("the external subcommand's future whole-target root refused: {reason}")
+            }
+            Bind::Wait => panic!("the external subcommand's future whole-target root waited"),
         }
     }
 

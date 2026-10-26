@@ -33,7 +33,6 @@ mod wrapper;
 use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
-use layout::Layout;
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;
@@ -421,53 +420,28 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // the pre-lease reservation needs the same requested member set binding
     // will use, and a command this checkout refuses on layout or an unmodelled
     // command name now refuses before any authority write (oxide#133).
-    let derives_exec = invocation.command == "exec" && invocation.declared_outputs.is_empty();
-    let declaration = if invocation.command == "exec" {
-        if invocation.declared_outputs.is_empty() {
-            // oxide#160 (S1): an `exec` that declares no output derives the
-            // member set from this checkout's committed placement. It never
-            // guesses a profile, never links, reserves or converts, and runs
-            // with no owned destination in a detached or unconverted checkout.
-            outputs::exec_declaration(Some(&output_control), &checkout, pool_fallback.as_deref())?
-        } else {
-            // The caller's `--output` declaration is the complete set of the
-            // tool's profile outputs, exactly as before; it stays an optional
-            // override and keeps its byte-identical slot key.
-            layout::declared(&invocation.declared_outputs)?
-        }
-    } else if !cli::models_profile_outputs(&invocation.command) {
-        // An external or unknown subcommand's output directories are opaque.
-        // A profile checkout refuses it before Cargo rather than assuming its
-        // dev profile.
-        outputs::refuse_unknown_layout(
-            Some(&output_control),
-            &checkout,
-            &format!(
-                "`{}` is not a command whose profile outputs Oxide models",
-                invocation.command
-            ),
-        )?;
-        layout::Declaration::empty()
-    } else {
-        match layout::classify(
-            &invocation.command,
-            invocation.profile,
-            invocation.explicit_profile,
-            &invocation.targets,
-        ) {
-            Layout::Declared(declaration) => declaration,
-            Layout::Unknown(reason) => {
-                outputs::refuse_unknown_layout(Some(&output_control), &checkout, &reason)?;
-                layout::Declaration::empty()
-            }
-        }
-    };
+    //
+    // oxide#164: an external subcommand is Cargo running `cargo-<name>`, which
+    // is exactly what `oxide exec -- cargo <name>` runs, so it derives its
+    // member set from this checkout's committed receipt through the SAME
+    // function as a derived `exec`. One path, one key, one set of refusals.
+    let derives_from_receipt =
+        cli::derives_from_receipt(&invocation.command, &invocation.declared_outputs);
+    let declaration = outputs::lease_declaration(
+        &invocation,
+        Some(&output_control),
+        &checkout,
+        pool_fallback.as_deref(),
+    )?;
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
-    // released again before this command waits for a slot. A derived `exec`
+    // released again before this command waits for a slot. A derived profile
     // plan is a subset of the receipt's own placements, so it reserves
-    // nothing: the root it binds already exists and no member is new.
-    if !derives_exec {
+    // nothing: the root it binds already exists and no member is new. A derived
+    // set that is EMPTY names no placement, and a whole-target plan there can
+    // name a FUTURE root (the first local fallback), so it keeps the shipped
+    // reservation path (oxide#164 review finding).
+    if outputs::needs_reservation(derives_from_receipt, &declaration) {
         prep!(outputs::reserve(
             &store,
             Some(&output_control),
@@ -551,10 +525,12 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         held.record_id(),
         planned.as_ref(),
         pool_fallback.as_deref(),
-        // A derived `oxide exec` may create the absent member directory of its
-        // own verified, committed root (oxide#162); every other command keeps
-        // the existing refusal (`derives_exec` is false for them).
-        derives_exec,
+        // A derived command — `oxide exec` without `--output`, or any external
+        // subcommand — may create the absent member directory of its own
+        // verified, committed root (oxide#162, oxide#164); every other command
+        // keeps the existing refusal (`derives_from_receipt` is false for
+        // them).
+        derives_from_receipt,
     ) {
         Ok(binding) => binding,
         Err(reason) => {
@@ -656,6 +632,20 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         // deadline can pass before the launch attempt (the in-flight case).
         std::thread::sleep(delay);
     }
+    // oxide#164: a tool's own directory that is not a profile member (the
+    // nextest `target/nextest` or llvm-cov analogue) stays a real local
+    // directory, and is reported once. This is a bounded observation of ONE
+    // directory — the real target's direct entries, before the writer starts
+    // and after its group closes — with no recursion, no payload walk, no link
+    // followed and no new authority. It belongs to the receipt-derived
+    // PROFILE-MEMBER layout only: a Cargo-only command, an unconverted,
+    // ephemeral, whole-target or detached checkout, a modelled command and an
+    // explicit `--output` declaration all keep their shipped stderr.
+    let reports_tool_directories =
+        outputs::tool_notice_applies(derives_from_receipt, planned.as_ref());
+    let target_entries_before = reports_tool_directories
+        .then(|| outputs::target_entries(&key.checkout))
+        .flatten();
     let started_group = store
         .mark_spawning(&held)
         .map_err(Unstarted::Record)
@@ -774,6 +764,14 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let measured = held.measured.clone();
+    // The one bounded notice for what this tool created in the checkout's real
+    // target (oxide#164). Printed after the writer's group closed and before
+    // the summary, once, and only on the receipt-derived profile-member layout.
+    if let Some(note) =
+        outputs::tool_directories_note(&key.checkout, target_entries_before.as_deref())
+    {
+        eprintln!("oxide: {note}");
+    }
     let mut notes = [gate.describe(), wrapper_note, output_note]
         .into_iter()
         .flatten()

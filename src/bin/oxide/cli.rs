@@ -56,12 +56,35 @@ fn is_building_builtin(command: &str) -> bool {
     matches!(command, "doc" | "bench" | "rustc" | "rustdoc" | "fix")
 }
 
-/// Whether Oxide models this command's profile outputs. Modelled commands and
-/// the building built-ins do; an external or unknown subcommand's output
-/// directories are opaque, so a profile checkout refuses it unless the caller
-/// declares them with `oxide exec --output`.
+/// Whether Oxide models this command's profile outputs from the command name.
+/// Modelled commands and the building built-ins do; an external or unknown
+/// subcommand's output directories are not modelled from its name, so it
+/// derives its member set from the checkout's committed receipt instead — the
+/// same derivation `oxide exec` uses, because an external subcommand is Cargo
+/// running `cargo-<name>` (oxide#164).
 pub(crate) fn models_profile_outputs(command: &str) -> bool {
     classify(command) == Class::Modelled || is_building_builtin(command)
+}
+
+/// Whether one leased command derives its profile member set from this
+/// checkout's committed receipt instead of declaring or classifying one
+/// (oxide#160 S1, extended by oxide#164).
+///
+/// Two commands derive: an `exec` that declares no `--output`, and every
+/// external or unknown subcommand, which is Cargo running `cargo-<name>` —
+/// exactly what `oxide exec -- cargo <name>` runs, so it gets the same
+/// receipt-keyed set, the same slot key and the same refusals. A modelled
+/// command, a building built-in, or an `exec` with an explicit declaration
+/// keeps its own source of truth.
+pub(crate) fn derives_from_receipt(command: &str, declared_outputs: &[String]) -> bool {
+    if !declared_outputs.is_empty() {
+        return false;
+    }
+    // Only a leased command can derive: `exec` itself, or an external/unknown
+    // subcommand (Cargo's building passthrough that is not one of the building
+    // built-ins). Every plain, Oxide-owned and modelled command keeps its own
+    // path.
+    command == "exec" || (classify(command) == Class::Building && !models_profile_outputs(command))
 }
 
 /// Whether Cargo itself reads this leased command's `--config` arguments.
@@ -655,8 +678,8 @@ mod tests {
         ] {
             assert!(models_profile_outputs(command), "{command}");
         }
-        // An external or unknown subcommand's output directories are opaque:
-        // a profile checkout must refuse it rather than assume `debug`.
+        // An external or unknown subcommand is not modelled from its name: it
+        // derives its member set from the receipt instead (oxide#164).
         for command in [
             "nextest",
             "deny",
@@ -666,6 +689,28 @@ mod tests {
             "custom-tool",
         ] {
             assert!(!models_profile_outputs(command), "{command}");
+        }
+    }
+
+    /// oxide#164: the derivation is the same one `exec` uses, and external
+    /// subcommands reach it; modelled commands, building built-ins and an
+    /// explicit `exec` declaration keep their own source of truth. Restoring
+    /// the pre-#164 rule (`command == "exec"` alone) makes the external
+    /// assertions here fail, which is the counterfactual for this change.
+    #[test]
+    fn external_subcommands_derive_from_the_receipt_like_exec() {
+        assert!(derives_from_receipt("exec", &[]));
+        assert!(!derives_from_receipt("exec", &["debug".to_owned()]));
+        for command in ["nextest", "llvm-cov", "custom-tool", "miri"] {
+            assert!(derives_from_receipt(command, &[]), "{command}");
+        }
+        // Modelled commands and the building built-ins are classified, never
+        // derived.
+        for command in [
+            "check", "build", "run", "test", "clippy", "doc", "bench", "rustc", "rustdoc", "fix",
+            "clean", "status", "outputs",
+        ] {
+            assert!(!derives_from_receipt(command, &[]), "{command}");
         }
     }
 

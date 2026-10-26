@@ -42,7 +42,7 @@ Commands fall into four classes:
 | Class | Commands | Behavior |
 | --- | --- | --- |
 | Modelled | `check`, `test`, `clippy`, `build`, `run` | Profile-aware, leased, strategy-selected (see [profiles](#profiles-and-strategies)). |
-| Building passthrough | Other built-ins that compile (`doc`, `bench`, `rustc`, `rustdoc`, `fix`) and every unknown or external subcommand (`nextest`, `llvm-cov`, `miri`) | Passed to Cargo unchanged, under a lease with storage and profile definitions injected. Unknown commands are treated as building, which is the conservative choice. |
+| Building passthrough | Other built-ins that compile (`doc`, `bench`, `rustc`, `rustdoc`, `fix`) and every unknown or external subcommand (`nextest`, `llvm-cov`, `miri`) | Passed to Cargo unchanged, under a lease with storage and profile definitions injected. Unknown commands are treated as building, which is the conservative choice. The compiling built-ins' profile outputs are classified from the command name; an external subcommand derives its member set from the checkout's committed receipt exactly like `oxide exec` (oxide#164). |
 | Plain passthrough | Non-building built-ins (`fmt`, `tree`, `metadata`, `add`, `remove`, `update`, `info`, `search`, `install`, `publish`, `login`, `vendor`, `fetch`, `generate-lockfile`, `locate-project`, `pkgid`, `version`, `help`) and the four scanner tools `deny`, `audit`, `outdated`, `machete` | Run as plain Cargo; no lease. |
 | Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step (see [adoption](#adoption-oxide-init)). `clean` removes the checkout's private outputs and slot affinity and never deletes a shared slot: a 2026-10-18 probe showed plain `cargo clean` also deletes the injected build directory. A whole-target clean is Oxide's own plan ([clean](#clean)). |
 | Oxide-owned | `status`, `pool`, `exec` | Oxide semantics. `exec` runs a tool that calls Cargo itself under a lease ([below](#oxide-exec-cargo-wrapping-tools)); it shadows an external `cargo-exec` subcommand, which stays reachable as plain `cargo exec`. |
@@ -1400,7 +1400,7 @@ Tom ruled on 2026-10-25 that every Rust project in `~/Dev/projects` moves fully 
 - **Named proof exceptions.** Only a proof whose subject is Cargo's own target layout (for example a scanner that reads `target/<profile>/deps`) or that must build without any shared intermediate state may set its own build directory. It runs under `oxide exec`, places that private directory under the drive's `scratch/<project>/` or the proof's `OXIDE_TASK_SCRATCH_ROOT` (never `/var/folders`, `~` or a drive root), removes it afterwards, and is listed by name in the project as an intentional proof exception.
 - **Stays on Cargo:** CI and release workflows (above), container builds inside Linux images without `oxide`, product code that runs Cargo as part of its own behaviour, and test fixtures.
   - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user; #106 moved only the final outputs to `target/debug/`. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
-- **nextest.** `oxide nextest run` with no profile flag builds with the quick recipe in the quick slot. Drop an existing `--cargo-profile oxide-quick`: it still builds, but into `target/oxide-quick/`.
+- **nextest.** `oxide nextest run` with no profile flag builds with the quick recipe in the quick slot. In a profile-layout checkout the external subcommand derives its member set from the committed receipt like `oxide exec` (oxide#164), so it runs instead of refusing, and any directory the tool owns that is not a member (`target/nextest`) stays a real local directory reported once. Drop an existing `--cargo-profile oxide-quick`: it still builds, but into `target/oxide-quick/`.
 - **Final outputs.** Since #106, `quick` and `debug` binaries are in `target/debug/`, so scripts that read them there can move to `oxide`. Earlier adopters' `target/oxide-quick/` directories are left alone; `oxide clean` removes them with the rest of `target/`.
 - **Worktree seeding.** Selectors that move to `oxide` drop any copy of a primary checkout's `target/` into worktrees. The shared slot is the warm state.
 - **Proof per project:**
@@ -4507,8 +4507,30 @@ author and reviewer native remain unactivated.
   real member stays `real` with the existing notice, a link or file the receipt
   does not place refuses, and a checkout placing more than eight members
   refuses naming `oxide outputs detach`. The derived path itself reserves
-  nothing, relinks nothing, converts nothing and creates no member; only that
-  one absent member directory is created later, inside binding. A detached profile receipt plans no
+  nothing when its set is non-empty, relinks nothing, converts nothing and
+  creates no member; only that one absent member directory is created later,
+  inside binding. A derived set that is EMPTY (whole-target, detached,
+  unconverted) names no placement, and a whole-target plan there can name a
+  FUTURE root — the first local fallback to an absent root — which binding
+  accepts only through the exact reservation its slot was keyed with, so the
+  reservation skip is scoped to a non-empty derived set
+  (`outputs::needs_reservation`) and an empty one keeps the shipped
+  reservation path (oxide#117, oxide#164). An external subcommand
+  (`oxide nextest`, `oxide llvm-cov`, …) takes this **same** derivation through
+  the same function (oxide#164): it is Cargo running `cargo-<name>`, exactly what
+  `oxide exec -- cargo <name>` runs, so it gets the receipt-keyed member set, the
+  #162 absent-member handling, the one bounded notice for a receipt-recorded
+  real member, the reservation rule above and the same refusals, while its argv
+  stays Cargo's. A tool's own directory that is not a member
+  (`target/nextest`) stays a real local directory and is reported once, after
+  the writer's group closes, by the bounded `tool directories kept local`
+  notice: two listings of ONE directory (the real target's direct entries before
+  the writer starts and after its group closes), capped at eight names, with no
+  recursion, no payload walk and no link followed, and only on the
+  receipt-derived profile-member layout — a never-converted, ephemeral,
+  whole-target or detached checkout, a modelled command and an explicit
+  `--output` declaration keep their previous stderr. A detached profile receipt
+  plans no
   destination at all, so its `exec` runs locally through real directories; a
   legacy whole-target receipt and an unconverted checkout are unchanged (the
   declaration is not consulted), and a prepared, pruning or pruned receipt

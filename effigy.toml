@@ -350,10 +350,26 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # drift, a receipt changed while the command waits and an interrupted tool
 # whose surviving group member holds the lease (case 15) all behave as
 # recorded with the links, receipt and roots unchanged where they must be.
+# Its oxide#164 cases (21-24) run a tiny external subcommand (`cargo-oxfixture`
+# on a private PATH): 21 derives the same receipt-keyed pair as exec, shares
+# exec's warm slot, writes through the owned debug member, keeps target/debug a
+# link, leaves its own non-member directory real and local and reports it once
+# with the bounded tool-directories notice, and keeps the receipt bytes; 22
+# requires the separate bounded unplaced-member notice for a receipt-recorded
+# real member; 23 keeps a whole-target checkout unchanged and refuses a foreign
+# member link before the tool runs; 24 reserves a FUTURE whole-target root's
+# keyed nonce and binds the first local fallback; 25 keeps a never-converted real
+# target and an ephemeral real target unchanged: the tool-directories notice
+# appears only on the receipt-derived profile layout, so those layouts print
+# exactly their previous stderr, and the ephemeral drive mode is restored only
+# after the child and every oracle completed (a fault retains the fixture state
+# and the first abort, with no recovery restore).
 # The HIGH premise checklist is traced in the mode's docstring: private
 # HOME/rustup, OXIDE_TEST_HOME_FROM_ENV, the OXIDE_/XDG_/CARGO_*/GIT_ scrub,
-# an explicitly created unconverted control, `-owners on` plus a read-only
-# mount observation, one frozen RUSTFLAGS with CARGO_ENCODED_RUSTFLAGS
+# an explicitly created unconverted control, Cargo's external-subcommand argv
+# convention, `-owners on` plus a read-only mount observation and one bounded
+# forced detach of this run's own image followed by an `-owners on` re-attach,
+# one frozen RUSTFLAGS with CARGO_ENCODED_RUSTFLAGS
 # removed for staging and every fixture child, the internal monitored scratch
 # root described below, and mkdtemp-only fixture temp roots.
 # `--plan` prints the fixed table and allocation with no effect.
@@ -377,14 +393,34 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # complete, aborted or unexecuted; a recoverable case-oracle failure is recorded
 # and the cases that do not depend on it still run, while an unknown outcome, a
 # lost resource or writer custody (an unclosed child, a lost mount or drive
-# registration) or an exhausted guard deadline aborts and leaves the rest
-# unexecuted. Its bounded `qualified: false` receipt is written in every
+# registration), an exhausted guard deadline, an abnormal or unclassifiable
+# proof-child exit (-9 or an unreaped leader, even with empty stderr), a command
+# result whose stderr carries Oxide's own unconfirmed-closure report (could not
+# confirm Cargo group / stays held, and a later oxide command recovers it / is
+# retired and stays held / quarantined: lost with the removable volume) aborts
+# and leaves the rest unexecuted, because the group's custody is unknown. An
+# abort retains an uncertain resource: the owned image is re-attached only after
+# a case COMPLETED (case 24 has no finally), the ordinary detach needs a clean
+# collection with no unclosed child, and the failure-cleanup path applies the same
+# gate (it records the retention instead of detaching), so none of them touches
+# custody while it is unconfirmed. The COUNTED run's tail goes through the same
+# latching wrapper, so ANY unsuccessful ordinary detach (a nonzero hdiutil, a
+# signal, a timeout) or a custody fault escaping its collector latches unknown
+# custody before any outer cleanup: the counted failure cleanup never detaches
+# twice, the original fault is preserved, and the recorded disposition names the
+# retention the cleanup made. A detach that RETURNS while the image is still
+# mounted is the same unknown device outcome: the counted tail aborts (never a
+# pass) and the image is retained. Its bounded
+# `qualified: false` receipt is written in every
 # outcome, and a skipped or unexecuted case is never a pass. Each run needs its
 # own owner activation, and only a counted run at the exact merge head can
 # pass. Not a benchmark, real-drive qualification or an alias for full QA.
 #
 # `proof:exec-inference:test` is the pure apparatus check of that collection:
-# the real case table, collector and receipt builder with fake bodies and seams.
+# the real case table, collector and receipt builder with fake bodies and seams,
+# including the runtime binding of every case body (a case calling a helper that
+# does not exist fails here) and the failure-cleanup retention gate in both modes,
+# with a counted signalled-detach counterfactual (no second detach).
 # It stages nothing, starts no child and touches no scratch, image, pool or
 # supervisor, so a dispatch, dependency-skip, keep-going, abort-latch or receipt
 # regression costs no native activation.

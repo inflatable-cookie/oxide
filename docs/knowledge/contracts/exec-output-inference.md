@@ -8,9 +8,43 @@ the independent exact-head review (decision `95b3bc63`) and written against
 `a7ed41b`. The operator direction is Tom's design-first ruling of
 2026-10-26 (Oxide Supervisor lead `d30b48c8`, parent direction `d78a7afa` /
 `a96712b`). As published, this document activated nothing; the implementation
-is in `src/bin/oxide/outputs.rs` (`exec_declaration`, `exec_members`, the
-shared `adopt_profile_from`) and `src/bin/oxide/main.rs`, with the
-`effigy rust:exec-output-inference` proof.
+is in `src/bin/oxide/outputs.rs` (`exec_declaration`, `exec_members`,
+`lease_declaration`, `needs_reservation`, the shared `adopt_profile_from`) and
+`src/bin/oxide/main.rs`, with the `effigy rust:exec-output-inference` proof.
+
+**Amendment note (oxide#164).** S1 item 4 as shipped kept
+`refuse_unknown_layout` for every non-`exec` external subcommand, so in a
+profile-layout checkout — now the default for a fresh or migrated checkout
+(S4b) — `oxide nextest`, `oxide llvm-cov` and every other external subcommand
+refused instead of running. Swallowtail's milestone QA and Effigy's built-in
+Rust test route both hit it. An external subcommand is Cargo running
+`cargo-<name>`, which is exactly what `oxide exec -- cargo <name>` runs, so it
+now takes **the same derivation through the same function** (`lease_declaration`
+→ `exec_declaration`): the receipt-keyed member set, #162's absent-member
+handling, the bounded notice for unplaced members and the member cap, with
+`--output`, modelled commands, whole-target and unconverted checkouts, and every
+refusal unchanged. `refuse_unknown_layout` survives only for a modelled
+command whose target the layout cannot model (a JSON target specification).
+
+Two points the review of that amendment settled. First, a derived set that is
+**empty** names no placement — a whole-target checkout, a detached receipt or an
+unconverted checkout — and a whole-target plan can still name a FUTURE root (the
+first local fallback to an absent root, oxide#117), which binding accepts only
+through the exact reservation its slot was keyed with. The reservation skip is
+therefore scoped to a NON-EMPTY derived set (`outputs::needs_reservation`); an
+empty one keeps the shipped reservation path, exactly as every command behaved
+before, and a derived `exec` in the same state now does too. Second, a tool's own
+directory that is not a member (`target/nextest`, `target/llvm-cov`) stays a real
+local directory and is reported once by the bounded `tool directories kept local`
+notice (`outputs::target_entries` + `outputs::tool_directories_note`): two
+listings of ONE directory — the real target's direct entries before the writer
+starts and after its group closes — capped at eight names, with no recursion, no
+payload walk and no link followed, printed only on the receipt-derived
+**profile-member layout** (`outputs::tool_notice_applies`). A never-converted,
+ephemeral, whole-target or detached checkout, a Cargo-only command, a modelled
+command and an explicit `--output` declaration all keep their previous stderr;
+the receipt-recorded real member keeps its own separate unplaced-member
+notice.
 
 This document is the design for one prerequisite: **`oxide exec` must not
 need `--output`**. Today a checkout that places outputs at profile members
@@ -272,8 +306,12 @@ all **before** Cargo and before any authority write:
 3. a receipt state that is not `Committed` or `Detached` (a prepared, pruning
    or pruned receipt) refuses (existing rule).
 
-`exec` performs **no** reservation (`outputs::reserve` is skipped: the keyed set
-is a subset of the receipt, so no root nonce and no member is new), never
+`exec` performs **no** reservation when its derived set is non-empty
+(`outputs::reserve` is skipped: the keyed set is a subset of the receipt, so no
+root nonce and no member is new). A derived set that is EMPTY (whole-target,
+detached or unconverted) keeps the shipped reservation path, because a
+whole-target plan there may name a future root (oxide#117;
+`outputs::needs_reservation`, oxide#164). `exec` never
 relinks, never converts a real directory, never deletes, and never creates a
 member while it derives or classifies. The classified set is validation only:
 it cannot add a member, extend the key or authorize a write. The single later
@@ -623,7 +661,18 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   already reached and every failure already recorded keeps its place in the
   receipt even when the run is cancelled — the interrupted case is recorded
   `aborted`, never `unexecuted` — and a receipt that cannot be written ends the
-  diagnostic instead of reporting success. The receipt is written in every
+  diagnostic instead of reporting success. An abnormal or unclassifiable
+  proof-child exit (`-9`, or an unreaped leader, even with empty stderr) and any
+  command result carrying Oxide's own unconfirmed-closure report abort the same
+  way, because the group's custody is unknown; an abort retains the uncertain
+  resource — the owned image is re-attached only after a case completed (case 24
+  has no `finally`), the ordinary detach needs a clean collection with no
+  unclosed child, and the failure-cleanup path applies the same gate, recording
+  the retention instead of detaching. The counted run's tail goes through the
+  same latching wrapper, so any unsuccessful ordinary detach — or a detach that
+  returns while the image is still mounted — and any custody fault escaping its
+  collector latch unknown custody (never a counted pass): its failure cleanup
+  never detaches twice and the original fault is preserved. The receipt is written in every
   outcome, carries one row per declared case and is `qualified: false`; a
   skipped or unexecuted case is never a pass.
   01 conversion via explicit adopt (host pair linked), asserted committed;
@@ -671,6 +720,16 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   creation timestamp is preserved, the old output still visible through the
   migrated member link, and a following `build` and `exec` succeeding without
   relinking or rewriting the upgraded receipt.
+  21-24 the external Cargo subcommand (oxide#164): 21 it derives the same
+  receipt-keyed pair as `exec` and shares `exec`'s warm slot, writes its nested
+  `$CARGO build` through the owned `debug` member, keeps `target/debug` a link,
+  leaves its own non-member `target/oxfixture` real and local, reports it once
+  with the bounded `tool directories kept local` notice and leaves the receipt
+  bytes unchanged; 22 the separate unplaced-member notice for a receipt-RECORDED
+  real member (detach, content, re-adopt); 23 an unchanged whole-target checkout
+  (link and receipt bytes) and a foreign member link that refuses before the tool
+  runs; 24 a whole-target checkout whose root is gone reserves the FUTURE root's
+  keyed nonce and binds the first local fallback.
   20 a converted checkout's whole `target` directory deleted (oxide#165): the
   next leased build recreates that real directory exclusively and republishes
   the member it places through the unchanged per-member transition into the
@@ -696,7 +755,7 @@ script, to be traced through the executable case bodies (not this prose):
 | 2 | account-home control | `OXIDE_TEST_HOME_FROM_ENV=1` on every fixture child that must honour the private `HOME` |
 | 3 | environment isolation | scrub `OXIDE_POOL`, `OXIDE_CONFIG`, `OXIDE_TEST_*`, `XDG_*` before setting only the fixture's explicit values and its debug pause hook |
 | 4 | automatic adoption | every case states its receipt premise; case 08's unconverted checkout is positively *created* (real `target`, no receipt) and its receipt absence asserted |
-| 5 | Cargo external argv | only relevant to the tiny fixture tool if it is invoked through a Cargo subcommand; the design's fixture tool is invoked directly, so the premise is recorded as not applicable with that reason |
+| 5 | Cargo external argv | exercised by the oxide#164 cases: a real `cargo-oxfixture` on a private `PATH`, invoked as `oxide oxfixture`, so Cargo resolves `cargo-oxfixture` and passes the subcommand name as the tool's first argument. The fixture refuses any other first argument (`exit 64`) and records the exact argv it saw before calling the inherited `$CARGO build`, so a change in Cargo's convention fails the case |
 | 6 | owned images | `hdiutil attach -owners on` on attach and reattach, asserted by the bounded read-only mount observation and the product's own registration refusal |
 | 7 | compiler flags | `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` frozen consistently for staging and fixture children |
 | 8 | temporary storage | the owner-accepted internal monitored root (`--root-parent /private/tmp`, decision `bd357a4c`): the fixture's control pool is a genuine internal `directory-budget` pool, which the product refuses on an external volume, so the internal pool, the supervisor scratch, the image backing and the fixture `TMPDIR` all stay inside one monitored 512 MiB root, with the image-backed removable pool registered afterwards as the operating pool; the qualified guard and its pinned bytes. The failed `171ae6fb` diagnostic is the apparatus evidence for this disposition |
@@ -739,6 +798,10 @@ clock, scratch budget or previous allowance transfers from #107, #117, #121,
    `exec` key marker?
 5. Is removing the "declares none" refusal for `exec` sufficient to keep
    `refuse_unknown_layout` meaningful for other external subcommands?
+   **Answered by oxide#164:** no. An external subcommand is Cargo running
+   `cargo-<name>`, so the refusal over-refused every profile-layout checkout
+   (`oxide nextest`); it now derives like `exec`, and the refusal is kept only
+   for a modelled command's unmodelled target.
 6. Should the derived path ever be allowed to exceed eight members, and is
    refusing with `oxide outputs detach` the right remedy?
 7. Are S1's native cases the right minimum, and does case 06 (an unrecorded
