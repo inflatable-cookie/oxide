@@ -829,6 +829,13 @@ performance or saving is claimed. The proof runs under the old
 `scripts/bounded-test.py` on route B (Tom, 2026-10-21) with its documented
 gaps, which do not qualify that script or any shared runner.
 
+**Host-permit lifetime.** An exec session's slot reservation and its host
+active-build permit are one record today, so an open session that is not
+compiling still consumes a host unit. The interception analysis, the supported
+boundary and the open operator dispositions for separating them are in the
+[proposed idle-session design](idle-exec-sessions.md); the current session
+still holds its permit throughout.
+
 ### Inherited rustc wrapper
 
 Leased builds bypass any inherited rustc wrapper, today the machine-wide
@@ -1118,6 +1125,12 @@ it is not final output, final-output placement or a claim of saved writes.
   to children Oxide launches for leased commands. CI, Effigy's own run
   scratch, Queue worktrees, container scratch, `$HOME` and host or global
   settings are untouched, and no other-platform default is guessed.
+
+The host permit a long-lived `run` program holds is a separate axis, and the
+successor alternatives for its slot and temp custody are analysed in the
+[proposed idle-session design](idle-exec-sessions.md). Nothing there is
+implemented: this guarantee stays current until an independently reviewed
+successor design establishes equivalence.
 
 **Proof.** `effigy rust:pool-temp-scratch` is one fixed script,
 `scripts/test-pool-temp-scratch.py`, and the whole command of the qualified

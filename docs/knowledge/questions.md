@@ -268,3 +268,20 @@ Cargo, but rebuilding a slot under a different index is UNSAFE by Cargo
 source; the affinity and invalidation mitigations were not run. Benefit
 INSUFFICIENT, writes UNKNOWN. Upstream Rust basedir normalization is
 unreleased.
+
+## Q-019 — How should `oxide exec` know a tool's profile output members?
+
+Design answer, 2026-10-26 ([design](contracts/exec-output-inference.md)):
+Cargo's supported stable interface reports no pre-build output profile
+directories, so `exec` derives its complete member set from the checkout's
+durable committed placement (Cargo's own profile-directory grammar applied to
+the receipt) and classifies every existing member-shaped entry before Cargo.
+No `exec` route needs `--output` to run; a member the receipt does not place
+stays a real local directory and is reported rather than guessed, and
+`--output` keeps its complete-declaration semantics as an optional explicit
+override. Leaning for implementation, not settled: whether a *derived* member
+may ever be newly linked (it would need a keyed reservation and a custody
+change), whether a derived set may exceed the eight-member declaration cap, and
+whether a later slice should add a `cargo` launcher guard. The design activates
+no code or native; the Oxide Supervisor freezes it after independent review
+(decision `95b3bc63`). Owner: [design](contracts/exec-output-inference.md).

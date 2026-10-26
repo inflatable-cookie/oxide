@@ -152,7 +152,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   it back before the next compile, so open dev servers such as `tauri dev` do
   not starve builds. Closure, crash custody and the reserve watchdog are
   unchanged. Whether a compile can be detected before it starts is a design
-  question. Today an exec session holds its permit throughout.
+  question. Today an exec session holds its permit throughout. The
+  [proposed design](contracts/idle-exec-sessions.md) records the interception
+  analysis, the supported boundary and the open operator dispositions.
 - **Paused:** the unchanged-source `oxide run` fast path. Its plan is preserved
   in #089's closed task and its committee contract.
 - **Deferred:** remote builds. The executor seam stays local-only.
@@ -185,7 +187,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   links migrate only by explicit adoption. It never moves existing output,
   and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
-- **Profile layout becomes the default** (approved, not built): automatic first conversion will create profile member links, keeping `target` a real directory so container tools that mount it (Effigy's isolated `target` mounts) keep working, instead of the legacy whole-target link. Prerequisite: `oxide exec` infers a tool's output members from Cargo's own plan, so no route needs `--output`. Existing whole-target checkouts then migrate by explicit `oxide outputs adopt`, Acowtancy's primary checkout first. Today automatic conversion creates the whole-target link.
+- **Profile layout becomes the default** (approved, not built): automatic first conversion will create profile member links, keeping `target` a real directory so container tools that mount it (Effigy's isolated `target` mounts) keep working, instead of the legacy whole-target link. Prerequisite: `oxide exec` infers a tool's output members from Cargo's own plan, so no route needs `--output` ([design](contracts/exec-output-inference.md), which records that a member the checkout's committed placement does not cover stays a real local directory and is reported, never guessed). Existing whole-target checkouts then migrate by explicit `oxide outputs adopt`, Acowtancy's primary checkout first. Today automatic conversion creates the whole-target link.
 - **Owned links at profile directories** (v1, operator accepted): a converted
   checkout keeps `target` itself a real directory and owns only the positively
   identified members `debug`, `release`, `<triple>/debug` and
@@ -213,7 +215,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   writes to or removes one. Otherwise Oxide owns one short per-command
   directory inside the slot, removed at release after writer closure; a `run`
   program that uses one keeps the lease until its own group closes
-  ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). It is
+  ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). The
+  [proposed idle-session design](contracts/idle-exec-sessions.md) weighs the
+  successor custody alternatives and keeps this guarantee; it selects none of
+  them. It is
   implemented on the oxide#136 branch but is not installed or qualified: its
   counted native has not passed and both uncounted diagnostics were attempted
   and failed. The separate proof and validation tooling
