@@ -191,7 +191,9 @@ PRUNE_SLUGS = {
 # product's terminal crash point after the registry terminal write but before
 # the checkout receipt settles (pre-completion).
 CASE_ENV = {
-    "prune_drain_fault": {"OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES": "1"},
+    # Keyed on the bounded seam's *recovered Finder metadata* count, so the
+    # reading cannot be satisfied by the ordinary deletions the pass makes.
+    "prune_drain_fault": {"OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_RECOVERED": "1"},
     "prune_completion_fault": {"OXIDE_TEST_PRUNE_CRASH": "terminal"},
 }
 SLOT_FOLDER_HEX = "0" * 8
@@ -594,6 +596,19 @@ def evidence_fired(mark: int) -> str:
         return handle.read()
 
 
+def firing_tail(mark: int) -> str:
+    """The first `prune-low-reserve-fired` line this case appended."""
+    path = os.path.join(evidence_dir(), "prune-low-reserve-fired")
+    if not os.path.isfile(path):
+        return ""
+    with open(path, encoding="utf-8") as handle:
+        handle.seek(mark)
+        for line in handle:
+            if line.strip():
+                return line.strip()
+    return ""
+
+
 def require_fired(case: str, mark: int, kind: str) -> None:
     if kind not in evidence_fired(mark):
         fail(f"{case}: the armed {kind} race never fired; the case proves nothing")
@@ -994,6 +1009,11 @@ def preview_plan(oxide: str, env: dict, base: str) -> tuple[str, str]:
 def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
     env, base = case_env(root, case, race)
     mark = evidence_mark()
+    # The product's low-reserve firing record is case-local too: remember what
+    # this case appended, so an earlier case's firing cannot satisfy it.
+    low_mark = os.path.getsize(os.path.join(evidence_dir(), "prune-low-reserve-fired")) if os.path.isfile(
+        os.path.join(evidence_dir(), "prune-low-reserve-fired")
+    ) else 0
     custody = ImageCustody(case)
     try:
         mount = custody.attach()
@@ -1038,6 +1058,7 @@ def prune_case(oxide: str, root: str, case: str, race: str | None) -> str:
             base,
             case,
             mark,
+            low_mark,
             real,
             outputs,
             root_path,
@@ -1070,6 +1091,7 @@ def settle_case(
     base: str,
     case: str,
     mark: int,
+    low_mark: int,
     real,
     outputs: str,
     root_path: str,
@@ -1117,11 +1139,17 @@ def settle_case(
         fail(f"{case}: the journal reached a terminal phase {phase!r}")
 
     if case == "prune_drain_fault":
-        # The intended injected stop: the product's low-reserve reading fired on
-        # the first check after one recovered unlink, so the drain stopped with
-        # the remaining tolerated metadata still there.
-        if "prune-low-reserve-fired" not in os.listdir(evidence_dir()):
-            fail(f"{case}: the low-reserve injection did not record a firing")
+        # The intended injected stop, bound to *this* case: the product's
+        # low-reserve reading fired on the first check after one recovered
+        # Finder metadata unlink, so the drain stopped with the remaining
+        # tolerated metadata still there.
+        fired = firing_tail(low_mark)
+        if not fired:
+            fail(f"{case}: the low-reserve injection recorded no firing for this case")
+        if not fired.startswith("recovered: "):
+            fail(f"{case}: the firing is not the recovered-metadata mode: {fired!r}")
+        if "1 recovered" not in fired:
+            fail(f"{case}: the firing does not name one recovered entry: {fired!r}")
         survivors = [
             path
             for path in tree_files(leaf)
@@ -1249,6 +1277,7 @@ def settle_completion_fault(
     base: str,
     case: str,
     mark: int,
+    low_mark: int,
     real,
     outputs: str,
     plan: str,

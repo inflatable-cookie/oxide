@@ -2730,8 +2730,30 @@ fn proof_evidence() -> Option<PathBuf> {
 ///   once at least n quarantined entries were actually deleted.
 /// It fires once, records itself in the evidence directory and changes no
 /// production reserve policy.
+/// Decide whether one check reads a low reserve. One mode at a time; an absent,
+/// malformed or combined set disarms every mode. The modes are the n-th check,
+/// the first check after n deletions of any kind, and the first check after n
+/// **recovered Finder metadata** entries — the last keys on the bounded seam's
+/// own work, never on the pass's total.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn low_reserve_decision(
+    check: u64,
+    deleted: u64,
+    recovered: u64,
+    at: Option<u64>,
+    after_entries: Option<u64>,
+    after_recovered: Option<u64>,
+) -> Option<&'static str> {
+    match (at, after_entries, after_recovered) {
+        (Some(at), None, None) if check == at => Some("check"),
+        (None, Some(after), None) if deleted >= after => Some("entries"),
+        (None, None, Some(after)) if recovered >= after => Some("recovered"),
+        _ => None,
+    }
+}
+
 #[cfg(debug_assertions)]
-fn injected_low_reserve(deleted: u64) -> bool {
+fn injected_low_reserve(deleted: u64, recovered: u64) -> bool {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     static CHECKS: AtomicU64 = AtomicU64::new(0);
     static FIRED: AtomicBool = AtomicBool::new(false);
@@ -2741,15 +2763,17 @@ fn injected_low_reserve(deleted: u64) -> bool {
             .map(|value| value.parse::<u64>().ok().filter(|n| *n > 0))
     };
     let count = CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
-    let (mode, fire) = match (
-        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AT"),
-        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES"),
-    ) {
-        (Some(Some(at)), None) => ("check", count == at),
-        (None, Some(Some(after))) => ("entries", deleted >= after),
-        _ => return false,
+    let Some(mode) = low_reserve_decision(
+        count,
+        deleted,
+        recovered,
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AT").flatten(),
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES").flatten(),
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_RECOVERED").flatten(),
+    ) else {
+        return false;
     };
-    if !fire || FIRED.load(Ordering::Relaxed) {
+    if FIRED.load(Ordering::Relaxed) {
         return false;
     }
     let Some(evidence) = proof_evidence() else {
@@ -2761,12 +2785,17 @@ fn injected_low_reserve(deleted: u64) -> bool {
         .append(true)
         .mode(0o600)
         .open(evidence.join("prune-low-reserve-fired"))
-        .and_then(|mut file| writeln!(file, "{mode}: check {count}, {deleted} entries deleted"));
+        .and_then(|mut file| {
+            writeln!(
+                file,
+                "{mode}: check {count}, {deleted} entries deleted, {recovered} recovered"
+            )
+        });
     true
 }
 
 #[cfg(not(debug_assertions))]
-fn injected_low_reserve(_deleted: u64) -> bool {
+fn injected_low_reserve(_deleted: u64, _recovered: u64) -> bool {
     false
 }
 
@@ -3184,7 +3213,7 @@ impl RootSession {
     /// The prune worker's own monitoring: the registered volume's identity
     /// and reserve, and the host reserve of the internal control volume
     /// (where every journal write lands). Unknown readings stop.
-    fn check(&self, control: &Path, deleted: u64) -> Result<(), Stop> {
+    fn check(&self, control: &Path, deleted: u64, recovered: u64) -> Result<(), Stop> {
         let host = oxide_storage::volume::observe_path(control).map_err(|error| {
             Stop::Pending(format!(
                 "the internal control volume cannot be read ({error}); no further writes"
@@ -3210,7 +3239,7 @@ impl RootSession {
             ))
         })?;
         // Unknown free space is not above the reserve: stop.
-        let available = if injected_low_reserve(deleted) {
+        let available = if injected_low_reserve(deleted, recovered) {
             Some(0)
         } else {
             facts.available_bytes
@@ -3419,6 +3448,10 @@ struct Deleter<'a> {
     control: &'a Path,
     deadline: Instant,
     entries: u64,
+    /// Finder metadata entries this pass recovered through the bounded seam,
+    /// counted separately from `entries` so a proof trigger can key on the
+    /// recovered work itself rather than on every deletion the pass made.
+    recovered: u64,
     /// The last volume and reserve check: rechecked every `DELETE_BATCH`
     /// entries and at least at the existing watchdog cadence.
     checked: Instant,
@@ -3426,6 +3459,8 @@ struct Deleter<'a> {
 
 impl Deleter<'_> {
     fn check(&mut self) -> Result<(), Stop> {
+        let (deleted, recovered) = (self.entries, self.recovered);
+        let _ = (deleted, recovered);
         // One bounded check: the delete pass's own deadline first, then the
         // registered volume and both reserves. Every caller of `check` — the
         // per-unlink drain check, the quarantine leaf's recheck and the
@@ -3435,7 +3470,7 @@ impl Deleter<'_> {
                 "the delete batch exceeded its time window; the quarantine is kept".to_owned(),
             ));
         }
-        self.session.check(self.control, self.entries)?;
+        self.session.check(self.control, deleted, recovered)?;
         self.checked = Instant::now();
         Ok(())
     }
@@ -3469,10 +3504,12 @@ fn remove_quarantined_directory(
         // unlink, not once per batch: a reserve, volume or deadline failure
         // stops the drain at that entry and keeps the intent pending.
         let mut between = || {
-            // This entry was unlinked *before* the check that follows it, so the
-            // deleter's entry count (and any entry-count trigger) advances one
-            // recovered unlink at a time.
+            // This entry was unlinked *before* the check that follows it, so both
+            // counts advance one recovered unlink at a time: `entries` for every
+            // deletion this pass made and `recovered` for the Finder metadata the
+            // bounded seam itself removed.
             deleter.entries += 1;
+            deleter.recovered += 1;
             deleter
                 .check()
                 .map_err(|stop| DrainStop::Stopped(stop_text(stop)))
@@ -3793,7 +3830,7 @@ fn prune_one_barrier(
     let (session, id, quarantine) = (|| {
         let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
         session.verify_marker(candidate).map_err(Stop::Refuse)?;
-        session.check(control, 0)?;
+        session.check(control, 0, 0)?;
         // The locked recheck keeps the operator-list legacy classification
         // the preview validated: a receiptless root, or a listed registry
         // row without a v2 identity, takes the boot Data volume rule.
@@ -4312,6 +4349,7 @@ fn finish_quarantine(
         control,
         deadline: Instant::now() + Duration::from_secs(120),
         entries: 0,
+        recovered: 0,
         checked: Instant::now(),
     };
     crash_point("deleting").map_err(Stop::Pending)?;
@@ -5519,6 +5557,37 @@ mod tests {
     /// a pending intent for every caller, never a completed deletion. The
     /// journal phases are not rewritten to recover it, and a name that is
     /// missing is not positive deletion proof.
+    /// oxide#155: the low-reserve fault modes are decided purely, and the
+    /// recovered-metadata mode keys on the seam's own work rather than on the
+    /// pass's total. The counterfactual is the old total-count trigger: with
+    /// nine ordinary deletions and no recovered entry it stays disarmed, so a
+    /// recovered-mode proof cannot be satisfied by ordinary delete work.
+    #[test]
+    fn the_low_reserve_modes_key_on_their_own_counter() {
+        // Recovered mode: disarmed by ordinary deletions, armed by one recovery.
+        assert_eq!(
+            low_reserve_decision(5, 9, 0, None, None, Some(1)),
+            None,
+            "ordinary deletions must not satisfy the recovered mode"
+        );
+        assert_eq!(
+            low_reserve_decision(5, 9, 1, None, None, Some(1)),
+            Some("recovered")
+        );
+        // The check mode and the older total-count mode keep their meanings.
+        assert_eq!(
+            low_reserve_decision(3, 0, 0, Some(3), None, None),
+            Some("check")
+        );
+        assert_eq!(
+            low_reserve_decision(1, 2, 0, None, Some(2), None),
+            Some("entries")
+        );
+        // One mode at a time; a combined or absent set disarms.
+        assert_eq!(low_reserve_decision(1, 1, 1, Some(1), Some(1), None), None);
+        assert_eq!(low_reserve_decision(1, 1, 1, None, None, None), None);
+    }
+
     #[test]
     fn every_terminal_finder_race_outcome_keeps_the_intent_pending() {
         let pending = |outcome: Rmdir| race_pending("the quarantine leaf", &outcome);
