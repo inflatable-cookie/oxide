@@ -666,9 +666,10 @@ python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
   resource — the owned image is re-attached only after a case completed (case 24
   has no `finally`), the ordinary detach needs a clean collection with no
   unclosed child, and the failure-cleanup path applies the same gate, recording
-  the retention instead of detaching. The counted run latches the same abort when
-  a custody fault escapes its collector or its final detach cannot be confirmed,
-  so its failure cleanup never detaches twice. The receipt is written in every
+  the retention instead of detaching. The counted run's tail goes through the
+  same latching wrapper, so any unsuccessful ordinary detach or a custody fault
+  escaping its collector latches unknown custody: its failure cleanup never
+  detaches twice and the original fault is preserved. The receipt is written in every
   outcome, carries one row per declared case and is `qualified: false`; a
   skipped or unexecuted case is never a pass.
   01 conversion via explicit adopt (host pair linked), asserted committed;

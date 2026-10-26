@@ -2783,7 +2783,7 @@ def detach_decision(collection: "Collection", unclosed) -> str | None:
     if collection.failures:
         return "the collection recorded a failure"
     if collection.aborted is not None:
-        return "the collection aborted"
+        return f"the collection aborted: {collection.aborted}"[:600]
     if unclosed:
         return f"unclosed children {sorted(unclosed)}"
     return None
@@ -3782,7 +3782,10 @@ def exec_self_test() -> None:
     expect(detach_decision(failed, set()) == "the collection recorded a failure", "a failure detached")
     aborted_record = Collection()
     aborted_record.aborted = "x: custody"
-    expect(detach_decision(aborted_record, set()) == "the collection aborted", "an abort detached")
+    expect(
+        detach_decision(aborted_record, set()).startswith("the collection aborted"),
+        "an abort detached",
+    )
     expect(
         detach_decision(clean, {"4242"}) == "unclosed children ['4242']",
         "an unclosed child did not refuse the detach",
@@ -4017,11 +4020,11 @@ def exec_self_test() -> None:
     if uncertain_outcome(setup_fault):
         held_counted.aborted = f"before the first case: {setup_fault!r}"
     expect(
-        detach_decision(held_counted, set()) == "the collection aborted",
+        detach_decision(held_counted, set()).startswith("the collection aborted"),
         "a counted setup abort did not refuse the detach",
     )
     expect(
-        detach_disposition(held_counted, set()) == "retained: the collection aborted",
+        detach_disposition(held_counted, set()).startswith("retained: the collection aborted"),
         f"{detach_disposition(held_counted, set())}",
     )
     # A clean collection that failed before its own decision says exactly that.
@@ -4052,6 +4055,76 @@ def exec_self_test() -> None:
         document["observations"]["detach"].startswith("retained: the collection aborted"),
         f"{document['observations']}",
     )
+
+    # 7h. The ACTUAL counted-branch tail, driven end to end through the same
+    #     function `exec_inference` calls and then the outer failure cleanup: a
+    #     first detach that exits nonzero must latch unknown custody, propagate
+    #     the ORIGINAL fault, and never be retried. The diagnostic branch of the
+    #     same tail records the retention without touching the image.
+    class NonzeroDetachProof:
+        def __init__(self) -> None:
+            self.root = tempfile.mkdtemp(prefix="oxide-counted-tail.")
+            self.mount = "/"
+            self.unclosed: set = set()
+            self.attempts: list[str] = []
+            self.first_fault = RuntimeError("hdiutil detach exited 1")
+
+        def detach(self) -> None:
+            self.attempts.append(self.mount)
+            raise self.first_fault
+
+    counted_tail = NonzeroDetachProof()
+    tail_collection = Collection()
+    try:
+        finish_exec_inference(counted_tail, tail_collection, diagnostic=False, mount="/")
+        raise AssertionError("the counted tail swallowed a nonzero detach")
+    except RuntimeError as fault:
+        expect(
+            fault is counted_tail.first_fault,
+            f"the counted tail replaced the original fault: {fault!r}",
+        )
+    expect(
+        counted_tail.attempts == ["/"],
+        f"the counted tail made more than one attempt: {counted_tail.attempts}",
+    )
+    expect(
+        tail_collection.aborted is not None
+        and "could not be confirmed" in tail_collection.aborted,
+        f"the counted tail did not latch the detach: {tail_collection.aborted}",
+    )
+    message = cleanup_after_failure(counted_tail, tail_collection)
+    expect(
+        counted_tail.attempts == ["/"],
+        f"the failure cleanup retried the counted detach: {counted_tail.attempts}",
+    )
+    expect("retained" in message, f"{message}")
+    expect(
+        tail_collection.detached.startswith("retained:"),
+        f"the retained disposition is missing: {tail_collection.detached}",
+    )
+    expect(
+        "could not be confirmed" in tail_collection.detached,
+        f"the disposition lost the original detach fault: {tail_collection.detached}",
+    )
+    shutil.rmtree(counted_tail.root, ignore_errors=True)
+
+    retained_tail = NonzeroDetachProof()
+    retained_collection = Collection()
+    retained_collection.aborted = "case 21: Oxide reported unconfirmed writer closure"
+    try:
+        finish_exec_inference(retained_tail, retained_collection, diagnostic=True, mount="/")
+        raise AssertionError("the diagnostic tail passed an aborted collection")
+    except RuntimeError as fault:
+        expect("did not all complete" in str(fault), f"{fault}")
+    expect(
+        retained_tail.attempts == [],
+        f"the diagnostic tail detached while custody was unknown: {retained_tail.attempts}",
+    )
+    expect(
+        retained_collection.detached.startswith("retained: the collection aborted"),
+        f"{retained_collection.detached}",
+    )
+    shutil.rmtree(retained_tail.root, ignore_errors=True)
 
     # 9. The receipt document itself: `qualified: false`, counted outcomes,
     #    a skipped case never counted as completed, and the limitation stated.
@@ -4349,6 +4422,67 @@ def detached_version_one(pool: str, checkout: str) -> str:
         json.dump(receipt, handle, indent=2)
     os.chmod(path, 0o600)
     return path
+
+
+def finish_exec_inference(
+    proof: Proof, collection: Collection, *, diagnostic: bool, mount: str
+) -> None:
+    """The one tail both exec-inference modes share (oxide#164 review).
+
+    The counted run is fail-fast and makes exactly ONE ordinary detach through
+    `run_ordinary_detach`, so an unsuccessful detach (a nonzero `hdiutil`, a
+    signal, a timeout) latches unknown custody BEFORE any outer cleanup can run.
+    The diagnostic run applies the retention gate, detaches only when the gate
+    allows it, verifies the mount is gone and records the result, then reports
+    every recorded failure or abort. Neither mode forces, retries or re-operates
+    an image whose device outcome is unconfirmed.
+    """
+    if not diagnostic:
+        # A fault has already propagated, so a clean return means every case
+        # completed.
+        expect(
+            not collection.failures and collection.aborted is None,
+            "the counted collection did not complete",
+        )
+        run_ordinary_detach(proof, collection)
+        collection.mount_present = os.path.ismount(mount)
+        collection.detached = (
+            "ordinary detach through Proof.detach; mount absent"
+            if not collection.mount_present
+            else "unknown: Proof.detach returned but the mount is still present"
+        )
+        return
+    # The owned image is this run's custody. Only a collection that recorded no
+    # failure, did not abort and left no child unclosed makes its ordinary
+    # detach; anything else retains the resource and the receipt names the
+    # refusal. A failed detach latches and raises into the existing failure
+    # cleanup, which then retains rather than retries.
+    refusal = detach_decision(collection, proof.unclosed)
+    if refusal is None:
+        run_ordinary_detach(proof, collection)
+        expect(
+            not os.path.ismount(mount),
+            f"the owned image is still mounted at {mount} after its ordinary detach",
+        )
+        expect(
+            not proof.unclosed,
+            f"unclosed children after detach: {sorted(proof.unclosed)}",
+        )
+        collection.detached = "ordinary detach through Proof.detach; mount absent"
+        collection.mount_present = os.path.lexists(mount)
+    else:
+        collection.detached = f"retained: {refusal}"
+    if collection.failures or collection.aborted:
+        fail(
+            "exec-inference cases did not all complete: "
+            + json.dumps(
+                {
+                    "failures": collection.failures,
+                    "aborted": collection.aborted,
+                    "cases": collection.outcomes,
+                }
+            )
+        )
 
 
 def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collection) -> None:
@@ -5718,48 +5852,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         after_case=after_case if diagnostic else None,
         record=collection,
     )
-    if not diagnostic:
-        # The counted run is fail-fast: a fault has already propagated, so a
-        # clean return means every case completed.
-        expect(
-            not collection.failures and collection.aborted is None,
-            "the counted collection did not complete",
-        )
-        proof.detach()
-        return
-    # The owned image is this run's custody. Only a collection that recorded no
-    # failure, did not abort and left no child unclosed makes exactly one
-    # ordinary detach; anything else retains the resource and the receipt names
-    # the refusal. A failed detach raises into the existing failure cleanup,
-    # which makes that same single attempt and keeps the evidence.
-    refusal = detach_decision(collection, proof.unclosed)
-    if refusal is None:
-        # A failed, timed-out or signalled detach latches the collection in
-        # EITHER mode, so the failure cleanup can never detach a second time.
-        run_ordinary_detach(proof, collection)
-        expect(
-            not os.path.ismount(mount),
-            f"the owned image is still mounted at {mount} after its ordinary detach",
-        )
-        expect(
-            not proof.unclosed,
-            f"unclosed children after detach: {sorted(proof.unclosed)}",
-        )
-        collection.detached = "ordinary detach through Proof.detach; mount absent"
-        collection.mount_present = os.path.lexists(mount)
-    else:
-        collection.detached = f"retained: {refusal}"
-    if collection.failures or collection.aborted:
-        fail(
-            "exec-inference cases did not all complete: "
-            + json.dumps(
-                {
-                    "failures": collection.failures,
-                    "aborted": collection.aborted,
-                    "cases": collection.outcomes,
-                }
-            )
-        )
+    finish_exec_inference(proof, collection, diagnostic=diagnostic, mount=mount)
 
 
 def exec_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
