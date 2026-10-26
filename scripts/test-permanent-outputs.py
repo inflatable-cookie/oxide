@@ -2285,16 +2285,24 @@ def ignore_run(proof: Proof, repo: str) -> None:
         ("could not confirm",),
     )
     no_git_env = dict(proof.env, PATH=private_path(root))
-    _, no_git = ignore_fixture(proof, root, "no-git", "/target\n/.oxide-outputs/\n")
+    # A leased *build* in this class is ineligibility, not a refusal
+    # (oxide#154), so this control asks the explicit conversion over a real
+    # empty target: adopt never creates that target, the missing prerequisite
+    # refuses before any receipt or root, and the target, receipt and drive
+    # roots are unchanged.
+    _, no_git = ignore_fixture(
+        proof, root, "no-git", "/target\n/.oxide-outputs/\n", empty=True
+    )
     refused_untouched(
         proof,
         pool,
         mount,
         no_git,
         "no Git binary on PATH",
-        ["build"],
+        ["outputs", "adopt"],
         ("could not confirm", "cannot run git"),
         env=no_git_env,
+        empty=True,
     )
     _, slow = ignore_fixture(proof, root, "slow-git", "/target\n/.oxide-outputs/\n")
     slow_dir = fake_git(root, "timeout", "#!/bin/sh\nexec sleep 30\n")
