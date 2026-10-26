@@ -145,7 +145,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   the outer closure and custody apply. One for another workspace gets its own
   slot but borrows the outer host permit, so nesting cannot deadlock the host
   limit. A stale or foreign token is ignored and never grants deletion.
-  Today a nested call takes an independent lease.
+  Today a nested call takes an independent lease. The
+  [proposed design](contracts/nested-lease.md) records the token, ticket,
+  permit, deadlock and idle-exec composition rules; it is design-reviewed but
+  not frozen and changes nothing until a briefed implementation lands.
 - **Idle exec sessions release their host permit** (approved, not built;
   design first): `oxide exec` keeps its slot for the whole session but holds
   the host active-build permit only while a compile runs in its group, taking

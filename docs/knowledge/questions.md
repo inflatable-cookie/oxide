@@ -20,7 +20,8 @@ this question's decision.
 
 ## Q-019 — How should nested Oxide lease joining and permit borrowing work?
 
-Design answer, 2026-10-26, unreviewed and unimplemented: the
+Design answer, 2026-10-26, independently design-reviewed (comment
+`6412288358`), unimplemented and not yet frozen: the
 [nested lease design](contracts/nested-lease.md) proposes that a leased
 command issue a lease token scoped to its own process subtree (a nonce, an
 inherited unlinked owner-only descriptor and durable record state), that a
@@ -32,8 +33,11 @@ a stale or foreign token is ignored and the command takes the independent
 path. The design is HIGH complexity and ELEVATED where it changes closure
 and recovery. Independent exact-head design review and the operator's design
 freeze (Tom, decision `95b3bc63`) must both pass before any implementation
-brief. Open after it: deadline inheritance (Q-018), the separate idle-exec
-permit design, hostile same-UID code and non-macOS/Linux platforms.
+brief. The three composition rules with the now-merged
+[idle exec design](contracts/idle-exec-sessions.md) are fixed in the nested design
+(§9, D15); its broker interface for a joined compile and which design lands
+first remain open. Also open: deadline inheritance (Q-018), hostile same-UID
+code and non-macOS/Linux platforms.
 
 
 ## Q-001 — What implementation shape best supports durable exclusive ownership?

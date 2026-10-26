@@ -32,8 +32,9 @@ a nested command for another workspace may borrow the outer host permit.
 Neither changes exclusive slot ownership, closure, accounting or deletion
 rules; the closure set only grows, and the borrow substitutes only the host
 active-build count. The [nested lease design](contracts/nested-lease.md) owns
-the token, validation, ticket, permit and failure rules and is awaiting
-independent design review and the operator's design freeze.
+the token, validation, ticket, permit, failure and interaction rules; its
+independent design review passed (comment `6412288358`) and the operator's
+design freeze is pending.
 
 Proposed: effective build context (incremental, debug, split-debuginfo) would
 be a partition input. Its lifetime and diagnostics rules are in the

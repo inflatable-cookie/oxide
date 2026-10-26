@@ -7,11 +7,15 @@ consumer change, runtime install or cleanup. It is not current product truth:
 the shipped behaviour stays what
 [workflow](workflow.md#what-one-command-does-local-executor) and
 [local lease](local-lease.md) say, where a nested `oxide` takes an
-independent lease. An independent exact-head design review must pass the four
+independent lease. The independent exact-head design review passed all four
 gates (operator scope and boundary, feasibility and source evidence, custody
-and failure design, test and proof plan) and the Oxide Supervisor then gives
-the design freeze (Tom, decision `95b3bc63`); only then may an implementation
-brief be written. Authority for the direction is Tom via Supervisor
+and failure design, test and proof plan) at `9210e65` (review comment
+`6412288358`). This head adds a merge with `origin/main` and a cross-design
+reconciliation with the then-merged [idle exec
+design](idle-exec-sessions.md) (§3.2, §9, D15), so exact-head review of this
+head is still required; the Oxide Supervisor then gives the design freeze
+(Tom, decision `95b3bc63`), and only then may an implementation brief be
+written. Authority for the direction is Tom via Supervisor
 `3cb9b620`, decision `17a1c828-2735-4a9d-a78b-651e8621f733`, recorded in
 [vision](../vision.md#product-workflow-direction).
 
@@ -31,7 +35,7 @@ implementation choice to the reviewed implementation brief.
   command issues, for its own process subtree only, one *lease token*: a
   128-bit nonce in the child environment **plus an inherited, unlinked,
   owner-only descriptor** holding the binding facts, **plus durable state**
-  (a record `permit` field, the record's held lock and the ledger's held
+  (a record `nested` field, the record's held lock and the ledger's held
   lease). Any one of the three without the others is not authority. An
   environment string alone is not authority ([§3](#3-the-lease-token-is-possession-plus-live-state)).
 - **Join** — a nested `oxide` whose computed slot key equals the token's
@@ -70,7 +74,7 @@ implementation choice to the reviewed implementation brief.
 | --- | --- |
 | Outer command | The top-level leased `oxide` that holds the ledger lease, the record, the host permit and the pool selection. |
 | Nested command | Any `oxide` process started below the outer command (build script, Cargo, a tool under `oxide exec`, a test, a helper). |
-| Lease token | The nonce + inherited descriptor + durable record `permit` described in §3. |
+| Lease token | The nonce + inherited descriptor + durable record `nested` state described in §3. |
 | Writer ticket | One durable record of a joined writer's phase and process group, inside the outer generation's control directory. |
 | Permit | The host-wide active-build count slot the outer already holds (`Store::attempt`'s `active < max_active`). |
 | Generation | One record lease: lease ID, slot ID and incarnation from the ledger. |
@@ -114,7 +118,7 @@ one of them is checked by the nested command before it does anything:
    outer's own subtree (or by an explicit same-UID hand-off, which §3.6
    places outside the cooperative boundary).
 2. **A live outer generation**: the record exists and is active, its
-   `permit.nonce` equals the token, its record lock is **still held**, and
+   `nested.nonce` equals the token, its record lock is **still held**, and
    the ledger still shows the same lease ID, slot and incarnation for that
    project. A dead, released, replaced or recovered generation fails at
    least one of these.
@@ -153,7 +157,7 @@ document is at most 4 KiB with UTF-8 byte caps like the record's:
 | Field | Meaning |
 | --- | --- |
 | `version` | exactly `1` |
-| `nonce` | the issuing record's `permit.nonce` (the generation nonce; a joined issuer keeps the root record's) |
+| `nonce` | the issuing record's `nested.nonce` (the generation nonce; a joined issuer keeps the root record's) |
 | `store_id` | the granting pool's recorded store identity |
 | `record` | the issuing record's id (the root record, or a borrowing command's own record; a joined issuer keeps the root record) |
 | `permit_root` | `{ store_id, record, nonce }`: the permit a borrowing descendant records as its parent. A record-holding issuer sets it to its own permit triple when `parent` is null, else to its `parent`; a joined issuer passes its own `permit_root` through unchanged |
@@ -176,7 +180,7 @@ own generation.
 **Durable state.** `Record` gains one optional field:
 
 ```text
-permit = { nonce, issued_ms, depth,
+nested = { nonce, issued_ms, depth,
            parent: null | { store_id, record, nonce } }
 ```
 
@@ -188,7 +192,10 @@ for a record-holding command that joined nothing). Every borrow anywhere in
 the tree references the **root** permit (the token's `permit_root`), not its
 immediate parent, so the coverage chain is one level deep and cannot be held
 open by an intermediate command.
-The field is cleared when the record leaves the active
+The field is named `nested`, not `permit`: the
+[idle exec design](idle-exec-sessions.md) proposes a record `permit` fact
+(`held`/`released`) for its session split, and the two compose without a
+collision (§9). The field is cleared when the record leaves the active
 phases and re-minted by every command that takes the record. `State` gains no
 other field: the gate, its closing marker and the tickets are files under the
 generation's control directory, so closure never depends on parsing a large
@@ -208,10 +215,10 @@ child is spawned:
    and `issuer_pid`, `issuer_started_ms`, `issuer_session` from this
    process; `fsync`, clear `FD_CLOEXEC`, unlink.
 2. Add `OXIDE_LEASE_TOKEN` (the token's own `nonce`, which is the issuing
-   record's `permit.nonce`) and `OXIDE_LEASE_TOKEN_FD` to the child `Command`
+   record's `nested.nonce`) and `OXIDE_LEASE_TOKEN_FD` to the child `Command`
    immediately before spawn.
 3. For a **record-holding** command (top-level, independent or borrowing)
-   only: write `permit` into its record under the admission lock (fresh
+   only: write `nested` into its record under the admission lock (fresh
    nonce; `parent` = `null` or the borrowed reference), before the descriptor
    exists. A command that crashes after this leaves an active record whose
    permit the next release or recovery clears.
@@ -225,7 +232,7 @@ child is spawned:
 
 **Record-holding issuance** (token depth 1). Every command that holds a
 record — a top-level command, an independent fallback or a borrowing command —
-writes its own `permit` (step 3), creates its own generation directory
+writes its own `nested` state (step 3), creates its own generation directory
 (step 4), and issues a depth-1 token for its own subtree. A borrow therefore
 starts a **new** generation with its own depth counter; recursion across
 borrows is bounded by the eight-live-borrows-per-root-permit rule (§5.2), not
@@ -234,7 +241,7 @@ by the joined-level counter.
 **Joined re-issue** (token depth `d + 1`). A joined command that validated a
 token of depth `d` issues a depth-`d + 1` token for its own children, because
 it is the only process that can prove its own subtree: it does **not** write
-a record or a `permit`, does **not** touch the gate or the ticket, does
+a record or a `nested` field, does **not** touch the gate or the ticket, does
 **not** mint a nonce, and does **not** create a second generation directory.
 It reuses the facts it validated (`store_id`, `record`, `nonce`, `lease_id`,
 `slot_id`, `incarnation`, `checkout`, `compatibility`) and adds only its own
@@ -253,7 +260,7 @@ countable at the root, and needs no cross-store stitching.
 
 Nothing is issued for a command that will not spawn (refusals, admission
 expiry, budget expiry before the launch attempt, a gate refusal): those
-paths release the lease as they do today and write no permit.
+paths release the lease as they do today and write no `nested` state.
 
 ### 3.4 Lifetime, revocation and bounded age
 
@@ -263,7 +270,7 @@ The token's authority ends at the **earliest** of:
   recovery, eviction, quarantine);
 - the record lock becoming free (the issuing record's holder died);
 - the `closed` marker being created (the record holder started its closeout);
-- `permit.nonce` changing (a later command took the record);
+- `nested.nonce` changing (a later command took the record);
 - the issuing process exiting.
 
 There is deliberately **no wall-clock TTL**. A clock cannot tell whether the
@@ -273,7 +280,7 @@ its admission/execution budget (if any) and the host limit already bound.
 A token found in an environment after the outer ended is stale by
 construction.
 
-Revocation is therefore free: close the gate, clear `permit`, release.
+Revocation is therefore free: close the gate, clear `nested`, release.
 Removing the directory is cleanup, never the revocation itself.
 
 ### 3.5 Validation, in order
@@ -290,7 +297,7 @@ into a fallback.
 | V2 | `fstat`: regular file, owner is the effective user, no group/other write, size ≤ 4 KiB, link count 0. | F |
 | V3 | Read exactly from the descriptor (bounded, one read retry on `EINTR`), parse strictly; `nonce` equals the environment value (constant-time compare). | F |
 | V4 | The selected pool's recorded `store_id` equals the token's, and the record lives in that pool's control directory. | F |
-| V5 | A passive snapshot shows the ledger lease held with the token's `lease_id`, `slot_id`, `incarnation` on the token's project, and `state.json` shows that record active with `permit.nonce` equal. | F |
+| V5 | A passive snapshot shows the ledger lease held with the token's `lease_id`, `slot_id`, `incarnation` on the token's project, and `state.json` shows that record active with `nested.nonce` equal. | F |
 | V6 | A non-blocking exclusive `flock` on the record lock fails with `EWOULDBLOCK` (still held). A free lock, a missing lock file or any other error is not liveness. | F |
 | V7 | The bounded ancestor walk (`≤ 64` hops, each PID with its start time) reaches `issuer_pid`, and this process's session id (`getsid(0)`) equals `issuer_session`. A caller that left the session with `setsid` keeps its ancestry only if the chain still reaches the issuer; the session check refuses it either way. | F |
 | V8 | `token.depth ≤ 4` (`MAX_JOINED_LEVELS`). Checked only after V1–V7 held, so a depth-5 token minted by a level-4 joined command **refuses**; it never becomes an independent lease. | exit 1 |
@@ -495,13 +502,17 @@ active = records in this pool that are active and not covered by a live permit
        + sibling pool's same figure
 ```
 
-`Record.permit.parent` is the only input this design adds, and it is exactly
+`Record.nested.parent` is the only input this design adds, and it is exactly
 the triple `{ store_id, record, nonce }` the token carries in `permit_root`:
 
 - a record with `parent: null` is a root permit holder and is always counted;
 - a record is **covered** only when `parent` is present and, in the same
   locked snapshot, a record with that store and record id is active in either
-  pool and its `permit.nonce` equals the referenced nonce;
+  pool, its `nested.nonce` equals the referenced nonce, **and** its host
+  permit is held. Today an active record always holds its permit; under the
+  [idle exec design](idle-exec-sessions.md) an exec session may have
+  `permit = released`, and then it covers nothing — the borrower is counted
+  itself, so a released permit is never silently lent;
 - anything else — an idle parent, a freed lock, a recovered parent, a
   mismatched nonce, a missing record, an unreadable sibling state, a
   malformed reference — counts the record itself.
@@ -549,8 +560,8 @@ never touches the outer's held slot.
 
 Default `oxide status` stays lock-free and walk-free. For a record with a
 permit it prints one extra fact from the recorded field, for example
-`permit borrowed from record 7 (nested depth 1)`, using `permit.parent.record`
-and `permit.depth`; it does not probe tickets, PIDs or groups. `--measure` may
+`permit borrowed from record 7 (nested depth 1)`, using `nested.parent.record`
+and `nested.depth`; it does not probe tickets, PIDs or groups. `--measure` may
 additionally list the generation's tickets (names, phases, groups) since it is
 already the diagnostic path. A borrowed record shows as an ordinary active
 slot with its own provenance; the outer's line does not claim the borrower.
@@ -567,8 +578,13 @@ whose next admission attempt returns one of
 - `Wait::Checkout` (this checkout's busy slot is the ancestor's slot),
 - `Wait::Clean` (a clean whose completion needs this checkout's lease, which
   the ancestor holds),
-- `Wait::HostLimit` when every counted active command is an ancestor, or
-- `Wait::ProjectCap` where the only candidate is the ancestor's slot,
+- `Wait::HostLimit` when every counted active command is an ancestor.
+
+(`Wait::ProjectCap` is unused in this tree and is not a live reason; the
+checkout case above is the one that arises. Order-FIFO `Wait::Queue`,
+`Wait::Uncertain` and `Wait::Capacity` waits are never implicated by an
+ancestor unless the ancestor is the counted holder, which the
+`HostLimit` case already covers.)
 
 **refuses with exit 1** naming the ancestor and the reason, instead of
 waiting. Waiting can only be satisfied by the ancestor, and the ancestor is
@@ -590,7 +606,7 @@ wait, and the outer's own window (if any) still covers it.
 | --- | --- | --- |
 | Joined levels below one outer command | 4 | Each record-holding command issues token depth 1 for its own generation; a joined command at level `d` issues `d + 1`; a token at depth 5 (issued by the level-4 command) refuses with exit 1. Fallback to an independent slot is **not** allowed, because unbounded recursion (a build script that calls `oxide`, whose build script calls `oxide`) would otherwise consume every slot and permit. |
 | Live joined writers per generation | 8 | A ninth join refuses with exit 1. The writer set is read under the ticket gate; a closed ticket never counts. |
-| Live borrows per root permit | 8 | A ninth borrow refuses with exit 1. Counted under the admission lock from both pools' active records whose `permit.parent` is this permit (§5.2). |
+| Live borrows per root permit | 8 | A ninth borrow refuses with exit 1. Counted under the admission lock from both pools' active records whose `nested.parent` is this permit (§5.2). |
 | Ancestor hops | 64 | Beyond it: no ancestors, so no join and no borrow (independent path). |
 | Token document | 4 KiB | Larger or unparsable: no join. |
 | Ticket scan | 32 tickets, 4 KiB each | More tickets than the bound: the outer keeps the slot held (never silently ignores one). |
@@ -630,7 +646,7 @@ These are product constants in the reviewed implementation, not settings.
 | 5 | Token from another pool or checkout's store | V4 | independent path | none |
 | 6 | Token presented outside the subtree | V7 | independent path | none |
 | 7 | PID reuse satisfies a forged chain | V7 start-time compare | independent path | none |
-| 8 | Token for another generation of the same record | V3 + V5 `permit.nonce` | independent path | none |
+| 8 | Token for another generation of the same record | V3 + V5 `nested.nonce` | independent path | none |
 | 9 | Join refused because the gate closed | V10 | refuse (same key) or borrow (different key) | outer continues its closeout |
 | 10 | Two joined writers start together | gate lock ordering | both register, separate build dirs | both ticketed |
 | 11 | Joined writer registers as the outer closes | gate lock ordering | registration refused | fallback/refuse, no lost writer |
@@ -708,7 +724,21 @@ Rules that follow and must be tested:
 - **Clean and prune.** A same-checkout clean refuses while nested (§6.1);
   other checkouts' cleans and prunes are unaffected, and prune keeps any root
   whose writer record is open.
-- **Installed hand-off and version fence.** `Record.permit` needs the next
+- **Idle-exec permit split (composition requirement).** The
+  [idle exec design](idle-exec-sessions.md) proposes that an exec session
+  releases its host permit while no gated compiler runs, recorded as a
+  `permit` fact on the same record. The two designs compose under three
+  rules: (i) the fields are distinct — `nested` here, `permit` there; (ii) a
+  borrow is covered only while the parent's host permit is held, so a
+  released exec permit leaves the borrower counted, never free (§5.2);
+  (iii) a **joined compile is a gated writer** — it must acquire the
+  session's permit through that design's broker before its Cargo starts and
+  must not bypass the gate, so this design's `RUSTC_WRAPPER=""` handling
+  cannot be applied blindly inside such a session. Rule (iii) is a hard
+  requirement on whichever design lands second; the broker interface and
+  whether a refused grant waits or refuses belong to that brief, not to this
+  one.
+- **Installed hand-off and version fence.** `Record.nested` needs the next
   `STATE_VERSION` and the existing hand-off trigger, and an older installed
   binary must be upgraded before a permit-bearing pool is served. A nested
   binary that predates join ignores the token (row 27): correct, but it may
@@ -760,18 +790,19 @@ review; none may be treated as settled by the design's existence.
 | D11 | Borrow requires the same pool/store. | Cross-pool permit stitching. |
 | D12 | Refusals exit 1 with an actionable message. | A new exit code (124/125 stay the budget meanings). |
 | D13 | A borrow references the **root** permit (flat, one-level coverage) and is capped at 8 per root permit. | Chained parent references with per-level caps (an intermediate command would hold an allowance open and the count would be per level). |
-| D14 | Ancestry is checked together with the issuer's session id, so a `setsid` caller is refused even when its ancestry survives. | Ancestry alone. |
+| D14 | Ancestry is checked together with the issuer's session id, so a `setsid` caller takes the independent path (F) even when its ancestry survives. | Ancestry alone. |
+| D15 | Compose with the idle-exec permit split: distinct record fields, coverage only under a held parent permit, and a joined compile counted as a gated writer (§9). | Lending a released exec permit, or letting a joined compile bypass the permit gate. |
 
 Still open, deliberately not decided here:
 
 - **Deadline inheritance.** A joined command does not inherit the outer's
   remaining window; whether an inner inheritance interface should exist stays
   [Q-018](../questions.md#q-018--how-do-per-command-admission-and-execution-budgets-behave-after-freeze).
-- **The idle-exec permit item.** [Vision](../vision.md#product-workflow-direction)
-  also approves "idle exec sessions release their host permit" as a separate
-  design. If that lands, a borrow must require a *held* permit epoch, not
-  merely an active exec record; the implementation brief must state which
-  lands first and re-check this seam.
+- **The idle-exec permit item.** That direction now has its own proposed
+  design ([idle exec sessions](idle-exec-sessions.md)). The three composition
+  rules are fixed here (§9, D15); the broker interface for a joined compile,
+  and which design lands first, belong to whichever implementation brief is
+  approved second.
 - **Hostile same-UID model.** Out of scope, as everywhere in Oxide
   ([architecture](../architecture.md#storage-invariants)).
 - **Platforms.** macOS and Linux only; any platform without a bounded
@@ -789,7 +820,7 @@ judge the shape and a later brief can be scoped.
 | Slice | Content | Depends on |
 | --- | --- | --- |
 | S1 | Pure token codec, ticket codec, limits, ordered validation V1–V10 against injected seams (snapshot, lock probe, ancestor chain). No effects. | this design |
-| S2 | Issuance in every record-holding command (top-level, independent or borrowing): `permit` with its own nonce and optional parent reference, generation directory, descriptor, environment, `STATE_VERSION` bump and hand-off trigger. | S1; installed-binary hand-off gate for any host install |
+| S2 | Issuance in every record-holding command (top-level, independent or borrowing): `nested` with its own nonce and optional parent reference, generation directory, descriptor, environment, `STATE_VERSION` bump and hand-off trigger. | S1; installed-binary hand-off gate for any host install |
 | S3 | Join: admission branch, private build directory and marker, ticket lifecycle, no gate/no origin/no release, summary and status. | S2 |
 | S4 | Closure: gate protocol, ticket decision, `settle`/`unclosed_writers` extension, exactly-once release, recovery. | S3 |
 | S5 | Borrow: `permit_root` propagation, permit reference, covered-record counting, the root fan-out bound, the no-wait rule and diagnostics. | S2, S4 |
@@ -822,11 +853,11 @@ consumer adoption, host settings and real-drive qualification stay separate.
   deterministic two-thread unit test on the lock, not a timing test).
 - Issuance: depth stamping and the level-4 → depth-5 refusal, a fresh
   descriptor per issuer carrying the same generation nonce, `permit_root`
-  propagation through a joined issuer, the `permit` shape for a borrowing
+  propagation through a joined issuer, the `nested` shape for a borrowing
   record, and a borrow starting its own generation counter.
 - Decision functions: depth, both fan-out bounds, ticket state → closed/held,
   the no-wait classification.
-- `STATE_VERSION` fence: previous version readable, new `permit` field
+- `STATE_VERSION` fence: previous version readable, new `nested` field
   defaulted, older reader refuses.
 
 ### 13.2 Native proof (proposed selector `rust:nested-lease`)
@@ -953,8 +984,8 @@ environment; it complements the uncounted diagnostic and cannot replace it.
 **Unsupported (refused, not silently degraded):**
 
 - Join or borrow deeper than the depth bound, beyond either live-writer or
-  live-borrow fan-out bound, without a qualified inherited temporary
-  directory, or from a platform that cannot supply ancestry.
+  live-borrow fan-out bound, or without a qualified inherited temporary
+  directory.
 - `clean`, `outputs adopt|detach|prune`-class mutations, `pool *`,
   `recover-interrupted` and `init`/`new` joining or borrowing; same-checkout
   `clean`/`adopt`/`detach` while nested refuse.
@@ -962,8 +993,9 @@ environment; it complements the uncounted diagnostic and cannot replace it.
   denial paths beyond the stated fallback.
 
 **Falls back rather than refusing:** a token whose pool differs from the
-nested command's selected pool, and any stale, copied, tampered or
-foreign-generation token. These take the existing independent path, with
+nested command's selected pool, any stale, copied, tampered or
+foreign-generation token, an out-of-subtree or `setsid` caller, and a
+platform that cannot supply the bounded ancestry or session query. These take the existing independent path, with
 §6.1's refusal only where an independent wait would be satisfied by the
 ancestor.
 
@@ -972,8 +1004,8 @@ ancestor.
 - The real cost profile: staging plus cases against a 300 s bound; the cold
   nested compile's time and bytes; a real Tauri `dev` session's nested
   calls.
-- Whether [idle exec permit release](../vision.md#product-workflow-direction)
-  lands first and changes the borrow's permit-epoch check.
+- The [idle exec](idle-exec-sessions.md) broker interface for a joined
+  compile, and which of the two designs lands first (§9, D15).
 - Whether `tauri` honours `CARGO_BUILD_BUILD_DIR` at all (already unverified
   for [oxide exec](workflow.md#oxide-exec-cargo-wrapping-tools)).
 

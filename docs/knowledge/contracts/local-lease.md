@@ -166,8 +166,8 @@ field on the control-state record, so a nested `oxide` can join that
 generation or borrow its host permit. The ledger, lease identity, slots,
 accounting and release order are unchanged; the permit is control state, not
 a lease. The [nested lease design](nested-lease.md) owns the rules, the state
-fence and the proof plan, and it awaits independent design review and the
-operator's design freeze.
+fence and the proof plan; its independent design review passed (comment
+`6412288358`) and the operator's design freeze is pending.
 
 ## Commands
 

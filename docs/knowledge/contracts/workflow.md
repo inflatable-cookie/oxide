@@ -578,9 +578,10 @@ root. A new Cargo release needs this check before it joins the table.
    slot or host permit) and one with a different key takes its own slot but
    borrows the outer host permit; the
    [nested lease design](nested-lease.md) owns the proposed token,
-   validation, closure, accounting and deadlock rules and is awaiting
-   independent design review and the operator's design freeze. Nothing above
-   changes until that design is frozen and implemented.
+   validation, closure, accounting, deadlock and idle-exec composition rules;
+   its independent design review passed (comment `6412288358`) and the
+   operator's design freeze is pending. Nothing above changes until that
+   design is frozen and implemented.
 3. Run the freshness gate when the slot's last origin differs.
 4. Run the real Cargo as the leader of a new process group, with:
    - the build directory pointed at the slot;
