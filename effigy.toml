@@ -318,18 +318,49 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # The first conversion's Git ignore prerequisite (oxide#125): the focused
 # `ignore-safety` mode of the #117 fixture, under the same qualified shared
 # supervisor (300 s, 512 MiB monitored scratch, ordinary detach) and one owned
-# 128 MiB scratch image. A `<checkout>/target` link is published only when Git
-# ignores its exact non-directory repository-relative path: trailing-slash,
-# negated, unignored and tracked paths, no repository, no Git, a timeout, a
-# command error and a malformed answer all refuse with the target, receipt and
-# roots unchanged, for explicit adopt, automatic adoption and prepared
-# first-conversion replay; accepted automatic, explicit and nested
-# publications stay invisible to `git status` and `git ls-files`; detach still
-# works. Its native run needs an owner activation before submission. It is not
-# a benchmark, real-drive qualification or an alias for full QA.
+# 128 MiB scratch image. A first conversion publishes owned
+# `<checkout>/target/<member>` links only when Git ignores the exact
+# repository-relative path of the link it is about to publish, and refuses
+# with nothing changed for a rule that re-includes the member, an unignored
+# path, a tracked member, no repository, no Git, a timeout, a command error and
+# a malformed answer, for explicit adopt, automatic adoption and prepared
+# first-conversion replay; a directory-only rule such as `/target/` genuinely
+# covers a profile member inside the real target directory and is accepted
+# (oxide#160, S4b); accepted automatic, explicit and nested publications stay
+# invisible to `git status` and `git ls-files`; detach still works. Its native
+# run needs an owner activation before submission. It is not a benchmark,
+# real-drive qualification or an alias for full QA.
 [tasks."rust:outputs-ignore-safety"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py ignore-safety"
+
+# Exec output inference (oxide#160, S1) plus the profile-layout automatic
+# first conversion (S4b): the focused `exec-inference` mode of the #117/#121
+# fixture, under the same qualified shared proof supervisor (300 s, 512 MiB
+# monitored scratch, ordinary detach) and one owned 128 MiB scratch image
+# attached with `hdiutil -owners on`. A fresh eligible checkout's first leased
+# build creates a real `target` holding owned `debug`/`release` member links
+# into one root, an `exec` with no `--output` derives its member set from that
+# committed receipt and places its tool's build in the root, a repeat reuses
+# the warm slot, the declared `--output` override reaches the same key, an
+# unrecorded member stays real and local, a detached and an unconverted
+# checkout run locally, a spaced checkout path works end to end, and a foreign
+# member link, root drift and a receipt changed while the command waits all
+# refuse with the links, receipt and roots unchanged. Cases 09 (a hand-built
+# legacy whole-target receipt) and 15 (an interrupted tool) are not implemented
+# in this mode and are covered by the source units and the #107/#117 modes.
+# `rust:exec-output-inference:diagnostic` appends `--diagnostic`: the same
+# bounded guard, uncounted, aborting at the first fault and writing a bounded
+# `qualified: false` receipt (it has no keep-going collection). Each run needs
+# its own owner activation, and only a counted run at the exact merge head can
+# pass. Not a benchmark, real-drive qualification or an alias for full QA.
+[tasks."rust:exec-output-inference"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference"
+
+[tasks."rust:exec-output-inference:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference --diagnostic"
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the qualified shared supervisor (`scripts/bounded-test.py` SHA-256

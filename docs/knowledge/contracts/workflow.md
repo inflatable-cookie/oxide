@@ -4195,9 +4195,9 @@ migration and consumer adoption remain separate gates.
   empty `<checkout>/target` directory and keeps every root in either drive
   mode (oxide#124): it is the per-checkout opt-out, and it refuses a foreign
   link or unknown writer custody without change. `status` is read-only.
-- **Automatic first conversion (oxide#121).** A leased command (build, run,
-  test, exec) converts a fresh checkout before its destination is keyed and
-  before its slot is taken, when all of these hold: the command's selected pool is the
+- **Automatic first conversion (oxide#121, profile layout since oxide#160).**
+  A leased command (build, run, test, exec) converts a fresh checkout before
+  its destination is keyed and before its slot is taken, when all of these hold: the command's selected pool is the
   registered permanent drive as selected at its start (not the internal
   fallback; the registration it selected must be permanent, and the volume
   and root in force now must be that same selection, so a switch is a no-op);
@@ -4208,14 +4208,26 @@ migration and consumer adoption remain separate gates.
   with a missing-target-only transition, and releases the barrier before the
   slot is taken. Every fact is rechecked under the admission lock. A concurrent
   receipt, creator, mode or volume change makes it a no-op, and the existing
-  path decides. Everything else keeps today's behaviour and is never touched:
+  path decides. The conversion creates the PROFILE layout (oxide#160, S4b):
+  it runs the same creator an explicit `oxide outputs adopt` runs for a fresh
+  checkout, so it publishes a real `target` directory holding owned
+  `debug`/`release` member links into one new owned root, with the same
+  receipt format and root marker, and every member's Git-ignore prerequisite
+  is checked before the real target directory exists, so a refusal changes
+  nothing at all. It never converts or keeps anything that already exists: an
+  empty or populated directory, a link or a member-shaped entry appearing
+  where a member must be created refuses, and the missing-target-only
+  transition is unchanged. Existing whole-target checkouts are untouched and
+  migrate only through an explicit `oxide outputs adopt`; crash replay keeps
+  the layout a prepared conversion recorded. Everything else keeps today's
+  behaviour and is never touched:
   a real target (empty or not), a foreign or dangling link, a file, an
   unreadable or corrupt receipt (an error, never absence), a detached
   checkout (its receipt stays, so a missing target beside it is excluded),
   ephemeral mode, an absent or unusable drive and internal fallback. A
   preparation that published nothing rolls back to a detached receipt, which
-  excludes it from automatic adoption; `oxide outputs adopt` still converts
-  it. Exactly one stderr notice, `oxide: auto-adopted <target> -> <root> for
+  excludes it from automatic adoption and whose commands then run locally;
+  `oxide outputs adopt` still converts it. Exactly one stderr notice, `oxide: auto-adopted <target> -> <root> for
   permanent-drive outputs; no existing outputs moved`, follows the durable
   commit; replays and later builds print none. A committed adoption persists
   when a later admission, build or cancellation fails. No persisted format
@@ -4400,13 +4412,29 @@ author and reviewer native remain unactivated.
   unchanged. `oxide exec --output <member>` is repeatable and COMPLETE: the
   caller declares the tool's entire profile-output set, only the four member
   forms are accepted, the same validation and eight-total cap apply, and the
-  tool's argv after `--` is untouched. A tool that supplies its own `--target`
-  needs the matching `<triple>/…` declaration in that project's selector; this
-  task changes no consumer selector. A profile checkout with any owned member
-  link refuses a command that declares none before Cargo, naming `oxide exec
-  --output` and `oxide outputs detach`; an unlinked checkout runs it locally as
-  before. Legacy whole-target checkouts keep today's behaviour until explicit
-  migration.
+  tool's argv after `--` is untouched. It is OPTIONAL (oxide#160, S1): an
+  `exec` that declares nothing derives its member set from this checkout's
+  committed receipt instead — exactly the receipt's recorded placements,
+  rendered with the same `outputs-3` lines, so the derived set and an equal
+  declaration share one slot key
+  ([design](exec-output-inference.md)). The derived path is read-only and
+  fail-closed: the member-shaped paths under the real `target` are enumerated
+  with the shipped `migration_members` traversal (member names first, so a
+  real `target/debug` payload is never listed; `file_type()` and `read_link`
+  only, so no link target is resolved or descended), a receipt-selected
+  member must already be this checkout's owned link at the recorded
+  destination (a missing, dangling, real or foreign entry refuses with
+  `oxide outputs adopt` named), a receipt-recorded real member stays `real`
+  with the existing notice, a link or file the receipt does not place
+  refuses, and a checkout placing more than eight members refuses naming
+  `oxide outputs detach`. The derived path reserves nothing, relinks nothing,
+  converts nothing and creates no member. A detached profile receipt plans no
+  destination at all, so its `exec` runs locally through real directories; a
+  legacy whole-target receipt and an unconverted checkout are unchanged (the
+  declaration is not consulted), and a prepared, pruning or pruned receipt
+  refuses. A tool that supplies its own `--target` needs the matching
+  `<triple>/…` declaration in that project's selector; this task changes no
+  consumer selector.
 - **Custody, keys and binding.** Every create, relink, fallback return,
   detach, clean, migration and replay waits for all checkout writers under the
   existing barrier, binding mutex and positive cross-pool closure; an unknown

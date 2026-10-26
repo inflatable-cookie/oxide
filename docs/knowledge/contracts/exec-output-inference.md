@@ -1,13 +1,16 @@
 # Oxide exec output-member inference (proposed design)
 
-Status: proposed design, 2026-10-26, written against Oxide `a7ed41b`. It
-activates nothing: no code, no native run, no tool launch, no consumer or
-project scan, no APFS image, mount or host change, no install, release, tag
-or workflow change, and no live storage cleanup. The operator direction is
-Tom's design-first ruling of 2026-10-26 (Oxide Supervisor lead `d30b48c8`,
-parent direction `d78a7afa` / `a96712b`). The Oxide Supervisor freezes this
-design after the independent exact-head review passes (decision
-`95b3bc63`); no implementation brief exists before that freeze.
+Status: S1 and S4(b) implemented by oxide#160 (queue brief `d2242cbb…`,
+operator decision `566dba6f`, Standard tier with one counted author native
+and the reviewer native waived); S2, S3, S4(c) and S5 are not built and keep
+their own briefs and gates. The design was frozen at Oxide `ce410e57` after
+the independent exact-head review (decision `95b3bc63`) and written against
+`a7ed41b`. The operator direction is Tom's design-first ruling of
+2026-10-26 (Oxide Supervisor lead `d30b48c8`, parent direction `d78a7afa` /
+`a96712b`). As published, this document activated nothing; the implementation
+is in `src/bin/oxide/outputs.rs` (`exec_declaration`, `exec_members`, the
+shared `adopt_profile_from`) and `src/bin/oxide/main.rs`, with the
+`effigy rust:exec-output-inference` proof.
 
 This document is the design for one prerequisite: **`oxide exec` must not
 need `--output`**. Today a checkout that places outputs at profile members
