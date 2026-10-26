@@ -3764,6 +3764,113 @@ def exec_self_test() -> None:
         f"{document['observations']}",
     )
 
+    # 7e. Runtime binding of every case body (oxide#164 review). A bare-name call
+    #     in a case must resolve to a module global, the `exec_inference` scope or
+    #     a name the body itself binds. The counterfactual is the reviewed case 23
+    #     calling a helper that does not exist (`external_whole_whole_target`):
+    #     that is caught here, with no native activation.
+    module_names = set(exec_inference.__globals__)
+    scope_names = set(exec_inference.__code__.co_cellvars) | set(
+        exec_inference.__code__.co_varnames
+    )
+    for case, _requires, _text in EXEC_CASES:
+        node = next(
+            inner
+            for inner in inference.body
+            if isinstance(inner, _ast.FunctionDef) and inner.name == body_map[case]
+        )
+        bound = module_names | scope_names | set(dir(__builtins__ if isinstance(__builtins__, dict) else __builtins__)) | {"__builtins__"}
+        for inner in _ast.walk(node):
+            if isinstance(inner, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                bound.add(inner.name)
+                for argument in (
+                    list(inner.args.args)
+                    + list(inner.args.kwonlyargs)
+                    + [inner.args.vararg, inner.args.kwarg]
+                ):
+                    if argument is not None:
+                        bound.add(argument.arg)
+            elif isinstance(inner, _ast.Name) and isinstance(
+                inner.ctx, (_ast.Store, _ast.Del)
+            ):
+                bound.add(inner.id)
+            elif isinstance(inner, _ast.ExceptHandler) and inner.name:
+                bound.add(inner.name)
+            elif isinstance(inner, (_ast.Import, _ast.ImportFrom)):
+                for alias in inner.names:
+                    bound.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(inner, _ast.comprehension):
+                for target in _ast.walk(inner.target):
+                    if isinstance(target, _ast.Name):
+                        bound.add(target.id)
+        unbound = sorted(
+            {
+                inner.func.id
+                for inner in _ast.walk(node)
+                if isinstance(inner, _ast.Call)
+                and isinstance(inner.func, _ast.Name)
+                and inner.func.id not in bound
+            }
+        )
+        expect(
+            not unbound,
+            f"{body_map[case]} calls helpers that do not exist at runtime: {unbound}",
+        )
+
+    # 7f. Failure cleanup obeys the same retention gate as the clean tail: after
+    #     a custody abort (or with an unclosed child) it must NOT detach the run's
+    #     image, and the collection records the retention so the receipt matches
+    #     the resource that is actually still attached. A clean collection still
+    #     detaches through Proof.detach.
+    class CleanupProof:
+        def __init__(self) -> None:
+            self.root = tempfile.mkdtemp(prefix="oxide-cleanup-check.")
+            self.mount = "/"
+            self.unclosed: set = set()
+            self.detached: list[str] = []
+
+        def detach(self) -> None:
+            self.detached.append(self.mount)
+
+    aborted_cleanup = CleanupProof()
+    held = Collection()
+    held.aborted = "case 21: Oxide reported unconfirmed writer closure"
+    message = cleanup_after_failure(aborted_cleanup, held)
+    expect(
+        aborted_cleanup.detached == [],
+        f"failure cleanup detached the image after a custody abort: {message}",
+    )
+    expect("retained" in message, f"{message}")
+    expect(
+        held.detached.startswith("retained:") and "aborted" in held.detached,
+        f"the receipt's detach disposition does not match the retention: {held.detached}",
+    )
+    shutil.rmtree(aborted_cleanup.root, ignore_errors=True)
+
+    unclosed_cleanup = CleanupProof()
+    unclosed_cleanup.unclosed = {"4242"}
+    unclosed_record = Collection()
+    message = cleanup_after_failure(unclosed_cleanup, unclosed_record)
+    expect(
+        unclosed_cleanup.detached == [],
+        f"failure cleanup detached the image with an unclosed child: {message}",
+    )
+    expect("unclosed" in message, f"{message}")
+    shutil.rmtree(unclosed_cleanup.root, ignore_errors=True)
+
+    clean_cleanup = CleanupProof()
+    clean_record = Collection()
+    message = cleanup_after_failure(clean_cleanup, clean_record)
+    expect(
+        clean_cleanup.detached == ["/"],
+        f"a clean failure cleanup did not detach: {message}",
+    )
+    expect(
+        not clean_record.detached.startswith("retained:"),
+        f"a clean failure cleanup recorded a retention: {clean_record.detached}",
+    )
+    shutil.rmtree(clean_cleanup.root, ignore_errors=True)
+
     # 9. The receipt document itself: `qualified: false`, counted outcomes,
     #    a skipped case never counted as completed, and the limitation stated.
     document = diagnostic_document(
@@ -5203,7 +5310,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         # checkout, and the derivation's foreign-member refusal is preserved
         # before the tool runs.
         external_whole = fresh_checkout(proof, root, "external-whole-target")
-        external_whole_root = external_whole_whole_target(
+        external_whole_root = legacy_whole_target(
             proof, pool, mount, external_whole, "23 external whole-target fixture"
         )
         external_whole_target = os.path.join(external_whole, "target")
@@ -5477,6 +5584,7 @@ def exec_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     recorded no failure and did not abort, and always writes its bounded receipt
     — including when the run fails or aborts before the first case ran."""
     collection = Collection()
+    proof.collection = collection
     failure: BaseException | None = None
     try:
         exec_inference(proof, repo, diagnostic, collection)
@@ -5970,17 +6078,29 @@ def record(name: str, contents: str) -> None:
         handle.write(contents)
 
 
-def cleanup_after_failure(proof: Proof) -> str:
+def cleanup_after_failure(proof: Proof, collection: "Collection | None" = None) -> str:
     """Ordinary detach of this run's own mount after a failure, through
     Proof.detach's checks: refused while any child is unclosed, never forced,
     and bounded by the proof's own clock. A closed process group is not taken
-    as a detached device; the mount path is checked afterwards."""
+    as a detached device; the mount path is checked afterwards.
+
+    It applies the SAME retention gate as the clean tail (oxide#164 review): a
+    latched abort, a recorded failure or an unclosed child means the image and
+    its writers are not ours to touch, so failure cleanup retains the resource
+    and records the refusal in the collection's detach disposition instead of
+    detaching behind a custody abort. `collection` is `None` for a mode that has
+    no keep-going collection, which keeps that mode's shipped behaviour."""
     # The alarm would cut the cleanup short; the proof clock still bounds it.
     signal.setitimer(signal.ITIMER_REAL, 0)
     image = os.path.join(proof.root, "volume.sparseimage")
     mount = proof.mount
     if not mount:
         return f"no mount attached by this run (image {image})"
+    if collection is not None:
+        refusal = detach_decision(collection, proof.unclosed)
+        if refusal is not None:
+            collection.detached = f"retained: {refusal}"
+            return f"retained {mount} (image {image}): {refusal}"
     try:
         proof.detach()
     except BaseException as error:
@@ -6065,7 +6185,7 @@ def main() -> int:
     try:
         scenario(proof, repo)
     except BaseException as failure:
-        cleanup = cleanup_after_failure(proof)
+        cleanup = cleanup_after_failure(proof, getattr(proof, "collection", None))
         record(
             "result.txt",
             f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\n"
