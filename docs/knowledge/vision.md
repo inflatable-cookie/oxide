@@ -159,6 +159,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
 ### Storage
 
+- **Barge owns drive management** (approved, staged): volume registration and selection, placement and fallback, owned roots, pruning and scratch move to the separate Barge product ([inflatable-cookie/barge](https://github.com/inflatable-cookie/barge)), which Oxide will use as a library. Oxide keeps Cargo, slots, leases, recipes, freshness and `exec`. Until each part moves, Oxide's current implementation stays authoritative.
 - **Pools are budget-only:** a soft admission budget, whole-idle-slot eviction
   and the host-reserve watchdog, with no OS-enforced cap.
 - **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
