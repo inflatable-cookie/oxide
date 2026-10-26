@@ -5415,9 +5415,12 @@ pub fn exec_declaration(
 
 /// Classify every candidate profile member of a profile-layout checkout for a
 /// derived `exec` plan. Only this checkout's own owned links at the receipt's
-/// committed destinations are accepted; a real member the receipt keeps local
-/// is planned `real`; everything else that occupies a member-shaped path
-/// refuses before Cargo, with the link, receipt and root unchanged.
+/// committed destinations are accepted, plus the two absent-link shapes the
+/// permanent-mode binding repairs (an absent member directory beneath a
+/// verified root, oxide#162, and an absent member link of a verified root whose
+/// real `target` directory went with it, oxide#165); a real member the receipt
+/// keeps local is planned `real`; everything else that occupies a member-shaped
+/// path refuses before Cargo, with the link, receipt and root unchanged.
 fn exec_members(
     context: &Context,
     receipt: &Receipt,
@@ -5469,6 +5472,21 @@ fn exec_members(
                     let destination = member_destination(&desired.root, name);
                     match &state {
                         TargetState::OwnedLink(root) if root == &destination => {
+                            members.push(name.clone());
+                        }
+                        // oxide#165: the member link is positively ABSENT
+                        // while its committed destination's root fully
+                        // verifies — the shape a deleted `<checkout>/target`
+                        // directory leaves, because the member links live
+                        // inside it. The permanent-mode binding recreates that
+                        // real directory and publishes this member through the
+                        // unchanged transition (which creates the member
+                        // directory inside the root first). A missing,
+                        // unverified or other root keeps the refusal below.
+                        TargetState::Missing
+                            if permanent
+                                && missing_member_of_verified_root(context, receipt, desired) =>
+                        {
                             members.push(name.clone());
                         }
                         // The only absent-directory case a derived exec may
@@ -5531,6 +5549,22 @@ fn exec_members(
         }
     }
     Ok(members)
+}
+
+/// Whether a member link is positively ABSENT while the receipt's committed
+/// placement for it is a root that fully verifies right now (oxide#165). This
+/// is the shape a deleted `<checkout>/target` directory leaves: the member
+/// links lived inside it, so they are gone with it, while the owned root, its
+/// marker, its nonce and its payload are untouched. The permanent-mode binding
+/// recreates the target directory and publishes such a member; nothing is
+/// replaced or followed here. A missing, another-nonce or unverified root
+/// fails this check and keeps the existing refusal.
+fn missing_member_of_verified_root(
+    context: &Context,
+    receipt: &Receipt,
+    wanted: &Selected,
+) -> bool {
+    check_bound_root(context, receipt.generation, wanted).is_ok()
 }
 
 /// Whether this member link's only defect is its ABSENT destination directory
@@ -9409,6 +9443,90 @@ mod tests {
             Bind::Refuse(reason) => panic!("the created member refused a second binding: {reason}"),
             Bind::Wait => panic!("the created member waited"),
         }
+    }
+
+    /// oxide#165: a converted checkout's whole `target` directory was deleted,
+    /// so every member link is positively absent while the owned root verifies.
+    /// The derived `exec` plans the receipt's members and the binding recreates
+    /// the real directory and republishes the pair into the same root; an
+    /// unverified root still refuses and creates nothing.
+    #[test]
+    fn exec_plans_deleted_member_links_of_the_verified_owned_root() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        register(&fixture, DriveMode::Permanent);
+        let context = fixture.context();
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (committed, selected, _) = adopt_profile(&context, receipt).unwrap();
+        let root = selected.root().to_path_buf();
+        fs::remove_dir_all(fixture.checkout.join("target")).unwrap();
+        assert_eq!(
+            target_state(&fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Missing
+        );
+        assert_eq!(derived_exec(&fixture), ["debug", "release"]);
+        let declaration =
+            exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            plan.members.iter().all(|member| member.selected.is_some()),
+            "the derived plan did not key the owned members"
+        );
+        let store = pool_store(&fixture.root.join("pool"));
+        let outcome = match bind_profile(&context, &store, 0, &committed, Some(&plan), true) {
+            Bind::Bound(outcome) => outcome,
+            Bind::Refuse(reason) => panic!("a deleted target directory refused: {reason}"),
+            Bind::Wait => panic!("a deleted target directory waited"),
+        };
+        assert_eq!(outcome.root.as_deref(), Some(root.as_path()));
+        let target = fixture.checkout.join("target");
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "the binding did not recreate a real target directory"
+        );
+        for member in ["debug", "release"] {
+            assert_eq!(
+                fs::read_link(target.join(member)).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
+            assert!(
+                root.join(member).is_dir(),
+                "{member}: the member directory is not real"
+            );
+        }
+
+        // Control: with the root's marker gone the root is not verified, so the
+        // absent links still refuse and nothing is created.
+        let unverified = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        register(&unverified, DriveMode::Permanent);
+        let unverified_context = unverified.context();
+        let unverified_receipt = Receipt::first_with(
+            &unverified.checkout,
+            &unverified_context.checkout_id,
+            LayoutKind::Profile,
+        );
+        let (_committed, unverified_selected, _) =
+            adopt_profile(&unverified_context, unverified_receipt).unwrap();
+        fs::remove_dir_all(unverified.checkout.join("target")).unwrap();
+        fs::remove_file(unverified_selected.root().join(MARKER)).unwrap();
+        let refused =
+            exec_declaration(Some(&unverified.control), &unverified.checkout, None).unwrap_err();
+        assert!(refused.contains("target/debug"), "{refused}");
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        assert_eq!(
+            target_state(&unverified.checkout, &unverified_context.checkout_id).unwrap(),
+            TargetState::Missing,
+            "a refused derived exec created the target directory"
+        );
     }
 
     /// The same shape with a keyed plan whose nonce the root does not carry: a
