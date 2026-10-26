@@ -113,6 +113,7 @@ const GIT_REPOSITORY_ENVIRONMENT: [&str; 8] = [
 const USAGE: &str = "\
 usage: oxide outputs plan      effect-free JSON plan for this checkout (oxide.outputs.plan/2)
        oxide outputs adopt     explicitly convert <checkout>/target to an owned link
+                               (or upgrade a committed version-1 whole-target receipt)
        oxide outputs detach    restore a real <checkout>/target directory; roots are kept
        oxide outputs status    read-only state of this checkout's owned outputs
        oxide outputs prune     explicitly prune roots whose checkout is gone
@@ -1628,13 +1629,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
     let target = context.target()?;
     let state = receipt
         .as_ref()
-        .map_or("none", |receipt| match receipt.state {
-            ReceiptState::Committed => "committed",
-            ReceiptState::Prepared => "prepared",
-            ReceiptState::Detached => "detached",
-            ReceiptState::Pruned => "pruned",
-            ReceiptState::Pruning => "pruning",
-        });
+        .map_or("none", |receipt| receipt_state_label(receipt.state));
     let next_generation = receipt
         .as_ref()
         .map_or(1, |receipt| receipt.generation.saturating_add(1));
@@ -1938,7 +1933,9 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-/// `oxide outputs adopt`: the explicit first conversion and later relinks.
+/// `oxide outputs adopt`: the explicit first conversion and later relinks, and
+/// the one command that upgrades a committed version-1 whole-target receipt
+/// (oxide#163) by running the shipped layout migration transaction.
 fn adopt_command() -> Result<u8, String> {
     let context = Context::open()?;
     let mode = context.mode()?;
@@ -1971,7 +1968,7 @@ fn adopt_command() -> Result<u8, String> {
         // receipt can be published: an existing receipt may need a replay
         // write. A target adopt refuses outright with no receipt changes
         // nothing, so it initializes nothing.
-        if read_receipt(&control, &context.workspace, &context.checkout_id)?.is_some()
+        if read_receipt_for_adopt(&control, &context.workspace, &context.checkout_id)?.is_some()
             || !matches!(
                 context.target()?,
                 TargetState::RealNonEmpty | TargetState::Foreign
@@ -1980,7 +1977,7 @@ fn adopt_command() -> Result<u8, String> {
             crate::prune::ensure_ready(&internal, &context.workspace)?;
         }
         let _admission = store::publication_guard(&control)?;
-        let stored = read_receipt(&control, &context.workspace, &context.checkout_id)?;
+        let stored = read_receipt_for_adopt(&control, &context.workspace, &context.checkout_id)?;
         if let Some(receipt) = stored.as_ref() {
             if receipt.transition.is_some() {
                 let replayed = replay_migration(&context, &control, receipt.clone())?;
@@ -7102,9 +7099,10 @@ fn stop_unknown(prepared: &Prepared, reason: &str) -> String {
 }
 
 /// Whether a receipt reader accepts the version-1 whole-target document.
-/// Prune is the only reader that does (oxide#152); every other path keeps
-/// refusing it, so decoding never widens a bind, adopt, detach, clean,
-/// replay, status or plan format.
+/// Prune reads any valid document (oxide#152) and explicit adopt reads a
+/// committed one to upgrade it (oxide#163); every other path keeps refusing
+/// it, so decoding never widens a bind, detach, clean, replay, status or plan
+/// format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LegacyReceiptReading {
     /// Ordinary readers refuse a version-1 receipt, as before oxide#152.
@@ -7112,10 +7110,26 @@ enum LegacyReceiptReading {
     /// Prune readers decode a valid version-1 receipt into the current
     /// in-memory whole-target form. Reading writes nothing.
     Read,
+    /// Explicit `oxide outputs adopt` decodes a valid COMMITTED version-1
+    /// receipt into the current in-memory whole-target form so its shipped
+    /// whole-target-to-profile migration can run. A noncommitted version-1
+    /// document stays refused, and reading still writes nothing.
+    Upgrade,
 }
 
-/// Only the version field, so an ordinary reader can refuse a version-1
-/// document before decoding the rest of it.
+/// The lowercase state name a receipt document carries.
+fn receipt_state_label(state: ReceiptState) -> &'static str {
+    match state {
+        ReceiptState::Committed => "committed",
+        ReceiptState::Prepared => "prepared",
+        ReceiptState::Detached => "detached",
+        ReceiptState::Pruned => "pruned",
+        ReceiptState::Pruning => "pruning",
+    }
+}
+
+/// Only the version field, so a reader can decide about a version-1 document
+/// before decoding the rest of it.
 #[derive(Deserialize)]
 struct ReceiptVersion {
     version: String,
@@ -7129,9 +7143,25 @@ fn read_receipt(
     read_receipt_with(LegacyReceiptReading::Refuse, control, checkout, checkout_id)
 }
 
+/// Read one checkout's receipt for explicit `oxide outputs adopt`, which is
+/// the ONE command that upgrades a committed version-1 whole-target receipt
+/// (oxide#163). Every other reader keeps refusing it.
+fn read_receipt_for_adopt(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+) -> Result<Option<Receipt>, String> {
+    read_receipt_with(
+        LegacyReceiptReading::Upgrade,
+        control,
+        checkout,
+        checkout_id,
+    )
+}
+
 /// Read one checkout's receipt without creating or repairing anything.
 /// `legacy` decides whether a valid version-1 whole-target document is read or
-/// refused; both readers keep the byte limit, the unknown-field strictness and
+/// refused; every reader keeps the byte limit, the unknown-field strictness and
 /// the checkout identity check unchanged.
 fn read_receipt_with(
     legacy: LegacyReceiptReading,
@@ -7153,19 +7183,31 @@ fn read_receipt_with(
             path.display()
         ));
     }
-    if legacy == LegacyReceiptReading::Refuse {
-        let version: ReceiptVersion = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
-        if version.version == LEGACY_RECEIPT_VERSION {
-            return Err(format!(
-                "{} is invalid: unsupported version {LEGACY_RECEIPT_VERSION:?} of the owned-output receipt",
-                path.display()
-            ));
-        }
+    let version: ReceiptVersion = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
+    let legacy_document = version.version == LEGACY_RECEIPT_VERSION;
+    if legacy_document && legacy == LegacyReceiptReading::Refuse {
+        return Err(format!(
+            "{} is invalid: unsupported version {LEGACY_RECEIPT_VERSION:?} of the owned-output receipt; run `oxide outputs adopt` to upgrade a committed version-1 receipt",
+            path.display()
+        ));
     }
     let receipt: Receipt = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
     receipt.validate(checkout, checkout_id)?;
+    // A version-1 document records no transition journal, so only its
+    // committed form can be upgraded: a detached or prepared one stays
+    // refused and nothing is rewritten.
+    if legacy_document
+        && legacy == LegacyReceiptReading::Upgrade
+        && receipt.state != ReceiptState::Committed
+    {
+        return Err(format!(
+            "{} is invalid: only a committed version-1 receipt can be upgraded, and this one is {}. Nothing was changed",
+            path.display(),
+            receipt_state_label(receipt.state)
+        ));
+    }
     Ok(Some(receipt))
 }
 
@@ -8459,16 +8501,21 @@ mod tests {
         document
     }
 
-    /// Publish a raw receipt document into the fixture's control directory.
-    fn write_receipt_document(fixture: &Fixture, document: &serde_json::Value) {
-        let path = receipt_path(&fixture.control, &context_id(fixture));
+    /// Publish a raw receipt document into a control directory.
+    fn write_receipt_document_at(fixture: &Fixture, control: &Path, document: &serde_json::Value) {
+        let path = receipt_path(control, &context_id(fixture));
         fs::write(&path, serde_json::to_vec_pretty(document).unwrap()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    /// Publish a raw receipt document into the fixture's own control directory.
+    fn write_receipt_document(fixture: &Fixture, document: &serde_json::Value) {
+        write_receipt_document_at(fixture, &fixture.control, document);
+    }
+
     /// A receipt's exact bytes and the metadata a read must never touch.
-    fn receipt_proof(fixture: &Fixture) -> (Vec<u8>, u64, u64, u32, i64) {
-        let path = receipt_path(&fixture.control, &context_id(fixture));
+    fn receipt_proof_at(control: &Path, checkout_id: &str) -> (Vec<u8>, u64, u64, u32, i64) {
+        let path = receipt_path(control, checkout_id);
         let bytes = fs::read(&path).unwrap();
         let metadata = fs::symlink_metadata(&path).unwrap();
         (
@@ -8478,6 +8525,12 @@ mod tests {
             metadata.mode(),
             metadata.mtime(),
         )
+    }
+
+    /// A receipt's exact bytes and metadata in the fixture's own control
+    /// directory.
+    fn receipt_proof(fixture: &Fixture) -> (Vec<u8>, u64, u64, u32, i64) {
+        receipt_proof_at(&fixture.control, &context_id(fixture))
     }
 
     /// oxide#152: prune reads a valid version-1 whole-target receipt as the
@@ -8552,6 +8605,289 @@ mod tests {
         assert_eq!(transition.state, ReceiptState::Prepared);
         assert!(transition.prepared_ref().is_some());
         assert!(transition.current().is_some());
+    }
+
+    /// oxide#163: explicit `oxide outputs adopt` is the ONE command that
+    /// upgrades a committed version-1 whole-target receipt, and it does so by
+    /// running the shipped whole-target-to-profile migration transaction. The
+    /// same bytes stay refused by every other reader (the pre-#163 arm is the
+    /// counterfactual), and reading the receipt writes nothing.
+    #[test]
+    fn an_explicit_adopt_upgrades_a_committed_version_one_receipt() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let id = context.checkout_id.clone();
+        // A pool whose control directory is the one this checkout's receipt
+        // lives in, so the binding path reads exactly these bytes.
+        let store = pool_store(&fixture.root.join("pool"));
+        let control = store.owner_control().to_path_buf();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        make_root_one_marker(&fixture, &legacy);
+        // Payload the upgrade must neither move, copy nor delete.
+        fs::create_dir_all(root.join("debug")).unwrap();
+        fs::write(root.join("debug").join("old-binary"), b"old").unwrap();
+        fs::write(root.join("sentinel"), b"root").unwrap();
+        write_receipt_document_at(
+            &fixture,
+            &control,
+            &version_one_receipt(&fixture, "committed", Some(&root)),
+        );
+        let before = receipt_proof_at(&control, &id);
+
+        // The counterfactual: without the upgrade arm the committed document
+        // is the pre-#163 refusal, which now names the one command that fixes
+        // it.
+        let counterfactual = read_receipt_with(
+            LegacyReceiptReading::Refuse,
+            &control,
+            &fixture.checkout,
+            &id,
+        )
+        .unwrap_err();
+        assert!(
+            counterfactual.contains("unsupported version"),
+            "{counterfactual}"
+        );
+        assert!(
+            counterfactual.contains("oxide outputs adopt"),
+            "{counterfactual}"
+        );
+        // bind (every leased build), status, detach and clean all read through
+        // the ordinary reader, so each still refuses and names adopt; two of
+        // them are called directly here and the CLI cases are in the native
+        // proof. The derived-exec repair path changes nothing for a receipt it
+        // cannot read.
+        let refused = read_receipt(&control, &fixture.checkout, &id).unwrap_err();
+        assert!(refused.contains("unsupported version"), "{refused}");
+        assert!(refused.contains(LEGACY_RECEIPT_VERSION), "{refused}");
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        let status = output_status_lines(&Context::new(
+            Some(control.clone()),
+            fixture.checkout.clone(),
+        ))
+        .unwrap_err();
+        assert!(status.contains("oxide outputs adopt"), "{status}");
+        let bind = match bind_for_command(&store, &fixture.checkout, 0, None, None, false) {
+            Err(reason) => reason,
+            Ok(_) => panic!("binding accepted a version-1 receipt"),
+        };
+        assert!(bind.contains("oxide outputs adopt"), "{bind}");
+        assert_eq!(receipt_proof_at(&control, &id), before);
+
+        // The upgrade arm reads the same bytes into the current in-memory
+        // whole-target form, and reading is still not a migration.
+        let upgraded = read_receipt_for_adopt(&control, &fixture.checkout, &id)
+            .unwrap()
+            .expect("the committed version-1 receipt was not read for adopt");
+        assert_eq!(upgraded.version, RECEIPT_VERSION);
+        assert_eq!(upgraded.layout(), LayoutKind::WholeTarget);
+        assert_eq!(upgraded.state, ReceiptState::Committed);
+        assert_eq!(upgraded.generation, legacy.generation);
+        assert!(upgraded
+            .selected()
+            .is_some_and(|selected| selected.root() == root.as_path()));
+        assert!(upgraded
+            .selected()
+            .is_some_and(|selected| selected.nonce().is_none()));
+        assert!(upgraded.transition.is_none());
+        assert_eq!(receipt_proof_at(&control, &id), before);
+
+        // The shipped migration transaction commits the profile layout and
+        // publishes the current receipt.
+        let (migrated, selected, converted) = migrate_layout(&context, &control, upgraded).unwrap();
+        assert!(converted);
+        assert_eq!(migrated.version, PROFILE_RECEIPT_VERSION);
+        assert_eq!(migrated.layout(), LayoutKind::Profile);
+        assert_eq!(migrated.state, ReceiptState::Committed);
+        assert!(migrated.transition.is_none());
+        assert_eq!(migrated.generation, legacy.generation + 1);
+        assert_eq!(selected.root(), root.as_path());
+        assert_eq!(selected.nonce().map(str::len), Some(32));
+        let marker = read_marker(&root).unwrap();
+        assert_eq!(marker.version, MARKER_VERSION);
+        assert_eq!(marker.nonce(), selected.nonce());
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(receipt_path(&control, &id)).unwrap()).unwrap();
+        assert_eq!(document["version"], PROFILE_RECEIPT_VERSION);
+        assert_eq!(document["layout"], "profile");
+        // The target is a real directory of member links into the SAME root,
+        // and the old payload is visible and intact through it.
+        let target = context.link();
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        for member in ["debug", "release"] {
+            assert_eq!(
+                fs::read_link(target.join(member)).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
+        }
+        assert_eq!(
+            fs::read(target.join("debug").join("old-binary")).unwrap(),
+            b"old"
+        );
+        assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"root");
+        assert!(!root
+            .join(format!("{MARKER}.oxide-old-{}", migrated.generation))
+            .exists());
+        // The receipt is now ordinary for every reader, and a replay of the
+        // finished migration is a no-op.
+        let reread = read_receipt(&control, &fixture.checkout, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread, migrated);
+        assert_eq!(
+            replay_migration(&context, &control, migrated.clone()).unwrap(),
+            migrated
+        );
+    }
+
+    /// oxide#163: a version-1 document that is not committed, carries a
+    /// successor-only surface, an unreadable identity or an unknown field is
+    /// never upgraded on explicit adopt, and its bytes never change.
+    #[test]
+    fn an_explicit_adopt_refuses_noncommitted_or_contradictory_version_one_receipts() {
+        let fixture = Fixture::new();
+        let root = fixture.local().root().to_path_buf();
+        let id = context_id(&fixture);
+
+        // A valid detached version-1 receipt: nothing to migrate from.
+        write_receipt_document(&fixture, &version_one_receipt(&fixture, "detached", None));
+        let before = receipt_proof(&fixture);
+        let refused = read_receipt_for_adopt(&fixture.control, &fixture.checkout, &id).unwrap_err();
+        assert!(
+            refused.contains("only a committed version-1 receipt can be upgraded"),
+            "{refused}"
+        );
+        assert!(refused.contains("detached"), "{refused}");
+        assert_eq!(receipt_proof(&fixture), before);
+
+        // A valid prepared version-1 receipt: its own transition is not this
+        // command's migration.
+        let mut prepared = version_one_receipt(&fixture, "prepared", Some(&root));
+        prepared["prepared"] = serde_json::json!({
+            "generation": 2,
+            "to": {"kind": "local", "root": root, "generation": 2},
+            "link": fixture.checkout.join("target"),
+        });
+        write_receipt_document(&fixture, &prepared);
+        let refused = read_receipt_for_adopt(&fixture.control, &fixture.checkout, &id).unwrap_err();
+        assert!(
+            refused.contains("only a committed version-1 receipt can be upgraded"),
+            "{refused}"
+        );
+        assert!(refused.contains("prepared"), "{refused}");
+
+        // Successor-only surfaces and unknown fields are contradictory, not
+        // merely old.
+        let mut layout = version_one_receipt(&fixture, "committed", Some(&root));
+        layout["layout"] = serde_json::json!("profile");
+        let mut reserved = version_one_receipt(&fixture, "committed", Some(&root));
+        reserved["reserved"] = serde_json::json!({
+            "id": "reservation",
+            "nonce": "a".repeat(32),
+            "kind": "local",
+            "root": root,
+            "generation": 2,
+            "created_ms": 1,
+        });
+        let mut nonce = version_one_receipt(&fixture, "committed", Some(&root));
+        nonce["selected"]["nonce"] = serde_json::json!("a".repeat(32));
+        let mut unknown = version_one_receipt(&fixture, "committed", Some(&root));
+        unknown["surprise"] = serde_json::json!(true);
+        let mut other = version_one_receipt(&fixture, "committed", Some(&root));
+        other["checkout"] = serde_json::json!("/somewhere/another-checkout");
+        for document in [&layout, &reserved, &nonce, &unknown] {
+            write_receipt_document(&fixture, document);
+            let before = receipt_proof(&fixture);
+            let refused =
+                read_receipt_for_adopt(&fixture.control, &fixture.checkout, &id).unwrap_err();
+            assert!(
+                refused.contains("is invalid"),
+                "{document} was read: {refused}"
+            );
+            assert_eq!(receipt_proof(&fixture), before, "{document}");
+        }
+        // An unreadable identity is refused by the same checkout check every
+        // reader applies, and nothing is rewritten.
+        write_receipt_document(&fixture, &other);
+        let before = receipt_proof(&fixture);
+        let refused = read_receipt_for_adopt(&fixture.control, &fixture.checkout, &id).unwrap_err();
+        assert!(refused.contains("another checkout"), "{refused}");
+        assert_eq!(receipt_proof(&fixture), before);
+    }
+
+    /// oxide#163: an upgrade stopped at any recorded phase leaves the P0
+    /// journal in the successor format, so ordinary readers see a pending
+    /// migration and the next explicit adopt replays the same exact phases.
+    #[test]
+    fn a_version_one_upgrade_replays_every_recorded_crash_phase() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        for boundary in [
+            "migration-p0",
+            "migration-staged",
+            "migration-marker",
+            "migration-backed-up",
+            "migration-swapped",
+            "migration-p4",
+        ] {
+            let (fixture, legacy) = legacy_checkout();
+            let context = fixture.context();
+            let root = legacy.selected().unwrap().root().to_path_buf();
+            make_root_one_marker(&fixture, &legacy);
+            write_receipt_document(
+                &fixture,
+                &version_one_receipt(&fixture, "committed", Some(&root)),
+            );
+            let upgraded =
+                read_receipt_for_adopt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                    .unwrap()
+                    .expect("the committed version-1 receipt was not read for adopt");
+            std::env::set_var(CRASH_ENVIRONMENT, boundary);
+            let stopped = migrate_layout(&context, &fixture.control, upgraded);
+            std::env::remove_var(CRASH_ENVIRONMENT);
+            assert!(
+                stopped.is_err(),
+                "{boundary}: the injected stop did not stop"
+            );
+            // No version-1 document survives the P0 write: the journal is the
+            // successor format, so an ordinary reader reports a pending
+            // migration instead of an unsupported version.
+            let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .expect("the P0 journal is not readable by an ordinary reader");
+            assert_eq!(stored.version, PROFILE_RECEIPT_VERSION, "{boundary}");
+            assert!(stored.transition.is_some(), "{boundary}");
+            // The next explicit adopt replays the recorded identities only.
+            let done = replay_migration(&context, &fixture.control, stored).unwrap();
+            assert_eq!(done.layout(), LayoutKind::Profile, "{boundary}");
+            assert!(done.transition.is_none(), "{boundary}");
+            assert_eq!(done.generation, legacy.generation + 1, "{boundary}");
+            let target = context.link();
+            assert!(
+                fs::symlink_metadata(&target).unwrap().is_dir(),
+                "{boundary}"
+            );
+            for member in ["debug", "release"] {
+                assert_eq!(
+                    fs::read_link(target.join(member)).unwrap(),
+                    member_destination(&root, member),
+                    "{boundary}: {member}"
+                );
+            }
+            assert!(
+                read_marker(&root).unwrap().nonce().is_some(),
+                "{boundary}: the root marker was not upgraded"
+            );
+            assert!(!fixture
+                .checkout
+                .join(format!("{BACKUP_PREFIX}{}", done.generation))
+                .exists());
+            assert!(!fixture
+                .checkout
+                .join(format!("{STAGE_PREFIX}{}", done.generation))
+                .exists());
+        }
     }
 
     /// A committed profile receipt over the fixture's own local root: every
