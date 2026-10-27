@@ -10,6 +10,33 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 13** binds the Oxide Supervisor's design-review disposition
+(2026-10-27, Queue brief v4) in three places. **Case 19 E now has one exact,
+reachable matched boundary**: the existing debug-only
+`OXIDE_TEST_PAUSE=keyed:<gate>` point (debug build only, `<gate>` under the
+supervisor scratch), with subject and control running the *same* guarded command,
+checkout and fixture transitions through it, and differing in exactly one stated
+variable — the receipt/journal state **at the gate baseline** (`Prepared` planted
+while paused versus `Detached`). Because the baseline is taken at the gate, the
+plant's own writes and its id are outside the measured window, and the oracle is a
+**field-scoped delta** over a named set (receipt bytes, member/target links and
+readlinks, siblings, markers, reservations, registry root entries, `cleans`, the
+`waiters/` listing and `next_id`); the record phase, `next_use`, origin and the
+checkout's local `target/` are outside it, so the successful control's later
+`mark_spawning`/Cargo effects cannot enter the delta. The counterfactual is
+explicit (`cleans` +1 and `next_id` +2 would falsify it), premise 6 (owned images)
+is recorded as not applicable to E, and **no new pause seam is proposed** (the
+earlier `leased:<gate>` idea is withdrawn). **The reserve/prune evidence is
+split**: the native prune case runs on the **internal directory-budget pool** with
+a fixture-driven `OXIDE_POOL_CAP` and one-use `Only` protection, the removable
+side asserts only its shipped refusal, and the removable reserve-prune protection
+is explicitly **not** claimed natively — it is covered by pure checks and unit
+regressions with injected registration and size facts plus the existing removable
+proofs, and the brief's requirement stays with the owner. **The bound is labelled
+provisional**: 480 s / 512 MiB is an unmeasured estimate, the implementation brief
+fixes the bound after the fixed script's first separately activated uncounted
+diagnostic, and any final bound above 300 s requires Tom's separate ruling, which
+this design does not grant.
 **Revision 12** answers the CHANGES REQUIRED design review of `3df605d`
 (comment `6454298750`, 2026-10-27) with two corrections. **Case 19's part E
 oracle is reachable and honest**: a guarded build that reaches binding has
@@ -209,8 +236,9 @@ class-scoped policy purely, and returns the reserve-path protection requirement
 plus its wiring change for a scoped ruling. **Byte pressure is stated correctly**
 for retries: a removable pool's effective cap is the recorded registration cap,
 not `OXIDE_POOL_CAP`, so the retry premises use the effective cap. The declared
-bound moves to 480 s with a 430 s cutoff for the added older-artifact staging
-(~296 s typical / ~370 s upper, ~298 MiB), put to the freeze for acceptance.
+bound moves provisionally to 480 s with a proposed ~430 s cutoff for the added
+older-artifact staging (~296 s typical / ~370 s upper, ~298 MiB) — an unmeasured
+estimate, not an approved limit (revision 13 labels it provisional).
 **Revision 4** answers the CHANGES REQUIRED design review of `0fb9396`
 (comment `6452964156`, 2026-10-27) with three corrections. **The eviction
 custody facts no longer reacquire locks**: `Store::checkout_custody` takes
@@ -298,8 +326,7 @@ checklist and a separately activated uncounted diagnostic; and the staging
 inventory now lists **helper-mediated** `stage_at` callers explicitly, with a
 per-call feature parameter and per-call fixture controls. The declared fixed
 bound is revised to **420 s** with the arithmetic in §16.4 (superseded by
-revision 5's 480 s), put to the freeze for acceptance rather than silently
-extending anything.
+revision 5's provisional 480 s), never silently extended.
 **Revision 1.** Written against clean pushed `main`
 `489eecc79398a1c0bfb17fd879fb5513914a6d52`, static reads only. Prerequisites
 oxide#136 (child temporary files) is merged and oxide#137's design of record
@@ -925,7 +952,7 @@ proposes **no new seam**:
 | **B1** binding mutex | receipt **`Detached`** (§4.2 lets a guarded command proceed) | peer paused at `OXIDE_TEST_PAUSE=bound:<gate>`: because a receipt-bearing binding takes `store.lock_binding` (`outputs.rs:4214-4235`) and keeps it until `mark_running` (`main.rs:701`), the peer holds the mutex at `bound` (`main.rs:545`). Observed by the peer's own `bound` marker file, then the guarded command stays alive and writes nothing; after the gate opens the **guarded command's own `bound` marker appears**, proving it acquired the mutex and passed the pause | no outputs write while blocked; both `bound` markers observed; final state matches |
 | **B2** barrier, live holder | receipt **`Committed`** (guarded `detach` is allowed; `cancel-reservation` too) | live peer paused at `bound` = an active same-checkout record; the guarded verb enters `begin_clean(Barrier)`, finds only **live** facts, and waits | the verb has not exited while the gate is closed and wrote nothing; after release it completes with the shipped detach output |
 | **B3** barrier, dead facts | receipt **`Committed`** (so the precheck passes) | (i) a same-checkout **dead record**: free record lock over a held lease; (ii) a same-checkout **dead clean mark**: free waiter lock, no live group; (iii) unreadable state/sibling | **bounded refusal** with the non-progress diagnostic inside the case's wall clock; record, lease and recovery log byte-identical; the dead lease still present. After an ordinary command recovers it, the same guarded `detach` proceeds |
-| **E** in-custody revalidation | receipt **`Detached`**, so the fast precheck **accepts**; the guarded command pauses at `OXIDE_TEST_PAUSE=keyed:<gate>` (`main.rs:475`, after the key and before the lease) | the fixture publishes a `Prepared` receipt (`OXIDE_TEST_OUTPUTS_CRASH=prepared`, unguarded invocation) while the guarded command is paused, then opens the gate; the guarded command proceeds to its binding mutex, revalidates, and refuses | exact diagnostic **from the revalidation** (the precheck had accepted, proven by the `keyed` marker), asserted as a **matched-control delta**: the control run (same pause, nothing planted) and the test run must have matching lease/ticket/record deltas and a **zero** test-specific delta — no clean mark, no `waiters/<id>.lock`, no receipt/link/marker/root/reservation change, and no id beyond the control's count. A whole-command byte-identical `next_id` is **not** claimed (the ticket/lease lifecycle legitimately advances it). An exact post-lease baseline needs the new `leased` pause point, proposed for scoped review |
+| **E** in-custody revalidation | **one boundary**: the existing `OXIDE_TEST_PAUSE=keyed:<gate>` point (debug build only, `<gate>` under the supervisor scratch); same guarded command, same checkout, **`Detached`** receipt in both runs, same fixture transitions through the boundary | baseline is taken **at the gate** (so the fixture's own plant and its id are excluded); the single differing variable is the receipt state at that baseline — `Prepared` (planted while paused) for the subject, `Detached` for the control; both then open the gate and run to exit | exact diagnostic **from the revalidation** (positive `keyed` marker proves the precheck had accepted); oracle is a **field-scoped delta over exactly**: receipt bytes, member/target links and readlinks, sibling links, root markers, reservations, registry root entries, `cleans`, the `waiters/` listing and `next_id` — the subject's delta must equal the control's and both must contain no clean mark, no waiter entry and no receipt/link/marker/root/reservation change, with `next_id` +1 (its own wait ticket) in both. Record phase/`next_use`/origin/local `target/` are **outside** the compared set, so the control's successful later effects cannot enter the delta. Counterfactual: a mark or extra id would appear as `cleans` +1 and `next_id` +2. Premise 6 (owned images) does **not** apply to E and is recorded so. No new seam |
 | **C** commit | prepared transition committed by an explicitly **unguarded** invocation (`OXIDE_TEST_TEMP_ROOTS=[]`, `OXIDE_TEST_WORKSPACE_CLASS=normal`) | — | the shipped `oxide outputs adopt` replays and commits; the guarded invocation afterwards sees `Committed` and refuses per §4.2 |
 
 Two premises are recorded as **not** established, and the case does not assert
@@ -2272,18 +2299,21 @@ claimed for a statically edited selector.
 11. **A tool that writes through `target` after the guard.** Not contained
     (§4.7); the hierarchical inspection of §4.3 catches a link *at* one of the
     declared components, not one created later.
-12. **The reserve path is not changed, and its protection requirement is
-    returned to the owner.** A removable admission carries no reserve today
-    (`store.rs:3277-3280` reads the registration from the wrong control
-    directory), so `unknown_removable_step` always refuses with the incomplete
-    scan and the prune branch never runs. Making it run would be a new deletion
-    behaviour, which the brief forbids inventing, so this design leaves it as
-    shipped, asserts that shipped behaviour natively (case 8), and returns the
-    reserve-path protection requirement plus the wiring change to the owner for a
-    scoped ruling (§19). The class-scoped policy that route's victim choice uses
-    is specified and asserted purely, so a scoped wiring could not select a
-    normal victim for a one-use admission — but that is not claimed as current
-    behaviour.
+12. **The reserve/prune evidence is split, and its limits are stated.** The
+    native prune case runs on the **internal directory-budget pool**, where the
+    fixture drives a real budget (`OXIDE_POOL_CAP`) and asserts one-use `Only`
+    pruning with no normal victim (case 8). The **removable** side is asserted for
+    its *shipped refusal* only, and the removable **reserve-prune protection is
+    not claimed natively**: a removable admission carries no reserve today
+    (`store.rs:3277-3280` reads the registration from the removable store's
+    control while it lives in the internal control), so
+    `unknown_removable_step` refuses with the incomplete scan and the prune branch
+    never runs. That branch's class-scoped policy and step are covered by pure
+    checks and unit regressions with **injected registration and size facts**,
+    plus the existing removable proofs — never presented as native evidence, and
+    never a substitute for the brief's reserve requirement, which stays with the
+    owner.
+
 13. **A retry is not a second attempt at a victim.** After a failure-stop or a
     protected-slice refusal the retried admission performs the whole class-scoped
     selection again, with the premises it needs — a fresh member and real byte
@@ -2326,7 +2356,8 @@ claimed for a statically edited selector.
 | normal new slot with slice overage or class-unknown rows | restoration + `Prefer`, then continue with a measured overage or a lower-bound note |
 | normal `Prefer` fallback with a protected/unverified one-use pair ranked first | the pair is **excluded** from the fallback set; an eligible normal slot or idle class-unknown orphan is selected, or the ordinary refusal fires |
 | version-5-or-below state carrying `class`/`class_reason` | **refuses** (a document that skipped its fence) |
-| removable unknown-figure admission (no reserve is carried today) | refuses with the shipped incomplete scan and evicts nothing; the reserve-path protection requirement is returned to the owner (§10.2, §19) |
+| internal directory-budget pool over its fixture-driven budget, one-use admission | prune eligible idle one-use members in rank order, never a normal slot; refuse on the ordinary reason when only protected members remain |
+| removable unknown-figure admission (no reserve is carried today) | refuses with the shipped incomplete scan and evicts nothing; the removable reserve-prune protection is **not** claimed natively (unit-level injected-fact coverage only) and the brief's requirement is returned to the owner (§10.2, §16.1, §19) |
 | any admission whose retry needs byte pressure on a removable pool | the effective cap is the **recorded registration cap**; `OXIDE_POOL_CAP` does not override an existing removable pool |
 | retried admission after a failure-stop | full class-scoped reselection; never the next candidate, never a normal victim |
 | member whose control record is active (ledger idle, custody uncertain) | **protected**: counted, never a victim, not a wait reason |
@@ -2482,9 +2513,14 @@ its own validation tier and native activation.
 - The restore decision table: 16 idle members and a new slot reclaims the oldest
   then admits; a warm reuse at 16 admits without reclaiming; a protected-only
   slice is `Full`; a class-unknown row yields `LowerBound`, never `NotNeeded`.
-- The reserve route's policy: `admit_unknown_removable` passes the admission's
-  `Prefer`/`Only` to the same class-scoped victim selector (source-level check
-  of that call, and the pure step function's cases).
+- The reserve route's policy and step, **unit-level only**: a source-level check
+  that `admit_unknown_removable` passes the admission's `Prefer`/`Only` to the
+  same class-scoped victim selector, plus unit regressions that drive
+  `unknown_removable_step` with **injected registration and size facts** (a
+  modelled reserve, a modelled free-space reading and an injected member set) for
+  the above-reserve, at/below-reserve, floor and refusal branches. These are
+  **not** native evidence: removable reserve-prune is not natively exercised by
+  the fixed proof (§16.2 case 8, §19).
 - The union walker: shared `(device,inode)` set across roots, duplicate root
   refused, link not followed, partial coverage reported, entry/deadline bound.
 - The slice arithmetic: `min(budget/10, 32 GiB)`, floor of 1, 16 members,
@@ -2573,20 +2609,41 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
    With every one-use member held (no fallback candidate), a normal admission
    still continues into the ordinary decision and reports a measured overage
    rather than stalling on the slice.
-8. removable unknown-figure admission, **today's behaviour asserted**: on the
-   owned image's registered and **selected** removable pool (positive
-   selected-removable control) with one idle normal slot and one idle one-use
-   member, a new-slot admission made to see a bounds-only pool figure
-   (`OXIDE_TEST_WALK_MUTATIONS`, `DelayBeforeReadDir` on the payload root,
-   6,000 ms > the 5 s removable figure bound) **refuses with the shipped
-   incomplete scan and evicts nothing**: no member is retired, the normal slot
-   is byte-identical, and the message carries `elapsed_deadline`. This is the
-   negative case that pins the reserve path's shipped behaviour (no reserve is
-   carried today, so no prune happens) and it is the evidence that this design
-   invents no cleanup; the class-scoped policy that route would use is asserted
-   purely (§16.1) and is not claimed natively. The brief's reserve-protection
-   requirement and the wiring change that would reach it are returned to the
-   owner (§19).
+8. **budget-driven prune on the internal directory-budget pool** (the pool whose
+   budget and watchdog the fixture can actually drive), plus the removable-path
+   **refusal**:
+   - *internal, fixture-driven byte pressure*: a private `directory-budget-v1`
+     pool created with a small recorded cap (`OXIDE_POOL_CAP`), one idle normal
+     slot and two idle one-use members. A **one-use** new-slot admission over the
+     budget prunes eligible one-use members in rank order under `Only` and never a
+     normal slot; with only protected members left it refuses on the ordinary
+     reason and every normal slot is byte-identical. This is the native
+     reserve-style prune evidence: the pressure is a real, fixture-driven budget,
+     not an injected reading.
+   - *removable, today's behaviour asserted*: on the owned image's registered and
+     **selected** removable pool (positive selected-removable control) with one
+     idle normal slot and one idle one-use member, a new-slot admission made to see
+     a bounds-only pool figure (`OXIDE_TEST_WALK_MUTATIONS`,
+     `DelayBeforeReadDir` on the payload root, 6,000 ms > the 5 s removable figure
+     bound) **refuses with the shipped incomplete scan and evicts nothing**: no
+     member is retired, the normal slot is byte-identical, and the message carries
+     `elapsed_deadline`. This pins the removable path's shipped behaviour (no
+     reserve is carried today, so no prune happens) and is the evidence that this
+     design invents no cleanup.
+   **Removable reserve-prune is deliberately not claimed natively.** The brief's
+   removable reserve-prune *protection* is a product requirement that this proof
+   does not exercise: today's removable admission reads the registration from the
+   removable store's control (`store.rs:3277-3280`, `removable.rs:614-615`) while
+   the registration lives in the internal control, so the unknown-size route
+   refuses without a reserve (`pool.rs:2848-2854`) and the prune branch never
+   runs. The class-scoped policy that branch would use is covered by **pure
+   checks and unit regressions with injected registration and size facts**
+   (`admit_unknown_removable` driven through the step function with a modelled
+   reserve/free-space reading and an injected member set), together with the
+   existing removable proofs; it is **not** native evidence and the design says
+   so wherever it is cited (§16.1, §19). Resolving the brief's requirement or
+   changing the wiring stays with the owner.
+
 9. one-use `Only` under pressure with no eligible one-use victim: refuses, and
    every normal slot's ledger bytes and payload digest are identical afterwards.
 10. normal warm reuse target-only: with members present, a normal warm reuse
@@ -2678,31 +2735,69 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       dead lease is still present. After an ordinary command recovers the dead
       lease (or the dead mark clears), the same guarded verb proceeds. Unknown
       custody is the (iii) refusal.
-    - **(E) in-custody revalidation, reached deterministically.** The checkout
-      holds a **`Detached`** receipt (the precheck accepts it). A guarded command
-      pauses at `OXIDE_TEST_PAUSE=keyed:<gate>` (after the key, before the lease;
-      `main.rs:475`), the fixture publishes a `Prepared` receipt through the
-      unguarded `crash_point` invocation, and the gate is then opened. The
-      guarded command proceeds to its binding mutex, **revalidates there**, and
-      refuses with the exact diagnostic — proven to be the *revalidation* and not
-      the precheck by the `keyed` marker (the precheck had already accepted).
-      **Oracle: a matched-control delta, not a whole-command byte comparison.**
-      The same guarded command is run twice at the same pause: a control run with
-      nothing planted and the test run with the transition planted. Both runs'
-      ordinary lease/ticket/record deltas must match (they include the ticket
-      registration that advances `next_id`), and the **test-specific** delta must
-      be empty: no clean mark, no `waiters/<id>.lock` created by the refusal, no
-      receipt, link, marker, root or reservation change, and no id beyond the
-      control's count. The case does **not** claim a byte-identical whole-command
-      `next_id`. Separately and non-vacuously, the **verb-level** refusals keep
-      their exact claim: a guarded `detach` or `cancel-reservation` refusal
+    - **(E) in-custody revalidation, one exact matched boundary.** The boundary is
+      the **existing** debug-only `OXIDE_TEST_PAUSE=keyed:<gate>` point
+      (`main.rs:475`, after the key and before `lease_with_gate`), restricted to
+      the shared supervisor scratch (`<gate>` is a path under
+      `OXIDE_TASK_SCRATCH_ROOT`; the point is `#[cfg(debug_assertions)]` only, so
+      the build restriction is a **debug** candidate, and a release artifact
+      ignores the variable). Subject and control are the *same* guarded command in
+      the *same* checkout with a **`Detached`** receipt, run through the *same*
+      fixture transitions and the *same* lifecycle through that boundary:
+      1. the command starts, passes the fast precheck (`Detached`), and pauses at
+         `keyed`; its `keyed` marker is the **positive proof that the precheck
+         passed**;
+      2. **baseline is taken at the gate**, after any fixture action, so nothing
+         the fixture does is inside the measured window;
+      3. the gate opens and the run continues to its binding decision.
+      The **single differing variable** is the receipt/journal state at that
+      baseline: the **subject** has a `Prepared` receipt (the fixture publishes it
+      with the unguarded `crash_point` invocation *while the command is paused*,
+      so the plant and its own id are **before the baseline** and excluded), the
+      **control** still has the `Detached` receipt. Nothing else differs; both
+      runs use the same gate, the same fixture, the same command and the same
+      environment.
+      **Executable effect oracle (field-scoped delta, specified exactly).** The
+      compared set is the *output-transition* field set only:
+      `outputs/*.json` receipt bytes, every `target`/member link and its
+      readlink, every sibling link, every root marker, every reservation row,
+      the `outputs registry` root entries, the `cleans` array in `state.json`,
+      the `waiters/` directory listing, and the numeric `next_id`. For each run
+      the delta is `state(after exit) − state(at baseline)` over exactly that
+      set. The observation window **ends when the command exits**, so the
+      successful control's later effects are excluded by construction: the
+      record phase, `next_use`, the origin and the checkout's local `target/`
+      contents are **not in the compared set** (they are the lease/build
+      lifecycle, and the control legitimately advances them at `mark_spawning`,
+      `main.rs:545,649-652`); `origins/` and the `tickets` array are likewise
+      lifecycle files (both runs register and release exactly one ticket and may
+      write one origin, so they cancel by construction and are excluded). The
+      **`waiters/` directory is included** precisely because a clean mark's own
+      lock file would appear there even though the mark's row lives in `cleans`.
+      Expected result: the subject's delta equals the
+      control's delta on that set, and both contain **no clean mark, no
+      `waiter` entry and no receipt/link/marker/root/reservation change**, while
+      `next_id` advances by exactly **one** (the command's own wait ticket,
+      removed at exit) in both runs.
+      **Counterfactual (what would falsify it).** If the guarded refusal
+      allocated a clean mark, the subject's delta would show `cleans` +1, a
+      `waiters/<id>.lock` transient, and `next_id` +2 relative to the baseline;
+      the case asserts those are absent and the control's +1 is the reference.
+      The refusal's **text** is also asserted exactly, and it is proven to be the
+      revalidation — not the precheck — by the `keyed` marker plus the fact that
+      the precheck had already accepted a `Detached` receipt.
+      **Premise-6 entry.** Proof-authoring premise 6 (owned images,
+      `hdiutil attach -owners on`) **does not apply to case E**: no image is
+      mounted in this part; it is recorded as such, and it does apply to case 8's
+      removable sub-case and case 21, which state their `-owners on` and
+      read-only mount observation.
+      **No new seam is proposed for E.** The earlier `leased:<gate>` idea is
+      withdrawn: with the baseline at the `keyed` gate and the field-scoped
+      delta, the oracle is exact without it. The **verb-level** claims stay direct
+      and non-vacuous: a guarded `detach` or `cancel-reservation` refusal
       allocates no clean mark and no id, and repeated such refusals are
-      byte-identical including `next_id` (asserted purely and, where a native
-      sequence reaches it, by planting the receipt before the verb starts). An
-      exact post-lease command-level baseline would need one new debug-only
-      `leased:<gate>` pause point between the lease and `outputs::bind_for_command`
-      (bounded like `bound`: owned-scratch marker, 120 s self-release, absent from
-      release builds); that seam is proposed for scoped review, not assumed.
+      byte-identical including `next_id` (asserted purely and natively where the
+      receipt is planted before the verb starts).
     - **(C) commit, explicitly unguarded.** The prepared transition is committed
       by a deliberately **unguarded** invocation of the same build with
       `OXIDE_TEST_TEMP_ROOTS=[]` and `OXIDE_TEST_WORKSPACE_CLASS=normal` (feature
@@ -2823,17 +2918,17 @@ retry is authorized by this text.
   because a private `directory-budget-v1` pool is a genuine internal pool that
   the product correctly refuses on an external volume; it stays inside one
   monitored 512 MiB owned root.
-- **Fixed bound: 480 s, not the 300 s default.** The reasons are the image
-  attach/detach cycle, the 128-slot ceiling fixture, the 6 s removable walk delay
-  and — new in revision 5 — the **third staging**: the fixed older artifact
-  (`489eecc`, state 5) the hand-off case needs, built from its own source and
-  flags with no shared target. §16.4 gives the arithmetic and the 430 s work
-  cutoff. This is a **candidate fixed bound for the Supervisor's decision**
-  under the brief's rule, not evidence of fit: it is source-derived and
-  unmeasured, the separately activated diagnostic measures actual fit, and
-  activation waits for that decision — never a silent extension. 300 s is not
-  claimed to fit. If the freeze prefers to keep 420 s, the
-  older-artifact case moves to its own scoped proof (§18 Q12).
+- **The bound is provisional and unmeasured — 480 s / 512 MiB is not an approved
+  limit.** The image attach/detach cycle, the 128-slot ceiling fixture, the 6 s
+  removable walk delay and the **third staging** (the fixed older artifact
+  `489eecc`, state 5, built from its own source and flags with no shared target)
+  are why the arithmetic is above the 300 s default (§16.4: ~296 s typical,
+  ~370 s upper). The implementation brief fixes the bound **after** the fixed
+  script's first separately activated uncounted diagnostic measures actual fit;
+  any final bound above **300 s requires a separate operator ruling from Tom**,
+  and none is granted by this design or by any review. Until then this document
+  states an estimate, never an approved clock, and makes no claim that 300 s
+  fits.
 - Cumulative author bound **180 min** from actual activation, including
   authoring, admission/waits, coverings, diagnostic, native, cleanup and report;
   reviewer **60 min**. No historical clock is active or reset. Exactly **one**
@@ -2860,7 +2955,7 @@ retry is authorized by this text.
 | Image: attach (`-owners on`), registration, selected control, ordinary detach | ~18 s | two attach/detach cycles at ~9 s each |
 | Fixture creation, member walks, digests, receipt | ~25 s | bounded metadata work on tiny trees |
 | Cleanup | ~20 s | inside the owned root, with the image custody record |
-| **Total** | **~296 s, upper ~370 s of 480** | arithmetic only; the script's work cutoff is 430 s |
+| **Total** | **~296 s typical, ~370 s upper** (provisional, UNMEASURED) | arithmetic only; a work cutoff near 430 s is a **proposal** pending the diagnostic and Tom's ruling above 300 s |
 
 Disk, inside the 512 MiB monitored root: one owned 128 MiB APFS sparse image
 (no free-space filler is needed); three staged targets — the feature and
@@ -2876,10 +2971,12 @@ that exceeds either fails (a deadline breach stops work; a monitored-bytes
 breach is a failure), and that is the brief's and the validation policy's
 time-and-budget gate. The per-phase figures above, the staged-artifact byte
 counts, Cargo-call counts and monitor timings are **observations**, reported by
-the receipt and never acceptance gates. The 480 s total and the ~296 s estimate
-remain UNMEASURED and need the owner's freeze decision before activation. If the
-diagnostic shows the work cannot finish inside 380 s, the owner must revise the
-fixed bound **before** a counted activation — never during one.
+the receipt and never acceptance gates. The 480 s / 512 MiB pair is
+**provisional and unmeasured**: the fixed script's first separately activated
+uncounted diagnostic measures fit, the implementation brief fixes the final
+bound, and any final bound above **300 s needs Tom's separate ruling** (none is
+granted here). If the measured work cannot fit, the bound is revised before a
+counted activation — never during one.
 
 ## 17. Folded papercuts
 
@@ -2944,11 +3041,11 @@ positive-absence policy are unchanged by either papercut.
 11. Is the staging inventory (§11.2) complete now that helper-mediated stagers
     are explicit and `stage_at` takes a per-call feature, including the
     suspended `test-oxide-cli.py` gap and every capability assertion?
-12. Is the fixed **480 s** bound with ~296 s typical / ~370 s upper and
-    ~298 MiB credible for the 27 cases including the owned image, the 128-slot
-    fixture, the 6 s removable delay and the **third** (older-artifact) staging,
-    or should the older-artifact case move to its own scoped proof and the bound
-    return to 420 s?
+12. Is the **provisional** 480 s / 512 MiB estimate (~296 s typical, ~370 s
+    upper, ~298 MiB) a sensible starting point for the 27 cases, understanding
+    that the implementation brief fixes the bound after the fixed script's first
+    separately activated uncounted diagnostic measures fit and that any final
+    bound above 300 s needs Tom's separate ruling?
 13. Is the seeding dependency handled correctly by making case 24 mandatory and
     offering only a scope split — no unexecuted case in a counted native?
 14. Is the race-safe guard protocol (§4.1, §4.6) sound: the fast precheck is
@@ -3007,8 +3104,10 @@ positive-absence policy are unchanged by either papercut.
 - No implementation, native, install, consumer, host or live-pool authority is
   granted; the merge hold and both counted natives remain.
 - The time and disk figures are source-derived arithmetic, not measurements; the
-  fit is UNMEASURED until the one activation per side runs, and the declared
-  480 s bound needs the freeze's acceptance before activation.
+  fit is UNMEASURED until the one activation per side runs; the 480 s / 512 MiB
+  pair is **provisional**, the implementation brief fixes the final bound after
+  the fixed script's first separately activated uncounted diagnostic measures it,
+  and any final bound above **300 s needs Tom's separate ruling**.
 - The seeding interaction (§8) is a requirement on a frozen but unimplemented
   interface; case 24 is mandatory, so the counted native waits for oxide#137's
   implementation or moves into a scope split.
@@ -3017,19 +3116,23 @@ positive-absence policy are unchanged by either papercut.
   `OXIDE_TEST_OUTPUTS_CRASH`) staying available and unchanged; if any is removed
   or narrowed, those cases return to the owner for a scoped ruling rather than
   being dropped or reported unexecuted.
-- **Returned to the owner (not a design claim):** the brief requires the fixed
-  native to cover normal-slot protection under the **reserve** path. Nothing in
-  this design substitutes for it: neither the shipped-refusal case 8 nor the pure
-  policy check satisfies that requirement, and only an owner ruling or a revised
-  brief can change how it is discharged. That path's
-  prune branch is unreachable in the current source because a removable
-  admission carries no reserve (`store.rs:3277-3280` versus
-  `removable.rs:28,298`), and reaching it would add a new deletion behaviour that
-  the brief forbids inventing. This design therefore does **not** claim the
-  reserve-path protection, keeps the shipped refusal, and returns the
-  requirement with its wiring change for a scoped ruling or a revised brief
-  (§10.2, §16.2 case 8). Everything else the brief lists remains in the fixed
-  case list. The concurrency case claims custody **exclusion**, never an
+- **Reserve-prune evidence is split, and the removable half is not native.**
+  The **native** prune case is the internal directory-budget pool with a
+  fixture-driven budget (case 8a). The **removable reserve-prune protection is
+  not natively exercised** by this proof: a removable admission carries no
+  reserve today (`store.rs:3277-3280` reads the registration from the removable
+  store's control while it lives in the internal control), so
+  `unknown_removable_step` refuses with the incomplete scan and the prune branch
+  never runs (case 8b asserts exactly that shipped refusal). That branch's
+  class-scoped policy and step are covered by **pure checks and unit regressions
+  with injected registration and size facts**, together with the existing
+  removable proofs. **Returned to the owner (not a design claim):** the brief's
+  reserve-path protection requirement is not discharged by any of that — neither
+  the shipped-refusal sub-case nor the injected unit facts are native evidence —
+  and reaching it would add a deletion behaviour the brief forbids inventing.
+  Only an owner ruling or a revised brief can change how it is discharged
+  (§10.2, §16.2 case 8, §16.1). Everything else the brief lists remains in the
+  fixed case list. The concurrency case claims custody **exclusion**, never an
   interleaved observation.
 - **Two small seams are specified and need their own review.** (1)
   `begin_clean` gains a mode so the guarded barrier performs no ticket drop and
