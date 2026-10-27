@@ -9,7 +9,20 @@ exact-head design review, then stop for the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 merge hold are separate and unchanged.
 
-**Revision 6** answers the CHANGES REQUIRED review of `effc985` (review
+**Revision 7** answers the CHANGES REQUIRED review of `6c3d5a07` (review
+comment `6450625847`, 2026-10-27): the supported target name is the **normalized**
+package name (`-` → `_`), matching pinned Cargo's inferred lib naming and its
+rejection of a hyphenated explicit name, so `cfg-if`/`cfg_if` is supported and
+a genuinely renamed target is unsupported; uniqueness and collision checks
+apply after normalization across all source kinds, and the collision fixture
+uses the valid `[lib] name = "cfg_if"` (§4.2); and the ambiguous-name skip
+count now has a source — the producing epoch records a bounded, generation-bound
+**rejection record** with the candidate-unit count it can classify for each
+excluded name (or `units_unknown`), which the summary, `last.json` and
+`oxide status` report as donor-side unit counts, never package counts and never
+inferred from an unpinned catalog or the recipient allowlist (§4.2, §4.4,
+§9.2).
+**Revision 6** answered the CHANGES REQUIRED review of `effc985` (review
 comment `6450400975`, 2026-10-27): the artifact join now parses **all** rules of
 rustc's dep-info and looks in the unit's own output directory — the `.d`'s own
 rule is first in the ordinary pinned shape, `.rmeta` and `.rlib` emits both
@@ -348,6 +361,11 @@ Consequences, stated rather than hidden:
 | 2. Selection read donor payload before the pin | §6.3 step 4 uses catalog data only (the recorded join), reads no donor payload, and the donation source re-verification reads the shared Cargo home; §6.3 step 6 performs every donor payload read under the donor record lock and pool lock, hashing each file and re-checking the `.d` rules against the recorded join. §7 states that call 1 reads control state only, and a native competing-`managed::lease` case proves an acquire/eviction between calls 1 and 2 aborts without reading or cloning. |
 | 3. Ambiguous-name visibility was missing from status | §9.2 adds bounded skip-count buckets to the summary, `last.json` and the recorded `oxide status` line (up to eight fixed tokens, `u32` counts), including a mixed successful-plus-ambiguous seed and a zero-skip control; no walk or reconciliation is added. |
 
+| `6450625847` finding (revision 7) | Amendment |
+| --- | --- |
+| 1. The package/target equality rule excluded the required positive | §4.2 now uses the normalized target name (`package_name.replace("-", "_")`), matching pinned Cargo's inferred lib naming and its rejection of a hyphenated explicit `[lib] name`; a genuinely renamed target stays ineligible, and uniqueness/collisions are evaluated after normalization across all source kinds. The `cfg-if` positive and the removable case are supported, and case 21 uses the valid `[lib] name = "cfg_if"` collision fixture. |
+| 2. The ambiguous-name unit count had no source | §4.2/§4.4 add a bounded generation-bound **rejection record** written while the producing lease is held: per excluded normalized name, its reason and the number of candidate compile units classifiable at producing time, or `units_unknown`. §9.2 reports those donor-side unit counts (never package counts, never from an unpinned catalog or the recipient allowlist) in the summary, `last.json` and the recorded status line, with an explicit unknown bucket; case 23 covers a mixed success-plus-ambiguous donor and the zero and unknown controls. |
+
 ## 4. Unit provenance: the producing epoch and the donor catalog
 
 Review finding 1–3 of `0ca2bd7f` are the reason this section exists: Cargo
@@ -400,8 +418,15 @@ measure in the separately scoped real-project comparison, not a claim here.
 
 The association rule for one package, applied on both sides independently:
 
-- its **name** maps to exactly one lock entry across **all** source kinds
-  (so a registry `foo` and a git `foo` make `foo` ineligible on that side);
+- its **normalized name** maps to exactly one lock entry across **all** source
+  kinds. Cargo normalizes an inferred library target as
+  `package_name.replace("-", "_")` (`cargo-1.97.1/c980f4866`
+  `src/cargo/util/toml/targets.rs:135-170`) and rejects an explicit `[lib]`
+  name containing a hyphen (`targets.rs:1055-1060`), so the design's name is
+  `package_name.replace("-", "_")`, not the literal package name: `cfg-if`
+  has target `cfg_if` and is supported. Uniqueness is applied after
+  normalization, so `foo-bar` and `foo_bar` collide and both become
+  ineligible on that side, as does a registry `foo` beside a git `foo`;
 - its lock entry has **no dependency edges at all** (§3.2), so its compilation
   cannot invoke a proc macro; a package with any dependency edge is ineligible
   on both sides;
@@ -410,11 +435,12 @@ The association rule for one package, applied on both sides independently:
 - path/workspace/vendored/source-replaced and `[[patch]]`-replaced entries are
   ineligible; a lock entry without a `source` is ineligible;
 - its manifest (read from the verified source root) declares exactly one
-  library or proc-macro target whose name equals the package name, no other
-  target with that name, and the recorded `[lib] name` (when present) equals
-  the package name. A package that renames its lib target is ineligible
-  because Cargo's file grammar is target-named, and two packages can expose
-  the same target name;
+  library or proc-macro target whose name is the normalized package name, and
+  an explicit `[lib] name`, when present, must equal that same normalized
+  name (so a hyphenated explicit name is unsupported by Cargo itself). A
+  package that declares a different lib target name — a genuine rename — is
+  ineligible in v1: the pinned adapter proves the inferred normalization, not
+  an arbitrary rename, and two packages can expose the same target name;
 - the donor and recipient lock entries agree on version and on
   source-plus-checksum (registry) or source-plus-full-revision (git).
 
@@ -436,7 +462,8 @@ The rules, applied inside the slot's `<profile>/` when the producing lease is
 held:
 
 1. **Classify every `<pkg>-<16hex>` fingerprint directory by unit.** For the
-   eligible package name `<pkg>`, each candidate directory must be exactly one
+   eligible normalized name `<pkg>`, each candidate directory must be exactly
+   one
    of:
    - **one complete unit** — the triple for a whitelisted role
      (`lib-<target>`, `.json`, `dep-lib-<target>` for a library or proc macro;
@@ -488,6 +515,19 @@ held:
    recorded join record. A donor file that changed, or a `.d` whose rules no
    longer match, aborts the whole seed; nothing is copied on catalog data
    alone.
+
+**Rejected candidates are recorded while the producing lease is held.** An
+excluded lock entry (ambiguous normalized name, non-leaf, unsupported source,
+join unprovable, run-only, or beyond a cap) never becomes an offered unit, so
+selection cannot count it later from an unpinned catalog. The producing epoch
+therefore writes a bounded rejection record into the catalog, per excluded
+normalized name: the reason token and the number of **candidate compile units**
+it can classify for that name at producing time (the `<pkg>-<hex>` directories
+that hold a complete whitelisted-role triple). A package whose unit count
+cannot be classified is recorded with `units_unknown: true` rather than a
+zero, so an unknown is never reported as a count of zero. The counts are
+donor-side facts about this catalog; a recipient-side allowlist exclusion is a
+different predicate and is not folded into them.
 
 A role whose join cannot be established is not offered. Nothing here predicts
 Cargo's package-id or unit metadata hash: the artifact identity comes from
@@ -608,10 +648,15 @@ Written while the producing lease is still held and before release, into
   value, target, recipe key, backend, adapter id, the §3.1 context digest and
   its absolute config-file list in precedence order, the flag digests, Cargo
   home, command family and command class;
-- per package: name, version, source string, checksum or full revision,
-  uniqueness evidence for the donor lock, the **leaf evidence** (the lock entry
-  has no dependency edges, §3.2), source-root kind, and the **canonical source
-  tree digest** verified at both ends of the producing window (§4.3);
+- per package: normalized name, version, source string, checksum or full
+  revision, uniqueness evidence for the donor lock (after normalization), the
+  **leaf evidence** (the lock entry has no dependency edges, §3.2), source-root
+  kind, and the **canonical source tree digest** verified at both ends of the
+  producing window (§4.3);
+- a bounded **rejection record** for excluded lock entries (§4.2): normalized
+  name, reason token, candidate-unit count and `units_unknown` when it could
+  not be classified — at most 256 entries and 4,096 counted units, names
+  ≤ 64 bytes; the counts feed the summary and status skip buckets (§9.2);
 - per unit: role (`lib`, `proc-macro`, `build-script-compile`), target name,
   the `.d` relative path and the **join record** (its rule targets, prerequisite
   roots and the `.d`'s SHA-256), and the exact relative file list (the manifest
@@ -1021,7 +1066,8 @@ lock lifetime: the recipient is reset as in §6.5, the attempt state becomes
 | catalog | 2 MiB, 2048 packages, 8,192 files, 3 units per package | overflow: no catalog |
 | plan | 256 units, 4,096 files, 384 MiB logical bytes | overflow: skip |
 | artifact join (all `.d` rules parsed) | 1 MiB per `.d`, 4,096 rules and inputs per unit, 32,768 inputs total | unparseable, duplicated or out-of-root input → package ineligible |
-| skip-count buckets | 8 tokens, `u32` each, in the summary and `last.json` | recorded with the seed; no walk |
+| skip-count buckets | 8 tokens plus an unknown count, `u32` each, in the summary and `last.json` | donor-side unit counts from the catalog; no walk |
+| catalog rejection record | 256 entries, 4,096 counted units, names ≤ 64 bytes | at producing time only; overflow entries are recorded as `unknown` |
 | source-verification cache | 2,048 records, 8 MiB sidecar, identity-checked per hit | missing/untrackable identity → full re-derivation or skip |
 | donation source verification | 128 MiB content, 3 s | packages beyond the remaining cap are dropped from the plan, not the whole seed |
 | seed work (clone + digest verify) | 5 s cooperative deadline, checked between filesystem calls | a blocked syscall cannot be pre-empted; not a hard lock bound |
@@ -1140,16 +1186,23 @@ with the seed.
   of completely cloned compile units and **M** is the logical cloned bytes.
   Neither number is a reused-unit count, a Cargo freshness claim or a
   physical-saving figure; the wording never says "reused" or "saved".
-- When the selection also skipped candidate units, the same line appends one
-  bounded suffix: `; skipped <K> candidate units: ambiguous name (<a>),
-  non-leaf (<b>), join unprovable (<c>), differing context (<d>)`, with only
-  non-zero buckets printed and at most eight buckets from a fixed token set
-  (ambiguous name, non-leaf, join unprovable, differing context, unverified
-  source, cap, variant, run-only). `K` is the sum of the buckets.
+- When the chosen donor's catalog carries rejected-candidate units, the same
+  line appends one bounded suffix: `; skipped <K> donor candidate units:
+  ambiguous name (<a>), non-leaf (<b>), join unprovable (<c>), unverified
+  source (<d>), unsupported source (<e>), run-only (<f>), cap (<g>)`, with
+  only non-zero buckets printed and at most eight buckets from a fixed token
+  set. `K` is the
+  sum of the buckets. The counts are the catalog's recorded rejection facts
+  (§4.2, §4.4) — donor-side **unit** counts, never package counts, and never
+  inferred from the recipient allowlist.
+- A rejection the producing epoch could not classify is reported as
+  `unknown (<n>)` in its own bucket and is never added to `K` as if it were
+  zero units, so the summary distinguishes "no ambiguous units" from "not
+  measured".
 - `last.json` records, beside the generation envelope, the same buckets and
-  counts (integers, ≤ 8 entries, each ≤ `u32`), so the numbers are bounded and
-  survive a later command. A seed with no skips records an empty set, not a
-  missing field.
+  counts (integers, ≤ 8 entries plus the unknown count, each ≤ `u32`), so the
+  numbers are bounded and survive a later command. A seed with no rejected
+  candidates records an empty set, not a missing field.
 - A miss prints `seeding skipped: <reason>` with the same bounded reason
   tokens. Reserve, ownership, device and custody faults are refusals, not skip
   tokens (§8.3, §13).
@@ -1464,8 +1517,13 @@ submodule, unreadable) and the **exact argv/environment** of every git call
 (`GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `submodule.recurse=0`,
 `core.fsmonitor=false`, `-C` only, cleared `GIT_DIR`/`GIT_WORK_TREE`/
 `GIT_INDEX_FILE`/`GIT_CONFIG_*`) plus a fake-git control that would run a
-configured fsmonitor hook and a bounded-budget exhaustion refusal; the §3.1
-context digest with a synthetic config tree: equal contexts, differing flag,
+configured fsmonitor hook and a bounded-budget exhaustion refusal;
+**normalization and rejections**: a hyphenated package (`cfg-if`) infers target
+`cfg_if` and is offered; an explicit hyphenated `[lib] name` is unsupported;
+`foo-bar` and `foo_bar` collide after normalization and both become ineligible;
+a genuinely renamed lib target is ineligible; the rejection record's
+candidate-unit counts and `units_unknown`; the §3.1 context digest with a
+synthetic config tree: equal contexts, differing flag,
 differing table, **member working directory**, **ancestor above the account
 home**, a config at the filesystem root, **differing relative `[env]` values**,
 both `config`/`config.toml` in one directory, unsupported `--config`,
@@ -1508,7 +1566,8 @@ the selected-volume rule.
    exclusion of an offered run unit; the proof receipt says so, and case 3
    supplies the non-vacuous exclusion oracle;
 2. **leaf registry positive and complete manifest.** A small registry leaf
-   (`cfg-if`, no dependency edges) is offered with its full triple
+   (`cfg-if`, no dependency edges, normalized target `cfg_if`) is offered with
+   its full triple
    (hash/`.json`/`dep-…`) plus artifacts; two checkouts share one lock and
    Cargo home, the second leases a new slot that is seeded, and Cargo reports
    the offered dependency unit fresh (`--message-format` is caller-supplied by
@@ -1587,7 +1646,9 @@ the selected-volume rule.
     as warm by a later command.
 
 21. **artifact collision and multi-unit controls.** A workspace/path package
-    that declares `[lib] name = "cfg-if"` beside a genuine registry `cfg-if`,
+    that declares `[lib] name = "cfg_if"` (a valid explicit name, and the
+    normalization of the registry `cfg-if`) beside a genuine registry
+    `cfg-if`,
     and a same-target dependency from a second source, must leave the plan
     containing only the verified registry artifacts: the proof asserts the
     workspace artifact's path is absent from the plan and that the recipient
@@ -1605,12 +1666,18 @@ the selected-volume rule.
     is reset, and the command either builds cold or refuses per §13. The
     adversary's own slot state is unchanged. Without the interleaving the same
     fixture seeds normally, so the control is non-vacuous.
-23. **ambiguous-name visibility.** A donor whose catalog holds one eligible and
-    one ambiguous-name candidate: the summary shows the seeded counts **and**
-    the bounded skip suffix naming `ambiguous name (1)`, and `oxide status`
-    renders the same recorded bucket from `last.json` without any walk or
-    reconciliation. A seed with no skips renders no suffix and an empty bucket
-    set, so the control distinguishes "zero skips" from "not recorded".
+23. **ambiguous-name visibility.** The donor workspace compiles one eligible
+    leaf (`leaf-a`) and a normalized-name collision pair (`foo-bar` and
+    `foo_bar`, both ineligible on that side). The producing epoch records the
+    rejection with the **candidate unit count** it can classify for that name
+    (two fingerprint directories), and the catalog carries it. The recipient
+    seeds `leaf-a`: the summary shows the seeded counts **and** the bounded
+    suffix naming `ambiguous name (2)`, and `oxide status` renders the same
+    recorded bucket from `last.json` without any walk or reconciliation. A
+    second donor with no rejected candidates renders no suffix and an empty
+    bucket set, and a donor whose rejected package could not be classified
+    renders `unknown (1)` instead of a zero count, so the control distinguishes
+    "zero units", "not measured" and "not recorded".
 
 ### 16.3 Runner, bounds, clocks and activation
 
@@ -1718,7 +1785,14 @@ comparison as the proof.
    narrowed — or does the Supervisor want the broader dependency graph, which
    would need the deferred artifact-JSON/unit-graph capture plus a reviewed
    proc-macro input-tracking mechanism?
-2. Is the §4.2 per-unit association accepted — each `<pkg>-<hex>` directory
+2. Is the §4.2 normalized-name rule accepted — supported target is
+   `package_name.replace("-", "_")`, an explicit hyphenated `[lib] name` is
+   unsupported, a genuine rename is ineligible, and uniqueness/collisions are
+   evaluated after normalization across all source kinds — and does the
+   origin-side **rejection record** (candidate-unit counts or `units_unknown`)
+   satisfy binding `bb151a59`'s ambiguous-name reporting as donor-side units
+   rather than package counts?
+3. Is the §4.2 per-unit association accepted — each `<pkg>-<hex>` directory
    classified as one unit or a run-only directory (variants offered, run
    payload never copied); each artifact set joined by parsing **all** rules of
    the unit's dep-info in its own output directory (the `.d`'s own rule first,
@@ -1726,7 +1800,7 @@ comparison as the proof.
    target and sources entirely inside the verified source root; the join
    recorded at producing time and re-verified under the pin; and no offering
    when the join is unprovable?
-3. Is the §6.3/§7 sequencing accepted as the brief's admission barrier: one
+4. Is the §6.3/§7 sequencing accepted as the brief's admission barrier: one
    admission lifetime (recipient record → sibling barrier → admission) across
    call 1 (pool lock alone, **catalog bytes only, no donor payload**), the
    effect-free selection from the recorded join and the reserve gate, then call
@@ -1734,31 +1808,31 @@ comparison as the proof.
    and hashed** and held through the final donor revalidation, with a competing
    `managed::lease` acquire/eviction between the calls aborting the seed and
    the pool hold bounded in work rather than wall time?
-4. Is the §4.3 archive-to-tree rule sound — cached `.crate` bytes against the
+5. Is the §4.3 archive-to-tree rule sound — cached `.crate` bytes against the
    lock checksum, a canonical derivation with strict entry grammar, a cache hit
    bound to the archive's recorded device/inode/size/mtime identity — and is the
    pinned `flate2` + `tar` reader acceptable as a new locked dependency?
-5. Is the complete per-role manifest in §5.1, including the required `.d` join,
+6. Is the complete per-role manifest in §5.1, including the required `.d` join,
    accepted as the completeness and association boundary?
-6. Is recording per-file producing-epoch SHA-256 digests (§4.4) with a
+7. Is recording per-file producing-epoch SHA-256 digests (§4.4) with a
    256 MiB / 4 s cap the right stale-content evidence, and is abandoning the
    whole seed on one mismatch the intended fail-closed behaviour?
-7. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
+8. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
    the unseeded fact, including an older binary reusing a slot?
-8. Is the §8.3 reserve treatment accepted: the gate sampled only after the
+9. Is the §8.3 reserve treatment accepted: the gate sampled only after the
    effect-free selection produced a non-empty plan and before the durable
    markers, a 22 GiB start gate and monitored stop that refuses rather than
    cold-builds, the removable volume on its own removal-only watchdog and
    registration reserve, and a no-plan command keeping today's behaviour (no
    sample, no marker)?
-9. Is the §9.2 bounded skip-count reporting accepted as satisfying binding
+10. Is the §9.2 bounded skip-count reporting accepted as satisfying binding
    `bb151a59`'s ambiguous-name visibility for both the summary and `oxide
    status`, without adding a walk or reconciliation?
-10. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, time
+11. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, time
    about 130-260 s of 300 s, with the required SQLite and offered-run cases
    retained) make the bound plausible, or should the conflict go to the
    Supervisor before freeze?
-11. Is the D-4 interface in §11 the intended reading — seeding cannot help
+12. Is the D-4 interface in §11 the intended reading — seeding cannot help
     while the only donor is the session's held slot — or should a scoped
     follow-up consider a read-only held-slot donor under stricter closure?
 
@@ -1776,6 +1850,12 @@ comparison as the proof.
 - Selection trusts the join record the producing epoch wrote; a producing epoch
   whose `.d` shapes differ from the pinned adapter writes no catalog, so the
   cost of an adapter mistake is an inert donor, never a wrong clone.
+- Supported target names are Cargo's normalized inferred names only; a package
+  that genuinely renames its lib target is ineligible in v1 rather than mapped
+  by a second grammar.
+- Skip counts are donor-side catalog facts. They describe what the producing
+  epoch rejected while it held the lease; they are not a recipient-side
+  allowlist measurement and they never imply donor reach.
 - It does not qualify removable media beyond the pinned adapter's own proofs,
   does not touch a real drive, and makes no persistence claim about physical
   disconnection.
