@@ -1156,6 +1156,10 @@ class ImageCustody:
         self.device = ""
         self.volume_uuid = ""
         self.whole_disk = ""
+        # The backing's own (dev, ino, size) at attach: the rebind and the
+        # removal both compare it, so a replaced backing is never removed by
+        # pathname alone.
+        self.backing_identity: dict | None = None
         self.state = "unallocated"
         self.disposition: str | None = None
         self.notes: list[str] = []
@@ -1231,6 +1235,7 @@ class ImageCustody:
             raise Aborted(f"image attach is unknown; backing kept: {error}") from error
         self.mount = facts["mount"]
         self.device = facts["device"]
+        self.backing_identity = identity
         # Record the volume facts the pre-detach rebind will require. An
         # unavailable reading here is not fatal for the legacy path; the
         # pre-detach protocol refuses when they cannot be positively rebound.
@@ -1262,6 +1267,11 @@ class ImageCustody:
         if not self.evidence or os.path.dirname(self.backing) != self.evidence:
             raise Aborted(
                 f"the image backing {self.backing} is not inside the verified evidence directory"
+            )
+        if self.backing_identity is not None and identity != self.backing_identity:
+            raise Aborted(
+                f"the image backing {self.backing} is not the object attached"
+                f" ({identity} != {self.backing_identity})"
             )
         entities = self.effects.image_entities(self.backing)
         if len(entities) > MAX_ATTACH_ENTITIES:
@@ -1410,7 +1420,26 @@ class ImageCustody:
                 census_extra=post.get("extra", []),
             )
         # Only now, after the rebind, the bound ordinary detach, the positive
-        # absence check and BOTH clean censuses, is the backing removed.
+        # absence check and BOTH clean censuses, is the backing removed — and
+        # only while it is still the SAME object that was attached and rebound,
+        # never by pathname alone.
+        if self.backing_identity is not None:
+            try:
+                current = self.verify_backing()
+            except BaseException as error:
+                return self._retain(
+                    "retained:backing-identity",
+                    f"the backing identity cannot be re-read before its removal ({error})",
+                    census="pre-clean,post-clean",
+                    census_members=post.get("members", []),
+                )
+            if current != self.backing_identity:
+                return self._retain(
+                    "retained:backing-identity",
+                    f"the backing is not the attached object ({current} != {self.backing_identity})",
+                    census="pre-clean,post-clean",
+                    census_members=post.get("members", []),
+                )
         try:
             self.effects.remove(self.backing)
             removed = "removed-after-clean-pre/post-census-and-ordinary-detach"

@@ -125,8 +125,9 @@ jobs):
   case 5 (armed control + unchanged-authority checks)          8 s
   case 6 (two 11-second armed races + fixtures)               40 s
   case 7 (three registry/receipt controls, exact restores)    20 s
-  ordinary detach, custody record and helper cleanup          25 s
-  supervisor closure, reserve and contingency                 25 s
+  ordinary detach, custody record and helper cleanup          30 s
+  (the pre-detach rebind probes and both bounded censuses are in it)
+  supervisor closure, reserve and contingency                 20 s
   total                                                      300 s
 Scratch: 280 MiB staging + 128 MiB image + 32 MiB fixtures + 32 MiB evidence +
 8 MiB bootstrap Cargo output + 32 MiB margin = 512 MiB. Every figure includes
@@ -187,8 +188,8 @@ ALLOCATION_SECONDS = [
     ("custody-and-group", 8),
     ("witness-races", 40),
     ("competing-owner-and-mismatch", 20),
-    ("ordinary detach and cleanup", 25),
-    ("supervisor closure and contingency", 25),
+    ("ordinary detach and cleanup", 30),
+    ("supervisor closure and contingency", 20),
 ]
 ALLOCATION_MIB = [
     ("staging", 280),
@@ -1347,23 +1348,31 @@ class FakeCustodyEffects:
     file, image or process is touched.
     """
 
-    def __init__(self, entities, volume, detach_code=0, lingering=(), remove_error=None):
+    def __init__(
+        self, entities, volume, detach_code=0, lingering=(), remove_error=None, replace_after=None
+    ):
         self.entities = entities
         self.volume = volume
         self.detach_code = detach_code
         self.lingering = set(lingering)
         self.remove_error = remove_error
+        # After this many stat calls the backing presents a DIFFERENT object,
+        # so a rebind or a pre-removal check can be shown to notice it.
+        self.replace_after = replace_after
+        self.stat_calls = 0
         self.records = {}
         self.events = []
         self.detached = []
         self.removed = []
 
     def stat(self, path):
+        self.stat_calls += 1
+        replaced = self.replace_after is not None and self.stat_calls > self.replace_after
         return SimpleNamespace(
             st_mode=stat.S_IFREG | 0o600,
             st_uid=os.geteuid(),
             st_dev=7,
-            st_ino=1,
+            st_ino=99 if replaced else 1,
             st_size=128 * 1024 * 1024,
             st_nlink=1,
         )
@@ -1415,6 +1424,7 @@ def fake_custody(effects, volume_uuid="UUID-135", whole_disk="/dev/disk9"):
     custody.whole_disk = whole_disk
     custody.state = "attached"
     custody.disposition = None
+    custody.backing_identity = {"dev": 7, "ino": 1, "size": 128 * 1024 * 1024}
     return custody
 
 
@@ -1526,6 +1536,35 @@ def detach_counterfactuals() -> None:
         f"a lingering device did not retain the backing: {disposition}",
     )
     require(not effects.removed, "the backing was removed with a lingering device")
+    # A REPLACED backing is never removed by pathname alone: the rebind catches
+    # it before any detach...
+    effects = FakeCustodyEffects(entities, volume, replace_after=0)
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events)),
+    )
+    require(
+        disposition == "refused:unbound",
+        f"a replaced backing was not refused at the rebind: {disposition}",
+    )
+    require(not effects.detached and not effects.removed, "a replaced backing still detached")
+    # ...and, if it is replaced after the detach, the pre-removal identity check
+    # retains it instead of unlinking whatever now carries the name.
+    effects = FakeCustodyEffects(entities, volume)
+    custody = fake_custody(effects)
+    # The rebind's own two stats are 1 and 2; the replacement appears at the
+    # pre-removal identity check (call 3), after the detach and both censuses.
+    effects.replace_after = 2
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events)),
+    )
+    require(
+        disposition == "retained:backing-identity",
+        f"a backing replaced before removal was not retained: {disposition}",
+    )
+    require(not effects.removed, "a replaced backing was removed by pathname")
     # A wrong volume UUID refuses before any detach.
     effects = FakeCustodyEffects(entities, volume)
     custody = fake_custody(effects)

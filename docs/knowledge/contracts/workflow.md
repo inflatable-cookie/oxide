@@ -5116,8 +5116,11 @@ The stable, read-only interface other tools use to find the registered Builds dr
   historical behaviour): the image is positively rebound from a fresh
   `hdiutil info` for THIS backing and a fresh `diskutil info` for its bound
   device (backing path inside the never-auto-cleaned evidence directory, mounted
-  entity, bound device, volume UUID and whole-disk device), the proof's own
-  session is censused with a bounded readable `kinfo_proc` snapshot where only
+  entity, bound device, volume UUID and whole-disk device), with the backing's
+  recorded `(dev, ino, size)` identity — taken at attach and kept on the custody
+  object — compared at that rebind AND again immediately before the pathname
+  removal, so a replaced backing is retained and never unlinked by name; the
+  proof's own session is censused with a bounded readable `kinfo_proc` snapshot where only
   the script itself may appear, ONE ordinary `hdiutil detach` of the bound
   device runs (never `-force`, never retried), the mount and device must then be
   positively absent, the session is censused again, and only after both clean
@@ -5127,7 +5130,22 @@ The stable, read-only interface other tools use to find the registered Builds dr
   (including EBUSY) or a lingering device all retain the image, its backing and
   its record, with the members recorded. A process that calls `setsid` leaves
   the proof's session and is outside the census — the coordinator's own residual
-  limitation — so no claim is made that such a writer is observed. A child that is still
+  limitation — so no claim is made that such a writer is observed.
+
+  **Authority and fit reconciliation (pre-detach protocol).** The protocol and
+  its in-process census were applied under the Oxide Supervisor's #135 apparatus
+  ruling relayed by ROOT. It is proof-side custody work only: it adds no
+  supervisor, no product seam, no runner change and no persisted format, and the
+  shared helper stays opt-in so every other proof's recorded evidence keeps the
+  behaviour it ran under. The prospective fit absorbs it inside the published
+  envelope — the detach phase now carries the rebind probes (two bounded
+  read-only `hdiutil info` / `diskutil info` calls) and the two bounded censuses
+  (30 s of the 300 s, with the supervisor contingency reduced to 20 s; 512 MiB
+  unchanged) — and remains UNMEASURED. Outstanding ROOT-owned activations: the
+  uncounted diagnostic, the counted author native and the distinct counted
+  reviewer native are each still unactivated, and Effigy heavy admission is
+  unavailable (f6b3b50 retired host-run client; Queue #381 pending), so no
+  native credit exists at any head and the merge hold stays. A child that is still
   running is waited for, never mistaken for a stuck one: the armed races mutate
   the fixture while the product is inside its own 11-second delay. Each
   state-mutating case puts its own fixture back (checkout chain, replaced
