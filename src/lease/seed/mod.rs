@@ -96,7 +96,7 @@ pub use catalog::{
     SEED_MAX_PACKAGES, SEED_MAX_PLAN_INPUTS, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS,
     SEED_MAX_UNITS_PER_PACKAGE, SEED_MAX_UNIT_INPUTS,
 };
-pub use join::{JoinRefusal, ParsedJoin};
+pub use join::{parse as parse_seed_join, JoinRefusal, ParsedJoin};
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
 use super::pool::{open_seed, SeedPoolView, SeedSlotView};

@@ -27,6 +27,8 @@ mod prune;
 mod removable;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_lock;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_plan;
 mod store;
 mod version;
 mod watchdog;
