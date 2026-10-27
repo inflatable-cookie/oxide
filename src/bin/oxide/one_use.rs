@@ -349,10 +349,15 @@ fn accept_root(raw: &OsStr, facts: &Facts, notes: &mut Vec<String>) -> Option<Pa
                 // A payload that does not resolve is compared as recorded: it
                 // is still the truthful location of an absent root.
                 let pool = pool.canonicalize().unwrap_or_else(|_| pool.clone());
-                if root.starts_with(&pool) && root != pool {
+                // The payload root itself is unsafe-broad too: a workspace
+                // there sits in the pool's own bytes, not beside them.
+                if root == pool {
+                    return drop("a registered pool payload", notes);
+                }
+                if root.starts_with(&pool) {
                     return drop("inside a registered pool", notes);
                 }
-                if pool.starts_with(&root) && pool != root {
+                if pool.starts_with(&root) {
                     return drop("contains a registered pool payload", notes);
                 }
             }
@@ -502,7 +507,14 @@ mod tests {
         assert!(!volume_root(Path::new("/Volumes/Builds/leaf")));
 
         let mut facts = facts(
-            vec![Path::new("/"), &home, &pool, &payload.join("slot"), &safe],
+            vec![
+                Path::new("/"),
+                &home,
+                &pool,
+                &payload,
+                &payload.join("slot"),
+                &safe,
+            ],
             None,
         );
         facts.homes = vec![home.clone()];
@@ -514,11 +526,20 @@ mod tests {
             "the filesystem root",
             "the account home",
             "contains a registered pool payload",
+            "a registered pool payload",
             "inside a registered pool",
         ] {
             assert!(notes.contains(reason), "{reason}: {notes}");
         }
-        assert_eq!(classification.notes.len(), 4, "{notes}");
+        assert_eq!(classification.notes.len(), 5, "{notes}");
+        // A workspace exactly at the payload root is never one-use: it is the
+        // pool's own bytes, and dropping equality would classify it normal.
+        let at_payload = classify(&payload, &facts);
+        assert!(!at_payload.guarded(), "{}", at_payload.reason());
+        assert!(at_payload
+            .notes
+            .iter()
+            .any(|note| note.contains("a registered pool payload")));
         // The safe root still applied, so membership came from it.
         assert!(classification.reason().contains("safe"));
 

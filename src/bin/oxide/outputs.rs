@@ -2070,10 +2070,7 @@ fn adopt_command() -> Result<u8, String> {
     // barrier work below, so the verb never enters custody (design §4.1,
     // §4.5). The state selects only the text.
     if guarded_workspace(context.control(), &context.workspace).is_some() {
-        return Err(match context.receipt()? {
-            Some(receipt) if prepared_like(&receipt) => crate::one_use::PREPARED_GUARDED.to_owned(),
-            _ => crate::one_use::adopt_refusal(&context.workspace),
-        });
+        return Err(guarded_adopt_refusal(&context));
     }
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
@@ -4387,6 +4384,13 @@ fn gated_replay(
 /// would write: refuse before Cargo so the next attempt keys afresh.
 fn keyed_state_matches(receipt: Option<&Receipt>, expected: Option<&Plan>) -> Result<(), String> {
     let converted = receipt.is_some_and(|receipt| receipt.state != ReceiptState::Detached);
+    keyed_state_refusal(converted, expected)
+}
+
+/// The shipped key mismatch refusal for one already-decided `converted` fact,
+/// so a guarded binding can use the same text with its own notion of a receipt
+/// that selects nothing (design §4.2's `Pruned` row).
+fn keyed_state_refusal(converted: bool, expected: Option<&Plan>) -> Result<(), String> {
     if converted == expected.is_some() {
         return Ok(());
     }
@@ -6289,6 +6293,21 @@ fn guarded_prepared_refusal(context: &Context) -> Result<(), String> {
     }
 }
 
+/// The guarded `adopt` refusal and its precedence (design §4.1, §4.5): a
+/// `Prepared` transition (the state, a prepared placement or a pending
+/// migration journal) selects the exact §4.4 diagnostic; **every** other state
+/// — absent, `Committed`, `Detached`, `Pruned`, `Pruning`, an unsettled prune
+/// intent, a malformed or mismatched receipt — selects the general refusal.
+/// A malformed document is never the reply and never becomes the decision,
+/// because a guarded workspace cannot adopt at all.
+fn guarded_adopt_refusal(context: &Context) -> String {
+    if matches!(context.receipt(), Ok(Some(receipt)) if prepared_like(&receipt)) {
+        crate::one_use::PREPARED_GUARDED.to_owned()
+    } else {
+        crate::one_use::adopt_refusal(&context.workspace)
+    }
+}
+
 /// The shipped refusal text for a receipt whose listed legacy root is being
 /// pruned, reused by the guard so a guarded command refuses before any effect
 /// exactly as it does today.
@@ -6304,6 +6323,7 @@ fn local_outputs_decision(
     members: &[String],
     prefix: &str,
 ) -> Result<(), String> {
+    unsettled_refusal(context.control(), &context.checkout_id)?;
     if let Some(receipt) = context.receipt()? {
         if prepared_like(&receipt) {
             return Err(crate::one_use::PREPARED_GUARDED.to_owned());
@@ -6403,6 +6423,7 @@ fn bind_local_outputs(
     local: &LocalOutputs<'_>,
 ) -> Result<OutputBinding, String> {
     let lock = store.lock_binding(&context.workspace)?;
+    unsettled_refusal(context.control(), &context.checkout_id)?;
     let receipt = context.receipt()?;
     if let Some(receipt) = &receipt {
         if prepared_like(receipt) {
@@ -6420,10 +6441,15 @@ fn bind_local_outputs(
         }
     }
     inspect_components(&context.link(), local.members, "outputs")?;
-    // A slot is keyed for a local target, so a checkout converted (or
-    // detached) while this command waited still refuses through the shipped
-    // key check rather than binding another destination.
-    keyed_state_matches(receipt.as_ref(), expected)?;
+    // A slot is keyed for a local target, so a checkout converted while this
+    // command waited still refuses through the shipped key check rather than
+    // binding another destination. `Detached` and `Pruned` receipts select
+    // nothing and are unconverted for this purpose (design §4.2); a
+    // `Committed`, `Prepared` or `Pruning` receipt was refused above.
+    let converted = receipt.as_ref().is_some_and(|receipt| {
+        !matches!(receipt.state, ReceiptState::Detached | ReceiptState::Pruned)
+    });
+    keyed_state_refusal(converted, expected)?;
     Ok(OutputBinding {
         outcome: local_outcome(local.reason),
         _lock: Some(lock),
@@ -6441,25 +6467,63 @@ fn local_outcome(reason: &str) -> Outcome {
     }
 }
 
-/// The guarded verbs' barrier acquisition (design §4.1 steps 3-5): under the
-/// checkout binding mutex, revalidate the receipt and migration journal, then
-/// try the `Barrier`-mode barrier without blocking. Nothing is allocated until
-/// an attempt finds the checkout clear.
+/// The guarded verbs' barrier acquisition (design §4.1 steps 3-5).
+///
+/// The checkout binding mutex is held across **both** the revalidation and the
+/// non-blocking `Barrier` attempt, so no peer command's binding can publish a
+/// `Prepared` receipt in the gap between them; it is released between attempts
+/// and before the poll. Every lock the attempt takes is non-blocking, so this
+/// order can never deadlock with a shipped verb that holds the barrier and then
+/// wants the binding mutex. The attempt budget is
+/// [`crate::store::barrier_attempts`]; expiry is the bounded busy refusal with
+/// nothing written.
 fn guarded_barrier(
     store: &Store,
     context: &Context,
     waits: &mut WaitAccounting,
 ) -> Result<CleanGuard, String> {
-    let revalidate = || {
-        let _binding = store.lock_binding(&context.workspace)?;
-        guarded_prepared_refusal(context)
+    for _ in 0..crate::store::barrier_attempts() {
+        if let Some(signal) = process::received_signal() {
+            return Err(format!(
+                "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
+            ));
+        }
+        let binding = store.lock_binding(&context.workspace)?;
+        let attempt = store.begin_clean_with(
+            &context.workspace,
+            waits,
+            crate::store::CleanMode::Barrier,
+            || guarded_prepared_refusal(context),
+        )?;
+        drop(binding);
+        match attempt {
+            Cleaning::Guard(guard) => return Ok(guard),
+            Cleaning::Interrupted(signal) => {
+                return Err(format!(
+                    "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
+                ))
+            }
+            // A dead fact: no attempt can make progress, so refuse now.
+            Cleaning::Busy(reason) => return Err(reason),
+            Cleaning::Retry(_) => std::thread::sleep(BINDING_POLL),
+        }
+    }
+    Err(crate::one_use::BARRIER_BUSY.to_owned())
+}
+
+/// Refuse a guarded command while a prune intent for this checkout is
+/// unsettled: the shipped refusal, kept for the guarded branch (design §4.2's
+/// "refuses through the existing validation/refusal"), because the intent owns
+/// authority over this checkout's roots.
+fn unsettled_refusal(control: Option<&Path>, checkout_id: &str) -> Result<(), String> {
+    let Some(control) = control else {
+        return Ok(());
     };
-    match store.begin_clean_barrier(&context.workspace, waits, revalidate)? {
-        Cleaning::Guard(guard) => Ok(guard),
-        Cleaning::Interrupted(signal) => Err(format!(
-            "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
+    match crate::prune::unsettled_for(control, checkout_id)? {
+        Some(intent) => Err(format!(
+            "outputs: prune intent {intent} is unsettled for this checkout; nothing is built until the exact intent completes or `oxide outputs resolve-intent {intent}` settles it"
         )),
-        Cleaning::Busy(reason) => Err(reason),
+        None => Ok(()),
     }
 }
 
@@ -6493,9 +6557,9 @@ fn barrier(
 ) -> Result<CleanGuard, String> {
     match store.begin_clean(checkout, waits)? {
         Cleaning::Guard(guard) => Ok(guard),
-        // `Recovering` mode never returns `Busy`; only a guarded verb's
-        // `Barrier` mode does, through [`guarded_barrier`].
-        Cleaning::Busy(reason) => Err(reason),
+        // `Recovering` mode never returns `Busy` or `Retry`; only a guarded
+        // verb's `Barrier` mode does, through [`guarded_barrier`]'s own loop.
+        Cleaning::Busy(reason) | Cleaning::Retry(reason) => Err(reason),
         Cleaning::Interrupted(signal) => Err(format!(
             "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
         )),
@@ -16525,48 +16589,333 @@ mod tests {
         assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
     }
 
-    /// Dormancy: without activation the guard is not even computed, so the
-    /// dropped-root notes are silent, the leased command takes the shipped
-    /// path, and that path writes nothing it did not write before.
-    #[test]
-    fn the_guard_is_dormant_without_activation() {
-        assert!(!crate::one_use::is_active());
-        let fixture = GuardFixture::new("dormant");
-        let control = fixture.control();
-        assert!(
-            guarded_workspace(Some(&control), &fixture.checkout).is_none(),
-            "a dormant build never classifies"
+    /// A bounded durable digest of one fixture's authority state: the control
+    /// state bytes, every receipt file, and the checkout's `target` tree with
+    /// each entry's kind and (for a link) its exact text. Small trees only;
+    /// never a payload walk.
+    fn durable_digest(fixture: &GuardFixture) -> Vec<String> {
+        let mut entries = Vec::new();
+        let state = fixture.control().join("state.json");
+        if let Ok(bytes) = fs::read(&state) {
+            entries.push(format!("state:{}", file_digest(&state).unwrap()));
+            assert!(!String::from_utf8_lossy(&bytes).contains("\"class\""));
+        }
+        let outputs = fixture.control().join("outputs");
+        if let Ok(listing) = fs::read_dir(&outputs) {
+            let mut names: Vec<String> = listing
+                .filter_map(|entry| Some(entry.ok()?.file_name().to_str()?.to_owned()))
+                .collect();
+            names.sort();
+            for name in names {
+                entries.push(format!(
+                    "receipt {name}:{}",
+                    file_digest(&outputs.join(&name)).unwrap()
+                ));
+            }
+        }
+        let mut pending = vec![fixture.checkout.join("target")];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let shown = path
+                .strip_prefix(&fixture.checkout)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            if metadata.file_type().is_symlink() {
+                let text = fs::read_link(&path).unwrap();
+                entries.push(format!("link {shown} -> {}", text.display()));
+            } else if metadata.is_dir() {
+                entries.push(format!("dir {shown}"));
+                if let Ok(listing) = fs::read_dir(&path) {
+                    for entry in listing.flatten() {
+                        pending.push(entry.path());
+                    }
+                }
+            } else {
+                entries.push(format!("file {shown}"));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// The leased preparation a command performs before it starts: the guard's
+    /// fast precheck (only when the guard applies), the destination plan and the
+    /// binding, in `main`'s order.
+    fn prepare(fixture: &GuardFixture, guard: Option<&LocalOutputs<'_>>) -> Vec<String> {
+        let mut trace = Vec::new();
+        if let Some(local) = guard {
+            trace.push(format!(
+                "precheck {:?}",
+                guarded_precheck(Some(&fixture.control()), &fixture.checkout, local.members)
+            ));
+        } else {
+            trace.push("precheck skipped".to_owned());
+        }
+        let declaration = crate::layout::Declaration::empty();
+        let planned = planned_destination(
+            Some(&fixture.control()),
+            &fixture.checkout,
+            &declaration,
+            None,
+            guard.is_some(),
         );
+        let planned = match planned {
+            Ok(plan) => {
+                if guard.is_some() {
+                    assert!(plan.is_none(), "a guarded plan owns no root");
+                }
+                trace.push(format!("plan {:?}", plan.is_some()));
+                plan
+            }
+            Err(reason) => {
+                // The shipped plan refuses this shape; `main` stops here too.
+                trace.push(format!("plan refused {reason}"));
+                return trace;
+            }
+        };
+        match bind_for_command(
+            &fixture.store,
+            &fixture.checkout,
+            0,
+            planned.as_ref(),
+            None,
+            false,
+            guard,
+        ) {
+            Ok(binding) => trace.push(format!(
+                "bind ok warnings={:?} note={:?} root={:?}",
+                binding.outcome.warnings, binding.outcome.note, binding.outcome.root
+            )),
+            Err(reason) => trace.push(format!("bind refused {reason}")),
+        }
+        trace
+    }
+
+    /// **Dormant byte identity, with a matched control** (the brief's
+    /// requirement and gate `dormant_byte_identity`). The same fixture is
+    /// prepared twice: the subject goes through the production gate exactly as
+    /// `main` does (the one temporary switch decides, and it is off in every
+    /// production binary), and the control calls the shipped path with no guard
+    /// at all, which is the pre-slice code. Both must return the same trace and
+    /// leave byte-identical durable state, and that state must equal the
+    /// pre-run digest: a dormant build writes nothing it did not write before.
+    ///
+    /// The last part is the non-vacuity control: the same fixture prepared
+    /// through the *guarded* branch refuses with the one-use text when the
+    /// classification says the workspace is guarded, and otherwise equals the
+    /// control. Either answer proves the comparison above is not comparing two
+    /// dead paths, and neither is claimed unconditionally.
+    #[test]
+    fn the_dormant_guard_is_byte_identical_to_the_shipped_path() {
+        assert!(!crate::one_use::is_active());
+        let fixture = GuardFixture::new("dormant-control");
+        // A real, nonempty local target beside a committed receipt: the shape
+        // in which a guard has something to refuse and today's code has a
+        // decision to make.
+        fs::create_dir_all(fixture.checkout.join("target/debug")).unwrap();
+        fs::write(fixture.checkout.join("target/debug/binary"), b"x").unwrap();
+        fixture.write(&fixture.committed());
+
+        let before = durable_digest(&fixture);
         let state_before = fixture.state_bytes();
-        let bind = bind_for_command(
+        assert!(
+            !before.iter().any(|entry| entry.starts_with("state:")),
+            "the fixture starts with no pool state"
+        );
+
+        // Control: the shipped path, exactly as the release before this slice.
+        let control = prepare(&fixture, None);
+        let control_digest = durable_digest(&fixture);
+        assert_eq!(control_digest, before, "the shipped path wrote nothing new");
+        assert_eq!(fixture.state_bytes(), state_before);
+
+        // Subject: the production gate, which is dormant here.
+        let classification = crate::one_use::is_active().then(|| {
+            crate::one_use::classify(
+                &fixture.checkout,
+                &crate::one_use::Facts::from_control(Some(&fixture.control())),
+            )
+        });
+        let guarded = classification
+            .as_ref()
+            .is_some_and(crate::one_use::Classification::guarded);
+        let subject_guard: Option<LocalOutputs<'_>> = guarded.then(|| LocalOutputs {
+            members: &[],
+            reason: "dormant-control",
+        });
+        let subject = prepare(&fixture, subject_guard.as_ref());
+        assert_eq!(subject, control, "the gate changed the decision");
+        assert_eq!(
+            durable_digest(&fixture),
+            control_digest,
+            "the gate changed the durable bytes"
+        );
+        assert_eq!(fixture.state_bytes(), state_before);
+
+        // Non-vacuity: the same fixture through the guarded branch refuses with
+        // the one-use text and still writes nothing. This half does not depend
+        // on the environment: the guard's decision is the receipt's, not the
+        // classification's, so passing the guard is enough to prove the two
+        // paths above really differ.
+        let members = members(&["debug"]);
+        let local = LocalOutputs {
+            members: &members,
+            reason: "one-use control",
+        };
+        let guarded_trace = prepare(&fixture, Some(&local)).join("\n");
+        assert!(
+            guarded_trace.contains("one-use (temporary) workspace"),
+            "the guarded branch refuses this shape: {guarded_trace}"
+        );
+        assert!(
+            guarded_trace.contains("precheck Err"),
+            "the refusal comes from the fast precheck: {guarded_trace}"
+        );
+        assert_eq!(durable_digest(&fixture), control_digest);
+        assert_eq!(fixture.state_bytes(), state_before);
+    }
+
+    /// The guarded branch keeps the shipped unsettled-prune-intent refusal, at
+    /// the fast precheck and under the binding mutex (design §4.2).
+    #[test]
+    fn an_unsettled_prune_intent_refuses_a_guarded_command() {
+        let fixture = GuardFixture::new("unsettled");
+        let id =
+            crate::prune::seed_test_unsettled_intent(&fixture.control(), &fixture.checkout_id());
+        let members = members(&["debug"]);
+        let before = durable_digest(&fixture);
+        let refused =
+            guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members).unwrap_err();
+        assert!(refused.contains(&id), "{refused}");
+        assert!(refused.contains("unsettled"), "{refused}");
+        let local = LocalOutputs {
+            members: &members,
+            reason: "one-use",
+        };
+        let refused = match bind_for_command(
             &fixture.store,
             &fixture.checkout,
             0,
             None,
             None,
             false,
+            Some(&local),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("an unsettled prune intent refuses the guarded binding"),
+        };
+        assert!(refused.contains(&id), "{refused}");
+        assert_eq!(durable_digest(&fixture), before);
+    }
+
+    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally
+    /// through it (design §4.2's `Pruned` row), writing no receipt or state
+    /// byte.
+    #[test]
+    fn a_pruned_receipt_still_binds_locally() {
+        let fixture = GuardFixture::new("pruned-binding");
+        let mut receipt = Receipt::first_with(
+            &fixture.checkout,
+            &fixture.checkout_id(),
+            LayoutKind::Profile,
+        );
+        receipt.links = vec![LinkPlacement {
+            member: "debug".to_owned(),
+            selected: None,
+            prepared: None,
+        }];
+        receipt.state = ReceiptState::Pruned;
+        receipt.pruned = Some(PruneRecord {
+            intent: "prune".to_owned(),
+            outcome: "deleted".to_owned(),
+            at_ms: 1,
+        });
+        fixture.write(&receipt);
+        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let before = durable_digest(&fixture);
+        let members = members(&["debug"]);
+        let local = LocalOutputs {
+            members: &members,
+            reason: "one-use",
+        };
+        let binding = bind_for_command(
+            &fixture.store,
+            &fixture.checkout,
+            0,
             None,
+            None,
+            false,
+            Some(&local),
         )
         .unwrap();
-        assert!(bind.outcome.warnings.is_empty());
-        assert!(bind.outcome.root.is_none());
+        assert_eq!(
+            binding.outcome.warnings,
+            vec!["one-use workspace: local outputs (one-use)".to_owned()]
+        );
+        assert!(binding.outcome.root.is_none());
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+        assert_eq!(durable_digest(&fixture), before);
+    }
+
+    /// A malformed receipt never becomes a guarded `adopt` reply: the verb
+    /// refuses unconditionally, so the general guarded refusal is the answer and
+    /// only a `Prepared` transition selects the exact diagnostic (design §4.1
+    /// precedence, §4.5).
+    #[test]
+    fn a_malformed_receipt_keeps_the_general_guarded_adopt_refusal() {
+        let fixture = GuardFixture::new("malformed-adopt");
+        let path = receipt_path(&fixture.control(), &fixture.checkout_id());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{not a receipt").unwrap();
+        let context = fixture.context();
+        assert!(
+            context.receipt().is_err(),
+            "the malformed document is refused by the reader"
+        );
+        let refused = guarded_adopt_refusal(&context);
+        assert_eq!(refused, crate::one_use::adopt_refusal(&fixture.checkout));
+        assert!(
+            refused.contains("one-use (temporary) workspace"),
+            "{refused}"
+        );
+        assert!(refused.contains("cannot own an output root"), "{refused}");
+        // A prepared receipt still selects the exact §4.4 diagnostic.
+        fixture.write(&fixture.prepared());
+        assert_eq!(
+            guarded_adopt_refusal(&fixture.context()),
+            crate::one_use::PREPARED_GUARDED
+        );
+    }
+
+    /// The bounded barrier budget: with a live holder the guarded verb retries
+    /// on the shipped poll and then refuses finitely, having written nothing
+    /// (no mark, no id, no `waiters/` file, `next_id` unchanged).
+    #[test]
+    fn the_guarded_barrier_gives_up_after_its_attempt_budget() {
+        let fixture = GuardFixture::new("barrier-budget");
+        let _held = crate::store::hold_record_for_tests(&fixture.store, &fixture.checkout, 5);
+        fixture.write(&fixture.committed());
+        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let state_before = fixture.state_bytes();
+        let context = fixture.context();
+        let refused =
+            match guarded_barrier(&fixture.store, &context, &mut WaitAccounting::default()) {
+                Err(reason) => reason,
+                Ok(_) => panic!("a live holder exhausts the attempt budget"),
+            };
+        assert_eq!(refused, crate::one_use::BARRIER_BUSY);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
         assert_eq!(fixture.state_bytes(), state_before);
-        // With the switch on, the guard follows exactly the classification's
-        // own predicate: the expectation is derived from the classification
-        // itself, never from this machine's temporary roots.
-        let expected = crate::one_use::classify(
-            &fixture.checkout,
-            &crate::one_use::Facts::from_control(Some(&control)),
-        )
-        .guarded();
-        crate::one_use::with_active(|| {
-            assert_eq!(
-                guarded_workspace(Some(&control), &fixture.checkout).is_some(),
-                expected
-            );
-        });
-        // The switch is off again: nothing stays active between commands.
-        assert!(guarded_workspace(Some(&control), &fixture.checkout).is_none());
+        let waiters = fixture.control().join("waiters");
+        let listed = fs::read_dir(&waiters)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(listed, 0, "no waiter lock was created");
     }
 
     /// The guarded branch of the shipped verbs that need no live link: a

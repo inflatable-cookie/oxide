@@ -599,6 +599,9 @@ fn run_whole(
             Cleaning::Guard(guard) => Some(guard),
             Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
             Cleaning::Busy(reason) => return Err(reason),
+            // `Recovering` mode never returns `Retry` either; only a guarded
+            // verb's `Barrier` mode does, through its own attempt loop.
+            Cleaning::Retry(reason) => return Err(reason),
         },
         None => None,
     };
@@ -734,6 +737,9 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
             Cleaning::Guard(guard) => Some(guard),
             Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
             Cleaning::Busy(reason) => return Err(reason),
+            // `Recovering` mode never returns `Retry` either; only a guarded
+            // verb's `Barrier` mode does, through its own attempt loop.
+            Cleaning::Retry(reason) => return Err(reason),
         },
         None => None,
     };

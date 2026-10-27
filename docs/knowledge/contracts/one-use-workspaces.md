@@ -16,7 +16,34 @@ checkout binding mutex before any mark, then a bounded non-blocking
 the `begin_clean` **mode** seam (`CleanMode::Recovering` for every existing
 caller, `CleanMode::Barrier` for the guarded verbs, with the §4.1 step-5
 live/dead/unknown busy classifier and the bounded non-progress refusal) through
-`Store::begin_clean_with`. **Dormancy is one temporary process-local switch,
+`Store::begin_clean_with`.
+
+Five properties of that record are worth stating because they are what the
+implementation review corrected:
+
+- **The binding mutex spans the attempt.** `guarded_barrier` holds the
+  checkout binding mutex across the revalidation **and** the `Barrier` attempt,
+  releasing it only between attempts and before the poll, so no peer command's
+  binding can publish a `Prepared` receipt in the gap. To keep that safe it
+  takes **every** lock in the attempt non-blocking
+  (`store::try_lock_admission`), so it can never deadlock with a shipped verb
+  that holds the barrier and then wants the binding mutex. Expiry is the
+  bounded `BARRIER_BUSY` refusal with nothing written.
+- **A dead busy fact refuses even beside a live one.** A free waiter or record
+  lock never clears itself without the shipped recovery, so waiting for a live
+  holder could not make progress; the classifier reports the dead fact.
+- **The payload root is unsafe-broad.** §3.3's pool test now also drops a
+  candidate that *is* a registered payload root, not only ones inside or around
+  it.
+- **The shipped checkout-authority refusals are kept.** A guarded command keeps
+  the unsettled-prune-intent refusal (fast precheck and under the binding
+  mutex), keeps the `Pruning` refusal, and a `Pruned` receipt selects nothing,
+  so it runs locally through the live-component rows instead of tripping the
+  slot-key mismatch.
+- **Guarded `adopt` never surfaces a malformed receipt.** The verb refuses
+  unconditionally, so a malformed or mismatched document selects the general
+  guarded refusal and only a `Prepared` transition selects the §4.4
+  diagnostic. **Dormancy is one temporary process-local switch,
 `one_use::is_active`, `false` in every production binary, settable only by
 unit tests** (S4 replaces it with the `proof-controls` readers of §11.1, which
 are the only activation path the frozen design allows). While it is off, no

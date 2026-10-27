@@ -4962,6 +4962,9 @@ fn prune_one(
         // `Recovering` mode never returns `Busy`; only a guarded verb's
         // `Barrier` mode does.
         store::Cleaning::Busy(reason) => return Err(Stop::Refuse(reason)),
+        // `Recovering` mode never returns `Retry`; only a guarded verb's
+        // `Barrier` mode does.
+        store::Cleaning::Retry(reason) => return Err(Stop::Refuse(reason)),
     };
     let outcome = prune_one_barrier(store, control, candidate, plan_sha, list, evidence);
     store
@@ -5897,6 +5900,9 @@ fn under_checkout_barrier<T>(
         // `Recovering` mode never returns `Busy`; only a guarded verb's
         // `Barrier` mode does.
         store::Cleaning::Busy(reason) => return Err(reason),
+        // `Recovering` mode never returns `Retry`; only a guarded verb's
+        // `Barrier` mode does.
+        store::Cleaning::Retry(reason) => return Err(reason),
     };
     let outcome = (|| {
         let _binding = store.lock_binding(checkout)?;
@@ -6431,6 +6437,9 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
         // `Recovering` mode never returns `Busy`; only a guarded verb's
         // `Barrier` mode does.
         Ok(store::Cleaning::Busy(reason)) => return Ok(refused(&reason)),
+        // `Recovering` mode never returns `Retry`; only a guarded verb's
+        // `Barrier` mode does.
+        Ok(store::Cleaning::Retry(reason)) => return Ok(refused(&reason)),
         Err(reason) => return Ok(refused(&reason)),
     };
     let outcome = (|| -> Result<u8, String> {
@@ -6754,6 +6763,48 @@ pub(crate) fn seed_test_registry(control: &Path) -> Result<(), String> {
         Err(_) if read_registry(control)?.is_some() => Ok(()),
         Err(reason) => Err(reason),
     }
+}
+
+/// Test-only: publish one unfinished prune intent for `checkout_id` into a
+/// ready registry, so the guarded branch's unsettled-intent refusal is
+/// exercisable without running a real prune. Returns the intent ID.
+#[cfg(test)]
+pub(crate) fn seed_test_unsettled_intent(control: &Path, checkout_id: &str) -> String {
+    let mut registry = ready_registry(control).unwrap();
+    let id = "b".repeat(32);
+    registry.intents.push(Intent {
+        version: INTENT_VERSION.to_owned(),
+        id: id.clone(),
+        identity: RootIdentity {
+            checkout_id: checkout_id.to_owned(),
+            checkout: PathBuf::from("/checkout"),
+            receipt: control.join("outputs").join(format!("{checkout_id}.json")),
+            member: "debug".to_owned(),
+            root: PathBuf::from("/root"),
+            root_kind: RootKind::External,
+            volume_uuid: None,
+            nonce: Some("a".repeat(32)),
+            generation: 1,
+            dev: 1,
+            ino: 2,
+            marker_digest: "c".repeat(64),
+        },
+        phase: IntentPhase::Intent,
+        quarantine: PathBuf::from("/quarantine"),
+        preview_sha256: "f".repeat(64),
+        created_ms: 1,
+        updated_ms: 1,
+        resolved_ms: None,
+        receipt_settled: false,
+        was_selected: true,
+        prior_receipt_sha: String::new(),
+        group: Vec::new(),
+        expected_terminal_sha: None,
+        terminal_ms: None,
+    });
+    registry.bump().unwrap();
+    write_registry(control, &registry).unwrap();
+    id
 }
 
 /// Test-only view of registry rows: root, selected, pending, pruning.

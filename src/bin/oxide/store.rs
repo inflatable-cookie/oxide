@@ -756,10 +756,15 @@ impl CleanGuard {
 pub enum Cleaning {
     Guard(CleanGuard),
     Interrupted(i32),
-    /// A guarded verb's bounded non-blocking barrier acquisition gave up: the
-    /// checkout stayed busy for the whole attempt budget. Nothing was written
-    /// (one-use S1, design §4.1 step 4).
+    /// A guarded verb's `Barrier` attempt found no progress possible: a dead
+    /// busy fact (a free or missing lock with no live group) refuses here.
+    /// Nothing was written (one-use S1, design §4.1 step 5).
     Busy(String),
+    /// A guarded verb's `Barrier` attempt found a *live* holder or a lock held
+    /// elsewhere. The caller releases the binding mutex, waits on the shipped
+    /// poll and tries again; it never blocks inside this attempt, so the
+    /// shipped lock order cannot deadlock with it (design §4.1 step 4).
+    Retry(String),
 }
 
 /// How one checkout's clean barrier is acquired (one-use S1, design §4.1).
@@ -793,7 +798,12 @@ enum BarrierState {
 /// barrier reaches its bounded refusal quickly.
 const BARRIER_ATTEMPTS: usize = 25;
 
-fn barrier_attempts() -> usize {
+/// How many non-blocking barrier attempts a guarded verb makes before its
+/// bounded refusal (design §4.1 step 4). The caller of
+/// [`Store::begin_clean_barrier`] owns the budget and the poll between
+/// attempts. The production budget is [`BARRIER_ATTEMPTS`] shipped polls; the
+/// unit suite uses two so a held barrier reaches its bounded refusal quickly.
+pub(crate) fn barrier_attempts() -> usize {
     if cfg!(test) {
         2
     } else {
@@ -2757,27 +2767,31 @@ impl Store {
         self.begin_clean_recovering(checkout, waits)
     }
 
-    /// The guarded-verb barrier (one-use S1, design §4.1 steps 3-5).
+    /// One `Barrier`-mode attempt (one-use S1, design §4.1 steps 3-5).
     ///
-    /// `revalidate` runs under the caller's checkout binding mutex **before
-    /// every attempt and therefore before any mark exists**; its error is the
-    /// guard's own refusal and is returned unchanged with nothing written.
-    /// This path never calls `drop_dead_tickets`, `recover_settled`,
-    /// `ensure_control` or `fence_recorded_accounting`: a refusal here writes
-    /// no state, allocates no id and creates no `waiters/` file.
+    /// `revalidate` runs **under the caller's checkout binding mutex and
+    /// before any mark exists**; its error is the guard's own refusal and is
+    /// returned unchanged with nothing written. This path never calls
+    /// `drop_dead_tickets`, `recover_settled`, `ensure_control` or
+    /// `fence_recorded_accounting`, and it takes every lock it needs
+    /// **non-blocking**: a refusal or a retry writes no state, allocates no
+    /// id and creates no `waiters/` file, and holding the binding mutex across
+    /// this call can never deadlock with a shipped verb that holds the barrier
+    /// and then wants the binding mutex.
     ///
     /// The busy facts are classified rather than acted on:
     ///
-    /// - **live** (a held waiter or record lock, or a recorded non-empty
-    ///   group) — wait on the shipped poll, because the holder can progress;
     /// - **dead** (a free or missing waiter/record lock with no live group) —
-    ///   refuse with the bounded non-progress diagnostic instead of waiting
-    ///   for a fact that can never clear itself without recovery;
+    ///   [`Cleaning::Busy`] with the bounded non-progress diagnostic. A dead
+    ///   fact refuses even beside a live one: it cannot clear itself without
+    ///   the shipped recovery, so no amount of waiting makes progress.
+    /// - **live** (a held waiter or record lock, or a recorded non-empty
+    ///   group) — [`Cleaning::Retry`], because the holder can progress.
     /// - **unknown** (a probe or state read error, or an unreadable sibling
-    ///   state) — refuse; unknown custody is protected.
+    ///   state) — a refusal; unknown custody is protected.
     ///
-    /// After [`barrier_attempts`] polls with no mark, it returns
-    /// [`Cleaning::Busy`]. Ctrl-C still cancels.
+    /// The caller owns the bounded attempt budget and the poll between
+    /// attempts (`crate::store::barrier_attempts`).
     pub fn begin_clean_barrier<F>(
         &self,
         checkout: &Path,
@@ -2792,9 +2806,9 @@ impl Store {
 
     /// The one barrier seam (one-use S1, design §4.1): `Recovering` is the
     /// shipped behaviour for every existing caller and ignores `revalidate`;
-    /// `Barrier` is the guarded verbs' non-recovering, classified, bounded
-    /// acquisition. Keeping one entry point makes the mode choice explicit at
-    /// the call site instead of implicit in which method is named.
+    /// `Barrier` is the guarded verbs' non-recovering, classified,
+    /// non-blocking attempt. Keeping one entry point makes the mode choice
+    /// explicit at the call site instead of implicit in which method is named.
     pub fn begin_clean_with<F>(
         &self,
         checkout: &Path,
@@ -2812,67 +2826,72 @@ impl Store {
             // This path creates no control tree: with no pool state there is
             // no barrier to take, and creating one would be an effect before
             // the guarded verb's own transition.
-            return Ok(Cleaning::Busy(crate::one_use::barrier_unknown(
+            return Err(crate::one_use::barrier_unknown(
                 "this pool has no control state to take a barrier over",
-            )));
+            ));
         }
-        for attempt in 0..barrier_attempts() {
-            if let Some(signal) = process::received_signal() {
+        if let Some(signal) = process::received_signal() {
+            waits.stop(Instant::now());
+            return Ok(Cleaning::Interrupted(signal));
+        }
+        revalidate()?;
+        // The shipped internal-first order, tried without blocking: a held
+        // admission lock (or a live internal clean) is a fact to retry, never a
+        // wait while the caller holds the binding mutex. Both admissions are
+        // held across the state read and the mark, exactly as the shipped
+        // barrier holds them.
+        let _sibling = match self.sibling.as_ref().filter(|sibling| sibling.barrier) {
+            Some(sibling) => match try_lock_admission(&sibling.control)? {
+                Some(lock) => Some(lock),
+                None => {
+                    return Ok(Cleaning::Retry(
+                        "another oxide command holds the internal admission lock".to_owned(),
+                    ))
+                }
+            },
+            None => None,
+        };
+        let Some(_admission) = try_lock_admission(&self.control)? else {
+            return Ok(Cleaning::Retry(
+                "another oxide command holds this pool's admission lock".to_owned(),
+            ));
+        };
+        // An unreadable state or a probe error is unknown custody, so it
+        // refuses with the bounded guarded text instead of a raw error.
+        let mut state = self
+            .load()
+            .map_err(|error| crate::one_use::barrier_unknown(&error))?;
+        match self
+            .barrier_state(&state, checkout)
+            .map_err(|error| crate::one_use::barrier_unknown(&error))?
+        {
+            BarrierState::Dead(what) => Ok(Cleaning::Busy(crate::one_use::barrier_dead(&what))),
+            BarrierState::Live(reason) => Ok(Cleaning::Retry(reason)),
+            BarrierState::Clear => {
+                if state.cleans.len() >= MAX_TICKETS {
+                    return Err(format!("too many concurrent oxide cleans ({MAX_TICKETS})"));
+                }
+                let id = state.take_id()?;
+                let Probe::Free(lock) = probe_lock(&self.ticket_path(id), true)? else {
+                    return Err("a new Oxide clean lock is unexpectedly held".to_owned());
+                };
+                state.cleans.push(Clean {
+                    id,
+                    checkout: checkout.to_path_buf(),
+                    process_group: None,
+                });
+                self.save(&state)?;
                 waits.stop(Instant::now());
-                return Ok(Cleaning::Interrupted(signal));
-            }
-            revalidate()?;
-            // The same order the shipped barrier uses (internal admission
-            // first), but without the recorded-accounting fence write: the
-            // lock alone is enough here and a guarded refusal must not write.
-            let _sibling = self.sibling_admission()?;
-            let _admission = lock_admission(&self.control)?;
-            // An unreadable state or a probe error is unknown custody, so it
-            // refuses with the bounded guarded text instead of a raw error.
-            let mut state = self
-                .load()
-                .map_err(|error| crate::one_use::barrier_unknown(&error))?;
-            match self
-                .barrier_state(&state, checkout)
-                .map_err(|error| crate::one_use::barrier_unknown(&error))?
-            {
-                BarrierState::Live(reason) => {
-                    waits.observe_with_reason(&Wait::Clean, Instant::now(), &reason);
-                }
-                BarrierState::Dead(what) => {
-                    waits.stop(Instant::now());
-                    return Ok(Cleaning::Busy(crate::one_use::barrier_dead(&what)));
-                }
-                BarrierState::Clear => {
-                    if state.cleans.len() >= MAX_TICKETS {
-                        return Err(format!("too many concurrent oxide cleans ({MAX_TICKETS})"));
-                    }
-                    let id = state.take_id()?;
-                    let Probe::Free(lock) = probe_lock(&self.ticket_path(id), true)? else {
-                        return Err("a new Oxide clean lock is unexpectedly held".to_owned());
-                    };
-                    state.cleans.push(Clean {
-                        id,
-                        checkout: checkout.to_path_buf(),
-                        process_group: None,
-                    });
-                    self.save(&state)?;
-                    waits.stop(Instant::now());
-                    waits.print_completion("clean barrier acquired");
-                    return Ok(Cleaning::Guard(CleanGuard { id, lock }));
-                }
-            }
-            if attempt + 1 < barrier_attempts() {
-                std::thread::sleep(WAIT_POLL);
+                waits.print_completion("clean barrier acquired");
+                Ok(Cleaning::Guard(CleanGuard { id, lock }))
             }
         }
-        waits.stop(Instant::now());
-        Ok(Cleaning::Busy(crate::one_use::BARRIER_BUSY.to_owned()))
     }
 
     /// The busy classification of one checkout for [`CleanMode::Barrier`]
-    /// (design §4.1 step 5). A *live* fact wins over a dead one: a holder that
-    /// can progress may clear both.
+    /// (design §4.1 step 5). Any **dead** fact outranks a live one: a free
+    /// waiter or record lock never clears itself without the shipped recovery,
+    /// so waiting for a live holder could not make progress.
     fn barrier_state(&self, state: &State, checkout: &Path) -> Result<BarrierState, String> {
         let mut live: Option<String> = None;
         let mut dead: Option<String> = None;
@@ -2925,9 +2944,12 @@ impl Store {
                 }
             }
         }
-        Ok(match (live, dead) {
-            (Some(reason), _) => BarrierState::Live(reason),
-            (None, Some(what)) => BarrierState::Dead(what),
+        // A dead fact outranks a live one: waiting for a holder that can
+        // progress would still end on the dead fact, which never clears itself
+        // without the shipped recovery, so the guarded verb refuses now.
+        Ok(match (dead, live) {
+            (Some(what), _) => BarrierState::Dead(what),
+            (None, Some(reason)) => BarrierState::Live(reason),
             (None, None) => BarrierState::Clear,
         })
     }
@@ -4474,7 +4496,8 @@ fn writers_closed(state: &State, pool: &str, own_checkout: Option<&Path>) -> Res
     Ok(())
 }
 
-pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
+/// The pool's admission lock file, opened (and created once) but not locked.
+fn open_admission_file(control: &Path) -> Result<File, String> {
     let directory = open_control_directory(control)?
         .ok_or_else(|| format!("{} does not exist", control.display()))?;
     let name = CString::new("admission.lock").map_err(|error| error.to_string())?;
@@ -4538,11 +4561,69 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
             control.join("admission.lock").display()
         ));
     }
+    Ok(file)
+}
+
+pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
+    let file = open_admission_file(control)?;
     crate::budget::lock(&file, "admission")?;
     Ok(file)
 }
 
-/// Open an owner-only regular control file without following symlinks.
+/// A non-blocking admission attempt (one-use S1, design §4.1 step 4): `Some`
+/// once the lock is taken, `None` when another command holds it. A guarded
+/// verb never blocks on this lock while it holds the checkout binding mutex.
+pub(crate) fn try_lock_admission(control: &Path) -> Result<Option<File>, String> {
+    let file = open_admission_file(control)?;
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else if error.kind() == std::io::ErrorKind::Interrupted {
+        Ok(None)
+    } else {
+        Err(format!("cannot take the Oxide admission lock: {error}"))
+    }
+}
+
+/// Test-only: record one active record for `checkout` in `store` and take its
+/// lock the way a live command holds it. The returned file keeps it held.
+#[cfg(test)]
+pub fn hold_record_for_tests(store: &Store, checkout: &Path, id: u64) -> File {
+    let mut state = store.load().unwrap();
+    let mut entry = Record {
+        id,
+        identity: "identity".to_owned(),
+        compatibility: "key".to_owned(),
+        profile: "quick".to_owned(),
+        checkout: Some(checkout.to_path_buf()),
+        phase: Phase::Running,
+        process_group: None,
+        last_used: 1,
+        holder: Some(Holder {
+            pid: 41,
+            started_ms: 7,
+            lease_holder: "oxide-41-3".to_owned(),
+            command: None,
+        }),
+        lease_id: Some("v1.a.1.1.1".to_owned()),
+        pending_recovery: None,
+        retired: None,
+        lost: None,
+        last_used_ms: None,
+    };
+    entry.phase = Phase::Running;
+    state.records.push(entry);
+    store.save(&state).unwrap();
+    let Probe::Free(file) = probe_lock(&store.lock_path(id), true).unwrap() else {
+        panic!("a fresh record lock is free");
+    };
+    file
+}
+
 /// The optional diagnostic sidecar, read without following a link. `None`
 /// means no observations were ever recorded; any other failure is returned
 /// so a caller reports "not measured" instead of falling back to a scan.
@@ -4702,6 +4783,7 @@ impl Store {
     }
 }
 
+/// Open an owner-only regular control file without following symlinks.
 pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
     let mut options = OpenOptions::new();
     options
@@ -5820,37 +5902,61 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A live holder is waited for on the shipped poll, and when it outlasts
-    /// the attempt budget the verb gets the bounded busy refusal rather than
-    /// an unbounded wait. Nothing is marked.
+    /// A live holder is a *retry* fact (the holder can progress), and once it
+    /// is gone the same record is a dead fact that refuses. Neither attempt
+    /// writes anything.
     #[test]
-    fn the_guarded_barrier_waits_for_a_live_holder_then_gives_up() {
+    fn the_guarded_barrier_retries_a_live_holder_and_refuses_a_dead_one() {
         let (root, internal, _removable) = paired_controls("guarded-live-holder");
         let checkout = Path::new("/checkout");
         let held = hold_record(&internal, checkout, 5);
         let before = state_bytes(&internal);
-        let refused =
-            match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(()))
-            {
-                Ok(Cleaning::Busy(reason)) => reason,
-                _ => panic!("a live holder reaches the bounded budget"),
-            };
-        assert!(
-            refused.starts_with("clean barrier busy:"),
-            "a live holder reaches the bounded budget, not a dead refusal: {refused}"
-        );
+        match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(())) {
+            Ok(Cleaning::Retry(reason)) => assert!(reason.contains("record 5"), "{reason}"),
+            _ => panic!("a live holder is retried, never marked"),
+        }
         assert_eq!(state_bytes(&internal), before);
         assert!(internal.load().unwrap().cleans.is_empty());
         drop(held);
         // With the holder gone the same checkout is classified dead, so it
-        // still refuses: only an ordinary (recovering) command recovers it.
+        // refuses: only an ordinary (recovering) command recovers it.
         let refused =
             match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(()))
             {
                 Ok(Cleaning::Busy(reason)) => reason,
-                _ => panic!("a dead clean mark refuses the guarded barrier"),
+                _ => panic!("a dead record refuses the guarded barrier"),
             };
         assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert_eq!(state_bytes(&internal), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Any dead fact refuses even beside a live one (design §4.1 step 5): a
+    /// dead record never clears itself without the shipped recovery, so
+    /// waiting for the live holder could not make progress.
+    #[test]
+    fn a_dead_fact_outranks_a_live_holder() {
+        let (root, internal, _removable) = paired_controls("guarded-dead-and-live");
+        let checkout = Path::new("/checkout");
+        let held = hold_record(&internal, checkout, 5);
+        let mut state = internal.load().unwrap();
+        state.cleans.push(Clean {
+            id: 9,
+            checkout: checkout.to_path_buf(),
+            process_group: None,
+        });
+        internal.save(&state).unwrap();
+        // A free waiter lock with no live group is dead.
+        let before = state_bytes(&internal);
+        match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(())) {
+            Ok(Cleaning::Busy(reason)) => {
+                assert!(reason.contains("clean mark 9"), "{reason}");
+                assert!(reason.contains("clean barrier refused"), "{reason}");
+            }
+            _ => panic!("a dead clean mark refuses despite the live record"),
+        }
+        assert_eq!(state_bytes(&internal), before);
+        drop(held);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5874,6 +5980,30 @@ mod tests {
             fs::read(internal.control.join("state.json")).unwrap(),
             b"{not json"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A held admission lock is a fact to retry, never a lock to block on:
+    /// that is what makes it safe for a guarded verb to hold the checkout
+    /// binding mutex across the attempt (the shipped order takes the barrier
+    /// and then the binding mutex, so blocking here could deadlock).
+    #[test]
+    fn the_guarded_barrier_never_blocks_on_a_held_admission_lock() {
+        let (root, internal, _removable) = paired_controls("guarded-admission");
+        internal.save(&State::default()).unwrap();
+        let held = lock_admission(&internal.control).unwrap();
+        let before = state_bytes(&internal);
+        match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Ok(Cleaning::Retry(reason)) => assert!(reason.contains("admission"), "{reason}"),
+            _ => panic!("a held admission lock is retried, never blocked on"),
+        }
+        assert_eq!(state_bytes(&internal), before);
+        assert!(internal.load().unwrap().cleans.is_empty());
+        drop(held);
         fs::remove_dir_all(root).unwrap();
     }
 
