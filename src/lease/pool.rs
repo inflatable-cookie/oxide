@@ -2464,20 +2464,53 @@ fn restore_captures_in(
             // children are then resolved *through* that verified directory, so
             // a put-back parent never strands its child captures.
             restore_recorded(base, record)?;
-            let original = recorded_name(&record.original)?;
-            let restored = open_directory_at(base, &original).map_err(|error| {
-                format!("the restored captured directory cannot be opened ({error})")
-            })?;
-            let identity = descriptor_identity(restored.as_fd()).map_err(|error| {
-                format!("the restored directory's identity cannot be read ({error})")
-            })?;
-            if identity != (record.device, record.inode) {
-                return Err("the restored directory is not the recorded capture".to_owned());
-            }
             *resolved += 1;
             let mut inner = chain.to_vec();
             inner.push(record.private.clone());
-            restore_captures_in(restored.as_fd(), &inner, records, resolved)?;
+            if !records.iter().any(|child| child.path == inner) {
+                // No recorded child needs descent, so the restored parent is
+                // not opened at all.
+                continue;
+            }
+            let original = recorded_name(&record.original)?;
+            // The restored parent may carry the owner's search-only mode, so it
+            // gets the same identity-bound access repair as a still-private
+            // capture: widen through its own verified descriptor, then restore
+            // exactly the recorded mode on every exit path (including a panic).
+            widen_captured_mode(base, &original, record.device, record.inode, record.mode)?;
+            let mut widened = RestoreWidenedMode {
+                base,
+                private: original.clone(),
+                device: record.device,
+                inode: record.inode,
+                mode: record.mode,
+                armed: true,
+            };
+            let stepped = (|| {
+                let restored = open_directory_at(base, &original).map_err(|error| {
+                    format!("the restored captured directory cannot be opened ({error})")
+                })?;
+                let identity = descriptor_identity(restored.as_fd()).map_err(|error| {
+                    format!("the restored directory's identity cannot be read ({error})")
+                })?;
+                if identity != (record.device, record.inode) {
+                    return Err("the restored directory is not the recorded capture".to_owned());
+                }
+                restore_captures_in(restored.as_fd(), &inner, records, resolved)
+            })();
+            match stepped {
+                Ok(()) => {
+                    widened.restore()?;
+                }
+                Err(reason) => {
+                    return match widened.restore() {
+                        Ok(()) => Err(reason),
+                        Err(restore_reason) => Err(format!(
+                            "{reason}; the restored directory's recorded mode could not be restored ({restore_reason})"
+                        )),
+                    }
+                }
+            }
             continue;
         }
         verify_recorded(base, &private, record)?;

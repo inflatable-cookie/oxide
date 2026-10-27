@@ -4969,7 +4969,8 @@ fn a_restored_parent_with_a_child_capture_resolves_once_the_obstruction_goes() {
             original: "par".to_owned(),
             device: outer_facts.device,
             inode: outer_facts.inode,
-            mode: outer_facts.mode as u32,
+            // The owner left the restored parent search-only.
+            mode: u32::from(outer_facts.file_type()) | 0o100,
         },
         crate::owned_delete::CaptureRecord {
             path: vec![outer_private.clone()],
@@ -4987,6 +4988,11 @@ fn a_restored_parent_with_a_child_capture_resolves_once_the_obstruction_goes() {
     )
     .expect("child put back");
     fs::rename(&par_dir, captured.join("par")).expect("parent put back");
+    // The owner left the restored parent search-only, so a replay that descends
+    // through it needs the same identity-bound access repair as a still-private
+    // capture and must restore exactly this mode afterwards.
+    fs::set_permissions(captured.join("par"), fs::Permissions::from_mode(0o100))
+        .expect("search-only restored parent");
     write_journal(&pool, slot_id, plan, true, records, Vec::new());
 
     // An obstruction on the parent's observed name keeps the replay pending.
@@ -4996,6 +5002,11 @@ fn a_restored_parent_with_a_child_capture_resolves_once_the_obstruction_goes() {
     assert_eq!(blocked.slots.len(), 1, "the obstruction keeps it pending");
     assert_eq!(blocked.coverage, AccountingCoverage::Unknown);
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+    assert_eq!(
+        mode_of(&captured.join("par-aside")),
+        0o100,
+        "the search-only restored parent keeps its recorded mode across the blocked replay"
+    );
 
     // Removing it lets the next open resolve the parent and its child through
     // the verified restored directory, then replay and complete.
