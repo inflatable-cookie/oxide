@@ -361,7 +361,18 @@ fn test_pause_with(point: &str, detail: &str) {
     let _ = (point, detail);
 }
 
+/// Opt-in is deliberately held until the pinned Cargo layout is qualified.
+fn cold_seed_qualification_notice(value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    (value == Some(std::ffi::OsStr::new("1")))
+        .then_some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
+}
+
 fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
+    if let Some(reason) =
+        cold_seed_qualification_notice(std::env::var_os("OXIDE_COLD_SEED").as_deref())
+    {
+        eprintln!("oxide: seeding skipped: {reason}");
+    }
     // The clock was installed by `run` before the hand-off check; nothing here
     // may re-arm it (oxide#140).
     let exec = invocation.command == "exec";
@@ -2163,6 +2174,16 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::ffi::OsStr;
+
+    #[test]
+    fn cold_seed_opt_in_is_qualification_held() {
+        assert_eq!(cold_seed_qualification_notice(None), None);
+        assert_eq!(cold_seed_qualification_notice(Some(OsStr::new("0"))), None);
+        assert_eq!(
+            cold_seed_qualification_notice(Some(OsStr::new("1"))),
+            Some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
+        );
+    }
 
     fn const_scan() -> oxide_storage::lease::AccountingScan {
         oxide_storage::lease::AccountingScan {
