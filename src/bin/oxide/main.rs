@@ -595,10 +595,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
                     production = Some(prepared);
                 }
                 Ok(store::SeedRun::Abandoned) => {
-                    drop(binding);
-                    store.release(held, None)?;
-                    grants.share = false;
-                    (held, gate) = match lease_with_gate(
+                    (held, gate, binding) = match abandon_seed_and_reacquire(
                         &store,
                         &key,
                         invocation.profile,
@@ -606,39 +603,21 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
                         label.as_deref(),
                         &mut waits,
                         &mut grants,
+                        held,
+                        binding,
+                        planned.as_ref(),
+                        pool_fallback.as_deref(),
+                        derives_from_receipt,
                     )? {
                         Ok(leased) => leased,
                         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
                         Err(Stop::Cargo(code)) => return Ok(code),
                         Err(Stop::Admission) => return Ok(stop_for_admission()),
                     };
-                    binding = match outputs::bind_for_command(
-                        &store,
-                        &key.checkout,
-                        held.record_id(),
-                        planned.as_ref(),
-                        pool_fallback.as_deref(),
-                        derives_from_receipt,
-                    ) {
-                        Ok(binding) => binding,
-                        Err(reason) => {
-                            let origin = held.prior.unchanged();
-                            store.release(held, origin)?;
-                            if budget::admission_expired() {
-                                return Ok(stop_for_admission());
-                            }
-                            return Err(reason);
-                        }
-                    };
                     eprintln!("oxide: seeding skipped: recipient walk incomplete");
                 }
                 Err(reason) => {
-                    drop(binding);
-                    store.release(held, None)?;
-                    if budget::admission_expired() {
-                        return Ok(stop_for_admission());
-                    }
-                    return Err(reason);
+                    return refuse_seed(&store, held, binding, reason);
                 }
             },
             Err(seed_sources::PreparationError::Skip(reason)) => {
@@ -1297,6 +1276,66 @@ impl LeaseGrants {
 
     fn taken(&mut self) {
         self.remaining -= 1;
+    }
+}
+
+fn refuse_seed(
+    store: &Store,
+    held: store::Lease,
+    binding: outputs::OutputBinding,
+    reason: String,
+) -> Result<u8, String> {
+    drop(binding);
+    store.release(held, None)?;
+    if budget::admission_expired() {
+        Ok(stop_for_admission())
+    } else {
+        Err(reason)
+    }
+}
+
+/// Release a failed-walk recipient before using the ordinary admission loop.
+#[allow(clippy::too_many_arguments)]
+fn abandon_seed_and_reacquire(
+    store: &Store,
+    key: &SlotKey,
+    profile: cli::Profile,
+    resolution: &cli::Resolution,
+    label: Option<&str>,
+    waits: &mut store::WaitAccounting,
+    grants: &mut LeaseGrants,
+    held: store::Lease,
+    binding: outputs::OutputBinding,
+    planned: Option<&outputs::Plan>,
+    pool_fallback: Option<&str>,
+    derives_from_receipt: bool,
+) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding), Stop>, String> {
+    drop(binding);
+    store.release(held, None)?;
+    grants.share = false;
+    let (held, gate) = match lease_with_gate(store, key, profile, resolution, label, waits, grants)?
+    {
+        Ok(leased) => leased,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    match outputs::bind_for_command(
+        store,
+        &key.checkout,
+        held.record_id(),
+        planned,
+        pool_fallback,
+        derives_from_receipt,
+    ) {
+        Ok(binding) => Ok(Ok((held, gate, binding))),
+        Err(reason) => {
+            let origin = held.prior.unchanged();
+            store.release(held, origin)?;
+            if budget::admission_expired() {
+                Ok(Err(Stop::Admission))
+            } else {
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -2351,6 +2390,62 @@ mod tests {
         grants.taken();
         assert_eq!(grants.remaining, 0);
         assert!(!grants.share);
+    }
+
+    #[test]
+    fn failed_walk_releases_then_reacquires_under_the_original_grant_limit() {
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        std::fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
+        let binding =
+            outputs::bind_for_command(&store, &key.checkout, held.record_id(), None, None, false)
+                .unwrap();
+        let mut grants = LeaseGrants::new();
+        grants.taken();
+        let mut waits = store::WaitAccounting::default();
+        let result = abandon_seed_and_reacquire(
+            &store,
+            &key,
+            cli::Profile::Quick,
+            &cli::Resolution::default(),
+            None,
+            &mut waits,
+            &mut grants,
+            held,
+            binding,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let Ok((cold, _, binding)) = result else {
+            panic!("cold admission stopped")
+        };
+        assert!(matches!(cold.prior, freshness::Prior::Fresh));
+        assert!(!cold.build_dir.join("partial").exists());
+        assert!(grants.remaining < 8);
+        assert!(!grants.share);
+        drop(binding);
+        store.release(cold, None).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_seed_refuses_and_releases_an_untrusted_generation() {
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        std::fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
+        let binding =
+            outputs::bind_for_command(&store, &key.checkout, held.record_id(), None, None, false)
+                .unwrap();
+        assert!(
+            matches!(refuse_seed(&store, held, binding, "seed fault".into()), Err(ref reason) if reason == "seed fault")
+        );
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        assert!(matches!(held.prior, freshness::Prior::Unknown));
+        assert!(held.build_dir.join("partial").exists());
+        store.discard(held).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn const_scan() -> oxide_storage::lease::AccountingScan {

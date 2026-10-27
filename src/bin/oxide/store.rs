@@ -4959,7 +4959,7 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A ledger as an earlier Oxide wrote it reads back, keeps its stored
@@ -5940,7 +5940,11 @@ mod tests {
         outcome
     }
 
-    fn seed_fixture() -> (PathBuf, Store, SlotKey) {
+    pub(crate) fn seed_fixture_lease(store: &Store, key: &SlotKey) -> Lease {
+        lease(store, key, None).expect("fixture lease")
+    }
+
+    pub(crate) fn seed_fixture() -> (PathBuf, Store, SlotKey) {
         use std::ffi::{CStr, CString, OsStr};
         use std::os::unix::ffi::OsStrExt;
         let template = std::env::temp_dir().join("oxide-seed-front.XXXXXX");

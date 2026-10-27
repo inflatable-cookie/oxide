@@ -82,3 +82,68 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
     assert!(std::fs::read_dir(&cargo_home).unwrap().next().is_none());
     assert!(!home.join(".rustup").exists());
 }
+
+#[test]
+fn tiny_build_matches_staged_base_when_seed_is_off() {
+    let Some(base) = std::env::var_os("OXIDE_SEED_BASELINE_BINARY") else {
+        // The covering suite has no implicit second build; the explicit
+        // comparison run supplies a base staged from the merge-base source.
+        return;
+    };
+    let real_home = std::env::var_os("HOME").expect("invoking HOME");
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(real_home).join(".rustup"));
+    let scratch = Scratch::new();
+    let home = scratch.0.join("home");
+    let cargo_home = scratch.0.join("cargo-home");
+    let pool = scratch.0.join("pool");
+    let checkout = scratch.0.join("checkout");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&cargo_home).unwrap();
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    std::fs::write(
+        checkout.join("Cargo.toml"),
+        "[package]\nname = 'seed-off-fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        checkout.join("src/main.rs"),
+        "fn main() { println!(\"seed-off\"); }\n",
+    )
+    .unwrap();
+    let run = |binary: &OsStr| {
+        let output = Command::new(binary)
+            .args(["build", "--offline"])
+            .current_dir(&checkout)
+            .env("HOME", &home)
+            .env("CARGO_HOME", &cargo_home)
+            .env("RUSTUP_HOME", &rustup_home)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("RUSTUP_TOOLCHAIN", "1.97.1")
+            .env("OXIDE_POOL", &pool)
+            .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
+            .env_remove("OXIDE_COLD_SEED")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .output()
+            .expect("run tiny offline build");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("seeding"));
+        let bytes = std::fs::read(checkout.join("target/debug/seed-off-fixture")).unwrap();
+        assert!(!pool.join("oxide-managed/seeds").exists());
+        assert!(!home.join(".rustup").exists());
+        (output.stdout, bytes)
+    };
+    let old = run(&base);
+    std::fs::remove_dir_all(&pool).unwrap();
+    std::fs::remove_dir_all(checkout.join("target")).unwrap();
+    let new = run(OsStr::new(env!("CARGO_BIN_EXE_oxide")));
+    assert_eq!(old.0, new.0);
+    assert_eq!(old.1, new.1);
+}
