@@ -10,14 +10,22 @@ bounded seeder, and the existing supervised staging helper builds the candidate.
 
 Premise checklist (mandatory for a proof-authoring brief):
 (1) seed_and_stage uses the invoking Cargo home, a private Cargo home and 1.97.1
-    with no install, and no `--locked` fixture call.
+    with no install. Staging is the only Cargo call THIS SCRIPT makes. The
+    private pool bootstrap runs one product `oxide check`, which invokes Cargo in
+    its own process group (two jobs); it is a bounded child in the supervisor's
+    session, the product's own command reports its positive closure before it
+    returns, the proof requires exit 0 and an empty session before proceeding,
+    and its time and scratch are declared below.
 (2) proof_env sets OXIDE_TEST_HOME_FROM_ENV=1 for every fixture command.
 (3) proof_env scrubs inherited Oxide, XDG, CARGO_* and GIT_* controls before its
     private settings.
 (4) every fixture checkout's `target` is asserted absent before its adopt.
 (5) no external Cargo subcommand is exercised, so no argv convention is assumed.
 (6) ImageCustody attaches with `-owners on` and records exactly one ordinary
-    detach in a finally path, before which the backing is never removed.
+    detach in a finally path, before which the backing is never removed. The
+    detach runs only when closure is positively known: any killed, signalled or
+    unreaped child, and any recorded custody fault, latches an unknown reason
+    BEFORE the fallible cleanup and refuses the detach while keeping the backing.
 (7) staging scrubs the encoded and plain Rust-wrapper flags; fixtures set
     RUSTFLAGS empty and drop CARGO_ENCODED_RUSTFLAGS.
 (8) the selector fixes --root-parent /private/tmp: the missing-ancestor premise
@@ -36,25 +44,40 @@ descriptor walk whose held nearest existing ancestor is a readable directory on
 the same device and APFS volume UUID as /System/Volumes/Data. A missing chain
 never waives a mount boundary, a recorded checkout volume, or any other
 authority predicate, and the real run's own ancestry witness is compared again
-under the checkout's barrier and binding and immediately before publication.
+under the checkout's barrier and binding and, as the deciding comparison, under
+publication custody immediately before the journal.
 
-Cases, in execution order (counted fail-fast; the diagnostic records each one):
-  1 data-missing-chains   a registered profile group and an operator-listed
-                          receiptless legacy root, each with MULTIPLE missing
-                          ancestors on the boot Data volume, are candidates; the
-                          same chain is KEPT when the marker records a different
-                          checkout volume (a recorded volume is never waived);
-                          the receiptless root needs the exact list; one real
-                          private run completes both through the journal,
-                          terminal receipts and tombstones with no intent left,
-                          while a live checkout stays kept with unchanged bytes.
+Ordinary path ineligibility is a PER-ROOT keep: an unprovable path keeps its own
+root and leaves the snapshot complete, so a sibling root can still be pruned.
+Incomplete required authority (a missing, malformed or contradictory receipt or
+registry, or unknown writer custody) still refuses the whole batch. Case 1 proves
+both sides of that line in one mixed batch.
+
+Cases, in execution order (counted fail-fast; the diagnostic records each one and
+continues into cases that do not depend on a failure):
+  1 data-missing-chains   a MIXED batch: a registered profile group and an
+                          operator-listed receiptless legacy root, each with
+                          MULTIPLE missing ancestors on the boot Data volume, are
+                          candidates while a marker-recorded conflicting checkout
+                          volume and a symlinked ancestor are ordinary per-root
+                          keeps in the SAME batch; one real private run completes
+                          both candidates through the journal, terminal receipts
+                          and tombstones with no intent left, leaves both kept
+                          roots byte-identical, and a live checkout stays kept.
   2 mount-boundaries      a registered checkout inside the attached image whose
                           ancestor below the mount is missing stays KEEP naming
                           the leaf-only rule, and a missing chain under an absent
-                          /Volumes/<name> stays KEEP in BOTH spellings.
+                          /Volumes/<name> stays KEEP in BOTH spellings, each as a
+                          complete-snapshot per-root keep.
   3 symlink-and-nondir    a symlinked ancestor and a non-directory component each
                           stay KEEP with unchanged root bytes.
-  4 witness-races         after the real run's own snapshot: recreating the
+  4 eacces                the debug-only scoped EACCES injection fires and keeps
+                          the root, with the uninjected counterpart proving the
+                          same chain absent.
+  5 custody-and-group     the unknown-custody fault keeps the whole batch with no
+                          stale intent, and the kept root's group rows, receipt
+                          bytes and registry bytes are unchanged.
+  6 witness-races         after the real run's own snapshot: recreating the
                           checkout refuses, and replacing an existing ancestor by
                           a DIFFERENT empty directory while the checkout stays
                           absent refuses with the witness comparison, which a
@@ -62,30 +85,34 @@ Cases, in execution order (counted fail-fast; the diagnostic records each one):
                           exclusively created marker is reset and bound to each
                           race's own root, so neither race can be satisfied by a
                           stale firing.
-  5 eacces                the debug-only scoped EACCES injection fires and keeps
-                          the root, with the uninjected counterpart proving the
-                          same chain absent.
-  6 custody-and-group     the unknown-custody fault keeps the whole batch with no
-                          stale intent, and the kept root's group rows, receipt
-                          bytes and registry bytes are unchanged.
+  7 competing-owner-and-  on a positively absent missing-chain candidate: another
+    mismatch              checkout's live reference keeps the root as ONE per-root
+                          keep in a complete snapshot, while a mismatched group
+                          identity and a mismatched receipt each refuse the whole
+                          batch. No case leaves an intent, quarantine, tombstone
+                          or changed root byte behind.
 
-Prospective, UNMEASURED fit (one staged candidate, fixtures run no Cargo child;
-the only Cargo call is staging at two jobs, planning demand 2 CPU / 4 GiB):
-  launch and source binding                                   6 s
-  offline seed + constrained debug staging (2 Cargo jobs)    90 s
-  image allocate/attach/register + all fixture checkouts     25 s
-  case 1 (two dry runs + one positive real run)              30 s
-  case 2 (one registered control + two listed controls)      10 s
-  case 3 (two listed controls)                               8 s
-  case 4 (two 11-second armed races + fixtures)              40 s
-  case 5 (unarmed control + armed control)                    8 s
-  case 6 (armed control + unchanged-authority checks)         8 s
-  ordinary detach, custody record and helper cleanup         25 s
-  supervisor closure, reserve and contingency                50 s
-  total                                                     300 s
-Scratch: 288 MiB staging + 128 MiB image + 32 MiB fixtures + 32 MiB evidence +
-32 MiB margin = 512 MiB. Every figure includes cleanup, is prospective and is
-NOT a measured fit: a native run must establish it at the published source.
+Prospective, UNMEASURED fit (one staged candidate, one product Cargo child for the
+private pool bootstrap; planning demand 2 CPU / 4 GiB, every Cargo call at two
+jobs):
+  launch and source binding                                    6 s
+  offline seed + constrained debug staging (2 Cargo jobs)     85 s
+  image allocate/attach/register + all fixture checkouts      25 s
+  private pool bootstrap (one Cargo child, own group, 2 jobs) 10 s
+  case 1 (mixed batch + positive real run)                    30 s
+  case 2 (one registered control + two listed controls)       10 s
+  case 3 (two listed controls)                                 8 s
+  case 4 (unarmed control + armed control)                     8 s
+  case 5 (armed control + unchanged-authority checks)          8 s
+  case 6 (two 11-second armed races + fixtures)               40 s
+  case 7 (three registry/receipt controls, exact restores)    20 s
+  ordinary detach, custody record and helper cleanup          25 s
+  supervisor closure, reserve and contingency                 25 s
+  total                                                      300 s
+Scratch: 280 MiB staging + 128 MiB image + 32 MiB fixtures + 32 MiB evidence +
+8 MiB bootstrap Cargo output + 32 MiB margin = 512 MiB. Every figure includes
+cleanup, is prospective and is NOT a measured fit: a native run must establish it
+at the published source.
 
 Each native invocation needs independent published source-fit, fresh finite
 headroom and a SEPARATE explicit ROOT activation. Diagnostic mode is uncounted
@@ -130,32 +157,41 @@ TOTAL_SECONDS = 300
 TOTAL_MIB = 512
 ALLOCATION_SECONDS = [
     ("launch and source binding", 6),
-    ("offline seed and staging", 90),
+    ("offline seed and staging", 85),
     ("image, registration and fixtures", 25),
+    ("private pool bootstrap", 10),
     ("data-missing-chains", 30),
     ("mount-boundaries", 10),
     ("symlink-and-nondir", 8),
-    ("witness-races", 40),
     ("eacces", 8),
     ("custody-and-group", 8),
+    ("witness-races", 40),
+    ("competing-owner-and-mismatch", 20),
     ("ordinary detach and cleanup", 25),
-    ("supervisor closure and contingency", 50),
+    ("supervisor closure and contingency", 25),
 ]
 ALLOCATION_MIB = [
-    ("staging", 288),
+    ("staging", 280),
     ("APFS sparse image", 128),
     ("fixtures", 32),
     ("evidence", 32),
+    ("bootstrap Cargo output", 8),
     ("margin", 32),
 ]
 CASE_NAMES = (
     "data-missing-chains",
     "mount-boundaries",
     "symlink-and-nondir",
-    "witness-races",
     "eacces",
     "custody-and-group",
+    "witness-races",
+    "competing-owner-and-mismatch",
 )
+# Which earlier cases a case depends on. A recoverable failure records itself and
+# blocks only its dependents; every case below is independent of the others, so
+# the uncounted diagnostic genuinely keeps going after one ordinary failure and
+# stops only on an unclassifiable custody, infrastructure or deadline outcome.
+CASE_NEEDS: dict[str, tuple] = {name: () for name in CASE_NAMES}
 # The product's debug-only fixture seams used here, with the marker file each
 # writes. A firing is an observation of the fixture, never a gate.
 EACCES_VAR, EACCES_MARKER = "OXIDE_TEST_PRUNE_EACCES", "prune-eacces-fired"
@@ -171,9 +207,13 @@ LEAF_ONLY_REFUSAL = "an ancestor of the checkout below its mount is missing"
 NO_RECORDED_VOLUME = "a /Volumes checkout has no recorded volume UUID"
 RECORDED_VOLUME_CONFLICT = "is not on the checkout's recorded volume"
 NOT_A_DIRECTORY = "an ancestor of the checkout is not a directory"
-WITNESS_REFUSAL = "the checkout's ancestry changed after the real run's snapshot"
-UNKNOWN_CUSTODY = "writer custody is unknown (injected fixture)"
 UNREADABLE = "Permission denied"
+ABSENCE_UNKNOWN = "checkout absence is unknown ("
+WITNESS_REFUSAL = "the checkout's ancestry changed after the real run's snapshot"
+COMPETING_OWNER = "another checkout's live reference also names this root"
+GROUP_DISAGREEMENT = "selected group references disagree about root identity"
+RECEIPT_MISMATCH = "the registry row does not match the checkout's committed receipt"
+UNKNOWN_CUSTODY = "writer custody is unknown (injected fixture)"
 
 
 def require(value, message):
@@ -182,15 +222,38 @@ def require(value, message):
 
 
 def require_batch_refusal(doc, expected):
-    """The whole batch was kept and the named fault is what refused it."""
+    """The whole batch was kept and the named INCOMPLETE-AUTHORITY fault did it."""
     require(
         doc["coverage"]["complete"] is False and not doc["candidates"],
-        f"the batch was not kept: {doc['coverage']} {doc['candidates']}",
+        f"the batch was not kept as incomplete authority: {doc['coverage']} {doc['candidates']}",
     )
     reasons = [item["reason"] for item in doc["kept"]]
     require(
         any(expected in reason for reason in reasons),
         f"the batch refusal did not name {expected!r}: {reasons}",
+    )
+
+
+def require_root_kept(doc, root, expected):
+    """One root was kept as ORDINARY path ineligibility in a COMPLETE snapshot.
+
+    That distinction is the point: an unprovable path is not an untrustworthy
+    snapshot, so a sibling root can still be a candidate in the same batch.
+    """
+    require(
+        doc["coverage"]["complete"] is True,
+        f"an ordinary keep made the snapshot incomplete: {doc['coverage']}",
+    )
+    require(
+        root not in {candidate["root"] for candidate in doc["candidates"]},
+        f"{root} became a candidate",
+    )
+    reasons = [item["reason"] for item in doc["kept"] if item.get("root") == root]
+    # One root may carry several kept references (one per checkout/root group),
+    # so the oracle is that THIS root's keep names the expected fault.
+    require(
+        any(expected in reason for reason in reasons),
+        f"no keep reason named {expected!r} for {root}: {reasons}",
     )
 
 
@@ -236,16 +299,69 @@ def require_data_volume(root: str, mount: str) -> None:
         )
 
 
+def closure_unknown(code, killed: bool, reaped: bool, unclosed) -> str | None:
+    """Why one finished child's writer closure is UNKNOWN, or `None`.
+
+    A direct child that ended on a signal, a child that was never reaped, a
+    leader this run had to kill, or any pid still in the session means the group
+    behind it is not positively closed. The decision is pure so the uncounted
+    diagnostic and the pure check share it.
+    """
+    if killed:
+        return "a proof child was killed, so its group closure is unknown"
+    if not reaped:
+        return "a proof child was never reaped, so its group closure is unknown"
+    if code is None:
+        return "a proof child left no exit status, so its closure is unknown"
+    if code < 0:
+        return f"a proof child ended on signal {-code}, so its group closure is unknown"
+    if unclosed:
+        return f"{len(unclosed)} proof child(ren) were never reaped, so closure is unknown"
+    return None
+
+
+def latch_unknown(proof, reason: str) -> None:
+    """Record the FIRST custody reason, BEFORE any fallible cleanup."""
+    fresh = getattr(proof, "custody_unknown", None) is None
+    if fresh:
+        proof.custody_unknown = reason
+    proof.closure_known = False
+    if fresh:
+        print(f"custody latched unknown: {reason}", file=sys.stderr, flush=True)
+
+
+def settle_child(world, child, proof, label: str, unclosed):
+    """Finish one armed child and decide its custody BEFORE cleaning up.
+
+    The kill (if any) happens after the latch, so a killed leader's surviving
+    group can never be read as closed; the returned reason is the latched one.
+    """
+    killed = False
+    if child.poll() is None:
+        killed = True
+        latch_unknown(proof, f"{label}: the child outlived its work window and was killed")
+        child.kill()
+    try:
+        code, out, err = world.finish(child, label)
+    except BaseException as error:
+        latch_unknown(proof, f"{label}: the child could not be reaped ({error})")
+        raise
+    reason = closure_unknown(code, killed, True, unclosed)
+    if reason is not None:
+        latch_unknown(proof, f"{label}: {reason}")
+    return code, out, err, reason
+
+
 class Adapter:
     """The existing qualified-session child helper behind World's own API."""
 
-    def __init__(self, proof, binary):
+    def __init__(self, proof, binary, unclosed=None):
         self.inner = proof
         self.root = str(proof.root)
         self.binary = str(binary)
         self.env = {}
         self.serial = 0
-        self.unclosed = set()
+        self.unclosed = unclosed if unclosed is not None else set()
 
     def run(self, argv, cwd=None, env=None, timeout=120):
         self.serial += 1
@@ -280,9 +396,9 @@ def listed_legacy_root(
     Without `recorded_checkout_volume` it is the genuine legacy shape (root/1,
     no nonce, no recorded checkout volume). With one, it keeps the current
     marker shape and nonce and records that volume, which the product must
-    honour: the proof's conflicting control is exactly this case. Only one leaf
-    is created: the container is the product's own owner-only oxide-outputs
-    directory."""
+    honour: the mixed batch's conflicting control is exactly this case. Only one
+    leaf is created: the container is the product's own owner-only
+    oxide-outputs directory."""
     checkout_id = hashlib.sha256(checkout.encode()).hexdigest()
     root = os.path.join(world.mount, "oxide-outputs", f"{label}-{checkout_id[:8]}")
     os.mkdir(root, 0o700)
@@ -328,6 +444,22 @@ def fired(path: Path, expected: str) -> None:
     )
 
 
+def snapshot_file(path: Path) -> tuple:
+    """Exact bytes and mode of one control document this proof restores."""
+    facts = os.lstat(path)
+    require(stat.S_ISREG(facts.st_mode) and facts.st_mode & 0o777 == 0o600, f"{path} is not 0600")
+    return path.read_bytes(), stat.S_IMODE(facts.st_mode)
+
+
+def restore_file(path: Path, saved: tuple) -> None:
+    """Restore exact bytes and mode, then verify both."""
+    original, mode = saved
+    path.write_bytes(original)
+    os.chmod(path, mode)
+    require(path.read_bytes() == original, f"{path} was not restored byte-exactly")
+    require(stat.S_IMODE(os.lstat(path).st_mode) == mode, f"{path} lost its mode")
+
+
 def armed_real_run(world, plan: str, sha: str, extra: dict):
     """Start one real run in the supervisor's session, so the proof can mutate
     the fixture while the product holds its own snapshot."""
@@ -337,37 +469,73 @@ def armed_real_run(world, plan: str, sha: str, extra: dict):
     return permanent.start_child(world.proof, argv, world.root, env)
 
 
-def await_firing(world, marker: Path, expected: str, child, label: str) -> None:
+def await_firing(marker: Path, expected: str, child, label: str) -> None:
     """Wait, bounded by the supervisor's own deadline, for THIS run's firing.
 
     The seam's marker is created exclusively, so a marker that already exists is
     a previous case's firing and can never satisfy this wait: the loop requires
-    the recorded path to be `expected`. An early exit is reported with its
-    custody, never silently skipped."""
+    the recorded path to be `expected`. The child is never finished here: its
+    custody decision belongs to `settle_child`, which latches before cleanup."""
     deadline = time.monotonic() + min(30.0, permanent.work_left())
     while True:
         if marker.exists():
             recorded = marker.read_text(errors="replace").strip().splitlines()
             if recorded and recorded[-1] == expected:
                 return
-        if child.poll() is not None:
-            code, out, err = world.finish(child, label)
+        code = child.poll()
+        if code is not None:
             raise RuntimeError(
-                f"{label} ended before {marker.name} fired for {expected} (exit {code}): {out}{err}"
+                f"{label} ended (exit {code}) before {marker.name} fired for {expected}"
             )
         if time.monotonic() >= deadline:
             raise RuntimeError(f"{label} never fired {marker.name} for {expected}")
         time.sleep(0.05)
 
 
-def finish_armed(world, child, proof, label: str):
-    """Finish one armed child; a child that will not be reaped keeps closure
-    unknown and blocks the ordinary detach."""
-    if child.poll() is None:
-        child.kill()
-        world.finish(child, f"{label} (killed)")
-        proof.closure_known = False
-        raise RuntimeError(f"{label} did not end and was killed; closure is unknown")
+def write_competitor(world, control: str, template_row: dict, root: str) -> tuple:
+    """A hand-written live registry row for ANOTHER checkout naming `root`.
+
+    The product's own rows cannot produce this state (two checkouts never select
+    one root), so the fixture writes the row and the committed whole-target
+    receipt its readers require, and the proof restores both exactly. The
+    fabricated checkout path is under `/`, where no missing-chain proof applies,
+    so the competitor can never become a candidate itself.
+    """
+    checkout = f"/oxide135-competitor/{secrets.token_hex(8)}"
+    checkout_id = hashlib.sha256(checkout.encode()).hexdigest()
+    receipt_path = os.path.join(control, "outputs", checkout_id + ".json")
+    row = dict(template_row)
+    for key in ("pruning", "pruned_ms", "reservation", "cancelling"):
+        row.pop(key, None)
+    row.update(
+        checkout=checkout,
+        checkout_id=checkout_id,
+        receipt=receipt_path,
+        member="target",
+        generation=1,
+        selected=True,
+        pending=False,
+    )
+    selection = {
+        "kind": "external",
+        "root": root,
+        "volume_uuid": row["volume_uuid"],
+        "nonce": row["nonce"],
+        "generation": 1,
+    }
+    document = {
+        "version": "oxide.outputs.transition/2",
+        "checkout": checkout,
+        "checkout_id": checkout_id,
+        "generation": 1,
+        "state": "committed",
+        "roots": [selection],
+        "links": [{"member": "target", "selected": selection}],
+        "updated_ms": 1,
+    }
+    Path(receipt_path).write_text(json.dumps(document))
+    os.chmod(receipt_path, 0o600)
+    return row, receipt_path
 
 
 def verified_seed_source(home: Path) -> dict:
@@ -434,7 +602,7 @@ def run_cases(proof, custody, diagnostic, cases):
         raise RuntimeError("the canonical Cargo cache identity changed during staging")
     provenance["seed_source"] = source
     (proof.evidence / "prune135-provenance.json").write_text(json.dumps(provenance, indent=2))
-    adapter = Adapter(proof, oxide)
+    adapter = Adapter(proof, oxide, proof.unclosed)
     world = prior.World(adapter, adapter.root)
     home, cargo_home = proof.root / "home", proof.root / "fixture-cargo-home"
     home.mkdir(mode=0o700)
@@ -447,7 +615,13 @@ def run_cases(proof, custody, diagnostic, cases):
     require_data_volume(adapter.root, "")
     boot = world.checkout("bootstrap")
     code, _, err = world.oxide(["check"], "private pool bootstrap", boot)
-    require(code == 0, err)
+    if code != 0:
+        latch_unknown(proof, "the private pool bootstrap failed, so its Cargo group is unclassified")
+        raise RuntimeError(f"the private pool bootstrap failed (exit {code}): {err}")
+    require(
+        not adapter.unclosed,
+        f"the bootstrap left an unreaped child: {sorted(adapter.unclosed)}",
+    )
     custody.allocate(str(proof.evidence), str(proof.root))
     world.mount = custody.attach()
     require_data_volume(adapter.root, world.mount)
@@ -487,6 +661,7 @@ def run_cases(proof, custody, diagnostic, cases):
     group = adopt_chain(("a", "b", "checkout"))
     live = adopt_chain(("checkout",))
     kept_group = adopt_chain(("checkout",))
+    owned_chain = adopt_chain(("checkout",))
     recreate_race = adopt_chain(("checkout",))
     replace_race = adopt_chain(("anc", "child", "checkout"))
     custody_case = adopt_chain(("checkout",))
@@ -495,7 +670,7 @@ def run_cases(proof, custody, diagnostic, cases):
     marker_template = prior.marker(world.selected(group["checkout"])["root"])
     # A receiptless root whose marker RECORDS the image's checkout volume while
     # its surviving ancestors are on the boot Data volume: the record must be
-    # honoured, so this chain is kept even though the Data proof holds.
+    # honoured, so this chain is KEPT even though the Data proof holds.
     conflicting_checkout = os.path.join(
         adapter.root, "chains", secrets.token_hex(4), "x", "checkout"
     )
@@ -544,6 +719,7 @@ def run_cases(proof, custody, diagnostic, cases):
             ("group", group),
             ("live", live),
             ("kept_group", kept_group),
+            ("owned_chain", owned_chain),
             ("recreate_race", recreate_race),
             ("replace_race", replace_race),
             ("custody", custody_case),
@@ -556,50 +732,50 @@ def run_cases(proof, custody, diagnostic, cases):
         if row["root"] == roots["group"] and row["selected"]
     )
     require(members == ["debug", "release"], f"the profile group premise is {members}")
-    for key in ("group", "live", "custody"):
+    for key in ("group", "live", "custody", "owned_chain"):
         Path(roots[key], "payload").write_bytes(b"x" * 4096)
     live_before = prior.tree_snapshot(roots["live"])
     live_identity = (os.lstat(roots["live"]).st_dev, os.lstat(roots["live"]).st_ino)
-    tainted = False
+    failed = set()
 
     def case(name, body):
-        nonlocal tainted
-        if tainted:
+        needs = CASE_NEEDS[name]
+        missing = [dependency for dependency in needs if dependency in failed]
+        if missing:
             cases.append(
-                {"case": name, "state": "skipped", "reason": "earlier fixture state uncertain"}
+                {
+                    "case": name,
+                    "state": "skipped",
+                    "reason": f"depends on {', '.join(missing)}",
+                }
             )
             return
         cases.append({"case": name, "state": "reached"})
         try:
             body()
             cases[-1]["state"] = "completed"
+        except (prior.Aborted, KeyboardInterrupt, SystemExit):
+            cases[-1].update(state="failed", reason="infrastructure or custody abort")
+            raise
         except BaseException as error:
             cases[-1].update(state="failed", reason=f"{type(error).__name__}: {error}")
-            tainted = True
-            if (
-                not diagnostic
-                or isinstance(error, (prior.Aborted, KeyboardInterrupt, SystemExit))
-                or not proof.closure_known
-            ):
+            failed.add(name)
+            if not diagnostic:
                 raise
+            print(f"---- {name} failed (diagnostic continues): {error!r}", flush=True)
+        # An unclassifiable custody or deadline outcome aborts the collection:
+        # no later case may run beside an unknown writer group.
+        if getattr(proof, "custody_unknown", None) is not None:
+            raise prior.Aborted(f"custody unknown; collection aborted after {name}")
+        if permanent.work_left() < 10:
+            raise prior.Aborted(f"the work window is exhausted after {name}")
 
     def data_missing_chains():
-        # A recorded checkout volume is never waived: the same Data missing
-        # chain is KEPT when the marker records a different volume, and the
-        # root's bytes are untouched.
-        untouched = prior.tree_snapshot(conflicting_root)
-        listed = operator_list(world, [conflicting_root], "conflict")
-        _, out, _ = world.dry_run("recorded volume conflict", boot, listed)
-        require_batch_refusal(json.loads(out), RECORDED_VOLUME_CONFLICT)
-        require(prior.tree_snapshot(conflicting_root) == untouched, "the conflicting root changed")
-        # The checkout is present first: the same root is then kept for the
-        # ordinary reason, which is this case's non-vacuous control.
-        _, out, _ = world.dry_run("present group", boot)
-        present = json.loads(out)
-        require(world.kept(present, roots["group"]) == PRESENT_KEEP, str(present["kept"]))
         vanished(world, str(group["token"]))
-        # The receiptless root needs the exact list: without it, it is not even
-        # considered, so the batch is exactly the registered candidate.
+        # The MIXED batch: two positively absent Data chains are candidates while
+        # two ordinary per-root keeps (a recorded-volume conflict and a symlinked
+        # ancestor) sit in the SAME complete snapshot. A listless batch holds only
+        # the registered candidate, so the receiptless roots need the exact list.
         _, out, _ = world.dry_run("no list", boot)
         without_list = json.loads(out)
         require(
@@ -607,12 +783,20 @@ def run_cases(proof, custody, diagnostic, cases):
             and world.candidates(without_list) == {roots["group"]},
             f"the listless batch is not exactly the registered candidate: {without_list}",
         )
-        listed = operator_list(world, [legacy_root], "data")
-        plan, sha, doc = world.plan_file("data chains", boot, listed)
-        require(
-            world.candidates(doc) == {roots["group"], legacy_root},
-            f"a boot Data missing chain was not a candidate: {doc['candidates']} {doc['kept']}",
+        conflict_before = prior.tree_snapshot(conflicting_root)
+        symlink_before = prior.tree_snapshot(symlink_root)
+        listed = operator_list(
+            world, [legacy_root, conflicting_root, symlink_root], "data"
         )
+        plan, sha, doc = world.plan_file("mixed batch", boot, listed)
+        require(
+            doc["coverage"]["complete"]
+            and world.candidates(doc) == {roots["group"], legacy_root},
+            f"the mixed batch is not two candidates plus two keeps: "
+            f"{doc['candidates']} {doc['kept']}",
+        )
+        require_root_kept(doc, conflicting_root, RECORDED_VOLUME_CONFLICT)
+        require_root_kept(doc, symlink_root, NOT_A_DIRECTORY)
         require(
             world.kept(doc, roots["live"]) == PRESENT_KEEP,
             f"the live checkout was not kept: {doc['kept']}",
@@ -638,6 +822,9 @@ def run_cases(proof, custody, diagnostic, cases):
             and (os.lstat(roots["live"]).st_dev, os.lstat(roots["live"]).st_ino) == live_identity,
             "the kept live root changed",
         )
+        # The ordinary keeps in that same batch are untouched by the effect.
+        require(prior.tree_snapshot(conflicting_root) == conflict_before, "the conflict root changed")
+        require(prior.tree_snapshot(symlink_root) == symlink_before, "the symlink root changed")
         require("positively absent" in out, out)
 
     case("data-missing-chains", data_missing_chains)
@@ -649,7 +836,7 @@ def run_cases(proof, custody, diagnostic, cases):
         os.rename(checkouts, away)
         try:
             _, out, _ = world.dry_run("image missing ancestor", boot)
-            require_batch_refusal(json.loads(out), LEAF_ONLY_REFUSAL)
+            require_root_kept(json.loads(out), roots["image"], LEAF_ONLY_REFUSAL)
             require(prior.tree_snapshot(roots["image"]) == payload, "the kept image root changed")
         finally:
             # Restored: the row is an ordinary present-checkout keep again, so
@@ -664,9 +851,8 @@ def run_cases(proof, custody, diagnostic, cases):
             listed = operator_list(world, [root], "mount")
             _, out, _ = world.dry_run(label, boot, listed)
             doc = json.loads(out)
-            require_batch_refusal(doc, NO_RECORDED_VOLUME)
+            require_root_kept(doc, root, NO_RECORDED_VOLUME)
             require(prior.tree_snapshot(root) == untouched, f"the {label} root changed")
-            require(not doc["candidates"], f"{label}: a mount chain became a candidate")
 
     case("mount-boundaries", mount_boundaries)
 
@@ -678,77 +864,11 @@ def run_cases(proof, custody, diagnostic, cases):
             untouched = prior.tree_snapshot(root)
             listed = operator_list(world, [root], label)
             _, out, _ = world.dry_run(label, boot, listed)
-            require_batch_refusal(json.loads(out), NOT_A_DIRECTORY)
+            require_root_kept(json.loads(out), root, NOT_A_DIRECTORY)
             require(prior.tree_snapshot(root) == untouched, f"the {label} root changed")
             require(not world.intents() and not world.quarantines(), f"{label} left an intent")
 
     case("symlink-and-nondir", symlink_and_nondir)
-
-    def witness_races():
-        # (a) The checkout recreated after the real run's own snapshot. A fresh
-        # absence proof already sees it present, so this proves the lock-time
-        # revalidation rather than the witness comparison.
-        vanished(world, str(recreate_race["token"]))
-        plan, sha, doc = world.plan_file("recreate plan", boot)
-        require(
-            world.candidates(doc) == {roots["recreate_race"]},
-            f"the recreate race fixture is not one candidate: {doc['candidates']}",
-        )
-        before = prior.tree_snapshot(roots["recreate_race"])
-        child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["recreate_race"]})
-        try:
-            await_firing(
-                world,
-                proof.evidence / DELAY_MARKER,
-                roots["recreate_race"],
-                child,
-                "recreate race",
-            )
-            os.makedirs(recreate_race["checkout"], exist_ok=True)
-            code, out, err = world.finish(child, "recreate race")
-        finally:
-            finish_armed(world, child, proof, "recreate race")
-        require(code != 0, f"a recreated checkout was pruned: {out}{err}")
-        require(PRESENT_KEEP in err, f"the recreated checkout was not refused as present: {err}")
-        # The product creates this seam's marker exclusively, so the second race
-        # needs its own firing: removing this case's marker is what makes the
-        # next wait prove the SECOND root's delay rather than a stale file.
-        marker = proof.evidence / DELAY_MARKER
-        fired(marker, roots["recreate_race"])
-        marker.unlink()
-        require(prior.tree_snapshot(roots["recreate_race"]) == before, "the refused root changed")
-        require(not world.intents() and not world.quarantines(), "the recreate race left an intent")
-        # (b) An EXISTING ancestor replaced by a DIFFERENT empty directory while
-        # the checkout stays absent. A fresh absence proof still succeeds, so
-        # only the real run's own witness comparison can refuse this.
-        vanished(world, str(replace_race["path"].parent))
-        plan, sha, doc = world.plan_file("replace plan", boot)
-        require(
-            world.candidates(doc) == {roots["replace_race"]},
-            f"the replace race fixture is not one candidate: {doc['candidates']}",
-        )
-        before = prior.tree_snapshot(roots["replace_race"])
-        ancestor = str(replace_race["path"].parent.parent)
-        child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["replace_race"]})
-        try:
-            await_firing(
-                world,
-                proof.evidence / DELAY_MARKER,
-                roots["replace_race"],
-                child,
-                "replace race",
-            )
-            os.rename(ancestor, ancestor + "-away")
-            os.mkdir(ancestor, 0o700)
-            code, out, err = world.finish(child, "replace race")
-        finally:
-            finish_armed(world, child, proof, "replace race")
-        require(code != 0, f"a replaced ancestor was pruned: {out}{err}")
-        require(WITNESS_REFUSAL in err, f"the witness comparison did not refuse: {err}")
-        require(prior.tree_snapshot(roots["replace_race"]) == before, "the refused root changed")
-        require(not world.intents() and not world.quarantines(), "the replace race left an intent")
-
-    case("witness-races", witness_races)
 
     def eacces():
         listed = operator_list(world, [eacces_root], "eacces")
@@ -760,7 +880,7 @@ def run_cases(proof, custody, diagnostic, cases):
         )
         untouched = prior.tree_snapshot(eacces_root)
         _, out, _ = world.dry_run("eacces", boot, listed, {EACCES_VAR: eacces_target})
-        require_batch_refusal(json.loads(out), UNREADABLE)
+        require_root_kept(json.loads(out), eacces_root, UNREADABLE)
         fired(proof.evidence / EACCES_MARKER, eacces_target)
         require(prior.tree_snapshot(eacces_root) == untouched, "the unreadable-ancestor root changed")
         require(not world.intents() and not world.quarantines(), "the EACCES refusal left an intent")
@@ -774,6 +894,8 @@ def run_cases(proof, custody, diagnostic, cases):
         _, out, _ = world.dry_run(
             "unknown custody", boot, None, {CUSTODY_VAR: custody_case["checkout"]}
         )
+        # Unknown writer custody is incomplete AUTHORITY, not path
+        # ineligibility: the whole batch refuses.
         require_batch_refusal(json.loads(out), UNKNOWN_CUSTODY)
         fired(proof.evidence / CUSTODY_MARKER, custody_case["checkout"])
         require(not world.intents() and not world.quarantines(), "a custody refusal left an intent")
@@ -799,16 +921,190 @@ def run_cases(proof, custody, diagnostic, cases):
         )
 
     case("custody-and-group", custody_and_group)
-    require(not adapter.unclosed, f"a proof child was never reaped: {sorted(adapter.unclosed)}")
+
+    def witness_races():
+        # (a) The checkout recreated after the real run's own snapshot. A fresh
+        # absence proof already sees it present, so this proves the lock-time
+        # revalidation rather than the witness comparison.
+        vanished(world, str(recreate_race["token"]))
+        plan, sha, doc = world.plan_file("recreate plan", boot)
+        require(
+            world.candidates(doc) == {roots["recreate_race"]},
+            f"the recreate race fixture is not one candidate: {doc['candidates']}",
+        )
+        before = prior.tree_snapshot(roots["recreate_race"])
+        child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["recreate_race"]})
+        try:
+            await_firing(
+                proof.evidence / DELAY_MARKER,
+                roots["recreate_race"],
+                child,
+                "recreate race",
+            )
+            os.makedirs(recreate_race["checkout"], exist_ok=True)
+        finally:
+            code, out, err, reason = settle_child(
+                world, child, proof, "recreate race", adapter.unclosed
+            )
+        require(reason is None, f"the recreate race left custody unknown: {reason}")
+        require(code != 0, f"a recreated checkout was pruned: {out}{err}")
+        require(PRESENT_KEEP in err, f"the recreated checkout was not refused as present: {err}")
+        require(prior.tree_snapshot(roots["recreate_race"]) == before, "the refused root changed")
+        require(not world.intents() and not world.quarantines(), "the recreate race left an intent")
+        # The product creates this seam's marker exclusively, so the second race
+        # needs its own firing: removing this case's marker is what makes the
+        # next wait prove the SECOND root's delay rather than a stale file.
+        marker = proof.evidence / DELAY_MARKER
+        fired(marker, roots["recreate_race"])
+        marker.unlink()
+        # (b) An EXISTING ancestor replaced by a DIFFERENT empty directory while
+        # the checkout stays absent. A fresh absence proof still succeeds, so
+        # only the real run's own witness comparison can refuse this.
+        vanished(world, str(replace_race["path"].parent))
+        plan, sha, doc = world.plan_file("replace plan", boot)
+        require(
+            world.candidates(doc) == {roots["replace_race"]},
+            f"the replace race fixture is not one candidate: {doc['candidates']}",
+        )
+        before = prior.tree_snapshot(roots["replace_race"])
+        ancestor = str(replace_race["path"].parent.parent)
+        child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["replace_race"]})
+        try:
+            await_firing(
+                proof.evidence / DELAY_MARKER,
+                roots["replace_race"],
+                child,
+                "replace race",
+            )
+            os.rename(ancestor, ancestor + "-away")
+            os.mkdir(ancestor, 0o700)
+        finally:
+            code, out, err, reason = settle_child(
+                world, child, proof, "replace race", adapter.unclosed
+            )
+        require(reason is None, f"the replace race left custody unknown: {reason}")
+        require(code != 0, f"a replaced ancestor was pruned: {out}{err}")
+        require(WITNESS_REFUSAL in err, f"the witness comparison did not refuse: {err}")
+        require(prior.tree_snapshot(roots["replace_race"]) == before, "the refused root changed")
+        require(not world.intents() and not world.quarantines(), "the replace race left an intent")
+
+    case("witness-races", witness_races)
+
+    def competing_owner_and_mismatch():
+        # A positively absent missing-chain candidate that must survive every
+        # control below unchanged.
+        vanished(world, str(owned_chain["token"]))
+        plan, sha, doc = world.plan_file("candidate plan", boot)
+        require(
+            world.candidates(doc) == {roots["owned_chain"]},
+            f"the control fixture is not one candidate: {doc['candidates']}",
+        )
+        root_before = prior.tree_snapshot(roots["owned_chain"])
+        registry = Path(world.registry)
+        registry_saved = snapshot_file(registry)
+
+        def no_effect(label):
+            require(
+                os.path.isdir(roots["owned_chain"]),
+                f"{label}: the candidate root was deleted",
+            )
+            require(
+                prior.tree_snapshot(roots["owned_chain"]) == root_before,
+                f"{label}: the candidate root changed",
+            )
+            require(
+                not world.intents() and not world.quarantines(),
+                f"{label}: a stale intent or quarantine appeared",
+            )
+            tombstones = os.path.join(world.outputs, "tombstones.json")
+            if os.path.exists(tombstones):
+                entries = permanent.read_json(tombstones)["entries"]
+                require(
+                    roots["owned_chain"] not in {entry["root"] for entry in entries},
+                    f"{label}: a tombstone names the candidate root",
+                )
+
+        # (a) Another checkout's live reference names the same root: ONE per-root
+        # keep in a COMPLETE snapshot, never a batch-wide verdict.
+        candidate_row = next(
+            row
+            for row in world.registry_doc()["rows"]
+            if row["root"] == roots["owned_chain"] and row["member"] == "debug"
+        )
+        competitor, competitor_receipt, _ = write_competitor(
+            world, world.control, candidate_row, roots["owned_chain"]
+        )
+        try:
+            document = json.loads(registry_saved[0])
+            document["rows"].append(competitor)
+            document["revision"] = int(document["revision"]) + 1
+            registry.write_text(json.dumps(document))
+            os.chmod(registry, registry_saved[1])
+            _, out, _ = world.dry_run("competing owner", boot)
+            doc = json.loads(out)
+            require_root_kept(doc, roots["owned_chain"], COMPETING_OWNER)
+            require(not doc["candidates"], f"a competing owner left a candidate: {doc['candidates']}")
+            no_effect("competing owner")
+        finally:
+            restore_file(registry, registry_saved)
+            os.unlink(competitor_receipt)
+
+        # (b) A mismatched GROUP identity is incomplete authority: the whole
+        # batch refuses and nothing is written.
+        try:
+            document = json.loads(registry_saved[0])
+            release = next(
+                row
+                for row in document["rows"]
+                if row["root"] == roots["kept_group"] and row["member"] == "release"
+            )
+            release["nonce"] = "0" * 32
+            document["revision"] = int(document["revision"]) + 1
+            registry.write_text(json.dumps(document))
+            os.chmod(registry, registry_saved[1])
+            _, out, _ = world.dry_run("group mismatch", boot)
+            require_batch_refusal(json.loads(out), GROUP_DISAGREEMENT)
+            no_effect("group mismatch")
+        finally:
+            restore_file(registry, registry_saved)
+
+        # (c) A mismatched RECEIPT is incomplete authority too.
+        receipt = Path(permanent.receipt_file(world.pool, owned_chain["checkout"]))
+        receipt_saved = snapshot_file(receipt)
+        try:
+            document = json.loads(receipt_saved[0])
+            document["links"][0]["selected"]["generation"] += 1
+            receipt.write_text(json.dumps(document))
+            os.chmod(receipt, receipt_saved[1])
+            _, out, _ = world.dry_run("receipt mismatch", boot)
+            require_batch_refusal(json.loads(out), RECEIPT_MISMATCH)
+            no_effect("receipt mismatch")
+        finally:
+            restore_file(receipt, receipt_saved)
+
+        # The controls leave the candidate exactly as they found it.
+        _, out, _ = world.dry_run("after the controls", boot)
+        require(
+            world.candidates(json.loads(out)) == {roots["owned_chain"]},
+            "the candidate did not survive its own controls",
+        )
+        no_effect("after the controls")
+
+    case("competing-owner-and-mismatch", competing_owner_and_mismatch)
+    require(
+        not adapter.unclosed,
+        f"a proof child was never reaped: {sorted(adapter.unclosed)}",
+    )
     return cases
 
 
 def self_check() -> int:
     """Pure apparatus check: no child, no scratch, no pool, no image.
 
-    It drives the real oracles, the branch classifier and the case/allocation
-    table with in-memory counterfactuals, so a fixture that names the wrong
-    refusal, the wrong branch or the wrong seam cannot pass.
+    It drives the real oracles, the branch classifier, the per-root keep versus
+    batch-refusal distinction, the closure decision and the case/allocation table
+    with in-memory counterfactuals, so a fixture that names the wrong refusal,
+    the wrong branch or the wrong custody outcome cannot pass.
     """
     require(
         sum(item[1] for item in ALLOCATION_SECONDS) == TOTAL_SECONDS,
@@ -819,19 +1115,19 @@ def self_check() -> int:
         "the prospective scratch allocation does not sum to the published budget",
     )
     allocated = {name for name, _ in ALLOCATION_SECONDS}
-    require(
-        all(name in allocated for name in CASE_NAMES),
-        "a case has no time allocation",
-    )
+    require(all(name in allocated for name in CASE_NAMES), "a case has no time allocation")
     require(all(seconds > 0 for _, seconds in ALLOCATION_SECONDS), "a phase has no time")
+    require(all(mib > 0 for _, mib in ALLOCATION_MIB), "a phase has no scratch")
+    require(set(CASE_NEEDS) == set(CASE_NAMES), "a case has no dependency entry")
     # A different incomplete-authority reason never satisfies an oracle, even
     # though it also keeps the whole batch.
     for expected in (
         LEAF_ONLY_REFUSAL,
         NO_RECORDED_VOLUME,
-        RECORDED_VOLUME_CONFLICT,
         NOT_A_DIRECTORY,
         UNKNOWN_CUSTODY,
+        GROUP_DISAGREEMENT,
+        RECEIPT_MISMATCH,
     ):
         doc = {
             "coverage": {"complete": False},
@@ -865,6 +1161,82 @@ def self_check() -> int:
             pass
         else:
             raise AssertionError(f"a non-refusing batch passed: {doc}")
+    # Per-root keep versus incomplete authority: the SAME document must satisfy
+    # exactly one of the two oracles.
+    root = "/vol/oxide-outputs/app"
+    per_root = {
+        "coverage": {"complete": True},
+        "candidates": [{"root": "/vol/oxide-outputs/other"}],
+        "kept": [{"root": root, "reason": f"checkout absence is unknown ({UNREADABLE}), so its root is kept"}],
+    }
+    require_root_kept(per_root, root, UNREADABLE)
+    require_root_kept(per_root, root, ABSENCE_UNKNOWN)
+    try:
+        require_batch_refusal(per_root, UNREADABLE)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a complete per-root keep satisfied the whole-batch oracle")
+    try:
+        require_root_kept(
+            {
+                "coverage": {"complete": False},
+                "candidates": [],
+                "kept": [{"root": root, "reason": UNREADABLE}],
+            },
+            root,
+            UNREADABLE,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an incomplete snapshot satisfied the per-root oracle")
+    try:
+        require_root_kept(
+            {
+                "coverage": {"complete": True},
+                "candidates": [{"root": root}],
+                "kept": [{"root": root, "reason": UNREADABLE}],
+            },
+            root,
+            UNREADABLE,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a candidate satisfied the per-root keep oracle")
+    try:
+        require_root_kept(
+            {
+                "coverage": {"complete": True},
+                "candidates": [],
+                "kept": [{"root": "/other", "reason": UNREADABLE}],
+            },
+            root,
+            UNREADABLE,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("another root's keep satisfied this root's oracle")
+    # The custody decision: only a reaped, normal-exit child with an empty
+    # session is positively closed.
+    require(closure_unknown(0, False, True, set()) is None, "a clean exit was not closed")
+    require(closure_unknown(2, False, True, set()) is None, "a normal refusal was not closed")
+    require(closure_unknown(-9, False, True, set()) is not None, "a signalled child was closed")
+    require(closure_unknown(None, False, True, set()) is not None, "a missing status was closed")
+    require(closure_unknown(0, True, True, set()) is not None, "a killed child was closed")
+    require(closure_unknown(0, False, False, set()) is not None, "an unreaped child was closed")
+    require(closure_unknown(0, False, True, {7}) is not None, "an unclosed session was closed")
+    # A latch is idempotent and keeps the FIRST reason.
+    class FakeProof:
+        closure_known = True
+        custody_unknown = None
+
+    fake = FakeProof()
+    latch_unknown(fake, "first")
+    latch_unknown(fake, "second")
+    require(fake.custody_unknown == "first" and fake.closure_known is False, "the latch moved")
     # Both /Volumes spellings are mounts, including an absent mount name; the
     # mount root itself and every non-normal spelling are invalid, and a plain
     # path is not a mount.
@@ -883,15 +1255,17 @@ def self_check() -> int:
         ("/private/tmp/../tmp/x", "invalid"),
     ):
         require(mount_branch(spelling) == branch, f"{spelling} was not classified {branch}")
-    # The two races must be distinguishable: a recreated checkout and a replaced
-    # ancestor cannot be refused by the same sentence, and the fixture seams
-    # must not alias.
+    # The two races must be distinguishable, and the fixture seams must not alias.
     require(
         WITNESS_REFUSAL != PRESENT_KEEP and WITNESS_REFUSAL not in PRESENT_KEEP,
         "the two race refusals must be distinguishable sentences",
     )
     require(EACCES_VAR != DELAY_VAR and EACCES_MARKER != DELAY_MARKER, "the seams alias")
     require(CUSTODY_VAR not in (EACCES_VAR, DELAY_VAR), "the custody seam aliases")
+    require(
+        GROUP_DISAGREEMENT != RECEIPT_MISMATCH and COMPETING_OWNER != GROUP_DISAGREEMENT,
+        "the mismatch oracles must be distinguishable",
+    )
     print("prune absence self-check: OK")
     return 0
 
@@ -903,6 +1277,8 @@ def main():
     if sys.argv[1:] not in ([], ["--diagnostic"]):
         raise SystemExit("expected no argument or --diagnostic")
     proof = wrapper.Proof()
+    proof.custody_unknown = None
+    proof.unclosed = set()
     require(wrapper.git(proof, "status", "--porcelain") == "", "source is not clean")
     custody = prior.ImageCustody("Ox135" + secrets.token_hex(4))
     cases, error = [], None
@@ -912,7 +1288,15 @@ def main():
         error = exc
         traceback.print_exc()
     finally:
-        disposition = custody.detach_once(sessions_closed=proof.closure_known)
+        # The detach needs POSITIVE closure: the proof's own latch, an empty
+        # session and the guard's closure. A killed or unreaped child, or any
+        # recorded custody fault, refuses the detach and keeps the backing.
+        closed = (
+            proof.closure_known
+            and getattr(proof, "custody_unknown", None) is None
+            and not proof.unclosed
+        )
+        disposition = custody.detach_once(sessions_closed=closed)
     recorded = {item["case"] for item in cases}
     cases.extend(
         {"case": name, "state": "unexecuted"} for name in CASE_NAMES if name not in recorded
@@ -920,6 +1304,8 @@ def main():
     report = {
         "qualified": False if diagnostic else None,
         "cases": cases,
+        "failed": sorted(item["case"] for item in cases if item["state"] == "failed"),
+        "custody_unknown": getattr(proof, "custody_unknown", None),
         "error": None if error is None else f"{type(error).__name__}: {error}",
         "custody": custody.state,
         "detach": disposition,
@@ -930,6 +1316,7 @@ def main():
     if error is not None:
         raise error
     require(disposition == "completed", f"the ordinary detach was {disposition}")
+    require(report["custody_unknown"] is None, f"custody is unknown: {report['custody_unknown']}")
     require(all(case["state"] == "completed" for case in cases), "proof incomplete")
 
 

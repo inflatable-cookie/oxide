@@ -2409,9 +2409,12 @@ fn evaluate(
                     .kept
                     .as_deref()
                     .unwrap_or("receiptless authority is unknown");
+                // Ordinary path ineligibility is a per-root keep, never an
+                // incomplete-authority verdict for the whole batch.
                 if reason != "the checkout is present, so its root is kept"
                     && reason != "an active writer still holds this checkout"
                     && !reason.starts_with("a recorded writer still holds this checkout (")
+                    && !reason.starts_with("checkout absence is unknown (")
                 {
                     snapshot_error.get_or_insert_with(|| reason.to_owned());
                 }
@@ -2698,7 +2701,14 @@ fn eligibility(
             ))
         }
         Ok(Absence::Unknown(reason)) | Err(reason) => {
-            return Err(format!("checkout absence is unknown ({reason})"))
+            // Ordinary path ineligibility keeps THIS root and nothing else:
+            // an unprovable path is not an untrustworthy snapshot. Incomplete
+            // required authority (a missing, malformed or contradictory
+            // receipt or registry, or unknown writer custody) still refuses
+            // the whole batch where it is found.
+            return Ok(Some(format!(
+                "checkout absence is unknown ({reason}), so its root is kept"
+            )));
         }
     }
     // Writer custody across both pools, and library ledger holders. A
@@ -7901,6 +7911,82 @@ mod tests {
             .is_some_and(|reason| reason.contains("whole batch"))));
     }
 
+    /// Ordinary path ineligibility keeps ONE root and leaves the snapshot
+    /// COMPLETE, so an unprovable sibling never prevents another root from being
+    /// considered. Only incomplete required authority refuses the whole batch.
+    #[test]
+    fn an_unprovable_checkout_keeps_only_its_own_root() {
+        // The recipe's internal root: a selected-volume fixture path is a
+        // /Volumes mount spelling, where the recorded-volume rule applies first.
+        let fixture = Fixture::at_internal_root();
+        let present = legacy_snapshot_row(&fixture, &"a".repeat(64));
+        fs::create_dir_all(&present.checkout).unwrap();
+        fs::create_dir(fixture.root.join("real")).unwrap();
+        std::os::unix::fs::symlink(
+            fixture.root.join("real"),
+            fixture.root.join("linked-parent"),
+        )
+        .unwrap();
+        let mut linked = legacy_snapshot_row(&fixture, &"b".repeat(64));
+        linked.checkout = fixture.root.join("linked-parent").join("child");
+        let control = ready_control(&fixture, vec![present.clone(), linked.clone()], Vec::new());
+        for row in [&present, &linked] {
+            publish_snapshot_receipt(
+                &control,
+                row,
+                &snapshot_receipt(
+                    row,
+                    "oxide.outputs.transition/1",
+                    "committed",
+                    Some(&row.root),
+                ),
+            );
+        }
+        let list = OperatorList {
+            roots: vec![present.root.clone(), linked.root.clone()],
+            sha256: "d".repeat(64),
+        };
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let registry = ready_registry(&control).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(
+            evaluated.complete,
+            "an unprovable sibling made the whole snapshot incomplete"
+        );
+        assert!(evaluated.iter().all(|entry| entry.candidate.is_none()));
+        let reason = |id: &str| {
+            evaluated
+                .iter()
+                .find(|entry| entry.row.checkout_id == id)
+                .and_then(|entry| entry.kept.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            reason(&present.checkout_id),
+            "the checkout is present, so its root is kept"
+        );
+        let absent = reason(&linked.checkout_id);
+        assert!(
+            absent.starts_with("checkout absence is unknown ("),
+            "{absent}"
+        );
+        assert!(!absent.contains("whole batch"), "{absent}");
+        // Incomplete required authority is DIFFERENT: a missing receipt still
+        // refuses the whole batch, naming its exact file.
+        let missing = outputs::receipt_path_public(&control, &linked.checkout_id);
+        fs::remove_file(&missing).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(
+            !evaluated.complete,
+            "a missing receipt did not refuse the batch"
+        );
+        for entry in &evaluated {
+            let reason = entry.kept.clone().unwrap_or_default();
+            assert!(reason.contains("whole batch"), "{reason}");
+            assert!(reason.contains("is missing"), "{reason}");
+        }
+    }
+
     /// One synthetic checkout whose recorded root sits inside a `/Volumes`
     /// mount: eligibility stops at the recorded-volume/absence predicate, so a
     /// test needs no real drive. Its recorded identity is legacy (no nonce)
@@ -8050,11 +8136,13 @@ mod tests {
         };
         let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert_eq!(evaluated.len(), 3);
-        assert!(!evaluated.complete);
+        // An unprovable checkout path is ordinary per-root ineligibility: it
+        // keeps each of these roots and leaves the snapshot COMPLETE.
+        assert!(evaluated.complete);
         for entry in &evaluated {
             let reason = entry.kept.clone().unwrap_or_default();
             assert!(reason.contains("checkout absence is unknown"), "{reason}");
-            assert!(reason.contains("whole batch"), "{reason}");
+            assert!(!reason.contains("whole batch"), "{reason}");
             assert!(entry.candidate.is_none());
         }
     }
@@ -8087,6 +8175,10 @@ mod tests {
             sha256: "d".repeat(64),
         };
         let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(
+            evaluated.complete,
+            "an unprovable path is not incomplete authority"
+        );
         assert!(evaluated[0]
             .kept
             .as_deref()
