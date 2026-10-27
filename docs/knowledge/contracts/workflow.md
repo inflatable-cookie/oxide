@@ -5221,6 +5221,40 @@ The stable, read-only interface other tools use to find the registered Builds dr
   diagnostic each still need their own ROOT activation after an independent
   exact-head source-fit review.
 
+  **Second spent native start and the group-mismatch fixture (preserved, not
+  credit).** A second, separately activated uncounted diagnostic ran once at
+  `c8fd10b` and stopped with exit 1: guard receipt `5f9697bf…` (run_id
+  `c94e227c05fc987784aadf7378ee0154`, closed, status 1, **no deadline**, 51.62 s
+  of 300 s, reserve minimum 2221.32 GiB over 204 samples, owned peak 278.84 MiB
+  of 512 MiB, post-leader census certain with zero members) and proof receipt
+  `4ba6241c…` under `/private/tmp/oxide-proof.cz_9ao0b/evidence`, both kept. Six
+  of seven cases COMPLETED, including the whole `data-missing-chains` mixed batch
+  with its real prune, the mount/volume boundaries, the scoped EACCES pair, the
+  kept-group custody refusal, the corrected `witness-races` (its real-run refusal
+  `the checkout reappeared before the prune` plus
+  `every candidate root was kept by a fresh check before its intent; no output
+  root was changed` matched the oracle, `prune135-033/034.stdout`), and the
+  competing-owner per-root keep (`another checkout's live reference also names
+  this root`, complete snapshot, zero candidates). The image-custody record
+  `e2f61dca…` again shows the full pre-detach protocol end to end. The run then
+  failed on the `competing-owner-and-mismatch` fixture, not on the product: the
+  group sub-control edited a selected row's `nonce`, which the earlier
+  receipt-placement cross-check (`prune.rs:2435-2454`, exactly one selected row
+  per checkout/member/root with the same `generation` and `nonce`) catches before
+  the selected-group identity loop (`prune.rs:2478-2490`) can run, so the batch
+  was correctly refused as incomplete authority but with
+  "a receipt reference is missing or contradictory in the registry"
+  (`prune135-035.stdout 8bb1abb6…`) instead of the group sentence. The fixture
+  now edits a genuinely GROUP-ONLY field, `root_ino` — the receipt's `Selected`
+  reference carries only kind, root, volume_uuid, nonce and generation, so no
+  receipt reference changes and only the group gate can fire — the group oracle
+  keeps requiring exactly `selected group references disagree about root
+  identity` with zero candidates and no effect, the separate receipt sub-control
+  keeps requiring `the registry row does not match the checkout's committed
+  receipt`, and a pure counterfactual proves both edits and both distinct
+  sentences (each oracle rejects the other's). That start is SPENT and is not
+  credit.
+
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.
 - **Tombstones.** After a positive completion (both the registry terminal state and the receipt's terminal state committed), the completed row and the settled intent leave the live registry in one revision, and a diagnostic entry is appended best effort to `outputs/tombstones.json` (`oxide.outputs.tombstones/1`, at most 16,384 entries and 4 MiB, oldest compacted first). The ring is never a safety journal or a live cap; unfinished intents and reservations stay in the registry and are never compacted. A recreated root always gets a fresh nonce.
 - **Replay detail.** An `intent`-phase journal with its original root still present and unchanged is rolled back exactly on replay; that is not a completion, and the root is re-evaluated in the same run against the plan. An `intent`-phase journal whose root is instead found under its own quarantine leaf with the recorded device, inode and marker (a crash between the rename and its journal phase) resumes deletion. Any other unfinished phase is resumed only from its exact recorded identity, otherwise it stays pending. A symbolic link inside a quarantine stops the deletion and leaves the intent pending.

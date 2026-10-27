@@ -667,6 +667,50 @@ def await_firing(marker: Path, expected: str, child, label: str) -> None:
         time.sleep(0.05)
 
 
+# The product's authority order (src/bin/oxide/prune.rs) decides which edit lands
+# on which gate. `evaluate` first cross-checks every receipt PLACEMENT against the
+# registry (prune.rs:2435-2454): exactly one selected row for that checkout,
+# member and root, with the SAME `generation` and `nonce`. Only later does the
+# selected-group identity loop (prune.rs:2478-2490) compare the WHOLE selected
+# group: nonce, generation, root_dev, root_ino, marker_digest, root_kind and
+# volume_uuid. So a `nonce` edit is caught by the earlier receipt-reference check
+# ("a receipt reference is missing or contradictory in the registry"), while a
+# field the receipt does not carry — root_dev, root_ino, marker_digest,
+# root_kind, volume_uuid — reaches the group gate
+# ("selected group references disagree about root identity").
+RECEIPT_REFERENCE_FIELDS = ("nonce", "generation")
+GROUP_ONLY_IDENTITY_FIELDS = ("root_dev", "root_ino", "marker_digest", "root_kind", "volume_uuid")
+# The sentence the earlier cross-check produces; recorded by the spent
+# diagnostic at c8fd10b and kept as an oracle only for that distinct branch.
+RECEIPT_REFERENCE_CONTRADICTION = "a receipt reference is missing or contradictory in the registry"
+
+
+def group_only_identity_edit(row: dict) -> None:
+    """Make one selected group row disagree on a field the receipt never carries.
+
+    `root_ino` is such a field, so every earlier receipt-reference agreement is
+    preserved and only the group-identity gate can fire.
+    """
+    field = "root_ino"
+    require(field in GROUP_ONLY_IDENTITY_FIELDS, "the group-only field is not group-only")
+    require(field not in RECEIPT_REFERENCE_FIELDS, "the group-only field is receipt-referenced")
+    require(type(row.get(field)) is int, f"the fixture row has no integer {field}")
+    row[field] = row[field] + 1
+
+
+def receipt_reference_edit(row: dict) -> None:
+    """Make one selected row contradict its receipt placement instead.
+
+    `nonce` IS receipt-referenced, so this is the edit that trips the earlier
+    receipt-reference cross-check — it must never be used for the group gate.
+    """
+    field = "nonce"
+    require(field in RECEIPT_REFERENCE_FIELDS, "the receipt field is not receipt-referenced")
+    require(field not in GROUP_ONLY_IDENTITY_FIELDS, "the receipt field is group-only")
+    require(isinstance(row.get(field), str), "the fixture row has no nonce")
+    row[field] = "0" * 32
+
+
 def write_competitor(world, control: str, template_row: dict, root: str) -> tuple:
     """A hand-written live registry row for ANOTHER checkout naming `root`.
 
@@ -1331,7 +1375,10 @@ def run_cases(proof, custody, diagnostic, cases):
                 for row in document["rows"]
                 if row["root"] == roots["kept_group"] and row["member"] == "release"
             )
-            release["nonce"] = "0" * 32
+            # A GROUP-only identity field: the receipt carries no inode, so all
+            # earlier receipt-reference agreement holds and the group gate is
+            # the branch that fires.
+            group_only_identity_edit(release)
             document["revision"] = int(document["revision"]) + 1
             registry.write_text(json.dumps(document))
             os.chmod(registry, registry_saved[1])
@@ -1817,6 +1864,51 @@ def self_check() -> int:
     # This file's own structure: the case table and every unpacked helper.
     structure = source_structure_problems(Path(__file__).read_text())
     require(not structure, f"the proof's own structure is inconsistent: {structure}")
+    # The two identity edits and the two DISTINCT authority branches. A
+    # group-only edit changes a field the receipt never carries, so every
+    # receipt-reference agreement still holds and only the group gate can fire;
+    # a receipt-referenced edit is the one the earlier cross-check catches. Each
+    # oracle rejects the other's sentence, so neither can silently stand in for
+    # the other (the spent c8fd10b run failed exactly by demanding the group
+    # sentence for a nonce edit).
+    base = {"nonce": "a" * 32, "generation": 1, "root_ino": 41, "root_dev": 7,
+            "marker_digest": "b" * 64, "root_kind": "external", "volume_uuid": "U-1"}
+    grouped = dict(base)
+    group_only_identity_edit(grouped)
+    require(grouped["nonce"] == base["nonce"] and grouped["generation"] == base["generation"],
+            "a group-only edit changed a receipt-referenced field")
+    changed = {key for key in base if grouped[key] != base[key]}
+    require(changed and changed <= set(GROUP_ONLY_IDENTITY_FIELDS),
+            f"the group-only edit changed {sorted(changed)}")
+    referenced = dict(base)
+    receipt_reference_edit(referenced)
+    require(referenced["nonce"] != base["nonce"], "the receipt edit changed nothing")
+    require(referenced["generation"] == base["generation"], "the receipt edit changed generation")
+    require(
+        {key for key in base if referenced[key] != base[key]} <= set(RECEIPT_REFERENCE_FIELDS),
+        "the receipt edit touched a field outside the receipt reference",
+    )
+    group_doc = {
+        "coverage": {"complete": False},
+        "candidates": [],
+        "kept": [{"reason": f"the registry snapshot is incomplete ({GROUP_DISAGREEMENT}); the whole batch is kept"}],
+    }
+    reference_doc = {
+        "coverage": {"complete": False},
+        "candidates": [],
+        "kept": [{"reason": f"the registry snapshot is incomplete ({RECEIPT_REFERENCE_CONTRADICTION}); the whole batch is kept"}],
+    }
+    require_batch_refusal(group_doc, GROUP_DISAGREEMENT)
+    require_batch_refusal(reference_doc, RECEIPT_REFERENCE_CONTRADICTION)
+    for doc, wrong in ((group_doc, RECEIPT_REFERENCE_CONTRADICTION), (reference_doc, GROUP_DISAGREEMENT)):
+        try:
+            require_batch_refusal(doc, wrong)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"an oracle accepted the other branch's sentence: {wrong!r}")
+    require(GROUP_DISAGREEMENT != RECEIPT_REFERENCE_CONTRADICTION,
+            "the two authority branches must stay distinguishable")
     # The witness race's expected branch: the exact sentences the SPENT
     # diagnostic at fe3228b recorded, and NOT the dry-run eligibility keep that
     # the first version demanded (that mismatch aborted that run).
