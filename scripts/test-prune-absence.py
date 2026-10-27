@@ -145,6 +145,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import plistlib
 import secrets
 from types import SimpleNamespace
 import stat
@@ -1409,6 +1410,31 @@ class FakeCustodyEffects:
             raise OSError(self.remove_error)
         self.removed.append(path)
 
+    def create_image(self, path, name):
+        self.events.append("create")
+
+    def attach_raw(self, path):
+        self.events.append("attach")
+        return attach_document()
+
+    def retain_attach_document(self, path, document):
+        self.records[path] = "retained"
+
+    def volume_facts_forbidden(self, device):
+        raise AssertionError("the opt-out path probed volume facts")
+
+
+def attach_document() -> bytes:
+    """A minimal one-image plist with exactly one mounted entity."""
+    return plistlib.dumps(
+        {
+            "system-entities": [
+                {"dev-entry": "/dev/disk9s1", "mount-point": "/Volumes/Ox135Fake"},
+                {"dev-entry": "/dev/disk9"},
+            ]
+        }
+    )
+
 
 def fake_custody(effects, volume_uuid="UUID-135", whole_disk="/dev/disk9"):
     """One attached ImageCustody over in-memory effects (no allocation, no image)."""
@@ -1424,6 +1450,7 @@ def fake_custody(effects, volume_uuid="UUID-135", whole_disk="/dev/disk9"):
     custody.whole_disk = whole_disk
     custody.state = "attached"
     custody.disposition = None
+    custody.custody_protocol = True
     custody.backing_identity = {"dev": 7, "ino": 1, "size": 128 * 1024 * 1024}
     return custody
 
@@ -1565,6 +1592,32 @@ def detach_counterfactuals() -> None:
         f"a backing replaced before removal was not retained: {disposition}",
     )
     require(not effects.removed, "a replaced backing was removed by pathname")
+    # An UNAVAILABLE attach-time whole-disk identity is Unknown and is never
+    # filled in from the fresh detach-time observation.
+    effects = FakeCustodyEffects(entities, volume)
+    custody = fake_custody(effects)
+    custody.whole_disk = ""
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events)),
+    )
+    require(
+        disposition == "refused:unbound",
+        f"a missing original whole disk was accepted: {disposition}",
+    )
+    require(not effects.detached and not effects.removed, "a missing original whole disk detached")
+    # A whole disk that differs from the attach-time one refuses.
+    effects = FakeCustodyEffects(entities, {"uuid": "UUID-135", "whole_disk": "/dev/disk7"})
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events)),
+    )
+    require(
+        disposition == "refused:unbound",
+        f"a mismatched whole disk was accepted: {disposition}",
+    )
+    require(not effects.detached and not effects.removed, "a mismatched whole disk detached")
     # A wrong volume UUID refuses before any detach.
     effects = FakeCustodyEffects(entities, volume)
     custody = fake_custody(effects)
@@ -1574,6 +1627,65 @@ def detach_counterfactuals() -> None:
     )
     require(disposition == "refused:unbound", f"a wrong volume UUID was not refused: {disposition}")
     require(not effects.detached and effects.events == [], "a wrong volume UUID still detached")
+
+
+def attach_call_shape() -> None:
+    """Opt-out callers get NO volume probe and NO new record fields.
+
+    The pre-detach protocol is opt-in: a caller that does not select it must keep
+    the historical attach behaviour exactly, including its recorded shape.
+    """
+    # Opt-out: any volume probe raises, so a call would fail this counterfactual.
+    effects = FakeCustodyEffects([], {})
+    effects.volume_facts = effects.volume_facts_forbidden
+    custody = prior.ImageCustody("Ox135OptOut", effects=effects)
+    custody.evidence = "/evidence"
+    custody.backing = "/evidence/152-image-Ox135OptOut.sparseimage"
+    custody.record = "/evidence/152-image-Ox135OptOut-custody.json"
+    custody.attach_document = "/evidence/152-image-Ox135OptOut-attach.plist"
+    custody.expected_mount = "/Volumes/Ox135Fake"
+    custody.state = "allocated"
+    custody.attach()
+    record = effects.records[custody.record]
+    require('"volume_uuid"' not in record, "an opt-out attach recorded a volume UUID")
+    require('"whole_disk"' not in record, "an opt-out attach recorded a whole disk")
+    # Opt-in: the same attach DOES probe and record both.
+    probed = []
+    effects = FakeCustodyEffects([], {"uuid": "UUID-135", "whole_disk": "/dev/disk9"})
+    effects.volume_facts = lambda device: (
+        probed.append(device) or {"uuid": "UUID-135", "whole_disk": "/dev/disk9"}
+    )
+    custody = prior.ImageCustody("Ox135OptIn", effects=effects, custody_protocol=True)
+    custody.evidence = "/evidence"
+    custody.backing = "/evidence/152-image-Ox135OptIn.sparseimage"
+    custody.record = "/evidence/152-image-Ox135OptIn-custody.json"
+    custody.attach_document = "/evidence/152-image-Ox135OptIn-attach.plist"
+    custody.expected_mount = "/Volumes/Ox135Fake"
+    custody.state = "allocated"
+    custody.attach()
+    require(probed == ["/dev/disk9s1"], f"the opt-in attach did not probe once: {probed}")
+    record = effects.records[custody.record]
+    require('"volume_uuid": "UUID-135"' in record, "the opt-in attach lost its volume UUID")
+    require('"whole_disk": "/dev/disk9"' in record, "the opt-in attach lost its whole disk")
+    require(custody.whole_disk == "/dev/disk9", "the opt-in attach did not keep the whole disk")
+    # An opt-out image cannot take a custodied detach at all.
+    effects = FakeCustodyEffects([], {})
+    custody = prior.ImageCustody("Ox135OptOut", effects=effects)
+    custody.evidence = "/evidence"
+    custody.backing = "/evidence/152-image-Ox135OptOut.sparseimage"
+    custody.record = "/evidence/152-image-Ox135OptOut-custody.json"
+    custody.mount = "/Volumes/Ox135Fake"
+    custody.device = "/dev/disk9s1"
+    custody.state = "attached"
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census([])),
+    )
+    require(
+        disposition == "refused:no-protocol",
+        f"an opt-out image accepted a custodied detach: {disposition}",
+    )
+    require(not effects.detached and not effects.removed, "an opt-out image detached")
 
 
 def source_structure_problems(source: str) -> list:
@@ -1672,6 +1784,7 @@ def self_check() -> int:
     require(not structure, f"the proof's own structure is inconsistent: {structure}")
     # The pre-detach protocol's counterfactuals (injectable effects only).
     detach_counterfactuals()
+    attach_call_shape()
     # A different incomplete-authority reason never satisfies an oracle, even
     # though it also keeps the whole batch.
     for expected in (
@@ -1900,7 +2013,10 @@ def main():
     proof.custody_unknown = None
     proof.unclosed = set()
     require(wrapper.git(proof, "status", "--porcelain") == "", "source is not clean")
-    custody = prior.ImageCustody("Ox135" + secrets.token_hex(4))
+    # Opt in to the pre-detach custody protocol: the image records its own
+    # attach-time identity (backing, mount, device, volume UUID, whole disk) and
+    # a custodied detach is the only detach that may run.
+    custody = prior.ImageCustody("Ox135" + secrets.token_hex(4), custody_protocol=True)
     cases, error = [], None
     try:
         run_cases(proof, custody, diagnostic, cases)

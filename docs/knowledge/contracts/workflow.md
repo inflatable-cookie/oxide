@@ -5133,19 +5133,35 @@ The stable, read-only interface other tools use to find the registered Builds dr
   limitation — so no claim is made that such a writer is observed.
 
   **Authority and fit reconciliation (pre-detach protocol).** The protocol and
-  its in-process census were applied under the Oxide Supervisor's #135 apparatus
-  ruling relayed by ROOT. It is proof-side custody work only: it adds no
-  supervisor, no product seam, no runner change and no persisted format, and the
-  shared helper stays opt-in so every other proof's recorded evidence keeps the
-  behaviour it ran under. The prospective fit absorbs it inside the published
-  envelope — the detach phase now carries the rebind probes (two bounded
-  read-only `hdiutil info` / `diskutil info` calls) and the two bounded censuses
-  (30 s of the 300 s, with the supervisor contingency reduced to 20 s; 512 MiB
-  unchanged) — and remains UNMEASURED. Outstanding ROOT-owned activations: the
-  uncounted diagnostic, the counted author native and the distinct counted
-  reviewer native are each still unactivated, and Effigy heavy admission is
-  unavailable (f6b3b50 retired host-run client; Queue #381 pending), so no
-  native credit exists at any head and the merge hold stays. A child that is still
+  its in-process census are adopted under ROOT's proof-custody apparatus
+  clarification (brief v8), which itself records the Oxide Supervisor's #135
+  ruling. It is proof-side custody observation only: it adds no supervisor (the
+  fixed `scripts/bounded-test.py` remains the sole supervisor), no product seam,
+  no persisted format, no watchdog or signal timer, and it never signals or kills
+  a census member. `ImageCustody` stays opt-in: a caller that does not select the
+  protocol receives the historical attach behaviour exactly — no `diskutil`
+  volume probe and no new record fields — and may not take a custodied detach
+  (`refused:no-protocol`).
+
+  Every identity compared at the rebind is the ORIGINAL attach-time observation:
+  image path, backing `(dev, ino, size)`, whole-disk device, mount and volume
+  UUID. A missing original identity is Unknown and is never filled in from a
+  fresh detach-time observation; a whole disk or volume UUID that differs from
+  the attached one refuses; the backing's original identity is re-checked again
+  immediately before the pathname removal, and only then is a backing inside the
+  evidence directory removed. The guard's own post-leader census remains separate
+  closure evidence and never authorizes a backing removal in an unknown branch,
+  and no backing is ever placed in guard scratch.
+
+  The prospective fit absorbs all of it inside the published envelope — the
+  detach phase carries the rebind probes (two bounded read-only `hdiutil info` /
+  `diskutil info` calls) and the two bounded censuses (30 s of the 300 s, with the
+  supervisor contingency reduced to 20 s; 512 MiB unchanged) — and remains
+  UNMEASURED. Outstanding ROOT-owned activations: the uncounted diagnostic, the
+  counted author native and the distinct counted reviewer native are each still
+  unactivated, so no native credit exists at any head and the Elevated merge hold
+  stays. Heavy admission is tested normally at activation; the earlier
+  "Queue #381 pending" note is withdrawn. A child that is still
   running is waited for, never mistaken for a stuck one: the armed races mutate
   the fixture while the product is inside its own 11-second delay. Each
   state-mutating case puts its own fixture back (checkout chain, replaced
@@ -5170,10 +5186,9 @@ The stable, read-only interface other tools use to find the registered Builds dr
   table. **No native has run at any head**: the author's diagnostic, counted
   author and distinct counted reviewer natives are each separately
   owner-activated (ELEVATED: this changes deletion authority), so its fit is
-  unmeasured and this is not a benchmark or an alias for full QA.
-  Effigy heavy admission unavailable (f6b3b50 retired host-run client;
-  Queue #381 pending); not host-admitted. No live prune, host install, mode,
-  settings or consumer change is authorized by this implementation.
+  unmeasured and this is not a benchmark or an alias for full QA. No live prune,
+  host install, mode, settings or consumer change is authorized by this
+  implementation.
 
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.
 - **Tombstones.** After a positive completion (both the registry terminal state and the receipt's terminal state committed), the completed row and the settled intent leave the live registry in one revision, and a diagnostic entry is appended best effort to `outputs/tombstones.json` (`oxide.outputs.tombstones/1`, at most 16,384 entries and 4 MiB, oldest compacted first). The ring is never a safety journal or a live cap; unfinished intents and reservations stay in the registry and are never compacted. A recreated root always gets a fresh nonce.

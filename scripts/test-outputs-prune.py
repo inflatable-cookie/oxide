@@ -1144,9 +1144,13 @@ class ImageCustody:
     guard's never-auto-cleaned evidence directory, allocated BEFORE attachment,
     with exactly one recorded ordinary-detach disposition."""
 
-    def __init__(self, name: str, effects=REAL_CUSTODY_EFFECTS):
+    def __init__(self, name: str, effects=REAL_CUSTODY_EFFECTS, custody_protocol: bool = False):
         self.name = name
         self.effects = effects
+        # Opt-in. A caller that does not select the pre-detach protocol keeps the
+        # historical attach behaviour exactly: no volume probe, no new record
+        # fields, and no custodied detach.
+        self.custody_protocol = custody_protocol is True
         self.expected_mount = f"/Volumes/{name}"
         self.evidence = ""
         self.backing = ""
@@ -1236,22 +1240,27 @@ class ImageCustody:
         self.mount = facts["mount"]
         self.device = facts["device"]
         self.backing_identity = identity
-        # Record the volume facts the pre-detach rebind will require. An
-        # unavailable reading here is not fatal for the legacy path; the
-        # pre-detach protocol refuses when they cannot be positively rebound.
-        try:
-            volume = self.effects.volume_facts(self.device)
-            self.volume_uuid = volume.get("uuid") or ""
-            self.whole_disk = volume.get("whole_disk") or ""
-        except BaseException as error:
-            self.notes.append(f"volume facts unavailable at attach: {error}")
+        recorded = {}
+        if self.custody_protocol:
+            # The ORIGINAL volume identity the pre-detach rebind compares with.
+            # A missing reading here stays missing: it is never filled in later
+            # from a fresh detach-time observation.
+            try:
+                volume = self.effects.volume_facts(self.device)
+                self.volume_uuid = volume.get("uuid") or ""
+                self.whole_disk = volume.get("whole_disk") or ""
+            except BaseException as error:
+                self.notes.append(f"volume facts unavailable at attach: {error}")
+            recorded = {
+                "volume_uuid": self.volume_uuid or None,
+                "whole_disk": self.whole_disk or None,
+            }
         self._write(
             "attached",
             backing_identity=identity,
             attach_entities=facts["entities"],
             attach_device_entries=facts["device_entries"],
-            volume_uuid=self.volume_uuid or None,
-            whole_disk=self.whole_disk or None,
+            **recorded,
         )
         return self.mount
 
@@ -1263,12 +1272,25 @@ class ImageCustody:
         facts and the caller's expected volume UUID. Anything unknown raises:
         the caller then keeps the image, its backing and its record.
         """
+        if not self.custody_protocol:
+            raise Aborted("the pre-detach protocol is not selected for this image")
+        if (
+            self.backing_identity is None
+            or not self.volume_uuid
+            or not self.whole_disk
+            or not self.mount
+            or not self.device
+        ):
+            raise Aborted(
+                "the attach-time image identity is incomplete; a missing original is"
+                " never filled in from a fresh observation"
+            )
         identity = self.verify_backing()
         if not self.evidence or os.path.dirname(self.backing) != self.evidence:
             raise Aborted(
                 f"the image backing {self.backing} is not inside the verified evidence directory"
             )
-        if self.backing_identity is not None and identity != self.backing_identity:
+        if identity != self.backing_identity:
             raise Aborted(
                 f"the image backing {self.backing} is not the object attached"
                 f" ({identity} != {self.backing_identity})"
@@ -1292,14 +1314,22 @@ class ImageCustody:
         if device != self.device:
             raise Aborted(f"the image's bound device is {device!r}, not the attached {self.device!r}")
         volume = self.effects.volume_facts(device)
-        if not custody.volume_uuid or volume.get("uuid") != custody.volume_uuid:
+        if volume.get("uuid") != self.volume_uuid:
             raise Aborted(
-                f"the image volume UUID {volume.get('uuid')!r} is not the expected"
-                f" {custody.volume_uuid!r}"
+                f"the image volume UUID {volume.get('uuid')!r} is not its attached"
+                f" {self.volume_uuid!r}"
+            )
+        if custody.volume_uuid and custody.volume_uuid != self.volume_uuid:
+            raise Aborted(
+                f"the expected volume UUID {custody.volume_uuid!r} is not the attached"
+                f" {self.volume_uuid!r}"
             )
         whole = volume.get("whole_disk") or ""
-        if not whole or (self.whole_disk and whole != self.whole_disk):
-            raise Aborted(f"the image's whole-disk device {whole!r} is not its attached one")
+        if not whole or whole != self.whole_disk:
+            raise Aborted(
+                f"the image's whole-disk device {whole!r} is not its attached"
+                f" {self.whole_disk!r}"
+            )
         return {
             "backing": self.backing,
             "mount": mount,
@@ -1334,6 +1364,11 @@ class ImageCustody:
             self._write("unknown", detach_refused="unclosed-sessions")
             return self.disposition
         if custody is not None:
+            if not self.custody_protocol:
+                return self._retain(
+                    "refused:no-protocol",
+                    "a custodied detach was requested for an image without the protocol",
+                )
             return self._detach_custodied(custody)
         self.disposition = "attempted"
         self._write("attached")
