@@ -46,13 +46,26 @@ pub struct ParsedJoin {
 }
 
 impl ParsedJoin {
-    /// Whether this parse records exactly the given rule sets, compared as
-    /// sets: rule order and repeats are not part of the recorded evidence.
-    pub fn matches(&self, targets: &[String], inputs: &[String]) -> bool {
+    /// Whether this parse is exactly the recorded join, compared as sets (rule
+    /// order and repeats are not part of the recorded evidence):
+    ///
+    /// - every recorded output-rule file (`joined`) appears as a rule target;
+    /// - every rule target is either one of those files or a recorded
+    ///   prerequisite (rustc's phony source rules);
+    /// - the rule prerequisites are exactly the recorded inputs.
+    pub fn joins(&self, joined: &[String], inputs: &[String]) -> bool {
         fn set(values: &[String]) -> std::collections::BTreeSet<&str> {
             values.iter().map(String::as_str).collect()
         }
-        set(&self.targets) == set(targets) && set(&self.inputs) == set(inputs)
+        let joined: std::collections::BTreeSet<&str> = set(joined);
+        let inputs: std::collections::BTreeSet<&str> = set(inputs);
+        let targets = set(&self.targets);
+        let parsed_inputs = set(&self.inputs);
+        joined.iter().all(|path| targets.contains(path))
+            && targets
+                .iter()
+                .all(|target| joined.contains(target) || inputs.contains(target))
+            && parsed_inputs == inputs
     }
 }
 

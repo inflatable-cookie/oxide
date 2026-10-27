@@ -284,6 +284,10 @@ pub(super) struct SeedSlotView {
     pub(super) last_lease_id: String,
     pub(super) rank: u64,
     pub(super) dir: Option<String>,
+    /// The recorded project: for a front-door slot this is the pool's
+    /// `oxide-managed/affinity/<record id>` directory, which is what binds a
+    /// slot to its front-door record.
+    pub(super) project: PathBuf,
     pub(super) held: bool,
     pub(super) idle: bool,
 }
@@ -291,6 +295,9 @@ pub(super) struct SeedSlotView {
 /// The pool and ledger facts call 1 and call 2 may read.
 pub(super) struct SeedPoolView {
     pub(super) store_id: String,
+    /// The recorded backend. The seeding custody calls only write an internal
+    /// directory-budget pool's payload.
+    pub(super) backend: String,
     pub(super) pool_root: PathBuf,
     pub(super) payload_root: PathBuf,
     pub(super) slots: Vec<SeedSlotView>,
@@ -960,6 +967,7 @@ impl Pool {
     pub(super) fn seed_view(&self) -> SeedPoolView {
         SeedPoolView {
             store_id: self.config.store_id.clone(),
+            backend: self.config.backend.clone(),
             pool_root: self.root.clone(),
             payload_root: self.backing.payload_root().to_path_buf(),
             slots: self
@@ -973,6 +981,7 @@ impl Pool {
                     last_lease_id: slot.last_lease_id.clone(),
                     rank: slot.rank,
                     dir: slot.dir.clone(),
+                    project: slot.project.clone(),
                     held: slot.state == SlotPersistState::Held,
                     idle: slot.state == SlotPersistState::Idle,
                 })

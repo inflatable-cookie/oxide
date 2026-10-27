@@ -196,6 +196,13 @@ pub struct SeedFile {
     pub mtime_ms: u64,
     /// SHA-256 of the file's content.
     pub digest: String,
+    /// The producing epoch's record that this path is an **output rule** of
+    /// the unit's `.d` (the `.d` itself and the role's artifacts are; Cargo's
+    /// fingerprint files and the unhashed build-script uplift are not).
+    /// Donation re-parses the `.d` and requires every such file to appear
+    /// there, and no output rule outside these files and the recorded
+    /// prerequisites.
+    pub joined: bool,
 }
 
 /// Why a lock entry was not offered. The counts feed the bounded skip
@@ -373,12 +380,16 @@ impl SeedUnit {
         // The joining `.d` is part of the unit's own file list: a catalog that
         // names a join it would not clone is not a complete unit. The join's
         // own digest is that file record's digest, so the recorded rules and
-        // the bytes they describe cannot be published apart.
+        // the bytes they describe cannot be published apart, and the `.d` is
+        // an output rule of itself.
         let Some(join_file) = self.files.iter().find(|file| file.path == self.join.path) else {
             return Err("cold-seed unit's join file is not in its file list");
         };
         if join_file.digest != self.join.digest {
             return Err("cold-seed unit's join digest is not its .d file digest");
+        }
+        if !join_file.joined {
+            return Err("cold-seed unit's .d is not recorded as an output rule");
         }
         // The profile component of the fingerprint directory is the unit's
         // output subtree: every offered file lives below it, so one unit can

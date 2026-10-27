@@ -9,7 +9,10 @@ use super::super::pool::{
     create_injected, lease_injected, mark_evicting_for_test, release_injected, slot_state_injected,
     tamper_idle_generations_injected,
 };
-use super::super::{LeaseError, LeaseGrant, LeaseRequest, Profile};
+use super::super::{
+    LeaseError, LeaseGrant, LeaseRequest, Profile, BUDGET_BACKEND_DIRECTORY_V1,
+    VOLUME_BACKEND_APFS_V1,
+};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::fs::{self, OpenOptions};
@@ -208,6 +211,7 @@ struct Rig {
     pool: PathBuf,
     records: RefCell<Vec<StateRecord>>,
     cleans: RefCell<Vec<PathBuf>>,
+    next_record: Cell<u64>,
 }
 
 impl Rig {
@@ -220,7 +224,30 @@ impl Rig {
             pool,
             records: RefCell::new(Vec::new()),
             cleans: RefCell::new(Vec::new()),
+            next_record: Cell::new(1),
         }
+    }
+
+    fn next_record_id(&self) -> u64 {
+        let id = self.next_record.get();
+        self.next_record.set(id + 1);
+        id
+    }
+
+    /// The front door's affinity directory for one record: the project a
+    /// front-door lease records, so a slot's ledger project names its record.
+    fn affinity_dir(&self, record_id: u64) -> PathBuf {
+        let managed = self.pool.join(MANAGED_NAME);
+        let affinity = managed.join("affinity");
+        let path = affinity.join(record_id.to_string());
+        for directory in [&managed, &affinity, &path] {
+            fs::create_dir_all(directory).expect("affinity dir");
+            // The control directory is owner-only; the front door's
+            // `ensure_private_dir` refuses anything looser.
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("affinity mode");
+        }
+        path
     }
 
     fn control(&self) -> PathBuf {
@@ -229,6 +256,10 @@ impl Rig {
 
     fn lease(&self, label: &str, holder: &str) -> LeaseGrant {
         let project = self.fx.dir(&format!("project-{label}"));
+        self.lease_at(label, holder, project)
+    }
+
+    fn lease_at(&self, label: &str, holder: &str, project: PathBuf) -> LeaseGrant {
         let workspace = self.fx.dir(&format!("workspace-{label}"));
         lease_injected(LeaseRequest {
             pool: self.pool.clone(),
@@ -367,15 +398,33 @@ fn sha(text: &str) -> String {
 }
 
 fn dep_info_text() -> String {
-    format!("{DEP}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n")
+    // The ordinary rustc shape: the `.d`'s own rule first, then the role's
+    // artifact, then one empty phony rule per source input.
+    format!(
+        "{DEP}: {SOURCE_A} {SOURCE_B}\n{ARTIFACT}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n"
+    )
 }
 
 fn dep_targets() -> Vec<String> {
-    vec![DEP.to_owned(), SOURCE_A.to_owned(), SOURCE_B.to_owned()]
+    vec![
+        DEP.to_owned(),
+        ARTIFACT.to_owned(),
+        SOURCE_A.to_owned(),
+        SOURCE_B.to_owned(),
+    ]
+}
+
+/// The files the producing epoch records as `.d` output rules.
+fn dep_joined() -> Vec<String> {
+    vec![DEP.to_owned(), ARTIFACT.to_owned()]
 }
 
 fn dep_inputs() -> Vec<String> {
     vec![SOURCE_A.to_owned(), SOURCE_B.to_owned()]
+}
+
+fn is_joined(path: &str) -> bool {
+    path == DEP || path == ARTIFACT
 }
 
 fn default_files() -> Vec<(String, String)> {
@@ -425,6 +474,7 @@ fn catalog_for(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -
             size: content.len() as u64,
             mtime_ms: 0,
             digest: sha(content),
+            joined: is_joined(path),
         })
         .collect();
     SeedCatalog {
@@ -471,10 +521,16 @@ fn catalog_for(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -
 /// One released donor slot with a published catalog, its own record lock and
 /// an idle control record.
 fn make_donor(rig: &Rig, label: &str) -> Donor {
-    let grant = rig.lease(&format!("donor-{label}"), "donor");
+    // A front-door lease records its record's affinity directory as the
+    // project, which is the binding a catalog's record id must match.
+    let record_id = rig.next_record_id();
+    let grant = rig.lease_at(
+        &format!("donor-{label}"),
+        "donor",
+        rig.affinity_dir(record_id),
+    );
     let files = default_files();
     write_files(&grant.env.cargo_build_build_dir, &files);
-    let record_id = grant.slot_id.parse::<u64>().expect("record id");
     let catalog = catalog_for(&grant, record_id, &files);
     publish_seed_catalog(&rig.pool, &catalog).expect("publish catalog");
     let bytes = catalog.to_bytes().expect("catalog bytes");
@@ -592,8 +648,8 @@ fn candidates_ignore_a_catalog_whose_generation_moved_on() {
     let rig = Rig::new("candidates-generation");
     let donor = make_donor(&rig, "a");
     // The slot is granted again, which mints a new lease id and invalidates
-    // the catalog atomically (§4.6).
-    let again = rig.lease("donor-a", "donor");
+    // the catalog atomically (§4.6). Its recorded project is its affinity.
+    let again = rig.lease_at("donor-a", "donor", rig.affinity_dir(donor.record_id));
     assert_eq!(again.slot_id, donor.grant.slot_id);
     release_injected(&rig.pool, &again.lease_id).expect("release again");
     let (_, recipient) = lease_recipient(&rig, "a");
@@ -683,7 +739,7 @@ fn seed_skips_a_donor_that_left_idle_before_the_first_clone() {
     let (grant, recipient) = lease_recipient(&rig, "a");
     let request = donor.request(&recipient);
     // Take the donor slot again: its ledger state is no longer `Idle`.
-    let busy = rig.lease("donor-a", "donor");
+    let busy = rig.lease_at("donor-a", "donor", rig.affinity_dir(donor.record_id));
     assert_eq!(busy.slot_id, donor.grant.slot_id);
     let outcome = seed(&rig.pool, &request).expect("seed");
     assert_eq!(
@@ -719,13 +775,17 @@ fn seed_skips_a_changed_donor_file_without_touching_the_recipient() {
 fn seed_skips_a_join_that_disagrees_with_the_donated_dot_d() {
     reset_hooks();
     let rig = Rig::new("join-inconsistent");
-    // A recorded target the `.d` does not contain: the digest still matches
-    // the file, so only a re-parse can catch it.
+    // A file recorded as a `.d` output rule that the `.d` never names: the
+    // digest still matches the file, so only the re-parse can catch it.
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
     let digest = rewrite_catalog(&rig, &donor, |catalog| {
-        catalog.packages[0].units[0].join.targets =
-            vec![DEP.to_owned(), "/fixture/src/other-unlisted.rs".to_owned()];
+        let unit = &mut catalog.packages[0].units[0];
+        for file in &mut unit.files {
+            if file.path.ends_with("/lib-cfg_if") {
+                file.joined = true;
+            }
+        }
     });
     let mut request = donor.request(&recipient);
     request.donor.catalog_digest = digest;
@@ -738,9 +798,31 @@ fn seed_skips_a_join_that_disagrees_with_the_donated_dot_d() {
     );
     assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
 
-    // A recorded input the `.d` does not have is refused the same way.
+    // An output rule the `.d` names but the catalog did not record as joined
+    // is the same refusal: an offered artifact must be a joined artifact.
     let donor = make_donor(&rig, "b");
     let (_, recipient) = lease_recipient(&rig, "b");
+    let digest = rewrite_catalog(&rig, &donor, |catalog| {
+        let unit = &mut catalog.packages[0].units[0];
+        for file in &mut unit.files {
+            if file.path == ARTIFACT {
+                file.joined = false;
+            }
+        }
+    });
+    let mut request = donor.request(&recipient);
+    request.donor.catalog_digest = digest;
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::JoinInconsistent
+        })
+    );
+
+    // A recorded input the `.d` does not have is refused the same way.
+    let donor = make_donor(&rig, "c");
+    let (_, recipient) = lease_recipient(&rig, "c");
     let digest = rewrite_catalog(&rig, &donor, |catalog| {
         catalog.packages[0].units[0].join.inputs = vec![SOURCE_A.to_owned()];
     });
@@ -753,6 +835,42 @@ fn seed_skips_a_join_that_disagrees_with_the_donated_dot_d() {
             reason: SeedSkipReason::JoinInconsistent
         })
     );
+}
+
+#[test]
+fn seed_skips_a_catalog_whose_record_is_not_the_donor_slots_affinity() {
+    reset_hooks();
+    let rig = Rig::new("record-affinity");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    // Another record exists, is idle and has its own free lock, but the donor
+    // slot's recorded project is the donor record's affinity: a catalog
+    // naming the other record cannot select that record's custody.
+    let other = rig.next_record_id();
+    rig.donor_lock(other);
+    rig.add_record(StateRecord::idle(other));
+    let digest = rewrite_catalog(&rig, &donor, |catalog| catalog.record_id = other);
+    let mut request = donor.request(&recipient);
+    request.donor.record_id = other;
+    request.donor.catalog_digest = digest;
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::DonorCustodyUnknown
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
+fn this_slice_never_writes_a_removable_payload() {
+    reset_hooks();
+    // The gate is the pool's recorded backend. A removable pool cannot be
+    // opened in a fixture without a real mounted volume, so the live branch is
+    // checked through the same predicate the seeding calls read.
+    assert!(internal_backend(BUDGET_BACKEND_DIRECTORY_V1));
+    assert!(!internal_backend(VOLUME_BACKEND_APFS_V1));
 }
 
 #[test]
@@ -1083,16 +1201,46 @@ fn seed_refuses_a_failed_clone_and_never_copies_bytes() {
     let rig = Rig::new("clone-failed");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    // A pre-existing entry makes `clonefile` fail. There is no byte-copy
-    // fallback, so the planted entry is still a directory, not a file.
+    // A pre-existing entry makes the first `clonefile` fail. That is before
+    // the design's point of no return, so the attempt is abandoned and the
+    // same slot still builds cold. There is no byte-copy fallback, so the
+    // planted entry is still a directory, not a file.
     BREAK_DONOR.with(|cell| cell.set(Some(0)));
-    let refused = seed(&rig.pool, &donor.request(&recipient));
-    assert!(matches!(refused, Err(LeaseError::Io(_))));
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::CloneFailed
+        })
+    );
     let destination = grant.env.cargo_build_build_dir.join(&donor.files[0].0);
     assert!(fs::symlink_metadata(&destination)
         .expect("planted entry")
         .file_type()
         .is_dir());
+    assert!(!grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[1].0)
+        .exists());
+}
+
+#[test]
+fn seed_refuses_when_the_first_clone_is_created_but_untrusted() {
+    reset_hooks();
+    let rig = Rig::new("first-clone-untrusted");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    // The first clone is created and then fails its digest: the point of no
+    // return has been crossed, so the fault refuses and retains.
+    TAMPER_CLONE.with(|cell| cell.set(Some(0)));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(refused, Err(LeaseError::UnsafePath(_))));
+    assert!(grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
 }
 
 #[test]
@@ -1182,10 +1330,10 @@ fn seeding_never_reconciles_a_recorded_deletion() {
     // is published later, a recipient lease, and one unrelated idle slot.
     let donor = make_donor(&rig, "a");
     let (recipient_grant, recipient) = lease_recipient(&rig, "a");
-    let second = rig.lease("donor-b", "donor");
+    let second_record = rig.next_record_id();
+    let second = rig.lease_at("donor-b", "donor", rig.affinity_dir(second_record));
     let second_files = default_files();
     write_files(&second.env.cargo_build_build_dir, &second_files);
-    let second_record = second.slot_id.parse::<u64>().expect("record id");
     let second_catalog = catalog_for(&second, second_record, &second_files);
     let third = rig.lease("third", "third");
     release_injected(&rig.pool, &third.lease_id).expect("release third");
@@ -1266,10 +1414,10 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
     // A ceiling the new catalog cannot meet refuses the write, and no catalog
     // is destroyed by the refusal.
     FAMILY_CAP.with(|cell| cell.set(Some(1)));
-    let fifth = rig.lease("donor-e", "donor");
+    let fifth_record = rig.next_record_id();
+    let fifth = rig.lease_at("donor-e", "donor", rig.affinity_dir(fifth_record));
     let files = default_files();
     write_files(&fifth.env.cargo_build_build_dir, &files);
-    let fifth_record = fifth.slot_id.parse::<u64>().expect("record id");
     let refused = publish_seed_catalog(&rig.pool, &catalog_for(&fifth, fifth_record, &files));
     assert!(matches!(refused, Err(LeaseError::LedgerExhausted)));
     assert!(!seeds
@@ -1286,9 +1434,13 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
 fn join_parser_accepts_rustc_shapes_and_refuses_others() {
     reset_hooks();
     let parsed = join::parse(dep_info_text().as_bytes()).expect("parse the fixture");
-    assert!(parsed.matches(&dep_targets(), &dep_inputs()));
-    assert!(!parsed.matches(&dep_targets(), &[SOURCE_A.to_owned()]));
-    assert_eq!(parsed.rules, 3);
+    assert!(parsed.joins(&dep_joined(), &dep_inputs()));
+    // The artifact is an output rule; without it recorded as one, the same
+    // parse no longer joins.
+    assert!(!parsed.joins(&[DEP.to_owned()], &dep_inputs()));
+    // A recorded input the `.d` does not list is not a join either.
+    assert!(!parsed.joins(&dep_joined(), &[SOURCE_A.to_owned()]));
+    assert_eq!(parsed.rules, 4);
 
     // Escaped space, escaped colon, literal `$` and a continued line.
     let text = "out/one\\ two: /src/a\\ b.rs /src/c.rs \\\n /src/d.rs\n/srv/\\$x: /src/e.rs\n";
@@ -1365,6 +1517,14 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     let mut join_digest = catalog.clone();
     join_digest.packages[0].units[0].join.digest = "f".repeat(64);
     assert!(join_digest.validate().is_err());
+    // The `.d` itself is an output rule.
+    let mut join_unjoined = catalog.clone();
+    for file in &mut join_unjoined.packages[0].units[0].files {
+        if file.path == DEP {
+            file.joined = false;
+        }
+    }
+    assert!(join_unjoined.validate().is_err());
     // The catalog's own byte ceiling is enforced before parsing.
     assert!(SeedCatalog::parse(&vec![b' '; SEED_CATALOG_MAX_BYTES + 1]).is_err());
 }
