@@ -729,6 +729,23 @@ pub(super) fn tamper_idle_generations_injected(pool: &Path) -> Result<(), LeaseE
     write_ledger(pool, &ledger)
 }
 
+/// Test-only: one slot's ledger state as the ledger file records it, read
+/// without opening (and therefore without reconciling) the pool.
+#[cfg(test)]
+pub(super) fn slot_state_injected(pool: &Path, slot_id: &str) -> Option<String> {
+    let ledger = read_ledger(pool).ok()?;
+    let id = slot_id.parse::<u64>().ok()?;
+    ledger
+        .slots
+        .iter()
+        .find(|slot| slot.id == id)
+        .map(|slot| match slot.state {
+            SlotPersistState::Held => "held".to_owned(),
+            SlotPersistState::Idle => "idle".to_owned(),
+            SlotPersistState::Evicting => "evicting".to_owned(),
+        })
+}
+
 /// Test-only: open a passive measurement, wait, then walk, returning each
 /// scan's recorded elapsed bound so the shared deadline can be observed.
 #[cfg(test)]
@@ -887,11 +904,13 @@ impl Pool {
         })
     }
 
-    /// Open for the read-only candidate call (`oxide#137` §6.3 call 1): the
-    /// pool lock alone, no reconciliation, no mutation. A pending recorded
-    /// deletion still makes the pool's accounting unknown, so the read reports
-    /// it rather than finishing a deletion a passive read does not own.
-    pub(super) fn open_seed_read_only(root: &Path) -> Result<Self, LeaseError> {
+    /// Open for the seeding custody calls (`oxide#137` §6.3 calls 1 and 2 and
+    /// `publish_seed_catalog`): the pool lock alone, **no reconciliation**, no
+    /// ledger or payload mutation. A recorded `Evicting` slot is read as it
+    /// stands and never finished here, so a queued deletion stays queued until
+    /// the owner that owes it runs. Call 2's clone and the catalog sidecar
+    /// write are the only effects, and neither touches the ledger.
+    pub(super) fn open_seed(root: &Path) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;

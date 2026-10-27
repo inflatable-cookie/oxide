@@ -371,9 +371,14 @@ impl SeedUnit {
             return Err("cold-seed unit has an unusable file list");
         }
         // The joining `.d` is part of the unit's own file list: a catalog that
-        // names a join it would not clone is not a complete unit.
-        if !self.files.iter().any(|file| file.path == self.join.path) {
+        // names a join it would not clone is not a complete unit. The join's
+        // own digest is that file record's digest, so the recorded rules and
+        // the bytes they describe cannot be published apart.
+        let Some(join_file) = self.files.iter().find(|file| file.path == self.join.path) else {
             return Err("cold-seed unit's join file is not in its file list");
+        };
+        if join_file.digest != self.join.digest {
+            return Err("cold-seed unit's join digest is not its .d file digest");
         }
         // The profile component of the fingerprint directory is the unit's
         // output subtree: every offered file lives below it, so one unit can
@@ -405,14 +410,17 @@ impl SeedJoin {
         if self.targets.is_empty() || self.targets.len() > SEED_MAX_RULES {
             return Err("cold-seed join has an unusable rule set");
         }
+        // Rule targets are the `.d`'s output rules and rustc's phony source
+        // rules, so each is either slot-relative or an absolute source path;
+        // prerequisites are the verified source paths.
         for target in &self.targets {
-            require_path(target, false)?;
+            require_recorded_path(target)?;
         }
         if self.inputs.len() > SEED_MAX_INPUTS {
             return Err("cold-seed join has too many inputs");
         }
         for input in &self.inputs {
-            require_path(input, true)?;
+            require_recorded_path(input)?;
         }
         Ok(())
     }
@@ -456,6 +464,11 @@ fn require_path(text: &str, absolute: bool) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// A recorded join path: an absolute path or a strict relative one.
+fn require_recorded_path(text: &str) -> Result<(), &'static str> {
+    require_path(text, text.starts_with('/'))
 }
 
 fn require_bounded(text: &str, max: usize, field: &'static str) -> Result<(), &'static str> {

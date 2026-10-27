@@ -7,8 +7,10 @@
 //!
 //! The walk publishes only when it is complete and ownership-clean: every
 //! entry owned by this user, on the slot's device, readable and inside the
-//! slot, within the capacity contract's entry, depth and elapsed bounds. Any
-//! other outcome is a gap, and the caller abandons seeding only.
+//! slot, within the capacity contract's entry, depth and elapsed bounds. Every
+//! other outcome is a gap, including a root that cannot be opened, stat'd or
+//! proven owned, and a directory read that fails: a walk never reports clean
+//! coverage it did not establish. The caller abandons seeding on any gap.
 
 use super::super::current_uid;
 use crate::owned_delete::open_directory_at;
@@ -64,38 +66,11 @@ pub struct WalkOutcome {
     pub elapsed_ms: u64,
 }
 
-/// Walk `root` on `device` with `limits`. A root that cannot be opened or is
-/// not a real owner-owned directory on `device` is an error, not a gap: the
-/// caller refuses rather than recording a clean zero-byte observation.
-pub fn walk_slot(
-    root: &Path,
-    device: u64,
-    limits: WalkLimits,
-    started: Instant,
-) -> std::io::Result<WalkOutcome> {
-    let root = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::other("slot root holds a NUL"))?;
-    // SAFETY: the path is a live NUL-terminated string.
-    let fd = unsafe {
-        libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a newly owned descriptor.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let root_stat = stat(fd.as_fd())?;
-    if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || root_stat.st_uid != current_uid()
-        || root_stat.st_dev as u64 != device
-    {
-        return Err(std::io::Error::other(
-            "the slot root is not an owned directory on the pool's device",
-        ));
-    }
+/// Walk `root` on `device` with `limits`. A root that cannot be opened,
+/// stat'd or proven to be an owned directory on the pool's device is a gap,
+/// never an error and never a clean zero-byte observation: the caller abandons
+/// seeding on any gap.
+pub fn walk_slot(root: &Path, device: u64, limits: WalkLimits, started: Instant) -> WalkOutcome {
     let mut walk = Walk {
         limits,
         started,
@@ -106,14 +81,27 @@ pub fn walk_slot(
         allocated_bytes: 0,
         gap: None,
     };
-    walk.visit(fd.as_fd(), 0);
-    Ok(WalkOutcome {
+    match open_root(root) {
+        Ok(fd) => match stat(fd.as_fd()) {
+            Ok(root_stat) if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR => {
+                walk.stop(WalkGap::UnexpectedType)
+            }
+            Ok(root_stat) if root_stat.st_uid != current_uid() => walk.stop(WalkGap::ForeignOwner),
+            Ok(root_stat) if root_stat.st_dev as u64 != device => {
+                walk.stop(WalkGap::DeviceBoundary)
+            }
+            Ok(_) => walk.visit(fd.as_fd(), 0),
+            Err(_) => walk.stop(WalkGap::Unreadable),
+        },
+        Err(_) => walk.stop(WalkGap::Unreadable),
+    }
+    WalkOutcome {
         entries: walk.entries,
         logical_bytes: walk.logical_bytes,
         allocated_bytes: walk.allocated_bytes,
         gap: walk.gap,
         elapsed_ms: walk.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-    })
+    }
 }
 
 /// Whether an owned directory has no entries at all. Used for the recipient's
@@ -228,6 +216,23 @@ impl Walk {
     }
 }
 
+fn open_root(root: &Path) -> std::io::Result<OwnedFd> {
+    let root = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("slot root holds a NUL"))?;
+    // SAFETY: the path is a live NUL-terminated string.
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a newly owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 fn stat(fd: BorrowedFd<'_>) -> std::io::Result<libc::stat> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is live and `stat` is valid for writes.
@@ -271,7 +276,9 @@ pub(super) fn open_regular(directory: &BorrowedFd<'_>, name: &CStr) -> std::io::
 }
 
 /// Read one directory's names, skipping `.` and `..`, and stop after
-/// `remaining` more names than the caller may still visit.
+/// `remaining` more names than the caller may still visit. A `readdir` failure
+/// is an error, never an empty or complete directory: `errno` is cleared before
+/// each call and checked after a null result.
 fn list_names(directory: BorrowedFd<'_>, remaining: u64) -> std::io::Result<Vec<CString>> {
     // fdopendir owns its descriptor, so hand it a duplicate.
     // SAFETY: `directory` is live.
@@ -288,9 +295,17 @@ fn list_names(directory: BorrowedFd<'_>, remaining: u64) -> std::io::Result<Vec<
     }
     let mut names = Vec::new();
     loop {
+        clear_errno();
         // SAFETY: `stream` is a live directory stream.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
+            let error = current_errno();
+            if error != 0 {
+                // SAFETY: `stream` is live and not used again; it closes
+                // `duplicate`.
+                unsafe { libc::closedir(stream) };
+                return Err(std::io::Error::from_raw_os_error(error));
+            }
             break;
         }
         // SAFETY: readdir returned a live entry for the stream.
@@ -307,4 +322,30 @@ fn list_names(directory: BorrowedFd<'_>, remaining: u64) -> std::io::Result<Vec<
     // SAFETY: `stream` is live and not used again; it closes `duplicate`.
     unsafe { libc::closedir(stream) };
     Ok(names)
+}
+
+fn clear_errno() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: `__error` returns this thread's errno pointer.
+    unsafe {
+        *libc::__error() = 0;
+    }
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: `__errno_location` returns this thread's errno pointer.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+}
+
+fn current_errno() -> i32 {
+    #[cfg(target_os = "macos")]
+    // SAFETY: `__error` returns this thread's errno pointer.
+    unsafe {
+        *libc::__error()
+    }
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: `__errno_location` returns this thread's errno pointer.
+    unsafe {
+        *libc::__errno_location()
+    }
 }

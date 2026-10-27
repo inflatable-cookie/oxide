@@ -7,13 +7,16 @@
 //!   that the recipient is still held by the caller's lease, and returns the
 //!   bounded catalogs of at most eight donor slots by rank. It reads control
 //!   state only: no donor payload is opened and nothing is mutated.
-//! - [`seed`] is call 2: it takes the donor's record lock non-blocking and
-//!   then the pool lock, both held to the end, re-reads and re-checks the
-//!   selected catalog (generation, lease id and bytes), revalidates every
-//!   planned donor file against the catalog's recorded digest, clones with
-//!   `clonefile` only, hashes each clone against the same digest, re-reads the
-//!   donor's ledger generation, and then walks the recipient as an
-//!   `observed-while-held` fact before publishing anything.
+//! - [`seed`] is call 2: it takes the donor's record lock — derived from the
+//!   pool's control directory and the plan's record id, so it is exactly that
+//!   record's lock and not a caller-supplied path — non-blocking, and then the
+//!   pool lock, both held to the end. Under them it re-reads and re-checks the
+//!   selected catalog (record id, generation, lease id and bytes), checks the
+//!   §7 control record, revalidates every planned donor file against the
+//!   catalog's recorded digest and its `.d` join against a fresh parse of the
+//!   donated rules, clones with `clonefile` only, hashes each clone against the
+//!   same digest, re-reads both ledger generations, and then walks the
+//!   recipient as an `observed-while-held` fact before publishing anything.
 //! - [`publish_seed_catalog`] writes one generation-bound catalog sidecar
 //!   under `<pool>/oxide-managed/seeds/` after bounded orphan and family-size
 //!   checks. It is called by the producing lease, not by [`seed`].
@@ -36,12 +39,22 @@
 //! still-untouched recipient is conservatively retained and refused rather
 //! than reused. This is the strict reading, never a laxer one.
 //!
-//! The donor predicate of §7 has two halves. The ledger half (state `Idle`, no
-//! lease, the catalog's lease as `last_lease_id`, same payload root and device,
-//! matching volume binding) is checked here. The control-record half (no
-//! holder, no live `oxide clean`) belongs to the front door's record, which is
-//! exactly what the donor's record lock this call holds proves: a holder or a
-//! clean would hold it and make the donor a skip.
+//! The donor predicate of §7 has two halves and both are checked here. The
+//! ledger half is state `Idle`, no lease, the catalog's lease as
+//! `last_lease_id`, the same payload root and device, and a matching volume
+//! binding. The control-record half is read from the front door's own
+//! `oxide-managed/state.json`: the record the catalog names must exist, be
+//! `idle`, carry no holder, lease id, pending recovery, retirement or lost
+//! marker, and its checkout must have no recorded `oxide clean`. The file is
+//! read bounded and tolerantly; a missing, unreadable or unknown-version
+//! document is unknown custody, which is a skip and never a repair.
+//!
+//! **No reconciliation.** Calls 1 and 2 and the catalog write open the pool
+//! through the non-reconciling seam: a recorded `Evicting` slot stays exactly
+//! as the ledger records it, and no deletion or unrelated ledger/payload
+//! mutation can happen here. That keeps this slice library custody under the
+//! Standard tier: nothing in this module decides crash recovery, recycles
+//! storage or writes removable media.
 //!
 //! Nothing here reads the registry adapter, a source tree, an archive or a
 //! Cargo home: slice 1's verification evidence reaches this layer only as the
@@ -50,6 +63,7 @@
 //! (§6.3 step 4).
 
 pub mod catalog;
+mod join;
 mod walk;
 
 pub use catalog::{
@@ -58,6 +72,7 @@ pub use catalog::{
     SeedUnit, SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_FILES, SEED_MAX_PACKAGES,
     SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
 };
+pub use join::{JoinRefusal, ParsedJoin};
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
 use super::pool::{Pool, SeedPoolView, SeedSlotView};
@@ -66,6 +81,7 @@ use super::{
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
 };
 use crate::owned_delete::open_directory_at;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -84,8 +100,14 @@ pub const SEED_MAX_PLAN_UNITS: usize = 256;
 pub const SEED_MAX_PLAN_FILES: usize = 4096;
 /// Logical bytes per plan.
 pub const SEED_MAX_PLAN_BYTES: u64 = 384 * 1024 * 1024;
-/// The seed's own cooperative work deadline.
+/// The seed's cooperative work deadline (clone plus digest verify): 5 s, a
+/// ceiling a caller may lower but never raise (§8.1).
 pub const SEED_WORK_BUDGET_MS: u64 = 5_000;
+/// The front door's control-state version this module can classify. Any other
+/// value is unknown custody, never a guess.
+const CONTROL_STATE_VERSION: u32 = 5;
+/// The control state's whole-file bound, matching the front door's own.
+const CONTROL_STATE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// The post-clone recipient walk's bounds: the capacity contract's slot walk.
 pub const SEED_WALK_MAX_ENTRIES: u64 = 2_000_000;
 pub const SEED_WALK_MAX_DEPTH: usize = 64;
@@ -118,6 +140,10 @@ pub struct SeedDonor {
     /// The producing lease, which is the ledger's `last_lease_id` while the
     /// catalog is eligible.
     pub lease_id: String,
+    /// The producing record id (from the catalog call 1 returned). It is also
+    /// the front door record whose lock this call takes and whose control
+    /// record it verifies, so the lock cannot be an unrelated one.
+    pub record_id: u64,
     /// Lowercase SHA-256 of the catalog bytes call 1 returned.
     pub catalog_digest: String,
 }
@@ -154,10 +180,8 @@ pub struct SeedRequest {
     pub recipient: SeedRecipient,
     pub donor: SeedDonor,
     pub units: Vec<SeedUnitRef>,
-    /// The donor's front-door record lock, which must already exist. The
-    /// library takes it non-blocking and holds it to the end.
-    pub donor_record_lock: PathBuf,
-    /// The cooperative work deadline; `None` uses [`SEED_WORK_BUDGET_MS`].
+    /// The cooperative work deadline; `None` uses [`SEED_WORK_BUDGET_MS`] and
+    /// any value is clamped to that ceiling.
     pub work_budget_ms: Option<u64>,
 }
 
@@ -196,6 +220,10 @@ pub enum SeedSkipReason {
     NoCandidate,
     DonorBusy,
     DonorLockMissing,
+    /// The donor's control record is missing, unreadable, of an unknown state
+    /// version, or carries a pending recovery, retirement or lost marker:
+    /// its custody is unknown.
+    DonorCustodyUnknown,
     /// The donor's ledger generation no longer matches the planned catalog.
     DonorGenerationChanged,
     /// The catalog bytes call 2 re-read differ from the plan's.
@@ -211,6 +239,9 @@ pub enum SeedSkipReason {
     /// A planned donor file is missing, unreadable or no longer matches its
     /// recorded digest.
     FileChanged,
+    /// The donated `.d` parses to different rule targets or inputs than the
+    /// catalog recorded: the recorded join is internally inconsistent.
+    JoinInconsistent,
     /// This platform has no `clonefile`.
     Unsupported,
 }
@@ -222,6 +253,7 @@ impl SeedSkipReason {
             Self::NoCandidate => "no donor",
             Self::DonorBusy => "donor busy",
             Self::DonorLockMissing => "donor lock missing",
+            Self::DonorCustodyUnknown => "donor custody unknown",
             Self::DonorGenerationChanged => "donor generation changed",
             Self::CatalogChanged => "catalog changed",
             Self::DonorPayloadMissing => "donor payload missing",
@@ -229,6 +261,7 @@ impl SeedSkipReason {
             Self::PlanCap => "cap",
             Self::WorkDeadline => "deadline",
             Self::FileChanged => "file changed",
+            Self::JoinInconsistent => "join inconsistent",
             Self::Unsupported => "unsupported",
         }
     }
@@ -272,7 +305,7 @@ pub fn seed_candidates(
     max_candidates: usize,
 ) -> Result<SeedCandidates, LeaseError> {
     validate_recipient(recipient)?;
-    let opened = Pool::open_seed_read_only(pool)?;
+    let opened = Pool::open_seed(pool)?;
     let view = opened.seed_view();
     let held = view
         .slot(&recipient.slot_id)
@@ -324,21 +357,25 @@ pub fn seed_candidates(
 /// Call 2: donor record lock, then pool lock, clone and revalidate.
 pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseError> {
     let started = Instant::now();
-    let budget = Duration::from_millis(
-        request
-            .work_budget_ms
-            .unwrap_or(SEED_WORK_BUDGET_MS)
-            .clamp(1, 60_000),
-    );
+    let budget = work_budget(request.work_budget_ms);
     validate_request(request)?;
     if !cfg!(target_os = "macos") {
         return Ok(SeedOutcome::Skipped(SeedSkip {
             reason: SeedSkipReason::Unsupported,
         }));
     }
+    // The donor's record lock is the front door's lock for exactly the record
+    // the plan names: `<pool>/oxide-managed/locks/<record_id>.lock`. A caller
+    // supplies no path, so a free unrelated lock can never stand in for the
+    // donor's closure, and the catalog's own `record_id` is rechecked below.
+    let pool_root = super::canonical_existing_dir(pool, true)?;
+    let donor_lock_path = pool_root
+        .join(MANAGED_NAME)
+        .join("locks")
+        .join(format!("{}.lock", request.donor.record_id));
     // Lock order (§7): the donor's record lock first, non-blocking and
     // `create: false`, then the pool lock, both held to the end.
-    let _donor_lock = match probe_donor_lock(&request.donor_record_lock)? {
+    let _donor_lock = match probe_donor_lock(&donor_lock_path)? {
         DonorLock::Taken(file) => file,
         DonorLock::Missing => {
             return Ok(SeedOutcome::Skipped(SeedSkip {
@@ -351,7 +388,9 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
             }))
         }
     };
-    let opened = Pool::open(pool)?;
+    // The non-reconciling open: a recorded `Evicting` slot is never finished,
+    // deleted or mutated by a seed.
+    let opened = Pool::open_seed(pool)?;
     let view = opened.seed_view();
     let recipient = view
         .slot(&request.recipient.slot_id)
@@ -373,17 +412,26 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     {
         return Ok(skip(SeedSkipReason::DonorGenerationChanged));
     }
-    let Some((catalog, _bytes, catalog_digest)) = read_catalog(&view.pool_root, donor.id) else {
+    let Some((catalog, _bytes, actual_catalog_digest)) = read_catalog(&view.pool_root, donor.id)
+    else {
         return Ok(skip(SeedSkipReason::CatalogChanged));
     };
-    if catalog_digest != request.donor.catalog_digest
+    if actual_catalog_digest != request.donor.catalog_digest
         || catalog.store_id != view.store_id
         || catalog.slot_id != request.donor.slot_id
         || catalog.incarnation != request.donor.incarnation
         || catalog.lease_id != request.donor.lease_id
+        || catalog.record_id != request.donor.record_id
         || catalog.attempt != SeedAttemptState::None
     {
         return Ok(skip(SeedSkipReason::CatalogChanged));
+    }
+    // The §7 control-record half: the donor's own front-door record and any
+    // recorded clean of its checkout.
+    match donor_control(&view.pool_root, catalog.record_id) {
+        DonorControl::Eligible => {}
+        DonorControl::Busy => return Ok(skip(SeedSkipReason::DonorBusy)),
+        DonorControl::Unknown => return Ok(skip(SeedSkipReason::DonorCustodyUnknown)),
     }
     // The volume binding is re-verified before any payload read and again
     // before the final publication decision: a lost or re-mounted volume is
@@ -415,36 +463,61 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         Ok(plan) => plan,
         Err(reason) => return Ok(skip(reason)),
     };
-    if started.elapsed() > budget {
-        return Ok(skip(SeedSkipReason::WorkDeadline));
-    }
+    // The five-second cooperative work bound starts with donor revalidation,
+    // and every read and clone step below checks it.
+    let deadline = Instant::now() + budget;
+    test_point(TestPoint::BeforeVerify { pool });
     // Every donor payload read happens here, under the pin: each planned file
     // is opened without following a link, checked against the catalog's
-    // recorded size and hashed against its recorded digest before anything is
-    // copied. The `.d`'s digest is its join re-check: the recorded rules were
-    // derived from exactly those bytes.
-    test_point(TestPoint::BeforeVerify { pool });
+    // recorded size and revalidated against its recorded digest before
+    // anything is copied. The `.d` is read bounded, hashed and re-parsed: its
+    // recorded targets and inputs must really be this file's rules, so an
+    // internally inconsistent catalog is refused rather than trusted.
     let mut sources = Vec::with_capacity(plan.files.len());
-    for file in &plan.files {
-        if started.elapsed() > budget {
+    for planned in &plan.files {
+        if Instant::now() > deadline {
             return Ok(skip(SeedSkipReason::WorkDeadline));
         }
+        let file = &planned.file;
         let opened_file = match open_relative_file(donor_build.as_fd(), &file.path, payload_device)
         {
             Ok(opened_file) => opened_file,
             Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
         };
-        let metadata = opened_file.metadata;
-        let digest = match hash_fd(opened_file.fd.as_fd()) {
-            Ok(digest) => digest,
-            Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
-        };
-        if metadata.st_size.max(0) as u64 != file.size || digest != file.digest {
+        if opened_file.metadata.st_size.max(0) as u64 != file.size {
             return Ok(skip(SeedSkipReason::FileChanged));
+        }
+        match &planned.join {
+            Some(join) => {
+                let bytes =
+                    match read_bounded(opened_file.fd.as_fd(), join::MAX_JOIN_BYTES, deadline) {
+                        Ok(bytes) => bytes,
+                        Err(StreamError::Deadline) => {
+                            return Ok(skip(SeedSkipReason::WorkDeadline))
+                        }
+                        Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
+                    };
+                if catalog_digest(&bytes) != file.digest || file.digest != join.digest {
+                    return Ok(skip(SeedSkipReason::FileChanged));
+                }
+                let parsed = match join::parse(&bytes) {
+                    Ok(parsed) => parsed,
+                    Err(_) => return Ok(skip(SeedSkipReason::JoinInconsistent)),
+                };
+                if !parsed.matches(&join.targets, &join.inputs) {
+                    return Ok(skip(SeedSkipReason::JoinInconsistent));
+                }
+            }
+            None => match hash_fd(opened_file.fd.as_fd(), deadline) {
+                Ok(digest) if digest == file.digest => {}
+                Ok(_) => return Ok(skip(SeedSkipReason::FileChanged)),
+                Err(StreamError::Deadline) => return Ok(skip(SeedSkipReason::WorkDeadline)),
+                Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
+            },
         }
         sources.push(opened_file.fd);
     }
-    if started.elapsed() > budget {
+    if Instant::now() > deadline {
         return Ok(skip(SeedSkipReason::WorkDeadline));
     }
     // The first recipient write is the trust boundary (§6.5).
@@ -452,7 +525,11 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         Some(build) => build,
         None => create_owned_directory(recipient_fd.as_fd(), c"build", payload_device)?,
     };
-    for (index, file) in plan.files.iter().enumerate() {
+    for (index, planned) in plan.files.iter().enumerate() {
+        let file = &planned.file;
+        if Instant::now() > deadline {
+            return Err(work_deadline_after_clone());
+        }
         let (parents, name) = split_relative(&file.path);
         let mut deepest: Option<OwnedFd> = None;
         for component in parents {
@@ -487,20 +564,29 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         // does not reproduce it is never published.
         let cloned = walk::open_regular(&directory, &name).map_err(io_error)?;
         let metadata = fstat(cloned.as_fd()).map_err(io_error)?;
+        let digest = match hash_fd(cloned.as_fd(), deadline) {
+            Ok(digest) => digest,
+            Err(StreamError::Deadline) => return Err(work_deadline_after_clone()),
+            Err(StreamError::Io(error)) => return Err(error),
+            Err(StreamError::TooLarge) => {
+                return Err(LeaseError::Io(
+                    "a seeded clone exceeds its recorded size".to_owned(),
+                ))
+            }
+        };
         if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
             || metadata.st_uid != current_uid()
             || metadata.st_dev as u64 != payload_device
             || metadata.st_size.max(0) as u64 != file.size
-            || hash_fd(cloned.as_fd())? != file.digest
+            || digest != file.digest
         {
             return Err(LeaseError::UnsafePath(
                 "a seeded clone does not match its recorded digest",
             ));
         }
-        if started.elapsed() > budget {
-            return Err(LeaseError::Io(
-                "cold-seed work deadline expired after the first clone".to_owned(),
-            ));
+        test_point(TestPoint::DuringClone { index });
+        if Instant::now() > deadline {
+            return Err(work_deadline_after_clone());
         }
     }
     // Final donor recheck: the ledger still names the planned generation for
@@ -520,8 +606,7 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     let limits = walk_limits();
     // The walk's own cooperative deadline starts here; the seed's 5 s work
     // budget above is a separate bound and is not charged to the walk.
-    let walked = walk::walk_slot(&recipient_slot, payload_device, limits, Instant::now())
-        .map_err(io_error)?;
+    let walked = walk::walk_slot(&recipient_slot, payload_device, limits, Instant::now());
     let observation = SeedObservation {
         store_id: view.store_id.clone(),
         slot_id: recipient.id.to_string(),
@@ -543,7 +628,7 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         units: plan.units as u64,
         files: plan.files.len() as u64,
         logical_bytes: plan.logical_bytes,
-        catalog_digest,
+        catalog_digest: actual_catalog_digest,
         observation,
         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
     }))
@@ -556,7 +641,7 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
 /// touched, and an over-cap catalog is not written.
 pub fn publish_seed_catalog(pool: &Path, catalog: &SeedCatalog) -> Result<(), LeaseError> {
     let bytes = catalog.to_bytes().map_err(LeaseError::InvalidInput)?;
-    let opened = Pool::open(pool)?;
+    let opened = Pool::open_seed(pool)?;
     let view = opened.seed_view();
     let slot = view
         .slot(&catalog.slot_id)
@@ -601,12 +686,19 @@ fn walk_limits() -> SeedWalkLimits {
     }
 }
 
+/// One planned file, with the unit join it must satisfy when it is that
+/// unit's `.d`.
+struct PlannedFile {
+    file: SeedFile,
+    join: Option<SeedJoin>,
+}
+
 /// The plan the library derived from the catalog: the exact file list and the
 /// bytes it must still find. Nothing here came from the caller except the
 /// unit identities.
 struct Plan {
     units: usize,
-    files: Vec<SeedFile>,
+    files: Vec<PlannedFile>,
     logical_bytes: u64,
 }
 
@@ -614,7 +706,7 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
     if units.len() > SEED_MAX_PLAN_UNITS {
         return Err(SeedSkipReason::PlanCap);
     }
-    let mut files: Vec<SeedFile> = Vec::new();
+    let mut files: Vec<PlannedFile> = Vec::new();
     let mut seen_paths = std::collections::BTreeSet::new();
     let mut seen_units = std::collections::BTreeSet::new();
     for wanted in units {
@@ -631,7 +723,10 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
             if !seen_paths.insert(file.path.as_str()) {
                 return Err(SeedSkipReason::PlanCap);
             }
-            files.push(file.clone());
+            files.push(PlannedFile {
+                join: (file.path == unit.join.path).then(|| unit.join.clone()),
+                file: file.clone(),
+            });
             if files.len() > SEED_MAX_PLAN_FILES {
                 return Err(SeedSkipReason::PlanCap);
             }
@@ -639,7 +734,7 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
     }
     let logical_bytes = files
         .iter()
-        .try_fold(0u64, |total, file| total.checked_add(file.size))
+        .try_fold(0u64, |total, planned| total.checked_add(planned.file.size))
         .ok_or(SeedSkipReason::PlanCap)?;
     if logical_bytes > SEED_MAX_PLAN_BYTES {
         return Err(SeedSkipReason::PlanCap);
@@ -688,12 +783,126 @@ fn validate_request(request: &SeedRequest) -> Result<(), LeaseError> {
             ));
         }
     }
-    if !request.donor_record_lock.is_absolute() {
+    if request.donor.record_id == 0 {
         return Err(LeaseError::InvalidInput(
-            "the donor record lock path must be absolute",
+            "the donor record id must be a positive integer",
         ));
     }
     Ok(())
+}
+
+/// The cooperative work bound: 5 s at most, however a caller asks for more.
+fn work_budget(ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        ms.unwrap_or(SEED_WORK_BUDGET_MS)
+            .clamp(1, SEED_WORK_BUDGET_MS),
+    )
+}
+
+fn work_deadline_after_clone() -> LeaseError {
+    LeaseError::Io("cold-seed work deadline expired after the first clone".to_owned())
+}
+
+/// What the donor's front-door control record says about its custody.
+enum DonorControl {
+    Eligible,
+    /// A holder, a lease or a recorded `oxide clean` of the donor's checkout.
+    Busy,
+    /// Missing, unreadable, of an unknown version, absent of this record, or
+    /// carrying a pending recovery, retirement or lost marker.
+    Unknown,
+}
+
+/// The bounded part of the front door's control state this predicate needs.
+/// It is deliberately tolerant: this is a read-only custody check, not a
+/// parser for the state format, and anything it cannot classify is unknown.
+#[derive(Deserialize)]
+struct ControlState {
+    version: u32,
+    #[serde(default)]
+    records: Vec<ControlRecord>,
+    #[serde(default)]
+    cleans: Vec<ControlClean>,
+}
+
+#[derive(Deserialize)]
+struct ControlRecord {
+    id: u64,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    checkout: Option<PathBuf>,
+    #[serde(default)]
+    holder: Option<serde_json::Value>,
+    #[serde(default)]
+    lease_id: Option<String>,
+    #[serde(default)]
+    pending_recovery: Option<serde_json::Value>,
+    #[serde(default)]
+    retired: Option<String>,
+    #[serde(default)]
+    lost: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ControlClean {
+    #[serde(default)]
+    checkout: Option<PathBuf>,
+}
+
+/// Read the donor's own control record: exactly idle, no holder, no lease, no
+/// pending recovery or retirement, and no recorded clean of its checkout.
+fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
+    let path = pool_root.join(MANAGED_NAME).join("state.json");
+    let Some(bytes) = read_private_bounded(&path, CONTROL_STATE_MAX_BYTES) else {
+        return DonorControl::Unknown;
+    };
+    let Ok(state) = serde_json::from_slice::<ControlState>(&bytes) else {
+        return DonorControl::Unknown;
+    };
+    if state.version != CONTROL_STATE_VERSION {
+        return DonorControl::Unknown;
+    }
+    let Some(record) = state.records.iter().find(|record| record.id == record_id) else {
+        return DonorControl::Unknown;
+    };
+    if record.pending_recovery.is_some() || record.retired.is_some() || record.lost.is_some() {
+        return DonorControl::Unknown;
+    }
+    if record.phase != "idle" || record.holder.is_some() || record.lease_id.is_some() {
+        return DonorControl::Busy;
+    }
+    if let Some(checkout) = &record.checkout {
+        if state
+            .cleans
+            .iter()
+            .any(|clean| clean.checkout.as_deref() == Some(checkout.as_path()))
+        {
+            return DonorControl::Busy;
+        }
+    }
+    DonorControl::Eligible
+}
+
+/// Read one owner-only sidecar under its byte ceiling, or `None` when it is
+/// missing, symlinked, foreign-owned, not private or oversized.
+fn read_private_bounded(path: &Path, max: u64) -> Option<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > max
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max).then_some(bytes)
 }
 
 fn validate_slot_id(text: &str) -> Result<(), LeaseError> {
@@ -1119,18 +1328,65 @@ fn fstat(fd: BorrowedFd<'_>) -> std::io::Result<libc::stat> {
     Ok(stat)
 }
 
-fn hash_fd(fd: BorrowedFd<'_>) -> Result<String, LeaseError> {
-    let mut file = File::from(fd.try_clone_to_owned().map_err(io_error)?);
+/// A streamed read's failure. `Deadline` is the cooperative work bound, `Io`
+/// a real read error and `TooLarge` a bounded read past its ceiling.
+enum StreamError {
+    Io(LeaseError),
+    Deadline,
+    TooLarge,
+}
+
+/// Hash one file, checking the cooperative deadline between read calls.
+fn hash_fd(fd: BorrowedFd<'_>, deadline: Instant) -> Result<String, StreamError> {
+    let mut file = File::from(
+        fd.try_clone_to_owned()
+            .map_err(io_error)
+            .map_err(StreamError::Io)?,
+    );
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(io_error)?;
+        if Instant::now() > deadline {
+            return Err(StreamError::Deadline);
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(io_error)
+            .map_err(StreamError::Io)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
     Ok(catalog::hex(&hasher.finalize()))
+}
+
+/// Read a bounded file, checking the cooperative deadline between read calls.
+fn read_bounded(fd: BorrowedFd<'_>, max: usize, deadline: Instant) -> Result<Vec<u8>, StreamError> {
+    let mut file = File::from(
+        fd.try_clone_to_owned()
+            .map_err(io_error)
+            .map_err(StreamError::Io)?,
+    );
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        if Instant::now() > deadline {
+            return Err(StreamError::Deadline);
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(io_error)
+            .map_err(StreamError::Io)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() > max {
+            return Err(StreamError::TooLarge);
+        }
+    }
+    Ok(bytes)
 }
 
 /// `clonefile` only: there is no byte-copy, hard-link or shell fallback. A
@@ -1191,6 +1447,8 @@ enum TestPoint<'a> {
     },
     /// After one clone was created, before it is verified.
     AfterClone { index: usize, path: &'a Path },
+    /// After one clone was verified, before the next step.
+    DuringClone { index: usize },
     /// After every clone, before the recipient walk.
     BeforeWalk { slot: &'a Path },
     /// After the walk, before the final ledger recheck.

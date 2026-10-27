@@ -1,25 +1,29 @@
 //! Tiny owned fixtures for the seed custody calls (`oxide#137` §15 slice 2).
 //!
-//! No Cargo, no image and no volume: a budget-only directory pool and
-//! hand-written catalogs stand in for the front door. Each test builds only
-//! its own unique directory below the recipe's test temp and removes it.
+//! No Cargo, no image and no volume: a budget-only directory pool, hand-written
+//! catalogs and a hand-written front-door control state stand in for the front
+//! door. Each test builds only its own unique directory below the recipe's test
+//! temp and removes it.
 
 use super::super::pool::{
-    create_injected, lease_injected, release_injected, tamper_idle_generations_injected,
+    create_injected, lease_injected, mark_evicting_for_test, release_injected, slot_state_injected,
+    tamper_idle_generations_injected,
 };
 use super::super::{LeaseError, LeaseGrant, LeaseRequest, Profile};
 use super::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FINGERPRINT: &str = "debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa";
 const DEP: &str = "debug/deps/cfg_if-aaaaaaaaaaaaaaaa.d";
 const ARTIFACT: &str = "debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta";
+const SOURCE_A: &str = "/fixture/src/lib.rs";
+const SOURCE_B: &str = "/fixture/src/other.rs";
 
 thread_local! {
     static WALK_LIMITS: Cell<Option<SeedWalkLimits>> = const { Cell::new(None) };
@@ -27,8 +31,10 @@ thread_local! {
     static TAMPER_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
     static BREAK_DONOR: Cell<Option<usize>> = const { Cell::new(None) };
     static PLANT_SYMLINK: Cell<bool> = const { Cell::new(false) };
+    static REMOVE_SLOT: Cell<bool> = const { Cell::new(false) };
     static TAMPER_LEDGER: Cell<bool> = const { Cell::new(false) };
     static VERIFY_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
+    static CLONE_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 pub(super) fn walk_limits_override() -> Option<SeedWalkLimits> {
@@ -45,16 +51,16 @@ fn reset_hooks() {
     TAMPER_CLONE.with(|cell| cell.set(None));
     BREAK_DONOR.with(|cell| cell.set(None));
     PLANT_SYMLINK.with(|cell| cell.set(false));
+    REMOVE_SLOT.with(|cell| cell.set(false));
     TAMPER_LEDGER.with(|cell| cell.set(false));
     VERIFY_DELAY_MS.with(|cell| cell.set(None));
+    CLONE_DELAY_MS.with(|cell| cell.set(None));
 }
 
 pub(super) fn inject(point: TestPoint<'_>) {
     match point {
         TestPoint::BeforeVerify { .. } => {
-            if let Some(ms) = VERIFY_DELAY_MS.with(Cell::get) {
-                std::thread::sleep(Duration::from_millis(ms));
-            }
+            sleep_opt(VERIFY_DELAY_MS.with(Cell::get));
         }
         TestPoint::BeforeClone {
             index,
@@ -73,12 +79,18 @@ pub(super) fn inject(point: TestPoint<'_>) {
                     .append(true)
                     .open(path)
                     .expect("open tampered clone");
+                use std::io::Write as _;
                 file.write_all(b"tampered").expect("tamper clone");
             }
         }
+        TestPoint::DuringClone { index: 0 } => sleep_opt(CLONE_DELAY_MS.with(Cell::get)),
+        TestPoint::DuringClone { .. } => {}
         TestPoint::BeforeWalk { slot } => {
             if PLANT_SYMLINK.with(Cell::get) {
                 symlink("missing-target", slot.join("foreign-link")).expect("plant symlink");
+            }
+            if REMOVE_SLOT.with(Cell::get) {
+                fs::remove_dir_all(slot).expect("remove recipient slot");
             }
         }
         TestPoint::BeforeFinalDonorCheck { pool } => {
@@ -86,6 +98,12 @@ pub(super) fn inject(point: TestPoint<'_>) {
                 tamper_idle_generations_injected(pool).expect("tamper ledger");
             }
         }
+    }
+}
+
+fn sleep_opt(ms: Option<u64>) {
+    if let Some(ms) = ms {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -127,9 +145,69 @@ impl Drop for Fixture {
     }
 }
 
+/// One record of the front door's control state, as the donor predicate sees
+/// it. Only the fields this layer reads are written.
+struct StateRecord {
+    id: u64,
+    phase: &'static str,
+    checkout: Option<PathBuf>,
+    held: bool,
+    pending_recovery: bool,
+    retired: bool,
+    lost: bool,
+}
+
+impl StateRecord {
+    fn idle(id: u64) -> Self {
+        Self {
+            id,
+            phase: "idle",
+            checkout: Some(PathBuf::from("/fixture/checkout")),
+            held: false,
+            pending_recovery: false,
+            retired: false,
+            lost: false,
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "id": self.id,
+            "phase": self.phase,
+            "checkout": self.checkout,
+        });
+        if self.held {
+            value["holder"] = serde_json::json!({
+                "pid": 1,
+                "started_ms": 0,
+                "lease_holder": "fixture",
+            });
+            value["lease_id"] = serde_json::json!("fixture-lease");
+        }
+        if self.pending_recovery {
+            value["pending_recovery"] = serde_json::json!({
+                "slot_id": self.id.to_string(),
+                "lease_id": "fixture-lease",
+            });
+        }
+        if self.retired {
+            value["retired"] = serde_json::json!("flush failed");
+        }
+        if self.lost {
+            value["lost"] = serde_json::json!({
+                "slot_id": self.id.to_string(),
+                "at_ms": 0,
+            });
+        }
+        value
+    }
+}
+
 struct Rig {
     fx: Fixture,
     pool: PathBuf,
+    records: RefCell<Vec<StateRecord>>,
+    cleans: RefCell<Vec<PathBuf>>,
 }
 
 impl Rig {
@@ -137,7 +215,16 @@ impl Rig {
         let fx = Fixture::new(label);
         let pool = fx.dir("pool");
         create_injected(&pool, 4 * 1024 * 1024).expect("init pool");
-        Self { fx, pool }
+        Self {
+            fx,
+            pool,
+            records: RefCell::new(Vec::new()),
+            cleans: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn control(&self) -> PathBuf {
+        self.pool.join(MANAGED_NAME)
     }
 
     fn lease(&self, label: &str, holder: &str) -> LeaseGrant {
@@ -157,13 +244,71 @@ impl Rig {
         .expect("lease")
     }
 
-    fn record_lock(&self, slot_id: &str) -> PathBuf {
-        let locks = self.fx.path.join("locks");
-        if !locks.exists() {
-            fs::create_dir(&locks).expect("locks dir");
-            fs::set_permissions(&locks, fs::Permissions::from_mode(0o700)).expect("locks mode");
+    fn add_record(&self, record: StateRecord) {
+        {
+            let mut records = self.records.borrow_mut();
+            records.retain(|existing| existing.id != record.id);
+            records.push(record);
         }
-        let path = locks.join(format!("{slot_id}.lock"));
+        self.save_control();
+    }
+
+    fn add_clean(&self, checkout: &str) {
+        self.cleans.borrow_mut().push(PathBuf::from(checkout));
+        self.save_control();
+    }
+
+    fn state_version(&self, version: u32) {
+        self.save_control_version(version);
+    }
+
+    fn save_control(&self) {
+        let current = {
+            let path = self.control().join("state.json");
+            let bytes = fs::read(&path).ok();
+            bytes
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| value["version"].as_u64())
+                .and_then(|version| u32::try_from(version).ok())
+                .unwrap_or(5)
+        };
+        self.save_control_version(current);
+    }
+
+    fn save_control_version(&self, version: u32) {
+        let control = self.control();
+        fs::create_dir_all(control.join("locks")).expect("control dirs");
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("control mode");
+        fs::set_permissions(control.join("locks"), fs::Permissions::from_mode(0o700))
+            .expect("locks mode");
+        let records: Vec<serde_json::Value> = self
+            .records
+            .borrow()
+            .iter()
+            .map(StateRecord::json)
+            .collect();
+        let cleans: Vec<serde_json::Value> = self
+            .cleans
+            .borrow()
+            .iter()
+            .map(|checkout| serde_json::json!({"id": 1, "checkout": checkout}))
+            .collect();
+        let state = serde_json::json!({
+            "version": version,
+            "records": records,
+            "cleans": cleans,
+        });
+        let path = control.join("state.json");
+        fs::write(&path, serde_json::to_vec(&state).expect("control json")).expect("control state");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("state mode");
+    }
+
+    /// The front-door record lock for exactly this record id.
+    fn donor_lock(&self, record_id: u64) -> PathBuf {
+        let locks = self.control().join("locks");
+        fs::create_dir_all(&locks).expect("locks dir");
+        fs::set_permissions(&locks, fs::Permissions::from_mode(0o700)).expect("locks mode");
+        let path = locks.join(format!("{record_id}.lock"));
         if !path.exists() {
             fs::write(&path, b"").expect("record lock");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("lock mode");
@@ -191,30 +336,27 @@ impl Rig {
 
 struct Donor {
     grant: LeaseGrant,
+    record_id: u64,
     catalog: SeedCatalog,
     digest: String,
     files: Vec<(String, String)>,
 }
 
 impl Donor {
-    fn lock_path(&self, rig: &Rig) -> PathBuf {
-        rig.record_lock(&self.grant.slot_id)
-    }
-
-    fn request(&self, rig: &Rig, recipient: &SeedRecipient) -> SeedRequest {
+    fn request(&self, recipient: &SeedRecipient) -> SeedRequest {
         SeedRequest {
             recipient: recipient.clone(),
             donor: SeedDonor {
                 slot_id: self.grant.slot_id.clone(),
                 incarnation: self.grant.incarnation.clone(),
                 lease_id: self.grant.lease_id.clone(),
+                record_id: self.record_id,
                 catalog_digest: self.digest.clone(),
             },
             units: vec![SeedUnitRef {
                 fingerprint_dir: FINGERPRINT.to_owned(),
                 role: SeedRole::Lib,
             }],
-            donor_record_lock: self.lock_path(rig),
             work_budget_ms: None,
         }
     }
@@ -222,6 +364,18 @@ impl Donor {
 
 fn sha(text: &str) -> String {
     catalog_digest(text.as_bytes())
+}
+
+fn dep_info_text() -> String {
+    format!("{DEP}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n")
+}
+
+fn dep_targets() -> Vec<String> {
+    vec![DEP.to_owned(), SOURCE_A.to_owned(), SOURCE_B.to_owned()]
+}
+
+fn dep_inputs() -> Vec<String> {
+    vec![SOURCE_A.to_owned(), SOURCE_B.to_owned()]
 }
 
 fn default_files() -> Vec<(String, String)> {
@@ -233,10 +387,7 @@ fn default_files() -> Vec<(String, String)> {
         (format!("{FINGERPRINT}/lib-cfg_if.json"), "{}".to_owned()),
         (format!("{FINGERPRINT}/dep-lib-cfg_if"), String::new()),
         (ARTIFACT.to_owned(), "rmeta-fixture".to_owned()),
-        (
-            DEP.to_owned(),
-            format!("{DEP}: /fixture/src/lib.rs\n/fixture/src/lib.rs:\n"),
-        ),
+        (DEP.to_owned(), dep_info_text()),
     ]
 }
 
@@ -266,7 +417,7 @@ fn producer() -> SeedProducer {
     }
 }
 
-fn catalog_for(grant: &LeaseGrant, files: &[(String, String)]) -> SeedCatalog {
+fn catalog_for(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -> SeedCatalog {
     let entries: Vec<SeedFile> = files
         .iter()
         .map(|(path, content)| SeedFile {
@@ -276,17 +427,13 @@ fn catalog_for(grant: &LeaseGrant, files: &[(String, String)]) -> SeedCatalog {
             digest: sha(content),
         })
         .collect();
-    let dep = files
-        .iter()
-        .find(|(path, _)| path == DEP)
-        .expect("dep-info fixture");
     SeedCatalog {
         schema: SEED_CATALOG_SCHEMA.to_owned(),
         store_id: grant.store_id.clone(),
         slot_id: grant.slot_id.clone(),
         incarnation: grant.incarnation.clone(),
         lease_id: grant.lease_id.clone(),
-        record_id: 1,
+        record_id,
         mark: 1,
         started_at_ms: 1,
         finished_at_ms: 2,
@@ -310,9 +457,9 @@ fn catalog_for(grant: &LeaseGrant, files: &[(String, String)]) -> SeedCatalog {
                 target: "cfg_if".to_owned(),
                 join: SeedJoin {
                     path: DEP.to_owned(),
-                    targets: vec![DEP.to_owned()],
-                    inputs: vec!["/fixture/src/lib.rs".to_owned()],
-                    digest: sha(&dep.1),
+                    targets: dep_targets(),
+                    inputs: dep_inputs(),
+                    digest: sha(&dep_info_text()),
                 },
                 files: entries,
             }],
@@ -321,18 +468,23 @@ fn catalog_for(grant: &LeaseGrant, files: &[(String, String)]) -> SeedCatalog {
     }
 }
 
-/// One released donor slot with a published catalog.
+/// One released donor slot with a published catalog, its own record lock and
+/// an idle control record.
 fn make_donor(rig: &Rig, label: &str) -> Donor {
     let grant = rig.lease(&format!("donor-{label}"), "donor");
     let files = default_files();
     write_files(&grant.env.cargo_build_build_dir, &files);
-    let catalog = catalog_for(&grant, &files);
+    let record_id = grant.slot_id.parse::<u64>().expect("record id");
+    let catalog = catalog_for(&grant, record_id, &files);
     publish_seed_catalog(&rig.pool, &catalog).expect("publish catalog");
     let bytes = catalog.to_bytes().expect("catalog bytes");
     let digest = catalog_digest(&bytes);
     release_injected(&rig.pool, &grant.lease_id).expect("release donor");
+    rig.donor_lock(record_id);
+    rig.add_record(StateRecord::idle(record_id));
     Donor {
         grant,
+        record_id,
         catalog,
         digest,
         files,
@@ -340,7 +492,9 @@ fn make_donor(rig: &Rig, label: &str) -> Donor {
 }
 
 fn lease_recipient(rig: &Rig, label: &str) -> (LeaseGrant, SeedRecipient) {
-    let grant = rig.lease(&format!("recipient-{label}"), "recipient");
+    // One holder holds one lease at a time, so each recipient fixture has its
+    // own holder identity.
+    let grant = rig.lease(&format!("recipient-{label}"), &format!("recipient-{label}"));
     let recipient = SeedRecipient {
         slot_id: grant.slot_id.clone(),
         incarnation: grant.incarnation.clone(),
@@ -387,18 +541,34 @@ fn collect(root: &Path, dir: &Path, found: &mut Vec<(String, u64, Vec<u8>)>) {
     }
 }
 
+/// Rewrite a published catalog sidecar with `mutate` applied, returning the new
+/// catalog bytes' digest for a request.
+fn rewrite_catalog(rig: &Rig, donor: &Donor, mutate: impl FnOnce(&mut SeedCatalog)) -> String {
+    let mut catalog = donor.catalog.clone();
+    mutate(&mut catalog);
+    let bytes = catalog.to_bytes().expect("catalog bytes");
+    let path = rig
+        .pool
+        .join(MANAGED_NAME)
+        .join("seeds")
+        .join(format!("{}.catalog.json", donor.grant.slot_id));
+    fs::write(&path, &bytes).expect("rewrite catalog");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("catalog mode");
+    catalog_digest(&bytes)
+}
+
 #[test]
 fn candidates_require_the_held_recipient_and_offer_catalogs_by_rank() {
     reset_hooks();
     let rig = Rig::new("candidates");
-    let _donor = make_donor(&rig, "a");
+    let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
     let found = candidates(&rig, &recipient);
     assert_eq!(found.candidates.len(), 1);
     let candidate = &found.candidates[0];
-    assert_eq!(candidate.slot_id, _donor.grant.slot_id);
-    assert_eq!(candidate.catalog_digest, _donor.digest);
-    assert_eq!(candidate.catalog, _donor.catalog);
+    assert_eq!(candidate.slot_id, donor.grant.slot_id);
+    assert_eq!(candidate.catalog_digest, donor.digest);
+    assert_eq!(candidate.catalog, donor.catalog);
     assert!(candidate.rank > 0);
 
     // A released recipient generation is not the lease call 1 was told about.
@@ -439,7 +609,7 @@ fn seed_clones_catalogued_units_and_records_a_complete_observation() {
     let before_donor = tree(&donor.grant.env.cargo_build_build_dir);
     let before_sidecars = rig.sidecars();
     let before_ledger = rig.ledger_bytes();
-    let outcome = seed(&rig.pool, &donor.request(&rig, &recipient)).expect("seed");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     let SeedOutcome::Seeded(receipt) = outcome else {
         panic!("expected a published seed, got {outcome:?}");
     };
@@ -486,19 +656,16 @@ fn seed_skips_a_changed_catalog_without_touching_the_recipient() {
     let rig = Rig::new("catalog-changed");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let request = donor.request(&rig, &recipient);
-    let _ = request;
-    // Rewrite the sidecar with a different (still valid) catalog.
-    let mut changed = donor.catalog.clone();
-    changed.mark = 2;
     let path = rig
         .pool
         .join(MANAGED_NAME)
         .join("seeds")
         .join(format!("{}.catalog.json", donor.grant.slot_id));
+    let mut changed = donor.catalog.clone();
+    changed.mark = 2;
     fs::write(&path, changed.to_bytes().expect("changed bytes")).expect("rewrite catalog");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("catalog mode");
-    let outcome = seed(&rig.pool, &donor.request(&rig, &recipient)).expect("seed");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     assert_eq!(
         outcome,
         SeedOutcome::Skipped(SeedSkip {
@@ -514,7 +681,7 @@ fn seed_skips_a_donor_that_left_idle_before_the_first_clone() {
     let rig = Rig::new("donor-busy");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let request = donor.request(&rig, &recipient);
+    let request = donor.request(&recipient);
     // Take the donor slot again: its ledger state is no longer `Idle`.
     let busy = rig.lease("donor-a", "donor");
     assert_eq!(busy.slot_id, donor.grant.slot_id);
@@ -534,7 +701,7 @@ fn seed_skips_a_changed_donor_file_without_touching_the_recipient() {
     let rig = Rig::new("file-changed");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let request = donor.request(&rig, &recipient);
+    let request = donor.request(&recipient);
     // Same size, same mtime is not required: the digest is authoritative.
     let artifact = donor.grant.env.cargo_build_build_dir.join(ARTIFACT);
     fs::write(&artifact, b"rmeta-FIXTURE").expect("rewrite donor file");
@@ -549,29 +716,69 @@ fn seed_skips_a_changed_donor_file_without_touching_the_recipient() {
 }
 
 #[test]
+fn seed_skips_a_join_that_disagrees_with_the_donated_dot_d() {
+    reset_hooks();
+    let rig = Rig::new("join-inconsistent");
+    // A recorded target the `.d` does not contain: the digest still matches
+    // the file, so only a re-parse can catch it.
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let digest = rewrite_catalog(&rig, &donor, |catalog| {
+        catalog.packages[0].units[0].join.targets =
+            vec![DEP.to_owned(), "/fixture/src/other-unlisted.rs".to_owned()];
+    });
+    let mut request = donor.request(&recipient);
+    request.donor.catalog_digest = digest;
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::JoinInconsistent
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+
+    // A recorded input the `.d` does not have is refused the same way.
+    let donor = make_donor(&rig, "b");
+    let (_, recipient) = lease_recipient(&rig, "b");
+    let digest = rewrite_catalog(&rig, &donor, |catalog| {
+        catalog.packages[0].units[0].join.inputs = vec![SOURCE_A.to_owned()];
+    });
+    let mut request = donor.request(&recipient);
+    request.donor.catalog_digest = digest;
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::JoinInconsistent
+        })
+    );
+}
+
+#[test]
 fn seed_skips_a_missing_or_held_donor_record_lock() {
     reset_hooks();
     let rig = Rig::new("donor-lock");
     let donor = make_donor(&rig, "a");
     let (_, recipient) = lease_recipient(&rig, "a");
-    let mut request = donor.request(&rig, &recipient);
-    request.donor_record_lock = rig.fx.path.join("locks").join("missing.lock");
-    let missing = seed(&rig.pool, &request).expect("seed");
+    // A missing lock for the record the plan names is a skip, not a wait.
+    fs::remove_file(rig.donor_lock(donor.record_id)).expect("remove donor lock");
+    let missing = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     assert_eq!(
         missing,
         SeedOutcome::Skipped(SeedSkip {
             reason: SeedSkipReason::DonorLockMissing
         })
     );
-    // A peer's record lock means the donor is skipped, never waited for.
+    // A held record lock means the donor is skipped, never waited for.
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(donor.lock_path(&rig))
+        .open(rig.donor_lock(donor.record_id))
         .expect("open record lock");
     // SAFETY: the descriptor is live for the call.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-    let held = seed(&rig.pool, &donor.request(&rig, &recipient)).expect("seed");
+    let held = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     assert_eq!(
         held,
         SeedOutcome::Skipped(SeedSkip {
@@ -581,12 +788,142 @@ fn seed_skips_a_missing_or_held_donor_record_lock() {
 }
 
 #[test]
+fn seed_does_not_accept_a_lock_for_another_record() {
+    reset_hooks();
+    let rig = Rig::new("donor-lock-unrelated");
+    let donor = make_donor(&rig, "a");
+    let (_, recipient) = lease_recipient(&rig, "a");
+    // A second, unrelated record's lock is held and its control record is
+    // idle: neither stands in for the donor's own closure.
+    let other = donor.record_id + 1000;
+    rig.donor_lock(other);
+    rig.add_record(StateRecord::idle(other));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(rig.donor_lock(other))
+        .expect("open unrelated lock");
+    // SAFETY: the descriptor is live for the call.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert!(matches!(outcome, SeedOutcome::Seeded(_)));
+}
+
+#[test]
+fn seed_skips_a_donor_plan_whose_record_id_is_not_the_catalog_record() {
+    reset_hooks();
+    let rig = Rig::new("record-mismatch");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let other = donor.record_id + 1000;
+    rig.donor_lock(other);
+    rig.add_record(StateRecord::idle(other));
+    let mut request = donor.request(&recipient);
+    request.donor.record_id = other;
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::CatalogChanged
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
+fn seed_skips_a_donor_control_record_that_is_not_idle() {
+    reset_hooks();
+    let rig = Rig::new("control-busy");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let mut record = StateRecord::idle(donor.record_id);
+    record.phase = "running";
+    record.held = true;
+    rig.add_record(record);
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::DonorBusy
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
+fn seed_skips_a_donor_with_pending_recovery_retirement_or_loss() {
+    reset_hooks();
+    let rig = Rig::new("control-custody");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    for mutate in [
+        (|record: &mut StateRecord| record.pending_recovery = true) as fn(&mut StateRecord),
+        |record: &mut StateRecord| record.retired = true,
+        |record: &mut StateRecord| record.lost = true,
+    ] {
+        let mut record = StateRecord::idle(donor.record_id);
+        mutate(&mut record);
+        rig.add_record(record);
+        let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+        assert_eq!(
+            outcome,
+            SeedOutcome::Skipped(SeedSkip {
+                reason: SeedSkipReason::DonorCustodyUnknown
+            })
+        );
+    }
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
+fn seed_skips_a_donor_with_a_recorded_clean_of_its_checkout() {
+    reset_hooks();
+    let rig = Rig::new("control-clean");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    rig.add_clean("/fixture/checkout");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::DonorBusy
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
+fn seed_skips_an_unknown_or_missing_control_state() {
+    reset_hooks();
+    let rig = Rig::new("control-unknown");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    rig.state_version(4);
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::DonorCustodyUnknown
+        })
+    );
+    fs::remove_file(rig.control().join("state.json")).expect("remove state");
+    let missing = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        missing,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::DonorCustodyUnknown
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
 fn seed_skips_a_plan_naming_a_unit_the_catalog_lacks() {
     reset_hooks();
     let rig = Rig::new("unit-missing");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let mut request = donor.request(&rig, &recipient);
+    let mut request = donor.request(&recipient);
     request.units = vec![SeedUnitRef {
         fingerprint_dir: "debug/.fingerprint/cfg-if-bbbbbbbbbbbbbbbb".to_owned(),
         role: SeedRole::Lib,
@@ -608,7 +945,7 @@ fn plan_caps_before_the_first_clone() {
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
     // The unit cap: one selector more than the plan may hold.
-    let mut request = donor.request(&rig, &recipient);
+    let mut request = donor.request(&recipient);
     request.units = (0..=SEED_MAX_PLAN_UNITS)
         .map(|index| SeedUnitRef {
             fingerprint_dir: format!("debug/.fingerprint/cfg-if-{index:016x}"),
@@ -623,18 +960,43 @@ fn plan_caps_before_the_first_clone() {
         })
     );
     assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
-    // The file and byte caps are checked on catalog data alone.
+    // The byte cap is checked on catalog data alone.
     let mut oversized = donor.catalog.clone();
     oversized.packages[0].units[0].files[0].size = SEED_MAX_PLAN_BYTES + 1;
-    let mut request = donor.request(&rig, &recipient);
-    request.units = vec![SeedUnitRef {
-        fingerprint_dir: FINGERPRINT.to_owned(),
-        role: SeedRole::Lib,
-    }];
+    let request = donor.request(&recipient);
     assert!(matches!(
         plan_units(&oversized, &request.units),
         Err(SeedSkipReason::PlanCap)
     ));
+}
+
+#[test]
+fn the_work_budget_is_capped_at_five_seconds_and_checked_within_reads() {
+    reset_hooks();
+    assert_eq!(
+        work_budget(None),
+        Duration::from_millis(SEED_WORK_BUDGET_MS)
+    );
+    assert_eq!(
+        work_budget(Some(60_000)),
+        Duration::from_millis(SEED_WORK_BUDGET_MS)
+    );
+    assert_eq!(work_budget(Some(1)), Duration::from_millis(1));
+    assert_eq!(work_budget(Some(0)), Duration::from_millis(1));
+    // A streamed read past its deadline is a deadline, not a digest.
+    let rig = Rig::new("hash-deadline");
+    let (grant, _) = lease_recipient(&rig, "a");
+    let files = default_files();
+    write_files(&grant.env.cargo_build_build_dir, &files);
+    let path = grant.env.cargo_build_build_dir.join(ARTIFACT);
+    let file = std::fs::File::open(&path).expect("open fixture file");
+    let past = Instant::now() - Duration::from_millis(1);
+    assert!(matches!(
+        hash_fd(file.as_fd(), past),
+        Err(StreamError::Deadline)
+    ));
+    let future = Instant::now() + Duration::from_secs(60);
+    assert!(matches!(hash_fd(file.as_fd(), future), Ok(digest) if digest == sha("rmeta-fixture")));
 }
 
 #[test]
@@ -643,7 +1005,7 @@ fn seed_skips_on_the_work_deadline_before_the_first_write() {
     let rig = Rig::new("deadline");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let mut request = donor.request(&rig, &recipient);
+    let mut request = donor.request(&recipient);
     request.work_budget_ms = Some(1);
     VERIFY_DELAY_MS.with(|cell| cell.set(Some(25)));
     let outcome = seed(&rig.pool, &request).expect("seed");
@@ -657,6 +1019,27 @@ fn seed_skips_on_the_work_deadline_before_the_first_write() {
 }
 
 #[test]
+fn seed_refuses_after_the_clone_when_the_work_deadline_expires() {
+    reset_hooks();
+    let rig = Rig::new("deadline-clone");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let mut request = donor.request(&recipient);
+    // A generous-enough budget that the pre-clone revalidation cannot
+    // plausibly exhaust it, then a delay longer than it after the first clone.
+    request.work_budget_ms = Some(1_000);
+    CLONE_DELAY_MS.with(|cell| cell.set(Some(1_200)));
+    let refused = seed(&rig.pool, &request);
+    assert!(matches!(refused, Err(LeaseError::Io(_))));
+    // The clone is retained untrusted; nothing is published.
+    assert!(grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
+}
+
+#[test]
 fn seed_refuses_a_nonempty_recipient_build() {
     reset_hooks();
     let rig = Rig::new("nonempty-build");
@@ -665,7 +1048,7 @@ fn seed_refuses_a_nonempty_recipient_build() {
     let build = &grant.env.cargo_build_build_dir;
     fs::create_dir_all(build).expect("recipient build");
     fs::write(build.join("stray"), b"x").expect("stray entry");
-    let refused = seed(&rig.pool, &donor.request(&rig, &recipient));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
     assert!(matches!(refused, Err(LeaseError::UnsafePath(_))));
     assert!(build.join("stray").exists());
 }
@@ -679,7 +1062,7 @@ fn seed_refuses_a_clone_whose_bytes_do_not_match_and_retains_the_partial_slot() 
     let before_sidecars = rig.sidecars();
     let before_ledger = rig.ledger_bytes();
     TAMPER_CLONE.with(|cell| cell.set(Some(1)));
-    let refused = seed(&rig.pool, &donor.request(&rig, &recipient));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
     assert!(matches!(refused, Err(LeaseError::UnsafePath(_))));
     // Everything already cloned is retained: nothing is deleted or repaired,
     // and nothing is published.
@@ -700,10 +1083,10 @@ fn seed_refuses_a_failed_clone_and_never_copies_bytes() {
     let rig = Rig::new("clone-failed");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    // The donor file disappears after it was verified and before its clone, so
-    // the clone alone fails. There is no byte-copy fallback.
+    // A pre-existing entry makes `clonefile` fail. There is no byte-copy
+    // fallback, so the planted entry is still a directory, not a file.
     BREAK_DONOR.with(|cell| cell.set(Some(0)));
-    let refused = seed(&rig.pool, &donor.request(&rig, &recipient));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
     assert!(matches!(refused, Err(LeaseError::Io(_))));
     let destination = grant.env.cargo_build_build_dir.join(&donor.files[0].0);
     assert!(fs::symlink_metadata(&destination)
@@ -720,7 +1103,7 @@ fn seed_abandons_on_a_failed_recipient_walk_and_publishes_nothing() {
     let (grant, recipient) = lease_recipient(&rig, "a");
     let before_sidecars = rig.sidecars();
     PLANT_SYMLINK.with(|cell| cell.set(true));
-    let outcome = seed(&rig.pool, &donor.request(&rig, &recipient)).expect("seed");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
@@ -749,12 +1132,29 @@ fn seed_abandons_on_an_entry_limit_walk() {
             max_elapsed_ms: SEED_WALK_MAX_ELAPSED_MS,
         }))
     });
-    let outcome = seed(&rig.pool, &donor.request(&rig, &recipient)).expect("seed");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
     assert_eq!(abandon.observation.gap, Some(SeedWalkGap::EntryLimit));
     assert_eq!(abandon.observation.limits.max_entries, 1);
+}
+
+#[test]
+fn seed_abandons_when_the_recipient_root_is_gone_before_the_walk() {
+    reset_hooks();
+    let rig = Rig::new("walk-root-gone");
+    let donor = make_donor(&rig, "a");
+    let (_, recipient) = lease_recipient(&rig, "a");
+    // The walk root itself disappears after the clone: a root that cannot be
+    // opened is a gap, never a refusal and never clean coverage.
+    REMOVE_SLOT.with(|cell| cell.set(true));
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    let SeedOutcome::Abandoned(abandon) = outcome else {
+        panic!("expected an abandoned seed, got {outcome:?}");
+    };
+    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::Unreadable));
+    assert_eq!(abandon.observation.entries, 0);
 }
 
 #[test]
@@ -764,7 +1164,7 @@ fn seed_refuses_a_donor_generation_that_changed_after_the_clone() {
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
     TAMPER_LEDGER.with(|cell| cell.set(true));
-    let refused = seed(&rig.pool, &donor.request(&rig, &recipient));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
     assert!(matches!(refused, Err(LeaseError::UnknownAccounting)));
     // The clone is retained untrusted, and the slot is still held.
     assert!(grant
@@ -772,6 +1172,46 @@ fn seed_refuses_a_donor_generation_that_changed_after_the_clone() {
         .cargo_build_build_dir
         .join(&donor.files[0].0)
         .exists());
+}
+
+#[test]
+fn seeding_never_reconciles_a_recorded_deletion() {
+    reset_hooks();
+    let rig = Rig::new("no-reconcile");
+    // A donor with a published catalog, a second producing lease whose catalog
+    // is published later, a recipient lease, and one unrelated idle slot.
+    let donor = make_donor(&rig, "a");
+    let (recipient_grant, recipient) = lease_recipient(&rig, "a");
+    let second = rig.lease("donor-b", "donor");
+    let second_files = default_files();
+    write_files(&second.env.cargo_build_build_dir, &second_files);
+    let second_record = second.slot_id.parse::<u64>().expect("record id");
+    let second_catalog = catalog_for(&second, second_record, &second_files);
+    let third = rig.lease("third", "third");
+    release_injected(&rig.pool, &third.lease_id).expect("release third");
+    let third_payload = third
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .expect("slot dir")
+        .to_path_buf();
+    let third_id: u64 = third.slot_id.parse().expect("slot id");
+    mark_evicting_for_test(&rig.pool, third_id).expect("mark evicting");
+    let before_ledger = rig.ledger_bytes();
+    assert!(third_payload.exists());
+
+    // Neither a catalog write nor a seed may touch the queued deletion, the
+    // ledger or the unrelated slot's payload.
+    publish_seed_catalog(&rig.pool, &second_catalog).expect("publish second catalog");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert!(matches!(outcome, SeedOutcome::Seeded(_)));
+    assert_eq!(
+        slot_state_injected(&rig.pool, &third.slot_id).as_deref(),
+        Some("evicting")
+    );
+    assert!(third_payload.exists());
+    assert_eq!(rig.ledger_bytes(), before_ledger);
+    let _ = (&recipient_grant, second_record);
 }
 
 #[test]
@@ -804,7 +1244,6 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
         fs::Permissions::from_mode(0o600),
     )
     .expect("orphan mode");
-    let (_, recipient) = lease_recipient(&rig, "a");
     let third = make_donor(&rig, "c");
     assert!(!seeds.join("999.catalog.json").exists());
     assert!(seeds
@@ -824,22 +1263,62 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
     assert!(!seeds
         .join(format!("{}.catalog.json", third.grant.slot_id))
         .exists());
-    // A ceiling the new catalog cannot meet refuses the write, and the pool's
-    // seed sidecars stay as they were.
+    // A ceiling the new catalog cannot meet refuses the write, and no catalog
+    // is destroyed by the refusal.
     FAMILY_CAP.with(|cell| cell.set(Some(1)));
     let fifth = rig.lease("donor-e", "donor");
     let files = default_files();
     write_files(&fifth.env.cargo_build_build_dir, &files);
-    let refused = publish_seed_catalog(&rig.pool, &catalog_for(&fifth, &files));
+    let fifth_record = fifth.slot_id.parse::<u64>().expect("record id");
+    let refused = publish_seed_catalog(&rig.pool, &catalog_for(&fifth, fifth_record, &files));
     assert!(matches!(refused, Err(LeaseError::LedgerExhausted)));
     assert!(!seeds
         .join(format!("{}.catalog.json", fifth.slot_id))
         .exists());
-    release_injected(&rig.pool, &fifth.lease_id).expect("release fifth");
     assert!(seeds
         .join(format!("{}.catalog.json", fourth.grant.slot_id))
         .exists());
-    let _ = (&first, &second, &recipient);
+    release_injected(&rig.pool, &fifth.lease_id).expect("release fifth");
+    let _ = (&first, &second);
+}
+
+#[test]
+fn join_parser_accepts_rustc_shapes_and_refuses_others() {
+    reset_hooks();
+    let parsed = join::parse(dep_info_text().as_bytes()).expect("parse the fixture");
+    assert!(parsed.matches(&dep_targets(), &dep_inputs()));
+    assert!(!parsed.matches(&dep_targets(), &[SOURCE_A.to_owned()]));
+    assert_eq!(parsed.rules, 3);
+
+    // Escaped space, escaped colon, literal `$` and a continued line.
+    let text = "out/one\\ two: /src/a\\ b.rs /src/c.rs \\\n /src/d.rs\n/srv/\\$x: /src/e.rs\n";
+    let parsed = join::parse(text.as_bytes()).expect("escapes");
+    assert!(parsed.targets.contains(&"out/one two".to_owned()));
+    assert!(parsed.targets.contains(&"/srv/$x".to_owned()));
+    assert!(parsed.inputs.contains(&"/src/a b.rs".to_owned()));
+    assert!(parsed.inputs.contains(&"/src/d.rs".to_owned()));
+
+    assert_eq!(join::parse(b"no rule here\n"), Err(JoinRefusal::Malformed));
+    assert_eq!(join::parse(b"out: in\n: in\n"), Err(JoinRefusal::Malformed));
+    assert_eq!(join::parse(b"out: $x\n"), Err(JoinRefusal::Malformed));
+    assert_eq!(
+        join::parse(b"out: /src/a.rs\nbad rule\n"),
+        Err(JoinRefusal::Malformed)
+    );
+    assert_eq!(join::parse(&[0xff]), Err(JoinRefusal::NotUtf8));
+    assert!(matches!(
+        join::parse(&vec![b' '; join::MAX_JOIN_BYTES + 1]),
+        Err(JoinRefusal::TooLarge)
+    ));
+
+    // Rule and input counts are bounded.
+    let many_rules = "out: in\n".repeat(join::MAX_JOIN_TARGETS + 1);
+    assert_eq!(join::parse(many_rules.as_bytes()), Err(JoinRefusal::Budget));
+    let many_inputs = format!("out: {}\n", "a ".repeat(join::MAX_JOIN_INPUTS + 1));
+    assert_eq!(
+        join::parse(many_inputs.as_bytes()),
+        Err(JoinRefusal::Budget)
+    );
 }
 
 #[test]
@@ -849,7 +1328,8 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     let (grant, _) = lease_recipient(&rig, "a");
     let files = default_files();
     write_files(&grant.env.cargo_build_build_dir, &files);
-    let catalog = catalog_for(&grant, &files);
+    let record_id = grant.slot_id.parse::<u64>().expect("record id");
+    let catalog = catalog_for(&grant, record_id, &files);
     let bytes = catalog.to_bytes().expect("valid catalog bytes");
     assert!(SeedCatalog::parse(&bytes).is_ok());
 
@@ -875,13 +1355,16 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     let mut duplicate = catalog.clone();
     let mut second = catalog.packages[0].clone();
     second.name = "cfg_if".to_owned();
-    second.target = "cfg_if".to_owned();
     duplicate.packages.push(second);
     assert!(duplicate.validate().is_err());
     let mut wrong_profile = catalog.clone();
     wrong_profile.packages[0].units[0].files[0].path =
         "release/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa/lib-cfg_if".to_owned();
     assert!(wrong_profile.validate().is_err());
+    // The join's own digest is its `.d` file record's digest.
+    let mut join_digest = catalog.clone();
+    join_digest.packages[0].units[0].join.digest = "f".repeat(64);
+    assert!(join_digest.validate().is_err());
     // The catalog's own byte ceiling is enforced before parsing.
     assert!(SeedCatalog::parse(&vec![b' '; SEED_CATALOG_MAX_BYTES + 1]).is_err());
 }
