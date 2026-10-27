@@ -31,7 +31,6 @@ use crate::removable;
 use crate::wrapper;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The one production opt-in (design §3.5): exactly `1`.
 pub(crate) const OPT_IN: &str = "OXIDE_ONE_USE_WORKSPACE";
@@ -98,20 +97,26 @@ pub(crate) const PLAN_LOCAL: &str =
 pub(crate) const STATUS_LOCAL: &str =
     "outputs: this checkout is a one-use (temporary) workspace; final outputs are local and no owned output root is selected";
 
-/// The activation switch. `false` in every production binary: see the module
-/// documentation's dormancy note.
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Whether the one-use feature is active in this process. `false` everywhere
-/// except a unit test that called [`with_active`].
-pub(crate) fn is_active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
+// The activation switch. `false` in every production binary: see the module
+// documentation's dormancy note. It is **thread-local** on purpose: a test that
+// activates the feature must not change what a parallel test observes, because
+// the dormancy comparison depends on the dormant path being genuinely dormant.
+// Every guarded decision a command takes happens on the command's own thread, so
+// a thread-local switch is the honest scope for a test-only activation.
+thread_local! {
+    static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test-only: how many workspaces **this thread** has classified. A dormant
-/// command must classify nothing, which makes the dormancy claim observable at
-/// the command path instead of merely asserted. Thread-local so parallel tests
-/// cannot pollute one another's count.
+/// Whether the one-use feature is active on this thread. `false` everywhere
+/// except a unit test that called [`with_active`].
+pub(crate) fn is_active() -> bool {
+    ACTIVE.with(std::cell::Cell::get)
+}
+
+// Test-only: how many workspaces **this thread** has classified. A dormant
+// command must classify nothing, which makes the dormancy claim observable at
+// the command path instead of merely asserted. Thread-local so parallel tests
+// cannot pollute one another's count.
 #[cfg(test)]
 thread_local! {
     static CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -129,22 +134,33 @@ pub(crate) fn classifications() -> usize {
     CLASSIFICATIONS.with(std::cell::Cell::get)
 }
 
-/// Run `body` with the one-use feature active (tests only), restoring the
-/// previous value afterwards. The switch is process-local rather than
-/// thread-local because the guard, the classification and a test's assertions
-/// must observe the same value; the unit suite is the only caller and it
-/// serialises on the same value.
+/// Run `body` with the one-use feature active **on this thread** (tests only).
+///
+/// The previous value is restored by a guard, so a panicking body cannot leak
+/// an active switch into the rest of the test process; and because the switch
+/// is thread-local, a parallel dormant test never observes it. The counter in
+/// [`CLASSIFICATIONS`] uses the same scope for the same reason.
 #[cfg(test)]
 pub(crate) fn with_active<T>(body: impl FnOnce() -> T) -> T {
-    let previous = ACTIVE.swap(true, Ordering::Relaxed);
-    let result = body();
-    ACTIVE.store(previous, Ordering::Relaxed);
-    result
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.set(self.0));
+        }
+    }
+    let previous = ACTIVE.with(|active| active.replace(true));
+    let _restore = Restore(previous);
+    body()
 }
 
-/// The registered pool facts the unsafe-broad test needs (design §3.3 item
-/// 4). Unknown facts never justify guessing a safe root: an unreadable
-/// registration drops every candidate root.
+/// The registered **payload** roots the unsafe-broad test needs (design §3.3
+/// item 4): the internal pool's payload root and the removable registration's
+/// payload directory. The removable mount point is deliberately *not* listed as
+/// a payload: it is an ancestor of its payload, so the ancestor rule already
+/// drops it, while a scratch root on the registered volume but outside the
+/// payload (the AGENTS.md validation scratch, for instance) is a legitimate
+/// one-use root and must stay accepted. Unknown facts never justify guessing a
+/// safe root: an unreadable registration drops every candidate root.
 #[derive(Clone, Debug)]
 pub(crate) enum Pools {
     Known(Vec<PathBuf>),
@@ -207,7 +223,7 @@ impl Facts {
                 let mut roots = vec![pool.join("payload")];
                 match removable::read_registration(control) {
                     Ok(Some(registration)) => {
-                        roots.push(registration.mount_point.clone());
+                        // Only the payload directory: see [`Pools`].
                         roots.push(registration.mount_point.join(removable::PAYLOAD_DIR));
                     }
                     Ok(None) => {}
@@ -603,6 +619,81 @@ mod tests {
         assert!(dropped.notes.join("\n").contains("unavailable"));
 
         std::fs::remove_dir_all(&here).unwrap();
+    }
+
+    /// A candidate root on the registered volume but **outside** its payload is
+    /// a legitimate one-use root: the mount point is not a payload. Only the
+    /// payload root itself, a path inside it, and an ancestor of it (which
+    /// already covers the mount point) are unsafe-broad.
+    #[test]
+    fn a_registered_volumes_scratch_root_is_not_a_pool() {
+        let here = scratch("volume-scratch");
+        let mount = here.join("Builds");
+        let scratch_root = mount.join("scratch");
+        let payload = mount.join("oxide-pool");
+        let inside_payload = payload.join("slots/one");
+        for path in [&scratch_root, &payload, &inside_payload] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let workspace = scratch_root.join("run/repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let facts = |candidates: Vec<&Path>| Facts {
+            candidates: candidates
+                .into_iter()
+                .map(|path| path.as_os_str().to_owned())
+                .collect(),
+            homes: Vec::new(),
+            pools: Pools::Known(vec![payload.clone()]),
+            opt_in: None,
+        };
+
+        // Scratch on the volume, outside the payload: accepted, so the
+        // workspace under it is one-use.
+        let accepted = classify(&workspace, &facts(vec![&scratch_root]));
+        assert!(accepted.guarded(), "{}", accepted.reason());
+        assert!(accepted.notes.is_empty(), "{:?}", accepted.notes);
+
+        // The payload itself, a path inside it, and the mount point are not.
+        let at_payload = classify(&payload, &facts(vec![&payload]));
+        assert!(!at_payload.guarded());
+        assert!(at_payload
+            .notes
+            .iter()
+            .any(|note| note.contains("a registered pool payload")));
+        let inside = classify(&inside_payload, &facts(vec![&inside_payload]));
+        assert!(!inside.guarded());
+        assert!(inside
+            .notes
+            .iter()
+            .any(|note| note.contains("inside a registered pool")));
+        let at_mount = classify(&mount, &facts(vec![&mount]));
+        assert!(!at_mount.guarded());
+        assert!(at_mount
+            .notes
+            .iter()
+            .any(|note| note.contains("contains a registered pool payload")));
+
+        std::fs::remove_dir_all(&here).unwrap();
+    }
+
+    /// The activation switch is thread-local and panic-safe: a parallel test
+    /// never observes another thread's activation, a nested activation restores
+    /// the outer value, and a panicking body cannot leak an active switch.
+    #[test]
+    fn the_activation_switch_is_thread_local_and_panic_safe() {
+        assert!(!is_active());
+        let panicked = std::panic::catch_unwind(|| with_active(|| panic!("a controlled panic")));
+        assert!(panicked.is_err(), "the body panicked");
+        assert!(!is_active(), "a panicking body restores the switch");
+        with_active(|| {
+            assert!(is_active());
+            let other = std::thread::spawn(is_active).join().unwrap();
+            assert!(!other, "another thread never sees this thread's activation");
+            assert!(with_active(is_active), "a nested activation is active");
+            assert!(is_active(), "the outer activation is restored");
+        });
+        assert!(!is_active());
     }
 
     /// Dormancy: nothing activates the feature by itself, and the switch is

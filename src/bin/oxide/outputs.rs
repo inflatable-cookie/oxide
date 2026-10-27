@@ -2065,13 +2065,17 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
 /// (oxide#163) by running the shipped layout migration transaction.
 fn adopt_command() -> Result<u8, String> {
     let context = Context::open()?;
-    adopt_at(&context, output_store()?)
+    adopt_at(&context, output_store)
 }
 
-/// `oxide outputs adopt` against one already-opened context and pool, so the
-/// guarded entry point is exercised exactly as [`adopt_command`] runs it (the
-/// verb-level regressions enter here).
-fn adopt_at(context: &Context, internal: Option<Store>) -> Result<u8, String> {
+/// `oxide outputs adopt` against one already-opened context and a **lazy** pool
+/// provider, so the guarded refusal is decided before the pool is opened or
+/// coordinated (design §4.1: nothing at all happens first) and the verb-level
+/// regressions can hand in a provider that fails, proving the refusal wins.
+fn adopt_at(
+    context: &Context,
+    pool: impl FnOnce() -> Result<Option<Store>, String>,
+) -> Result<u8, String> {
     // A guarded workspace always refuses `adopt`, whatever the receipt state,
     // and it refuses here: effect-free, before the drive-mode, pool and
     // barrier work below, so the verb never enters custody (design §4.1,
@@ -2079,6 +2083,7 @@ fn adopt_at(context: &Context, internal: Option<Store>) -> Result<u8, String> {
     if guarded_workspace(context.control(), &context.workspace).is_some() {
         return Err(guarded_adopt_refusal(context));
     }
+    let internal = pool()?;
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
         return Err(format!(
@@ -2095,9 +2100,10 @@ fn adopt_at(context: &Context, internal: Option<Store>) -> Result<u8, String> {
     let Some(internal) = internal else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
+    let internal = &internal;
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
-    let guard = barrier(&internal, &context.workspace, &mut waits)?;
+    let guard = barrier(internal, &context.workspace, &mut waits)?;
     if let Some(intent) = crate::prune::unsettled_for(&control, &context.checkout_id)? {
         return Err(format!(
             "outputs: prune intent {intent} is unsettled for this checkout; `adopt` refuses until it completes or `oxide outputs resolve-intent {intent}` settles it"
@@ -4025,23 +4031,25 @@ pub fn auto_adopt(
 /// detached receipt stays, so automatic first conversion never follows it.
 fn detach_command() -> Result<u8, String> {
     let context = Context::open()?;
-    // The guard's effect-free fast precheck runs before the pool is even
-    // opened: a guarded workspace refuses a `Prepared` transition, an
-    // unsettled prune intent or a listed root with literally nothing done.
-    guarded_command_precheck(&context, "outputs detach refused")?;
-    detach_at(&context, output_store()?.as_ref())
+    detach_at(&context, output_store)
 }
 
-/// `oxide outputs detach` against one already-opened context and pool, so the
-/// guarded entry point is exercised exactly as [`detach_command`] runs it.
-fn detach_at(context: &Context, internal: Option<&Store>) -> Result<u8, String> {
+/// `oxide outputs detach` against one already-opened context and a **lazy**
+/// pool provider, so the guard's effect-free fast precheck runs before the pool
+/// is opened: a guarded workspace refuses a `Prepared` transition, an unsettled
+/// prune intent or a listed root with literally nothing done.
+fn detach_at(
+    context: &Context,
+    pool: impl FnOnce() -> Result<Option<Store>, String>,
+) -> Result<u8, String> {
     guarded_command_precheck(context, "outputs detach refused")?;
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
-    let Some(internal) = internal else {
+    let Some(internal) = pool()? else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
+    let internal = &internal;
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
     // A guarded workspace takes the same barrier, but through the guarded
@@ -6110,21 +6118,24 @@ fn cancel_reservation(
 /// checkout's unused reservation, under its clean barrier and binding lock.
 fn cancel_command() -> Result<u8, String> {
     let context = Context::open()?;
-    // The same effect-free fast precheck as `detach`, before the pool opens.
-    guarded_command_precheck(&context, "outputs cancel-reservation refused")?;
-    cancel_at(&context, output_store()?.as_ref())
+    cancel_at(&context, output_store)
 }
 
-/// `oxide outputs cancel-reservation` against one already-opened context and
-/// pool, so the guarded entry point is exercised as [`cancel_command`] runs it.
-fn cancel_at(context: &Context, internal: Option<&Store>) -> Result<u8, String> {
+/// `oxide outputs cancel-reservation` against one already-opened context and a
+/// **lazy** pool provider: the same effect-free fast precheck as `detach`, and
+/// it runs before the pool is opened.
+fn cancel_at(
+    context: &Context,
+    pool: impl FnOnce() -> Result<Option<Store>, String>,
+) -> Result<u8, String> {
     guarded_command_precheck(context, "outputs cancel-reservation refused")?;
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
-    let Some(internal) = internal else {
+    let Some(internal) = pool()? else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
+    let internal = &internal;
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
     // The same guarded order as `detach`: revalidate the receipt and the
@@ -6539,12 +6550,9 @@ fn guarded_barrier(
             ));
         }
         let binding = store.lock_binding(&context.workspace)?;
-        let attempt = store.begin_clean_with(
-            &context.workspace,
-            waits,
-            crate::store::CleanMode::Barrier,
-            || guarded_prepared_refusal(context),
-        )?;
+        let attempt = store.begin_clean_barrier(&context.workspace, waits, || {
+            guarded_prepared_refusal(context)
+        })?;
         drop(binding);
         match attempt {
             Cleaning::Guard(guard) => return Ok(guard),
@@ -16758,9 +16766,15 @@ mod tests {
         // (so `next_id` advances once per verb), `adopt` refuses before the
         // barrier, no receipt is written, and the only other write is the
         // shipped recorded-accounting fence.
-        let detach = detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
-        let cancel = cancel_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
-        let adopt = adopt_at(&fixture.context(), None).unwrap_err();
+        let detach = detach_at(&fixture.context(), || {
+            Ok(Some(fixture.store.handle_for_tests()))
+        })
+        .unwrap_err();
+        let cancel = cancel_at(&fixture.context(), || {
+            Ok(Some(fixture.store.handle_for_tests()))
+        })
+        .unwrap_err();
+        let adopt = adopt_at(&fixture.context(), || Ok(None)).unwrap_err();
         assert_eq!(
             detach,
             "this checkout has no owned-output receipt; nothing to detach"
@@ -16822,9 +16836,13 @@ mod tests {
                 "the fixture's checkout is under a temporary root, so it is guarded"
             );
             (
-                detach_at(&fixture.context(), Some(&fixture.store)),
-                cancel_at(&fixture.context(), Some(&fixture.store)),
-                adopt_at(&fixture.context(), None).unwrap_err(),
+                detach_at(&fixture.context(), || {
+                    Ok(Some(fixture.store.handle_for_tests()))
+                }),
+                cancel_at(&fixture.context(), || {
+                    Ok(Some(fixture.store.handle_for_tests()))
+                }),
+                adopt_at(&fixture.context(), || Ok(None)).unwrap_err(),
             )
         });
         assert_eq!(
@@ -16886,8 +16904,11 @@ mod tests {
                 guarded_workspace(Some(&fixture.control()), &fixture.checkout).is_some(),
                 "the fixture's checkout is under a temporary root, so it is guarded"
             );
-            let refused = detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
-            let refused_adopt = adopt_at(&fixture.context(), None).unwrap_err();
+            let refused = detach_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+            .unwrap_err();
+            let refused_adopt = adopt_at(&fixture.context(), || Ok(None)).unwrap_err();
             let refused_bind = match bind_for_command(
                 &fixture.store,
                 &fixture.checkout,
@@ -16919,7 +16940,57 @@ mod tests {
         assert!(!crate::one_use::is_active());
     }
 
-    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a
+    /// The guarded verbs decide **before** the pool is opened or coordinated:
+    /// a provider that fails (or refuses to run at all) cannot shadow the
+    /// guard's refusal, so an unreadable registration can never replace the
+    /// exact `Prepared` diagnostic or the guarded `adopt` refusal.
+    #[test]
+    fn the_guarded_verbs_refuse_before_the_pool_is_opened() {
+        let fixture = GuardFixture::new("precheck-before-pool");
+        fixture.write(&fixture.prepared());
+        let before = durable_digest(&fixture);
+        let never =
+            || -> Result<Option<Store>, String> { panic!("a guarded verb must not open the pool") };
+        let failing = || -> Result<Option<Store>, String> {
+            Err("the removable registration is unreadable".to_owned())
+        };
+        crate::one_use::with_active(|| {
+            assert_eq!(
+                adopt_at(&fixture.context(), never).unwrap_err(),
+                crate::one_use::PREPARED_GUARDED
+            );
+            assert_eq!(
+                adopt_at(&fixture.context(), failing).unwrap_err(),
+                crate::one_use::PREPARED_GUARDED
+            );
+            assert_eq!(
+                detach_at(&fixture.context(), never).unwrap_err(),
+                crate::one_use::PREPARED_GUARDED
+            );
+            assert_eq!(
+                detach_at(&fixture.context(), failing).unwrap_err(),
+                crate::one_use::PREPARED_GUARDED
+            );
+            assert_eq!(
+                cancel_at(&fixture.context(), never).unwrap_err(),
+                crate::one_use::PREPARED_GUARDED
+            );
+            assert_eq!(
+                cancel_at(&fixture.context(), failing).unwrap_err(),
+                crate::one_use::PREPARED_GUARDED
+            );
+        });
+        assert_eq!(durable_digest(&fixture), before);
+        // The general guarded `adopt` refusal wins over a pool error too.
+        let fixture = GuardFixture::new("precheck-before-pool-general");
+        crate::one_use::with_active(|| {
+            assert!(adopt_at(&fixture.context(), failing)
+                .unwrap_err()
+                .contains("one-use (temporary) workspace"));
+        });
+    }
+
+    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a
     /// `Prepared` transition with the exact diagnostic, repeatedly and
     /// byte-identically including `next_id`, and the refusal happens at the
     /// effect-free fast precheck — before the binding mutex is even created
@@ -16935,9 +17006,15 @@ mod tests {
         let mut traces = Vec::new();
         crate::one_use::with_active(|| {
             for _ in 0..3 {
-                let refused = detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
+                let refused = detach_at(&fixture.context(), || {
+                    Ok(Some(fixture.store.handle_for_tests()))
+                })
+                .unwrap_err();
                 assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
-                let refused = cancel_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
+                let refused = cancel_at(&fixture.context(), || {
+                    Ok(Some(fixture.store.handle_for_tests()))
+                })
+                .unwrap_err();
                 assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
                 traces.push((
                     fs::read(&receipt_path).unwrap(),
@@ -16981,7 +17058,10 @@ mod tests {
         let receipt_bytes = fs::read(&stored_receipt).unwrap();
         let state_before = fixture.state_bytes();
         let refused = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
+            detach_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+            .unwrap_err()
         });
         assert!(refused.contains("clean barrier refused"), "{refused}");
         assert!(refused.contains("record 7"), "{refused}");
@@ -16996,7 +17076,10 @@ mod tests {
         let receipt_bytes = fs::read(&stored_receipt).unwrap();
         let state_before = fixture.state_bytes();
         let refused = crate::one_use::with_active(|| {
-            cancel_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
+            cancel_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+            .unwrap_err()
         });
         assert!(refused.contains("clean barrier refused"), "{refused}");
         assert!(refused.contains("clean mark 9"), "{refused}");
@@ -17010,7 +17093,10 @@ mod tests {
         let _held = crate::store::hold_record_for_tests(&fixture.store, &fixture.checkout, 5);
         let state_before = fixture.state_bytes();
         let refused = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
+            detach_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+            .unwrap_err()
         });
         assert_eq!(refused, crate::one_use::BARRIER_BUSY);
         assert_eq!(fixture.state_bytes(), state_before);
@@ -17030,7 +17116,10 @@ mod tests {
         let stored_receipt = receipt_path(&fixture.control(), &fixture.checkout_id());
         let receipt_bytes = fs::read(&stored_receipt).unwrap();
         let refused = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
+            detach_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+            .unwrap_err()
         });
         assert!(refused.contains("clean barrier refused"), "{refused}");
         assert_eq!(fs::read(&stored_receipt).unwrap(), receipt_bytes);

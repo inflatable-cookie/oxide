@@ -34,17 +34,25 @@ implementation review corrected:
   holder could not make progress; the classifier reports the dead fact. A free
   *record* lock is not dead by itself: §4.1 step 5's dead row also requires no
   live group, so a record whose recorded process group still exists is a live
-  fact the verb retries.
+  fact the verb retries. Unknown custody is never collapsed to "clear": the
+  pool's control directory and the sibling pool's state are inspected so that
+  only a genuinely absent document or directory counts as absent, while a
+  symlinked, unreadable or invalid one refuses.
 - **Each guarded output verb has its effect-free fast precheck.** `detach`,
   `cancel-reservation` (and `adopt`, which never enters custody) read the
   checkout's authority state **before the pool is opened, before any signal
   handler, before the binding mutex and before the barrier**, so a `Prepared`
   transition, a pending migration journal, an unsettled prune intent or a
   listed root refuses with literally nothing created. The authoritative
-  revalidation still runs later under the binding mutex.
-- **The payload root is unsafe-broad.** §3.3's pool test now also drops a
-  candidate that *is* a registered payload root, not only ones inside or around
-  it.
+  revalidation still runs later under the binding mutex. The pool is a **lazy
+  provider** passed into the verb's core, so no registration or pool error can
+  pre-empt the refusal; the regression hands in a failing provider to prove it.
+- **The payload root is unsafe-broad, and only a payload root is.** §3.3's pool
+  test drops a candidate that *is* a registered payload root, not only ones
+  inside or around it. The removable **mount point is not a payload**: it is an
+  ancestor of its payload, so the ancestor rule already drops it, while a
+  scratch root on the registered volume but outside the payload is a legitimate
+  one-use root — which is where the AGENTS.md validation scratch lives.
 - **The shipped checkout-authority refusals are kept.** A guarded command keeps
   the unsettled-prune-intent refusal (fast precheck and under the binding
   mutex), keeps the `Pruning` refusal, and a `Pruned` receipt selects nothing,
@@ -54,6 +62,11 @@ implementation review corrected:
   unconditionally, so a malformed or mismatched document selects the general
   guarded refusal and only a `Prepared` transition selects the §4.4
   diagnostic.
+- **The activation switch is thread-local and panic-safe.** A test-only guard
+  sets the flag on its own thread and restores the previous value on drop, so a
+  parallel dormant test never observes an active feature and a panicking body
+  cannot leak one; the classification counter uses the same scope. That scope is
+  what makes the dormancy comparison meaningful.
 - **The regressions enter the real verbs.** `adopt`, `detach` and
   `cancel-reservation` are split into a command wrapper and an
   `…_at(context, pool)` core, so the tests drive the guarded entry points

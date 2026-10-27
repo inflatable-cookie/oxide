@@ -2529,6 +2529,25 @@ impl Store {
         store
     }
 
+    /// Test-only: an independent handle to the same pool, so a test can hand
+    /// one to a verb that takes the pool by value and still observe the pool.
+    #[cfg(test)]
+    pub fn handle_for_tests(&self) -> Store {
+        Store {
+            pool: self.pool.clone(),
+            backend: self.backend,
+            payload: self.payload.clone(),
+            control: self.control.clone(),
+            budget: self.budget,
+            recorded_budget: self.recorded_budget,
+            max_active: self.max_active,
+            sibling: self.sibling.as_ref().map(|sibling| Sibling {
+                control: sibling.control.clone(),
+                barrier: sibling.barrier,
+            }),
+        }
+    }
+
     /// Record a lost slot whose writers were never confirmed closed, for
     /// other modules' unit tests of unknown custody.
     #[cfg(test)]
@@ -2822,13 +2841,28 @@ impl Store {
         if mode == CleanMode::Recovering {
             return self.begin_clean_recovering(checkout, waits);
         }
-        if !self.control.is_dir() {
-            // This path creates no control tree: with no pool state there is
-            // no barrier to take, and creating one would be an effect before
-            // the guarded verb's own transition.
-            return Err(crate::one_use::barrier_unknown(
-                "this pool has no control state to take a barrier over",
-            ));
+        // This path creates no control tree: with no pool state there is no
+        // barrier to take, and creating one would be an effect before the
+        // guarded verb's own transition. `is_dir()` would map an unreadable
+        // directory to "absent", so the metadata is inspected instead: only
+        // `NotFound` is absence, anything else is unknown custody.
+        match fs::symlink_metadata(&self.control) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(crate::one_use::barrier_unknown(
+                    "this pool has no control state to take a barrier over",
+                ))
+            }
+            Err(error) => {
+                return Err(crate::one_use::barrier_unknown(&format!(
+                    "the pool's control directory cannot be inspected: {error}"
+                )))
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(crate::one_use::barrier_unknown(
+                    "the pool's control path is not a directory",
+                ))
+            }
+            Ok(_) => {}
         }
         if let Some(signal) = process::received_signal() {
             waits.stop(Instant::now());
@@ -6054,6 +6088,42 @@ mod tests {
             _ => panic!("a free lock with no group is dead"),
         }
         assert_eq!(state_bytes(&internal), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An unreadable *sibling* state is unknown custody, not "no records": a
+    /// symlinked document cannot be read (`O_NOFOLLOW`), so the guarded barrier
+    /// refuses before any mark instead of treating the other pool as clear.
+    #[test]
+    fn the_guarded_barrier_refuses_an_unreadable_sibling_state() {
+        let (root, internal, removable) = paired_controls("guarded-sibling-unknown");
+        removable.save(&State::default()).unwrap();
+        let state = removable.control.join("state.json");
+        let elsewhere = root.join("elsewhere.json");
+        fs::write(&elsewhere, b"{}").unwrap();
+        fs::remove_file(&state).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &state).unwrap();
+        let refused = match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("an unreadable sibling state refuses the guarded barrier"),
+        };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(refused.contains("other pool"), "{refused}");
+        assert!(internal.load().unwrap().cleans.is_empty());
+        // Non-vacuity: with the document absent the same checkout is clear.
+        fs::remove_file(&state).unwrap();
+        match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Ok(Cleaning::Guard(guard)) => internal.abandon_clean(guard).unwrap(),
+            _ => panic!("an absent sibling state is clear"),
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
