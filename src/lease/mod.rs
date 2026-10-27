@@ -885,26 +885,28 @@ impl Drop for WidenedMode<'_> {
     }
 }
 
-/// One captured entry's private name, as the journal records it.
-fn capture_private(capture: &Capture) -> String {
-    String::from_utf8_lossy(capture.private.as_bytes()).into_owned()
+/// One captured entry's private name, as the journal records it. The name is
+/// generated ASCII, so this is the exact name and never a lossy conversion.
+fn capture_private(capture: &Capture) -> Result<String, LeaseError> {
+    crate::owned_delete::journal_name(&capture.private).map_err(LeaseError::Io)
 }
 
 /// The durable record of one capture inside the tree, built from the verified
-/// observation and the captured private name.
+/// observation and the captured private name. Both names are required to
+/// round-trip exactly; the walk refuses a name that cannot before it captures.
 fn capture_record(
     context: &CaptureContext<'_>,
     capture: &Capture,
     observed: &crate::owned_delete::EntryFacts,
-) -> crate::owned_delete::CaptureRecord {
-    crate::owned_delete::CaptureRecord {
+) -> Result<crate::owned_delete::CaptureRecord, LeaseError> {
+    Ok(crate::owned_delete::CaptureRecord {
         path: context.chain.clone(),
-        private: capture_private(capture),
-        original: String::from_utf8_lossy(capture.original.as_bytes()).into_owned(),
+        private: capture_private(capture)?,
+        original: crate::owned_delete::journal_name(&capture.original).map_err(LeaseError::Io)?,
         device: observed.device,
         inode: observed.inode,
         mode: u32::try_from(observed.mode).unwrap_or(u32::MAX),
-    }
+    })
 }
 
 /// One entry, named in the held `parent`, of the tree rooted at `root`.
@@ -952,6 +954,20 @@ fn remove_tree_owned_at(
         }
     } else {
         return Err(LeaseError::UnknownAccounting);
+    }
+    // A journal records an entry's exact name, so a name that is not UTF-8 is
+    // refused **before** it is captured: nothing is renamed, nothing is
+    // deleted, the escaped bytes are reported and the deletion stays pending.
+    #[cfg(test)]
+    let name_cannot_round_trip =
+        std::str::from_utf8(name.as_bytes()).is_err() || crate::test_fs::forced_invalid_name();
+    #[cfg(not(test))]
+    let name_cannot_round_trip = std::str::from_utf8(name.as_bytes()).is_err();
+    if name_cannot_round_trip {
+        return Err(LeaseError::UnexpectedEntry {
+            place: "slot tree entry",
+            entry: entry_label(std::ffi::OsStr::from_bytes(name.as_bytes())),
+        });
     }
     // The tree root is journaled intent-first: the planned private name, its
     // own identity, the verified parent's identity and its full mode are
@@ -1005,8 +1021,9 @@ fn remove_tree_owned_at(
             .unwrap_or_else(|error| format!("unreadable capture ({error})"));
         let foreign = crate::owned_delete::ForeignCapture {
             path: context.chain.clone(),
-            private: capture_private(&capture),
-            original: String::from_utf8_lossy(capture.original.as_bytes()).into_owned(),
+            private: capture_private(&capture)?,
+            original: crate::owned_delete::journal_name(&capture.original)
+                .map_err(LeaseError::Io)?,
             expected_device: observed.device,
             expected_inode: observed.inode,
             expected_mode: u32::from(observed.mode),
@@ -1030,7 +1047,7 @@ fn remove_tree_owned_at(
         // A captured file or link is recorded before it is removed and its
         // removal is recorded before it counts as work done, so a crash is
         // always resolved by replay rather than assumed.
-        let record = capture_record(context, &capture, &observed);
+        let record = capture_record(context, &capture, &observed)?;
         if let Err(reason) = context.record_captured(&record) {
             return Err(abort_capture(
                 parent,
@@ -1062,7 +1079,12 @@ fn remove_tree_owned_at(
     // without a durable original mode. The **root** is recorded by its plan, not
     // as a nested capture: a nested record is located by the chain of captured
     // private names *below* the root.
-    let record = (!root_level).then(|| capture_record(context, &capture, &observed));
+    let record = if root_level {
+        None
+    } else {
+        Some(capture_record(context, &capture, &observed)?)
+    };
+    let capture_name = capture_private(&capture)?;
     if let Some(record) = &record {
         if let Err(reason) = context.record_captured(record) {
             return Err(abort_capture(
@@ -1230,7 +1252,7 @@ fn remove_tree_owned_at(
     // The chain names captured parents *below* the root: the root is the
     // base the journal's replay opens, so its own private name is not in it.
     if !root_level {
-        context.chain.push(capture_private(&capture));
+        context.chain.push(capture_name);
     }
     let names = match names_of(child.as_fd()) {
         Ok(names) => names,

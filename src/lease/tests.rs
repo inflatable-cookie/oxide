@@ -4834,3 +4834,103 @@ fn a_replaced_whole_slot_capture_is_foreign_and_stays_pending() {
         "no second capture was made: the deletion did not retry"
     );
 }
+
+/// An entry name that cannot be journaled exactly is refused **before** it is
+/// captured: nothing is renamed or deleted, the escaped bytes are reported, and
+/// the deletion stays pending. APFS refuses to create a non-UTF-8 name at all,
+/// so the walk's check is fed that input through the debug-only seam and the
+/// production refusal path is what is asserted; the predicate itself is also
+/// checked directly against real non-UTF-8 bytes.
+#[test]
+fn an_entry_name_that_cannot_round_trip_refuses_before_capture() {
+    // The predicate: real non-UTF-8 bytes are rejected with their escaped form.
+    let odd = std::ffi::CString::new(b"caf\xe9".to_vec()).expect("name");
+    assert_eq!(
+        crate::owned_delete::journal_name(&odd),
+        Err("an entry name is not valid UTF-8 (caf\\xe9)".to_owned()),
+        "a lossy conversion would silently journal a different name"
+    );
+    let lossy = String::from_utf8_lossy(b"caf\xe9").into_owned();
+    assert_ne!(
+        lossy.as_bytes(),
+        b"caf\xe9",
+        "a lossy conversion changes bytes, which is why the name is refused"
+    );
+
+    let fixture = Fixture::new("invalid-name");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "invalid-name");
+    let locked = slot_path.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+
+    let forced = crate::test_fs::force_invalid_name();
+    let outcome = super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string());
+    drop(forced);
+    match outcome {
+        Err(LeaseError::UnexpectedEntry { place, entry }) => {
+            assert_eq!(place, "slot tree entry");
+            assert_eq!(
+                entry,
+                slot_path.file_name().expect("slot leaf").to_string_lossy(),
+                "the refused entry is named"
+            );
+        }
+        other => panic!("a name that cannot round-trip must refuse before capture: {other:?}"),
+    }
+
+    // Nothing was captured or renamed, and the deletion stays pending.
+    assert!(slot_path.is_dir(), "the slot is restored");
+    assert!(locked.is_dir(), "the refused entry is untouched");
+    assert_eq!(
+        private_names_in(&slot_path).len(),
+        0,
+        "nothing was captured: the name was refused before the capture"
+    );
+    // Nothing was journaled for the refused attempt, so the recorded deletion
+    // stays pending until a retry can run; here the platform's real names are
+    // UTF-8, so that retry completes instead of touching the refused entry.
+    let after = status_injected(&pool).expect("status");
+    assert!(
+        after.slots.is_empty(),
+        "the pending deletion completed on retry"
+    );
+    assert!(!slot_path.exists());
+}
+
+/// A captured entry whose name is valid multi-byte UTF-8 is journaled exactly
+/// and put back under exactly that name when the deletion refuses.
+#[test]
+fn a_live_putback_restores_the_exact_non_ascii_name() {
+    let fixture = Fixture::new("exact-name");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "exact-name");
+    let odd = slot_path.join("café");
+    fs::create_dir(&odd).expect("non-ASCII directory");
+    fs::write(odd.join("data"), b"x").expect("data");
+
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "foreign", false);
+    assert!(
+        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
+        "the raced deletion refuses"
+    );
+
+    let journal = super::pool::capture_record_injected(&pool, slot_id)
+        .expect("the capture journal is retained");
+    assert!(
+        journal
+            .captures
+            .iter()
+            .any(|record| record.original == "café"),
+        "the journal records the exact UTF-8 name: {journal:?}"
+    );
+    assert!(
+        odd.is_dir(),
+        "the live put-back restored the entry under its exact original name"
+    );
+
+    // The next open releases the recorded capture and finishes the deletion,
+    // which is only possible because the recorded name round-trips exactly.
+    let after = status_injected(&pool).expect("status");
+    assert!(after.slots.is_empty(), "the recorded deletion completed");
+    assert!(!slot_path.exists());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}

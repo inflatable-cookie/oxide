@@ -531,3 +531,35 @@ pub(crate) fn run_before_walk_capture() {
         action();
     }
 }
+
+thread_local! {
+    static FORCED_INVALID_NAME: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm the walk's name check as if the entry's name were not valid UTF-8.
+/// APFS refuses to create such a name at all, so this injects the *input* of
+/// the check — the production refusal path itself is what a test then asserts.
+#[must_use = "dropping the guard ends the forced name"]
+pub(crate) struct ForcedInvalidNameGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn force_invalid_name() -> ForcedInvalidNameGuard {
+    FORCED_INVALID_NAME.with(|cell| {
+        assert!(!cell.get(), "overlapping forced invalid names");
+        cell.set(true);
+    });
+    ForcedInvalidNameGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for ForcedInvalidNameGuard {
+    fn drop(&mut self) {
+        FORCED_INVALID_NAME.with(|cell| cell.set(false));
+    }
+}
+
+pub(crate) fn forced_invalid_name() -> bool {
+    FORCED_INVALID_NAME.with(std::cell::Cell::get)
+}

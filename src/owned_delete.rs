@@ -152,6 +152,21 @@ pub(crate) fn entry_label(name: &OsStr) -> String {
     label
 }
 
+/// One entry name as the journal records it: the **exact** UTF-8 name, never a
+/// lossy conversion. This platform's own pool and output names are valid UTF-8,
+/// so a name that is not is refused before any capture rather than recorded
+/// lossily; the error carries the escaped bytes and the caller stays pending.
+pub fn journal_name(name: &CStr) -> Result<String, String> {
+    std::str::from_utf8(name.to_bytes())
+        .map(str::to_owned)
+        .map_err(|_| {
+            format!(
+                "an entry name is not valid UTF-8 ({})",
+                entry_label(OsStr::from_bytes(name.to_bytes()))
+            )
+        })
+}
+
 /// Why a caller stopped a drain between two verified entries: its own bounded
 /// check (volume, reserve, deadline, journal) failed. The caller keeps the
 /// reason, so its refusal or pending intent is unchanged by the seam.
@@ -1174,6 +1189,16 @@ fn drain_finder_metadata(
         // name can redirect the removal.
         #[cfg(test)]
         crate::test_fs::run_before_capture(entry.ordinal);
+        // A journal records the exact name, so a name that cannot round-trip
+        // is refused *before* it is captured: nothing is renamed or removed.
+        let original = match journal_name(&entry.name) {
+            Ok(name) => name,
+            Err(reason) => {
+                return Err(Rmdir::Unproven {
+                    reason: format!("{reason}; nothing was captured or removed"),
+                })
+            }
+        };
         let capture = match capture_entry(dir, &entry.name) {
             Ok(capture) => capture,
             Err(error) => return Err(Rmdir::CaptureFailed { error }),
@@ -1205,8 +1230,9 @@ fn drain_finder_metadata(
                 .unwrap_or_else(|error| format!("unreadable capture ({error})"));
             let mut foreign = ForeignCapture {
                 path: context.chain.clone(),
-                private: String::from_utf8_lossy(capture.private.as_bytes()).into_owned(),
-                original: String::from_utf8_lossy(entry.name.as_bytes()).into_owned(),
+                private: journal_name(&capture.private)
+                    .map_err(|reason| Rmdir::Unproven { reason })?,
+                original,
                 expected_device: entry.device,
                 expected_inode: entry.inode,
                 expected_mode: u32::from(libc::S_IFREG),
@@ -1257,8 +1283,8 @@ fn drain_finder_metadata(
         // by name and identity, and never treats the name as ordinary content.
         let record = CaptureRecord {
             path: context.chain.clone(),
-            private: String::from_utf8_lossy(capture.private.as_bytes()).into_owned(),
-            original: String::from_utf8_lossy(entry.name.as_bytes()).into_owned(),
+            private: journal_name(&capture.private).map_err(|reason| Rmdir::Unproven { reason })?,
+            original: journal_name(&entry.name).map_err(|reason| Rmdir::Unproven { reason })?,
             device: entry.device,
             inode: entry.inode,
             mode: u32::from(libc::S_IFREG),
