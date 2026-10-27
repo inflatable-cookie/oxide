@@ -351,6 +351,17 @@ impl SeedPoolOpen {
     }
 }
 
+/// The recorded backend, read without the pool lock and without touching any
+/// payload, so a seeding call can gate a removable pool before it takes the
+/// donor record lock or opens the seam. The config is replaced atomically, so a
+/// single read is consistent.
+pub(super) fn recorded_backend(root: &Path) -> Result<String, LeaseError> {
+    let root = canonical_existing_dir(root, true)?;
+    refuse_foreign_pool_entries(&root)?;
+    refuse_retired_image_pool(&root)?;
+    Ok(read_config(&root)?.backend)
+}
+
 /// Open the seeding seam: the pool lock alone, no reconciliation, no ledger or
 /// payload mutation. A recorded `Evicting` slot is read as it stands and never
 /// finished here. Only an internal `directory-budget-v1` payload is opened; a

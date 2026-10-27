@@ -35,10 +35,12 @@ pub const SEED_MAX_TEXT_BYTES: usize = 512;
 pub const SEED_MAX_PATH_BYTES: usize = 1024;
 /// Config files in the producer context, in precedence order.
 pub const SEED_MAX_CONFIG_FILES: usize = 16;
-/// Rule targets recorded for one `.d`.
+/// Rule targets (rules) recorded for one unit's `.d` (§8.1).
 pub const SEED_MAX_RULES: usize = 4096;
-/// Rule inputs recorded for one `.d`.
-pub const SEED_MAX_INPUTS: usize = 32768;
+/// Rule inputs recorded for one unit's `.d` (§8.1: 4,096 per unit).
+pub const SEED_MAX_UNIT_INPUTS: usize = 4096;
+/// Rule inputs across one plan (§8.1: 32,768 total).
+pub const SEED_MAX_PLAN_INPUTS: usize = 32768;
 /// Files recorded for one unit: the fingerprint triple, the artifacts and
 /// their `.d`, with bounded headroom for role variants.
 pub const SEED_MAX_UNIT_FILES: usize = 16;
@@ -477,8 +479,8 @@ impl SeedJoin {
         for target in &self.targets {
             require_recorded_path(target)?;
         }
-        if self.inputs.len() > SEED_MAX_INPUTS {
-            return Err("cold-seed join has too many inputs");
+        if self.inputs.len() > SEED_MAX_UNIT_INPUTS {
+            return Err("cold-seed join has too many inputs for one unit");
         }
         for input in &self.inputs {
             require_recorded_path(input)?;

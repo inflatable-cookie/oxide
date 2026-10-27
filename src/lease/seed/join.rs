@@ -18,8 +18,8 @@
 pub const MAX_JOIN_BYTES: usize = 1024 * 1024;
 /// Rule targets per `.d` (§8.1).
 pub const MAX_JOIN_TARGETS: usize = 4096;
-/// Prerequisite paths per `.d` (§8.1).
-pub const MAX_JOIN_INPUTS: usize = 32768;
+/// Prerequisite paths per `.d` (§8.1: 4,096 per unit).
+pub const MAX_JOIN_INPUTS: usize = 4096;
 /// One path string's byte ceiling.
 pub const MAX_JOIN_PATH_BYTES: usize = 4096;
 

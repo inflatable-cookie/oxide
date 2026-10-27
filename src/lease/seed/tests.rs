@@ -1098,6 +1098,93 @@ fn a_removable_pool_is_skipped_before_any_payload_access() {
 }
 
 #[test]
+fn a_removable_pool_reports_the_unsupported_skip_before_donor_lock_outcomes() {
+    reset_hooks();
+    let rig = Rig::new("removable-before-lock");
+    let donor = make_donor(&rig, "a");
+    let (_, recipient) = lease_recipient(&rig, "a");
+    let absent_mount = rig.fx.path.join("absent-volume");
+    rewrite_removable_backend_injected(&rig.pool, &absent_mount).expect("rewrite backend");
+
+    // A missing donor lock would be a donor-lock skip on an internal pool; the
+    // removable reason must win.
+    fs::remove_file(rig.donor_lock(donor.record_id)).expect("remove donor lock");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::RemovablePoolUnsupported
+        })
+    );
+
+    // A held donor lock would be a donor-busy skip; the removable reason still
+    // wins.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(rig.donor_lock(donor.record_id))
+        .expect("open lock");
+    // SAFETY: the descriptor is live for the call.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::RemovablePoolUnsupported
+        })
+    );
+}
+
+#[test]
+fn plan_bounds_the_total_join_inputs_across_units() {
+    reset_hooks();
+    let rig = Rig::new("plan-input-cap");
+    let (grant, _) = lease_recipient(&rig, "a");
+    let record_id = grant.slot_id.parse::<u64>().expect("record id");
+    let files = default_files();
+    write_files(&grant.env.cargo_build_build_dir, &files);
+    let mut catalog = catalog_for(&grant, record_id, &files);
+    let inputs: Vec<String> = (0..SEED_MAX_UNIT_INPUTS)
+        .map(|index| format!("/fixture/src/{index}.rs"))
+        .collect();
+    catalog.packages[0].units = (0..9)
+        .map(|index| SeedUnit {
+            fingerprint_dir: format!("debug/.fingerprint/cfg-if-{index:016x}"),
+            role: SeedRole::Lib,
+            target: "cfg_if".to_owned(),
+            join: SeedJoin {
+                path: format!("debug/deps/cfg_if-{index:016x}.d"),
+                targets: vec![format!("debug/deps/cfg_if-{index:016x}.d")],
+                inputs: inputs.clone(),
+                digest: "a".repeat(64),
+            },
+            files: vec![SeedFile {
+                path: format!("debug/deps/lib{index}.rmeta"),
+                size: 1,
+                mtime_ms: 0,
+                digest: "b".repeat(64),
+                kind: SeedFileKind::Artifact,
+            }],
+        })
+        .collect();
+    let selectors: Vec<SeedUnitRef> = catalog.packages[0]
+        .units
+        .iter()
+        .map(|unit| SeedUnitRef {
+            fingerprint_dir: unit.fingerprint_dir.clone(),
+            role: SeedRole::Lib,
+        })
+        .collect();
+    // Eight units hold exactly the 32,768 plan-wide bound.
+    assert!(plan_units(&catalog, &selectors[..8]).is_ok());
+    // A ninth unit takes the plan past it.
+    assert!(matches!(
+        plan_units(&catalog, &selectors),
+        Err(SeedSkipReason::PlanCap)
+    ));
+}
+
+#[test]
 fn seed_refuses_an_unestablishable_donor_path_instead_of_skipping() {
     reset_hooks();
     let rig = Rig::new("donor-path-symlink");
@@ -1924,11 +2011,16 @@ fn join_parser_accepts_rustc_shapes_and_refuses_others() {
     // Rule and input counts are bounded.
     let many_rules = "out: in\n".repeat(join::MAX_JOIN_TARGETS + 1);
     assert_eq!(join::parse(many_rules.as_bytes()), Err(JoinRefusal::Budget));
+    // The per-unit input bound is exactly 4,096: one more is a budget refusal
+    // and exactly the bound parses.
     let many_inputs = format!("out: {}\n", "a ".repeat(join::MAX_JOIN_INPUTS + 1));
     assert_eq!(
         join::parse(many_inputs.as_bytes()),
         Err(JoinRefusal::Budget)
     );
+    let at_input_cap = format!("out: {}\n", "a ".repeat(join::MAX_JOIN_INPUTS));
+    let parsed = join::parse(at_input_cap.as_bytes()).expect("input cap");
+    assert_eq!(parsed.inputs.len(), join::MAX_JOIN_INPUTS);
 }
 
 #[test]
@@ -2040,6 +2132,18 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     unit.files.retain(|file| file.path != ARTIFACT);
     unit.join.targets.retain(|target| target != ARTIFACT);
     assert!(no_artifact.validate().is_err());
+    // A unit's `.d` may record at most 4,096 inputs: one more is invalid and
+    // exactly the bound is accepted.
+    let mut too_many_inputs = catalog.clone();
+    too_many_inputs.packages[0].units[0].join.inputs = (0..=SEED_MAX_UNIT_INPUTS)
+        .map(|i| format!("/fixture/src/{i}.rs"))
+        .collect();
+    assert!(too_many_inputs.validate().is_err());
+    let mut at_input_cap = catalog.clone();
+    at_input_cap.packages[0].units[0].join.inputs = (0..SEED_MAX_UNIT_INPUTS)
+        .map(|i| format!("/fixture/src/{i}.rs"))
+        .collect();
+    assert!(at_input_cap.validate().is_ok());
     // The catalog's own byte ceiling is enforced before parsing.
     assert!(SeedCatalog::parse(&vec![b' '; SEED_CATALOG_MAX_BYTES + 1]).is_err());
 }

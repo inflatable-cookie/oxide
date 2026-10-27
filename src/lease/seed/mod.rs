@@ -93,7 +93,8 @@ pub use catalog::{
     digest as catalog_digest, SeedAttemptState, SeedCatalog, SeedFile, SeedFileKind, SeedJoin,
     SeedPackage, SeedProducer, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind,
     SeedSourceRoot, SeedUnit, SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_FILES,
-    SEED_MAX_PACKAGES, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
+    SEED_MAX_PACKAGES, SEED_MAX_PLAN_INPUTS, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS,
+    SEED_MAX_UNITS_PER_PACKAGE, SEED_MAX_UNIT_INPUTS,
 };
 pub use join::{JoinRefusal, ParsedJoin};
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
@@ -411,6 +412,13 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         return Ok(SeedOutcome::Skipped(SeedSkip {
             reason: SeedSkipReason::Unsupported,
         }));
+    }
+    // The removable gate comes before any lock outcome: brief v2 requires the
+    // unsupported reason for a removable pool, never a donor-lock skip or a
+    // lock refusal. The backend is read from the config alone, without the pool
+    // lock and without touching any payload.
+    if !internal_backend(&super::pool::recorded_backend(pool)?) {
+        return Ok(skip(SeedSkipReason::RemovablePoolUnsupported));
     }
     // The donor's record lock is the front door's lock for exactly the record
     // the plan names: `<pool>/oxide-managed/locks/<record_id>.lock`. A caller
@@ -842,6 +850,7 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
     let mut files: Vec<PlannedFile> = Vec::new();
     let mut seen_paths = std::collections::BTreeSet::new();
     let mut seen_units = std::collections::BTreeSet::new();
+    let mut join_inputs = 0usize;
     for wanted in units {
         if !seen_units.insert((wanted.fingerprint_dir.as_str(), wanted.role)) {
             return Err(SeedSkipReason::PlanCap);
@@ -852,6 +861,10 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
             .flat_map(|package| package.units.iter())
             .find(|unit| unit.fingerprint_dir == wanted.fingerprint_dir && unit.role == wanted.role)
             .ok_or(SeedSkipReason::UnitMissing)?;
+        join_inputs = join_inputs.saturating_add(unit.join.inputs.len());
+        if join_inputs > SEED_MAX_PLAN_INPUTS {
+            return Err(SeedSkipReason::PlanCap);
+        }
         let artifacts: Vec<String> = unit
             .files
             .iter()
@@ -881,6 +894,9 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
     if logical_bytes > SEED_MAX_PLAN_BYTES {
         return Err(SeedSkipReason::PlanCap);
     }
+    // The running check above is §8.1's plan-wide join input bound: 32,768
+    // rule inputs across every selected unit's `.d`, on top of each unit's own
+    // 4,096.
     Ok(Plan {
         units: units.len(),
         files,
