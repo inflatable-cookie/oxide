@@ -12,6 +12,7 @@
 
 mod backing;
 mod pool;
+pub mod seed;
 
 use crate::owned_delete::{
     capture_entry, capture_planned, descriptor_identity, names_of, observe_entry,

@@ -1235,6 +1235,12 @@ in-slot "reset" path at all. The outcome classes are:
   leaves the previous state (`intent`) or the origin, both non-trusted and
   non-publishable.
 
+> **Implementation note (freeze amendment `eccede9f`).** Slice 2 takes the
+> point of no return to be the first write of any kind into the recipient,
+> including directory creation: before it a fault skips; from it onward a
+> fault refuses and retains, while a failed recipient walk still abandons and
+> cold-builds in a newly admitted slot.
+
 **Refuse-path boundaries (release, flush, rebind, accounting).** Because the
 refusal path takes no second lease, each boundary is named once:
 
@@ -1460,6 +1466,15 @@ build:
   seeding path's precondition; a command that seeds nothing keeps today's
   behaviour exactly. Unifying the start gate for every command would be a
   separate scoped change, and this design does not make it.
+
+> **Implementation note (Oxide Supervisor ruling, PR #159 head `394c0c6`).**
+> Slice 2 implements the internal `directory-budget-v1` gate and seeding path
+> under the Standard tier. Until **Elevated slice 4** lands with its
+> removable-media native case, an `apfs-volume-v1` pool is a fail-closed
+> seeding skip reported as "seeding not yet supported on a removable pool", and
+> the command takes the normal cold build; no removable payload is read or
+> written on the slice-2 paths. The removable bullet above is unchanged and
+> remains the eventual contract that slice 4 must satisfy.
 
 The pool budget stays soft: a started command's seed may pass the cap exactly
 as its Cargo may, and the seed's bytes are visible to the next admission. The
@@ -1833,6 +1848,17 @@ anything it cannot prove it owns and never starts Cargo on unverified state.
 
 Each slice needs its own approved Queue brief, risk tier and covering checks.
 This design mints none of that.
+
+> **Implementation note (Oxide Supervisor ruling, PR #159 head `394c0c6`).**
+> Slice 2 is implemented for the internal `directory-budget-v1` pool under the
+> Standard tier. Its removable `apfs-volume-v1` custody is reassigned to one
+> **Elevated slice 4** that lands the removable support code together with the
+> fixed proof script and its removable-media native case in the same slice —
+> not as a separate support slice followed by a proof slice. The knowledge
+> slice follows it. The frozen eventual behaviour of §§6–8 is unchanged: this
+> is a slice and validation reassignment, not a contract change. Slice 2
+> reports an `apfs-volume-v1` pool as the skip "seeding not yet supported on a
+> removable pool" and takes the normal cold build until slice 4 lands.
 
 ## 16. Proof plan
 
