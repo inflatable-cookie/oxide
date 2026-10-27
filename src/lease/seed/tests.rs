@@ -15,7 +15,9 @@ use super::super::{
 };
 use super::*;
 use std::cell::{Cell, RefCell};
+use std::ffi::{CStr, OsString};
 use std::fs::{self, OpenOptions};
+use std::os::fd::BorrowedFd;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -43,6 +45,8 @@ thread_local! {
     static RACE_DESTINATION: Cell<bool> = const { Cell::new(false) };
     static CLONE_FAULT: Cell<Option<(usize, bool)>> = const { Cell::new(None) };
     static CATALOG_FAULT: Cell<Option<bool>> = const { Cell::new(None) };
+    static VANISH_ENTRY: RefCell<Option<OsString>> = const { RefCell::new(None) };
+    static AFTER_VISIT_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// The injected clone-operation interruption, if this thread set one: `true`
@@ -57,6 +61,26 @@ pub(super) fn clone_fault(index: usize, after_call: bool) -> Option<LeaseError> 
 pub(super) fn catalog_fault(after_rename: bool) -> Option<LeaseError> {
     (CATALOG_FAULT.with(Cell::get) == Some(after_rename))
         .then(|| LeaseError::Io("injected catalog-write interruption".to_owned()))
+}
+
+/// Remove a listed entry between the directory read and its classification,
+/// so the walk meets a vanished entry exactly as a concurrent writer can.
+pub(super) fn walk_before_stat(directory: BorrowedFd<'_>, name: &CStr) {
+    let armed = VANISH_ENTRY.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|armed| armed.as_bytes() == name.to_bytes())
+    });
+    if armed {
+        // SAFETY: the descriptor and the name are live for the call.
+        unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    }
+}
+
+/// A deterministic elapsed-time delay after the walk's visit, so the
+/// completion-path deadline check can be exercised.
+pub(super) fn after_visit_delay() {
+    sleep_opt(AFTER_VISIT_DELAY_MS.with(Cell::get));
 }
 
 pub(super) fn walk_limits_override() -> Option<SeedWalkLimits> {
@@ -82,6 +106,8 @@ fn reset_hooks() {
     RACE_DESTINATION.with(|cell| cell.set(false));
     CLONE_FAULT.with(|cell| cell.set(None));
     CATALOG_FAULT.with(|cell| cell.set(None));
+    VANISH_ENTRY.with(|cell| *cell.borrow_mut() = None);
+    AFTER_VISIT_DELAY_MS.with(|cell| cell.set(None));
 }
 
 pub(super) fn inject(point: TestPoint<'_>) {
@@ -1717,6 +1743,57 @@ fn seed_abandons_on_an_unreadable_recipient_entry() {
         .join(&donor.files[0].0)
         .exists());
     assert_eq!(rig.sidecars(), before_sidecars);
+}
+
+#[test]
+fn seed_abandons_when_a_listed_recipient_entry_vanishes() {
+    reset_hooks();
+    let rig = Rig::new("walk-vanished");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let before_sidecars = rig.sidecars();
+    // The artifact disappears between the directory read and its stat, exactly
+    // as a concurrent writer can make it: the walk cannot establish coverage,
+    // so seeding abandons instead of publishing.
+    let name = ARTIFACT.rsplit('/').next().expect("artifact name");
+    VANISH_ENTRY.with(|cell| *cell.borrow_mut() = Some(OsString::from(name)));
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    let SeedOutcome::Abandoned(abandon) = outcome else {
+        panic!("expected an abandoned seed, got {outcome:?}");
+    };
+    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::Vanished));
+    assert!(!abandon.observation.complete());
+    assert_eq!(rig.sidecars(), before_sidecars);
+    // The recipient is retained untrusted, not published.
+    assert!(grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
+}
+
+#[test]
+fn seed_abandons_when_the_walk_deadline_expires_at_completion() {
+    reset_hooks();
+    let rig = Rig::new("walk-deadline");
+    let donor = make_donor(&rig, "a");
+    let (_, recipient) = lease_recipient(&rig, "a");
+    // The walk finishes its visit inside a 10 ms bound and the budget elapses
+    // before the completion check: the observation is not complete.
+    WALK_LIMITS.with(|cell| {
+        cell.set(Some(SeedWalkLimits {
+            max_entries: SEED_WALK_MAX_ENTRIES,
+            max_depth: SEED_WALK_MAX_DEPTH,
+            max_elapsed_ms: 10,
+        }))
+    });
+    AFTER_VISIT_DELAY_MS.with(|cell| cell.set(Some(30)));
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    let SeedOutcome::Abandoned(abandon) = outcome else {
+        panic!("expected an abandoned seed, got {outcome:?}");
+    };
+    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::Deadline));
+    assert_eq!(abandon.observation.limits.max_elapsed_ms, 10);
 }
 
 #[test]

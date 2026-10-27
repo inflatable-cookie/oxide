@@ -45,6 +45,9 @@ pub enum WalkGap {
     Unreadable,
     ForeignOwner,
     UnexpectedType,
+    /// A listed entry disappeared before it could be classified, so the walk
+    /// did not establish coverage of it.
+    Vanished,
 }
 
 impl WalkGap {
@@ -57,6 +60,7 @@ impl WalkGap {
             Self::Unreadable => "unreadable",
             Self::ForeignOwner => "foreign-owner",
             Self::UnexpectedType => "unexpected-type",
+            Self::Vanished => "vanished",
         }
     }
 }
@@ -118,7 +122,16 @@ pub fn walk_slot_in(
         }
         Ok(root_stat) if root_stat.st_uid != current_uid() => walk.stop(WalkGap::ForeignOwner),
         Ok(root_stat) if root_stat.st_dev as u64 != device => walk.stop(WalkGap::DeviceBoundary),
-        Ok(_) => walk.visit(root, 0),
+        Ok(_) => {
+            walk.visit(root, 0);
+            #[cfg(test)]
+            super::tests::after_visit_delay();
+            // The bound is checked on the completion path too: a walk whose
+            // budget elapsed while it finished is not a complete observation.
+            if walk.gap.is_none() && walk.out_of_time() {
+                walk.stop(WalkGap::Deadline);
+            }
+        }
         Err(_) => walk.stop(WalkGap::Unreadable),
     }
     WalkOutcome {
@@ -133,7 +146,7 @@ pub fn walk_slot_in(
 /// Whether an owned directory has no entries at all. Used for the recipient's
 /// `build/` precondition: Finder metadata is an entry too.
 pub fn directory_is_empty(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
-    Ok(list_names(fd, 1)?.is_empty())
+    Ok(list_names(fd, 1, None)?.is_empty())
 }
 
 struct Walk {
@@ -175,13 +188,21 @@ impl Walk {
         self.started.elapsed() > self.deadline
     }
 
+    fn deadline_at(&self) -> Option<Instant> {
+        self.started.checked_add(self.deadline)
+    }
+
     fn visit(&mut self, directory: BorrowedFd<'_>, depth: usize) {
         if self.gap.is_some() {
             return;
         }
         let remaining = self.limits.max_entries.saturating_sub(self.entries);
-        let names = match list_names(directory, remaining) {
+        let names = match list_names(directory, remaining, self.deadline_at()) {
             Ok(names) => names,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                self.stop(WalkGap::Deadline);
+                return;
+            }
             Err(_) => {
                 self.stop(WalkGap::Unreadable);
                 return;
@@ -200,9 +221,16 @@ impl Walk {
                 self.stop(WalkGap::EntryLimit);
                 return;
             }
+            #[cfg(test)]
+            super::tests::walk_before_stat(directory, &name);
             let entry = match stat_at(directory, &name) {
                 Ok(entry) => entry,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                // A listed entry that vanished before classification leaves the
+                // walk without coverage of it: incomplete, never clean.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.stop(WalkGap::Vanished);
+                    return;
+                }
                 Err(_) => {
                     self.stop(WalkGap::Unreadable);
                     return;
@@ -324,7 +352,11 @@ pub(super) fn open_regular(directory: &BorrowedFd<'_>, name: &CStr) -> std::io::
 /// `remaining` more names than the caller may still visit. A `readdir` failure
 /// is an error, never an empty or complete directory: `errno` is cleared before
 /// each call and checked after a null result.
-fn list_names(directory: BorrowedFd<'_>, remaining: u64) -> std::io::Result<Vec<CString>> {
+fn list_names(
+    directory: BorrowedFd<'_>,
+    remaining: u64,
+    deadline: Option<Instant>,
+) -> std::io::Result<Vec<CString>> {
     // fdopendir owns its descriptor, so hand it a duplicate.
     // SAFETY: `directory` is live.
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
@@ -340,6 +372,14 @@ fn list_names(directory: BorrowedFd<'_>, remaining: u64) -> std::io::Result<Vec<
     }
     let mut names = Vec::new();
     loop {
+        if deadline.is_some_and(|deadline| Instant::now() > deadline) {
+            // SAFETY: `stream` is live and not used again; it closes `duplicate`.
+            unsafe { libc::closedir(stream) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "walk deadline",
+            ));
+        }
         clear_errno();
         // SAFETY: `stream` is a live directory stream.
         let entry = unsafe { libc::readdir(stream) };
