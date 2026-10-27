@@ -323,17 +323,50 @@ fn a_registry_package_derives_its_tree_and_hits_the_cache_without_rereading_the_
     assert_eq!(second.digest, first.digest);
     assert_eq!(second.content_bytes, first.content_bytes);
 
-    // A hit never opens the archive: its identity is unchanged and the bytes
-    // are unreadable, which a full derivation could not survive.
+    // §4.3 lists an unreadable archive among the identity changes that force a
+    // full re-derivation or a skip. A hit opens the archive (no follow) to
+    // establish readability and identity, reading no content byte, so an
+    // archive that loses read access refuses instead of hitting.
     fs::set_permissions(&fixture.archive, fs::Permissions::from_mode(0o000))
         .expect("make the archive unreadable");
-    let third = fixture
-        .verify(&mut cache)
-        .expect("hit without an archive read");
-    assert!(third.cache_hit);
-    assert_eq!(third.digest, first.digest);
+    assert_eq!(
+        fixture.verify(&mut cache).err(),
+        Some(Refusal::ArchiveUnreadable)
+    );
     fs::set_permissions(&fixture.archive, fs::Permissions::from_mode(0o644))
         .expect("restore archive mode");
+    let third = fixture.verify(&mut cache).expect("hit once readable again");
+    assert!(third.cache_hit);
+    assert_eq!(third.digest, first.digest);
+}
+
+#[test]
+fn a_cache_hit_binds_the_archive_identity_and_does_not_read_its_bytes() {
+    // The design's stated cooperative residual: a same-user rewrite that
+    // preserves the archive's device, inode, size and mtime is not detected by
+    // a hit, because a hit deliberately reads no archive content. Overwriting
+    // the bytes in place with the same length and restoring the mtime proves
+    // the hit path never consulted them; a fresh cache on the same bytes does
+    // re-derive and refuses.
+    let fixture = PackageFixture::create("cache-identity", &simple_files());
+    let mut cache = fixture.cache();
+    let first = fixture.verify(&mut cache).expect("first verification");
+    let metadata = fs::metadata(&fixture.archive).expect("archive metadata");
+    let modified = metadata.modified().expect("archive mtime");
+    let size = metadata.len();
+    fs::write(
+        &fixture.archive,
+        vec![0_u8; usize::try_from(size).expect("archive size")],
+    )
+    .expect("rewrite the archive in place");
+    set_mtime(&fixture.archive, modified);
+    let hit = fixture.verify(&mut cache).expect("identity-bound hit");
+    assert!(hit.cache_hit);
+    assert_eq!(hit.digest, first.digest);
+    assert!(
+        fixture.verify(&mut fixture.cache()).is_err(),
+        "a fresh derivation sees the changed bytes"
+    );
 }
 
 #[test]
