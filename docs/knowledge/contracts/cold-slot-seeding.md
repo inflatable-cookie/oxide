@@ -9,6 +9,20 @@ exact-head design review, then stop for the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 merge hold are separate and unchanged.
 
+**Revision 2** answers the CHANGES REQUIRED review of `62d05c36` (review
+comment `6449252752`, 2026-10-27). The amendments are: a complete per-role Cargo
+unit manifest including the fingerprint directory's encoded dep-info (§4.2,
+§5.1); registry source verification through the cached archive bytes and a
+canonical archive-to-tree comparison instead of a self-declared checksum file
+(§4.3); per-file content hashes recorded from the closed producing epoch and
+revalidated at donation (§4.4, §6.3); a durable unseeded condition so a seeded
+recipient can never publish a catalog (§4.1); a bounded producer-context digest
+covering the compiler, wrapper, flag, profile, config and environment inputs
+Cargo does not fully vouch for (§3); a reserve start gate plus monitored stop
+during clone and reset, with the removable path separated (§8.3); and the real
+SQLite/`cc`/`OUT_DIR` proof retained with a source-derived time and disk
+allocation (§16). Each finding is dispositioned in §3.2.
+
 Written against clean pushed `main` at
 `cec65daff49a2961c9b9d1dd2cad235251c02e48`. Every `file:line` anchor below is
 against that commit; re-check the anchors before trusting them after any
@@ -73,6 +87,10 @@ Checked against the design input. "Read" means this design reads the fact;
 | Control-state numeric fences | `store.rs:65-83` (`STATE_VERSION = 5`), `store.rs:116-117`, `store.rs:79-80` | **Not bumped** in this design (§9.4), with an explicit stop condition if a field turns out to be required. |
 | Slot origin (checkout, content, anchor, uncertain paths) and `Built` | `store.rs:251-259`; `src/bin/oxide/freshness.rs:168-200`; `store.rs:3577-3591` (`trusted_origin` needs a matching `mark`) | Read, never widened. It remains the only trust record for reuse. |
 | Cargo identity | `freshness.rs:75-84` (`VERIFIED_CARGO`), `freshness.rs:419-445` (`verified_cargo`) — probed per command, **not persisted** | Recorded explicitly in the new donor catalog; legacy slots have no such fact and are not donors. |
+| Encoded dep-info in the fingerprint directory | Cargo's `.fingerprint/<pkg>-<hash>/dep-<kind>-<target>`, marker `01 00 00 00 ff`, version 1; the repository's own bounded reader documents the format (`src/dep_info.rs:1-30`) and the version-matrix proof decodes every `dep-*` file (`workflow.md#cargo-version-matrix`) | Part of every offered unit's manifest (§4.2, §5.1); a unit without it is not offered. |
+| Cargo configuration and environment that Cargo does not fully fingerprint | `workflow.md#cargo-version-matrix` names `build.rustc`, `CARGO_BUILD_RUSTC`, `RUSTC_WORKSPACE_WRAPPER` and a kept wrapper as outside the slot key | A bounded context digest over the named environment variables and config tables must be equal on both sides; anything unsupported skips (§3). |
+| Registry source integrity | Cargo verifies the downloaded `.crate` bytes against the lock checksum and writes `.cargo-ok` after unpack (`cargo-1.97.1/c980f4866` `sources/registry/download.rs`, `sources/registry/mod.rs`); it does **not** keep a per-file manifest for registry trees | Verification goes through the cached archive bytes and a canonical archive-to-tree comparison, not a self-declared checksum file (§4.3). |
+| Host reserve watchdog | `store.rs:49-53` (`HOST_RESERVE_BYTES` 20 GiB at creation), `src/bin/oxide/watchdog.rs:22-30` (22 GiB trigger, `MARGIN_BYTES`), `store.rs:1716-1726` (removable pool uses a removal-only watchdog), `store.rs:4028-4038` | The seed has its own start gate and monitored stop at the same trigger; a breach or unknown reading refuses, never a cold fallback (§8.3). |
 | rustc identity | Digested into the key at `identity.rs:41-61`; not independently recoverable | The in-memory `rustc -vV` text of the current command is kept for the seed identity; the catalog records its digest. No key change. |
 | Slot ledger: incarnation, state, rank, `last_lease_id`, recorded size | `src/lease/pool.rs:154-215`; `src/lease/mod.rs:343-420` | Read for donor eligibility and generation binding. No ledger field or format change. |
 | New-slot creation (empty `<slot>/build` only) | `pool.rs:1128-1185` | The recipient precondition: a new record's slot directory is created empty with exactly one `build/` entry. |
@@ -88,7 +106,6 @@ Checked against the design input. "Read" means this design reads the fact;
 | Child temporary directory `<slot>/scratch` | `src/bin/oxide/child_temp.rs:66-180`, `child_temp.rs:317`; `workflow.md#child-temporary-files-oxide136` | Untouched; `build/` and `scratch/` are disjoint. |
 | Command budgets | `workflow.md#command-time-budgets-oxide140`; `src/bin/oxide/budget.rs` | Seeding runs inside the admission window and never extends it (§8.3). |
 | Hand-off / installer capability | `src/bin/oxide/handoff.rs:7-53` | No numeric version change, so no capability or receipt change (§9.4). |
-| Host reserve watchdog | `store.rs:49-53` (`HOST_RESERVE_BYTES`), `src/bin/oxide/watchdog.rs` | Sampled around the seed; a reserve breach skips the seed (§8.3). |
 
 ## 3. Seed compatibility, separate from slot leasing
 
@@ -112,11 +129,14 @@ known for the recipient command. Anything missing, malformed or unknown is
 | Target triple (explicit `--target`, else host) | retained | Different target, different artifacts. |
 | Oxide recipe key (`quick:dev-recipe-2`, `debug:dev-recipe-2`, `release`) | retained | Profile/recipe is in the key today. |
 | Backend (`directory-budget-v1`, `apfs-volume-v1`) | retained | Different failure and flush semantics. |
-| Inherited rustc-wrapper policy (bypass / allowed) | retained (new fact) | A wrapper can change outputs. |
-| `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `RUSTDOCFLAGS` (present/absent and exact value digest) | retained (new fact) | Content-affecting; recorded, not inferred. |
-| Verified Cargo home path used for registry/git sources | retained (new fact) | Cloned `.d`/fingerprint entries name absolute source paths. |
-| Command family (`check`-like, `build`-like, `doc`) | retained (new fact) | `check` and `build` units are different units. |
-| Producing slot generation (`last_lease_id`, incarnation) | retained | The catalog is bound to exactly one idle generation (§4.6). |
+| Compiler selection: `RUSTC` value and `rustc -vV` digest | retained (new fact); `build.rustc` or `CARGO_BUILD_RUSTC` present on either side | `workflow.md#cargo-version-matrix` records that the slot key does not represent a compiler taken from Cargo config or `CARGO_BUILD_RUSTC`. A configured compiler is therefore **unsupported**: the package set is skipped, never assumed equal |
+| Wrapper context: the default bypass policy only | retained (new fact); a kept inherited wrapper (`OXIDE_ALLOW_RUSTC_WRAPPER=1`), any `RUSTC_WRAPPER`/`CARGO_BUILD_RUSTC_WRAPPER`, or any `RUSTC_WORKSPACE_WRAPPER`/`CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` | A wrapper can change compiled output arbitrarily and its identity is not bounded by reading one file (a script may run more tools). v1 seeds only under the bypass policy; everything else skips |
+| Compiler flags: `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_BUILD_RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTDOCFLAGS` | retained (new fact), exact value digest and presence | Content-affecting; recorded, not inferred |
+| Profile and target overrides: `CARGO_PROFILE_*` and `CARGO_TARGET_*` beyond the recipe's own variables | **unsupported** | Oxide's own recipe variables are already in the recipe key; a caller override is not represented and skips |
+| Bounded Cargo configuration context digest (§3.1) | retained (new fact), equal on both sides | The merged config can change the compiler, flags, linker, profile, `[env]` or source resolution; anything unsupported or unreadable skips |
+| Verified Cargo home path used for registry/git sources | retained (new fact) | Cloned `.d` and fingerprint entries name absolute source paths |
+| Command family (`check`-like, `build`-like, `doc`) | retained (new fact) | `check` and `build` units are different units |
+| Producing slot generation (`last_lease_id`, incarnation) and the durable unseeded fact | retained | The catalog is bound to exactly one idle, **unseeded** generation (§4.1, §4.6) |
 | Project identity, checkout path, compatibility digest | **ignored** | Deliberately not donor dimensions: only dependency intermediates move, and their content is fixed by locked source + toolchain, not by the checkout. |
 | Owned-output destination | **ignored** | Finals never move; the recipient's own placement decides its own outputs. |
 | Feature selection, `--all-targets`, `-p`, test/bench flags | **not predicted** | Cargo's own fingerprint components decide; unmatched copies stay inert (§4.5). |
@@ -135,7 +155,41 @@ converted checkout — may donate to each other's dependency units. Nothing abou
 finals moves: the recipient's own placement still decides where its binaries,
 tests and uplifts go, and the donor's links, receipts and roots are untouched.
 
-### 3.1 Prior review findings, resolved or dispositioned
+### 3.1 The producer-context digest
+
+Cargo's own unit fingerprint binds the compiler hash, resolved flags, profile,
+features, dependencies, target and path. It does **not** promise to bind the
+whole inherited environment, and `workflow.md#cargo-version-matrix` names
+exactly the inputs the slot key misses: `build.rustc`, `CARGO_BUILD_RUSTC`,
+`RUSTC_WORKSPACE_WRAPPER` and a kept inherited wrapper. So the seed predicate
+also requires a **context digest** that both sides compute from the same fixed
+key set, and anything it cannot read or represent makes the packages that
+depend on it ineligible (in v1: the whole seed skips).
+
+The digest is SHA-256 over an ordered, canonical `key = value` record list and
+covers:
+
+- the environment variables named in the table above, each as
+  `absent` or a hex digest of its exact bytes (no shell expansion);
+- the Cargo configuration Cargo itself would merge for the command: the
+  checkout's ancestor chain up to the account home plus `$CARGO_HOME/config`
+  and `$CARGO_HOME/config.toml` (every existing regular file of those names, no
+  symlink followed), parsed with the repository's `basic-toml` dependency and
+  reduced to the `[build]`, `[profile]`, `[target]`, `[env]` and `[net]`
+  tables — the tables that can change compiler selection, flags, linker,
+  profile settings, build-script environment or source identity;
+- the presence of `[source]`, `[patch]`, `[registries]` or `[unstable]`
+  anywhere in those files, and any `--config` argument, as **unsupported**
+  (skip);
+- the `registries`/`replace-with` machinery is likewise unsupported.
+
+Bounds: at most 8 config files, 4 MiB of config bytes and 128 KiB of rendered
+key records; an unreadable, unparseable, oversized or duplicated-key file,
+and any table the adapter does not model, skips. The catalog records the
+digest together with the file list (relative-to-home paths only), so a
+reviewer can see what was compared. Tests use synthetic configs only.
+
+### 3.2 Prior review findings, resolved or dispositioned
 
 | `0ca2bd7f` finding | Disposition in this design |
 | --- | --- |
@@ -146,7 +200,17 @@ tests and uplifts go, and the donor's links, receipts and roots are untouched.
 | 5. One recipient transaction, never import donor trust | Durable untrusted origin, clone-then-verify, reset-or-refuse, no staging protocol (§6). |
 | 6. Freeze custody at the integration point | Seed point after the nine-grant lease and output binding, before `mark_spawning`; library-scoped donor pin and pool lock (§6.1, §7). |
 | 7. Bounded facts and a deliberate older-binary fence | Separate generation-bound sidecars, strict caps, no control/ledger field and an explicit stop condition if one is needed (§9). |
-| 8. Bounds and executable feasibility | Finite bounds table, honest per-inode accounting and a source-derived (UNMEASURED) proof allocation (§8, §16.3). |
+| 8. Bounds and executable feasibility | Finite bounds table, honest per-inode accounting and a source-derived (UNMEASURED) proof allocation (§8, §16.4). |
+
+| `6449252752` finding (revision 2) | Amendment |
+| --- | --- |
+| 1. Whitelist cannot produce a fresh unit: encoded dep-info missing | §4.2 and §5.1 now freeze the complete per-role manifest: the fingerprint hash file, its `.json`, and Cargo's encoded `dep-<kind>-<target>` entry (marker `01 00 00 00 ff`, version 1 — the format the repository's own `src/dep_info.rs` documents and the version-matrix proof decodes), plus the role's artifacts. A unit whose triple is incomplete is not offered; a fingerprint-directory entry that cannot be classified, or a `dep-*` entry that does not match exactly one offered unit, makes the package ineligible. Any extra or missing entry therefore fails closed instead of yielding a stale-for-Cargo copy. |
+| 2. Registry integrity was not archive-bound | §4.3 replaces `.cargo-checksum.json`. The cached `.crate` archive's bytes are hashed against the lock checksum, and the extracted tree is compared entry-by-entry against a canonical derivation of that authenticated archive (strict regular-file/directory grammar; symlinks, hardlinks, special entries, absolute or `..` paths, duplicate paths and extra/missing/extracted-only entries all fail closed). `.cargo-ok` is Cargo's unpack marker and is never treated as evidence. Verification runs before and after the producing command and again at donation, with a bounded verification cache keyed by archive checksum and tree identity. |
+| 3. The catalog did not prove the current donor artifacts are the produced ones | §4.4 records a SHA-256 for every offered file, computed from the closed producing epoch, and §6.3 revalidates every offered donor file against those hashes under the donor pin and then verifies the clone against the same authenticated manifest. A changed file is an unknown donor: the whole seed is abandoned, not partially offered. |
+| 4. A seeded recipient could publish a wrong catalog | §4.1 makes the unseeded condition a durable fact: a per-generation seed-attempt record, written before candidate reads and before the first clone, and no catalog is published unless that record is absent or terminal `skipped`/`reset`. A command that seeded anything publishes nothing, and a native regression proves a successfully seeded recipient never donates. |
+| 5. Compatibility omitted effective producer inputs | §3 and §3.1 add the compiler selection, wrapper context, full flag set, profile/target overrides and a bounded Cargo configuration digest, with every unreadable, unsupported or unrepresentable fact skipping. |
+| 6. Reserve handling turned an unsafe start into a cold build | §8.3 now gives the seed its own start gate at the existing 22 GiB watchdog trigger (`HOST_RESERVE_BYTES` + `MARGIN_BYTES`) and monitors at the watchdog's own cadence during clone and reset; a below-trigger, unknown or lost reading aborts the seed and **refuses the command before any child**, never a cold build. The removable path keeps its own removal-only watchdog and registration reserve instead of the internal space trigger. |
+| 7. The plan replaced the required SQLite fixture | §16.2 keeps the real `libsqlite3-sys`-with-`bundled`-SQLite case and §16.4 supplies a source-derived time and disk allocation, including staging, seeded Cargo home, two coexisting slots, the owned image, fixtures and cleanup, with a fit gate that stops and reports instead of trimming a case. |
 
 ## 4. Unit provenance: the producing epoch and the donor catalog
 
@@ -154,7 +218,10 @@ Review finding 1–3 of `0ca2bd7f` are the reason this section exists: Cargo
 identity is probed rather than recorded, `Cargo.lock` does not map packages to
 unit directories, and a git cache can be dirty during the producing build.
 Architect binding `bb151a59` then restricted v1 to the on-disk subset and
-required the partial-association framing.
+required the partial-association framing. The `6449252752` findings sharpen the
+same boundaries: a unit manifest that omits Cargo's fingerprint-dir encoded
+dep-info is not usable, and an archive check that only reads a tree's own
+checksum file proves nothing.
 
 ### 4.1 Only an empty producing epoch produces a catalog
 
@@ -166,12 +233,24 @@ A slot qualifies as a *producing epoch* only when all of the following hold:
    view of that fact (`store.rs:3356`). Every file the catalog can list was
    therefore written by this producing build, which is also why no file is
    ever stamped with a later Cargo identity than the one it was built with.
-2. The primary child was Cargo itself (not `exec`, not an external
+2. The generation is **unseeded**, durably. A per-generation seed-attempt
+   record (§9.1) is written before the first candidate read and before the
+   first clone; a catalog is published only when that record is absent or
+   records the terminal state `skipped`/`reset` (a lingering `intent` is never
+   eligible). A generation whose record
+   says `seeded` never publishes, even though it began empty: Cargo may have
+   left the offered variants untouched and its workspace units rebuilt, so the
+   record's files would be a donor's units described by this command's source
+   and tool identity. This is the brief's empty **unseeded** producer rule, and
+   it is durable rather than an in-memory flag, so a crash, a skipped seed, a
+   failed seed, a former donor's reuse or an older binary's use of the slot
+   cannot turn into a publication.
+3. The primary child was Cargo itself (not `exec`, not an external
    subcommand), the command family is a supported family, and the command
    succeeded.
-3. The command's own identity facts are recorded (§4.4) and its Cargo is a
-   verified release with the pinned adapter.
-4. The slot is being released with a recorded `Built` origin — i.e. the
+4. The command's own identity and context facts are recorded (§3.1, §4.4) and
+   its Cargo is a verified release with the pinned adapter.
+5. The slot is being released with a recorded `Built` origin — i.e. the
    existing trust record is written as usual.
 
 The accepted consequence (binding `d1f281eb`) is a **short donor lifetime**:
@@ -199,6 +278,31 @@ The association rule for one package, applied on both sides independently:
 - the donor and recipient lock entries agree on version and on
   source-plus-checksum (registry) or source-plus-full-revision (git).
 
+**Unit and file association (the complete manifest).** The opaque package-id
+hash in `<profile>/.fingerprint/<pkg>-<16hex>/` is never predicted or
+recomputed: the directory is copied verbatim once its name prefix is the exact
+allowlisted package name and its suffix is exactly 16 lowercase hex digits.
+Inside it, a unit is identified by Cargo's own unit suffix `<kind>-<target>` (`lib-<target>` for a library or proc-macro,
+`build-script-build` for a build-script compile unit). The unit's complete
+manifest is exactly:
+
+- `<kind>-<target>` (the fingerprint hash file),
+- `<kind>-<target>.json` (the encoded fingerprint components), and
+- `dep-<kind>-<target>` (Cargo's encoded dep-info, marker `01 00 00 00 ff`,
+  version 1);
+
+plus the role's artifacts (§5.1). A unit is offered only when all three
+exist and are regular, owner-owned files. Within one offered package, every
+entry of its fingerprint directory must classify as one of: an offered unit's
+triple, an explicitly excluded run-unit or completion entry (§5.1), or a
+`deps/` artifact in the role whitelist. Anything else — an entry with an
+unknown suffix, a `dep-*` entry that matches no uniquely identified offered
+unit, a second `dep-*` for one suffix, a symlink, a directory or a
+metadata file — makes **the whole package** ineligible. That is deliberate:
+an incomplete manifest would be stale to Cargo (safe but useless), while a
+mis-associated one could present a neighbour's fingerprint under the offered
+unit's name. Both cases skip cold rather than guess.
+
 This is exactly the **partial association** binding `bb151a59` accepted: the
 file grammar plus name uniqueness plus verified source content, not a general
 package-to-artifact proof. If any of these facts is missing, the package is
@@ -207,39 +311,79 @@ skipped and the seed still proceeds for the packages that pass.
 ### 4.3 Source verification, including the git counterexample
 
 Source content is verified **before and after** the producing command, and
-again when the donor is used, always through the pinned registry/git adapter:
+again every time the donor is used, through the pinned registry/git adapter.
+The check must bind content to the lock, not to a directory's own claim:
 
-- registry: the extracted root's Cargo-written `.cargo-checksum.json` must
-  name the lock's package checksum, and every file it lists must hash to the
-  recorded value, over the full tree;
-- git: the checkout must be at the locked revision, `git status --porcelain`
-  empty, no declared submodule initialized or modified, and the tracked tree
-  digest recomputed from the index and worktree must match;
-- anything else (a bare checkout Cargo cannot resolve, an ambiguous
-  registry-index directory, an unreadable tree, a submodule, a tree over the
-  content cap) makes the package ineligible.
+- **registry.** The lock's `checksum` is the SHA-256 of the `.crate` archive
+  bytes; Cargo verifies exactly those bytes when it downloads and then writes
+  `.cargo-ok` after unpacking (`cargo-1.97.1/c980f4866`,
+  `sources/registry/download.rs` and `sources/registry/mod.rs`). The design
+  therefore hashes the cached archive at
+  `$CARGO_HOME/registry/cache/<index>/<name>-<version>.crate` against the lock
+  checksum, and derives the expected extracted tree **from those authenticated
+  archive bytes**, entry by entry, with a bounded reader: regular files and
+  directories only, `ustar`/pax/gnu long names accepted, and symlinks,
+  hardlinks, device nodes, duplicate paths, absolute paths, `..` components,
+  and any unparseable entry cause refusal. The extracted tree must then equal
+  that derivation exactly, modulo Cargo's own `.cargo-ok` marker, which is
+  never evidence: a tree entry absent from the archive, an archive entry
+  absent from the tree, a mode/executable-bit or content difference, or an
+  extra unrecognized entry fails closed. `.cargo-checksum.json` is not used
+  even when present, because it is a tree's self-declaration and Cargo does
+  not write it for registry extracts;
+- **archive reader adapter.** Deriving the tree needs gzip decompression and a
+  tar reader inside Oxide. v1 pins that as an adapter with two new pinned
+  dependencies (`flate2` with the Rust backend, and `tar` used only for
+  decompression and entry iteration), added with their locked versions and
+  covered by the implementation's staging seeder like every other dependency:
+  no runtime network access, no external process, no new daemon or config
+  key. If the project declines those dependencies, registry packages become
+  ineligible and only git dependencies seed; that is a scope narrowing and
+  must return to the Supervisor rather than being decided here;
+- **git.** The checkout must be at the locked revision, `git status
+  --porcelain` empty, no declared submodule initialized or modified, and the
+  tree digest recomputed from the index and the worktree must match. A dirty,
+  ambiguous, submodule-bearing or unreadable checkout makes the package
+  ineligible. Present cleanliness alone is never accepted as producing-build
+  evidence;
+- **uniform failures.** A missing cached archive (pruned cache, vendored or
+  source-replaced source), an ambiguous registry-index directory, an
+  unreadable or oversized tree, or a tree over the content cap makes the
+  package ineligible. Nothing is repaired, re-downloaded or fetched.
 
 The `0ca2bd7f` counterexample — a git cache checkout compiled while locally
 modified and restored afterwards — is handled by the producing-window rule,
 not by trusting present cleanliness:
 
 - the pre-verification runs after the freshness gate and before Cargo starts,
-  and records each eligible source file's size, mtime and content digest;
+  and records the package's canonical tree digest (sorted relative paths,
+  entry type, executable bit, size and content hash), which must equal the
+  archive-derived digest (registry) or the locked-revision digest (git);
 - the post-verification runs after Cargo's group closed and requires the same
-  digest set **and** that no eligible source file's mtime is later than the
+  digest **and** that no eligible source file's mtime is later than the
   producing start. A restore (git checkout, editor write, re-extraction)
   updates mtimes and therefore drops the package;
-- donation re-verifies the offered packages' trees to the digest recorded in
-  the catalog.
+- donation re-verifies the same digest for the offered packages, and a
+  mismatch drops the package (or, for the offered files themselves, abandons
+  the seed; §4.4, §6.3).
+
+**Verification cache.** Re-deriving every archive on every build would be
+unbounded work. A bounded sidecar (`oxide-managed/seeds/sources.json`, §9.1)
+records `(cargo_home, archive relative path, archive SHA-256, tree root
+device/inode, tree digest, verified-at)`; a record is used only when the
+archive hash still equals the lock checksum and the tree digest matches, so a
+hit skips the archive read but never the tree comparison. The cache is not a
+trust root: a different archive, tree identity or digest means re-derivation
+or skip. At most 64 MiB of archive-derived content is verified per producing
+build, in deterministic lock order; packages beyond that budget are simply not
+catalogued in that build.
 
 **Residual, stated plainly:** a same-user writer that modifies a source file
 during the producing build and restores the old content while preserving the
 original mtime and size is not detected. That is outside the cooperative
 foreground-workflow contract Oxide already relies on for closure, origins and
 `setsid` escapees; this design does not claim an adversarial same-user fence
-and does not present it as proven. Registry sources are further constrained by
-Cargo's own checksum manifest, which the producing build and the donation both
-re-read.
+and does not present it as proven.
 
 ### 4.4 What a donor catalog records (bounded)
 
@@ -249,22 +393,33 @@ Written while the producing lease is still held and before release, into
 
 - envelope: schema version, `store_id`, slot id, incarnation, producing
   `lease_id`, producing record id and use mark, producing start/finish wall
-  times;
-- producing identity: Cargo version, rustc digest, target, recipe key,
-  backend, adapter id, wrapper policy, the three flags digests, Cargo home,
-  command family and command class;
+  times, and the seed-attempt record's terminal state (§4.1);
+- producing identity and context: Cargo version, rustc digest and `RUSTC`
+  value, target, recipe key, backend, adapter id, the §3.1 context digest and
+  its config file list, the flag digests, Cargo home, command family and
+  command class;
 - per package: name, version, source string, checksum or full revision,
-  uniqueness evidence for the donor lock, source-root kind and recorded tree
-  digest, and the unit list;
+  uniqueness evidence for the donor lock, source-root kind, and the
+  **canonical source tree digest** verified at both ends of the producing
+  window (§4.3);
 - per unit: role (`lib`, `proc-macro`, `build-script-compile`), target name,
-  and the exact relative file list (fingerprint entries plus artifacts), each
-  with size and mtime at catalog time.
+  and the exact relative file list (the manifest of §4.2 plus the role's
+  artifacts), each with size, mtime and a **SHA-256 content digest computed
+  from the closed producing epoch**.
 
-Caps: 1 MiB per catalog, 2048 packages, 16,384 file entries, at most three
+The per-file digests are the donor stale-content check the brief requires.
+They are computed after Cargo's group closed and before the catalog is
+published, over the same file set the manifest names, bounded by the
+producing-time hashing cap (§8.1). A file that later changes in place while
+keeping its size and mtime therefore no longer matches its recorded digest;
+§6.3 revalidates every offered file under the donor pin and abandons the seed
+on any mismatch instead of offering a changed file.
+
+Caps: 2 MiB per catalog, 2048 packages, 8,192 file entries, at most three
 units per package. A catalog that would exceed a cap is not written (the slot
-simply never donates). The catalog deliberately stores **no** file content
-digest for the copied artifacts: hashing happens at donation time over the
-bytes actually offered (§6.3), which is where the integrity claim belongs.
+simply never donates), and the producing-time hashing budget decides how many
+of the offered files get a digest: a unit whose files were not all hashed is
+not offered. Nothing is offered from a catalog without recorded hashes.
 
 ### 4.5 Over-offer, and no expected unit hash
 
@@ -297,23 +452,31 @@ slot is evicted. Nothing reads a catalog of a generation it does not match.
 
 ### 5.1 Roles in v1
 
-| Role | Seeded | Files (relative to the slot's `build/<profile>/`) |
-| --- | --- | --- |
-| registry/git dependency library | yes | `.fingerprint/<pkg>-<id>/lib-<target>` and `.json`; `deps/lib<target_underscored>-<hex>.{rlib,rmeta,d}` |
-| proc macro | yes | same fingerprint entries; `deps/lib<target_underscored>-<hex>.{dylib,so,d}` — a `.dSYM` bundle is **excluded**, and only regular files from the whitelist are copied |
-| build-script **compile** unit | yes (inert in v1) | `.fingerprint/<pkg>-<id>/build-script-build` and `.json`; `build/<pkg>-<id>/build-script-build`; `deps/build_script_build-<hex>.d` |
-| build-script **run** unit and its output | **no** | `run-build-script-build-script-build*`, `build/<pkg>-<id>/{output,root-output,out/**,stderr}`, `invoked.timestamp` |
-| workspace/path package units | **no** | never classified |
-| final outputs, uplifted binaries, test/bench executables | **no** | they live in the checkout `target/` or are final uplifts |
-| `incremental/**` | **no** | |
+The fingerprint directory is `<slot>/build/<profile>/.fingerprint/<pkg>-<16hex>/`
+and the artifacts live under `<slot>/build/<profile>/`. `<target_underscored>`
+is the target name with `-` replaced by `_`; `<hex>` is Cargo's opaque unit
+metadata hash, copied verbatim and never predicted.
 
-The fingerprint directory's hash suffix is copied verbatim; the file names are
-matched by the fixed grammar `<pkg>` (dashes preserved for directories),
-`<target_underscored>` and exactly 16 lowercase hex digits. Anything that does
-not match the whitelist — an unknown suffix, a directory, a symlink, a
-Finder-metadata file, a `.dSYM` bundle, an unexpected target kind — is never
-copied. Because missing files can only make a unit stale, omitting an
-unclassified entry is always the safe direction.
+| Role | Complete fingerprint triple (inside the package directory) | Artifacts |
+| --- | --- | --- |
+| registry/git dependency library | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{rlib,rmeta}`; `deps/<target_underscored>-<hex>.d` when present |
+| proc macro | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{dylib,so}`; `deps/<target_underscored>-<hex>.d` when present. A `.dSYM` bundle is **excluded** |
+| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | `build/<pkg>-<hex>/build-script-build`; `deps/build_script_build-<hex>.d` when present |
+| build-script **run** unit and its output | **excluded entirely** | `run-build-script-build-script-build*`, `dep-run-build-script-build-script-build`, `build/<pkg>-<hex>/{output,root-output,stderr}`, `build/<pkg>-<hex>/out/**`, `invoked.timestamp` |
+| workspace/path package units | **excluded** | never classified |
+| final outputs, uplifted binaries, test/bench executables | **excluded** | live in the checkout `target/` or are final uplifts |
+| `incremental/**` | **excluded** | |
+
+The three fingerprint entries are the unit's complete Cargo-visible state and
+are all required: the hash file, the encoded components, and the encoded
+dep-info whose absence Cargo 1.97.1 already treats as stale. These names are
+the adapter's, and §10 requires them to be confirmed against a real 1.97.1
+build before any seeding is enabled. A unit with any
+of them missing is not offered. Artifacts are matched by the `<hex>` variants
+of the allowlisted stems; unlisted stems, unknown suffixes, symlinks,
+directories, Finder metadata and `.dSYM` bundles are never copied, and a
+fingerprint-directory entry that classifies as none of the rows above makes
+the package ineligible (§4.2).
 
 ### 5.2 Run units are excluded unconditionally in v1
 
@@ -378,6 +541,10 @@ attempt.
 
 ### 6.2 Preconditions (all must hold, else skip)
 
+The order in which these are evaluated, and where the durable attempt record
+and the reserve gate sit, is §6.3's; a precondition is never evaluated by
+writing to the recipient.
+
 - recipient: `reused == false` / `Prior::Fresh`, `<slot>/build` is a real
   owner-only directory on the pool's device and contains **no entries**;
 - the recipient's Cargo is a verified release with the pinned adapter; the
@@ -391,34 +558,48 @@ attempt.
   the donor candidates are chosen by rank before any overlap is known, so a
   graph whose only overlap sits outside the eight newest candidates is a
   stated skip, not an unbounded search;
-- the pool's host reserve reads above the 20 GiB threshold, and the seed's
-  declared bytes fit the remaining bounded budget (§8).
+- the recipient's §3.1 context digest is supported and equal to the donor's;
+- the seed start gate passes (§8.3): the internal pool's host reading is
+  present and at or above the watchdog trigger. A missing or below-trigger
+  reading is **not** a skip — it refuses the command before any child.
 
-If any precondition fails, the command prints one `seeding skipped: <reason>`
+If a *precondition* fails, the command prints one `seeding skipped: <reason>`
 line and builds cold. A skip is never an error, never retried and never
-converted into a refusal.
+converted into a refusal. The reserve and ownership gates are not
+preconditions: they refuse (§8.3, §13).
 
 ### 6.3 Split of responsibility, donor pin, plan and clone
 
-Two library entry points and one front-door step keep "arbitrary mutable paths"
-out of the front door and Cargo semantics out of the lease library:
+Three library entry points, one front-door step and the sidecar writers keep
+"arbitrary mutable paths" out of the front door and Cargo semantics out of the
+lease library:
 
-1. **Candidate catalogs (library, read only).** `managed::seed_candidates`
+1. **Seed attempt record, durably, first (library).** `managed::seed_begin`
+   first samples the §8.3 start gate and refuses without writing when it cannot
+   pass, then, before any candidate is read, writes
+   `<pool>/oxide-managed/seeds/<slot-id>.attempt.json` with the generation
+   envelope and the state `intent`, atomically and synced. It is updated to
+   `seeded`, `skipped` or `reset` before the command proceeds and is never
+   deleted for its generation. This is the durable unseeded fact of §4.1: a
+   generation whose record says `seeded` can never publish a catalog, whatever
+   later commands do with the slot.
+2. **Candidate catalogs (library, read only).** `managed::seed_candidates`
    takes the pool lock, validates that the recipient is still `Held` by this
    lease, reads at most eight donor catalogs — chosen by most recent rank then
    slot id, each generation-checked against the ledger — and returns their
    bounded bytes. It takes no donor record lock and mutates nothing.
-2. **Choice, plan and source re-verification (front door, read only).** The
-   command parses the catalogs, intersects their package identities with the
+3. **Choice, plan and source re-verification (front door, read only).** The
+   command parses the catalogs, checks that each candidate's §3.1 context
+   digest equals the recipient's, intersects package identities with the
    recipient allowlist and picks **one** donor deterministically: greatest
    overlap, then most recent rank, then slot id. It then builds a bounded plan
    of *relative* names for that donor's allowlisted units (no absolute path, no
    `.`/`..` component, no symlink component; caps in §8.1), and re-verifies the
-   offered packages' source trees to the catalog's digests under the donation
-   source cap (§4.3). All of this is read-only against the recipient lock, the
-   Cargo home and the donor catalog; a plan or source failure skips without
-   writing anything.
-3. **Untrusted recipient, always before the first clone.** Immediately before
+   offered packages' source trees to the catalog's canonical digests under the
+   donation source cap (§4.3). All of this is read-only against the recipient
+   lock, the Cargo home and the donor catalog; a plan or source failure skips
+   without touching the recipient.
+4. **Untrusted recipient, always before the first clone.** Immediately before
    the seed transaction the command persists
    `<pool>/oxide-managed/origins/<record>.json` with `origin: null` and the
    current use mark through the existing writer, and syncs it. With the mark
@@ -430,35 +611,39 @@ out of the front door and Cargo semantics out of the lease library:
    door never computes or writes a trust record itself. That untrusted record
    is superseded only by the normal `release` write of a `Built` origin after
    Cargo closes — never by the seed, and never by a successful copy.
-4. **Seed transaction (library, custody).** `managed::seed` receives the
-   recipient lease, the donor slot/incarnation/lease identity and that relative
-   plan. It takes the donor's record lock non-blocking with `create: false`
-   (`store.rs:4509`, `probe_lock`) and then the pool lock, in that order, and
-   re-verifies the whole donor predicate (§7) plus the recipient's `Held`
-   generation, the empty recipient `build/`, the same payload root/device and,
-   for a removable pool, the volume binding. A candidate that changed between
-   steps 1 and 4 is abandoned, never trusted. The front door never opens a
-   donor path, and the library never interprets Cargo semantics. Inside that
-   transaction, and clonefile only, for each planned file the library verifies
-   the donor file (regular, owner-owned, inside the donor's `build/` through
-   no-follow descriptors, on the payload device, size and mtime matching the
-   catalog) and hashes it, clones it into the recipient (`clonefile`,
-   device-local, no copy fallback), then hashes the recipient copy and
-   compares. Any mismatch, `EXDEV`, `ENOSPC`, `EDQUOT`, an unexpected file
-   type, a permission change or an unreadable path aborts the whole seed. No
-   partial unit is ever published: either the entire plan verifies or nothing
-   stays.
-5. **Publication.** On complete success the library returns a receipt (units,
+5. **Seed transaction (library, custody).** `managed::seed` receives the
+   recipient lease, the donor slot/incarnation/lease identity, that relative
+   plan and each file's recorded digest. It takes the donor's record lock
+   non-blocking with `create: false` (`store.rs:4509`, `probe_lock`) and then
+   the pool lock, in that order, and re-verifies the whole donor predicate
+   (§7) plus the recipient's `Held` generation, the empty recipient `build/`,
+   the same payload root/device and, for a removable pool, the volume binding.
+   A candidate that changed between steps 2 and 5 is abandoned, never trusted.
+   The front door never opens a donor path, and the library never interprets
+   Cargo semantics. Inside that transaction, and clonefile only, for each
+   planned file the library verifies the donor file (regular, owner-owned,
+   inside the donor's `build/` through no-follow descriptors, on the payload
+   device, size and mtime matching the catalog) and **hashes it against the
+   catalog's recorded digest** — a mismatch means the donor changed and the
+   seed abandons. It then clones the file into the recipient (`clonefile`,
+   device-local, no copy fallback), hashes the recipient copy and compares it
+   with the same authenticated digest. Any mismatch, `EXDEV`, `ENOSPC`,
+   `EDQUOT`, an unexpected file type, a permission change or an unreadable
+   path aborts the whole seed. No partial unit is ever published: either the
+   entire plan verifies against the producing-epoch manifest or nothing stays.
+6. **Publication.** On complete success the library returns a receipt (units,
    files, logical bytes, donor identity, catalog digest, elapsed) and the
    command re-reads the two safety facts it can still check — the donor's
    ledger/control state and the host free-space reserve — before continuing.
    A donor that left `Idle`, an unreadable reading or a reserve breach after
-   the clone makes the seed a failure, handled exactly as §6.5 (reset, cold
-   build). The pool's recorded per-slot figure is not rewritten here; the
-   recipient's next closed record accounts the bytes honestly (§8.2). On
-   success the command writes the bounded last-seed sidecar (§9.2) and
-   continues. The recipient's origin is still the untrusted marker; the normal
-   `gate.finish`/`release` writes the trusted origin after Cargo closes.
+   the clone makes the seed fail closed per §8.3 (reset, then refuse), and the
+   attempt record becomes `reset`. The pool's recorded per-slot figure is not
+   rewritten here; the recipient's next closed record accounts the bytes
+   honestly (§8.2). On success the attempt record becomes `seeded`, the
+   bounded last-seed sidecar (§9.2) is written, and Cargo runs. The recipient's
+   origin is still the untrusted marker; the normal `gate.finish`/`release`
+   writes the trusted origin after Cargo closes. Because the attempt record
+   says `seeded`, this generation publishes no catalog (§4.1).
 
 ### 6.4 What the recipient holds afterwards
 
@@ -471,23 +656,30 @@ neither measures nor claims, §8).
 
 ### 6.5 Failure: reset the owned recipient, or refuse
 
-- **Skip** (no donor, no overlap, an ineligible package, a cap, reserve or
-  deadline): nothing was written; build cold.
-- **Fault after a partial clone** (any clone/verify error): the library resets
-  exactly the recipient it owns — the plan's relative names deepest-first plus
-  the directories the plan created, keeping the library-created `build/`
-  directory itself — using the existing owned-deletion traversal, then
-  verifies `<slot>/build` has no entries. If the reset verifies, the command
-  builds cold in the same slot: no tenth grant, no new record, and the
-  recipient never carries partial state into Cargo. A crash *during* the reset
-  leaves the untrusted generation in place, so the next command's
-  `Prior::Unknown` whole-slot eviction (with oxide#155's capture-and-verify
-  deletion) finishes it; the seed never deletes outside its own plan.
+- **Skip** (no donor, no overlap, an ineligible package, a cap or the seed's
+  own cooperative deadline): nothing was written to the recipient; the attempt
+  record becomes `skipped`; build cold.
+- **Fault after a partial clone** (any clone, digest or verify error): the
+  library resets exactly the recipient it owns — the plan's relative names
+  deepest-first plus the directories the plan created, keeping the
+  library-created `build/` directory itself — using the existing
+  owned-deletion traversal, then verifies `<slot>/build` has no entries. If the
+  reset verifies, the attempt record becomes `reset` and the command builds
+  cold in the same slot: no tenth grant, no new record, and the recipient
+  never carries partial state into Cargo. A crash *during* the reset leaves the
+  untrusted generation in place, so the next command's `Prior::Unknown`
+  whole-slot eviction (with oxide#155's capture-and-verify deletion) finishes
+  it; the seed never deletes outside its own plan.
+- **Reserve breach or unknown reading during the seed** (§8.3): the seed is
+  abandoned, the recipient is reset as above, and the command **refuses**
+  before any child. A reserve fault is never converted into a cold build.
 - **Unknown ownership or an incomplete reset** (a foreign entry appeared, the
-  device or volume identity changed, a path refused): the command **refuses**,
-  prints the reason and exits non-zero. It does not run Cargo over a
-  half-seeded slot and does not delete what it cannot prove it owns; the
-  untrusted origin keeps the generation from being reused later.
+  device or volume identity changed, a path refused, a digest mismatch left
+  the state unclassifiable): the command **refuses**, prints the reason and
+  exits non-zero. It does not run Cargo over a half-seeded slot and does not
+  delete what it cannot prove it owns; the untrusted origin and the
+  `intent`/`seeded` attempt record keep the generation from being reused or
+  published later.
 
 ### 6.6 Crash matrix
 
@@ -546,15 +738,17 @@ is abandoned: the recipient is reset as in §6.5 and Cargo runs cold.
 | --- | --- | --- |
 | seed attempts per command | 1 | no retry, no extra grant |
 | donor candidates examined | 8 | chosen by most recent rank then slot id; catalogs only |
-| donor catalogs read | ≤ 8 × 1 MiB | strict schema; unknown → ineligible |
+| donor catalogs read | ≤ 8 × 2 MiB | strict schema; unknown → ineligible |
 | recipient lock parsed | 4 MiB, 2048 packages | read only; no Cargo call |
-| producing source snapshot (pre and post) | 2048 packages, 100,000 entries, 128 MiB content, 3 s each | deterministic lock order; overflow packages are not catalogued |
-| catalog | 1 MiB, 2048 packages, 16,384 files, 3 units per package | overflow: no catalog |
+| producer context digest | 8 config files, 4 MiB config bytes, 128 KiB rendered keys | unreadable/unsupported → skip |
+| producing source verification (pre and post) | 2048 packages, 100,000 entries, 128 MiB file content, 64 MiB archive-derived content, 4 s each | deterministic lock order; overflow packages are not catalogued |
+| producing-time artifact hashing | 8,192 files, 256 MiB, 4 s | a unit without all digests is not offered |
+| catalog | 2 MiB, 2048 packages, 8,192 files, 3 units per package | overflow: no catalog |
 | plan | 256 units, 4,096 files, 384 MiB logical bytes | overflow: skip |
 | donation source verification | 128 MiB content, 3 s | packages beyond the remaining cap are dropped from the plan, not the whole seed |
-| seed work (clone + verify) | 5 s cooperative deadline, checked between filesystem calls | a blocked syscall cannot be pre-empted; not a hard lock bound |
-| hashed bytes | 2 × cloned bytes (donor + recipient copy) | plus the donation source verification above |
-| last-seed + catalog sidecars total | 16 MiB | write refuses when exceeded |
+| seed work (clone + digest verify) | 5 s cooperative deadline, checked between filesystem calls | a blocked syscall cannot be pre-empted; not a hard lock bound |
+| hashed bytes at donation | 2 × cloned bytes (donor + recipient copy) | the donor copy is compared with the producing-epoch digest; the clone with the same digest |
+| seed sidecars total (`catalog`, `attempt`, `last`, `sources`) | 24 MiB | write refuses, or the oldest catalog is dropped, when exceeded |
 | diagnostics | 2 KiB sidecar, one summary line ≤ 240 bytes | generated from post-reset state only |
 
 ### 8.2 Accounting is honest
@@ -569,48 +763,86 @@ deduct it, and makes **no free-space or write-savings claim**. A cross-slot
 hard-link pair would be counted once by the `(device, inode)` union, but
 seeding never creates hard links.
 
-### 8.3 Budget and reserve
+### 8.3 Reserve: a start gate, a monitored stop, and two backends
+
+The owning rule is a monitored start/abort threshold, not a guarantee
+([architecture](../architecture.md#storage-invariants)). The existing product
+refuses **pool creation** below `HOST_RESERVE_BYTES` (20 GiB,
+`store.rs:4028-4038`) and stops a running build below the watchdog trigger
+`HOST_RESERVE_BYTES + MARGIN_BYTES` (22 GiB, `watchdog.rs:22-30,113-140`). The
+seed writes up to 384 MiB **before** that watchdog exists, so it carries its
+own gate at the same trigger and never converts a bad reading into a cold
+build:
+
+- **internal `directory-budget-v1` pool.** `managed::seed_begin` samples the
+  payload's filesystem with the watchdog's own reader before it writes
+  anything. Unknown, below 22 GiB, or unreadable means the command **refuses
+  before any child** with the reserve-stop diagnostic; no attempt record is
+  written and the seed is not attempted. While cloning and
+  resetting, the seed samples at the watchdog's interval (about 1 s, and at
+  least between every 64 copied files) with the same trigger; a breach or
+  lost reading aborts the seed, resets the recipient and refuses the command.
+  The sampled minimum and the crossing are reported like a watchdog stop.
+- **removable `apfs-volume-v1` pool.** Its watchdog is a removal detector and
+  has no space trigger (`store.rs:1716-1726`), and the volume's own capacity
+  is its hard limit. The seed therefore requires the verified mount/volume-UID
+  binding and the registration's reserve reading (the existing admission
+  rule), monitors the binding at the same cadence, and aborts and resets on
+  any binding or removal failure; the command then follows the existing
+  lost-volume path rather than a generic cold build.
+- **Deliberate asymmetry, stated for the Supervisor.** This gate is the
+  seeding path's precondition; a command that seeds nothing keeps today's
+  behaviour exactly. Unifying the start gate for every command would be a
+  separate scoped change, and this design does not make it.
 
 The pool budget stays soft: a started command's seed may pass the cap exactly
 as its Cargo may, and the seed's bytes are visible to the next admission. The
-seed **skips** (never refuses and never spills elsewhere) when:
+command's admission budget is never extended: an expiry before the clone means
+no seed; an expiry during it abandons and resets the seed and releases the
+slot exactly as the existing expired-admission path does (no child, exit 124).
+That release records no trusted origin, so the seeded generation is evicted by
+the next command: the seed is never treated as a trusted build.
 
-- the measured host free space is below `HOST_RESERVE_BYTES` (20 GiB) before
-  the clone or after it, or the reading is unavailable;
-- the removable volume's binding no longer verifies;
-- the command's admission budget is already expired, or expires during the
-  seed. In that case the seed is not started or is abandoned, the slot is
-  released exactly as the existing expired-admission path does (no child
-  starts, exit 124), and no window is extended. That release records no
-  trusted origin, so the seeded generation is evicted by the next command: the
-  seed is never treated as a trusted build.
-
-An unknown ownership, accounting or device fact is a **refusal** (§6.5), not a
-cold fallback: a safety fault must not be disguised as a harmless miss.
+An unknown ownership, accounting, device or custody fact is a **refusal**
+(§6.5), not a cold fallback: a safety fault must not be disguised as a
+harmless miss. A removable-volume loss is neither a skip nor a reserve refusal;
+it follows the existing removal and quarantine rules.
 
 ## 9. Persistence, visibility and format fences
 
 ### 9.1 Sidecars, not control-state fields
 
-Two new owner-only sidecars under the existing `oxide-managed/` control
+Four new owner-only sidecars under the existing `oxide-managed/` control
 directory (mode `0700`, atomic temp + rename + `sync`, never in the payload):
 
 - `<pool>/oxide-managed/seeds/<slot-id>.catalog.json` — the donor catalog
   (§4.4), at most one per ledger slot id;
+- `<pool>/oxide-managed/seeds/<slot-id>.attempt.json` — the per-generation seed
+  attempt (§4.1, §6.3): generation envelope plus a terminal state
+  (`intent`, `seeded`, `skipped`, `reset`) and, when `seeded`, the donor slot,
+  unit/file/byte counts and the catalog digest. Never deleted for its
+  generation, so a later command cannot claim an unseeded epoch;
 - `<pool>/oxide-managed/seeds/last.json` — the last completed seed
-  (§9.2), schema `oxide.cold-seed/1`, at most 2 KiB.
+  (§9.2), schema `oxide.cold-seed/1`, at most 2 KiB;
+- `<pool>/oxide-managed/seeds/sources.json` — the bounded source-verification
+  cache (§4.3): at most 2048 `(cargo_home, archive relative path, archive
+  SHA-256, tree device/inode, tree digest, verified-at)` records.
 
-Each carries `store_id`, slot id, incarnation and lease id and is only read
-when they match the current ledger generation. Both are bound by the same caps
-and validate every field's length, like the status-observations sidecar
-(`store.rs:1078-1143`). A sidecar that is missing, oversized, malformed,
-symlinked, foreign-owned, unknown-version or generation-mismatched is
-**ignored**, never repaired and never adopted.
+Each carries `store_id` (and the slot sidecars their slot id, incarnation and
+lease id) and is only read when they match the current ledger generation. All
+are bound by the caps in §8.1 and validate every field's length, like the
+status-observations sidecar (`store.rs:1078-1143`). A sidecar that is missing,
+oversized, malformed, symlinked, foreign-owned, unknown-version or
+generation-mismatched is **ignored**, never repaired and never adopted. The
+`attempt` record is the only one whose absence is a positive fact (an unseeded
+legacy generation) rather than an unknown.
 
-Orphan cleanup is bounded: when a catalog or last-seed is written, at most
-eight sidecar files whose slot id is no longer in the ledger are removed. Slot
-ids are monotonic and never reused, so this cannot delete a live record's
-sidecar.
+Orphan cleanup is bounded: when a catalog, attempt or last-seed is written, at
+most eight sidecar files whose slot id is no longer in the ledger are removed.
+Slot ids are monotonic and never reused, so this cannot delete a live record's
+sidecar. When the four sidecar families together would exceed 24 MiB, the
+least recently produced catalog is dropped (at most eight per write) or the
+new catalog is not written.
 
 ### 9.2 Visibility
 
@@ -667,10 +899,23 @@ verifies (`workflow.md#cargo-version-matrix`):
 - adapter id `cargo-1.97.1/c980f4866/build-dir-v1`;
 - assumptions, all pinned-source or fixture-checked: `CARGO_BUILD_BUILD_DIR`
   is the slot's `build/`, Cargo creates `<profile>/` beneath it, fingerprints
-  live in `<profile>/.fingerprint/<pkg>-<hex>/` with per-unit files, artifacts
-  in `<profile>/deps/`, build scripts in `<profile>/build/<pkg>-<hex>/`, the
-  profile directory name is Cargo's, and uplift copies finals to
-  `CARGO_TARGET_DIR`;
+  live in `<profile>/.fingerprint/<pkg>-<hex>/` with the three-entry unit
+  manifest of §5.1, artifacts in `<profile>/deps/`, build scripts in
+  `<profile>/build/<pkg>-<hex>/`, the profile directory name is Cargo's, and
+  uplift copies finals to `CARGO_TARGET_DIR`;
+- **manifest qualification is a precondition, not an assumption.** Before any
+  seeding is enabled, the implementation must confirm, against a real 1.97.1
+  build of a tiny fixture, that every offered unit's complete triple is
+  present with exactly the names §5.1 lists (including the encoded
+  `dep-<kind>-<target>`), that nothing else in the package fingerprint
+  directory is needed for Cargo to consider the unit fresh, and that the
+  package's `deps/` artifacts are the ones its fingerprint names. A mismatch
+  means no seeding (never a guessed manifest), and it is recorded as an
+  adapter-qualification failure in the implementation brief;
+- the archive-reader adapter (§4.3) is qualified on the same tiny fixtures
+  with its negative cases: a tampered archive, an extra tree file, a missing
+  tree file, a symlink/hardlink entry, a `..` path and duplicate paths all
+  refuse;
 - a build-dir v2 layout (`-Zbuild-dir-new-layout`), any Cargo outside the
   verified table, any non-verified or rebuilt Cargo, and any release without
   this adapter's qualification means **no seeding** — never a disabled or
@@ -687,8 +932,8 @@ missing lock, and any package/unit outside the whitelist.
 
 ## 11. Interfaces with other contracts
 
-- **oxide#136 child temporary files.** Seeding writes only `<slot>/build/**`
-  before the owned temp directory exists; `scratch/` custody, its marker, its
+- **oxide#136 child temporary files.** The seed's only payload writes are under
+  `<slot>/build/**`, before the owned temp directory exists; `scratch/` custody, its marker, its
   accounting, its release removal after positive closure and the crash
   leftover rules are untouched. A seed reset never touches `scratch/`.
 - **oxide#140 command budgets.** The seed is inside the admission window,
@@ -744,20 +989,34 @@ missing lock, and any package/unit outside the whitelist.
    registry plus a git source of one name, make the name ineligible on both
    sides; this is the price of partial association.
 4. **A producing build that downloads or extracts sources excludes those
-   packages.** Their files are newer than the producing start, so the mtime
-   rule drops them; donors are strongest when the Cargo home is already warm.
+   packages** until the archive and tree verification succeeds: a file newer
+   than the producing start drops the package, and a tree verified for the
+   first time in this build is catalogued only within the 64 MiB
+   archive-derivation budget. Donors are strongest when the Cargo home is
+   already warm and verified.
 5. **A dirty git cache compiled and restored** is caught when the restore
    updates mtimes (§4.3); the mtime-preserving adversarial case remains a
    stated residual.
-6. **Copy-on-write is not a saving claim.** Cloned bytes are counted in full
+6. **A tampered registry tree is caught by the archive, not by itself.** An
+   extra or altered file, a symlink and a pre-existing local edit all fail the
+   archive-to-tree comparison even when the tree carries a plausible checksum
+   file (§4.3); a source directory name is never evidence.
+7. **A context difference skips rather than guesses.** A configured compiler,
+   a workspace or kept wrapper, a flag/profile override, `--config`, a
+   source replacement or a `[patch]` makes the seed skip, so a project whose
+   build depends on them simply never donates (§3.1).
+8. **A seeded recipient never donates.** Its attempt record says `seeded`
+   durably, so the design cannot attribute a donor's units to the recipient's
+   own source and tool identity (§4.1).
+9. **Copy-on-write is not a saving claim.** Cloned bytes are counted in full
    until a measurement proves otherwise, and this design does not measure
    physical savings.
-7. **A held donor cannot be read.** So D-4's in-session respawn is not helped
-   by the session's own slot (§11).
-8. **Debug information** of a recipient's *new* links uses the recipient's own
-   cloned object files, so it does not point into the donor; binaries the donor
-   already linked keep pointing into the donor slot, exactly as they do today.
-   No debugger behaviour is claimed by this design.
+10. **A held donor cannot be read.** So D-4's in-session respawn is not helped
+    by the session's own slot (§11).
+11. **Debug information** of a recipient's *new* links uses the recipient's own
+    cloned object files, so it does not point into the donor; binaries the donor
+    already linked keep pointing into the donor slot, exactly as they do today.
+    No debugger behaviour is claimed by this design.
 
 ## 13. Skip, refuse and fail-closed matrix
 
@@ -766,9 +1025,13 @@ missing lock, and any package/unit outside the whitelist.
 | no eligible donor / no catalog / no overlap / package ineligible | skip, cold build, one reason |
 | unsupported Cargo, adapter, command family, `exec`/external tool | skip, cold build |
 | recipient lock missing, empty allowlist, malformed or oversized | skip, cold build (Cargo may create the lock itself) |
-| cap, reserve or seed deadline exceeded | skip (abandon and reset if cloning started) |
+| unsupported producer context (compiler, wrapper, flags, profile, config, source replacement, patch) | skip, cold build |
+| cap or the seed's own cooperative deadline exceeded | skip (abandon and reset if cloning started) |
+| donor archive or git tree fails verification; catalog digest mismatch | skip the package, or abandon and reset when an offered file/mode changed |
+| **internal pool host reserve unknown or below the 22 GiB trigger, before or during the seed** | **refuse**; the seed is abandoned and reset, and no child starts |
+| removable volume binding or registration reserve fails, or the mount is lost | abandon and reset; the existing removal/quarantine path runs, never a generic cold build |
 | donor became held/evicting/retired during the transaction, volume mismatch | abandon, reset recipient, cold build |
-| a clone, hash, file-type or reset check fails | reset; if the reset verifies, cold build; otherwise **refuse** |
+| a clone, digest, file-type or reset check fails | reset; if the reset verifies, cold build; otherwise **refuse** |
 | donor path or volume identity cannot be established | **refuse** (unknown ownership is not a cold fallback) |
 | recipient `build/` is not empty or not an owned directory | **refuse** |
 
@@ -777,6 +1040,17 @@ anything it cannot prove it owns and never starts Cargo on unverified state.
 
 ## 14. Alternatives rejected
 
+- **Trust a registry tree's own `.cargo-checksum.json`, or Cargo's `.cargo-ok`
+  marker, as source integrity evidence.** Both prove nothing about the archive
+  the lock authenticated; §4.3 derives the tree from the verified archive
+  instead. A system `tar`/`gzip` subprocess was also rejected in favour of a
+  bounded in-process reader with strict entry grammar.
+- **Publish a catalog from a generation that seeded anything.** Cargo may leave
+  offered variants untouched, so the files would be a donor's units described
+  by another command's source and tool identity; §4.1's attempt record forbids
+  it.
+- **Treat a below-trigger or unknown reserve reading as a harmless miss.** The
+  seed refreshes starts and refuses instead (§8.3).
 - **Write "fresh" marks or patch fingerprints/mtimes.** Forbidden by the
   brief, and it would replace Cargo's judgment with Oxide's.
 - **Capture build artifact JSON to build a full catalog.** Deferred by
@@ -800,16 +1074,22 @@ anything it cannot prove it owns and never starts Cargo on unverified state.
 
 ## 15. Implementation slices (not authorized by this design)
 
-1. **Library custody.** `managed::seed` / `managed::publish_seed_catalog` /
-   donor-catalog read entry point: pool-lock-scoped donor pin, path and device
-   validation, clonefile-only copy, per-file hashing, reset-or-refuse,
-   bounded caps. Unit regressions on tiny owned fixtures, no Cargo.
-2. **Front door.** Lock parsing, allowlist and source verification, catalog
-   production at release, summary/status sidecars, skip reasons, the seed point
-   in `main.rs`. No user-visible change when nothing is eligible.
-3. **Proof apparatus.** The fixed script, its pure self-test and its
+1. **Registry verification adapter.** The pinned `flate2` + `tar` archive
+   reader with its strict entry grammar, the canonical tree digest, the
+   bounded source-verification cache, and the archive/tree/git negatives. Pure
+   and tiny-fixture regressions; no Cargo yet.
+2. **Library custody.** `managed::seed_begin` / `managed::seed_candidates` /
+   `managed::seed` / `managed::publish_seed_catalog`: pool-lock-scoped donor
+   pin, path and device validation, per-file digest revalidation, clonefile-only
+   copy, reset-or-refuse, the attempt record, bounded caps. Unit regressions on
+   tiny owned fixtures, no Cargo.
+3. **Front door.** Lock parsing, the §3.1 context digest, allowlist and source
+   verification, catalog production with per-file hashes at release, the
+   reserve gate, summary/status sidecars, skip reasons, the seed point in
+   `main.rs`. No user-visible change when nothing is eligible.
+4. **Proof apparatus.** The fixed script, its pure self-test and its
    diagnostic mode, then the owner-activated natives.
-4. **Knowledge truth.** Merge the implemented contract into
+5. **Knowledge truth.** Merge the implemented contract into
    `workflow.md` and turn this document's status line into an implementation
    record; `vision.md`'s "approved, not built" bullet changes only then.
 
@@ -826,14 +1106,24 @@ fixed script, and a source sweep never replaces it.
 
 ### 16.1 Pure checks (no child, no Cargo, no pool)
 
-Lock parsing and the uniqueness rule; manifest target-name rule; file-grammar
-classification including every negative (symlink, `..`, absolute, unknown
-suffix, `.dSYM`, Finder metadata, oversized); catalog schema, caps and
-generation binding; producing-window mtime rule; plan intersection and
-determinism; reset list derivation; receipt and summary/status rendering and
-their caps; adapter dispatch and unsupported-version skip; donor predicate
-matrix (held, retired, evicting, pending recovery, rank/lease mismatch, volume
-mismatch, missing lock); and the fail-closed matrix of §13.
+Lock parsing and the uniqueness rule; manifest target-name rule; the complete
+per-role triple (hash, `.json`, `dep-…`) with every negative (missing
+`dep-…`, an extra `dep-…`, a duplicate suffix, an unclassifiable
+fingerprint-dir entry, symlink, `..`, absolute path, unknown suffix, `.dSYM`,
+Finder metadata, oversized); archive-reader negatives (tampered archive, extra
+tree file, missing tree file, symlink/hardlink/device entry, duplicate path,
+absolute path, pax/gnu long name, truncation); git verification negatives
+(dirty, wrong revision, submodule, unreadable); the §3.1 context digest
+(equal, differing flag, differing config table, unsupported `--config`,
+`[source]`, `[patch]`, unreadable/oversized config, and an environment
+override); catalog schema, per-file digest records, caps and generation
+binding; the durable attempt record's states and the unseeded publication rule;
+producing-window mtime rule; plan intersection and determinism; reset list
+derivation; reserve gate and monitored-stop decision points against a fake
+reader; receipt and summary/status rendering and their caps; adapter dispatch
+and unsupported-version skip; donor predicate matrix (held, retired, evicting,
+pending recovery, rank/lease mismatch, volume mismatch, missing lock, `seeded`
+attempt); and the fail-closed matrix of §13.
 
 ### 16.2 Native cases (one fixed script)
 
@@ -846,52 +1136,68 @@ one fresh internal root for the genuine internal pool, and `TMPDIR`, `TMP` and
 `TEMP` point at a separate fresh directory so ordinary test temp still follows
 the selected-volume rule.
 
-1. registry library positive: two checkouts with the same lock and Cargo home
-   on one pool; the first builds the donor epoch, the second leases a new slot
-   that is seeded, and Cargo reports the offered dependency unit fresh for the
-   second checkout (`--message-format` is caller-supplied by the proof, never
-   injected);
-2. `cc`/`OUT_DIR` run-unit control: the run unit is excluded, the build script
-   reruns, its consumer rebuilds, and the program's runtime `env!("OUT_DIR")`
-   value is correct after the donor is gone;
-3. proc macro: a proc-macro dependency's dylib and fingerprint are offered,
-   and a macro expansion compiles and runs;
-4. build-script compile unit: offered, but the excluded run unit makes it
+1. **SQLite/`cc`/`OUT_DIR` (required by the brief, retained).** A private
+   workspace whose only dependency path is `libsqlite3-sys` with the `bundled`
+   feature (the SQLite amalgamation compiled by `cc`, exposed through
+   `OUT_DIR` and the link-search replay). The donor epoch builds it; the
+   recipient's seeded run must show the run unit rerunning, SQLite recompiling
+   or its consumer rebuilding, and the program's runtime `env!("OUT_DIR")`
+   value and SQLite version correct after the donor slot is deleted. This is
+   the non-vacuous proof that an excluded run never becomes fresh;
+2. **complete-manifest registry positive.** A small registry dependency with
+   no build script (`cfg-if`) is offered with its full triple
+   (hash/`.json`/`dep-…`) plus artifacts; two checkouts share one lock and
+   Cargo home, the second leases a new slot that is seeded, and Cargo reports
+   the offered dependency unit fresh (`--message-format` is caller-supplied by
+   the proof, never injected). A debug-only proof control that drops only the
+   `dep-…` entry from the plan must make the same unit rebuild, proving the
+   manifest is the complete one;
+3. proc macro: a small proc-macro dependency's dylib and fingerprint are
+   offered, and a macro expansion compiles and runs;
+4. build-script **compile** unit: offered, but the excluded run unit makes it
    inert — the package's lib is rebuilt (the non-vacuous control);
 5. donor deleted before the recipient builds: the recipient still compiles and
    runs, with no link to the donor;
-6. changed dependency: a recipient lock with a different version or source does
-   not offer that unit, and the build is correct;
+6. changed dependency: a recipient lock with a different version or source
+   does not offer that unit, and the build is correct;
 7. held donor: a gated writer holds the only compatible donor → `donor busy`
    skip, the recipient builds cold, and the donor is unchanged;
-8. cross-toolchain: a donor built under a different recorded compiler/Cargo
-   identity is not eligible;
+8. cross-toolchain and producer context: a donor built under a different
+   recorded compiler/Cargo identity, and one built with a different
+   `RUSTFLAGS` or a differently configured linker/profile in its Cargo config,
+   are not eligible and build cold;
 9. crash mid-seed: a debug-only hook (absent from release builds, scoped like
    the existing `OXIDE_TEST_*` hooks) crashes after the first clone; the next
    command must evict the untrusted generation, run no Cargo over partial
    state, and build cold;
-10. byte, unit, file and time caps each skip without donor mutation;
-11. git identity: a fully verified git dependency seeds; a dirty or
+10. caps each skip without donor mutation: logical bytes, units, files and the
+    seed's own deadline;
+11. git identity: a fully verified git dependency seeds; a dirty, submodule or
     differently-revisioned checkout does not; a same-name registry/git
     collision is ineligible;
 12. unsupported layout: a fake `cargo` that reports an unverified version
     makes the command skip seeding while Cargo still runs normally;
-13. no donor writes: donor tree content digest, ledger bytes and control bytes
-    are identical before and after a seed, and its rank, use mark and recorded
-    figure are unchanged;
+13. no donor writes: donor tree content digest, its catalog, ledger bytes and
+    control bytes are identical before and after a seed, and its rank, use mark
+    and recorded figure are unchanged;
 14. removable path: one owned 128 MiB APFS image (`hdiutil attach -owners on`)
-    registered as a removable pool seeds across two of its slots and detaches
-    ordinarily, proving the same-volume predicate and that the recipient's
-    bytes are on the image;
-15. partial-trust negative: a fault-injected partial recipient is never reused
+    registered as a removable pool seeds a tiny `cfg-if` workspace across two
+    of its slots and detaches ordinarily, proving the same-volume predicate and
+    that the recipient's bytes are on the image;
+15. registry tamper controls: the cached `.crate` replaced with a different
+    archive (checksum mismatch), the extracted tree with one extra file, one
+    altered file, one symlink and one missing file each make the package
+    ineligible and the command cold — never a seeded copy;
+16. seeded recipient never donates: after a successful seed and build, the
+    recipient's `attempt` record says `seeded` and a third cold slot must not
+    receive a catalog from it, even though its build began empty and
+    succeeded;
+17. reserve gate: an injected below-trigger reading (the existing debug-only
+    free-space seam) makes a command whose only available donor would seed
+    **refuse before any child**; a mid-seed breach aborts, resets and refuses;
+    the non-seeding control still runs Cargo as today;
+18. partial-trust negative: a fault-injected partial recipient is never reused
     as warm by a later command.
-
-**Deviation to be frozen by the reviewer:** case 2 uses the `cc` crate with a
-tiny C source rather than a bundled-SQLite-sized build, because a real SQLite
-compile does not fit the 300 s bound with staging. It exercises the same
-mechanism (build script, absolute `OUT_DIR`, link-search replay, runtime
-`OUT_DIR`). A bundled-SQLite case belongs to the separate measured
-real-project comparison, not this proof.
 
 ### 16.3 Runner, bounds, clocks and activation
 
@@ -913,12 +1219,6 @@ real-project comparison, not this proof.
 - `effigy proof:cold-slot-seeding:test` runs only the script's pure
   `--self-check`/`--self-test` with synthetic seams: no child, pool, image or
   Cargo.
-- Source-derived allocation (UNMEASURED): one debug staging of this HEAD's
-  `oxide` offline with 1.97.1 (~37 s measured for the #122 recipe), 15 tiny
-  cases at roughly 3–10 s each with at most two Cargo jobs and sequential
-  fixtures, one image attach/detach (~5 s), cleanup inside the guard. Static
-  estimate 150–230 s of the 300 s window; the script must verify the actual
-  fit before activation.
 - Proposed clocks: author 120 minutes and reviewer 45 minutes cumulative
   including admission waits, covering checks, the native and cleanup, with no
   reset and no extension; the independent design review ratifies feasibility
@@ -938,39 +1238,96 @@ real-project comparison, not this proof.
   is traced through the case bodies and helpers in the script, not in plan
   text.
 
+### 16.4 Fixed-script time and disk allocation (source-derived, UNMEASURED)
+
+Disk, against the 512 MiB monitored scratch budget:
+
+| Item | Estimate | Basis |
+| --- | --- | --- |
+| debug staging of this HEAD's `oxide` (offline 1.97.1, 4 jobs, stripped) | 50-70 MiB | the #122 recipe measured a 58.3 MiB peak |
+| seeded private `CARGO_HOME` (archives + extracted sources) | 25-35 MiB | SQLite amalgamation about 9.5 MiB compressed and 30 MiB extracted, plus `libsqlite3-sys`, `cc`, `cfg-if` and a tiny proc macro |
+| donor slot (SQLite build intermediates) | 90-140 MiB | amalgamation object files plus the fixture's units, one `debug` profile |
+| recipient slot (seeded dependency units only) | 40-90 MiB | the offered subset; workspace bins stay local |
+| checkout fixtures, logs, receipts | 8 MiB or less | tiny sources and bounded receipts |
+| one owned 128 MiB sparse image (removable case only) | 128 MiB allocated at most | separate phase after the SQLite slots are released; sparse backing |
+
+Peak internal phase is about 205-343 MiB; the removable phase about 85-200 MiB.
+The script reports the monitored peak and stops if it exceeds 480 MiB instead
+of trimming a case.
+
+Time, against the 300 s wall clock:
+
+| Phase | Estimate |
+| --- | --- |
+| staging `oxide` once | 35-45 s |
+| SQLite donor epoch (`libsqlite3-sys` bundled, `cc` at debug opt-level) plus fixture bins | 35-70 s |
+| SQLite seeded recipient (run unit reruns, SQLite recompiles, consumer rebuilds) | 30-60 s |
+| twelve tiny registry/git/proc-macro/caps/context cases at 3-8 s each | 40-90 s |
+| crash, reserve-gate, tamper and partial-trust controls | 20-40 s |
+| image attach, removable seed and ordinary detach | 8-15 s |
+| cleanup and receipt inside the guard | 5-10 s |
+
+The total is about 173-330 s, which straddles the 300 s bound; the estimate is
+not a demonstrated fit. The script prints a phase table, and if the first
+diagnostic run's projection exceeds 270 s it **stops and reports** rather than
+dropping a required case. If the required SQLite case cannot fit even with a
+single staging and one Cargo job, the conflict returns to the Supervisor for a
+scoped bound amendment; this design does not substitute a cheaper fixture and
+does not treat the separate real-project comparison as the proof.
+
 ## 17. Independent review questions
 
-1. Is the §4.3 producing-window rule (pre/post content digests plus "no source
-   mtime later than the producing start", on top of Cargo's checksum manifest
-   or git revision) enough to freeze partial association, or does the
-   mtime-preserving residual need a stronger producing-time witness?
-2. Is refusing run units unconditionally (§5.2) accepted as the frozen v1
-   boundary, including the reach statement that build-script packages never
-   benefit?
-3. Is a sidecar-only representation (§9) accepted instead of a
-   `STATE_VERSION = 6` control fence, given the three safety cases in §9.3 and
-   the stop condition?
-4. Is the donor pin order (record lock non-blocking, then pool lock) safe with
-   the current recovery and clean paths, and is the 5 s pool-lock occupancy
-   bound acceptable?
-5. Is the D-4 interface in §11 the intended reading — seeding cannot help while
+1. Is the archive-to-tree rule in §4.3 sound as specified — cached `.crate`
+   bytes against the lock checksum, a canonical derivation with strict entry
+   grammar and extra/missing entries failing closed, `.cargo-ok` never treated
+   as evidence, and a verification cache keyed by checksum and tree identity —
+   and is the pinned `flate2` + `tar` reader acceptable as a new locked
+   dependency, or should registry packages be withheld until a different
+   reviewed mechanism exists?
+2. Is the complete per-role manifest in §5.1 (fingerprint hash, `.json` and
+   `dep-<kind>-<target>`, plus the role's artifacts) accepted as the exact
+   completeness boundary, with an unclassifiable fingerprint-dir entry making
+   the whole package ineligible rather than being silently dropped?
+3. Is recording per-file producing-epoch SHA-256 digests in the catalog (§4.4)
+   with a 256 MiB / 4 s producing-time hashing cap the right stale-content
+   evidence, and is abandoning the whole seed on a single offered-file mismatch
+   (rather than dropping that unit) the intended fail-closed behaviour?
+4. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
+   the unseeded fact, including the case where an older binary reuses a slot?
+   The older binary neither reads nor publishes catalogs, and it cannot clear
+   the record.
+5. Is the §3.1 context digest — compiler selection, wrapper context, full flag
+   set, profile/target overrides and the named config tables, with `--config`,
+   `[source]`, `[patch]`, `[registries]` and `[unstable]` unsupported — the
+   right bounded boundary, and are the unsupported cases the ones the reviewer
+   expects to skip?
+6. Is the §8.3 reserve treatment accepted: a 22 GiB start gate and monitored
+   stop for the seeding path that **refuses** rather than cold-builds, with the
+   removable volume on its own removal-only watchdog and registration reserve,
+   and the non-seeding path deliberately unchanged pending a separate
+   unification decision?
+7. Does the §16.2 case list and the §16.4 allocation make the required SQLite
+   proof plausible within one 300 s / 512 MiB session, or should the conflict
+   go to the Supervisor for a scoped bound amendment before freeze?
+8. Is the D-4 interface in §11 the intended reading — seeding cannot help while
    the only donor is the session's held slot — or should a scoped follow-up
    consider a read-only held-slot donor under stricter closure rules?
-6. Does the reviewer accept the `cc`-based case 2 deviation, or require a
-   bundled-SQLite fixture with a larger owner-approved bound?
-7. Are the §8 bounds and the §16.3 static allocation plausible for one 300 s,
-   512 MiB session with one image?
 
 ## 18. Limits of this design
 
 - It establishes no native evidence, no selected-volume fit, no timing, no
   reach, no saving and no benefit. The separate measured real-Effigy
   seeded-versus-unseeded comparison stays non-gating and separately scoped.
+- It does not implement the registry archive reader; it names the dependency
+  and the strictness the implementation must prove, and it records that
+  declining that dependency would narrow the approved registry scope and must
+  return to the Supervisor.
 - It does not qualify removable media beyond the pinned adapter's own proofs,
   does not touch a real drive, and makes no persistence claim about physical
   disconnection.
 - It does not remove the cooperative same-user residual, the `setsid` escape
-  class, or the control-directory trust that already covers origins.
+  class, the source-tamper-with-preserved-mtime case, or the
+  control-directory trust that already covers origins.
 - It does not decide one-use workspace classification, admission, quota or
   output locality (sibling lead `eb8bdd5c`), and it does not extend the
   nested-lease permit or idle-exec custody designs.
