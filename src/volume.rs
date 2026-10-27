@@ -36,7 +36,7 @@
 //! verified mount-root descriptor ([`Binding::dir_at`]), never through a
 //! re-resolved path string.
 
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -292,7 +292,7 @@ impl Binding {
         let parent_fd = open_dir(None, parent)?;
         let fd = open_dir(Some(parent_fd.as_fd_ref()), Path::new(name))
             .map_err(|error| format!("{} is not available: {error}", mount_point.display()))?;
-        let facts = observe(&fd)?;
+        let facts = observe(fd.as_fd())?;
         judge(&mount_point, &facts, expected_uuid)?;
         if u64::try_from(fstat(parent_fd.as_fd_ref())?.st_dev).unwrap_or(u64::MAX) == facts.dev {
             return Err(format!(
@@ -339,7 +339,7 @@ impl Binding {
         if let Some(modelled) = verified_facts::modelled()? {
             return Ok(modelled);
         }
-        let facts = observe(&self.fd)?;
+        let facts = observe(self.fd.as_fd())?;
         judge(&self.mount_point, &facts, Some(&self.uuid))?;
         if facts.device != self.device {
             return Err(format!(
@@ -688,7 +688,16 @@ pub fn writable(path: &Path) -> Result<bool, String> {
 /// Facts about the directory `path` names, read through a descriptor.
 pub fn observe_path(path: &Path) -> Result<Facts, String> {
     let fd = open_dir(None, path)?;
-    observe(&fd)
+    observe(fd.as_fd())
+}
+
+/// Facts about the directory an already-held descriptor names, read through
+/// that same descriptor. This is the observation the absence protocol binds
+/// to: it never reopens a path, so an ancestor is never resolved a second time
+/// and cannot be swapped between the open and the volume reading. Non-macOS
+/// builds stay conservative and report no facts.
+pub fn observe_held(fd: BorrowedFd<'_>) -> Result<Facts, String> {
+    observe(fd)
 }
 
 /// Open `name` under `dir`, optionally creating it owner-only. It must be a
@@ -784,7 +793,7 @@ fn c_text(field: &[libc::c_char]) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn observe(fd: &OwnedFd) -> Result<Facts, String> {
+fn observe(fd: BorrowedFd<'_>) -> Result<Facts, String> {
     // SAFETY: zeroed statfs is valid output storage; the descriptor is open.
     let mut sample: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut sample) } != 0 {
@@ -794,7 +803,7 @@ fn observe(fd: &OwnedFd) -> Result<Facts, String> {
         ));
     }
     let block = u64::from(sample.f_bsize);
-    let stat = fstat(fd.as_fd_ref())?;
+    let stat = fstat(fd)?;
     Ok(Facts {
         mounted_on: PathBuf::from(c_text(&sample.f_mntonname)),
         device: c_text(&sample.f_mntfromname),
@@ -811,7 +820,7 @@ fn observe(fd: &OwnedFd) -> Result<Facts, String> {
 /// `ATTR_VOL_UUID` of the volume holding `fd`'s directory, if reported. Not
 /// a mount-root proof: see the module notes.
 #[cfg(target_os = "macos")]
-fn volume_uuid(fd: &OwnedFd) -> Option<String> {
+fn volume_uuid(fd: BorrowedFd<'_>) -> Option<String> {
     #[repr(C, align(4))]
     struct Reply {
         length: u32,
@@ -884,7 +893,7 @@ fn flush_volume(fd: &OwnedFd) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn observe(_fd: &OwnedFd) -> Result<Facts, String> {
+fn observe(_fd: BorrowedFd<'_>) -> Result<Facts, String> {
     Err("the apfs-volume-v1 backend is macOS-only".to_owned())
 }
 
