@@ -150,6 +150,7 @@ pub(crate) struct Production {
 
 pub(crate) enum PreparationError {
     Skip(&'static str),
+    SkipNamed(String),
     Refuse(String),
 }
 
@@ -183,7 +184,10 @@ impl Production {
         let lock =
             crate::seed_lock::read(&checkout.join("Cargo.lock")).map_err(PreparationError::Skip)?;
         if lock.eligible.is_empty() {
-            return Err(PreparationError::Skip("no eligible locked packages"));
+            return Err(PreparationError::SkipNamed(crate::seed_lock::skip_reason(
+                "no eligible locked packages",
+                &lock,
+            )));
         }
         let cwd = std::env::current_dir()
             .map_err(|_| PreparationError::Skip("working directory unavailable"))?;

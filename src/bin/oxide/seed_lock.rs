@@ -74,6 +74,23 @@ pub(crate) struct Analysis {
     pub rejected: Vec<RejectedPackage>,
 }
 
+/// Keep the cold-build reason useful without rendering an unbounded lockfile.
+pub(crate) fn skip_reason(reason: &str, analysis: &Analysis) -> String {
+    let rejected = analysis.rejected.iter().find_map(|entry| {
+        let detail = match entry.reason {
+            SeedRejectReason::AmbiguousName => "ambiguous name",
+            SeedRejectReason::NonLeaf => "non-leaf",
+            _ => return None,
+        };
+        Some((&entry.package.name, detail))
+    });
+    let Some((name, detail)) = rejected else {
+        return reason.to_owned();
+    };
+    let name = &name[..name.len().min(80)]; // Lock names are ASCII.
+    format!("{reason}; {name}: {detail}")
+}
+
 /// Filter by normalized-name uniqueness across *all* lock entries, leafness,
 /// and supported immutable source identity. The order remains lock order.
 pub(crate) fn eligible(bytes: &[u8]) -> Result<Vec<Package>, &'static str> {
@@ -201,6 +218,18 @@ dependencies = ["cfg-if"]
         assert_eq!(result.rejected[0].reason, SeedRejectReason::AmbiguousName);
         assert_eq!(result.rejected[1].reason, SeedRejectReason::AmbiguousName);
         assert_eq!(result.rejected[2].reason, SeedRejectReason::NonLeaf);
+        assert_eq!(
+            skip_reason("no eligible donor", &result),
+            "no eligible donor; foo-bar: ambiguous name"
+        );
+        let nonleaf = Analysis {
+            eligible: vec![],
+            rejected: vec![result.rejected[2].clone()],
+        };
+        assert_eq!(
+            skip_reason("no eligible locked packages", &nonleaf),
+            "no eligible locked packages; nonleaf: non-leaf"
+        );
     }
 
     #[test]

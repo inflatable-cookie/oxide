@@ -39,8 +39,8 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
     let pool = scratch.0.join("pool");
     std::fs::create_dir(&home).unwrap();
     std::fs::create_dir(&cargo_home).unwrap();
-    let run = |opt: Option<&str>| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_oxide"));
+    let run = |binary: &OsStr, opt: Option<&str>| {
+        let mut command = Command::new(binary);
         command
             .arg("status")
             .env("HOME", &home)
@@ -56,9 +56,10 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
         }
         command.output().expect("oxide status")
     };
-    let off = run(None);
-    let ignored = run(Some("0"));
-    let held = run(Some("1"));
+    let candidate = OsStr::new(env!("CARGO_BIN_EXE_oxide"));
+    let off = run(candidate, None);
+    let ignored = run(candidate, Some("0"));
+    let held = run(candidate, Some("1"));
     assert!(off.status.success() && ignored.status.success() && held.status.success());
     assert_eq!(off.stdout, ignored.stdout);
     assert_eq!(off.stderr, ignored.stderr);
@@ -68,6 +69,16 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
         held.stdout.strip_prefix(notice),
         Some(off.stdout.as_slice())
     );
+    // A separately staged merge-base binary turns this into a direct
+    // base-versus-branch comparison; ordinary suite runs need no second build.
+    if let Some(base) = std::env::var_os("OXIDE_SEED_BASELINE_BINARY") {
+        let base = run(&base, None);
+        assert_eq!(base.status.code(), off.status.code());
+        assert_eq!(base.stdout, off.stdout);
+        assert_eq!(base.stderr, off.stderr);
+    }
     assert!(!pool.exists());
+    assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+    assert!(std::fs::read_dir(&cargo_home).unwrap().next().is_none());
     assert!(!home.join(".rustup").exists());
 }

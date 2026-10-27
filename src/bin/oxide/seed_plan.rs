@@ -38,7 +38,6 @@ fn same_context(a: &SeedProducer, b: &SeedProducer) -> bool {
         && a.flags_digest == b.flags_digest
         && a.cargo_home == b.cargo_home
         && a.command_family == b.command_family
-        && a.command_class == b.command_class
 }
 
 /// Select the largest overlap, breaking ties by newer rank then slot id. Caps
@@ -195,6 +194,11 @@ mod tests {
         assert!(!same_context(&a, &b));
         b = a.clone();
         b.cargo_home = "/other".into();
+        assert!(!same_context(&a, &b));
+        b = a.clone();
+        b.command_class = "test".into();
+        assert!(same_context(&a, &b));
+        b.command_family = "check".into();
         assert!(!same_context(&a, &b));
     }
 

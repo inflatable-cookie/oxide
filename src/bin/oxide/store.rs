@@ -1677,9 +1677,35 @@ impl Store {
             &[oxide_storage::lease::managed::SeedCandidate],
         ) -> Result<Vec<crate::seed_plan::VerifiedSource>, String>,
     ) -> Result<SeedRun, String> {
+        self.seed_with(
+            held,
+            producer,
+            lock,
+            verify_sources,
+            |pool, request, monitor| {
+                oxide_storage::lease::managed::seed_monitored(pool, request, monitor)
+            },
+        )
+    }
+
+    fn seed_with(
+        &self,
+        held: &Lease,
+        producer: &oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
+        verify_sources: impl FnOnce(
+            &[oxide_storage::lease::managed::SeedCandidate],
+        ) -> Result<Vec<crate::seed_plan::VerifiedSource>, String>,
+        transaction: impl FnOnce(
+            &Path,
+            &oxide_storage::lease::managed::SeedRequest,
+            &mut dyn FnMut() -> bool,
+        )
+            -> Result<oxide_storage::lease::managed::SeedOutcome, LeaseError>,
+    ) -> Result<SeedRun, String> {
         use oxide_storage::lease::managed::{
-            seed_candidates, seed_monitored, write_seed_attempt, write_seed_last, SeedAttempt,
-            SeedAttemptState, SeedBucket, SeedLast, SeedOutcome, SeedRecipient, ATTEMPT_SCHEMA,
+            seed_candidates, write_seed_attempt, write_seed_last, SeedAttempt, SeedAttemptState,
+            SeedBucket, SeedLast, SeedOutcome, SeedRecipient, ATTEMPT_SCHEMA,
         };
         if self.backend == Backend::ApfsVolume {
             return Ok(SeedRun::Skipped(
@@ -1786,7 +1812,7 @@ impl Store {
                 }
             }
         };
-        let outcome = seed_monitored(&self.pool, &request, &mut monitor);
+        let outcome = transaction(&self.pool, &request, &mut monitor);
         drop(monitor);
         match outcome {
             Ok(SeedOutcome::Skipped(skip)) => {
@@ -5914,8 +5940,7 @@ mod tests {
         outcome
     }
 
-    #[test]
-    fn seed_with_no_catalog_does_not_verify_sources_or_write_sidecars() {
+    fn seed_fixture() -> (PathBuf, Store, SlotKey) {
         use std::ffi::{CStr, CString, OsStr};
         use std::os::unix::ffi::OsStrExt;
         let template = std::env::temp_dir().join("oxide-seed-front.XXXXXX");
@@ -5946,10 +5971,11 @@ mod tests {
             identity: "identity".into(),
             compatibility: "quick-key".into(),
         };
-        let held = lease(&store, &key, None).expect("fresh lease");
-        let lock = format!("version = 4\n[[package]]\nname = 'leaf'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
-        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
-        let producer = oxide_storage::lease::managed::SeedProducer {
+        (root, store, key)
+    }
+
+    fn seed_test_producer() -> oxide_storage::lease::managed::SeedProducer {
+        oxide_storage::lease::managed::SeedProducer {
             cargo_version: "cargo".into(),
             rustc_digest: "digest".into(),
             rustc: "rustc".into(),
@@ -5963,7 +5989,16 @@ mod tests {
             cargo_home: "/cargo".into(),
             command_family: "check".into(),
             command_class: "check".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn seed_with_no_catalog_does_not_verify_sources_or_write_sidecars() {
+        let (root, store, key) = seed_fixture();
+        let held = lease(&store, &key, None).expect("fresh lease");
+        let lock = format!("version = 4\n[[package]]\nname = 'leaf'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let producer = seed_test_producer();
         let before = fs::read(store.control.join("state.json")).unwrap();
         let result = store.seed(&held, &producer, &lock, |_| {
             panic!("source verification ran")
@@ -5971,6 +6006,363 @@ mod tests {
         assert!(matches!(result, Ok(SeedRun::Skipped("no eligible donor"))));
         assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
         assert!(!store.control.join("seeds").exists());
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seed_removable_and_empty_allowlist_skip_without_side_effects() {
+        let (root, mut store, key) = seed_fixture();
+        let held = lease(&store, &key, None).expect("fresh lease");
+        let lock = crate::seed_lock::analyze(b"version = 4\n").unwrap();
+        let before = fs::read(store.control.join("state.json")).unwrap();
+        let producer = seed_test_producer();
+        let result = store.seed(&held, &producer, &lock, |_| {
+            panic!("source verification ran")
+        });
+        assert!(matches!(
+            result,
+            Ok(SeedRun::Skipped("no eligible locked packages"))
+        ));
+        store.backend = Backend::ApfsVolume;
+        let result = store.seed(&held, &producer, &lock, |_| {
+            panic!("source verification ran")
+        });
+        assert!(matches!(
+            result,
+            Ok(SeedRun::Skipped(
+                "seeding not yet supported on a removable pool"
+            ))
+        ));
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        assert!(!store.control.join("seeds").exists());
+        store.backend = Backend::DirectoryBudget;
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seed_front_door_pins_a_catalog_and_records_the_completed_generation() {
+        use oxide_storage::lease::managed::{read_seed_last, SeedCatalog, SeedSourceKind};
+        let (root, mut store, donor_key) = seed_fixture();
+        let donor = lease(&store, &donor_key, None).expect("donor lease");
+        let source_root = root.join("source");
+        fs::create_dir_all(source_root.join("src")).unwrap();
+        let input = source_root.join("src/lib.rs");
+        fs::write(&input, "source").unwrap();
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let source = crate::seed_plan::VerifiedSource {
+            package: lock.eligible[0].clone(),
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root,
+            proc_macro: false,
+        };
+        let fingerprint = donor
+            .build_dir
+            .join("debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&fingerprint).unwrap();
+        for name in ["lib-cfg_if", "lib-cfg_if.json", "dep-lib-cfg_if"] {
+            fs::write(fingerprint.join(name), "fingerprint").unwrap();
+        }
+        let deps = donor.build_dir.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let dep = deps.join("cfg_if-aaaaaaaaaaaaaaaa.d");
+        let artifact = deps.join("libcfg_if-aaaaaaaaaaaaaaaa.rmeta");
+        fs::write(&artifact, "artifact").unwrap();
+        fs::write(
+            &dep,
+            format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                dep.display(),
+                input.display(),
+                artifact.display(),
+                input.display(),
+                input.display()
+            ),
+        )
+        .unwrap();
+        let mut producer = seed_test_producer();
+        producer.rustc_digest = "c".repeat(64);
+        producer.context_digest = "d".repeat(64);
+        producer.flags_digest = "e".repeat(64);
+        let origin = Built::Affine(donor_key.checkout.clone());
+        let cache = oxide_storage::seed_source::SourceCache::new(&donor.store_id).unwrap();
+        store
+            .publish_seed_catalog(
+                &donor,
+                producer.clone(),
+                &lock,
+                &[source.clone()],
+                &[source.clone()],
+                SystemTime::now(),
+                process::now_ms(),
+                true,
+                Some(&origin),
+                "debug",
+                &cache,
+            )
+            .unwrap();
+        let catalog_path = store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", donor.slot_id));
+        let catalog = SeedCatalog::parse(&fs::read(&catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog.packages.len(), 1);
+        assert_eq!(catalog.packages[0].units.len(), 1);
+        assert_eq!(catalog.packages[0].units[0].files.len(), 5);
+        assert!(store.control.join("seeds/sources.json").exists());
+        let recipient_checkout = root.join("recipient");
+        fs::create_dir(&recipient_checkout).unwrap();
+        let recipient_key = SlotKey {
+            checkout: recipient_checkout,
+            identity: "recipient".into(),
+            compatibility: "quick-key".into(),
+        };
+        let recipient = lease(&store, &recipient_key, None).expect("recipient lease");
+        // A complete catalog is not a donor while its producing generation
+        // is still held: a crash before release cannot make it eligible.
+        let held_donor = store
+            .seed(&recipient, &producer, &lock, |_| {
+                panic!("source verification ran")
+            })
+            .unwrap();
+        assert!(matches!(held_donor, SeedRun::Skipped("no eligible donor")));
+        store.release(donor, Some(origin)).unwrap();
+        // A candidate with no verified overlap skips without sampling the
+        // reserve or creating an attempt, even if the reading is unavailable.
+        let payload = std::mem::replace(&mut store.payload, root.join("missing-reserve"));
+        let skipped = store
+            .seed(&recipient, &producer, &lock, |_| Ok(vec![]))
+            .unwrap();
+        assert!(matches!(skipped, SeedRun::Skipped("no eligible donor")));
+        let attempt = store
+            .control
+            .join("seeds")
+            .join(format!("{}.attempt.json", recipient.slot_id));
+        assert!(!attempt.exists());
+        // With a real plan, the same unavailable reserve is a refusal before
+        // the marker and before any recipient write.
+        let refused = store.seed(&recipient, &producer, &lock, |_| Ok(vec![source.clone()]));
+        assert!(matches!(refused, Err(ref reason) if reason.contains("seed reserve stop")));
+        assert!(!attempt.exists());
+        assert!(fs::read_dir(&recipient.build_dir).unwrap().next().is_none());
+        store.payload = payload;
+        let result = store
+            .seed(&recipient, &producer, &lock, |candidates| {
+                assert_eq!(candidates.len(), 1);
+                assert!(matches!(
+                    probe_lock(&store.lock_path(recipient.record), false).unwrap(),
+                    Probe::Held
+                ));
+                assert!(matches!(
+                    probe_lock(&store.control.join("admission.lock"), false).unwrap(),
+                    Probe::Held
+                ));
+                assert!(matches!(
+                    probe_lock(&store.lock_path(catalog.record_id), false).unwrap(),
+                    Probe::Free(_)
+                ));
+                Ok(vec![source.clone()])
+            })
+            .unwrap();
+        let SeedRun::Seeded(receipt, last) = result else {
+            panic!("seed did not complete")
+        };
+        assert_eq!(receipt.units, 1);
+        assert_eq!(receipt.files, 5);
+        assert_eq!(last.lease_id, recipient.lease_id);
+        let attempt_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&attempt).unwrap()).unwrap();
+        assert_eq!(attempt_json["state"], "seeded");
+        assert_eq!(attempt_json["lease_id"], recipient.lease_id);
+        assert_eq!(
+            read_seed_last(&store.pool).unwrap().lease_id,
+            recipient.lease_id
+        );
+        assert!(recipient
+            .build_dir
+            .join("debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta")
+            .exists());
+        let state = store.load().unwrap();
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == recipient.record)
+            .unwrap();
+        assert!(store.trusted_origin(record).is_none());
+        store.release(recipient, None).unwrap();
+
+        // Inject the library outcomes after a recipient write; the library's
+        // own fixtures exercise the real clone and walk fault boundaries.
+        for fault in ["walk", "clone", "reserve"] {
+            use oxide_storage::lease::managed::{
+                SeedAbandon, SeedObservation, SeedOutcome, SeedWalkGap, SeedWalkLimits,
+            };
+            let checkout = root.join(format!("recipient-{fault}"));
+            fs::create_dir(&checkout).unwrap();
+            let key = SlotKey {
+                checkout,
+                identity: format!("recipient-{fault}"),
+                compatibility: "quick-key".into(),
+            };
+            let held = lease(&store, &key, None).expect("fault recipient");
+            let reserve_path = root.join("reserve-probe");
+            let saved_payload = if fault == "reserve" {
+                fs::create_dir(&reserve_path).unwrap();
+                Some(std::mem::replace(&mut store.payload, reserve_path.clone()))
+            } else {
+                None
+            };
+            let result = store.seed_with(
+                &held,
+                &producer,
+                &lock,
+                |_| Ok(vec![source.clone()]),
+                |_, _, monitor| {
+                    fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
+                    if fault == "reserve" {
+                        fs::remove_dir(&reserve_path).unwrap();
+                        assert!((0..64).any(|_| monitor()));
+                        return Err(LeaseError::Io("monitor stopped".into()));
+                    }
+                    if fault == "clone" {
+                        return Err(LeaseError::Io("injected clone failure".into()));
+                    }
+                    Ok(SeedOutcome::Abandoned(SeedAbandon {
+                        observation: SeedObservation {
+                            store_id: held.store_id.clone(),
+                            slot_id: held.slot_id.clone(),
+                            incarnation: held.incarnation.clone(),
+                            lease_id: held.lease_id.clone(),
+                            entries: 1,
+                            logical_bytes: 9,
+                            allocated_bytes: 0,
+                            gap: Some(SeedWalkGap::Unreadable),
+                            limits: SeedWalkLimits {
+                                max_entries: 1,
+                                max_depth: 1,
+                                max_elapsed_ms: 1,
+                            },
+                            elapsed_ms: 0,
+                        },
+                    }))
+                },
+            );
+            if let Some(payload) = saved_payload {
+                store.payload = payload;
+            }
+            if fault == "walk" {
+                assert!(matches!(result, Ok(SeedRun::Abandoned)));
+            } else if fault == "reserve" {
+                assert!(matches!(result, Err(ref reason) if reason.contains("seed reserve stop")));
+            } else {
+                assert!(
+                    matches!(result, Err(ref reason) if reason.contains("injected clone failure"))
+                );
+            }
+            let attempt = store
+                .control
+                .join("seeds")
+                .join(format!("{}.attempt.json", held.slot_id));
+            let attempt_json: serde_json::Value =
+                serde_json::from_slice(&fs::read(attempt).unwrap()).unwrap();
+            assert_eq!(attempt_json["state"], "reset");
+            assert_eq!(read_seed_last(&store.pool).unwrap(), last);
+            store.release(held, None).unwrap();
+            let untrusted = lease(&store, &key, None).expect("untrusted generation");
+            assert!(matches!(untrusted.prior, Prior::Unknown));
+            assert!(untrusted.build_dir.join("partial").exists());
+            store.discard(untrusted).unwrap();
+            let cold = lease(&store, &key, None).expect("cold generation");
+            assert!(matches!(cold.prior, Prior::Fresh));
+            store.release(cold, None).unwrap();
+        }
+
+        // Alter the donor only after the effect-free catalog read. The
+        // pinned second call must see the changed bytes and leave this new
+        // recipient empty, with a terminal skipped attempt.
+        let checkout = root.join("recipient-changed");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "recipient-changed".into(),
+            compatibility: "quick-key".into(),
+        };
+        let held = lease(&store, &key, None).expect("second recipient");
+        let catalog_path = store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", catalog.slot_id));
+        let mut changed = catalog.clone();
+        changed.mark += 1;
+        let result = store
+            .seed(&held, &producer, &lock, |_| {
+                fs::write(&catalog_path, changed.to_bytes().unwrap()).unwrap();
+                Ok(vec![source])
+            })
+            .unwrap();
+        assert!(matches!(result, SeedRun::Skipped("catalog changed")));
+        assert!(fs::read_dir(&held.build_dir).unwrap().next().is_none());
+        let attempt = store
+            .control
+            .join("seeds")
+            .join(format!("{}.attempt.json", held.slot_id));
+        let attempt_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(attempt).unwrap()).unwrap();
+        assert_eq!(attempt_json["state"], "skipped");
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held() {
+        for point in ["before-origin", "intent", "partial", "complete", "running"] {
+            let (root, store, key) = seed_fixture();
+            let held = lease(&store, &key, None).expect("fresh lease");
+            let record_id = held.record;
+            let state = store.load().unwrap();
+            let record = state.records.iter().find(|r| r.id == record_id).unwrap();
+            assert!(store.trusted_origin(record).is_none(), "{point}");
+            if point != "before-origin" {
+                store
+                    .write_origin(record_id, record.last_used, None)
+                    .unwrap();
+            }
+            if matches!(point, "partial" | "complete" | "running") {
+                fs::write(held.build_dir.join("seeded-fixture"), point).unwrap();
+            }
+            if point == "running" {
+                store.mark_spawning(&held).unwrap();
+                store.mark_running(&held, i32::MAX).unwrap();
+            }
+            drop(held);
+            let reacquired = lease(&store, &key, None).expect("recoverable lease");
+            assert!(matches!(reacquired.prior, Prior::Unknown), "{point}");
+            store.discard(reacquired).unwrap();
+            let cold = lease(&store, &key, None).expect("cold lease");
+            assert!(matches!(cold.prior, Prior::Fresh), "{point}");
+            assert!(!cold.build_dir.join("seeded-fixture").exists(), "{point}");
+            store.release(cold, None).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let (root, store, key) = seed_fixture();
+        let held = lease(&store, &key, None).expect("fresh lease");
+        store.mark_spawning(&held).unwrap();
+        let state = store.load().unwrap();
+        let record = state.records.iter().find(|r| r.id == held.record).unwrap();
+        let slot = ledger_view(&store.pool)
+            .unwrap()
+            .slots
+            .into_iter()
+            .find(|slot| slot.slot_id == held.slot_id)
+            .unwrap();
+        assert_eq!(settle(record, Some(&slot), |_| true), Settle::Keep);
+        assert!(store.trusted_origin(record).is_none());
+        // Fixture cleanup explicitly releases the simulated held generation.
         store.release(held, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

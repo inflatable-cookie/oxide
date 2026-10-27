@@ -586,6 +586,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         match seed_sources::Production::prepare(&invocation, &key.checkout, &held, &store) {
             Ok(mut prepared) => match prepared.seed(&store, &held) {
                 Ok(store::SeedRun::Skipped(reason)) => {
+                    let reason = seed_lock::skip_reason(reason, &prepared.lock);
                     eprintln!("oxide: seeding skipped: {reason}");
                     production = Some(prepared);
                 }
@@ -641,6 +642,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
                 }
             },
             Err(seed_sources::PreparationError::Skip(reason)) => {
+                eprintln!("oxide: seeding skipped: {reason}");
+            }
+            Err(seed_sources::PreparationError::SkipNamed(reason)) => {
                 eprintln!("oxide: seeding skipped: {reason}");
             }
             Err(seed_sources::PreparationError::Refuse(reason)) => {
