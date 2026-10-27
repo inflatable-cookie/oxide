@@ -275,6 +275,33 @@ enum SlotPersistState {
     Evicting,
 }
 
+/// One ledger slot as the seed custody calls read it: an immutable snapshot
+/// taken under the pool lock. Seeding never writes ledger state.
+pub(super) struct SeedSlotView {
+    pub(super) id: u64,
+    pub(super) incarnation: u64,
+    pub(super) lease_id: Option<String>,
+    pub(super) last_lease_id: String,
+    pub(super) rank: u64,
+    pub(super) dir: Option<String>,
+    pub(super) held: bool,
+    pub(super) idle: bool,
+}
+
+/// The pool and ledger facts call 1 and call 2 may read.
+pub(super) struct SeedPoolView {
+    pub(super) store_id: String,
+    pub(super) pool_root: PathBuf,
+    pub(super) payload_root: PathBuf,
+    pub(super) slots: Vec<SeedSlotView>,
+}
+
+impl SeedPoolView {
+    pub(super) fn slot(&self, id: &str) -> Option<&SeedSlotView> {
+        self.slots.iter().find(|slot| slot.id.to_string() == id)
+    }
+}
+
 /// Where slots live. Neither payload is an OS-enforced bound.
 enum Payload {
     Budget(PathBuf),
@@ -353,6 +380,12 @@ pub mod managed {
     use std::os::fd::AsFd;
     use std::path::Path;
     use std::time::Duration;
+
+    pub use super::super::seed::{
+        publish_seed_catalog, seed, seed_candidates, SeedAbandon, SeedCandidate, SeedCandidates,
+        SeedCatalog, SeedDonor, SeedObservation, SeedOutcome, SeedReceipt, SeedRecipient,
+        SeedRequest, SeedSkip, SeedSkipReason, SeedUnitRef, SeedWalkGap, SeedWalkLimits,
+    };
 
     /// Create an `apfs-volume-v1` pool: config, ledger and lock in `pool`
     /// (internal), payload in a new empty owner-only `payload_dir` on the
@@ -682,6 +715,20 @@ pub(super) fn measure_injected(pool: &Path) -> Result<super::MeasuredPool, Lease
     managed::measure(pool)
 }
 
+/// Test-only: give every idle slot a different `last_lease_id`, so a seed that
+/// already holds the pool lock can be shown to re-check the donor's recorded
+/// generation instead of trusting its own snapshot.
+#[cfg(test)]
+pub(super) fn tamper_idle_generations_injected(pool: &Path) -> Result<(), LeaseError> {
+    let mut ledger = read_ledger(pool)?;
+    for slot in ledger.slots.iter_mut() {
+        if slot.state == SlotPersistState::Idle && slot.lease_id.is_none() {
+            slot.last_lease_id = "0".repeat(32);
+        }
+    }
+    write_ledger(pool, &ledger)
+}
+
 /// Test-only: open a passive measurement, wait, then walk, returning each
 /// scan's recorded elapsed bound so the shared deadline can be observed.
 #[cfg(test)]
@@ -757,7 +804,7 @@ impl Pool {
     /// Open a budget-only directory or removable-volume pool. Any other
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
-    fn open(root: &Path) -> Result<Self, LeaseError> {
+    pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
@@ -838,6 +885,116 @@ impl Pool {
             admission_note: None,
             reserve: None,
         })
+    }
+
+    /// Open for the read-only candidate call (`oxide#137` §6.3 call 1): the
+    /// pool lock alone, no reconciliation, no mutation. A pending recorded
+    /// deletion still makes the pool's accounting unknown, so the read reports
+    /// it rather than finishing a deletion a passive read does not own.
+    pub(super) fn open_seed_read_only(root: &Path) -> Result<Self, LeaseError> {
+        let root = canonical_existing_dir(root, true)?;
+        refuse_foreign_pool_entries(&root)?;
+        refuse_retired_image_pool(&root)?;
+        let lock = lock_pool(&root)?;
+        let config = read_config(&root)?;
+        let paths = BackingPaths::under(&root);
+        let backing = match config.backend.as_str() {
+            BUDGET_BACKEND_DIRECTORY_V1 => open_budget_payload(&root, &paths, &config)?,
+            VOLUME_BACKEND_APFS_V1 => open_volume_payload(&paths, &config)?,
+            _ => return Err(LeaseError::BackingMismatch),
+        };
+        let ledger = read_ledger(&root)?;
+        if ledger.version != LEASE_VERSION
+            || ledger.store_id != config.store_id
+            || ledger.cap_bytes != config.cap_bytes
+        {
+            return Err(LeaseError::BackingMismatch);
+        }
+        if ledger.slots.len() > MAX_SLOTS {
+            return Err(LeaseError::LedgerExhausted);
+        }
+        for slot in &ledger.slots {
+            if let Some(dir) = &slot.dir {
+                split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
+            }
+        }
+        let pending = ledger
+            .slots
+            .iter()
+            .any(|slot| slot.state == SlotPersistState::Evicting);
+        Ok(Self {
+            _lock: Some(lock),
+            root,
+            config,
+            backing,
+            budget: ledger.cap_bytes,
+            ledger,
+            limits: accounting_limits(),
+            deadline: None,
+            reconciliation_blocked: pending,
+            admission_note: None,
+            reserve: None,
+        })
+    }
+
+    /// The immutable ledger and path facts the seed calls read.
+    pub(super) fn seed_view(&self) -> SeedPoolView {
+        SeedPoolView {
+            store_id: self.config.store_id.clone(),
+            pool_root: self.root.clone(),
+            payload_root: self.backing.payload_root().to_path_buf(),
+            slots: self
+                .ledger
+                .slots
+                .iter()
+                .map(|slot| SeedSlotView {
+                    id: slot.id,
+                    incarnation: slot.incarnation,
+                    lease_id: slot.lease_id.clone(),
+                    last_lease_id: slot.last_lease_id.clone(),
+                    rank: slot.rank,
+                    dir: slot.dir.clone(),
+                    held: slot.state == SlotPersistState::Held,
+                    idle: slot.state == SlotPersistState::Idle,
+                })
+                .collect(),
+        }
+    }
+
+    /// A recorded slot's own path from a snapshot record.
+    pub(super) fn seed_slot_path(&self, slot: &SeedSlotView) -> Result<PathBuf, LeaseError> {
+        self.slot_path_in(slot.id, slot.dir.as_deref())
+    }
+
+    /// Re-verify a removable volume's binding before seeding changes anything
+    /// on it. A directory pool has nothing to re-verify.
+    pub(super) fn seed_verify_backing(&self) -> Result<(), LeaseError> {
+        self.backing.verify_volume()
+    }
+
+    /// Re-read the ledger from disk and require this donor's generation to be
+    /// unchanged: exactly `Idle`, without a lease, with the planned lease id as
+    /// its most recent grant. The final recheck the pin exists for.
+    pub(super) fn seed_donor_unchanged(&self, donor: &SeedSlotView) -> Result<bool, LeaseError> {
+        let ledger = read_ledger(&self.root)?;
+        Ok(ledger.slots.iter().any(|slot| {
+            slot.id == donor.id
+                && slot.incarnation == donor.incarnation
+                && slot.state == SlotPersistState::Idle
+                && slot.lease_id.is_none()
+                && slot.last_lease_id == donor.last_lease_id
+        }))
+    }
+
+    /// Re-read the ledger and require the recipient still held by this lease.
+    pub(super) fn seed_recipient_held(&self, recipient: &SeedSlotView) -> Result<bool, LeaseError> {
+        let ledger = read_ledger(&self.root)?;
+        Ok(ledger.slots.iter().any(|slot| {
+            slot.id == recipient.id
+                && slot.incarnation == recipient.incarnation
+                && slot.state == SlotPersistState::Held
+                && slot.lease_id.as_deref() == recipient.lease_id.as_deref()
+        }))
     }
 
     /// Recorded identity and membership, as this open read them.
