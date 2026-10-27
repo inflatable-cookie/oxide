@@ -10,6 +10,28 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 6** answers the CHANGES REQUIRED design review of `0265ad1`
+(comment `6453290716`, 2026-10-27) with two corrections. **The legacy fence is
+now scoped-recognised by the pool opener**: `<control>/removable/state.json` is a
+top-level entry of the removable library pool, so the candidate's own
+`refuse_foreign_pool_entries` would refuse it at `Pool::open` (`pool.rs:762`),
+`Pool::open_passive` (`810`), `snapshot` (`522`) and `describe_volume` (`583`).
+The design adds one validator to that single allowlist — exactly the name
+`state.json`, owner-only regular non-symlink file under a 4 KiB cap, bounded
+object whose `version` is the one-use fence constant (6), `fence =
+"oxide.one-use/1"` and this pool's `store_id`, anything else `unexpected_entry`
+as today — validated and then
+inert, never read as state, with candidate controls on all four open paths and
+refusals for every invalid or foreign fence; the older-reader ordering is
+unchanged. **Guarded `adopt` now refuses entirely at the effect-free precheck**
+(it always refuses; state selects only the text), so case 19 no longer asserts a
+barrier wait for it: binding-mutex exclusion uses a converted checkout whose
+receipt-bearing binding positively holds the mutex across `bound` (with the
+receipt-absent non-premise recorded), barrier exclusion uses
+`detach`/`cancel-reservation` against an active peer, and the prepared transition
+is committed by an explicitly **unguarded** invocation
+(`OXIDE_TEST_TEMP_ROOTS=[]`, `OXIDE_TEST_WORKSPACE_CLASS=normal`) before the
+guarded refusal is asserted.
 **Revision 5** answers the CHANGES REQUIRED design review of `0de3d22`
 (comment `6453147896`, 2026-10-27) with four corrections. **The pre-effect
 hand-off now covers the real removable path**: the installed reader peeks
@@ -190,13 +212,14 @@ fact.
 | Admission of a lease | `src/lease/pool.rs:925-1070` (`lease`), `1072-1190` (`allocate`), `482-497` (`lease`/`lease_measured`/`release`) | **Read.** Restore and class-scoped victims slot in under the pool lock (§6). |
 | Idle enumeration and eviction | `pool.rs:1759-1784` (`evict_idle_until_under_cap`), `1786-1806` (`evict_one_idle`), `1808-1845` (`retire_idle_slot`), `1399-1418` (`replace_idle_slot_for_admission`), `1455-1510` (`admit_unknown_removable`) | **Read and parameterized**, never reimplemented (§6.7). |
 | Pool pressure figure | `pool.rs:1515-1544` (`pressure`), `1546-1578` (`recorded_total`), `1580-1680` (`slot_figure`) | **Read.** The recorded per-slot policy stays the pool figure; the one-use slice is a separate, bounded member measure (§6.4). |
+| Removable pool-root allowlist | `pool.rs:3424-3457` (`refuse_foreign_pool_entries`), called from `snapshot` (`522`), `describe_volume` (`583`), `Pool::open` (`762`) and `Pool::open_passive` (`810`) | **One scoped, validated exception** for the legacy fence document; every other name keeps its shipped refusal (§10.4). |
 | Ledger record and fence | `src/lease/mod.rs:45` (`MAX_SLOTS = 128`), `54-58` (`CAPACITY_POLICY_VERSION = 2`), `src/lease/pool.rs:169-232` (`Ledger`, `SlotRecord`, `RecordedSize`), `src/lease/mod.rs:295-435` (`SlotStatus`, `LedgerSlot`, `PassiveSnapshot`) | **Format unchanged, no bump.** Class lives in Oxide state; the library receives verified membership (§6.2, §10.2). |
 | Accounting walks | `src/inventory.rs:436` (`inventory_directory`), `460` (`scope_directory`), the `(device, inode)` union; `local-lease.md#capacity-and-eviction` | **One bounded multi-root union walk added** for the slice (§6.4). |
 | Owned-output receipt, prepared transition | `src/bin/oxide/outputs.rs:397-425` (`Receipt`), `225-232` (`Prepared`), `358-377` (`ReceiptState`), `64-76` (`RECEIPT_VERSION /2`, `PROFILE_RECEIPT_VERSION /3`, `MARKER_VERSION /2`, `PLAN_VERSION /2`) | **Format unchanged.** States are read exactly as today (§4.2). |
 | Automatic first conversion | `outputs.rs:3843-3886` (`AutoFacts`/`auto_adopts`), `3888-3970` (`auto_adopt`), called from `main.rs:414` | **Skipped for a guarded workspace, before any effect** (§4.1). |
 | Reservation and declared destination | `outputs.rs:5851` (`reserve`), `5355` (`lease_declaration`), `5265` (`planned_destination`), `6094` (`destination_facts`) | **Guarded commands reserve nothing and plan a local destination** (§4.1). |
 | Binding and prepared replay | `outputs.rs:4196-4270` (`bind_for_command`), `4301-4324` (`gated_replay`), `7203-7330` (`replay`) | **Guard branch added**; the three production replay sites refuse before replay (§4.4). |
-| Output mutation verbs | `outputs.rs:2037-2100` (`adopt_command`: barrier `2057`, fence `2075`, migration replay `2081`, receipt replay `2099`), `3983-4030` (`detach_command`: barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014`), `5988-6010` (`cancel_command`), `8450-8470` (`clean_placement`, `Prepared` refusal at `8467`) | **Fast precheck, then an authoritative revalidation under the verb's own custody before every effect**: adopt refuses after the barrier and before the fence/replays; detach and cancel-reservation refuse a `Prepared`/pending-migration receipt under the barrier before their fence/cancellation/replay; clean keeps its refusal with the guarded text (§4.1, §4.4, §4.5). |
+| Output mutation verbs | `outputs.rs:2037-2100` (`adopt_command`: barrier `2057`, fence `2075`, migration replay `2081`, receipt replay `2099`), `3983-4030` (`detach_command`: barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014`), `5988-6010` (`cancel_command`), `8450-8470` (`clean_placement`, `Prepared` refusal at `8467`) | **Fast precheck, then an authoritative revalidation under the verb's own custody before every effect**: `adopt` refuses entirely at the effect-free precheck (it always refuses; state selects only the text) and never enters custody; detach and cancel-reservation refuse a `Prepared`/pending-migration receipt under the barrier before their fence/cancellation/replay; clean keeps its refusal with the guarded text (§4.1, §4.4, §4.5). |
 | Proof staging helper | `scripts/test-oxide-pool-layout.py:96` (`stage_at`, imported by eight scripts) | **Explicit per-call `features` parameter**; a helper default never adds a feature, and each caller's role and fixture controls are edited where they live (§11.2). |
 | Custody and closure facts | `store.rs:2572` (`checkout_custody`), `store.rs:4500` (`probe_lock`; non-creating use at `3155`), `store.rs:630-639` (`settle`), `store.rs:3374-3420` (`recover_settled`), `store.rs:399-406` (`settle_idle`) | **Read** by the front door to derive the `evictable` subset (§5.5.1); the library never reads them. |
 | Per-checkout throughput custody | `outputs.rs:6151-6167` (`barrier` = `begin_clean`, `release_barrier`), `outputs.rs:4243` (checkout binding mutex), `outputs.rs:4008,5873,6000` (other binding-mutex sites) | **Read.** Guarded revalidation runs under one of these before any effect (§4.1, §4.6). |
@@ -408,12 +431,19 @@ authoritative:
    transactions is held. Only this revalidation can let the verb continue, and
    only it produces the "nothing changed" refusal.
 
+`adopt` is the exception, and the exception is total: a guarded workspace
+**always** refuses `adopt`, whatever the receipt state, so the decision is made
+entirely at the effect-free precheck and the verb never enters custody. State
+selects only *which text* is printed (§4.4 precedence), never *whether* it
+refuses; a state change between the precheck and any later point cannot turn a
+refusal into an effect, because there is no later point.
+
 The custody differs per verb, and each is the lock the shipped code already uses
 to exclude the writers of that state:
 
 | Verb | Custody that excludes concurrent transitions | Authoritative revalidation point | Effects it therefore precedes |
 | --- | --- | --- | --- |
-| `oxide outputs adopt` (`outputs.rs:2037`) | clean barrier (`outputs.rs:2057`, `begin_clean`) | immediately after the barrier is acquired | fence `2075`, migration replay `2081`, receipt/migration replay `2099`, any reservation change |
+| `oxide outputs adopt` (`outputs.rs:2037`) | **none — never entered** | at the effect-free precheck, unconditionally (state selects only the text) | barrier `2057`, fence `2075`, migration replay `2081`, receipt/migration replay `2099`, any reservation change |
 | `oxide outputs detach` (`3993`) | clean barrier (`3993`) | after the barrier, before the closure's first effect | fence `4000`, `cancel_reservation` `4009`, replay `4014` |
 | `oxide outputs cancel-reservation` (`5988`) | clean barrier (`5998`) | after the barrier | binding lock, cancellation journal, receipt write |
 | leased command binding (`4196`) | checkout binding mutex (`4243`) | inside the mutex, before `gated_replay` (`4253`) | `gated_replay`, `replay` (`4301`), any prepared transition |
@@ -437,13 +467,15 @@ If implementation finds a writer that takes neither custody, or a verb whose
 effect runs after its custody is released, the work **stops** and returns to
 design; the ordering claim is not widened to cover it.
 
-**What "nothing changed" means, precisely.** The fast-path refusal creates
-nothing. The in-custody refusal creates and then abandons one control-state
-clean mark (the shipped `barrier`/`release_barrier`, `outputs.rs:6151-6167`);
-it writes **no** receipt, link, sibling, root, marker, reservation, adoption
-fence, migration-journal step or slot state, and it replays nothing. The
-regression compares a bounded digest of every one of those before and after,
-plus the clean mark's absence.
+**What "nothing changed" means, precisely.** Every refusal of a guarded
+workspace creates nothing on the `adopt` path — that verb never reaches the
+barrier. The detach, cancel-reservation and binding refusals create and then
+abandon one control-state clean mark (the shipped
+`barrier`/`release_barrier`, `outputs.rs:6151-6167`); none of them writes a
+receipt, link, sibling, root, marker, reservation, adoption fence,
+migration-journal step or slot state, and none replays anything. The regression
+compares a bounded digest of every one of those before and after, plus the clean
+mark's absence.
 
 **Diagnostic precedence at `adopt`.** `adopt` on a guarded workspace always
 refuses, but the text depends on state, decided in this order:
@@ -578,16 +610,18 @@ shipped cancellation runs unchanged; it publishes no root and selects nothing.
 
 ### 4.6 Races, and the concurrent-transition regression
 
-The guard is evaluated in three places, and only the last two are authoritative:
+The guard is evaluated in these places, and only the custody ones are
+authoritative:
 
 1. during planning (`planned_destination`, `main.rs:456`), where the expected
    destination is `None` for a guarded command. This is the fast precheck: it
-   can refuse, but it can never authorise;
+   can refuse, but it can never authorise. For a guarded workspace it is the
+   **whole** decision for `adopt`, which never enters custody (§4.1);
 2. inside `bind_for_command` **under the checkout's binding mutex**
    (`store.lock_binding`, `outputs.rs:4243`) before `gated_replay`, where the
    receipt, the migration journal and every relevant component are re-read;
-3. for the output verbs, under the **clean barrier** before their first effect
-   (§4.1).
+3. for `detach` and `cancel-reservation`, under the **clean barrier** before
+   their first effect (§4.1).
 
 A transition published between (1) and (2)/(3) — by a concurrent adopt, detach,
 cancel-reservation or command binding — is therefore always seen by the
@@ -599,31 +633,46 @@ another. `bind_for_command`'s `expected = None` path already exists
 (`keyed_state_matches(None, expected)`), so a guarded command fails closed if a
 receipt appeared while it waited.
 
-**Regression (native case 19).** Two *existing* debug controls already reach the
-states this protocol must survive, so the design proposes **no new seam**:
+**Regression (native case 19).** All three parts use *existing* debug controls,
+each with a **positively established custody premise**, and the design proposes
+**no new seam**:
 
-- `OXIDE_TEST_PAUSE` is parsed as `<point>:<gate>` (`main.rs:333-352`: the value
-  is `strip_prefix(&format!("{point}:"))`), and `bound` fires **after**
-  `bind_for_command` returns (`main.rs:545`). It therefore holds a *command*,
-  not a prepared transition, and case 19 uses it for exactly that: a peer
-  command paused at `bound:<gate>` keeps the checkout occupied while the guarded
-  verbs run. Each guarded `adopt`/`detach`/`cancel-reservation` must **wait** for
-  the checkout (its barrier) and a guarded command binding must wait for the
-  binding mutex; none may proceed or write while the peer is paused. Releasing
-  the gate lets them run against the final state. This asserts the custody
-  **exclusion** that makes the precheck-to-effect window safe; it does not claim
-  to observe an interleaving, because both custody paths make one impossible.
-- `OXIDE_TEST_OUTPUTS_CRASH` (the `crash_point` control,
-  `outputs.rs:90,7191-7200`, debug-only) stops a transition **after its durable
-  prepared receipt write and before any link effect** (`crash_point("prepared")` at `outputs.rs:6984`,
-  `crash_point("migration-p0")` at `outputs.rs:2651`). The peer therefore leaves
-  a real `Prepared` receipt or migration journal written by the product's own
-  write-ahead path — stronger evidence than a hand-planted file. Every guarded
-  verb (`adopt`, `detach`, `cancel-reservation`, a normal command, and `clean`)
-  must then refuse with the exact diagnostic, with the bounded digest of the
-  receipt, links, siblings, markers, roots and reservations identical before and
-  after; a following explicit `oxide outputs adopt` replays and commits it, after
-  which the guarded verbs see `Committed` and refuse per §4.2.
+- **Binding-mutex exclusion (B1).** The peer is a normal command in a
+  **converted** checkout, paused at `OXIDE_TEST_PAUSE=bound:<gate>`
+  (`main.rs:333-352` parses `<point>:<gate>`). A *receipt-bearing* binding takes
+  the checkout mutex in `bind_for_command` (`outputs.rs:4214-4235`) and its
+  `OutputBinding` keeps that mutex until the command is recorded as running
+  (`main.rs:701`), so a peer paused at `bound` (`main.rs:545`) **positively holds
+  the mutex**. A guarded command in that checkout must then block on
+  `store.lock_binding` and write nothing; after release its outcome matches the
+  final state. The case also records the *non*-premise explicitly: a
+  **receipt-absent** bind returns `OutputBinding::unchecked` with **no** mutex,
+  so no exclusion is claimed there and the case does not assert one.
+- **Barrier exclusion (B2).** The peer is any normal command paused at `bound`
+  (an active record), and the guarded verbs are `detach` and
+  `cancel-reservation`, which may proceed to their barrier. They must wait for
+  the checkout and write nothing; guarded `adopt` is *not* used here, because it
+  refuses at the precheck and never reaches a barrier.
+- **Persisted prepared state (A).** `OXIDE_TEST_OUTPUTS_CRASH`
+  (`outputs.rs:90,7191-7200`, debug-only) stops a peer transition **after its
+  durable prepared receipt write and before any link effect**
+  (`crash_point("prepared")` at `outputs.rs:6984`, `crash_point("migration-p0")`
+  at `outputs.rs:2651`), leaving a real `Prepared` receipt or migration journal
+  written by the product's own write-ahead path. Every guarded verb (`adopt`,
+  `detach`, `cancel-reservation`, a normal command and `clean`) refuses with the
+  exact diagnostic, and the bounded digest of the receipt, links, siblings,
+  markers, roots and reservations is identical before and after.
+
+**Committing the prepared transition, explicitly unguarded.** Guarded `adopt`
+can never replay it, so the commit runs as a **deliberately unguarded
+invocation** of the same build with the proof controls that remove both
+predicates: `OXIDE_TEST_TEMP_ROOTS=[]` and `OXIDE_TEST_WORKSPACE_CLASS=normal`
+(feature build only; `guarded = false`). That invocation runs the shipped
+`oxide outputs adopt`, replays the recorded transition and commits it; the
+*guarded* invocation afterwards sees `Committed` and refuses per §4.2. The
+production route is the same idea without controls: the transition belongs to a
+checkout that is no longer a temporary workspace. The case states this premise
+rather than implying a guarded adopt can replay.
 
 Both controls are debug-only and inert in a release build; they are existing
 product test facilities, not new product behaviour. If the freeze wants a
@@ -1467,16 +1516,50 @@ installed reader:
 
 Two changes, in a fixed order, close it:
 
-1. **A durable legacy fence document.** Before the first v6 write to
-   `<control>/removable/oxide-managed/state.json`, the v6 binary atomically
-   publishes a bounded, owner-only document at `<control>/removable/state.json`
-   whose `version` is `N+1` (6) and which also records the pool's `store_id` and
-   the fence name (`oxide.one-use/1`). `peek_version` reads only the numeric
-   `version` through a plain `serde_json::Value` (`handoff.rs:148-163`), so any
-   #122-era reader that peeks that path sees `6 > 5` and hands off **before** its
-   own output effects; the fence is never removed by this feature and is written
-   once per pool. It is not a second ledger: the v6 binary never reads it as
-   state, and its own `peek_version` ignores it because `6 > 6` is false.
+1. **A durable legacy fence document, scoped-recognised by the pool opener.**
+   Before the first v6 write to `<control>/removable/oxide-managed/state.json`,
+   the v6 binary atomically publishes a bounded, owner-only document at
+   `<control>/removable/state.json` whose `version` is `N+1` (6) and which also
+   records the pool's `store_id` and the fence name (`oxide.one-use/1`).
+   `peek_version` reads only the numeric `version` through a plain
+   `serde_json::Value` (`handoff.rs:148-163`), so any #122-era reader that peeks
+   that path sees `6 > 5` and hands off **before** its own output effects. The
+   fence is never removed by this feature and is written once per pool.
+
+   That path is also the **root of the removable library pool**, and
+   `refuse_foreign_pool_entries` (`pool.rs:3424-3457`) does not allow
+   `state.json` there. Without a scoped exception the candidate would refuse its
+   own pool at `snapshot` (`pool.rs:522`), `describe_volume` (`583`), `Pool::open`
+   (`762`) and `Pool::open_passive` (`810`) — so the fence would break the pool
+   it protects. The design therefore adds **one validator**, called from that
+   single allowlist, with these exact rules:
+
+   - the name must be exactly `state.json`; nothing else becomes acceptable, and
+     every other name keeps today's `unexpected_entry` refusal;
+   - it must be a regular, owner-only, non-symlink file opened `O_NOFOLLOW`,
+     bounded by a small cap (4 KiB), with no group/other permission bits — the
+     same custody rule `open_control_file` uses for hand-off documents;
+   - it must parse as a bounded object with exactly three fields: `version`
+     equal to the **one-use fence constant** (6 — the version this feature
+     publishes, which an installed v5 reader sees as newer and a v6 or later
+     build recognises as its own known fence), `fence` equal to
+     `"oxide.one-use/1"`, and `store_id` (bounded text) equal to the pool's own
+     `store_id`, read from the config/ledger with the existing bounded readers;
+   - **any** deviation — wrong name, symlink, wrong owner or mode, oversize,
+     unparseable, an unknown `fence` string, a `version` that is not the fence
+     constant (including a higher number this build did not publish), a missing or
+     non-numeric version, a missing or mismatched `store_id`, or an unreadable
+     config/ledger — is `unexpected_entry` exactly as today. The validator never repairs, never ignores an error and
+     never waits;
+   - the file is **validated and then ignored**: the library never reads it as
+     state or ledger, never writes it and never deletes it. The candidate's own
+     `peek_version` ignores it because `6 > 6` is false.
+
+   So the fence is neither a ledger nor a second state document, and a stranger
+   cannot use it to place an arbitrary file in the pool: it must already be a
+   well-formed fence for *this* pool, and it is inert otherwise. A v5 binary that
+   somehow gets past its preflight still refuses the pool at this same allowlist,
+   which is fail-closed: no build runs against a v6 removable pool.
 2. **The candidate's own peek is corrected** to read the real removable state
    path as well (`<control>/removable/oxide-managed/state.json`), so a future
    version bump is observed through the path the store actually uses. This alone
@@ -1512,6 +1595,17 @@ control:
   binary.
 The internal path keeps its existing positive control (a v6 internal state with
 no matching installed receipt → exit 75, no effect).
+
+**Fence validation controls (same case, candidate build).** Because the fence
+lives at the removable **pool root**, the candidate must accept it through the
+scoped validator and nothing else: `oxide status`/measure (`snapshot`,
+`Pool::open_passive`), a leased build (`Pool::open`) and `oxide describe`
+(`describe_volume`) each succeed with a valid fence present, and each **refuses**
+the pool with the shipped `unexpected_entry` for a fence that is symlinked,
+group- or other-readable, oversized, unparseable, of an unknown fence name, of a
+non-numeric version, or carrying another pool's `store_id` — and for any other
+foreign entry at that root. No case relies on the fence being ignored as an
+arbitrary file.
 
 ### 10.5 Visibility
 
@@ -1692,7 +1786,7 @@ claimed for a statically edited selector.
    bytes stay until the operator prunes them (a separate, explicitly-authorized
    verb). This design does not delete them and does not convert the checkout.
 6. **A prepared transition in a temp checkout.** Every mutating verb refuses
-   with the exact guarded diagnostic before its barrier, fence, reservation
+   with the exact guarded diagnostic before any barrier, fence, reservation
    cancellation or replay, and changes nothing. There is no automatic repair and
    no repair advice; the operator must act deliberately.
 7. **A one-use slice full of protected slots.** The command waits only for a
@@ -1786,6 +1880,8 @@ claimed for a statically edited selector.
 | unverified membership pair (stale incarnation, missing row) | dropped from candidates, reported; never free quota |
 | unknown class value / version / fence | **refuses safely** |
 | version-6 state with an older installed binary | pre-effect hand-off or exit 75; no output or slot effect |
+| valid legacy fence at the removable pool root | the candidate validates and ignores it; `Pool::open`, `Pool::open_passive`, `snapshot` and `describe_volume` all succeed |
+| invalid or foreign fence at the removable pool root | shipped `unexpected_entry` refusal, exactly as any other foreign pool entry; the validator never repairs, ignores or waits |
 | seed headroom unknown or unfit | seed skipped, cold build in the same slot |
 
 ## 14. Alternatives rejected
@@ -1879,6 +1975,18 @@ its own validation tier and native activation.
   15 for a new slot.
 - The record→slot mapping: stale incarnation, missing record, missing slot, a
   foreign project and an unreadable record all classify unknown.
+- The legacy fence validator: a valid fence for this pool is accepted by the
+  pool-root allowlist; a symlinked, group/other-readable, oversized,
+  unparseable, unknown-fence, non-numeric-version or mismatched-`store_id`
+  document and any other foreign entry each refuse with `unexpected_entry`; the
+  fence is never read as state; and `peek_version` ignores a version equal to the
+  build's own.
+- Guarded `adopt` refuses at the effect-free precheck for **every** receipt state
+  (only the text differs), and never reaches a barrier; `detach`,
+  `cancel-reservation` and a command binding each revalidate under their custody.
+- The custody premises of case 19: a receipt-bearing binding holds the checkout
+  mutex across `bound`, a receipt-absent binding holds none, and a paused peer is
+  an active record for the barrier.
 - The capability JSON shape and the installer's `proof_controls` acceptance and
   refusal matrix (pure; the synthetic `dogfood:scripts:test` fixture covers the
   same decisions without an install).
@@ -1968,7 +2076,10 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
     output effect and only then refuses at `Store::load` (the gap the fence
     closes). Candidate control: the v6 candidate ignores the fence, reads the
     real removable path and classifies normally; a pure stub reader reproduces
-    the old `6 > 5` decision.
+    the old `6 > 5` decision. The same case runs the §10.4 **fence-validation
+    controls**: the candidate accepts a valid fence through `Pool::open`,
+    `Pool::open_passive`, `snapshot` and `describe_volume`, and refuses each
+    invalid or foreign one with the shipped `unexpected_entry`.
 
 16. guarded outputs, absent/real: a temp workspace with no receipt, and with a
     real local `target`, builds locally; no receipt, root or link is created.
@@ -1979,24 +2090,36 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
     links, and a mixed receipt with one owned member and one real nonempty
     member. Both **refuse** the build; detach then restores real directories with
     the root bytes unchanged; the following build runs locally.
-19. guarded `Prepared` and custody exclusion, with existing debug controls only:
-    - a peer `oxide outputs adopt` runs with
-      `OXIDE_TEST_OUTPUTS_CRASH=prepared` (and, in a second variant,
-      `=migration-p0`), leaving a real `Prepared` receipt / migration journal
-      written by the product's own write-ahead path. Every guarded verb —
-      `outputs adopt`, `outputs detach`, `outputs cancel-reservation`, a normal
-      command and `outputs clean` — refuses with the exact diagnostic, and the
-      bounded digest of the receipt, link, sibling, marker, reservation and root
-      is identical before and after. A following explicit `oxide outputs adopt`
-      replays and commits it, after which the guarded verbs see `Committed` and
-      refuse per §4.2.
-    - a peer command is paused with `OXIDE_TEST_PAUSE=bound:<gate>` (the value is
-      `<point>:<gate>`; `bound` fires after `bind_for_command` returns). While it
-      is paused, a guarded `adopt`/`detach`/`cancel-reservation` **waits** for the
-      checkout's barrier and a guarded command binding waits for the binding
-      mutex — neither proceeds nor writes. Releasing the gate lets them run
-      against the final state. This asserts custody **exclusion**; an
-      interleaved observation is impossible by construction and is not claimed.
+19. guarded `Prepared` and custody exclusion, with existing debug controls only and
+    every premise positively established:
+    - **(A) persisted prepared state.** A peer runs `oxide outputs adopt` with
+      `OXIDE_TEST_OUTPUTS_CRASH=prepared` (second variant `=migration-p0`), leaving
+      a real `Prepared` receipt / migration journal from the product's own
+      write-ahead path. Every guarded verb — `outputs adopt`, `outputs detach`,
+      `outputs cancel-reservation`, a normal command and `outputs clean` —
+      refuses with the exact diagnostic, and the bounded digest of the receipt,
+      link, sibling, marker, reservation and root is identical before and after.
+    - **(B1) binding-mutex exclusion.** The peer is a normal command in a
+      **converted** checkout paused at `OXIDE_TEST_PAUSE=bound:<gate>`; because a
+      receipt-bearing binding takes `store.lock_binding` (`outputs.rs:4214-4235`)
+      and keeps it until the command is recorded as running (`main.rs:701`), the
+      peer positively holds that mutex at `bound` (`main.rs:545`). A guarded
+      command in that checkout blocks on the mutex and writes nothing; after
+      release its outcome matches the final state. The case records that a
+      **receipt-absent** bind holds no mutex (`OutputBinding::unchecked`) and
+      asserts no exclusion there.
+    - **(B2) barrier exclusion.** The peer is a normal command paused at `bound`
+      (an active record), and the guarded verbs are `detach` and
+      `cancel-reservation`: each waits at the barrier and writes nothing.
+      Guarded `adopt` is not used, because it refuses at its effect-free
+      precheck and never reaches a barrier.
+    - **(C) commit, explicitly unguarded.** The prepared transition is committed
+      by a deliberately **unguarded** invocation of the same build with
+      `OXIDE_TEST_TEMP_ROOTS=[]` and `OXIDE_TEST_WORKSPACE_CLASS=normal` (feature
+      build only, `guarded = false`), which runs the shipped `oxide outputs
+      adopt` and replays it; the guarded invocation afterwards sees `Committed`
+      and refuses per §4.2. The production route is the same idea without
+      controls: the checkout is no longer a temporary workspace.
 20. guard hierarchy: a `target/<triple>` symlink (owned and dangling) refuses
     and is never followed, a linked member under a real triple directory
     refuses, and the link's referent is byte-identical afterwards.
@@ -2165,12 +2288,12 @@ positive-absence policy are unchanged by either papercut.
 3. Does the guarded table (§4.2) now match the brief for every committed shape,
    and is refusing a mixed or real-member committed receipt (rather than
    treating that member as local) the intended reading?
-4. Is the race-safe protocol of §4.1/§4.6 sound at all four mutation sites: a
-   fast precheck that never authorises, an in-custody revalidation before the
-   fence, reservation cancellation and every replay, custody mutual exclusion for
-   every writer with a stop condition, and the `Prepared`-before-general
-   diagnostic precedence at adopt? Is the guarded `clean` refusal text (retained
-   refusal, no adopt advice) acceptable?
+4. Is the race-safe protocol of §4.1/§4.6 sound: `adopt` decided entirely at the
+   effect-free precheck because it always refuses (state selecting only the
+   text), and `detach`/`cancel-reservation`/command binding revalidating under
+   their custody before the fence, reservation cancellation and every replay,
+   with custody mutual exclusion for every writer and a stop condition? Is the
+   guarded `clean` refusal text (retained refusal, no adopt advice) acceptable?
 5. Is the hierarchical component inspection (§4.3) sufficient for a modelled
    triple and its members, and does it refuse without following an intermediate
    link?
@@ -2221,11 +2344,17 @@ positive-absence policy are unchanged by either papercut.
     protection requirement and the wiring change to the owner** for a scoped
     ruling (§19)? Is that the correct Queue disposition rather than a design
     claim?
-18. Is custody **exclusion** (the `bound` pause) plus the product's own
-    write-ahead stop (`OXIDE_TEST_OUTPUTS_CRASH=prepared|migration-p0`) enough
-    for the race-safety assertion, given that an interleaved observation would
-    need a new seam?
-19. Are the HIGH complexity, premise checklist and separately activated
+18. Are case 19's premises now reachable as written: a receipt-bearing peer
+    paused at `bound` positively holding the binding mutex (with the
+    receipt-absent non-premise recorded), `detach`/`cancel-reservation` waiting at
+    the barrier for an active peer, and the prepared transition committed by an
+    explicitly **unguarded** invocation (`OXIDE_TEST_TEMP_ROOTS=[]`,
+    `OXIDE_TEST_WORKSPACE_CLASS=normal`)?
+19. Is the scoped fence validator (§10.4) the right shape — one allowlisted name,
+    strict ownership/schema/identity validation, the same `unexpected_entry`
+    failure-stop for anything else, never read as state, with candidate controls
+    on `Pool::open`, `Pool::open_passive`, `snapshot` and `describe_volume`?
+20. Are the HIGH complexity, premise checklist and separately activated
     uncounted diagnostic correctly placed before the first counted native?
 
 ## 19. Limits of this design
@@ -2254,6 +2383,12 @@ positive-absence policy are unchanged by either papercut.
   (§10.2, §16.2 case 8). Everything else the brief lists remains in the fixed
   case list. The concurrency case claims custody **exclusion**, never an
   interleaved observation.
+- **The legacy fence needs its own review.** It relaxes one refusal in the
+  library's pool-root allowlist (a validated `state.json` fence) and writes a new
+  document into the removable pool root; the design specifies strict validation
+  and failure-stop, but that allowlist change is safety-bearing and must be
+  reviewed on its own, with the §10.4 controls. No ledger field, `capacity_policy`
+  number or receipt/marker format changes.
 - No arbitrary-write containment, no byte-saving claim, no free-space guarantee
   and no claim that a one-use slot's warm build is as fast as a normal one.
 - Platform scope follows the existing proofs: macOS fixtures with the pool's
