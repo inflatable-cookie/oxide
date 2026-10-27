@@ -1824,6 +1824,112 @@ fn seed_refuses_a_fault_between_the_destination_mkdir_and_its_reopen() {
 }
 
 #[test]
+fn crash_row_partial_clone_is_retained_unpublished_and_never_reused() {
+    reset_hooks();
+    let rig = Rig::new("crash-partial-clone");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let before_ledger = rig.ledger_bytes();
+    // §6.6's "during cloning" row: a fault after the first clone and before
+    // the last leaves a partial `build/` and no published fact.
+    TAMPER_CLONE.with(|cell| cell.set(Some(1)));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    // Durable state: the cloned prefix, no sidecar for the recipient, and the
+    // ledger still recording the held generation.
+    assert!(grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
+    assert!(grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[1].0)
+        .exists());
+    assert!(rig
+        .sidecars()
+        .iter()
+        .all(|name| !name.starts_with(&format!("{}.", grant.slot_id))));
+    assert_eq!(rig.ledger_bytes(), before_ledger);
+    // The next command cannot reuse or complete that generation through the
+    // library: its `build/` is not empty.
+    TAMPER_CLONE.with(|cell| cell.set(None));
+    let again = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(again, Err(LeaseError::UnsafePath(_))), "{again:?}");
+}
+
+#[test]
+fn crash_row_complete_seed_before_spawning_leaves_no_library_trust() {
+    reset_hooks();
+    let rig = Rig::new("crash-complete-seed");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let before_sidecars = rig.sidecars();
+    let before_ledger = rig.ledger_bytes();
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert!(matches!(outcome, SeedOutcome::Seeded(_)), "{outcome:?}");
+    // §6.6's "after a complete seed, before mark_spawning" row: the cloned
+    // tree is complete, and the library published no fact and wrote no trust:
+    // the front door's attempt record is the only place a seed is claimed.
+    assert_eq!(rig.sidecars(), before_sidecars);
+    assert_eq!(rig.ledger_bytes(), before_ledger);
+    // The completed-but-unclaimed generation is not offered as a donor while
+    // the ledger still records it held.
+    let (_, other_recipient) = lease_recipient(&rig, "b");
+    let listed = candidates(&rig, &other_recipient);
+    assert!(listed
+        .candidates
+        .iter()
+        .all(|candidate| candidate.slot_id != grant.slot_id));
+}
+
+#[test]
+fn crash_row_interrupted_catalog_write_is_inert_and_publish_is_atomic() {
+    reset_hooks();
+    let rig = Rig::new("crash-catalog-write");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let seeds = rig.pool.join(MANAGED_NAME).join("seeds");
+    // A completed publish leaves exactly one whole catalog and no temp file.
+    assert_eq!(
+        rig.sidecars(),
+        vec![format!("{}.catalog.json", donor.grant.slot_id)]
+    );
+    assert!(SeedCatalog::parse(
+        &fs::read(seeds.join(format!("{}.catalog.json", donor.grant.slot_id)))
+            .expect("catalog bytes")
+    )
+    .is_ok());
+
+    // A half-written temp file left by an interrupted publish is inert: it is
+    // not a catalog, so nothing offers the donor and nothing is touched.
+    let temp = seeds.join("catalog.tmp-deadbeef");
+    fs::write(&temp, b"{\"schema\":").expect("torn temp");
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).expect("temp mode");
+    assert_eq!(candidates(&rig, &recipient).candidates.len(), 1);
+
+    // A torn catalog at the real name (a crash cannot produce it through the
+    // atomic rename, but the reader must still ignore it) offers nothing and
+    // the seed skips without touching the recipient.
+    let path = seeds.join(format!("{}.catalog.json", donor.grant.slot_id));
+    let complete = fs::read(&path).expect("complete catalog");
+    fs::write(&path, &complete[..complete.len() / 2]).expect("torn catalog");
+    assert!(candidates(&rig, &recipient).candidates.is_empty());
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::CatalogChanged
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
 fn seed_refuses_a_donor_generation_that_changed_after_the_clone() {
     reset_hooks();
     let rig = Rig::new("generation-changed");
