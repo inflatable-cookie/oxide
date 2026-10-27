@@ -10,7 +10,7 @@ supervisor:
     effigy rust:finder-metadata-race:test
 
 whose recipes are `python3 scripts/bounded-test.py --root-parent /private/tmp
---limit 300 --scratch-budget-mib 512 -- python3
+--limit 420 --scratch-budget-mib 512 -- python3
 scripts/test-finder-metadata-race.py [--diagnostic]`. Admission, the
 wall-clock limit, the host reserve, the owned scratch bound, child sessions and
 cleanup belong to the supervisor; this script starts no session, signals no
@@ -166,7 +166,10 @@ POOL_BUDGET = 1 * MIB
 IMAGE_MIB = 128
 RESERVE = "16MiB"
 IMAGE_CAP = "64MiB"
-SHUTDOWN_MARGIN_SECONDS = 25
+# Tom's decision 138a8155 keeps the approved 30 s shutdown margin under the
+# 420 s counted and diagnostic selectors: a running child is cut off with 30 s
+# left for closure and cleanup, never the 25 s an earlier draft used.
+SHUTDOWN_MARGIN_SECONDS = 30
 MUTED = ("OXIDE_", "XDG_", "CARGO_", "GIT_", "RUSTUP_", "RUSTC", "RUSTFLAGS")
 MANAGED_NAME = "oxide-managed"
 REGISTRY_RELATIVE = ("outputs", "registry.json")
@@ -318,6 +321,15 @@ def evidence_dir() -> str:
     return evidence
 
 
+def window_left(deadline_ns: int, now_ns: int) -> float:
+    """The supervisor's remaining work window minus the approved margin.
+
+    Pure so the self-check can assert the cutoff arithmetic: a 420 s session
+    leaves 390 s of work (420 - 30), not the 395 s a 25 s margin would give.
+    """
+    return (deadline_ns - now_ns) / 1e9 - SHUTDOWN_MARGIN_SECONDS
+
+
 def work_left() -> float:
     """What is left of the supervisor's work window.
 
@@ -328,9 +340,7 @@ def work_left() -> float:
     deadline = int(os.environ.get("OXIDE_PROOF_DEADLINE_NS", "0") or 0)
     if deadline <= 0:
         unknown("OXIDE_PROOF_DEADLINE_NS is missing; run this through effigy")
-    left = (
-        deadline - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
-    ) / 1e9 - SHUTDOWN_MARGIN_SECONDS
+    left = window_left(deadline, time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))
     if left <= 5:
         unknown("the supervisor's work window is spent")
     return left
@@ -1247,8 +1257,23 @@ def settle_case(settle: Settle) -> str:
 
 
 def self_check() -> int:
-    """Pure check of the fixture layout budget: no scratch, child or image."""
+    """Pure check of the fixture layout budget and the shutdown cutoff: no
+    scratch, child or image."""
     problems = []
+    # The approved 30 s shutdown margin, enforced for every running child.
+    # Counterfactual: the 420 s selector leaves exactly 390 s of work, and the
+    # earlier 25 s margin's 395 s is refused.
+    if SHUTDOWN_MARGIN_SECONDS != 30:
+        problems.append(f"shutdown margin is {SHUTDOWN_MARGIN_SECONDS} s, not the approved 30 s")
+    left = window_left(420 * 10**9 + 1, 1)
+    if left != 390.0:
+        problems.append(f"a 420 s session leaves {left} s of work, not 390 s")
+    if left == 395.0:
+        problems.append("the cutoff still uses the 25 s margin")
+    if window_left(35 * 10**9, 0) != 5.0:
+        problems.append("the spent-window floor is not measured from the 30 s margin")
+    if window_left(34 * 10**9, 0) >= 5:
+        problems.append("a window below the margin does not reach the spent floor")
     # Counterfactual: the layouts the first diagnostic refused, with the byte
     # counts the product reported. They must still exceed the bound, and every
     # one of those cases must now have a short slug.
