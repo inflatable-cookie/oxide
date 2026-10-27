@@ -7492,8 +7492,7 @@ fn read_receipt_with(
         return Ok(None);
     };
     let mut bytes = Vec::new();
-    file.take(MAX_RECEIPT_BYTES + 1)
-        .read_to_end(&mut bytes)
+    crate::prune::authority_read(file.take(MAX_RECEIPT_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
@@ -7579,8 +7578,14 @@ pub(crate) fn read_receipt_for_prune(
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.
 pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let path = root.join(MARKER);
-    let bytes =
-        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let file =
+        File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_MARKER_BYTES {
+        return Err(format!("{} exceeds its byte limit", path.display()));
+    }
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(&bytes);
@@ -7813,8 +7818,14 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     if metadata.len() > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
-    let bytes =
-        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let file =
+        File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_MARKER_BYTES {
+        return Err(format!("{} exceeds its byte limit", path.display()));
+    }
     let marker: Marker = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
     marker

@@ -490,6 +490,22 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # internal pool the product correctly refuses on an external volume. The
 # supervisor monitors that same root. Each side's run is a separately counted
 # owner activation; `--plan` alone touches nothing.
+# oxide#134 focused authority/accounting proof: one fixed script under the
+# qualified shared supervisor. Genuine internal pool placement uses the
+# owner-accepted /private/tmp exception; 300 s and 512 MiB including cleanup.
+# Each native start requires independent source fit and explicit activation.
+[tasks."rust:prune-authority"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py"
+
+# Uncounted keep-going diagnostic; it never grants native PASS credit.
+[tasks."rust:prune-authority:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --diagnostic"
+
+[tasks."proof:prune-authority:test"]
+run = "python3 scripts/test-prune-authority.py --self-check"
+
 [tasks."rust:outputs-prune"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py"

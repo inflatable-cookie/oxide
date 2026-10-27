@@ -681,8 +681,7 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
         return Ok(None);
     };
     let mut bytes = Vec::new();
-    file.take(MAX_REGISTRY_BYTES + 1)
-        .read_to_end(&mut bytes)
+    authority_read(file.take(MAX_REGISTRY_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_REGISTRY_BYTES {
         return Err(format!(
@@ -1524,19 +1523,21 @@ pub fn status_lines(control: &Path) -> Vec<String> {
         }
     ));
     for root in observation.roots.iter().take(8) {
+        let accounting = if root.accounting_complete {
+            format!(
+                "{} logical / {} allocated bytes",
+                root.logical_bytes, root.allocated_bytes
+            )
+        } else {
+            "unknown/incomplete accounting".to_owned()
+        };
         lines.push(format!(
-            "  {} {} {} ({}, {} logical / {} allocated bytes{})",
+            "  {} {} {} ({}, {})",
             root.outcome,
             root.checkout_id,
             root.root.display(),
             root.intent.as_deref().unwrap_or("no intent"),
-            root.logical_bytes,
-            root.allocated_bytes,
-            if root.accounting_complete {
-                ""
-            } else {
-                ", partial accounting"
-            }
+            accounting,
         ));
     }
     if observation.roots.len() > 8 {
@@ -1589,6 +1590,81 @@ const SNAPSHOT_MAX_RECEIPTS: usize = 8192;
 const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SNAPSHOT_TIME: Duration = Duration::from_secs(10);
 
+// A snapshot's shared input budget is scoped to this synchronous command
+// thread. The latched failure survives callers that translate an I/O error
+// into an unknown custody result.
+thread_local! {
+    static AUTHORITY: std::cell::RefCell<Option<AuthorityBudget>> = const { std::cell::RefCell::new(None) };
+}
+
+struct AuthorityBudget {
+    deadline: Instant,
+    remaining: u64,
+    failed: bool,
+}
+
+struct AuthorityScope;
+
+impl AuthorityScope {
+    fn begin() -> Result<Self, String> {
+        AUTHORITY.with(|cell| {
+            let mut active = cell.borrow_mut();
+            if active.is_some() {
+                return Err("nested authority snapshot".to_owned());
+            }
+            *active = Some(AuthorityBudget {
+                deadline: Instant::now() + SNAPSHOT_TIME,
+                remaining: SNAPSHOT_MAX_BYTES,
+                failed: false,
+            });
+            Ok(Self)
+        })
+    }
+
+    fn complete(&self) -> bool {
+        AUTHORITY.with(|cell| {
+            cell.borrow().as_ref().is_some_and(|budget| {
+                !budget.failed && budget.remaining > 0 && Instant::now() <= budget.deadline
+            })
+        })
+    }
+}
+
+impl Drop for AuthorityScope {
+    fn drop(&mut self) {
+        AUTHORITY.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// Charge bytes actually returned by each bounded authority input read.
+/// Outside a snapshot this is exactly the ordinary read operation.
+pub(crate) fn authority_read<R: Read>(reader: R, bytes: &mut Vec<u8>) -> std::io::Result<usize> {
+    let remaining = AUTHORITY.with(|cell| cell.borrow().as_ref().map(|budget| budget.remaining));
+    let before = bytes.len();
+    let result = match remaining {
+        Some(allowance) => reader.take(allowance).read_to_end(bytes),
+        None => reader.take(u64::MAX).read_to_end(bytes),
+    };
+    let used = (bytes.len() - before) as u64;
+    let exhausted = AUTHORITY.with(|cell| {
+        let mut active = cell.borrow_mut();
+        let Some(budget) = active.as_mut() else {
+            return false;
+        };
+        budget.remaining = budget.remaining.saturating_sub(used);
+        if result.is_err() || budget.remaining == 0 || Instant::now() > budget.deadline {
+            budget.failed = true;
+        }
+        budget.failed
+    });
+    if exhausted && result.is_ok() {
+        return Err(std::io::Error::other(
+            "the snapshot exceeded its input or time budget",
+        ));
+    }
+    result
+}
+
 /// One evaluated root: either a candidate or an explicit keep reason.
 struct Evaluated {
     row: Row,
@@ -1597,8 +1673,33 @@ struct Evaluated {
     legacy: bool,
 }
 
+/// The authority result is distinct from per-root eligibility. A partial
+/// authority view never supplies candidates or diagnostic observations.
+struct Evaluation {
+    entries: Vec<Evaluated>,
+    complete: bool,
+}
+
+impl std::ops::Deref for Evaluation {
+    type Target = [Evaluated];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl<'a> IntoIterator for &'a Evaluation {
+    type Item = &'a Evaluated;
+    type IntoIter = std::slice::Iter<'a, Evaluated>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 /// `oxide outputs prune --dry-run`
 fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
+    let authority = AuthorityScope::begin()?;
     let store = paired_store()?;
     let control = store.owner_control().to_path_buf();
     let list = match operator_list {
@@ -1621,8 +1722,9 @@ fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
             ),
         ));
     }
-    let evaluated = evaluate(&store, &control, &registry, list.as_ref())?;
-    let preview = build_preview(&registry, &evaluated, list.as_ref());
+    let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &authority)?;
+    drop(authority);
+    let preview = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete);
     preview.validate()?;
     let bytes = serde_json::to_vec(&preview).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_PLAN_BYTES {
@@ -1751,22 +1853,49 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             "oxide: prune rolled back {rolled_back} journaled intent(s) that had no filesystem effect; their roots are re-evaluated"
         );
     }
-    if !completed_roots.is_empty() || rolled_back > 0 {
-        registry = match ready_registry(&control) {
-            Ok(registry) => registry,
-            Err(reason) => {
-                return Ok(unsettled(
-                    &control,
-                    &format!(
-                        "a replayed intent settled but the registry became unreadable afterwards ({reason})"
-                    ),
-                ))
-            }
-        };
+    // Start one fresh authority window after any exact intent replay. The
+    // registry and optional list are re-read inside that window.
+    let authority = AuthorityScope::begin()?;
+    let fresh_store = paired_store()?;
+    if fresh_store.owner_control() != control {
+        return Ok(refused("the internal pool changed during revalidation"));
     }
-    // Fresh revalidation: the plan's root identity set must match one-to-one,
-    // with roots completed by an exact intent replay excluded.
-    let evaluated = match evaluate(&store, &control, &registry, list.as_ref()) {
+    let store = fresh_store;
+    registry = match ready_registry(&control) {
+        Ok(registry) => registry,
+        Err(reason) if !completed_roots.is_empty() => {
+            return Ok(partial(
+                &completed_roots,
+                &format!("the fresh registry failed ({reason})"),
+            ));
+        }
+        Err(reason) if rolled_back > 0 => {
+            return Ok(unsettled(&control, &format!("a replayed intent settled but the registry became unreadable afterwards ({reason})")));
+        }
+        Err(reason) => return Ok(refused(&reason)),
+    };
+    let fresh_list = match operator_list {
+        Some(path) => {
+            let fresh = match read_operator_list(path) {
+                Ok(fresh) => fresh,
+                Err(reason) if !completed_roots.is_empty() => {
+                    return Ok(partial(&completed_roots, &reason))
+                }
+                Err(reason) => return Ok(refused(&reason)),
+            };
+            if list.as_ref().map(|old| &old.sha256) != Some(&fresh.sha256) {
+                let reason = "the operator list changed during revalidation";
+                return Ok(if completed_roots.is_empty() {
+                    refused(reason)
+                } else {
+                    partial(&completed_roots, reason)
+                });
+            }
+            Some(fresh)
+        }
+        None => None,
+    };
+    let evaluated = match evaluate(&store, &control, &registry, fresh_list.as_ref(), &authority) {
         Ok(evaluated) => evaluated,
         Err(reason) if !completed_roots.is_empty() => {
             return Ok(partial(
@@ -1776,7 +1905,21 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         }
         Err(reason) => return Err(reason),
     };
-    let fresh = build_preview(&registry, &evaluated, list.as_ref());
+    drop(authority);
+    let fresh = build_preview(
+        &registry,
+        &evaluated,
+        fresh_list.as_ref(),
+        evaluated.complete,
+    );
+    if !fresh.coverage.complete {
+        let reason = "the fresh authority snapshot is incomplete, so every remaining root is kept";
+        return Ok(if completed_roots.is_empty() {
+            refused(reason)
+        } else {
+            partial(&completed_roots, reason)
+        });
+    }
     let plan_set: Vec<&Candidate> = preview
         .candidates
         .iter()
@@ -2026,8 +2169,7 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
     let file = File::open(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
+    authority_read(file.take(limit as u64 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the {what} {}: {error}", path.display()))?;
     if bytes.len() > limit {
         return Err(format!(
@@ -2046,8 +2188,8 @@ fn evaluate(
     control: &Path,
     registry: &Registry,
     list: Option<&OperatorList>,
-) -> Result<Vec<Evaluated>, String> {
-    let deadline = Instant::now() + SNAPSHOT_TIME;
+    authority: &AuthorityScope,
+) -> Result<Evaluation, String> {
     let mut budget = SNAPSHOT_MAX_BYTES;
     let mut receipts: std::collections::HashMap<String, Result<Receipt, String>> =
         std::collections::HashMap::new();
@@ -2088,20 +2230,27 @@ fn evaluate(
     let rows = grouped;
     if rows.len() > SNAPSHOT_MAX_RECEIPTS {
         // A cap is not permission to consider part of the registry.
-        return Ok(rows
-            .into_iter()
-            .map(|row| Evaluated {
-                row,
-                candidate: None,
-                kept: Some(
-                    "the registry exceeds the snapshot receipt cap; the whole batch is kept"
-                        .to_owned(),
-                ),
-                legacy: false,
-            })
-            .collect());
+        return Ok(Evaluation {
+            entries: rows
+                .into_iter()
+                .map(|row| Evaluated {
+                    row,
+                    candidate: None,
+                    kept: Some(
+                        "the registry exceeds the snapshot receipt cap; the whole batch is kept"
+                            .to_owned(),
+                    ),
+                    legacy: false,
+                })
+                .collect(),
+            complete: false,
+        });
     }
-    let mut snapshot_error: Option<String> = None;
+    let mut snapshot_error: Option<String> = if registry.complete {
+        None
+    } else {
+        Some("the registry is sticky-incomplete".to_owned())
+    };
     for row in rows {
         let entry = receipts.entry(row.checkout_id.clone()).or_insert_with(|| {
             match outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id) {
@@ -2114,13 +2263,22 @@ fn evaluate(
             }
         });
         let receipt = match entry.as_ref() {
+            Ok(receipt)
+                if receipt.checkout() != row.checkout
+                    || receipt.checkout_id() != row.checkout_id
+                    || row.receipt != outputs::receipt_path_public(control, &row.checkout_id) =>
+            {
+                snapshot_error
+                    .get_or_insert_with(|| "the registry and receipt identity disagree".to_owned());
+                None
+            }
             Ok(receipt) => Some(receipt),
             Err(reason) => {
                 snapshot_error.get_or_insert_with(|| reason.clone());
                 None
             }
         };
-        if Instant::now() > deadline {
+        if !authority.complete() {
             snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
         }
         let mut out = Evaluated {
@@ -2155,6 +2313,7 @@ fn evaluate(
                         continue;
                     }
                     Ok(RootState::Unknown(reason)) | Err(reason) => {
+                        snapshot_error.get_or_insert_with(|| reason.clone());
                         out.kept = Some(reason);
                         evaluated.push(out);
                         continue;
@@ -2163,7 +2322,6 @@ fn evaluate(
                 if facts.legacy {
                     out.legacy = true;
                 }
-                let (logical, allocated, complete) = account_root(&row.root);
                 out.candidate = Some(Candidate {
                     checkout_id: row.checkout_id.clone(),
                     checkout: row.checkout.clone(),
@@ -2178,13 +2336,17 @@ fn evaluate(
                     dev: facts.dev,
                     ino: facts.ino,
                     marker_digest: facts.marker_digest,
-                    logical_bytes: logical,
-                    allocated_bytes: allocated,
-                    accounting_complete: complete,
+                    logical_bytes: 0,
+                    allocated_bytes: 0,
+                    accounting_complete: false,
                     receiptless: false,
                 });
             }
-            Ok(Some(reason)) | Err(reason) => out.kept = Some(reason),
+            Ok(Some(reason)) => out.kept = Some(reason),
+            Err(reason) => {
+                snapshot_error.get_or_insert_with(|| reason.clone());
+                out.kept = Some(reason);
+            }
         }
         evaluated.push(out);
     }
@@ -2206,8 +2368,146 @@ fn evaluate(
                     );
                 }
             }
+            if entry.candidate.is_none() {
+                let reason = entry
+                    .kept
+                    .as_deref()
+                    .unwrap_or("receiptless authority is unknown");
+                if reason != "the checkout is present, so its root is kept"
+                    && reason != "an active writer still holds this checkout"
+                    && !reason.starts_with("a recorded writer still holds this checkout (")
+                {
+                    snapshot_error.get_or_insert_with(|| reason.to_owned());
+                }
+            }
             evaluated.push(entry);
         }
+    }
+    if !authority.complete() {
+        snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
+    }
+    // Every current receipt reference must be represented exactly once in
+    // the registry; checking only groups discovered there misses omissions.
+    for (checkout_id, result) in &receipts {
+        let Ok(receipt) = result else { continue };
+        if receipt.prepared_ref().is_some() {
+            continue;
+        }
+        for placement in receipt.links() {
+            let Some(selected) = placement.selected_ref() else {
+                continue;
+            };
+            let matches: Vec<&Row> = registry
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.checkout_id == *checkout_id
+                        && row.selected
+                        && row.member == placement.member()
+                        && row.root == selected.root()
+                })
+                .collect();
+            if matches.len() != 1
+                || matches[0].generation != selected.generation()
+                || matches[0].nonce.as_deref() != selected.nonce()
+            {
+                snapshot_error.get_or_insert_with(|| {
+                    "a receipt reference is missing or contradictory in the registry".to_owned()
+                });
+            }
+        }
+    }
+    // Verify selected receipt references for every complete group, including
+    // ordinary kept roots. A representative is not full transaction authority.
+    for entry in &evaluated {
+        if entry.row.checkout_id.is_empty()
+            || entry.candidate.as_ref().is_some_and(|c| c.receiptless)
+        {
+            continue;
+        }
+        let members = group_rows(registry, &entry.row.checkout_id, &entry.row.root);
+        let mut names = std::collections::HashSet::new();
+        if members.iter().any(|row| {
+            row.checkout != entry.row.checkout
+                || row.receipt != entry.row.receipt
+                || !names.insert(&row.member)
+        }) {
+            snapshot_error.get_or_insert_with(|| {
+                "a root group has duplicate or contradictory references".to_owned()
+            });
+        }
+        let selected: Vec<&Row> = members.iter().copied().filter(|row| row.selected).collect();
+        if let Some(first) = selected.first() {
+            if selected.iter().any(|row| {
+                row.nonce != first.nonce
+                    || row.generation != first.generation
+                    || row.root_dev != first.root_dev
+                    || row.root_ino != first.root_ino
+                    || row.marker_digest != first.marker_digest
+                    || row.root_kind != first.root_kind
+                    || row.volume_uuid != first.volume_uuid
+            }) {
+                snapshot_error.get_or_insert_with(|| {
+                    "selected group references disagree about root identity".to_owned()
+                });
+            }
+        }
+        let group: Vec<GroupRow> = members
+            .iter()
+            .map(|row| GroupRow {
+                member: row.member.clone(),
+                generation: row.generation,
+                nonce: row.nonce.clone(),
+                root_dev: row.root_dev,
+                root_ino: row.root_ino,
+                marker_digest: row.marker_digest.clone(),
+                selected: row.selected,
+            })
+            .collect();
+        if let Some(Ok(receipt)) = receipts.get(&entry.row.checkout_id) {
+            if receipt.prepared_ref().is_some() {
+                continue;
+            }
+            if let Err(reason) = verify_group_against_receipt(receipt, &entry.row.root, &group) {
+                snapshot_error.get_or_insert(reason);
+            }
+        }
+    }
+    // Candidate identity also requires all of the group's recorded facts.
+    for entry in &evaluated {
+        if let Some(candidate) = &entry.candidate {
+            if candidate.receiptless {
+                continue;
+            }
+            let verified = verified_group(registry, candidate).and_then(|group| {
+                let receipt = receipts
+                    .get(&candidate.checkout_id)
+                    .and_then(|result| result.as_ref().ok())
+                    .ok_or_else(|| "the checkout receipt is unavailable".to_owned())?;
+                verify_group_against_receipt(receipt, &candidate.root, &group)
+            });
+            if let Err(reason) = verified {
+                snapshot_error.get_or_insert(reason);
+            }
+        }
+    }
+    if !authority.complete() {
+        snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
+    }
+    let mut roots: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    for candidate in evaluated
+        .iter()
+        .filter_map(|entry| entry.candidate.as_ref())
+    {
+        if !roots.insert(&candidate.root) {
+            snapshot_error.get_or_insert_with(|| {
+                "more than one live registry reference names this root".to_owned()
+            });
+        }
+    }
+    if !authority.complete() {
+        snapshot_error
+            .get_or_insert_with(|| "the snapshot exceeded its input or time budget".to_owned());
     }
     if let Some(reason) = snapshot_error {
         for entry in &mut evaluated {
@@ -2216,26 +2516,29 @@ fn evaluate(
                 "the registry snapshot is incomplete ({reason}); the whole batch is kept"
             ));
         }
-        return Ok(evaluated);
+        return Ok(Evaluation {
+            entries: evaluated,
+            complete: false,
+        });
     }
-    // One root may not be selected by two live references.
-    let mut counts: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
-    for entry in &evaluated {
-        if let Some(candidate) = &entry.candidate {
-            *counts.entry(candidate.root.clone()).or_insert(0) += 1;
-        }
-    }
-    for entry in &mut evaluated {
-        let duplicated = entry
-            .candidate
-            .as_ref()
-            .is_some_and(|candidate| counts.get(&candidate.root).copied().unwrap_or(0) > 1);
-        if duplicated {
-            entry.kept = Some("more than one live registry reference names this root".to_owned());
-            entry.candidate = None;
-        }
-    }
-    Ok(evaluated)
+    // Diagnostics do not consume authority time or input budget.
+    AUTHORITY.with(|cell| *cell.borrow_mut() = None);
+    account_candidates(&mut evaluated, control);
+    Ok(Evaluation {
+        entries: evaluated,
+        complete: true,
+    })
+}
+
+#[cfg(test)]
+fn evaluate_test(
+    store: &Store,
+    control: &Path,
+    registry: &Registry,
+    list: Option<&OperatorList>,
+) -> Result<Evaluation, String> {
+    let authority = AuthorityScope::begin()?;
+    evaluate(store, control, registry, list, &authority)
 }
 
 /// The eligibility predicates for one row. `Ok(None)` means every predicate
@@ -2249,7 +2552,7 @@ fn eligibility(
     row: &Row,
     receipt: Option<&Receipt>,
     list: Option<&OperatorList>,
-    budget: &mut u64,
+    _budget: &mut u64,
     under_barrier: bool,
 ) -> Result<Option<String>, String> {
     if !registry.complete {
@@ -2306,15 +2609,15 @@ fn eligibility(
                 || selected.generation() != row.generation
                 || selected.kind() != row.root_kind
             {
-                return Ok(Some(
+                return Err(
                     "the registry row does not match the checkout's committed receipt".to_owned(),
-                ));
+                );
             }
         }
         _ if row.selected => {
-            return Ok(Some(
+            return Err(
                 "the registry selects this root but the checkout's receipt does not".to_owned(),
-            ))
+            )
         }
         _ => {}
     }
@@ -2349,7 +2652,7 @@ fn eligibility(
             ))
         }
         Ok(Absence::Unknown(reason)) | Err(reason) => {
-            return Ok(Some(format!("checkout absence is unknown ({reason})")))
+            return Err(format!("checkout absence is unknown ({reason})"))
         }
     }
     // Writer custody across both pools, and library ledger holders. A
@@ -2358,10 +2661,15 @@ fn eligibility(
         if let Err(reason) = custody_clear_under_barrier(store, control, &row.checkout) {
             return Ok(Some(reason));
         }
-        if *budget > 0 {
-            *budget = budget.saturating_sub(row.root.to_string_lossy().len() as u64);
-        }
         return Ok(None);
+    }
+    if prune_fixture_fault(
+        control,
+        "OXIDE_TEST_PRUNE_UNKNOWN_CUSTODY",
+        &row.checkout,
+        "prune-unknown-custody-fired",
+    ) {
+        return Err("writer custody is unknown (injected fixture)".to_owned());
     }
     match store.checkout_custody(&row.checkout, 0)? {
         CheckoutCustody::Clear => {}
@@ -2371,7 +2679,7 @@ fn eligibility(
             ))
         }
         CheckoutCustody::Unknown(reason) => {
-            return Ok(Some(format!("writer custody is unknown ({reason})")))
+            return Err(format!("writer custody is unknown ({reason})"))
         }
     }
     for holder in store::active_holders(control, &row.checkout)? {
@@ -2390,13 +2698,10 @@ fn eligibility(
             }
         }
         Err(reason) => {
-            return Ok(Some(format!(
+            return Err(format!(
                 "the removable pool's writer records are unreadable ({reason})"
-            )))
+            ))
         }
-    }
-    if *budget > 0 {
-        *budget = budget.saturating_sub(row.root.to_string_lossy().len() as u64);
     }
     Ok(None)
 }
@@ -2925,9 +3230,7 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
     // SAFETY: `marker_fd` is a newly owned descriptor.
     let marker_file = unsafe { File::from_raw_fd(marker_fd) };
     let mut bytes = Vec::new();
-    marker_file
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut bytes)
+    authority_read(marker_file.take(64 * 1024 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the owner marker: {error}"))?;
     if bytes.len() > 64 * 1024 {
         return Ok(RootState::Unknown(
@@ -2975,27 +3278,100 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
     }))
 }
 
-fn account_root(root: &Path) -> (u64, u64, bool) {
-    let limits = InventoryLimits {
-        max_entries: OBSERVATION_ENTRIES,
-        max_depth: 64,
-        max_output_bytes: 4096,
-        max_elapsed_ms: OBSERVATION_MS,
-    };
-    match inventory::inventory_directory(root, limits) {
-        Ok(report) => (
-            report.total.logical_bytes_by_name,
-            report.total.allocated_bytes,
-            report.coverage.complete,
-        ),
-        Err(_) => (0, 0, false),
+fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
+    let deadline = Instant::now() + Duration::from_millis(OBSERVATION_MS);
+    let mut remaining = OBSERVATION_ENTRIES;
+    for candidate in evaluated
+        .iter_mut()
+        .filter_map(|entry| entry.candidate.as_mut())
+    {
+        let now = Instant::now();
+        if remaining == 0 || now >= deadline {
+            break;
+        }
+        diagnostic_delay(control, &candidate.root);
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let limits = InventoryLimits {
+            max_entries: remaining,
+            max_depth: 64,
+            max_output_bytes: 4096,
+            max_elapsed_ms: deadline
+                .duration_since(now)
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        };
+        let Ok(report) = inventory::inventory_directory(&candidate.root, limits) else {
+            // Consumption is unknown on error, so no further walk is safe.
+            break;
+        };
+        remaining = remaining.saturating_sub(report.entries_visited);
+        candidate.logical_bytes = report.total.logical_bytes_by_name;
+        candidate.allocated_bytes = report.total.allocated_bytes;
+        candidate.accounting_complete = report.coverage.complete && Instant::now() <= deadline;
     }
 }
+
+#[cfg(debug_assertions)]
+fn prune_fixture_fault(control: &Path, variable: &str, target: &Path, marker: &str) -> bool {
+    let Some(evidence) = proof_evidence() else {
+        return false;
+    };
+    let Some(scratch) =
+        std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").and_then(|path| fs::canonicalize(path).ok())
+    else {
+        return false;
+    };
+    let Ok(canonical_control) = fs::canonicalize(control) else {
+        return false;
+    };
+    if canonical_control != control
+        || canonical_control == scratch
+        || !canonical_control.starts_with(&scratch)
+        || !matches!(store::open_control_directory(control), Ok(Some(_)))
+        || std::env::var_os(variable).as_deref() != Some(target.as_os_str())
+    {
+        return false;
+    }
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(evidence.join(marker))
+        .and_then(|mut file| writeln!(file, "{}", target.display()))
+        .is_ok()
+}
+
+#[cfg(not(debug_assertions))]
+fn prune_fixture_fault(_control: &Path, _variable: &str, _target: &Path, _marker: &str) -> bool {
+    false
+}
+
+/// This test-only delay is armed only for a private control directory inside
+/// the supervisor's scratch. It never relaxes inventory's mutation-hook rules.
+#[cfg(debug_assertions)]
+fn diagnostic_delay(control: &Path, root: &Path) {
+    if prune_fixture_fault(
+        control,
+        "OXIDE_TEST_PRUNE_DIAGNOSTIC_DELAY",
+        root,
+        "prune-diagnostic-delay-fired",
+    ) {
+        std::thread::sleep(Duration::from_secs(11));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn diagnostic_delay(_control: &Path, _root: &Path) {}
 
 fn build_preview(
     registry: &Registry,
     evaluated: &[Evaluated],
     list: Option<&OperatorList>,
+    authority_complete: bool,
 ) -> Preview {
     let candidates: Vec<Candidate> = evaluated
         .iter()
@@ -3022,7 +3398,7 @@ fn build_preview(
             registry_roots: registry.rows.len() as u64,
             candidate_roots: candidates.len() as u64,
             kept_roots: kept.len() as u64,
-            complete: registry.complete,
+            complete: authority_complete,
             source: "internal output registry".to_owned(),
             observed_ms: process::now_ms(),
         },
@@ -4365,6 +4741,15 @@ fn recheck_candidate(
     candidate: &Candidate,
     list: Option<&OperatorList>,
 ) -> Result<u64, String> {
+    if prune_fixture_fault(
+        control,
+        "OXIDE_TEST_PRUNE_LOCKED_REFUSE",
+        &candidate.root,
+        "prune-locked-refuse-fired",
+    ) {
+        return Err("the locked fixture recheck refused".to_owned());
+    }
+    let authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
     registry.validate()?;
     if !registry.complete {
@@ -4406,6 +4791,9 @@ fn recheck_candidate(
         RootState::Present(_) => return Err("the root's identity changed".to_owned()),
         RootState::Absent => return Err("the root is already absent".to_owned()),
         RootState::Unknown(reason) => return Err(reason),
+    }
+    if !authority.complete() {
+        return Err("the locked authority recheck exceeded its input or time budget".to_owned());
     }
     Ok(registry.revision)
 }
@@ -4545,6 +4933,14 @@ fn verify_group_receipt(
 ) -> Result<(), String> {
     let receipt = outputs::read_receipt_for_prune(control, checkout, checkout_id)?
         .ok_or_else(|| "the checkout's receipt disappeared".to_owned())?;
+    verify_group_against_receipt(&receipt, root, group)
+}
+
+fn verify_group_against_receipt(
+    receipt: &Receipt,
+    root: &Path,
+    group: &[GroupRow],
+) -> Result<(), String> {
     if receipt.prepared_ref().is_some() {
         return Err("the checkout receipt has a pending transition".to_owned());
     }
@@ -5507,7 +5903,6 @@ fn receiptless_candidate(
         RootState::Absent => return Err("the listed root is already absent".to_owned()),
         RootState::Unknown(reason) => return Err(reason),
     };
-    let (logical, allocated, complete) = account_root(root);
     Ok(Candidate {
         checkout_id: row.checkout_id.clone(),
         checkout: row.checkout.clone(),
@@ -5522,9 +5917,9 @@ fn receiptless_candidate(
         dev: facts.dev,
         ino: facts.ino,
         marker_digest: facts.marker_digest,
-        logical_bytes: logical,
-        allocated_bytes: allocated,
-        accounting_complete: complete,
+        logical_bytes: 0,
+        allocated_bytes: 0,
+        accounting_complete: false,
         receiptless: true,
     })
 }
@@ -5536,6 +5931,7 @@ fn recheck_receiptless(
     control: &Path,
     candidate: &Candidate,
 ) -> Result<u64, String> {
+    let authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
     registry.validate()?;
     let entry = evaluate_receiptless(store, control, &registry, &candidate.root, true);
@@ -5546,6 +5942,9 @@ fn recheck_receiptless(
     };
     if !same_candidates(&[candidate], &[&current]) {
         return Err("the listed root's identity changed".to_owned());
+    }
+    if !authority.complete() {
+        return Err("the locked authority recheck exceeded its input or time budget".to_owned());
     }
     Ok(registry.revision)
 }
@@ -6600,7 +6999,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
         };
-        let preview = build_preview(&registry, &[], None);
+        let preview = build_preview(&registry, &[], None, registry.complete);
         let first = serde_json::to_vec(&preview).unwrap();
         let second = serde_json::to_vec(&preview).unwrap();
         assert_eq!(first, second);
@@ -6882,6 +7281,19 @@ mod tests {
     }
 
     #[test]
+    fn authority_budget_charges_actual_reads_and_latches_exhaustion() {
+        let scope = AuthorityScope::begin().unwrap();
+        AUTHORITY.with(|cell| cell.borrow_mut().as_mut().unwrap().remaining = 5);
+        let mut first = Vec::new();
+        assert_eq!(authority_read(&b"abc"[..], &mut first).unwrap(), 3);
+        assert!(scope.complete());
+        let mut second = Vec::new();
+        assert!(authority_read(&b"xyz"[..], &mut second).is_err());
+        assert_eq!(second, b"xy");
+        assert!(!scope.complete());
+    }
+
+    #[test]
     fn a_malformed_receipt_keeps_the_whole_snapshot_batch() {
         let fixture = Fixture::new();
         let control = fixture.root.join("control");
@@ -6908,7 +7320,13 @@ mod tests {
         };
         write_registry(&control, &registry).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
-        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, None).unwrap();
+        assert!(!evaluated.complete);
+        assert!(
+            !build_preview(&registry, &evaluated, None, evaluated.complete)
+                .coverage
+                .complete
+        );
         assert!(evaluated.iter().all(|entry| entry.candidate.is_none()));
         assert!(evaluated.iter().all(|entry| entry
             .kept
@@ -6924,7 +7342,7 @@ mod tests {
         let mut row = row_for(&fixture.root);
         row.checkout_id = checkout_id.to_owned();
         row.checkout = fixture.root.join("gone").join(checkout_id);
-        row.receipt = fixture.root.join("unused.json");
+        row.receipt = outputs::receipt_path_public(&fixture.root.join("control"), checkout_id);
         row.root = PathBuf::from(format!("/Volumes/OxV1/oxide-outputs/{checkout_id}"));
         row.root_kind = RootKind::External;
         row.volume_uuid = Some("11111111-2222-3333-4444-555555555555".to_owned());
@@ -7002,7 +7420,8 @@ mod tests {
         let fixture = Fixture::new();
         let one = legacy_snapshot_row(&fixture, &"a".repeat(64));
         let two = legacy_snapshot_row(&fixture, &"b".repeat(64));
-        let three = legacy_snapshot_row(&fixture, &"c".repeat(64));
+        let mut three = legacy_snapshot_row(&fixture, &"c".repeat(64));
+        three.member = "debug".to_owned();
         let control = ready_control(
             &fixture,
             vec![one.clone(), two.clone(), three.clone()],
@@ -7048,7 +7467,7 @@ mod tests {
         }
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
         let registry = ready_registry(&control).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, None).unwrap();
         assert_eq!(evaluated.len(), 3);
         for entry in &evaluated {
             let reason = entry.kept.clone().unwrap_or_default();
@@ -7062,12 +7481,14 @@ mod tests {
             roots: vec![one.root.clone(), two.root.clone(), three.root.clone()],
             sha256: "d".repeat(64),
         };
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert_eq!(evaluated.len(), 3);
+        assert!(!evaluated.complete);
         for entry in &evaluated {
             let reason = entry.kept.clone().unwrap_or_default();
             assert!(reason.contains("checkout absence is unknown"), "{reason}");
-            assert!(reason.contains("no recorded volume UUID"), "{reason}");
+            assert!(reason.contains("whole batch"), "{reason}");
+            assert!(entry.candidate.is_none());
         }
     }
 
@@ -7089,7 +7510,7 @@ mod tests {
             Some(&row.root),
         );
         publish_snapshot_receipt(&control, &row, &legacy);
-        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, None).unwrap();
         assert!(evaluated[0]
             .kept
             .as_deref()
@@ -7098,7 +7519,7 @@ mod tests {
             roots: vec![row.root.clone()],
             sha256: "d".repeat(64),
         };
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert!(evaluated[0]
             .kept
             .as_deref()
@@ -7116,7 +7537,7 @@ mod tests {
                 Some(&elsewhere),
             ),
         );
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert!(evaluated[0]
             .kept
             .as_deref()
@@ -7129,7 +7550,7 @@ mod tests {
         recorded.nonce = Some("b".repeat(32));
         write_snapshot_registry(&control, vec![recorded.clone()], Vec::new());
         let registry = ready_registry(&control).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert!(evaluated[0].kept.as_deref().is_some_and(
             |reason| reason.contains("does not match the checkout's committed receipt")
         ));
@@ -7150,7 +7571,7 @@ mod tests {
         });
         publish_snapshot_receipt(&control, &row, &prepared);
         let registry = ready_registry(&control).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         let reason = evaluated[0].kept.clone().unwrap_or_default();
         assert!(reason.contains("not committed for this root"), "{reason}");
 
@@ -7159,7 +7580,7 @@ mod tests {
         let mut contradictory = legacy.clone();
         contradictory["state"] = serde_json::json!("pruned");
         publish_snapshot_receipt(&control, &row, &contradictory);
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         let reason = evaluated[0].kept.clone().unwrap_or_default();
         assert!(reason.contains("whole batch"), "{reason}");
         assert!(
@@ -7173,7 +7594,7 @@ mod tests {
 
         // A missing receipt names its own file in the same bounded summary.
         fs::remove_file(outputs::receipt_path_public(&control, &row.checkout_id)).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         let reason = evaluated[0].kept.clone().unwrap_or_default();
         assert!(reason.contains("whole batch"), "{reason}");
         assert!(reason.contains("is missing"), "{reason}");

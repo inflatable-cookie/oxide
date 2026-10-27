@@ -1229,8 +1229,7 @@ pub fn recorded_last_use(control: &Path) -> Result<Option<LastUse>, String> {
     let path = control.join("state.json");
     let file = private_file(&path, false)?.ok_or("no Oxide control state")?;
     let mut bytes = Vec::new();
-    file.take(MAX_STATE_BYTES + 1)
-        .read_to_end(&mut bytes)
+    crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
         .map_err(|error| error.to_string())?;
     let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     Ok(state
@@ -1254,8 +1253,7 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
         return Ok(Vec::new());
     };
     let mut bytes = Vec::new();
-    file.take(MAX_STATE_BYTES + 1)
-        .read_to_end(&mut bytes)
+    crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
         .map_err(|error| error.to_string())?;
     let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let boot = boot_session();
@@ -1295,8 +1293,7 @@ fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>,
         return Ok(Vec::new());
     };
     let mut bytes = Vec::new();
-    file.take(MAX_STATE_BYTES + 1)
-        .read_to_end(&mut bytes)
+    crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read Oxide state: {error}"))?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("Oxide state exceeds its byte limit".to_owned());
@@ -2526,9 +2523,7 @@ impl Store {
         let sibling = self.sibling.as_ref()?;
         let file = private_file(&sibling.control.join("state.json"), false).ok()??;
         let mut bytes = Vec::new();
-        file.take(MAX_STATE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
+        crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes).ok()?;
         serde_json::from_slice::<State>(&bytes).ok()
     }
 
@@ -3577,9 +3572,7 @@ impl Store {
     fn trusted_origin(&self, record: &Record) -> Option<Built> {
         let file = private_file(&self.origin_path(record.id), false).ok()??;
         let mut bytes = Vec::new();
-        file.take(MAX_ORIGIN_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
+        crate::prune::authority_read(file.take(MAX_ORIGIN_BYTES + 1), &mut bytes).ok()?;
         if bytes.len() as u64 > MAX_ORIGIN_BYTES {
             return None;
         }
@@ -3753,8 +3746,7 @@ impl Store {
             return Ok(State::default());
         };
         let mut bytes = Vec::new();
-        file.take(MAX_STATE_BYTES + 1)
-            .read_to_end(&mut bytes)
+        crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
             .map_err(|error| format!("cannot read Oxide state: {error}"))?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("Oxide state exceeds its byte limit".to_owned());
@@ -4295,8 +4287,7 @@ fn read_observations(control: &Path) -> Result<Option<Observations>, String> {
         return Ok(None);
     };
     let mut bytes = Vec::new();
-    file.take(MAX_OBSERVATIONS_BYTES + 1)
-        .read_to_end(&mut bytes)
+    crate::prune::authority_read(file.take(MAX_OBSERVATIONS_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read recorded observations: {error}"))?;
     if bytes.len() as u64 > MAX_OBSERVATIONS_BYTES {
         return Err("recorded observations exceed their byte limit".to_owned());
