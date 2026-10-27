@@ -4959,6 +4959,9 @@ fn prune_one(
                 "interrupted by signal {signal} while taking the checkout's clean barrier; nothing was changed"
             )))
         }
+        // `Recovering` mode never returns `Busy`; only a guarded verb's
+        // `Barrier` mode does.
+        store::Cleaning::Busy(reason) => return Err(Stop::Refuse(reason)),
     };
     let outcome = prune_one_barrier(store, control, candidate, plan_sha, list, evidence);
     store
@@ -5891,6 +5894,9 @@ fn under_checkout_barrier<T>(
                 "interrupted by signal {signal} while taking the checkout's clean barrier"
             ))
         }
+        // `Recovering` mode never returns `Busy`; only a guarded verb's
+        // `Barrier` mode does.
+        store::Cleaning::Busy(reason) => return Err(reason),
     };
     let outcome = (|| {
         let _binding = store.lock_binding(checkout)?;
@@ -6422,6 +6428,9 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
                 "interrupted by signal {signal} while waiting for this checkout's commands"
             )))
         }
+        // `Recovering` mode never returns `Busy`; only a guarded verb's
+        // `Barrier` mode does.
+        Ok(store::Cleaning::Busy(reason)) => return Ok(refused(&reason)),
         Err(reason) => return Ok(refused(&reason)),
     };
     let outcome = (|| -> Result<u8, String> {

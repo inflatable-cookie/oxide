@@ -21,6 +21,7 @@ mod handoff;
 mod identity;
 mod launch;
 mod layout;
+mod one_use;
 mod outputs;
 mod process;
 mod prune;
@@ -408,10 +409,37 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             .clone()
             .unwrap_or_else(|| "the removable pool is not selected".to_owned())
     });
+    // One-use workspace classification (design §3.1): once per command, after
+    // the pool selection and before the first step that can write an owned
+    // output effect. It reads no receipt, slot, child temp path or payload,
+    // and it is computed only while the feature is active, so a dormant build
+    // does exactly what it did before.
+    let classification = one_use::is_active().then(|| {
+        one_use::classify(
+            &checkout,
+            &one_use::Facts::from_control(Some(&output_control)),
+        )
+    });
+    if let Some(classification) = &classification {
+        for note in &classification.notes {
+            eprintln!("oxide: {note}");
+        }
+    }
+    let guarded = classification
+        .as_ref()
+        .is_some_and(one_use::Classification::guarded);
+    let local_guard: Option<String> = classification
+        .as_ref()
+        .filter(|classification| classification.guarded())
+        .map(one_use::Classification::reason);
     // A fresh checkout on the selected permanent drive converts its target
     // before the destination is planned and keyed (oxide#121). Its barrier is
-    // released before this command takes a slot.
-    prep!(outputs::auto_adopt(&selected.store, &checkout, &selected));
+    // released before this command takes a slot. A guarded workspace skips it
+    // entirely, silently: no barrier, fence, receipt, root, link or notice
+    // (design §4.1).
+    if !guarded {
+        prep!(outputs::auto_adopt(&selected.store, &checkout, &selected));
+    }
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -427,12 +455,42 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // function as a derived `exec`. One path, one key, one set of refusals.
     let derives_from_receipt =
         cli::derives_from_receipt(&invocation.command, &invocation.declared_outputs);
-    let declaration = outputs::lease_declaration(
-        &invocation,
-        Some(&output_control),
-        &checkout,
-        pool_fallback.as_deref(),
-    )?;
+    // A guarded workspace declares the members its own command writes, from
+    // its command line alone: it never derives a set from a receipt (design
+    // §4.1, §4.3). The set is used only to name the components the guard
+    // inspects, so an unmodelled command simply declares none.
+    let declaration = if guarded {
+        outputs::guarded_declaration(&invocation)?
+    } else {
+        outputs::lease_declaration(
+            &invocation,
+            Some(&output_control),
+            &checkout,
+            pool_fallback.as_deref(),
+        )?
+    };
+    let guarded_members: Vec<String> = if guarded {
+        declaration
+            .members()
+            .iter()
+            .map(|member| member.name().to_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let local_outputs = local_guard.as_deref().map(|reason| outputs::LocalOutputs {
+        members: &guarded_members,
+        reason,
+    });
+    if let Some(local) = &local_outputs {
+        // The guard's fast precheck (design §4.1 part 1): a read-only decision
+        // that may refuse here, before any reservation, lease or ticket.
+        prep!(outputs::guarded_precheck(
+            Some(&output_control),
+            &checkout,
+            local.members,
+        ));
+    }
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
     // released again before this command waits for a slot. A derived profile
@@ -441,7 +499,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // set that is EMPTY names no placement, and a whole-target plan there can
     // name a FUTURE root (the first local fallback), so it keeps the shipped
     // reservation path (oxide#164 review finding).
-    if outputs::needs_reservation(derives_from_receipt, &declaration) {
+    // A guarded command never reserves a future root, so it never occupies a
+    // nonce or a registry row (design §4.1).
+    if !guarded && outputs::needs_reservation(derives_from_receipt, &declaration) {
         prep!(outputs::reserve(
             &store,
             Some(&output_control),
@@ -461,6 +521,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         &checkout,
         &declaration,
         pool_fallback.as_deref(),
+        guarded,
     ));
     let destination = outputs::destination_facts(planned.as_ref());
     let key = prep!(SlotKey::resolve_in(
@@ -531,6 +592,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         // keeps the existing refusal (`derives_from_receipt` is false for
         // them).
         derives_from_receipt,
+        local_outputs.as_ref(),
     ) {
         Ok(binding) => binding,
         Err(reason) => {

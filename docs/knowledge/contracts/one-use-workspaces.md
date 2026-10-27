@@ -1,14 +1,33 @@
-# One-use workspaces beside normal slots (proposed design)
+# One-use workspaces beside normal slots (design of record)
 
-Status: **design only, unimplemented, unfrozen.** No product code, proof script,
-selector, native execution, live-pool read, installation, consumer change or
-host setting is authorized by this document. It is the first deliverable of
-oxide#138 under the ROOT design-first rebind of 2026-10-27 (Queue brief v3
-`sha256:f4523cf9…`): publish a concrete design in Oxide's owning knowledge
-tree, run `effigy docs:check`, publish a clean exact head, and stop for an
-independent exact-head design review and the Supervisor's delegated freeze.
-Implementation, the author and independent-reviewer native sessions, and the
-mechanical merge hold are separate and unchanged.
+Status: **design frozen (decision `dd090b31`), slice S1 implemented and
+DORMANT, everything else unimplemented.** The frozen design authorizes no
+proof script, selector, native execution, live-pool read, installation,
+consumer change or host setting by itself; each slice still needs its own
+approved brief, and activation belongs to the Elevated proof slice (§15 S4).
+
+**S1 implementation record (oxide#170).** Slice S1 of §15 landed dormant under
+its own approved brief: `src/bin/oxide/one_use.rs` owns §3's classification,
+the two predicates of §3.6, the bounded dropped-root reasons and the §4.4/§4.5
+diagnostic text; `outputs` owns the §4.2/§4.3 receipt-and-path decision, the
+§4.1 ordering (fast precheck, then the authoritative revalidation under the
+checkout binding mutex before any mark, then a bounded non-blocking
+`Barrier`-mode attempt) and the guarded plan/status/clean wording; `store` owns
+the `begin_clean` **mode** seam (`CleanMode::Recovering` for every existing
+caller, `CleanMode::Barrier` for the guarded verbs, with the §4.1 step-5
+live/dead/unknown busy classifier and the bounded non-progress refusal) through
+`Store::begin_clean_with`. **Dormancy is one temporary process-local switch,
+`one_use::is_active`, `false` in every production binary, settable only by
+unit tests** (S4 replaces it with the `proof-controls` readers of §11.1, which
+are the only activation path the frozen design allows). While it is off, no
+workspace is classified, no guard refusal exists, no note is printed, no
+`Record.class` is ever written, and every shipped path is byte-identical to the
+release before this slice. S1 deliberately carries **no** forward fence and
+**no** version-6 state document: both move to S2 with the stored field (§10.1),
+so a dormant pool is still readable by an older binary. The guarded command's
+one note reuses the shipped warning surface (§4.5), so its printed form is
+`oxide: WARNING: one-use workspace: local outputs (<reason>)`; the plan and
+status lines of §4.5 are added only while the switch is on.
 
 **Revision 13** binds the Oxide Supervisor's design-review disposition
 (2026-10-27, Queue brief v4) in three places. **Case 19 E now has one exact,
@@ -2428,22 +2447,29 @@ claimed for a statically edited selector.
 
 ## 15. Implementation slices (not authorized by this design)
 
-- **S1 classification and guard.** `classify`, the guarded plan/declaration/
-  binding branch, the local-output refusal table, the exact `Prepared`
-  diagnostic before every effect at all four mutation sites, the guarded
-  `clean` refusal text, plan/status wording, the forward fence and version 6, and
-  the two §4.1 seams: the `begin_clean` **mode** (`Recovering` for every existing
-  caller; `Barrier` for guarded verbs, with its **live/dead/unknown busy
-  classifier and bounded non-progress refusal**) and the **revalidation order**
-  that decides the `Prepared` refusal under the checkout binding mutex *before*
-  any mark, id or `waiters/` file exists, with a bounded non-blocking barrier
-  attempt afterwards. Regressions cover a dead record, a dead clean mark, a live
-  holder, unknown custody, the busy-barrier refusal, and **verb-level**
-  repeated refusals (byte-identical including `next_id`); the command-level case
-  uses a matched-control delta, since a build's ticket/lease lifecycle advances
-  `next_id` independently of the output path, and an exact post-lease baseline
-  would need the proposed `leased:<gate>` pause point (returned for scoped
-  review).
+- **S1 classification and guard — implemented, dormant (oxide#170).** The
+  shipped slice is: `classify`, the guarded plan/declaration/binding branch, the
+  local-output refusal table, the exact `Prepared` diagnostic before every
+  effect at all four mutation sites, the guarded `clean` refusal text,
+  plan/status wording, and the two §4.1 seams: the `begin_clean` **mode**
+  (`Recovering` for every existing caller; `Barrier` for guarded verbs, with its
+  **live/dead/unknown busy classifier and bounded non-progress refusal**) and
+  the **revalidation order** that decides the `Prepared` refusal under the
+  checkout binding mutex *before* any mark, id or `waiters/` file exists, with a
+  bounded non-blocking barrier attempt afterwards. **The forward fence and
+  version 6 are not part of it**: they move to S2, which owns the stored field
+  the fence protects, so a dormant pool stays readable by an older binary. The
+  slice is inactive outside tests: see the status note above for the one
+  temporary switch, which S4 replaces. Regressions cover a dead record, a dead
+  clean mark, a live holder, unknown custody, the busy-barrier refusal, the
+  guarded receipt/path table and hierarchy, plan/status wording, and
+  **verb-level** repeated refusals (byte-identical including `next_id`); the
+  command-level case uses a matched-control delta, since a build's
+  ticket/lease lifecycle advances `next_id` independently of the output path,
+  and an exact post-lease baseline would need the proposed `leased:<gate>` pause
+  point (returned for scoped review). Activation, the native cases and the
+  command-level oracle belong to the Elevated proof slice (S4) and to the
+  separately activated implementation proof brief.
 - **S2 record class and front-door scoping.** `Record.class`/`class_reason` with
   the omission rule (§5.1), the bounded **presence-aware decode** in
   `Store::load` that refuses a sub-6 document carrying either field, the fence,

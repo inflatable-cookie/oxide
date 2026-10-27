@@ -1717,6 +1717,10 @@ struct PlanReport {
     members: Vec<MemberPlanView>,
     cooperative_holders: Vec<String>,
     next_generation: u64,
+    /// Set only for a guarded one-use workspace: one line stating that final
+    /// outputs are local and no owned root is selected (design §4.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    one_use: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1802,7 +1806,19 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
         },
         cooperative_holders: holders,
         next_generation,
+        one_use: None,
     };
+    // A guarded workspace's plan is a local plan: it names no owned root and
+    // never offers adopt or conversion advice (design §4.5).
+    if guarded_workspace(context.control(), &context.workspace).is_some() {
+        report.action = "local";
+        report.one_use = Some(crate::one_use::PLAN_LOCAL);
+        report.reason = Some(
+            "this workspace is one-use (temporary): final outputs stay in its own target directory"
+                .to_owned(),
+        );
+        return Ok(report);
+    }
     if mode != Some(DriveMode::Permanent) {
         report.reason = Some(
             "the registered drive is not in permanent mode, so there is no owned-output policy to apply"
@@ -2035,6 +2051,12 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
             }
         }
     }
+    // One bounded line for a guarded one-use checkout (design §4.5, §10.5):
+    // final outputs are local and no owned root is selected. Never a savings
+    // claim.
+    if guarded_workspace(context.control(), &context.workspace).is_some() {
+        lines.push(crate::one_use::STATUS_LOCAL.to_owned());
+    }
     Ok(lines)
 }
 
@@ -2043,6 +2065,16 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
 /// (oxide#163) by running the shipped layout migration transaction.
 fn adopt_command() -> Result<u8, String> {
     let context = Context::open()?;
+    // A guarded workspace always refuses `adopt`, whatever the receipt state,
+    // and it refuses here: effect-free, before the drive-mode, pool and
+    // barrier work below, so the verb never enters custody (design §4.1,
+    // §4.5). The state selects only the text.
+    if guarded_workspace(context.control(), &context.workspace).is_some() {
+        return Err(match context.receipt()? {
+            Some(receipt) if prepared_like(&receipt) => crate::one_use::PREPARED_GUARDED.to_owned(),
+            _ => crate::one_use::adopt_refusal(&context.workspace),
+        });
+    }
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
         return Err(format!(
@@ -3997,8 +4029,24 @@ fn detach_command() -> Result<u8, String> {
     };
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
-    let guard = barrier(&internal, &context.workspace, &mut waits)?;
+    // A guarded workspace takes the same barrier, but through the guarded
+    // order: receipt and migration journal revalidated under the checkout
+    // binding mutex before any mark exists, then a bounded non-blocking
+    // `Barrier`-mode acquisition (design §4.1 steps 3-5, §4.5). A normal
+    // workspace keeps the shipped order byte for byte.
+    let guarded = guarded_workspace(Some(&control), &context.workspace).is_some();
+    let guard = if guarded {
+        guarded_barrier(&internal, &context, &mut waits)?
+    } else {
+        barrier(&internal, &context.workspace, &mut waits)?
+    };
     let outcome = (|| {
+        // Belt and braces: a `Prepared` transition that appeared while the
+        // barrier was taken is a custody defect, so the verb stops before its
+        // effects rather than replaying (design §4.1 step 6).
+        if guarded {
+            guarded_prepared_refusal(&context)?;
+        }
         refuse_unknown_custody(&internal, &context.workspace, "detach")?;
         // A pool adopted before the shared output format upgrades behind
         // the forward fence before its first receipt write (a no-op once
@@ -4207,12 +4255,21 @@ pub fn bind_for_command(
     expected: Option<&Plan>,
     pool_fallback: Option<&str>,
     repair_absent_members: bool,
+    guarded: Option<&LocalOutputs<'_>>,
 ) -> Result<OutputBinding, String> {
     let context = Context::new(
         Some(store.owner_control().to_path_buf()),
         checkout.to_path_buf(),
     )
     .with_pool_fallback(pool_fallback);
+    // A guarded workspace owns no output root, so none of the owned-output
+    // machinery below applies to it: no prune intent, no drive mode, no
+    // receipt transition, no link. The authoritative decision is taken under
+    // the checkout binding mutex in `bind_local_outputs`, and the command
+    // starts with a real local `target`.
+    if let Some(local) = guarded {
+        return bind_local_outputs(store, &context, expected, local);
+    }
     if let Some(intent) = crate::prune::unsettled_for(store.owner_control(), &context.checkout_id)?
     {
         return Err(format!(
@@ -5274,7 +5331,14 @@ pub fn planned_destination(
     checkout: &Path,
     declaration: &crate::layout::Declaration,
     pool_fallback: Option<&str>,
+    guarded: bool,
 ) -> Result<Option<Plan>, String> {
+    // A guarded workspace's final outputs are local: the plan selects no owned
+    // destination, so the slot key is exactly an unconverted checkout's key
+    // (design §4.1). Nothing below is read and no root is proposed.
+    if guarded {
+        return Ok(None);
+    }
     let Some(control) = control else {
         return Ok(None);
     };
@@ -5387,6 +5451,36 @@ pub fn lease_declaration(
             Ok(crate::layout::Declaration::empty())
         }
     }
+}
+
+/// The declaration a guarded one-use workspace's leased command uses (design
+/// §4.1, §4.3).
+///
+/// A guarded workspace owns no output root, so it never derives a member set
+/// from a receipt and nothing here reads one or refuses: the set exists only
+/// to name the components §4.3's guard inspects. A command whose layout this
+/// build cannot model — a JSON target specification, or a derived `oxide exec`
+/// with no `--output` — declares no member, and the guard then inspects the
+/// checkout's `target` directory alone; the command still builds locally.
+pub fn guarded_declaration(
+    invocation: &crate::cli::Invocation,
+) -> Result<crate::layout::Declaration, String> {
+    let command = invocation.command.as_str();
+    if command == "exec" || crate::cli::derives_from_receipt(command, &invocation.declared_outputs)
+    {
+        return crate::layout::declared(&invocation.declared_outputs);
+    }
+    Ok(
+        match crate::layout::classify(
+            command,
+            invocation.profile,
+            invocation.explicit_profile,
+            &invocation.targets,
+        ) {
+            crate::layout::Layout::Declared(declaration) => declaration,
+            crate::layout::Layout::Unknown(_) => crate::layout::Declaration::empty(),
+        },
+    )
 }
 
 /// The profile member set `oxide exec` derives when the caller declares none
@@ -6002,8 +6096,19 @@ fn cancel_command() -> Result<u8, String> {
     };
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
-    let guard = barrier(&internal, &context.workspace, &mut waits)?;
+    // The same guarded order as `detach`: revalidate the receipt and the
+    // migration journal under the binding mutex before any mark, then a
+    // bounded `Barrier`-mode acquisition (design §4.5).
+    let guarded = guarded_workspace(Some(&control), &context.workspace).is_some();
+    let guard = if guarded {
+        guarded_barrier(&internal, &context, &mut waits)?
+    } else {
+        barrier(&internal, &context.workspace, &mut waits)?
+    };
     let outcome = (|| -> Result<Option<Reservation>, String> {
+        if guarded {
+            guarded_prepared_refusal(&context)?;
+        }
         let _binding = internal.lock_binding(&context.workspace)?;
         let mut receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to cancel")?;
@@ -6132,6 +6237,232 @@ fn selected_facts(selected: &Selected) -> String {
     )
 }
 
+/// What a guarded leased command needs from the local-output guard: the
+/// member set design §4.3 inspects and the bounded reason its one note
+/// prints.
+pub struct LocalOutputs<'a> {
+    pub members: &'a [String],
+    pub reason: &'a str,
+}
+
+/// The one-use classification of `workspace` when the feature is active and
+/// the workspace is guarded; `None` when the feature is dormant or the
+/// workspace is normal, which is every production command in this slice.
+///
+/// Effect-free: the classification reads the environment and the registered
+/// pool facts only. Dropped-root notes are printed by the leased-command path
+/// alone, so one command reports them once.
+pub(crate) fn guarded_workspace(
+    control: Option<&Path>,
+    workspace: &Path,
+) -> Option<crate::one_use::Classification> {
+    if !crate::one_use::is_active() {
+        return None;
+    }
+    let classification =
+        crate::one_use::classify(workspace, &crate::one_use::Facts::from_control(control));
+    classification.guarded().then_some(classification)
+}
+
+/// Whether this receipt records an unresolved `Prepared` transition, in any
+/// shape: the state itself, a pending layout-migration journal, or a prepared
+/// placement (design §4.1, §4.4).
+fn prepared_like(receipt: &Receipt) -> bool {
+    receipt.state == ReceiptState::Prepared
+        || receipt.transition.is_some()
+        || receipt
+            .links()
+            .iter()
+            .any(|placement| placement.prepared_ref().is_some())
+}
+
+/// The exact guarded `Prepared` refusal for one checkout (design §4.4). Every
+/// guarded verb revalidates through this before any effect, under its own
+/// custody, so a `Prepared` receipt or a pending migration journal is never
+/// replayed and never repaired from a guarded workspace.
+fn guarded_prepared_refusal(context: &Context) -> Result<(), String> {
+    match context.receipt()? {
+        Some(receipt) if prepared_like(&receipt) => {
+            Err(crate::one_use::PREPARED_GUARDED.to_owned())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The shipped refusal text for a receipt whose listed legacy root is being
+/// pruned, reused by the guard so a guarded command refuses before any effect
+/// exactly as it does today.
+const PRUNING_REFUSAL: &str = "a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it";
+
+/// The guarded local-output decision for one leased command (design §4.2),
+/// read-only and effect-free.
+///
+/// `Ok(())` means the command runs with local outputs; `Err` is the exact
+/// refusal text and means nothing was created, linked, reserved or deleted.
+fn local_outputs_decision(
+    context: &Context,
+    members: &[String],
+    prefix: &str,
+) -> Result<(), String> {
+    if let Some(receipt) = context.receipt()? {
+        if prepared_like(&receipt) {
+            return Err(crate::one_use::PREPARED_GUARDED.to_owned());
+        }
+        match receipt.state {
+            // A committed receipt selects an owned root in every member shape,
+            // so a guarded workspace never builds locally through it.
+            ReceiptState::Committed => {
+                let root = receipt
+                    .selected()
+                    .map_or_else(|| context.link(), |selected| selected.root.clone());
+                return Err(crate::one_use::committed_refusal(&root));
+            }
+            ReceiptState::Pruning => return Err(format!("{prefix}: {PRUNING_REFUSAL}")),
+            // `Detached` and `Pruned` own no selection: the live components
+            // below decide, and neither is a repair opportunity.
+            ReceiptState::Prepared | ReceiptState::Detached | ReceiptState::Pruned => {}
+        }
+    }
+    inspect_components(&context.link(), members, prefix)
+}
+
+/// The bounded component inspection of design §4.3: `<workspace>/target` and
+/// every profile member this command declares, each reached through its
+/// parent chain with `symlink_metadata` only. No listing, no recursion, no
+/// link followed, no payload walk.
+fn inspect_components(target: &Path, members: &[String], prefix: &str) -> Result<(), String> {
+    if !inspect_component(target, prefix)? {
+        // An absent target holds nothing below it.
+        return Ok(());
+    }
+    for member in members {
+        let mut path = target.to_path_buf();
+        for component in member.split('/') {
+            path.push(component);
+            if !inspect_component(&path, prefix)? {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One inspected component: `Ok(false)` absent, `Ok(true)` a real directory,
+/// and a refusal (or an unreadable-path error) for anything else.
+fn inspect_component(path: &Path, prefix: &str) -> Result<bool, String> {
+    let shown = || path.display().to_string();
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "{prefix}: cannot inspect {}: {error}; nothing was changed",
+            shown()
+        )),
+        Ok(metadata) => {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                return Ok(true);
+            }
+            let kind = if metadata.file_type().is_symlink() {
+                "a symbolic link".to_owned()
+            } else if metadata.is_file() {
+                "a file".to_owned()
+            } else {
+                "not a real directory".to_owned()
+            };
+            Err(format!(
+                "{prefix}: {} is {kind}; a one-use (temporary) workspace keeps final outputs local and Oxide never follows, adopts or replaces it; nothing was changed",
+                shown()
+            ))
+        }
+    }
+}
+
+/// The guard's effect-free fast precheck for a leased command (design §4.1
+/// part 1). It may refuse early, with literally nothing created, and it never
+/// authorises the command: the authoritative decision is taken again inside
+/// [`bind_for_command`]'s checkout binding mutex.
+pub fn guarded_precheck(
+    control: Option<&Path>,
+    checkout: &Path,
+    members: &[String],
+) -> Result<(), String> {
+    let context = Context::new(control.map(Path::to_path_buf), checkout.to_path_buf());
+    local_outputs_decision(&context, members, "outputs")
+}
+
+/// The guarded binding branch: local outputs only, with the authoritative
+/// revalidation under the checkout binding mutex and no output effect at all
+/// (design §4.1 row 4).
+///
+/// The mutex excludes the one writer that can publish a `Prepared` receipt
+/// under the mutex alone (a peer command's own binding), so a transition that
+/// appeared while this command waited is refused here rather than replayed.
+fn bind_local_outputs(
+    store: &Store,
+    context: &Context,
+    expected: Option<&Plan>,
+    local: &LocalOutputs<'_>,
+) -> Result<OutputBinding, String> {
+    let lock = store.lock_binding(&context.workspace)?;
+    let receipt = context.receipt()?;
+    if let Some(receipt) = &receipt {
+        if prepared_like(receipt) {
+            return Err(crate::one_use::PREPARED_GUARDED.to_owned());
+        }
+        match receipt.state {
+            ReceiptState::Committed => {
+                let root = receipt
+                    .selected()
+                    .map_or_else(|| context.link(), |selected| selected.root.clone());
+                return Err(crate::one_use::committed_refusal(&root));
+            }
+            ReceiptState::Pruning => return Err(format!("outputs: {PRUNING_REFUSAL}")),
+            ReceiptState::Prepared | ReceiptState::Detached | ReceiptState::Pruned => {}
+        }
+    }
+    inspect_components(&context.link(), local.members, "outputs")?;
+    // A slot is keyed for a local target, so a checkout converted (or
+    // detached) while this command waited still refuses through the shipped
+    // key check rather than binding another destination.
+    keyed_state_matches(receipt.as_ref(), expected)?;
+    Ok(OutputBinding {
+        outcome: local_outcome(local.reason),
+        _lock: Some(lock),
+    })
+}
+
+/// The one bounded note a guarded command prints, through the shipped warning
+/// surface (design §4.5). No owned root is selected and no adoption warning is
+/// added.
+fn local_outcome(reason: &str) -> Outcome {
+    Outcome {
+        warnings: vec![format!("one-use workspace: local outputs ({reason})")],
+        note: None,
+        root: None,
+    }
+}
+
+/// The guarded verbs' barrier acquisition (design §4.1 steps 3-5): under the
+/// checkout binding mutex, revalidate the receipt and migration journal, then
+/// try the `Barrier`-mode barrier without blocking. Nothing is allocated until
+/// an attempt finds the checkout clear.
+fn guarded_barrier(
+    store: &Store,
+    context: &Context,
+    waits: &mut WaitAccounting,
+) -> Result<CleanGuard, String> {
+    let revalidate = || {
+        let _binding = store.lock_binding(&context.workspace)?;
+        guarded_prepared_refusal(context)
+    };
+    match store.begin_clean_barrier(&context.workspace, waits, revalidate)? {
+        Cleaning::Guard(guard) => Ok(guard),
+        Cleaning::Interrupted(signal) => Err(format!(
+            "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
+        )),
+        Cleaning::Busy(reason) => Err(reason),
+    }
+}
+
 /// Refuse an explicit output command while this checkout has unknown writer
 /// custody: a lost slot whose writers were never positively closed may still
 /// write through the output front door, so no link is replaced or restored.
@@ -6162,6 +6493,9 @@ fn barrier(
 ) -> Result<CleanGuard, String> {
     match store.begin_clean(checkout, waits)? {
         Cleaning::Guard(guard) => Ok(guard),
+        // `Recovering` mode never returns `Busy`; only a guarded verb's
+        // `Barrier` mode does, through [`guarded_barrier`].
+        Cleaning::Busy(reason) => Err(reason),
         Cleaning::Interrupted(signal) => Err(format!(
             "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
         )),
@@ -8457,6 +8791,10 @@ impl CleanPlacement {
 pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, String> {
     let settings = store::settings()?;
     let control = Store::open_existing_with(&settings)?.map(|store| store.control().to_path_buf());
+    // A guarded workspace keeps clean's refusal but loses its adopt advice
+    // (design §4.4): the guarded diagnostic is the only text, and nothing is
+    // changed. Every normal checkout keeps the shipped wording.
+    let guarded = guarded_workspace(control.as_deref(), workspace).is_some();
     let context = Context::new(control, workspace.to_path_buf());
     let receipt = context.receipt()?;
     let unconverted = receipt
@@ -8471,10 +8809,12 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
     match receipt.state {
         ReceiptState::Detached | ReceiptState::Pruned => Ok(None),
         ReceiptState::Pruning => Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
-        ReceiptState::Prepared => Err(
+        ReceiptState::Prepared => Err(if guarded {
+            crate::one_use::PREPARED_GUARDED.to_owned()
+        } else {
             "clean refused: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before cleaning"
-                .to_owned(),
-        ),
+                .to_owned()
+        }),
         ReceiptState::Committed => {
             // The profile layout is validated BEFORE the whole-target link
             // pre-gate: `target` is a real directory there, never the link the
@@ -9004,7 +9344,7 @@ mod tests {
         ))
         .unwrap_err();
         assert!(status.contains("oxide outputs adopt"), "{status}");
-        let bind = match bind_for_command(&store, &fixture.checkout, 0, None, None, false) {
+        let bind = match bind_for_command(&store, &fixture.checkout, 0, None, None, false, None) {
             Err(reason) => reason,
             Ok(_) => panic!("binding accepted a version-1 receipt"),
         };
@@ -9293,6 +9633,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -9306,10 +9647,15 @@ mod tests {
         assert!(facts.contains(" release"), "{facts}");
         let declared =
             crate::layout::declared(&["debug".to_owned(), "release".to_owned()]).unwrap();
-        let declared_plan =
-            planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
-                .unwrap()
-                .unwrap();
+        let declared_plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declared,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(destination_facts(Some(&declared_plan)), facts);
     }
 
@@ -9333,6 +9679,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -9341,10 +9688,15 @@ mod tests {
         assert!(!facts.contains(triple), "{facts}");
         assert_eq!(facts.lines().count(), 2, "{facts}");
         let declared = crate::layout::declared(&[triple.to_owned()]).unwrap();
-        let declared_plan =
-            planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
-                .unwrap()
-                .unwrap();
+        let declared_plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declared,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert!(destination_facts(Some(&declared_plan)).contains(triple));
         // The binding keeps `release` local and reports it once, in the
         // existing grammar.
@@ -9383,7 +9735,8 @@ mod tests {
             Some(&fixture.control),
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
-            None
+            None,
+            false,
         )
         .unwrap()
         .is_none());
@@ -9462,7 +9815,8 @@ mod tests {
             Some(&fixture.control),
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
-            None
+            None,
+            false,
         )
         .unwrap()
         .is_none());
@@ -9484,6 +9838,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -9582,6 +9937,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -9643,6 +9999,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -9716,6 +10073,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -9812,9 +10170,15 @@ mod tests {
         // A declared override is still complete: it names the member the
         // receipt does not place and plans the owned root for it.
         let declared = crate::layout::declared(&["release".to_owned()]).unwrap();
-        let plan = planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
-            .unwrap()
-            .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declared,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(plan.members.len(), 1);
         assert_eq!(plan.selected().map(Selected::root), Some(root.as_path()));
         // A checkout path with a space changes nothing: member names carry no
@@ -9828,7 +10192,8 @@ mod tests {
                     Some(&spaced.control),
                     &spaced.checkout,
                     &exec_declaration(Some(&spaced.control), &spaced.checkout, None).unwrap(),
-                    None
+                    None,
+                    false,
                 )
                 .unwrap()
                 .as_ref()
@@ -9876,6 +10241,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap();
         let facts = destination_facts(plan.as_ref());
@@ -9887,8 +10253,14 @@ mod tests {
         // One derivation, one key: the shipped `exec` path renders the same
         // bytes for the same checkout.
         let exec = exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
-        let exec_plan =
-            planned_destination(Some(&fixture.control), &fixture.checkout, &exec, None).unwrap();
+        let exec_plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &exec,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(destination_facts(exec_plan.as_ref()), facts);
         // The old refusal still exists for a classification this layout cannot
         // model, and it would have refused this profile checkout — which is
@@ -9919,7 +10291,8 @@ mod tests {
             Some(&plain.control),
             &plain.checkout,
             &crate::layout::Declaration::empty(),
-            None
+            None,
+            false,
         )
         .unwrap()
         .is_none());
@@ -9944,6 +10317,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -9954,9 +10328,14 @@ mod tests {
             "{facts}"
         );
         let modelled = declaration_of(&["debug".to_owned()]);
-        let modelled_plan =
-            planned_destination(Some(&fixture.control), &fixture.checkout, &modelled, None)
-                .unwrap();
+        let modelled_plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &modelled,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(destination_facts(modelled_plan.as_ref()), facts);
     }
 
@@ -9983,6 +10362,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -10168,6 +10548,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -10378,6 +10759,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -10607,6 +10989,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -10622,6 +11005,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -10632,6 +11016,7 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
+            false,
         )
         .unwrap_err();
         assert!(refused.contains("declares none"), "{refused}");
@@ -10837,9 +11222,14 @@ mod tests {
                 .unwrap();
         assert!(facts.members().len() == 1);
         facts = crate::layout::Declaration::empty();
-        assert!(
-            planned_destination(Some(&fixture.control), &fixture.checkout, &facts, None).is_err()
-        );
+        assert!(planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &facts,
+            None,
+            false
+        )
+        .is_err());
     }
 
     /// The observed defect (oxide#162): a migration that linked the host
@@ -12137,6 +12527,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -12264,6 +12655,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -12344,6 +12736,7 @@ mod tests {
                 &fixture.checkout,
                 &declaration,
                 None,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -12448,7 +12841,7 @@ mod tests {
         let plain = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
         let plain_store = pool_store(&plain.root.join("pool"));
         let binding =
-            bind_for_command(&plain_store, &plain.checkout, 0, None, None, false).unwrap();
+            bind_for_command(&plain_store, &plain.checkout, 0, None, None, false, None).unwrap();
         assert_eq!(binding.outcome.root, None);
         assert!(!plain.checkout.join("target").exists());
         assert!(!receipt_path(plain_store.control(), &context_id(&plain)).exists());
@@ -12511,6 +12904,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -12609,6 +13003,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -12723,6 +13118,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -12792,6 +13188,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -12911,6 +13308,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             Some("the registered volume is away"),
+            false,
         )
         .unwrap()
         .unwrap();
@@ -13115,6 +13513,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -13931,8 +14330,14 @@ mod tests {
         let fixture = Fixture::new();
         let context = fixture.context();
         let empty = crate::layout::Declaration::empty();
-        let planned =
-            planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None).unwrap();
+        let planned = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &empty,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(planned.is_none());
         assert_eq!(destination_facts(None), "");
         let receipt = transition(
@@ -13943,9 +14348,15 @@ mod tests {
             NonceAuthority::Unkeyed,
         )
         .unwrap();
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
-            .unwrap()
-            .unwrap();
+        let planned = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &empty,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         let selected = planned.selected().unwrap();
         assert_eq!(selected.kind, RootKind::Local);
         assert_eq!(selected.root, fixture.local().root());
@@ -13963,9 +14374,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again.generation, 2);
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
-            .unwrap()
-            .unwrap();
+        let planned = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &empty,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(destination_facts(Some(&planned)), first);
     }
 
@@ -14410,6 +14827,7 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -14443,6 +14861,7 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
+            false,
         )
         .unwrap();
         assert!(planned.is_none(), "{planned:?}");
@@ -14471,6 +14890,7 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             Some("container mismatch"),
+            false,
         )
         .unwrap()
         .unwrap();
@@ -14746,11 +15166,18 @@ mod tests {
         let store = pool_store(&fixture.root.join("pool"));
         register_at(&fixture, store.owner_control(), DriveMode::Permanent);
         let context = fixture.context();
-        let bind =
-            |label: &str| match bind_for_command(&store, &fixture.checkout, 0, None, None, false) {
-                Ok(_) => Ok(()),
-                Err(reason) => Err(format!("{label}: {reason}")),
-            };
+        let bind = |label: &str| match bind_for_command(
+            &store,
+            &fixture.checkout,
+            0,
+            None,
+            None,
+            false,
+            None,
+        ) {
+            Ok(_) => Ok(()),
+            Err(reason) => Err(format!("{label}: {reason}")),
+        };
         assert!(bind("missing").is_ok());
         fs::create_dir(context.link()).unwrap();
         assert!(bind("real").is_ok());
@@ -14794,6 +15221,7 @@ mod tests {
                 &fixture.checkout,
                 &crate::layout::Declaration::empty(),
                 None,
+                false,
             )
             .unwrap();
             assert!(keyed.is_none());
@@ -14806,7 +15234,15 @@ mod tests {
                 NonceAuthority::Unkeyed,
             )
             .unwrap();
-            match bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None, false) {
+            match bind_for_command(
+                &store,
+                &fixture.checkout,
+                0,
+                keyed.as_ref(),
+                None,
+                false,
+                None,
+            ) {
                 Ok(_) => panic!("{mode:?}: bound an owned root with an unconverted slot key"),
                 Err(reason) => assert!(reason.contains("converted to owned outputs"), "{reason}"),
             }
@@ -14816,10 +15252,19 @@ mod tests {
                 &fixture.checkout,
                 &crate::layout::Declaration::empty(),
                 None,
+                false,
             )
             .unwrap();
             assert!(rekeyed.is_some());
-            match bind_for_command(&store, &fixture.checkout, 0, rekeyed.as_ref(), None, false) {
+            match bind_for_command(
+                &store,
+                &fixture.checkout,
+                0,
+                rekeyed.as_ref(),
+                None,
+                false,
+                None,
+            ) {
                 Ok(binding) => assert_eq!(
                     binding.outcome.root.as_deref(),
                     Some(fixture.local().root())
@@ -14854,10 +15299,19 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
+            false,
         )
         .unwrap();
-        let binding = bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
+        let binding = bind_for_command(
+            &store,
+            &fixture.checkout,
+            0,
+            keyed.as_ref(),
+            None,
+            false,
+            None,
+        )
+        .unwrap_or_else(|reason| panic!("{reason}"));
         // The mode switches to permanent and a relinker starts.
         register_at(&fixture, store.owner_control(), DriveMode::Permanent);
         let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -15370,6 +15824,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -15418,6 +15873,7 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -15818,6 +16274,7 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -15837,5 +16294,316 @@ mod tests {
         let result = target_state(&fixture.checkout, &id);
         fs::set_permissions(&fixture.checkout, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err(), "{result:?}");
+    }
+
+    /// A one-use S1 fixture: a checkout and a pool whose control directory is
+    /// the one its receipts live in, so `bind_for_command`'s own context finds
+    /// them. The registry is ready, as every receipt write requires.
+    struct GuardFixture {
+        root: PathBuf,
+        checkout: PathBuf,
+        store: Store,
+    }
+
+    impl GuardFixture {
+        fn new(label: &str) -> Self {
+            let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let root = base
+                .canonicalize()
+                .unwrap()
+                .join(format!("oxide-guard-{label}-{}-{id}", std::process::id()));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let checkout = root.join("checkout");
+            fs::create_dir(&checkout).unwrap();
+            let store = pool_store(&root);
+            Self {
+                root,
+                checkout,
+                store,
+            }
+        }
+
+        fn control(&self) -> PathBuf {
+            self.store.owner_control().to_path_buf()
+        }
+
+        fn context(&self) -> Context {
+            Context::new(Some(self.control()), self.checkout.clone())
+        }
+
+        fn checkout_id(&self) -> String {
+            identity::digest(&self.checkout.to_string_lossy())
+        }
+
+        fn write(&self, receipt: &Receipt) {
+            write_receipt(&self.control(), receipt).unwrap();
+        }
+
+        /// A committed profile receipt whose members the live links would have
+        /// to select. The guard refuses before it reads them.
+        fn committed(&self) -> Receipt {
+            let mut receipt =
+                Receipt::first_with(&self.checkout, &self.checkout_id(), LayoutKind::Profile);
+            let selected = local_spec(&self.checkout).selected(1);
+            receipt.generation = 1;
+            receipt.state = ReceiptState::Committed;
+            receipt.links = vec![LinkPlacement {
+                member: "debug".to_owned(),
+                selected: Some(selected.clone()),
+                prepared: None,
+            }];
+            receipt.roots = vec![selected];
+            receipt
+        }
+
+        /// A `Prepared` receipt in the shipped write-ahead shape: exactly one
+        /// placement carries a prepared transition, at the next generation.
+        fn prepared(&self) -> Receipt {
+            let mut receipt = self.committed();
+            let to = local_spec(&self.checkout).selected(2);
+            let link = link_path(&self.checkout, "debug");
+            receipt.state = ReceiptState::Prepared;
+            receipt.links[0].prepared = Some(Prepared {
+                generation: receipt.generation + 1,
+                to,
+                link,
+            });
+            receipt
+        }
+
+        fn state_bytes(&self) -> Option<Vec<u8>> {
+            fs::read(self.control().join("state.json")).ok()
+        }
+    }
+
+    impl Drop for GuardFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn members(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// The guarded receipt/path table of design §4.2 in every shape, and the
+    /// hierarchy rule of §4.3. Every refusal is checked for its text and for
+    /// leaving the live paths untouched.
+    #[test]
+    fn the_guarded_local_output_table_holds() {
+        let fixture = GuardFixture::new("table");
+        let context = fixture.context();
+        let debug = members(&["debug"]);
+
+        // Absent receipt: absent target and a real (even nonempty) target both
+        // run locally.
+        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
+        fs::create_dir(fixture.checkout.join("target")).unwrap();
+        fs::create_dir(fixture.checkout.join("target/debug")).unwrap();
+        fs::write(fixture.checkout.join("target/debug/binary"), b"x").unwrap();
+        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
+
+        // A link of any kind refuses and names the path.
+        fs::remove_dir_all(fixture.checkout.join("target/debug")).unwrap();
+        let elsewhere = fixture.root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, fixture.checkout.join("target/debug")).unwrap();
+        let refused = local_outputs_decision(&context, &debug, "outputs").unwrap_err();
+        assert!(refused.contains("target/debug"), "{refused}");
+        assert!(refused.contains("symbolic link"), "{refused}");
+        assert!(refused.contains("nothing was changed"), "{refused}");
+        assert!(fixture.checkout.join("target/debug").is_symlink());
+        fs::remove_file(fixture.checkout.join("target/debug")).unwrap();
+
+        // The hierarchy: a linked triple refuses by its own name, so the
+        // profile member below it is never resolved through the link.
+        let triple = fixture.checkout.join("target/x86_64-unknown-linux-gnu");
+        symlink(&elsewhere, &triple).unwrap();
+        let refused = local_outputs_decision(
+            &context,
+            &members(&["x86_64-unknown-linux-gnu/debug"]),
+            "outputs",
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("x86_64-unknown-linux-gnu"),
+            "the triple itself is the refusing component: {refused}"
+        );
+        fs::remove_file(&triple).unwrap();
+
+        // A detached receipt with real directories runs; the same receipt with
+        // an inserted link refuses: detach is not a repair.
+        let mut detached = Receipt::first_with(
+            &fixture.checkout,
+            &fixture.checkout_id(),
+            LayoutKind::Profile,
+        );
+        detached.links = vec![LinkPlacement {
+            member: "debug".to_owned(),
+            selected: None,
+            prepared: None,
+        }];
+        fixture.write(&detached);
+        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
+
+        // A committed receipt refuses in every shape, naming detach.
+        fixture.write(&fixture.committed());
+        let refused = local_outputs_decision(&context, &debug, "outputs").unwrap_err();
+        assert!(refused.contains("committed receipt"), "{refused}");
+        assert!(refused.contains("oxide outputs detach"), "{refused}");
+        assert!(!refused.contains("outputs adopt"), "{refused}");
+
+        // A prepared receipt (any placement or a migration journal) refuses
+        // with the exact §4.4 diagnostic.
+        fixture.write(&fixture.prepared());
+        assert_eq!(
+            local_outputs_decision(&context, &debug, "outputs").unwrap_err(),
+            crate::one_use::PREPARED_GUARDED
+        );
+
+        // A pruned receipt owns no selection, so the live paths decide.
+        let mut pruned = detached.clone();
+        pruned.state = ReceiptState::Pruned;
+        fixture.write(&pruned);
+        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
+
+        // A pruning receipt keeps the shipped refusal. Its terminal evidence
+        // is what makes the state consistent.
+        let mut pruning = detached.clone();
+        pruning.state = ReceiptState::Pruning;
+        pruning.pruned = Some(PruneRecord {
+            intent: "prune".to_owned(),
+            outcome: "pending".to_owned(),
+            at_ms: 1,
+        });
+        fixture.write(&pruning);
+        let refused = local_outputs_decision(&context, &debug, "outputs").unwrap_err();
+        assert!(refused.contains("being pruned"), "{refused}");
+    }
+
+    /// The exact `Prepared` diagnostic is the same for every guarded mutation
+    /// site's revalidation, and it is byte-identical on repetition: the state,
+    /// the receipt, the links and `next_id` do not change.
+    #[test]
+    fn repeated_guarded_prepared_refusals_change_nothing() {
+        let fixture = GuardFixture::new("prepared");
+        fixture.write(&fixture.prepared());
+        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let state_before = fixture.state_bytes();
+        let context = fixture.context();
+        let mut digests = Vec::new();
+        for _ in 0..3 {
+            let refused =
+                match guarded_barrier(&fixture.store, &context, &mut WaitAccounting::default()) {
+                    Err(reason) => reason,
+                    Ok(_) => panic!("a prepared receipt refuses the guarded barrier"),
+                };
+            assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+            assert_eq!(fixture.state_bytes(), state_before);
+            digests.push((
+                fs::read(&receipt_path).unwrap(),
+                fixture.state_bytes(),
+                fixture
+                    .store
+                    .owner_control()
+                    .join("waiters")
+                    .read_dir()
+                    .map(|entries| entries.count())
+                    .unwrap_or(0),
+            ));
+        }
+        assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
+        let context_state = fixture.context();
+        assert!(guarded_prepared_refusal(&context_state).is_err());
+        assert!(guarded_prepared_refusal(&context_state).is_err());
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+    }
+
+    /// Dormancy: without activation the guard is not even computed, so the
+    /// dropped-root notes are silent, the leased command takes the shipped
+    /// path, and that path writes nothing it did not write before.
+    #[test]
+    fn the_guard_is_dormant_without_activation() {
+        assert!(!crate::one_use::is_active());
+        let fixture = GuardFixture::new("dormant");
+        let control = fixture.control();
+        assert!(
+            guarded_workspace(Some(&control), &fixture.checkout).is_none(),
+            "a dormant build never classifies"
+        );
+        let state_before = fixture.state_bytes();
+        let bind = bind_for_command(
+            &fixture.store,
+            &fixture.checkout,
+            0,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(bind.outcome.warnings.is_empty());
+        assert!(bind.outcome.root.is_none());
+        assert_eq!(fixture.state_bytes(), state_before);
+        // With the switch on, the guard follows exactly the classification's
+        // own predicate: the expectation is derived from the classification
+        // itself, never from this machine's temporary roots.
+        let expected = crate::one_use::classify(
+            &fixture.checkout,
+            &crate::one_use::Facts::from_control(Some(&control)),
+        )
+        .guarded();
+        crate::one_use::with_active(|| {
+            assert_eq!(
+                guarded_workspace(Some(&control), &fixture.checkout).is_some(),
+                expected
+            );
+        });
+        // The switch is off again: nothing stays active between commands.
+        assert!(guarded_workspace(Some(&control), &fixture.checkout).is_none());
+    }
+
+    /// The guarded branch of the shipped verbs that need no live link: a
+    /// prepared receipt refuses at the effect-free `adopt` precheck and in
+    /// `clean`, and a guarded clean never prints adopt advice.
+    #[test]
+    fn prepared_refusals_are_the_exact_diagnostic_without_advice() {
+        let fixture = GuardFixture::new("advice");
+        fixture.write(&fixture.prepared());
+        let context = fixture.context();
+        assert_eq!(
+            guarded_prepared_refusal(&context).unwrap_err(),
+            crate::one_use::PREPARED_GUARDED
+        );
+        assert!(!crate::one_use::PREPARED_GUARDED.contains("adopt"));
+        assert!(!crate::one_use::PREPARED_GUARDED.contains("detach"));
+        // The general adopt text is a different, bounded line that offers no
+        // repair for a prepared transition.
+        let general = crate::one_use::adopt_refusal(&fixture.checkout);
+        assert!(
+            general.contains("one-use (temporary) workspace"),
+            "{general}"
+        );
+        assert!(general.contains("nothing was changed"), "{general}");
+        // The committed refusal names the one safe verb.
+        let committed = crate::one_use::committed_refusal(&fixture.root);
+        assert!(committed.contains("oxide outputs detach"), "{committed}");
+    }
+
+    /// The plan and status wording is bounded and never recommends adopt.
+    #[test]
+    fn the_guarded_plan_and_status_lines_are_bounded() {
+        for line in [crate::one_use::PLAN_LOCAL, crate::one_use::STATUS_LOCAL] {
+            assert!(line.contains("one-use (temporary) workspace"), "{line}");
+            assert!(line.contains("local"), "{line}");
+            assert!(!line.contains("adopt"), "{line}");
+            assert!(line.len() < 200, "{line}");
+        }
     }
 }

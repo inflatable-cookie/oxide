@@ -756,6 +756,49 @@ impl CleanGuard {
 pub enum Cleaning {
     Guard(CleanGuard),
     Interrupted(i32),
+    /// A guarded verb's bounded non-blocking barrier acquisition gave up: the
+    /// checkout stayed busy for the whole attempt budget. Nothing was written
+    /// (one-use S1, design §4.1 step 4).
+    Busy(String),
+}
+
+/// How one checkout's clean barrier is acquired (one-use S1, design §4.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanMode {
+    /// The shipped order: recover dead tickets and settled leases, then mark
+    /// the checkout and wait as long as it has activity. Every caller that
+    /// existed before one-use keeps this mode unchanged.
+    Recovering,
+    /// Guarded verbs (`oxide outputs detach`, `oxide outputs
+    /// cancel-reservation`): recover nothing, refuse dead or unknown custody
+    /// **before** any mark, id or `waiters/` file exists, wait only for a
+    /// classified *live* holder, and give up after a bounded attempt budget.
+    /// Nothing here mutates control state on the refusal path, so a guarded
+    /// verb's "nothing changed" claim holds, `next_id` included.
+    Barrier,
+}
+
+/// The classified busy facts of one checkout for [`CleanMode::Barrier`]: a
+/// live holder can progress, a dead fact never can without the shipped
+/// recovery, and anything unreadable is unknown custody.
+enum BarrierState {
+    Clear,
+    Live(String),
+    Dead(String),
+}
+
+/// How many non-blocking barrier attempts a guarded verb makes before its
+/// bounded refusal (design §4.1 step 4). The production budget is
+/// [`BARRIER_ATTEMPTS`] shipped polls; the unit suite uses two so a held
+/// barrier reaches its bounded refusal quickly.
+const BARRIER_ATTEMPTS: usize = 25;
+
+fn barrier_attempts() -> usize {
+    if cfg!(test) {
+        2
+    } else {
+        BARRIER_ATTEMPTS
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2704,8 +2747,230 @@ impl Store {
 
     /// Wait until no live or unsettled command for this checkout holds a
     /// record, then mark the checkout as cleaning. Ctrl-C while waiting
-    /// cancels.
+    /// cancels. This is [`CleanMode::Recovering`], the shipped order, and
+    /// every pre-one-use caller keeps it byte for byte.
     pub fn begin_clean(
+        &self,
+        checkout: &Path,
+        waits: &mut WaitAccounting,
+    ) -> Result<Cleaning, String> {
+        self.begin_clean_recovering(checkout, waits)
+    }
+
+    /// The guarded-verb barrier (one-use S1, design §4.1 steps 3-5).
+    ///
+    /// `revalidate` runs under the caller's checkout binding mutex **before
+    /// every attempt and therefore before any mark exists**; its error is the
+    /// guard's own refusal and is returned unchanged with nothing written.
+    /// This path never calls `drop_dead_tickets`, `recover_settled`,
+    /// `ensure_control` or `fence_recorded_accounting`: a refusal here writes
+    /// no state, allocates no id and creates no `waiters/` file.
+    ///
+    /// The busy facts are classified rather than acted on:
+    ///
+    /// - **live** (a held waiter or record lock, or a recorded non-empty
+    ///   group) — wait on the shipped poll, because the holder can progress;
+    /// - **dead** (a free or missing waiter/record lock with no live group) —
+    ///   refuse with the bounded non-progress diagnostic instead of waiting
+    ///   for a fact that can never clear itself without recovery;
+    /// - **unknown** (a probe or state read error, or an unreadable sibling
+    ///   state) — refuse; unknown custody is protected.
+    ///
+    /// After [`barrier_attempts`] polls with no mark, it returns
+    /// [`Cleaning::Busy`]. Ctrl-C still cancels.
+    pub fn begin_clean_barrier<F>(
+        &self,
+        checkout: &Path,
+        waits: &mut WaitAccounting,
+        revalidate: F,
+    ) -> Result<Cleaning, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.begin_clean_with(checkout, waits, CleanMode::Barrier, revalidate)
+    }
+
+    /// The one barrier seam (one-use S1, design §4.1): `Recovering` is the
+    /// shipped behaviour for every existing caller and ignores `revalidate`;
+    /// `Barrier` is the guarded verbs' non-recovering, classified, bounded
+    /// acquisition. Keeping one entry point makes the mode choice explicit at
+    /// the call site instead of implicit in which method is named.
+    pub fn begin_clean_with<F>(
+        &self,
+        checkout: &Path,
+        waits: &mut WaitAccounting,
+        mode: CleanMode,
+        mut revalidate: F,
+    ) -> Result<Cleaning, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        if mode == CleanMode::Recovering {
+            return self.begin_clean_recovering(checkout, waits);
+        }
+        if !self.control.is_dir() {
+            // This path creates no control tree: with no pool state there is
+            // no barrier to take, and creating one would be an effect before
+            // the guarded verb's own transition.
+            return Ok(Cleaning::Busy(crate::one_use::barrier_unknown(
+                "this pool has no control state to take a barrier over",
+            )));
+        }
+        for attempt in 0..barrier_attempts() {
+            if let Some(signal) = process::received_signal() {
+                waits.stop(Instant::now());
+                return Ok(Cleaning::Interrupted(signal));
+            }
+            revalidate()?;
+            // The same order the shipped barrier uses (internal admission
+            // first), but without the recorded-accounting fence write: the
+            // lock alone is enough here and a guarded refusal must not write.
+            let _sibling = self.sibling_admission()?;
+            let _admission = lock_admission(&self.control)?;
+            // An unreadable state or a probe error is unknown custody, so it
+            // refuses with the bounded guarded text instead of a raw error.
+            let mut state = self
+                .load()
+                .map_err(|error| crate::one_use::barrier_unknown(&error))?;
+            match self
+                .barrier_state(&state, checkout)
+                .map_err(|error| crate::one_use::barrier_unknown(&error))?
+            {
+                BarrierState::Live(reason) => {
+                    waits.observe_with_reason(&Wait::Clean, Instant::now(), &reason);
+                }
+                BarrierState::Dead(what) => {
+                    waits.stop(Instant::now());
+                    return Ok(Cleaning::Busy(crate::one_use::barrier_dead(&what)));
+                }
+                BarrierState::Clear => {
+                    if state.cleans.len() >= MAX_TICKETS {
+                        return Err(format!("too many concurrent oxide cleans ({MAX_TICKETS})"));
+                    }
+                    let id = state.take_id()?;
+                    let Probe::Free(lock) = probe_lock(&self.ticket_path(id), true)? else {
+                        return Err("a new Oxide clean lock is unexpectedly held".to_owned());
+                    };
+                    state.cleans.push(Clean {
+                        id,
+                        checkout: checkout.to_path_buf(),
+                        process_group: None,
+                    });
+                    self.save(&state)?;
+                    waits.stop(Instant::now());
+                    waits.print_completion("clean barrier acquired");
+                    return Ok(Cleaning::Guard(CleanGuard { id, lock }));
+                }
+            }
+            if attempt + 1 < barrier_attempts() {
+                std::thread::sleep(WAIT_POLL);
+            }
+        }
+        waits.stop(Instant::now());
+        Ok(Cleaning::Busy(crate::one_use::BARRIER_BUSY.to_owned()))
+    }
+
+    /// The busy classification of one checkout for [`CleanMode::Barrier`]
+    /// (design §4.1 step 5). A *live* fact wins over a dead one: a holder that
+    /// can progress may clear both.
+    fn barrier_state(&self, state: &State, checkout: &Path) -> Result<BarrierState, String> {
+        let mut live: Option<String> = None;
+        let mut dead: Option<String> = None;
+        for clean in state
+            .cleans
+            .iter()
+            .filter(|clean| clean.checkout == checkout)
+        {
+            match probe_lock(&self.ticket_path(clean.id), false)? {
+                Probe::Held => {
+                    live.get_or_insert_with(|| {
+                        format!("a clean of this checkout (mark {}) is running", clean.id)
+                    });
+                }
+                Probe::Free(_) | Probe::Missing => {
+                    if clean
+                        .process_group
+                        .is_some_and(|group| !process::group_empty(group))
+                    {
+                        live.get_or_insert_with(|| {
+                            format!(
+                                "a clean of this checkout (mark {}) still has a live recorded group",
+                                clean.id
+                            )
+                        });
+                    } else {
+                        dead.get_or_insert_with(|| {
+                            format!(
+                                "the clean mark {} for this checkout has a free lock and no live group",
+                                clean.id
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        self.barrier_records(state, checkout, &self.control, &mut live, &mut dead)?;
+        if let Some(sibling) = self.sibling.as_ref() {
+            match self.sibling_state() {
+                Some(other) => {
+                    self.barrier_records(&other, checkout, &sibling.control, &mut live, &mut dead)?
+                }
+                // No state file means no records; an unreadable one is
+                // unknown custody, never "clear".
+                None if !sibling.control.join("state.json").exists() => {}
+                None => {
+                    return Err(crate::one_use::barrier_unknown(
+                        "the other pool's record state is unreadable",
+                    ))
+                }
+            }
+        }
+        Ok(match (live, dead) {
+            (Some(reason), _) => BarrierState::Live(reason),
+            (None, Some(what)) => BarrierState::Dead(what),
+            (None, None) => BarrierState::Clear,
+        })
+    }
+
+    /// The records of one pool that hold `checkout`, classified by whether
+    /// their lock is still held.
+    fn barrier_records(
+        &self,
+        state: &State,
+        checkout: &Path,
+        control: &Path,
+        live: &mut Option<String>,
+        dead: &mut Option<String>,
+    ) -> Result<(), String> {
+        for record in state
+            .records
+            .iter()
+            .filter(|record| record.checkout.as_deref() == Some(checkout) && record.active())
+        {
+            let path = control.join("locks").join(format!("{}.lock", record.id));
+            match probe_lock(&path, false)? {
+                Probe::Held => {
+                    live.get_or_insert_with(|| {
+                        format!(
+                            "a command (record {}) is active in this checkout",
+                            record.id
+                        )
+                    });
+                }
+                Probe::Free(_) | Probe::Missing => {
+                    dead.get_or_insert_with(|| {
+                        format!(
+                            "the record {} for this checkout has a free lock, so its holder ended without recovering it",
+                            record.id
+                        )
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_clean_recovering(
         &self,
         checkout: &Path,
         waits: &mut WaitAccounting,
@@ -5462,6 +5727,226 @@ mod tests {
             active_records(&internal.control, checkout).unwrap().len(),
             1
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The control-state bytes of one pool, for a refusal that must change
+    /// nothing (one-use S1: `next_id` included).
+    fn state_bytes(store: &Store) -> Vec<u8> {
+        fs::read(store.control.join("state.json")).unwrap()
+    }
+
+    /// A record whose lock file exists but is free: its holder ended without
+    /// recovering it, so it is a *dead* record.
+    fn dead_record(store: &Store, checkout: &Path, id: u64) {
+        let mut state = store.load().unwrap();
+        let mut entry = record(Phase::Running, None, Some("v1.a.1.1.1"));
+        entry.id = id;
+        entry.checkout = Some(checkout.to_path_buf());
+        state.records.push(entry);
+        store.save(&state).unwrap();
+        // Create the lock file and drop it unlocked.
+        let Probe::Free(file) = probe_lock(&store.lock_path(id), true).unwrap() else {
+            panic!("a fresh record lock is free");
+        };
+        drop(file);
+    }
+
+    /// Hold one record's lock for the duration of the guard, the way a live
+    /// command holds it.
+    fn hold_record(store: &Store, checkout: &Path, id: u64) -> File {
+        let mut state = store.load().unwrap();
+        let mut entry = record(Phase::Running, None, Some("v1.a.1.1.1"));
+        entry.id = id;
+        entry.checkout = Some(checkout.to_path_buf());
+        state.records.push(entry);
+        store.save(&state).unwrap();
+        let Probe::Free(file) = probe_lock(&store.lock_path(id), true).unwrap() else {
+            panic!("a fresh record lock is free");
+        };
+        file
+    }
+
+    /// Barrier mode (`CleanMode::Barrier`) classifies a dead record as
+    /// non-progress and refuses before allocating an id, a mark or a waiter
+    /// lock: the state bytes, `next_id` included, are unchanged.
+    #[test]
+    fn the_guarded_barrier_refuses_a_dead_record_before_any_mark() {
+        let (root, internal, _removable) = paired_controls("guarded-dead-record");
+        let checkout = Path::new("/checkout");
+        dead_record(&internal, checkout, 7);
+        let before = state_bytes(&internal);
+        let refused =
+            match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(()))
+            {
+                Ok(Cleaning::Busy(reason)) => reason,
+                _ => panic!("a dead record refuses the guarded barrier"),
+            };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(refused.contains("free lock"), "{refused}");
+        assert_eq!(state_bytes(&internal), before);
+        assert!(!internal.ticket_path(8).exists());
+        // The dead lease is still present: nothing recovered it.
+        let state = internal.load().unwrap();
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.cleans.len(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A dead clean mark is the same refusal: a free waiter lock with no live
+    /// group never clears itself, so the guarded barrier refuses instead of
+    /// waiting.
+    #[test]
+    fn the_guarded_barrier_refuses_a_dead_clean_mark() {
+        let (root, internal, _removable) = paired_controls("guarded-dead-mark");
+        let checkout = Path::new("/checkout");
+        let mut state = State::default();
+        state.cleans.push(Clean {
+            id: 3,
+            checkout: checkout.to_path_buf(),
+            process_group: None,
+        });
+        internal.save(&state).unwrap();
+        let before = state_bytes(&internal);
+        let refused =
+            match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(()))
+            {
+                Ok(Cleaning::Busy(reason)) => reason,
+                _ => panic!("a dead clean mark refuses the guarded barrier"),
+            };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(refused.contains("clean mark 3"), "{refused}");
+        assert_eq!(state_bytes(&internal), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A live holder is waited for on the shipped poll, and when it outlasts
+    /// the attempt budget the verb gets the bounded busy refusal rather than
+    /// an unbounded wait. Nothing is marked.
+    #[test]
+    fn the_guarded_barrier_waits_for_a_live_holder_then_gives_up() {
+        let (root, internal, _removable) = paired_controls("guarded-live-holder");
+        let checkout = Path::new("/checkout");
+        let held = hold_record(&internal, checkout, 5);
+        let before = state_bytes(&internal);
+        let refused =
+            match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(()))
+            {
+                Ok(Cleaning::Busy(reason)) => reason,
+                _ => panic!("a live holder reaches the bounded budget"),
+            };
+        assert!(
+            refused.starts_with("clean barrier busy:"),
+            "a live holder reaches the bounded budget, not a dead refusal: {refused}"
+        );
+        assert_eq!(state_bytes(&internal), before);
+        assert!(internal.load().unwrap().cleans.is_empty());
+        drop(held);
+        // With the holder gone the same checkout is classified dead, so it
+        // still refuses: only an ordinary (recovering) command recovers it.
+        let refused =
+            match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(()))
+            {
+                Ok(Cleaning::Busy(reason)) => reason,
+                _ => panic!("a dead clean mark refuses the guarded barrier"),
+            };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Unreadable state is unknown custody: the guarded barrier refuses and
+    /// leaves the bytes exactly as they were.
+    #[test]
+    fn the_guarded_barrier_refuses_unknown_custody() {
+        let (root, internal, _removable) = paired_controls("guarded-unknown");
+        internal.save(&State::default()).unwrap();
+        fs::write(internal.control.join("state.json"), b"{not json").unwrap();
+        let refused = match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("unreadable state refuses the guarded barrier"),
+        };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert_eq!(
+            fs::read(internal.control.join("state.json")).unwrap(),
+            b"{not json"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The guarded order (design §4.1 step 3): the caller's revalidation runs
+    /// before any mark, and its refusal is returned unchanged with nothing
+    /// allocated. The shipped `Recovering` mode never consults it.
+    #[test]
+    fn the_guarded_barrier_revalidates_before_any_mark() {
+        let (root, internal, _removable) = paired_controls("guarded-revalidate");
+        internal.save(&State::default()).unwrap();
+        let before = state_bytes(&internal);
+        let mut calls = 0;
+        let refused = match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || {
+                calls += 1;
+                Err("prepared output transition unresolved".to_owned())
+            },
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("the caller's revalidation refusal is returned"),
+        };
+        assert_eq!(refused, "prepared output transition unresolved");
+        assert_eq!(calls, 1, "revalidated exactly once before refusing");
+        assert_eq!(state_bytes(&internal), before);
+        assert!(internal.load().unwrap().cleans.is_empty());
+
+        // Recovering mode ignores the revalidation entirely and takes the
+        // mark: the shipped order is unchanged.
+        let mut calls = 0;
+        let guard = match internal
+            .begin_clean_with(
+                Path::new("/checkout"),
+                &mut WaitAccounting::default(),
+                CleanMode::Recovering,
+                || {
+                    calls += 1;
+                    Err("must not be consulted".to_owned())
+                },
+            )
+            .unwrap()
+        {
+            Cleaning::Guard(guard) => guard,
+            _ => panic!("a recovering barrier of an idle checkout acquires"),
+        };
+        assert_eq!(calls, 0);
+        internal.abandon_clean(guard).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The guarded barrier takes its mark on a clear checkout in `Barrier`
+    /// mode too: the refusal path is the only one that writes nothing.
+    #[test]
+    fn the_guarded_barrier_marks_a_clear_checkout() {
+        let (root, internal, _removable) = paired_controls("guarded-clear");
+        internal.save(&State::default()).unwrap();
+        let guard = match internal
+            .begin_clean_barrier(
+                Path::new("/checkout"),
+                &mut WaitAccounting::default(),
+                || Ok(()),
+            )
+            .unwrap()
+        {
+            Cleaning::Guard(guard) => guard,
+            _ => panic!("a clear checkout is marked"),
+        };
+        let state = internal.load().unwrap();
+        assert_eq!(state.cleans.len(), 1);
+        assert_eq!(state.next_id, 2, "exactly one id for the proceeding verb");
+        internal.abandon_clean(guard).unwrap();
+        assert!(internal.load().unwrap().cleans.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
