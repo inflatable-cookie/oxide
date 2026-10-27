@@ -1505,6 +1505,31 @@ pub(crate) enum SeedRun {
 }
 
 impl Store {
+    /// Verify the locked sources inside the admission lifetime before making
+    /// a plan. Source verification reads Cargo home, never the donor payload.
+    #[allow(dead_code)]
+    pub(crate) fn seed_verified(
+        &self,
+        held: &Lease,
+        producer: &oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
+        cargo_home: &Path,
+        git_hints: &[crate::seed_sources::GitHint],
+        cache: &mut oxide_storage::seed_source::SourceCache,
+    ) -> Result<SeedRun, String> {
+        self.seed(held, producer, lock, |_candidates| {
+            let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(3));
+            pass.locked(
+                cargo_home,
+                &lock.eligible,
+                git_hints,
+                cache,
+                process::now_ms(),
+            )
+            .map_err(str::to_owned)
+        })
+    }
+
     /// Build and publish a catalog for a successful, still-held producing
     /// generation. The caller verifies source trees on both sides of Cargo and
     /// supplies the producing start; all catalog work is bounded and the

@@ -128,6 +128,31 @@ pub(crate) struct Pass {
     git: GitVerifier,
 }
 
+/// A discovered Git checkout is only a hint. The adapter still checks its
+/// full locked revision, worktree and manifest before accepting it.
+pub(crate) struct GitHint {
+    pub package: Package,
+    pub checkout: PathBuf,
+}
+
+fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> Option<&'a Path> {
+    let base = cargo_home.join("git/checkouts");
+    let mut found = None;
+    for hint in hints.iter().filter(|hint| hint.package == *package) {
+        let path = &hint.checkout;
+        // Hints are required to be canonical: otherwise a link in a checkout
+        // path could silently redirect Git outside the selected Cargo home.
+        let canonical = std::fs::canonicalize(path).ok()?;
+        if canonical != *path || !canonical.starts_with(&base) || canonical == base {
+            return None;
+        }
+        if found.replace(path.as_path()).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
 impl Pass {
     pub fn new(duration: Duration) -> Self {
         Self {
@@ -138,6 +163,44 @@ impl Pass {
             derived: 0,
             git: GitVerifier::new(),
         }
+    }
+
+    /// Verify eligible locked sources in lock order under one shared pass
+    /// budget. Missing, ambiguous or unverifiable sources are omitted; an
+    /// unconfirmed Git child closure refuses the entire operation.
+    pub fn locked(
+        &mut self,
+        cargo_home: &Path,
+        packages: &[Package],
+        git_hints: &[GitHint],
+        cache: &mut SourceCache,
+        now: u64,
+    ) -> Result<Vec<VerifiedSource>, &'static str> {
+        if packages.len() > 2048 || git_hints.len() > 2048 {
+            return Err("source cap");
+        }
+        if std::fs::canonicalize(cargo_home).ok().as_deref() != Some(cargo_home) {
+            return Err("unresolved Cargo home");
+        }
+        let mut verified = Vec::new();
+        for package in packages {
+            if self.limits().is_none() {
+                break;
+            }
+            let source = match package.source.as_deref() {
+                Some(source) if source.starts_with("git+") => {
+                    match git_hint(cargo_home, package, git_hints) {
+                        Some(root) => self.git(root, package)?,
+                        None => None,
+                    }
+                }
+                _ => self.registry(cargo_home, package, cache, now),
+            };
+            if let Some(source) = source {
+                verified.push(source);
+            }
+        }
+        Ok(verified)
     }
 
     fn limits(&self) -> Option<SourceLimits> {
@@ -277,5 +340,62 @@ impl Pass {
             root: PathBuf::from(root),
             proc_macro,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let template = std::env::temp_dir().join("oxide-seed-hints.XXXXXX");
+            let mut name = CString::new(template.as_os_str().as_bytes())
+                .unwrap()
+                .into_bytes_with_nul();
+            // SAFETY: name is writable, NUL-terminated and ends in XXXXXX.
+            assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+            let name = CStr::from_bytes_until_nul(&name).unwrap();
+            Self(std::fs::canonicalize(PathBuf::from(OsStr::from_bytes(name.to_bytes()))).unwrap())
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn git_hints_must_be_unique_canonical_cargo_checkouts() {
+        let fixture = Fixture::new();
+        let package = crate::seed_lock::eligible(
+            format!("version = 4\n[[package]]\nname = 'sample'\nversion = '1'\nsource = 'git+https://example.invalid/r#{}'\n", "a".repeat(40)).as_bytes(),
+        ).unwrap().remove(0);
+        let root = fixture.0.join("git/checkouts/repo/revision");
+        std::fs::create_dir_all(&root).unwrap();
+        let hint = || GitHint {
+            package: package.clone(),
+            checkout: root.clone(),
+        };
+        assert_eq!(
+            git_hint(&fixture.0, &package, &[hint()]),
+            Some(root.as_path())
+        );
+        assert!(git_hint(&fixture.0, &package, &[hint(), hint()]).is_none());
+        let outside = GitHint {
+            package: package.clone(),
+            checkout: fixture.0.clone(),
+        };
+        assert!(git_hint(&fixture.0, &package, &[outside]).is_none());
+        let alias = fixture.0.join("git/checkouts/alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let linked = GitHint {
+            package: package.clone(),
+            checkout: alias,
+        };
+        assert!(git_hint(&fixture.0, &package, &[linked]).is_none());
     }
 }
