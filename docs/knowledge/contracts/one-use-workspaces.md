@@ -10,6 +10,32 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 11** answers the CHANGES REQUIRED design review of `281af04`
+(comment `6454103541`, 2026-10-27). **The guarded `Prepared` refusal no longer
+writes durable control state.** The `Barrier` mode suppressed tickets and
+recovery but still allocated a clean mark before revalidating, and that
+allocation advances `next_id` through `State::take_id` (`store.rs:383-386`) while
+`abandon_clean` (`store.rs:2805-2810`) keeps the advance — so the "nothing
+changed" claim and case 19's digest were false on exactly the race the
+revalidation exists for. The design now fixes the **order**: fast precheck →
+**checkout binding mutex** → **authoritative revalidation there, before any id
+allocation or state write** (a `Prepared` receipt or pending migration refuses
+with the exact diagnostic, having created no mark, no id and no waiter lock) →
+**bounded non-blocking barrier attempts** (a blocking acquisition while holding
+the mutex would invert the shipped order and could deadlock; releasing between
+attempts keeps it acyclic, and budget expiry refuses without a mark) → the
+`Barrier`-mode barrier held across the effects, with the live/dead/unknown
+classifier deciding before the mark. The id and lock-file lifecycle is stated for
+the refusal, proceeding, concurrent and crash cases, and case 19 gains part **E**
+— a `Detached` receipt, a `keyed` pause, a transition published while the guarded
+command is paused, then the revalidation refusal across **three repeated runs**
+with `state.json` (including `next_id`), the `waiters/` directory, receipt, links,
+markers, roots and reservations all byte-identical — while A stays the separate
+precheck control. `detach`/`cancel-reservation` have no pause point, so their
+identical order is asserted purely and a native interleaving for them is returned
+for scoped review. **The two returned owner items are unchanged and not
+adopted:** the removable reserve-path wiring/protection question and the 480 s /
+512 MiB bound fit.
 **Revision 10** answers the CHANGES REQUIRED design review of `389a510`
 (comment `6453913676`, 2026-10-27) with two corrections. **The non-recovering
 barrier is now finite**: a bare `Barrier` mode that kept the shipped busy test
@@ -317,7 +343,7 @@ fact.
 | Automatic first conversion | `outputs.rs:3843-3886` (`AutoFacts`/`auto_adopts`), `3888-3970` (`auto_adopt`), called from `main.rs:414` | **Skipped for a guarded workspace, before any effect** (§4.1). |
 | Reservation and declared destination | `outputs.rs:5851` (`reserve`), `5355` (`lease_declaration`), `5265` (`planned_destination`), `6094` (`destination_facts`) | **Guarded commands reserve nothing and plan a local destination** (§4.1). |
 | Binding and prepared replay | `outputs.rs:4196-4270` (`bind_for_command`), `4301-4324` (`gated_replay`), `7203-7330` (`replay`) | **Guard branch added**; the three production replay sites refuse before replay (§4.4). |
-| Output mutation verbs | `outputs.rs:2037-2100` (`adopt_command`: barrier `2057`, fence `2075`, migration replay `2081`, receipt replay `2099`), `3983-4030` (`detach_command`: barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014`), `5988-6010` (`cancel_command`), `8450-8470` (`clean_placement`, `Prepared` refusal at `8467`) | **Fast precheck, then an authoritative revalidation under the verb's own custody before every effect**: `adopt` refuses entirely at the effect-free precheck (it always refuses; state selects only the text) and never enters custody; detach and cancel-reservation refuse a `Prepared`/pending-migration receipt under the barrier before their fence/cancellation/replay; clean keeps its refusal with the guarded text (§4.1, §4.4, §4.5). |
+| Output mutation verbs | `outputs.rs:2037-2100` (`adopt_command`: barrier `2057`, fence `2075`, migration replay `2081`, receipt replay `2099`), `3983-4030` (`detach_command`: barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014`), `5988-6010` (`cancel_command`), `8450-8470` (`clean_placement`, `Prepared` refusal at `8467`) | **Fast precheck, then an authoritative revalidation under the verb's own custody before every effect and before any id allocation**: `adopt` refuses entirely at the effect-free precheck (it always refuses; state selects only the text) and never enters custody; detach and cancel-reservation refuse a `Prepared`/pending-migration receipt **under the checkout binding mutex, before any clean mark exists** (so no id is consumed), and only then take the barrier for their fence/cancellation/replay; clean keeps its refusal with the guarded text (§4.1, §4.4, §4.5). |
 | Proof staging helper | `scripts/test-oxide-pool-layout.py:96` (`stage_at`, imported by eight scripts) | **Explicit per-call `features` parameter**; a helper default never adds a feature, and each caller's role and fixture controls are edited where they live (§11.2). |
 | Custody and closure facts | `store.rs:2572` (`checkout_custody`, an **external-command** rule and not a victim premise), `store.rs:2509-2525` (`with_sibling`/`sibling_state`: the sibling is read without its lock), `store.rs:2652-2654` (`sibling_barrier` returns no lock when `barrier` is false), `store.rs:4500` (`probe_lock`; non-creating use at `3155`), `store.rs:630-639` (`settle`), `store.rs:3374-3420` (`recover_settled`), `store.rs:399-406` (`settle_idle`), `store.rs:1803-1825` (`mark_spawning` takes this pool's admission) | **Read** by the front door to derive the same-pool `evictable` subset (§5.5.1, §5.5.2); the library never reads them. |
 | Per-checkout throughput custody | `outputs.rs:6151-6167` (`barrier` = `begin_clean`, `release_barrier`), `outputs.rs:4243` (checkout binding mutex), `outputs.rs:4008,5873,6000` (other binding-mutex sites) | **Read.** Guarded revalidation runs under one of these before any effect (§4.1, §4.6). |
@@ -542,8 +568,8 @@ to exclude the writers of that state:
 | Verb | Custody that excludes concurrent transitions | Authoritative revalidation point | Effects it therefore precedes |
 | --- | --- | --- | --- |
 | `oxide outputs adopt` (`outputs.rs:2037`) | **none — never entered** | at the effect-free precheck, unconditionally (state selects only the text) | barrier `2057`, fence `2075`, migration replay `2081`, receipt/migration replay `2099`, any reservation change |
-| `oxide outputs detach` (`3993`) | clean barrier in **non-recovering** mode (`3993`, `begin_clean(..., Barrier)`), held across the effects | after the barrier, before the closure's first effect | fence `4000`, `cancel_reservation` `4009`, replay `4014` |
-| `oxide outputs cancel-reservation` (`5988`) | clean barrier in **non-recovering** mode (`5998`), held across the effects | after the barrier | binding lock, cancellation journal, receipt write |
+| `oxide outputs detach` (`3993`) | checkout binding mutex (`store.lock_binding`) for the revalidation, then the clean barrier in **`Barrier`** mode (non-blocking attempts, held across the effects) | **under the binding mutex, before any mark exists**; the busy-barrier classification runs before the mark too | fence `4000`, `cancel_reservation` `4009`, replay `4014` |
+| `oxide outputs cancel-reservation` (`5988`) | checkout binding mutex, then the clean barrier in **`Barrier`** mode | **under the binding mutex, before any mark exists**; classification before the mark too | cancellation journal, receipt write |
 | leased command binding (`4196`) | checkout binding mutex (`4243`) | inside the mutex, before `gated_replay` (`4253`) | `gated_replay`, `replay` (`4301`), any prepared transition |
 | automatic first conversion (`3888`, called at `main.rs:414`) | clean barrier (`3936`) | never: the whole verb is **skipped** for a guarded workspace | barrier, fence `3941`, adoption transaction |
 
@@ -577,77 +603,96 @@ the recovery is not enough either: the shipped busy test treats *any* active
 record or `clean` entry for the checkout as busy on every poll, so a **dead**
 record (a free record lock over a held lease) or a **dead** clean mark (a free
 waiter lock with no live group) would never clear itself and an unbudgeted verb
-would wait indefinitely. The design specifies one bounded seam that is both
-non-mutating and finite:
+would wait indefinitely. Two seams are needed — a `begin_clean` **mode** and a
+**revalidation order that precedes any mark** — and both are bounded and
+non-mutating on the refusal path:
 
-- `begin_clean` gains an explicit **mode**: `Recovering` (today's behaviour,
-  unchanged for every existing caller) and `Barrier` (guarded verbs only);
-- `Barrier` **classifies every busy fact for the checkout without mutating
-  anything**, using the same lock/group predicates the shipped code already
-  reads but performing no `drop_dead_tickets`, no `recover_settled`, no
-  `remove_file` and no state write while the checkout is busy:
-  - a **ticket** or `clean` entry is *live* when its `waiters/<id>.lock` is held,
-    or — for a clean — its `process_group` is recorded and not empty
-    (`store.rs:3676-3693`); a free or missing lock with no live group is
-    *dead*;
-  - an active **record** (`Acquiring`/`Spawning`/`Running`) is *live* when its
-    record lock is held, and *dead* when that lock is free or missing (a dead
-    command that never released — the state `recover_settled` would reset);
-  - a probe error, an unreadable state document or an unreadable sibling state is
-    *unknown*;
-- the decision is then finite and explicit:
-  - **no busy fact** → create exactly one clean mark (the only write) and
-    proceed;
-  - **every busy fact live** → wait, as today, for a holder that can progress
-    (this is the live-holder control; the wait stays interruptible and is bounded
-    by the caller's budget and the watchdog when one exists);
-  - **any busy fact dead** → **refuse**, without waiting and without mutating,
-    with a bounded, custody-safe diagnostic of its own (not the `Prepared` text):
-    `this checkout has an unrecovered dead command or clean mark; a guarded
-    output verb cannot wait for progress and will not recover it: run an ordinary
-    oxide command in this pool (or \`oxide pool recover-interrupted <slot>\` for a
-    held lease), then retry. Nothing was changed.`
-  - **any unknown** → **refuse** (unknown custody stays protected).
-- guarded `detach` and `cancel-reservation` acquire the barrier in `Barrier`
-  mode, revalidate under it, and — if the revalidation passes — run their shipped
-  effect sequence while holding it, so no transition can appear between the
-  revalidation and the effect;
-- the difference is bounded and stated: a guarded `detach`/`cancel-reservation`
-  does not perform the barrier's opportunistic recovery, and instead of waiting
-  on a dead fact it refuses finitely. Recovery still happens where it always
-  did: `recover_settled` runs at the start of every `Store::attempt`, and
-  `oxide pool recover-interrupted` remains the explicit route.
+**The order: revalidate before any mark exists.** The barrier's exclusion *is* a
+clean mark, and creating that mark writes durable state: `begin_clean` allocates
+an id through `State::take_id` (`store.rs:383-386`), which advances `next_id`
+before the mark is saved (`store.rs:2734-2748`), and `abandon_clean`
+(`store.rs:2805-2810`) removes the mark but **keeps the advanced `next_id`**. A
+refusal taken *after* a mark therefore changes durable control state and consumes
+an id on every attempt, which the brief's "nothing changed" text does not allow.
+The design fixes the **order**, not the claim:
 
-Regressions (case 19, B3): a **dead record** for the same checkout (free record
-lock over a held lease, receipt `Committed` so the guarded verb passes its
-precheck) → the guarded `detach` refuses with the non-progress diagnostic inside
-a bounded wall clock, the record, lease and recovery log are byte-identical, and
-the dead lease is still there; a **dead clean mark** → the same; a **live
-holder** control (a peer paused at `bound`) → the guarded `detach` waits and
-writes nothing until the peer finishes; and an unreadable state or sibling state
-→ refusal (unknown custody protected). After an ordinary command recovers the
-dead lease, the same guarded `detach` proceeds.
+1. **Fast precheck** (read-only, no effect).
+2. **Checkout binding mutex** (`store.lock_binding`, one durable per-checkout
+   lock file, created once and reused; holding it writes no control state). It
+   excludes a concurrent command's binding, which is the writer that can publish
+   a `Prepared` receipt under the mutex alone (`outputs.rs:4214-4235`).
+3. **Authoritative revalidation under the binding mutex, before any id
+   allocation or state write.** The receipt and the migration journal are
+   re-read; `Prepared` (or a pending migration) → release the mutex and **refuse
+   with the exact guarded diagnostic having written nothing at all**: no clean
+   mark, no `next_id` advance, no `waiters/<id>.lock`, no state save. This is the
+   only place the guarded `Prepared` refusal is decided, and it is decided before
+   the barrier exists.
+4. **Barrier acquisition, non-blocking and bounded.** A blocking acquisition
+   while holding the binding mutex would invert the shipped order (a normal
+   `detach` holds the barrier and then takes the binding mutex, `outputs.rs:4008`)
+   and could deadlock. The guarded verb therefore *tries* the barrier
+   (`begin_clean(Barrier)` with a non-blocking attempt), releases the binding
+   mutex between attempts, and retries on the shipped poll until a fixed attempt
+   budget or the caller's admission budget expires; on expiry it **refuses**
+   finitely with a bounded "the checkout barrier is busy; retry" message, again
+   having written nothing (no mark was created, because a busy checkout takes no
+   mark).
+5. **Barrier held (`Barrier` mode) → run the effects.** Only now are the mark and
+   its id allocated, which is the same state change any shipped clean/barrier
+   makes and is legitimate because this verb proceeds. `Barrier` still suppresses
+   the barrier's opportunistic `drop_dead_tickets`/`recover_settled`, and every
+   busy fact was classified before the mark:
+   - *live* (a held waiter or record lock, or a recorded non-empty group) → wait
+     for a holder that can progress (the live-holder control, interruptible and
+     bounded by any caller budget/watchdog);
+   - *dead* (a free or missing waiter/record lock with no live group) →
+     **refuse with the bounded non-progress diagnostic** before any mark exists;
+   - *unknown* (probe/read error, unreadable state or sibling state) → **refuse**
+     (unknown custody protected).
+6. **No post-barrier `Prepared` revalidation is needed.** Command bindings are
+   excluded by the binding mutex and then by the barrier (which waits for the
+   checkout's commands); adopt and the prune transitions are excluded by the
+   publication guard the shipped effect path takes (`outputs.rs:4011`), and any
+   adopt that ran between steps 3 and 4 made our barrier attempt fail, so step 3
+   re-read the receipt on the retry. A `Prepared` seen at the effect read would
+   therefore be a custody defect: the design **stops and refuses** rather than
+   replaying, and states honestly that such a refusal follows a mark.
 
-If the freeze prefers no barrier-mode difference at all, the alternative is to
-**return the conflict to the owner** for a scoped ruling: the brief's exact
-"nothing changed" text cannot then hold for the window in which a transition
-appears between the precheck and the shipped barrier, and a dead record or clean
-mark stays an unbounded wait. Either way the design does not claim the barrier is
-side-effect free.
+**ID and lock-file lifecycle, stated.** On the *refusal* path: nothing is
+allocated (no id, no mark, no lock file; the binding mutex file may be created
+once, on first use, and is never removed). On the *proceeding* path: exactly one
+id and one `waiters/<id>.lock` per verb, as today; the lock is removed with the
+mark by `abandon_clean`/`finish_clean`; `next_id` advances once per proceeding
+verb and never per refusal. On a **crash** while the mark exists, the mark and
+its lock file remain and the next ordinary command's recovering barrier drops
+them (`store.rs:3676-3693`: free lock, no live group), while a guarded verb's
+`Barrier` classifier refuses on that dead mark until an ordinary command clears
+it. Repeated refusals are therefore idempotent in the control state, including
+`next_id`.
 
-**What "nothing changed" means, precisely.** Every refusal of a guarded
-workspace creates nothing on the `adopt` path — that verb never reaches the
-barrier. On `detach` and `cancel-reservation` the classification is made
-**before** any mark exists, so a **dead-fact or unknown-custody refusal creates
-nothing at all**; a refusal by the in-custody *revalidation* (a `Prepared`
-transition that appeared after the precheck, or a committed destination mismatch)
-creates and then abandons exactly one clean mark under the non-recovering barrier,
-and the binding refusal holds only the checkout mutex. None of them drops a
-ticket, recovers a lease, or writes a receipt, link, sibling, root, marker,
-reservation, adoption fence, migration-journal step or slot state, and none
-replays anything. The regression compares a bounded digest of every one of those
-before and after, plus the clean mark's absence and an unchanged dead-lease and
-dead-mark state.
+**What "nothing changed" means, precisely — and it now includes `next_id`.**
+`adopt` refuses at the effect-free precheck and never reaches a barrier. On
+`detach` and `cancel-reservation` **every refusal named in this section happens
+before a mark is allocated**: the `Prepared` revalidation refusal (step 3), the
+dead-fact and unknown-custody refusals (step 5, decided before the mark), and the
+bounded busy-barrier refusal after the attempt budget (step 4). So none of them
+allocates an id, advances `next_id`, creates a `waiters/<id>.lock`, drops a
+ticket, recovers a lease, writes a receipt, link, sibling, root, marker,
+reservation, adoption fence, migration-journal step or slot state, or replays
+anything; the only lock any of them touches is the checkout binding mutex, whose
+single durable file may be created on first use and is never removed. The mark
+and its id exist only on the **proceeding** path, exactly as for a shipped
+`oxide clean`. Case 19's regression compares the complete relevant control state
+— `state.json` bytes including `next_id`, the `waiters/` lock files, the receipt,
+links, markers, roots and reservations — across **repeated** refusals, which must
+be byte-identical and must not consume ids.
+
+If the freeze instead prefers the shipped barrier order to be kept exactly (so
+the guarded revalidation stays after a mark), that conflict is **returned to the
+owner**: the "nothing changed" text cannot then hold, because every refusal would
+advance `next_id` and create and remove a waiter lock. The design does not claim
+that variant.
 
 **Diagnostic precedence at `adopt`.** `adopt` on a guarded workspace always
 refuses, but the text depends on state, decided in this order:
@@ -792,9 +837,10 @@ authoritative:
 2. inside `bind_for_command` **under the checkout's binding mutex**
    (`store.lock_binding`, `outputs.rs:4243`) before `gated_replay`, where the
    receipt, the migration journal and every relevant component are re-read;
-3. for `detach` and `cancel-reservation`, under the **non-recovering clean
-   barrier**, which they hold across their effects (§4.1). The shipped
-   recovering barrier is unchanged for every other caller.
+3. for `detach` and `cancel-reservation`, under the **checkout binding mutex
+   first** (before any mark), then the clean barrier in its `Barrier` mode held
+   across their effects (§4.1). The shipped recovering barrier is unchanged for
+   every other caller.
 
 A transition published between (1) and (2)/(3) — by a concurrent adopt, detach,
 cancel-reservation or command binding — is therefore always seen by the
@@ -817,12 +863,22 @@ proposes **no new seam**:
 | **B1** binding mutex | receipt **`Detached`** (§4.2 lets a guarded command proceed) | peer paused at `OXIDE_TEST_PAUSE=bound:<gate>`: because a receipt-bearing binding takes `store.lock_binding` (`outputs.rs:4214-4235`) and keeps it until `mark_running` (`main.rs:701`), the peer holds the mutex at `bound` (`main.rs:545`). Observed by the peer's own `bound` marker file, then the guarded command stays alive and writes nothing; after the gate opens the **guarded command's own `bound` marker appears**, proving it acquired the mutex and passed the pause | no outputs write while blocked; both `bound` markers observed; final state matches |
 | **B2** barrier, live holder | receipt **`Committed`** (guarded `detach` is allowed; `cancel-reservation` too) | live peer paused at `bound` = an active same-checkout record; the guarded verb enters `begin_clean(Barrier)`, finds only **live** facts, and waits | the verb has not exited while the gate is closed and wrote nothing; after release it completes with the shipped detach output |
 | **B3** barrier, dead facts | receipt **`Committed`** (so the precheck passes) | (i) a same-checkout **dead record**: free record lock over a held lease; (ii) a same-checkout **dead clean mark**: free waiter lock, no live group; (iii) unreadable state/sibling | **bounded refusal** with the non-progress diagnostic inside the case's wall clock; record, lease and recovery log byte-identical; the dead lease still present. After an ordinary command recovers it, the same guarded `detach` proceeds |
+| **E** in-custody revalidation | receipt **`Detached`**, so the fast precheck **accepts**; the guarded command pauses at `OXIDE_TEST_PAUSE=keyed:<gate>` (`main.rs:475`, after the key and before the lease) | the fixture publishes a `Prepared` receipt (`OXIDE_TEST_OUTPUTS_CRASH=prepared`, unguarded invocation) while the guarded command is paused, then opens the gate; the guarded command proceeds to its binding mutex, revalidates, and refuses | exact diagnostic **from the revalidation** (the precheck had accepted, proven by the `keyed` marker); the complete control state — `state.json` bytes including `next_id`, `waiters/` lock files, receipt, links, markers, roots, reservations — is **byte-identical** across three repeated runs; no id is consumed |
 | **C** commit | prepared transition committed by an explicitly **unguarded** invocation (`OXIDE_TEST_TEMP_ROOTS=[]`, `OXIDE_TEST_WORKSPACE_CLASS=normal`) | — | the shipped `oxide outputs adopt` replays and commits; the guarded invocation afterwards sees `Committed` and refuses per §4.2 |
 
 Two premises are recorded as **not** established, and the case does not assert
 them: a **receipt-absent** bind returns `OutputBinding::unchecked` with no mutex,
 so no exclusion is claimed there; and a guarded `adopt` never reaches a barrier
 (it always refuses at the precheck), so B2/B3 use `detach`/`cancel-reservation`.
+
+`detach` and `cancel-reservation` have **no debug pause point**, so their
+in-custody revalidation cannot be interleaved deterministically with an existing
+control. Part **E** therefore drives the identical step-3 order through a guarded
+**command** (whose binding revalidation shares it), and the two output verbs'
+order is asserted **purely** (binding mutex → revalidate → refuse with no id
+allocation) plus the repeated-refusal idempotence. A native interleaving for
+those two verbs would need one new pause point inside their binding section and
+is **returned for scoped review** rather than claimed.
 
 Both controls are debug-only and inert in a release build; they are existing
 product test facilities, not new product behaviour. If the freeze wants a
@@ -2225,6 +2281,8 @@ claimed for a statically edited selector.
 | invalid or foreign fence at the removable pool root | shipped `unexpected_entry` refusal, exactly as any other foreign pool entry; the validator never repairs, ignores or waits |
 | seed headroom **known** and unfit | seed skipped, cold build in the same slot |
 | seed headroom **unknown** (unreadable member, ownership/device/boundary fault, partial walk) | **refuses before any clone** with the shipped error class; never a cold build |
+| guarded `detach`/`cancel-reservation`, `Prepared` at the binding-mutex revalidation | exact diagnostic with **no mark, no id, no `waiters/` file**; `next_id` unchanged across repeated refusals |
+| guarded `detach`/`cancel-reservation`, barrier busy past the attempt budget | bounded "barrier busy; retry" refusal, no mark |
 | guarded `detach`/`cancel-reservation` barrier, all busy facts **live** | wait for the live holder like today, writing nothing |
 | guarded `detach`/`cancel-reservation` barrier, any busy fact **dead** (active record with a free/missing record lock; clean or ticket with a free/missing waiter lock and no live group) | **bounded non-progress refusal**, no wait, no mutation; the dead lease/mark is byte-identical and an ordinary command recovers it |
 | guarded `detach`/`cancel-reservation` barrier, **unknown** custody (probe/read error, unreadable state or sibling) | **refuses** (unknown stayed protected) |
@@ -2264,10 +2322,14 @@ claimed for a statically edited selector.
   binding branch, the local-output refusal table, the exact `Prepared`
   diagnostic before every effect at all four mutation sites, the guarded
   `clean` refusal text, plan/status wording, the forward fence and version 6, and
-  the `begin_clean` **mode** seam (§4.1: `Recovering` for every existing caller,
-  `Barrier` for the two guarded revalidation paths) with its **live/dead/unknown
-  busy classifier and bounded non-progress refusal**, and the regressions for a
-  dead record, a dead clean mark, a live holder and unknown custody.
+  the two §4.1 seams: the `begin_clean` **mode** (`Recovering` for every existing
+  caller; `Barrier` for guarded verbs, with its **live/dead/unknown busy
+  classifier and bounded non-progress refusal**) and the **revalidation order**
+  that decides the `Prepared` refusal under the checkout binding mutex *before*
+  any mark, id or `waiters/` file exists, with a bounded non-blocking barrier
+  attempt afterwards. Regressions cover a dead record, a dead clean mark, a live
+  holder, unknown custody, repeated refusals (idempotent including `next_id`) and
+  the busy-barrier refusal.
 - **S2 record class and front-door scoping.** `Record.class`/`class_reason` with
   the omission rule (§5.1), the bounded **presence-aware decode** in
   `Store::load` that refuses a sub-6 document carrying either field, the fence,
@@ -2334,6 +2396,13 @@ its own validation tier and native activation.
   fact → one mark; all live → wait; **any dead → the bounded non-progress
   refusal** with no mutation; any unknown → refusal. `Recovering` keeps today's
   behaviour for every existing caller.
+- The **order** of §4.1: a `Prepared` receipt observed at the binding-mutex
+  revalidation yields the exact diagnostic with `next_id`, the `waiters/`
+  directory, the receipt, links, markers, roots and reservations unchanged (the
+  mark and its id are allocated only after a passing revalidation); the busy
+  barrier is bounded by the attempt/deadline budget and refuses without a mark;
+  a `Prepared` appearing at the effect read is a custody defect that refuses
+  rather than replaying.
 - The fallback exclusion of §6.7: with a protected (or unverified) one-use pair
   ranked before an eligible normal slot, an idle class-unknown orphan and a
   second evictable member, `Prefer` never returns the protected pair; the
@@ -2539,6 +2608,21 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       dead lease is still present. After an ordinary command recovers the dead
       lease (or the dead mark clears), the same guarded verb proceeds. Unknown
       custody is the (iii) refusal.
+    - **(E) in-custody revalidation, reached deterministically.** The checkout
+      holds a **`Detached`** receipt (the precheck accepts it). A guarded command
+      pauses at `OXIDE_TEST_PAUSE=keyed:<gate>` (after the key, before the lease;
+      `main.rs:475`), the fixture publishes a `Prepared` receipt through the
+      unguarded `crash_point` invocation, and the gate is then opened. The
+      guarded command proceeds to its binding mutex, **revalidates there**, and
+      refuses with the exact diagnostic — proven to be the *revalidation* and not
+      the precheck by the `keyed` marker (the precheck had already accepted). The
+      complete relevant control state is compared across **three repeated runs**:
+      `state.json` bytes including `next_id`, every `waiters/` lock file, the
+      receipt, links, markers, roots and reservations are byte-identical, and no
+      id is consumed. The same order is asserted purely for `detach` and
+      `cancel-reservation`, which have no pause point; a native interleaving for
+      them would need one new pause point inside their binding section and is
+      returned for scoped review.
     - **(C) commit, explicitly unguarded.** The prepared transition is committed
       by a deliberately **unguarded** invocation of the same build with
       `OXIDE_TEST_TEMP_ROOTS=[]` and `OXIDE_TEST_WORKSPACE_CLASS=normal` (feature
@@ -2749,10 +2833,13 @@ positive-absence policy are unchanged by either papercut.
    treating that member as local) the intended reading?
 4. Is the race-safe protocol of §4.1/§4.6 sound: `adopt` decided entirely at the
    effect-free precheck because it always refuses (state selecting only the
-   text), and `detach`/`cancel-reservation`/command binding revalidating under
-   their custody before the fence, reservation cancellation and every replay,
-   with custody mutual exclusion for every writer and a stop condition? Is the
-   guarded `clean` refusal text (retained refusal, no adopt advice) acceptable?
+   text); `detach`/`cancel-reservation` revalidating under the **checkout binding
+   mutex before any mark** (so the `Prepared` refusal writes nothing, including
+   `next_id`), then acquiring the barrier with **bounded non-blocking attempts**;
+   and a command binding revalidating under its mutex — with custody mutual
+   exclusion for every writer, a stop condition, and the id/lock lifecycle
+   stated? Is the guarded `clean` refusal text (retained refusal, no adopt
+   advice) acceptable?
 5. Is the hierarchical component inspection (§4.3) sufficient for a modelled
    triple and its members, and does it refuse without following an intermediate
    link?
@@ -2865,10 +2952,14 @@ positive-absence policy are unchanged by either papercut.
   case list. The concurrency case claims custody **exclusion**, never an
   interleaved observation.
 - **Two small seams are specified and need their own review.** (1)
-  `begin_clean` gains a mode so the guarded revalidation path performs no ticket
-  drop and no recovery, **plus** a non-mutating live/dead/unknown classifier that
-  turns a dead record or dead clean mark into a bounded refusal instead of an
-  unbounded wait; every existing caller keeps `Recovering`. (2)
+  `begin_clean` gains a mode so the guarded barrier performs no ticket drop and
+  no recovery, **plus** a non-mutating live/dead/unknown classifier that turns a
+  dead record or dead clean mark into a bounded refusal instead of an unbounded
+  wait, and the guarded verbs **revalidate before any mark exists** so a
+  `Prepared` refusal allocates no id; every existing caller keeps `Recovering`.
+  A native interleaving of that revalidation for `detach`/`cancel-reservation`
+  would need one new pause point inside their binding section and is returned for
+  scoped review. (2)
   `Store::load` gains one bounded presence-aware decode before the typed parse.
   Both are safety-bearing changes outside the pure guard logic; if the freeze
   rejects either, the affected claim returns to the owner rather than being
