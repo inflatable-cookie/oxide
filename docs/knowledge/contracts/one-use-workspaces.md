@@ -18,13 +18,17 @@ supervisor scratch), with subject and control running the *same* guarded command
 checkout and fixture transitions through it, and differing in exactly one stated
 variable — the receipt/journal state **at the gate baseline** (`Prepared` planted
 while paused versus `Detached`). Because the baseline is taken at the gate, the
-plant's own writes and its id are outside the measured window, and the oracle is a
-**field-scoped delta** over a named set (receipt bytes, member/target links and
-readlinks, siblings, markers, reservations, registry root entries, `cleans`, the
+plant's own writes and its id are outside the measured window, and the deferred
+design input is a **field-scoped delta** over a named set (receipt bytes,
+member/target links and readlinks, siblings, markers, reservations, registry root
+entries, `cleans`, the
 `waiters/` listing and `next_id`); the record phase, `next_use`, origin and the
 checkout's local `target/` are outside it, so the successful control's later
 `mark_spawning`/Cargo effects cannot enter the delta. The counterfactual is
-explicit (`cleans` +1 and `next_id` +2 would falsify it), premise 6 (owned images)
+**oracle deferred to the implementation proof brief per decision `dd090b31`**: it
+is not established here, and the deferred brief must satisfy the five acceptance
+criteria listed under case 19 E (per-allocation accounting replaces any fixed
+`+1`/`+2` reading). Premise 6 (owned images)
 is recorded as not applicable to E, and **no new pause seam is proposed** (the
 earlier `leased:<gate>` idea is withdrawn). **The reserve/prune evidence is
 split**: the native prune case runs on the **internal directory-budget pool** with
@@ -965,7 +969,7 @@ proposes **no new seam**:
 | **B1** binding mutex | receipt **`Detached`** (§4.2 lets a guarded command proceed) | peer paused at `OXIDE_TEST_PAUSE=bound:<gate>`: because a receipt-bearing binding takes `store.lock_binding` (`outputs.rs:4214-4235`) and keeps it until `mark_running` (`main.rs:701`), the peer holds the mutex at `bound` (`main.rs:545`). Observed by the peer's own `bound` marker file, then the guarded command stays alive and writes nothing; after the gate opens the **guarded command's own `bound` marker appears**, proving it acquired the mutex and passed the pause | no outputs write while blocked; both `bound` markers observed; final state matches |
 | **B2** barrier, live holder | receipt **`Committed`** (guarded `detach` is allowed; `cancel-reservation` too) | live peer paused at `bound` = an active same-checkout record; the guarded verb enters `begin_clean(Barrier)`, finds only **live** facts, and waits | the verb has not exited while the gate is closed and wrote nothing; after release it completes with the shipped detach output |
 | **B3** barrier, dead facts | receipt **`Committed`** (so the precheck passes) | (i) a same-checkout **dead record**: free record lock over a held lease; (ii) a same-checkout **dead clean mark**: free waiter lock, no live group; (iii) unreadable state/sibling | **bounded refusal** with the non-progress diagnostic inside the case's wall clock; record, lease and recovery log byte-identical; the dead lease still present. After an ordinary command recovers it, the same guarded `detach` proceeds |
-| **E** in-custody revalidation | **one boundary**: the existing `OXIDE_TEST_PAUSE=keyed:<gate>` point (debug build only, `<gate>` under the supervisor scratch); same guarded command, same checkout, **`Detached`** receipt in both runs, same fixture transitions through the boundary | baseline is taken **at the gate** (so the fixture's own plant and its id are excluded); the single differing variable is the receipt state at that baseline — `Prepared` (planted while paused) for the subject, `Detached` for the control; both then open the gate and run to exit | exact diagnostic **from the revalidation** (positive `keyed` marker proves the precheck had accepted); oracle is a **field-scoped delta over exactly**: receipt bytes, member/target links and readlinks, sibling links, root markers, reservations, registry root entries, `cleans`, the `waiters/` listing and `next_id` — the subject's delta must equal the control's and both must contain no clean mark, no waiter entry and no receipt/link/marker/root/reservation change, with `next_id` +1 (its own wait ticket) in both. Record phase/`next_use`/origin/local `target/` are **outside** the compared set, so the control's successful later effects cannot enter the delta. Counterfactual: a mark or extra id would appear as `cleans` +1 and `next_id` +2. Premise 6 (owned images) does **not** apply to E and is recorded so. No new seam |
+| **E** in-custody revalidation | **one boundary**: the existing `OXIDE_TEST_PAUSE=keyed:<gate>` point (debug build only, `<gate>` under the supervisor scratch); same guarded command, same checkout, **`Detached`** receipt in both runs, same fixture transitions through the boundary | baseline is taken **at the gate** (so the fixture's own plant and its id are excluded); the single differing variable is the receipt state at that baseline — `Prepared` (planted while paused) for the subject, `Detached` for the control; both then open the gate and run to exit | exact diagnostic **from the revalidation** (the positive `keyed` marker shows the precheck had accepted); oracle is a **field-scoped delta over exactly**: receipt bytes, member/target links and readlinks, sibling links, root markers, reservations, registry root entries, `cleans`, the `waiters/` listing and `next_id` — **oracle deferred: per-allocation accounting per acceptance criteria 1–2 (decision `dd090b31`)** — no fixed `+1`/`+2` expectation is claimed, no clean-mark detection is claimed, and the deferred brief must satisfy all five criteria. Record phase/`next_use`/origin/local `target/` are **outside** the compared set, so the control's successful later effects cannot enter the delta. Premise 6 (owned images) does **not** apply to E and is recorded so. No new seam |
 | **C** commit | prepared transition committed by an explicitly **unguarded** invocation (`OXIDE_TEST_TEMP_ROOTS=[]`, `OXIDE_TEST_WORKSPACE_CLASS=normal`) | — | the shipped `oxide outputs adopt` replays and commits; the guarded invocation afterwards sees `Committed` and refuses per §4.2 |
 
 Two premises are recorded as **not** established, and the case does not assert
@@ -2777,7 +2781,8 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       **control** still has the `Detached` receipt. Nothing else differs; both
       runs use the same gate, the same fixture, the same command and the same
       environment.
-      **Executable effect oracle (field-scoped delta, specified exactly).** The
+      **Proposed oracle sketch (field-scoped delta; deferred — see the header and
+      the acceptance criteria).** It is not an executable oracle yet. The
       compared set is the *output-transition* field set only:
       `outputs/*.json` receipt bytes, every `target`/member link and its
       readlink, every sibling link, every root marker, every reservation row,
@@ -2794,18 +2799,19 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       write one origin, so they cancel by construction and are excluded). The
       **`waiters/` directory is included** precisely because a clean mark's own
       lock file would appear there even though the mark's row lives in `cleans`.
-      Expected result: the subject's delta equals the
-      control's delta on that set, and both contain **no clean mark, no
-      `waiter` entry and no receipt/link/marker/root/reservation change**, while
-      `next_id` advances by exactly **one** (the command's own wait ticket,
-      removed at exit) in both runs.
-      **Counterfactual (what would falsify it).** If the guarded refusal
-      allocated a clean mark, the subject's delta would show `cleans` +1, a
-      `waiters/<id>.lock` transient, and `next_id` +2 relative to the baseline;
-      the case asserts those are absent and the control's +1 is the reference.
-      The refusal's **text** is also asserted exactly, and it is proven to be the
-      revalidation — not the precheck — by the `keyed` marker plus the fact that
-      the precheck had already accepted a `Detached` receipt.
+      **Deferred expectation (design input only — not an oracle).** The sketch
+      *expects* the subject's delta to equal the control's on that set with no
+      clean mark, no `waiter` entry and no receipt/link/marker/root/reservation
+      change, and it *illustrates* the forbidden effect as `cleans` +1 plus a
+      `next_id` step. Those illustrative figures are **not** asserted: the
+      command-level oracle is **oracle deferred to the implementation proof brief
+      per decision `dd090b31`**, and per-allocation accounting per acceptance
+      criteria 1–2 replaces any fixed increment. The illustration is retained
+      only as design input and is not acceptance evidence.
+      The refusal's **text** is asserted exactly, and the deferred brief must
+      establish that the refusal is the revalidation rather than the precheck
+      using the `keyed` marker plus the fact that the precheck had already
+      accepted a `Detached` receipt; this design only names that premise.
       **Premise-6 entry.** Proof-authoring premise 6 (owned images,
       `hdiutil attach -owners on`) **does not apply to case E**: no image is
       mounted in this part; it is recorded as such, and it does apply to case 8's
