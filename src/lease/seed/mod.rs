@@ -570,6 +570,50 @@ pub fn write_seed_attempt(pool: &Path, attempt: &SeedAttempt) -> Result<(), Leas
     )
 }
 
+/// Publish a verified-source cache for the caller's held generation. The
+/// caller holds front-door admission, and this call holds the pool lock while
+/// checking the shared sidecar-family cap and publishing the cache.
+pub fn write_seed_sources(
+    pool: &Path,
+    recipient: &SeedRecipient,
+    cache: &crate::seed_source::SourceCache,
+) -> Result<(), LeaseError> {
+    validate_recipient(recipient)?;
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
+    let slot = view
+        .slot(&recipient.slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if cache.store_id() != view.store_id
+        || !slot.held
+        || slot.incarnation.to_string() != recipient.incarnation
+        || slot.lease_id.as_deref() != Some(recipient.lease_id.as_str())
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let bytes = cache
+        .encode()
+        .map_err(|_| LeaseError::InvalidInput("invalid source cache"))?;
+    let dir = view.pool_root.join(MANAGED_NAME).join(SEEDS_DIR);
+    ensure_private_dir(&dir)?;
+    let path = dir.join("sources.json");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.uid() == current_uid()
+                && metadata.mode() & 0o077 == 0
+                && crate::seed_source::SourceCache::try_read(&path, &view.store_id).is_some() => {}
+        Ok(_) => return Err(LeaseError::UnknownAccounting),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
+    remove_orphan_sidecars(&dir, view)?;
+    enforce_family_bytes(&dir, bytes.len() as u64, &recipient.slot_id)?;
+    cache
+        .write(&path)
+        .map_err(|_| LeaseError::Io("cannot publish source cache".to_owned()))
+}
+
 /// The one bounded, recorded status summary; its facts are descriptive and
 /// are never used for admission or trust.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -2635,3 +2635,20 @@ fn last_seed_read_requires_current_ledger_generation() {
     tamper_idle_generations_injected(&rig.pool).expect("change generation");
     assert_eq!(read_seed_last(&rig.pool), None);
 }
+
+#[test]
+fn source_cache_publication_requires_held_generation_and_preserves_invalid_file() {
+    reset_hooks();
+    let rig = Rig::new("sources-generation");
+    rig.affinity_dir(1);
+    let (grant, recipient) = lease_recipient(&rig, "source-cache");
+    let cache = crate::seed_source::SourceCache::new(&grant.store_id).unwrap();
+    write_seed_sources(&rig.pool, &recipient, &cache).expect("publish cache");
+    let path = rig.control().join("seeds/sources.json");
+    assert!(crate::seed_source::SourceCache::try_read(&path, &grant.store_id).is_some());
+    fs::write(&path, b"broken").unwrap();
+    assert!(write_seed_sources(&rig.pool, &recipient, &cache).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"broken");
+    release_injected(&rig.pool, &grant.lease_id).expect("release");
+    assert!(write_seed_sources(&rig.pool, &recipient, &cache).is_err());
+}

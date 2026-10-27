@@ -115,27 +115,34 @@ impl SourceCache {
             store_id: store_id.to_owned(),
             records: Vec::new(),
         };
+        Self::try_read_owned_by(path, store_id, owner).unwrap_or_else(empty)
+    }
+
+    /// Strict read for writers that must leave invalid existing sidecars
+    /// untouched, rather than treating them as an empty cache.
+    pub fn try_read(path: &Path, store_id: &str) -> Option<Self> {
+        Self::try_read_owned_by(path, store_id, effective_uid())
+    }
+
+    fn try_read_owned_by(path: &Path, store_id: &str, owner: u32) -> Option<Self> {
         if !valid_store_id(store_id) {
-            return empty();
+            return None;
         }
-        let Ok(mut file) = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
-        else {
-            return empty();
-        };
-        let Ok(metadata) = file.metadata() else {
-            return empty();
-        };
+            .ok()?;
+        let metadata = file.metadata().ok()?;
         // §9.1: a foreign-owned sidecar is ignored, never adopted. The check is
         // on the opened descriptor, so a swapped path cannot change the owner
         // between the open and the decision.
         if !metadata.file_type().is_file()
             || metadata.len() > MAX_CACHE_BYTES
             || metadata.uid() != owner
+            || metadata.mode() & 0o077 != 0
         {
-            return empty();
+            return None;
         }
         let mut bytes = Vec::new();
         if (&mut file)
@@ -144,26 +151,24 @@ impl SourceCache {
             .is_err()
             || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CACHE_BYTES
         {
-            return empty();
+            return None;
         }
-        let Ok(document) = serde_json::from_slice::<CacheDocument>(&bytes) else {
-            return empty();
-        };
+        let document = serde_json::from_slice::<CacheDocument>(&bytes).ok()?;
         if document.schema != CACHE_SCHEMA
             || document.store_id != store_id
             || document.records.len() > MAX_CACHE_RECORDS
         {
-            return empty();
+            return None;
         }
         for record in &document.records {
             if validate_record(record).is_err() {
-                return empty();
+                return None;
             }
         }
-        Self {
+        Some(Self {
             store_id: store_id.to_owned(),
             records: document.records,
-        }
+        })
     }
 
     /// The cache's store identity.
