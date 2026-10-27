@@ -7578,7 +7578,8 @@ pub(crate) fn read_receipt_for_prune(
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.
 pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let path = root.join(MARKER);
-    let file = File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let file =
+        File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -7817,7 +7818,8 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     if metadata.len() > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
-    let file = File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let file =
+        File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;

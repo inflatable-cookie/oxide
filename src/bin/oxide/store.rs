@@ -2523,8 +2523,7 @@ impl Store {
         let sibling = self.sibling.as_ref()?;
         let file = private_file(&sibling.control.join("state.json"), false).ok()??;
         let mut bytes = Vec::new();
-        crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
-            .ok()?;
+        crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes).ok()?;
         serde_json::from_slice::<State>(&bytes).ok()
     }
 
@@ -3573,8 +3572,7 @@ impl Store {
     fn trusted_origin(&self, record: &Record) -> Option<Built> {
         let file = private_file(&self.origin_path(record.id), false).ok()??;
         let mut bytes = Vec::new();
-        crate::prune::authority_read(file.take(MAX_ORIGIN_BYTES + 1), &mut bytes)
-            .ok()?;
+        crate::prune::authority_read(file.take(MAX_ORIGIN_BYTES + 1), &mut bytes).ok()?;
         if bytes.len() as u64 > MAX_ORIGIN_BYTES {
             return None;
         }
