@@ -689,6 +689,76 @@ fn nothing_non_padding_may_follow_the_tar_end_marker() {
 }
 
 #[test]
+fn a_second_gzip_member_or_compressed_tail_is_refused() {
+    // The decoder handles exactly one gzip member. Each member below is a
+    // valid archive on its own, so the concatenation is precisely the case a
+    // lock checksum could authenticate while the strict grammar never saw the
+    // hidden entry; it now refuses at the member boundary.
+    let first = build_archive(&[(
+        format!("{TARBALL}/Cargo.toml"),
+        Spec::File {
+            data: b"[package]\n",
+            mode: 0o644,
+        },
+    )]);
+    let second = build_archive(&[(
+        format!("{TARBALL}/hidden.rs"),
+        Spec::File {
+            data: b"pub fn hidden() {}\n",
+            mode: 0o644,
+        },
+    )]);
+    assert!(
+        derive(
+            Cursor::new(first.clone()),
+            TARBALL,
+            &SourceLimits::default(),
+            Instant::now()
+        )
+        .is_ok(),
+        "the first member alone is a valid archive"
+    );
+    assert!(
+        derive(
+            Cursor::new(second.clone()),
+            TARBALL,
+            &SourceLimits::default(),
+            Instant::now()
+        )
+        .is_ok(),
+        "the hidden member alone is a valid archive"
+    );
+
+    let mut concatenated = first.clone();
+    concatenated.extend_from_slice(&second);
+    assert_ne!(
+        sha256_hex(&concatenated),
+        sha256_hex(&first),
+        "a lock naming the concatenation authenticates the hidden bytes"
+    );
+    assert_eq!(
+        archive_error(concatenated, TARBALL),
+        Some(Refusal::ArchiveGrammar("member"))
+    );
+
+    // An empty second member is still a second member.
+    let mut empty_member = first.clone();
+    empty_member.extend_from_slice(&gzip(b""));
+    assert_eq!(
+        archive_error(empty_member, TARBALL),
+        Some(Refusal::ArchiveGrammar("member"))
+    );
+
+    // Raw compressed payload after the member is refused the same way.
+    let mut raw_tail = first;
+    raw_tail.extend_from_slice(b"trailing");
+    assert_eq!(
+        archive_error(raw_tail, TARBALL),
+        Some(Refusal::ArchiveGrammar("member"))
+    );
+}
+
+#[test]
 fn gnu_and_pax_long_names_are_accepted_and_an_escaping_pax_path_refuses() {
     let long = format!("{TARBALL}/{}", "a".repeat(140));
     let gnu = build_archive(&[(

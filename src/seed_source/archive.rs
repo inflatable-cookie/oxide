@@ -10,17 +10,19 @@
 //! FIFOs, sparse entries, duplicate paths, absolute paths, `.`/`..` components,
 //! a wrong top-level archive prefix and any unparseable or truncated entry
 //! refuse. After the tar end-of-archive marker only zero padding is accepted,
-//! so an entry or payload hidden past that marker cannot bypass the grammar.
+//! so an entry or payload hidden past that marker cannot bypass the grammar,
+//! and the archive must be one gzip member: a second member or any trailing
+//! compressed payload refuses rather than being hashed without being decoded.
 //! Entry count, archive bytes and derived content are bounded and the deadline
 //! is checked between entries, so a hostile archive cannot make the verifier do
 //! unbounded work.
 
 use super::digest::{ContentHash, EntryKind, SourceTree};
 use super::{Refusal, SourceLimits};
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::rc::Rc;
 use std::time::Instant;
 use tar::EntryType;
@@ -293,7 +295,18 @@ pub(super) fn derive<R: Read>(
             return Err(Refusal::ArchiveBudget);
         }
     }
-    let inner = decoder.into_inner().into_inner();
+    // The decoder decodes exactly one gzip member. A `.crate` is one member,
+    // so anything the buffer still holds, and anything left in the compressed
+    // stream after it, refuses: a second member or another compressed payload
+    // would otherwise be authenticated by the lock checksum without ever being
+    // decoded or subjected to the entry grammar. Bytes already pulled into the
+    // buffer were hashed as the reader supplied them, and the final drain
+    // hashes the rest, so a valid single member is still hashed whole.
+    let buffered = decoder.into_inner().into_inner();
+    if !buffered.buffer().is_empty() {
+        return Err(Refusal::ArchiveGrammar("member"));
+    }
+    let mut inner = buffered.into_inner();
     loop {
         if Instant::now() > deadline {
             return Err(Refusal::Deadline);
@@ -302,6 +315,7 @@ pub(super) fn derive<R: Read>(
         if read == 0 {
             break;
         }
+        return Err(Refusal::ArchiveGrammar("member"));
     }
     let sha256 = hashing.finish();
     Ok(DerivedArchive {
