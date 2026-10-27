@@ -4316,22 +4316,29 @@ fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
     // left the ancestor search-only.
     fs::remove_file(nested_dir.join(child.private.to_string_lossy().as_ref()))
         .expect("descendant removed");
+    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+    // The owner left the ancestor search-only, so the replay has to widen it
+    // and restore the recorded mode. This window is as short as the product
+    // step it tests.
     fs::set_permissions(&nested_dir, fs::Permissions::from_mode(0o100))
         .expect("search-only ancestor");
-    write_journal(&pool, slot_id, plan, true, records, Vec::new());
 
     let after = status_injected(&pool).expect("status");
+    let restored_mode = mode_of(&nested_dir);
+    // Give this test's own fixture back its access before anything else: the
+    // shared supervisor measures the scratch it owns, and only the oracle above
+    // needs the search-only mode.
+    make_removable(fixture.path());
+    assert_eq!(
+        restored_mode, 0o100,
+        "the widened ancestor's recorded mode was restored on the error path"
+    );
     assert_eq!(
         after.slots.len(),
         1,
         "the unresolved descendant stays pending"
     );
     assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    assert_eq!(
-        mode_of(&nested_dir),
-        0o100,
-        "the widened ancestor's recorded mode was restored on the error path"
-    );
     assert!(
         captured.exists(),
         "the captured tree is kept, not put back past the failure"
