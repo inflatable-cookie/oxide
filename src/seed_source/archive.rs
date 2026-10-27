@@ -175,8 +175,11 @@ pub(super) fn derive<R: Read>(
 ) -> Result<DerivedArchive, Refusal> {
     let (mut hashing, compressed_overflow) = HashingReader::new(source, limits.max_archive_bytes);
     let deadline = started + limits.deadline;
-    let (stream, stream_reason) =
-        TarStream::new(GzDecoder::new(&mut hashing), limits.max_tar_bytes, deadline);
+    let (stream, stream_reason) = TarStream::new(
+        GzDecoder::new(BufReader::new(&mut hashing)),
+        limits.max_tar_bytes,
+        deadline,
+    );
     let signals = Signals {
         compressed_overflow,
         stream: stream_reason,
