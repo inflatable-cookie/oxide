@@ -414,20 +414,19 @@ fn dep_targets() -> Vec<String> {
     ]
 }
 
-/// The files the producing epoch records as `.d` output rules.
-fn dep_joined() -> Vec<String> {
-    vec![DEP.to_owned(), ARTIFACT.to_owned()]
-}
-
 fn dep_inputs() -> Vec<String> {
     vec![SOURCE_A.to_owned(), SOURCE_B.to_owned()]
 }
 
-fn is_joined(path: &str) -> bool {
-    path == DEP || path == ARTIFACT
+fn file_kind(path: &str) -> SeedFileKind {
+    match path {
+        DEP => SeedFileKind::DepInfo,
+        ARTIFACT => SeedFileKind::Artifact,
+        _ => SeedFileKind::Fingerprint,
+    }
 }
 
-fn default_files() -> Vec<(String, String)> {
+fn files_with_dep(dep: &str) -> Vec<(String, String)> {
     vec![
         (
             format!("{FINGERPRINT}/lib-cfg_if"),
@@ -436,8 +435,12 @@ fn default_files() -> Vec<(String, String)> {
         (format!("{FINGERPRINT}/lib-cfg_if.json"), "{}".to_owned()),
         (format!("{FINGERPRINT}/dep-lib-cfg_if"), String::new()),
         (ARTIFACT.to_owned(), "rmeta-fixture".to_owned()),
-        (DEP.to_owned(), dep_info_text()),
+        (DEP.to_owned(), dep.to_owned()),
     ]
+}
+
+fn default_files() -> Vec<(String, String)> {
+    files_with_dep(&dep_info_text())
 }
 
 fn write_files(build: &Path, files: &[(String, String)]) {
@@ -467,6 +470,22 @@ fn producer() -> SeedProducer {
 }
 
 fn catalog_for(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -> SeedCatalog {
+    let dep = files
+        .iter()
+        .find(|(path, _)| path == DEP)
+        .map(|(_, content)| content.as_str())
+        .unwrap_or_default();
+    catalog_with_join(grant, record_id, files, &dep_targets(), &dep_inputs(), dep)
+}
+
+fn catalog_with_join(
+    grant: &LeaseGrant,
+    record_id: u64,
+    files: &[(String, String)],
+    targets: &[String],
+    inputs: &[String],
+    dep: &str,
+) -> SeedCatalog {
     let entries: Vec<SeedFile> = files
         .iter()
         .map(|(path, content)| SeedFile {
@@ -474,7 +493,7 @@ fn catalog_for(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -
             size: content.len() as u64,
             mtime_ms: 0,
             digest: sha(content),
-            joined: is_joined(path),
+            kind: file_kind(path),
         })
         .collect();
     SeedCatalog {
@@ -507,9 +526,9 @@ fn catalog_for(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -
                 target: "cfg_if".to_owned(),
                 join: SeedJoin {
                     path: DEP.to_owned(),
-                    targets: dep_targets(),
-                    inputs: dep_inputs(),
-                    digest: sha(&dep_info_text()),
+                    targets: targets.to_vec(),
+                    inputs: inputs.to_vec(),
+                    digest: sha(dep),
                 },
                 files: entries,
             }],
@@ -521,6 +540,16 @@ fn catalog_for(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -
 /// One released donor slot with a published catalog, its own record lock and
 /// an idle control record.
 fn make_donor(rig: &Rig, label: &str) -> Donor {
+    make_donor_with(rig, label, default_files(), &dep_targets(), &dep_inputs())
+}
+
+fn make_donor_with(
+    rig: &Rig,
+    label: &str,
+    files: Vec<(String, String)>,
+    targets: &[String],
+    inputs: &[String],
+) -> Donor {
     // A front-door lease records its record's affinity directory as the
     // project, which is the binding a catalog's record id must match.
     let record_id = rig.next_record_id();
@@ -529,9 +558,14 @@ fn make_donor(rig: &Rig, label: &str) -> Donor {
         "donor",
         rig.affinity_dir(record_id),
     );
-    let files = default_files();
     write_files(&grant.env.cargo_build_build_dir, &files);
-    let catalog = catalog_for(&grant, record_id, &files);
+    let dep = files
+        .iter()
+        .find(|(path, _)| path == DEP)
+        .map(|(_, content)| content.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let catalog = catalog_with_join(&grant, record_id, &files, targets, inputs, &dep);
     publish_seed_catalog(&rig.pool, &catalog).expect("publish catalog");
     let bytes = catalog.to_bytes().expect("catalog bytes");
     let digest = catalog_digest(&bytes);
@@ -772,59 +806,82 @@ fn seed_skips_a_changed_donor_file_without_touching_the_recipient() {
 }
 
 #[test]
-fn seed_skips_a_join_that_disagrees_with_the_donated_dot_d() {
+fn seed_skips_a_join_that_does_not_prove_each_artifact() {
     reset_hooks();
     let rig = Rig::new("join-inconsistent");
-    // A file recorded as a `.d` output rule that the `.d` never names: the
-    // digest still matches the file, so only the re-parse can catch it.
-    let donor = make_donor(&rig, "a");
-    let (grant, recipient) = lease_recipient(&rig, "a");
-    let digest = rewrite_catalog(&rig, &donor, |catalog| {
-        let unit = &mut catalog.packages[0].units[0];
-        for file in &mut unit.files {
-            if file.path.ends_with("/lib-cfg_if") {
-                file.joined = true;
-            }
-        }
-    });
-    let mut request = donor.request(&recipient);
-    request.donor.catalog_digest = digest;
-    let outcome = seed(&rig.pool, &request).expect("seed");
-    assert_eq!(
-        outcome,
-        SeedOutcome::Skipped(SeedSkip {
-            reason: SeedSkipReason::JoinInconsistent
-        })
-    );
-    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
 
-    // An output rule the `.d` names but the catalog did not record as joined
-    // is the same refusal: an offered artifact must be a joined artifact.
-    let donor = make_donor(&rig, "b");
-    let (_, recipient) = lease_recipient(&rig, "b");
-    let digest = rewrite_catalog(&rig, &donor, |catalog| {
-        let unit = &mut catalog.packages[0].units[0];
-        for file in &mut unit.files {
-            if file.path == ARTIFACT {
-                file.joined = false;
-            }
-        }
-    });
-    let mut request = donor.request(&recipient);
-    request.donor.catalog_digest = digest;
-    let outcome = seed(&rig.pool, &request).expect("seed");
-    assert_eq!(
-        outcome,
-        SeedOutcome::Skipped(SeedSkip {
-            reason: SeedSkipReason::JoinInconsistent
-        })
-    );
+    // The positive control: the ordinary rustc shape proves the artifact.
+    let positive = make_donor(&rig, "control");
+    let (grant, recipient) = lease_recipient(&rig, "control");
+    let outcome = seed(&rig.pool, &positive.request(&recipient)).expect("seed");
+    assert!(matches!(outcome, SeedOutcome::Seeded(_)), "{outcome:?}");
+    assert!(grant.env.cargo_build_build_dir.join(ARTIFACT).exists());
 
-    // A recorded input the `.d` does not have is refused the same way.
-    let donor = make_donor(&rig, "c");
-    let (_, recipient) = lease_recipient(&rig, "c");
+    let refused = |donor: &Donor, label: &str| {
+        let (grant, recipient) = lease_recipient(&rig, label);
+        let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+        assert_eq!(
+            outcome,
+            SeedOutcome::Skipped(SeedSkip {
+                reason: SeedSkipReason::JoinInconsistent
+            }),
+            "{label}"
+        );
+        assert!(tree(&grant.env.cargo_build_build_dir).is_empty(), "{label}");
+    };
+
+    // A flattened rule names the artifact among several targets: the artifact
+    // has no rule of its own, so nothing establishes its prerequisites.
+    let flattened = format!("{DEP} {ARTIFACT}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n");
+    let donor = make_donor_with(
+        &rig,
+        "flat",
+        files_with_dep(&flattened),
+        &dep_targets(),
+        &dep_inputs(),
+    );
+    refused(&donor, "flat");
+
+    // An artifact rule with no source prerequisites proves nothing.
+    let empty = format!("{DEP}: {SOURCE_A} {SOURCE_B}\n{ARTIFACT}:\n{SOURCE_A}:\n{SOURCE_B}:\n");
+    let donor = make_donor_with(
+        &rig,
+        "empty",
+        files_with_dep(&empty),
+        &dep_targets(),
+        &dep_inputs(),
+    );
+    refused(&donor, "empty");
+
+    // An artifact the `.d` never names. The recorded flat sets are the ones
+    // this `.d` really has, so only the missing artifact rule is at fault.
+    let missing = format!("{DEP}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n");
+    let missing_targets = vec![DEP.to_owned(), SOURCE_A.to_owned(), SOURCE_B.to_owned()];
+    let donor = make_donor_with(
+        &rig,
+        "missing",
+        files_with_dep(&missing),
+        &missing_targets,
+        &dep_inputs(),
+    );
+    refused(&donor, "missing");
+
+    // An unparseable `.d`.
+    let donor = make_donor_with(
+        &rig,
+        "unparseable",
+        files_with_dep("not a rule\n"),
+        &dep_targets(),
+        &dep_inputs(),
+    );
+    refused(&donor, "unparseable");
+
+    // The recorded flat rule sets disagree with the donated `.d`: the digest
+    // still matches the file, so only the re-parse can catch it.
+    let donor = make_donor(&rig, "flat-sets");
+    let (_, recipient) = lease_recipient(&rig, "flat-sets");
     let digest = rewrite_catalog(&rig, &donor, |catalog| {
-        catalog.packages[0].units[0].join.inputs = vec![SOURCE_A.to_owned()];
+        catalog.packages[0].units[0].join.targets = vec![DEP.to_owned()];
     });
     let mut request = donor.request(&recipient);
     request.donor.catalog_digest = digest;
@@ -871,6 +928,10 @@ fn this_slice_never_writes_a_removable_payload() {
     // checked through the same predicate the seeding calls read.
     assert!(internal_backend(BUDGET_BACKEND_DIRECTORY_V1));
     assert!(!internal_backend(VOLUME_BACKEND_APFS_V1));
+    assert_eq!(
+        SeedSkipReason::RemovablePoolUnsupported.as_str(),
+        "seeding not yet supported on a removable pool"
+    );
 }
 
 #[test]
@@ -1196,23 +1257,46 @@ fn seed_refuses_a_clone_whose_bytes_do_not_match_and_retains_the_partial_slot() 
 }
 
 #[test]
-fn seed_refuses_a_failed_clone_and_never_copies_bytes() {
+fn seed_skips_when_the_build_directory_cannot_be_created_before_any_write() {
     reset_hooks();
     let rig = Rig::new("clone-failed");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    // A pre-existing entry makes the first `clonefile` fail. That is before
-    // the design's point of no return, so the attempt is abandoned and the
-    // same slot still builds cold. There is no byte-copy fallback, so the
-    // planted entry is still a directory, not a file.
-    BREAK_DONOR.with(|cell| cell.set(Some(0)));
+    let build = grant.env.cargo_build_build_dir.clone();
+    assert!(
+        build.exists(),
+        "the pool creates the slot's build directory"
+    );
+    // No recipient write has happened yet: the (empty) `build/` refuses the
+    // first destination-directory creation, which is a pre-write fault and
+    // therefore a skip that leaves the same slot to build cold.
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o500)).expect("read-only build");
     let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o700)).expect("writable build");
     assert_eq!(
         outcome,
         SeedOutcome::Skipped(SeedSkip {
             reason: SeedSkipReason::CloneFailed
         })
     );
+    assert!(tree(&build).is_empty());
+}
+
+#[test]
+fn seed_refuses_a_fault_after_the_destination_directory_is_created() {
+    reset_hooks();
+    let rig = Rig::new("destination-entry");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let before_ledger = rig.ledger_bytes();
+    let before_sidecars = rig.sidecars();
+    // The destination directory was created (a recipient write), and the
+    // destination itself already exists, so `clonefile` fails with `EEXIST`.
+    // That is after the first write: it refuses and retains, and there is no
+    // byte-copy or hard-link fallback.
+    BREAK_DONOR.with(|cell| cell.set(Some(0)));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(refused, Err(LeaseError::Io(_))));
     let destination = grant.env.cargo_build_build_dir.join(&donor.files[0].0);
     assert!(fs::symlink_metadata(&destination)
         .expect("planted entry")
@@ -1223,6 +1307,10 @@ fn seed_refuses_a_failed_clone_and_never_copies_bytes() {
         .cargo_build_build_dir
         .join(&donor.files[1].0)
         .exists());
+    // Retained: nothing is published and the ledger still records the held
+    // recipient and the idle donor for the ordinary journaled eviction.
+    assert_eq!(rig.ledger_bytes(), before_ledger);
+    assert_eq!(rig.sidecars(), before_sidecars);
 }
 
 #[test]
@@ -1434,13 +1522,24 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
 fn join_parser_accepts_rustc_shapes_and_refuses_others() {
     reset_hooks();
     let parsed = join::parse(dep_info_text().as_bytes()).expect("parse the fixture");
-    assert!(parsed.joins(&dep_joined(), &dep_inputs()));
-    // The artifact is an output rule; without it recorded as one, the same
-    // parse no longer joins.
-    assert!(!parsed.joins(&[DEP.to_owned()], &dep_inputs()));
-    // A recorded input the `.d` does not list is not a join either.
-    assert!(!parsed.joins(&dep_joined(), &[SOURCE_A.to_owned()]));
-    assert_eq!(parsed.rules, 4);
+    assert!(parsed.sets_match(&dep_targets(), &dep_inputs()));
+    // The artifact has its own single-target rule with nonempty, recorded
+    // prerequisites.
+    assert!(parsed.artifact_rule_proven(ARTIFACT, &dep_inputs()));
+    assert_eq!(parsed.rules.len(), 4);
+    // A flattened rule names several targets: it proves no artifact.
+    let flattened = join::parse(
+        format!("{DEP} {ARTIFACT}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n").as_bytes(),
+    )
+    .expect("flattened");
+    assert!(!flattened.artifact_rule_proven(ARTIFACT, &dep_inputs()));
+    // A rule with no prerequisites proves no artifact either.
+    let empty = join::parse(format!("{ARTIFACT}:\n").as_bytes()).expect("empty rule");
+    assert!(!empty.artifact_rule_proven(ARTIFACT, &dep_inputs()));
+    // An artifact with no rule at all.
+    assert!(
+        !parsed.artifact_rule_proven("debug/deps/libcfg_if-bbbbbbbbbbbbbbbb.rmeta", &dep_inputs())
+    );
 
     // Escaped space, escaped colon, literal `$` and a continued line.
     let text = "out/one\\ two: /src/a\\ b.rs /src/c.rs \\\n /src/d.rs\n/srv/\\$x: /src/e.rs\n";
@@ -1517,14 +1616,36 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     let mut join_digest = catalog.clone();
     join_digest.packages[0].units[0].join.digest = "f".repeat(64);
     assert!(join_digest.validate().is_err());
-    // The `.d` itself is an output rule.
-    let mut join_unjoined = catalog.clone();
-    for file in &mut join_unjoined.packages[0].units[0].files {
+    // The unit's one dep-info file is its join.
+    let mut join_kind = catalog.clone();
+    for file in &mut join_kind.packages[0].units[0].files {
         if file.path == DEP {
-            file.joined = false;
+            file.kind = SeedFileKind::Artifact;
         }
     }
-    assert!(join_unjoined.validate().is_err());
+    assert!(join_kind.validate().is_err());
+    // A producer cannot opt an artifact out by calling it a fingerprint file,
+    // and a fingerprint file cannot pose as an artifact.
+    let mut artifact_as_fingerprint = catalog.clone();
+    for file in &mut artifact_as_fingerprint.packages[0].units[0].files {
+        if file.path == ARTIFACT {
+            file.kind = SeedFileKind::Fingerprint;
+        }
+    }
+    assert!(artifact_as_fingerprint.validate().is_err());
+    let mut fingerprint_as_artifact = catalog.clone();
+    for file in &mut fingerprint_as_artifact.packages[0].units[0].files {
+        if file.path.ends_with("/dep-lib-cfg_if") {
+            file.kind = SeedFileKind::Artifact;
+        }
+    }
+    assert!(fingerprint_as_artifact.validate().is_err());
+    // A unit with no rustc artifact at all is not offered.
+    let mut no_artifact = catalog.clone();
+    let unit = &mut no_artifact.packages[0].units[0];
+    unit.files.retain(|file| file.path != ARTIFACT);
+    unit.join.targets.retain(|target| target != ARTIFACT);
+    assert!(no_artifact.validate().is_err());
     // The catalog's own byte ceiling is enforced before parsing.
     assert!(SeedCatalog::parse(&vec![b' '; SEED_CATALOG_MAX_BYTES + 1]).is_err());
 }

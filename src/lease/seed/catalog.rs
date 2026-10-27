@@ -196,13 +196,25 @@ pub struct SeedFile {
     pub mtime_ms: u64,
     /// SHA-256 of the file's content.
     pub digest: String,
-    /// The producing epoch's record that this path is an **output rule** of
-    /// the unit's `.d` (the `.d` itself and the role's artifacts are; Cargo's
-    /// fingerprint files and the unhashed build-script uplift are not).
-    /// Donation re-parses the `.d` and requires every such file to appear
-    /// there, and no output rule outside these files and the recorded
-    /// prerequisites.
-    pub joined: bool,
+    /// What the producing epoch classified this file as. An **artifact** is a
+    /// rustc output the unit's `.d` must join with its own single-target rule
+    /// carrying nonempty source prerequisites; a fingerprint file, the
+    /// unhashed build-script uplift and the `.d` itself are not artifacts.
+    pub kind: SeedFileKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedFileKind {
+    /// One of Cargo's fingerprint triple: unit state, never a rustc output.
+    Fingerprint,
+    /// A rustc output the unit's `.d` must join.
+    Artifact,
+    /// Cargo's unhashed build-script uplift: a copy of the hashed output, not
+    /// a `.d` output rule.
+    Uplift,
+    /// The unit's own dep-info file.
+    DepInfo,
 }
 
 /// Why a lock entry was not offered. The counts feed the bounded skip
@@ -377,20 +389,6 @@ impl SeedUnit {
         if self.files.is_empty() || self.files.len() > SEED_MAX_UNIT_FILES {
             return Err("cold-seed unit has an unusable file list");
         }
-        // The joining `.d` is part of the unit's own file list: a catalog that
-        // names a join it would not clone is not a complete unit. The join's
-        // own digest is that file record's digest, so the recorded rules and
-        // the bytes they describe cannot be published apart, and the `.d` is
-        // an output rule of itself.
-        let Some(join_file) = self.files.iter().find(|file| file.path == self.join.path) else {
-            return Err("cold-seed unit's join file is not in its file list");
-        };
-        if join_file.digest != self.join.digest {
-            return Err("cold-seed unit's join digest is not its .d file digest");
-        }
-        if !join_file.joined {
-            return Err("cold-seed unit's .d is not recorded as an output rule");
-        }
         // The profile component of the fingerprint directory is the unit's
         // output subtree: every offered file lives below it, so one unit can
         // never name a file of another profile or of the slot root.
@@ -399,6 +397,58 @@ impl SeedUnit {
             .split_once('/')
             .map(|(profile, _)| profile)
             .ok_or("cold-seed unit has no profile directory")?;
+        // The joining `.d` is part of the unit's own file list and is the
+        // unit's one dep-info record: a catalog that names a join it would not
+        // clone is not a complete unit, and the join's own digest is that file
+        // record's digest so the recorded rules and the bytes they describe
+        // cannot be published apart.
+        let dep_info: Vec<&SeedFile> = self
+            .files
+            .iter()
+            .filter(|file| file.kind == SeedFileKind::DepInfo)
+            .collect();
+        if dep_info.len() != 1 || dep_info[0].path != self.join.path {
+            return Err("cold-seed unit's join is not its one dep-info file");
+        }
+        if dep_info[0].digest != self.join.digest {
+            return Err("cold-seed unit's join digest is not its .d file digest");
+        }
+        // A unit without a rustc artifact is not a unit this layer offers, and
+        // the classification must match the layout so a producer cannot opt an
+        // artifact out by calling it a fingerprint file or an uplift: an
+        // artifact is never a fingerprint-directory entry, and a fingerprint
+        // file always is one.
+        let fingerprint_prefix = format!("{}/", self.fingerprint_dir);
+        if !self
+            .files
+            .iter()
+            .any(|file| file.kind == SeedFileKind::Artifact)
+        {
+            return Err("cold-seed unit offers no artifact");
+        }
+        for file in &self.files {
+            match file.kind {
+                SeedFileKind::Fingerprint => {
+                    if !file.path.starts_with(&fingerprint_prefix) {
+                        return Err("cold-seed fingerprint file is outside its unit directory");
+                    }
+                }
+                SeedFileKind::Artifact | SeedFileKind::DepInfo => {
+                    if file.path.starts_with(&fingerprint_prefix) {
+                        return Err("cold-seed artifact is a fingerprint-directory entry");
+                    }
+                }
+                SeedFileKind::Uplift => {
+                    let build_prefix = format!("{}/build/", profile);
+                    if self.role != SeedRole::BuildScriptCompile
+                        || !file.path.starts_with(&build_prefix)
+                        || file.path.starts_with(&fingerprint_prefix)
+                    {
+                        return Err("cold-seed uplift is not a build-script uplift");
+                    }
+                }
+            }
+        }
         for file in &self.files {
             file.validate()?;
             let file_profile = file

@@ -36,36 +36,54 @@ pub enum JoinRefusal {
     Budget,
 }
 
-/// The rules one `.d` records: every rule target and every prerequisite path,
-/// in first-seen order.
+/// One rule of a `.d`: its targets and its prerequisites, in file order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JoinRule {
+    pub targets: Vec<String>,
+    pub inputs: Vec<String>,
+}
+
+/// The rules one `.d` records, plus their flat target and prerequisite sets in
+/// first-seen order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedJoin {
     pub targets: Vec<String>,
     pub inputs: Vec<String>,
-    pub rules: usize,
+    pub rules: Vec<JoinRule>,
 }
 
 impl ParsedJoin {
-    /// Whether this parse is exactly the recorded join, compared as sets (rule
-    /// order and repeats are not part of the recorded evidence):
-    ///
-    /// - every recorded output-rule file (`joined`) appears as a rule target;
-    /// - every rule target is either one of those files or a recorded
-    ///   prerequisite (rustc's phony source rules);
-    /// - the rule prerequisites are exactly the recorded inputs.
-    pub fn joins(&self, joined: &[String], inputs: &[String]) -> bool {
+    /// The rule that names `path` as one of its targets.
+    pub fn rule_for(&self, path: &str) -> Option<&JoinRule> {
+        self.rules
+            .iter()
+            .find(|rule| rule.targets.iter().any(|target| target == path))
+    }
+
+    /// Whether the flat rule sets are exactly the recorded ones. Rule order and
+    /// repeats are not part of the recorded evidence.
+    pub fn sets_match(&self, targets: &[String], inputs: &[String]) -> bool {
         fn set(values: &[String]) -> std::collections::BTreeSet<&str> {
             values.iter().map(String::as_str).collect()
         }
-        let joined: std::collections::BTreeSet<&str> = set(joined);
-        let inputs: std::collections::BTreeSet<&str> = set(inputs);
-        let targets = set(&self.targets);
-        let parsed_inputs = set(&self.inputs);
-        joined.iter().all(|path| targets.contains(path))
-            && targets
-                .iter()
-                .all(|target| joined.contains(target) || inputs.contains(target))
-            && parsed_inputs == inputs
+        set(&self.targets) == set(targets) && set(&self.inputs) == set(inputs)
+    }
+
+    /// Whether `artifact` has its own single-target rule whose prerequisites
+    /// are nonempty and all drawn from the recorded inputs. A flattened rule
+    /// that names several targets, or a rule with no source, establishes
+    /// nothing about that artifact.
+    pub fn artifact_rule_proven(&self, artifact: &str, recorded_inputs: &[String]) -> bool {
+        let inputs: std::collections::BTreeSet<&str> =
+            recorded_inputs.iter().map(String::as_str).collect();
+        self.rule_for(artifact).is_some_and(|rule| {
+            rule.targets.len() == 1
+                && !rule.inputs.is_empty()
+                && rule
+                    .inputs
+                    .iter()
+                    .all(|input| inputs.contains(input.as_str()))
+        })
     }
 }
 
@@ -78,7 +96,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedJoin, JoinRefusal> {
     let mut parsed = ParsedJoin {
         targets: Vec::new(),
         inputs: Vec::new(),
-        rules: 0,
+        rules: Vec::new(),
     };
     let mut logical = String::new();
     for line in text.split('\n') {
@@ -111,16 +129,19 @@ fn flush_line(line: &mut String, parsed: &mut ParsedJoin) -> Result<(), JoinRefu
     if trimmed.is_empty() {
         return Ok(());
     }
-    parsed.rules += 1;
-    if parsed.rules > MAX_JOIN_TARGETS {
-        return Err(JoinRefusal::Budget);
-    }
     let colon = first_unescaped_colon(trimmed).ok_or(JoinRefusal::Malformed)?;
     let targets = tokenize(trimmed[..colon].trim())?;
     if targets.is_empty() {
         return Err(JoinRefusal::Malformed);
     }
     let inputs = tokenize(trimmed[colon + 1..].trim())?;
+    parsed.rules.push(JoinRule {
+        targets: targets.clone(),
+        inputs: inputs.clone(),
+    });
+    if parsed.rules.len() > MAX_JOIN_TARGETS {
+        return Err(JoinRefusal::Budget);
+    }
     parsed.targets.extend(targets);
     if parsed.targets.len() > MAX_JOIN_TARGETS {
         return Err(JoinRefusal::Budget);

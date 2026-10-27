@@ -34,18 +34,20 @@
 //! - **After it, every other fault refuses and retains**: no deletion, no
 //!   retry, no second lease. (`Err`.)
 //!
-//! The first created entry is exactly the design's point of no return for
-//! trust: before it abandoning is free, after it the recipient is untrusted.
-//! The `build/` directory and the parent directories a clone needs may exist
-//! after an abandoned attempt — Cargo would create them anyway — but no file
-//! is written, so the same slot still builds cold.
+//! The first **recipient write** — creating the `build/` directory, creating a
+//! destination directory, or `clonefile` itself — is the point of no return:
+//! before any write abandoning is free and the same slot builds cold; from the
+//! first write onward an unsafe path, `EEXIST` at a destination and every other
+//! fault refuse and retain the untrusted generation.
 //!
 //! **Tier and scope: internal pools only.** This slice writes only a
-//! `directory-budget-v1` pool's payload. A removable `apfs-volume-v1` payload
-//! is the Elevated path (cloned files on removable media) and needs its own
-//! tier and native evidence, so [`seed`] skips such a pool and
-//! [`seed_candidates`] offers no candidate from one. The removable donation
-//! path is a later slice's, not a silent under-tier of this one.
+//! `directory-budget-v1` pool's payload. Removable `apfs-volume-v1` custody is
+//! reassigned to Elevated slice 4 with its removable-media native case (Oxide
+//! Supervisor ruling at PR #159 head `394c0c6`), so until then [`seed`] skips
+//! such a pool with the reason "seeding not yet supported on a removable pool"
+//! and [`seed_candidates`] offers no candidate from one. The command takes the
+//! normal cold build and no removable payload is read or written on these
+//! paths. The frozen eventual behaviour is unchanged by that reassignment.
 //!
 //! The donor predicate of §7 has two halves and both are checked here. The
 //! ledger half is state `Idle`, no lease, the catalog's lease as
@@ -80,10 +82,10 @@ mod join;
 mod walk;
 
 pub use catalog::{
-    digest as catalog_digest, SeedAttemptState, SeedCatalog, SeedFile, SeedJoin, SeedPackage,
-    SeedProducer, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind, SeedSourceRoot,
-    SeedUnit, SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_FILES, SEED_MAX_PACKAGES,
-    SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
+    digest as catalog_digest, SeedAttemptState, SeedCatalog, SeedFile, SeedFileKind, SeedJoin,
+    SeedPackage, SeedProducer, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind,
+    SeedSourceRoot, SeedUnit, SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_FILES,
+    SEED_MAX_PACKAGES, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
 };
 pub use join::{JoinRefusal, ParsedJoin};
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
@@ -260,9 +262,11 @@ pub enum SeedSkipReason {
     /// still builds cold (§6.5's point of no return is the first clone).
     CloneFailed,
     /// This slice's custody calls only write an internal `directory-budget-v1`
-    /// pool's payload. Writing a removable volume is the Elevated path and
-    /// needs its own tier and native evidence, so it is not part of this
-    /// slice: a removable pool is a cold skip.
+    /// pool's payload. Removable support is reassigned to Elevated slice 4
+    /// (Oxide Supervisor ruling at PR #159 head `394c0c6`) together with its
+    /// removable-media native case, so until then an `apfs-volume-v1` pool is a
+    /// fail-closed seeding skip reported as "seeding not yet supported on a
+    /// removable pool" and the command takes the normal cold build.
     RemovablePoolUnsupported,
     /// This platform has no `clonefile`.
     Unsupported,
@@ -285,7 +289,7 @@ impl SeedSkipReason {
             Self::FileChanged => "file changed",
             Self::JoinInconsistent => "join inconsistent",
             Self::CloneFailed => "clone failed",
-            Self::RemovablePoolUnsupported => "removable pool unsupported",
+            Self::RemovablePoolUnsupported => "seeding not yet supported on a removable pool",
             Self::Unsupported => "unsupported",
         }
     }
@@ -549,11 +553,18 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
                     Ok(parsed) => parsed,
                     Err(_) => return Ok(skip(SeedSkipReason::JoinInconsistent)),
                 };
-                // Every recorded output-rule file must be a rule target, and
-                // no rule target may be outside those files and the recorded
-                // prerequisites. An offered artifact that the `.d` does not
-                // join is not a proven unit.
-                if !parsed.joins(&unit_join.joined, &unit_join.join.inputs) {
+                // The flat rule sets must be exactly the recorded ones, the
+                // `.d` must be a rule target, and every offered artifact must
+                // have its own single-target rule with nonempty source
+                // prerequisites. A flattened rule, a missing rule, an empty
+                // rule or an artifact the `.d` never names is not a proven
+                // unit.
+                let proven = parsed.sets_match(&unit_join.join.targets, &unit_join.join.inputs)
+                    && parsed.rule_for(&unit_join.join.path).is_some()
+                    && unit_join.artifacts.iter().all(|artifact| {
+                        parsed.artifact_rule_proven(artifact, &unit_join.join.inputs)
+                    });
+                if !proven {
                     return Ok(skip(SeedSkipReason::JoinInconsistent));
                 }
             }
@@ -569,24 +580,29 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     if Instant::now() > deadline {
         return Ok(skip(SeedSkipReason::WorkDeadline));
     }
-    // §6.5's point of no return is the first `clonefile` that actually
-    // creates an entry. Everything before it — the `build/` directory and the
-    // parents a clone needs, and a first clone that fails to be created — is a
-    // skippable abandon: nothing was cloned, so the same slot still builds
-    // cold. Once an entry exists, the recipient is untrusted and every fault
-    // refuses and retains.
-    let mut cloned_any = false;
+    // §6.5's point of no return is the first **recipient write**: creating the
+    // `build/` directory, creating a destination directory, or `clonefile`
+    // itself. Before any write a fault is a skip and the same slot still builds
+    // cold; from the first write onward every fault — an unsafe path, `EEXIST`
+    // at a destination, a clone or digest error, the work deadline — refuses
+    // and retains. The one exception is the post-clone recipient walk, which
+    // abandons seeding only (the caller releases the untrusted recipient and
+    // cold-builds in a newly admitted slot).
+    let mut wrote_any = false;
     let recipient_build = match recipient_build {
         Some(build) => build,
         None => match create_owned_directory(recipient_fd.as_fd(), c"build", payload_device) {
-            Ok(build) => build,
-            Err(error) => return pre_clone(cloned_any, error),
+            Ok(build) => {
+                wrote_any = true;
+                build
+            }
+            Err(error) => return pre_write(wrote_any, error),
         },
     };
     for (index, planned) in plan.files.iter().enumerate() {
         let file = &planned.file;
         if Instant::now() > deadline {
-            return if cloned_any {
+            return if wrote_any {
                 Err(work_deadline_after_clone())
             } else {
                 Ok(skip(SeedSkipReason::WorkDeadline))
@@ -601,8 +617,11 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
                 None => recipient_build.as_fd(),
             };
             match open_or_create_directory(parent_fd, &component, payload_device) {
-                Ok(next) => deepest = Some(next),
-                Err(error) => return pre_clone(cloned_any, error),
+                Ok((next, created)) => {
+                    wrote_any |= created;
+                    deepest = Some(next);
+                }
+                Err(error) => return pre_write(wrote_any, error),
             }
         }
         let directory = match deepest.as_ref() {
@@ -617,27 +636,34 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
             relative: &file.path,
         });
         if let Err(error) = clone_file(sources[index].as_fd(), directory, &name) {
-            return pre_clone(cloned_any, error);
+            return pre_write(wrote_any, error);
         }
-        // The first created entry is the trust boundary; from here a fault
-        // refuses and retains.
-        cloned_any = true;
+        // The clone exists from here: the recipient is untrusted and every
+        // fault below refuses and retains.
+        wrote_any = true;
         test_point(TestPoint::AfterClone {
             index,
             path: &recipient_path,
         });
         // The clone is hashed against the same recorded digest; a clone that
         // does not reproduce it is never published.
-        let cloned = walk::open_regular(&directory, &name).map_err(io_error)?;
-        let metadata = fstat(cloned.as_fd()).map_err(io_error)?;
+        let cloned = match walk::open_regular(&directory, &name) {
+            Ok(cloned) => cloned,
+            Err(error) => return pre_write(wrote_any, io_error(error)),
+        };
+        let metadata = match fstat(cloned.as_fd()) {
+            Ok(metadata) => metadata,
+            Err(error) => return pre_write(wrote_any, io_error(error)),
+        };
         let digest = match hash_fd(cloned.as_fd(), deadline) {
             Ok(digest) => digest,
-            Err(StreamError::Deadline) => return Err(work_deadline_after_clone()),
-            Err(StreamError::Io(error)) => return Err(error),
+            Err(StreamError::Deadline) => return pre_write(wrote_any, work_deadline_after_clone()),
+            Err(StreamError::Io(error)) => return pre_write(wrote_any, error),
             Err(StreamError::TooLarge) => {
-                return Err(LeaseError::Io(
-                    "a seeded clone exceeds its recorded size".to_owned(),
-                ))
+                return pre_write(
+                    wrote_any,
+                    LeaseError::Io("a seeded clone exceeds its recorded size".to_owned()),
+                )
             }
         };
         if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
@@ -646,9 +672,10 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
             || metadata.st_size.max(0) as u64 != file.size
             || digest != file.digest
         {
-            return Err(LeaseError::UnsafePath(
-                "a seeded clone does not match its recorded digest",
-            ));
+            return pre_write(
+                wrote_any,
+                LeaseError::UnsafePath("a seeded clone does not match its recorded digest"),
+            );
         }
         test_point(TestPoint::DuringClone { index });
         if Instant::now() > deadline {
@@ -755,11 +782,11 @@ fn walk_limits() -> SeedWalkLimits {
     }
 }
 
-/// The recorded join of one selected unit: its `.d` and the files the
-/// producing epoch recorded as that `.d`'s output rules.
+/// The recorded join of one selected unit: its `.d` and the artifacts the
+/// producing epoch classified as its rustc outputs.
 struct UnitJoin {
     join: SeedJoin,
-    joined: Vec<String>,
+    artifacts: Vec<String>,
 }
 
 /// One planned file, with the unit join it must satisfy when it is that
@@ -795,10 +822,10 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
             .flat_map(|package| package.units.iter())
             .find(|unit| unit.fingerprint_dir == wanted.fingerprint_dir && unit.role == wanted.role)
             .ok_or(SeedSkipReason::UnitMissing)?;
-        let joined: Vec<String> = unit
+        let artifacts: Vec<String> = unit
             .files
             .iter()
-            .filter(|file| file.joined)
+            .filter(|file| file.kind == SeedFileKind::Artifact)
             .map(|file| file.path.clone())
             .collect();
         for file in &unit.files {
@@ -808,7 +835,7 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
             files.push(PlannedFile {
                 join: (file.path == unit.join.path).then(|| UnitJoin {
                     join: unit.join.clone(),
-                    joined: joined.clone(),
+                    artifacts: artifacts.clone(),
                 }),
                 file: file.clone(),
             });
@@ -905,11 +932,11 @@ fn work_deadline_after_clone() -> LeaseError {
     LeaseError::Io("cold-seed work deadline expired after the first clone".to_owned())
 }
 
-/// Before the first created clone, a fault abandons the attempt and the same
-/// slot builds cold; after it, the fault refuses and the untrusted generation
-/// is retained (§6.5).
-fn pre_clone(cloned_any: bool, error: LeaseError) -> Result<SeedOutcome, LeaseError> {
-    if cloned_any {
+/// Before the first recipient write, a fault abandons the attempt and the same
+/// slot builds cold; after any write, the fault refuses and the untrusted
+/// generation is retained (§6.5).
+fn pre_write(wrote_any: bool, error: LeaseError) -> Result<SeedOutcome, LeaseError> {
+    if wrote_any {
         Err(error)
     } else {
         Ok(skip(SeedSkipReason::CloneFailed))
@@ -1351,17 +1378,19 @@ fn create_owned_directory(
     }
 }
 
+/// Open a destination directory, creating it when absent. The flag is `true`
+/// only when this call created it, which is what makes it a recipient write.
 fn open_or_create_directory(
     parent: BorrowedFd<'_>,
     name: &std::ffi::CStr,
     device: u64,
-) -> Result<OwnedFd, LeaseError> {
+) -> Result<(OwnedFd, bool), LeaseError> {
     match open_optional_directory(parent, name, device) {
-        Ok(Some(fd)) => Ok(fd),
+        Ok(Some(fd)) => Ok((fd, false)),
         Ok(None) => {
             mkdir_owned(parent, name)?;
             match open_optional_directory(parent, name, device)? {
-                Some(fd) => Ok(fd),
+                Some(fd) => Ok((fd, true)),
                 None => Err(LeaseError::Io(
                     "a created seed directory is missing".to_owned(),
                 )),

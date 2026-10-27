@@ -1461,6 +1461,15 @@ build:
   behaviour exactly. Unifying the start gate for every command would be a
   separate scoped change, and this design does not make it.
 
+> **Implementation note (Oxide Supervisor ruling, PR #159 head `394c0c6`).**
+> Slice 2 implements the internal `directory-budget-v1` gate and seeding path
+> under the Standard tier. Until **Elevated slice 4** lands with its
+> removable-media native case, an `apfs-volume-v1` pool is a fail-closed
+> seeding skip reported as "seeding not yet supported on a removable pool", and
+> the command takes the normal cold build; no removable payload is read or
+> written on the slice-2 paths. The removable bullet above is unchanged and
+> remains the eventual contract that slice 4 must satisfy.
+
 The pool budget stays soft: a started command's seed may pass the cap exactly
 as its Cargo may, and the seed's bytes are visible to the next admission. The
 command's admission budget is never extended: an expiry before the clone means
@@ -1833,6 +1842,16 @@ anything it cannot prove it owns and never starts Cargo on unverified state.
 
 Each slice needs its own approved Queue brief, risk tier and covering checks.
 This design mints none of that.
+
+> **Implementation note (Oxide Supervisor ruling, PR #159 head `394c0c6`).**
+> Slice 2 is implemented for the internal `directory-budget-v1` pool under the
+> Standard tier. Its removable `apfs-volume-v1` custody is reassigned to a new
+> **Elevated slice 4**, which carries the removable-media native case that
+> validates it; the existing proof-apparatus and knowledge slices follow it.
+> The frozen eventual behaviour of §§6–8 is unchanged: this is a slice and
+> validation reassignment, not a contract change. Slice 2 reports an
+> `apfs-volume-v1` pool as the skip "seeding not yet supported on a removable
+> pool" and takes the normal cold build until slice 4 lands.
 
 ## 16. Proof plan
 
