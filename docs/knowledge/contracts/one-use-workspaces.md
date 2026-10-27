@@ -62,15 +62,31 @@ implementation review corrected:
   unconditionally, so a malformed or mismatched document selects the general
   guarded refusal and only a `Prepared` transition selects the §4.4
   diagnostic.
-- **A guarded refusal creates no lock file.** The admission locks are only
-  *probed* (never created) before the busy decision: `AdmissionProbe::Absent`
-  means no other command has ever entered a critical section on that pool, so
-  the decision is safe without the lock and a dead or unknown refusal leaves the
-  pool exactly as it found it. The lock is created only on the proceeding path,
-  under which the decision is taken again. The removables' sibling state is read
+- **A guarded refusal creates no lock file — structurally, not by promise.**
+  A guarded verb never creates the pool's `admission.lock` at any point: it
+  *probes* it (never creating it), refuses or retries when it is held, retries
+  when it is absent (a pool that has never had a controller enter its critical
+  section; the verb cannot bootstrap it), and then takes the **existing** lock
+  non-blockingly before its second authority decision. There is therefore no
+  path on which a dead, live, retry or unknown answer can leave a newly created
+  `admission.lock`; the only file a refusal may touch is the checkout binding
+  mutex. The caller's revalidation runs again between the two decisions, so a
+  change that lands in that window is refused before a mark, and only the
+  proceeding path writes the mark and its `waiters/` lock. The removables' sibling state is read
   through a checked reader that keeps absence (`Ok(None)`) apart from any other
   failure — a symlinked *or dangling* document, an inaccessible ancestor, an
   invalid document — which refuses as unknown custody.
+- **The prune-intent check follows the shipped definition.** `unsettled_for`
+  answers `Ok(None)` only when there is no registry document at all (a pool
+  that never published output authority cannot hold a published intent); every
+  read, parse or validation error propagates and refuses; a present intent whose
+  phase is terminal **and** whose checkout receipt committed is settled and
+  clear, exactly as the shipped verbs treat it; an unfinished intent refuses by
+  ID. The guarded check runs at the effect-free precheck of each verb and again
+  under the checkout binding mutex, and a `Pruning` receipt refuses there too.
+  The registry read is not taken under the publication lock — the same
+  pre-effect property the shipped `bind_for_command`, `reserve` and `detach`
+  have — and S1 adds no weakening to it.
 - **The dormant `adopt` keeps the shipped error precedence.** Drive mode, then
   the control directory, then the pool: the lazy pool provider is called last,
   so a dormant build reports the pre-S1 refusal when several preconditions are

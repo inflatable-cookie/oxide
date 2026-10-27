@@ -6765,11 +6765,12 @@ pub(crate) fn seed_test_registry(control: &Path) -> Result<(), String> {
     }
 }
 
-/// Test-only: publish one unfinished prune intent for `checkout_id` into a
-/// ready registry, so the guarded branch's unsettled-intent refusal is
-/// exercisable without running a real prune. Returns the intent ID.
+/// Test-only: publish one prune intent for `checkout_id` into a ready
+/// registry, so the guarded branch's unsettled-intent refusal (and the shipped
+/// definition of a *settled* intent) is exercisable without running a real
+/// prune. Returns the intent ID.
 #[cfg(test)]
-pub(crate) fn seed_test_unsettled_intent(control: &Path, checkout_id: &str) -> String {
+pub(crate) fn seed_test_intent(control: &Path, checkout_id: &str, settled: bool) -> String {
     let mut registry = ready_registry(control).unwrap();
     let id = "b".repeat(32);
     registry.intents.push(Intent {
@@ -6789,13 +6790,17 @@ pub(crate) fn seed_test_unsettled_intent(control: &Path, checkout_id: &str) -> S
             ino: 2,
             marker_digest: "c".repeat(64),
         },
-        phase: IntentPhase::Intent,
+        phase: if settled {
+            IntentPhase::Resolved
+        } else {
+            IntentPhase::Intent
+        },
         quarantine: PathBuf::from("/quarantine"),
         preview_sha256: "f".repeat(64),
         created_ms: 1,
         updated_ms: 1,
         resolved_ms: None,
-        receipt_settled: false,
+        receipt_settled: settled,
         was_selected: true,
         prior_receipt_sha: String::new(),
         group: Vec::new(),

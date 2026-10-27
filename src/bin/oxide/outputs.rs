@@ -16947,15 +16947,16 @@ mod tests {
 
     /// A guarded refusal must not create the pool's admission lock: every lock
     /// a guarded verb touches before it decides is the checkout binding mutex
-    /// (design §4.1 step 4). The admission lock is created only when the verb
-    /// proceeds.
+    /// (design §4.1 step 4). A pool that has no admission lock is a bounded
+    /// retry, never a creation; with an existing lock the dead and unknown
+    /// refusals leave the control directory and its files exactly as they were.
     #[test]
     fn a_guarded_refusal_creates_no_admission_lock() {
+        // No admission lock at all: the verb retries and creates nothing.
         let fixture = GuardFixture::new("no-admission-lock");
         fixture.write(&fixture.committed());
         let admission = fixture.control().join("admission.lock");
         let _ = fs::remove_file(&admission);
-        assert!(!admission.exists(), "the fixture starts without the lock");
         crate::store::dead_record_for_tests(&fixture.store, &fixture.checkout, 7);
         let refused = crate::one_use::with_active(|| {
             detach_at(&fixture.context(), || {
@@ -16963,19 +16964,31 @@ mod tests {
             })
             .unwrap_err()
         });
-        assert!(refused.contains("clean barrier refused"), "{refused}");
-        assert!(
-            !admission.exists(),
-            "a dead-custody refusal created the admission lock"
-        );
+        assert_eq!(refused, crate::one_use::BARRIER_BUSY);
+        assert!(!admission.exists(), "a refusal created the admission lock");
 
-        // Unknown custody the same way.
-        let fixture = GuardFixture::new("no-admission-lock-unknown");
+        // With the pool's existing admission lock, a dead-custody refusal
+        // leaves every file (that lock included) byte-identical.
+        let fixture = GuardFixture::new("existing-admission-lock");
         fixture.write(&fixture.committed());
         let admission = fixture.control().join("admission.lock");
-        let _ = fs::remove_file(&admission);
-        crate::store::save_default_state_for_tests(&fixture.store);
-        fs::write(fixture.control().join("state.json"), b"{not json").unwrap();
+        assert!(admission.is_file(), "a converted pool carries the lock");
+        let admission_before = fs::read(&admission).unwrap();
+        let listing = |dir: &Path| {
+            let mut names: Vec<String> = fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|entry| Some(entry.file_name().to_str()?.to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        // The plant itself writes state, so the comparison starts after it.
+        crate::store::dead_record_for_tests(&fixture.store, &fixture.checkout, 7);
+        let control_before = listing(&fixture.control());
         let refused = crate::one_use::with_active(|| {
             cancel_at(&fixture.context(), || {
                 Ok(Some(fixture.store.handle_for_tests()))
@@ -16983,26 +16996,24 @@ mod tests {
             .unwrap_err()
         });
         assert!(refused.contains("clean barrier refused"), "{refused}");
-        assert!(
-            !admission.exists(),
-            "an unknown-custody refusal created the admission lock"
-        );
+        assert!(refused.contains("record 7"), "{refused}");
+        assert_eq!(fs::read(&admission).unwrap(), admission_before);
+        let mut control_after = listing(&fixture.control());
+        control_after.sort();
+        let mut expected = control_before.clone();
+        expected.sort();
+        assert_eq!(control_after, expected, "no file was created");
 
-        // Non-vacuity: a clear checkout takes the barrier, so the lock is
-        // created there — the creation belongs to the proceeding path only.
-        let fixture = GuardFixture::new("no-admission-lock-proceed");
+        // Non-vacuity: a clear checkout takes the barrier and completes the
+        // verb through the existing lock.
+        let fixture = GuardFixture::new("existing-admission-lock-clear");
         fixture.write(&fixture.committed());
-        let admission = fixture.control().join("admission.lock");
-        let _ = fs::remove_file(&admission);
         let _ = crate::one_use::with_active(|| {
             detach_at(&fixture.context(), || {
                 Ok(Some(fixture.store.handle_for_tests()))
             })
         });
-        assert!(
-            admission.exists(),
-            "the proceeding path acquires the admission lock"
-        );
+        assert!(fixture.control().join("admission.lock").is_file());
     }
 
     /// The shipped (dormant) `adopt` keeps its **error precedence**: drive mode
@@ -17229,8 +17240,7 @@ mod tests {
     #[test]
     fn an_unsettled_prune_intent_refuses_a_guarded_command() {
         let fixture = GuardFixture::new("unsettled");
-        let id =
-            crate::prune::seed_test_unsettled_intent(&fixture.control(), &fixture.checkout_id());
+        let id = crate::prune::seed_test_intent(&fixture.control(), &fixture.checkout_id(), false);
         let members = members(&["debug"]);
         let before = durable_digest(&fixture);
         let refused =
@@ -17257,7 +17267,66 @@ mod tests {
         assert_eq!(durable_digest(&fixture), before);
     }
 
-    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally
+    /// The guarded prune-intent check follows the **shipped** definition, and
+    /// every failure of the registry read is a refusal:
+    ///
+    /// - no registry document at all -> clear (a pool that has never published
+    ///   output authority cannot hold a published intent; this is exactly what
+    ///   `prune::unsettled_for` answers for the shipped verbs);
+    /// - a malformed or unreadable registry -> refusal, never "unset, so
+    ///   clear";
+    /// - a present intent whose phase is terminal **and** whose checkout
+    ///   receipt committed (`settled()`) -> clear, because that is the shipped
+    ///   definition of settled;
+    /// - an unsettled intent -> the shipped refusal naming its ID.
+    #[test]
+    fn the_guarded_prune_intent_check_follows_the_shipped_definition() {
+        let members = members(&["debug"]);
+
+        // No registry document: clear, and nothing is written.
+        let fixture = GuardFixture::new("intent-absent");
+        let before = durable_digest(&fixture);
+        crate::one_use::with_active(|| {
+            assert!(guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members).is_ok())
+        });
+        assert_eq!(durable_digest(&fixture), before);
+
+        // Malformed registry: a refusal, not a silent clear.
+        let fixture = GuardFixture::new("intent-malformed");
+        let registry = fixture.control().join("outputs").join("registry.json");
+        fs::write(&registry, b"{not a registry").unwrap();
+        let refused = crate::one_use::with_active(|| {
+            match guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members) {
+                Err(reason) => reason,
+                Ok(()) => panic!("a malformed registry must refuse"),
+            }
+        });
+        assert!(!refused.is_empty());
+        assert_eq!(fs::read(&registry).unwrap(), b"{not a registry");
+
+        // A settled intent is clear; an unsettled one refuses.
+        let fixture = GuardFixture::new("intent-settled");
+        let id = crate::prune::seed_test_intent(&fixture.control(), &fixture.checkout_id(), true);
+        crate::one_use::with_active(|| {
+            assert!(
+                guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members).is_ok(),
+                "a settled intent is clear"
+            )
+        });
+        assert!(!id.is_empty());
+        let fixture = GuardFixture::new("intent-unsettled");
+        let id = crate::prune::seed_test_intent(&fixture.control(), &fixture.checkout_id(), false);
+        let refused = crate::one_use::with_active(|| {
+            match guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members) {
+                Err(reason) => reason,
+                Ok(()) => panic!("an unsettled intent must refuse"),
+            }
+        });
+        assert!(refused.contains(&id), "{refused}");
+        assert!(refused.contains("unsettled"), "{refused}");
+    }
+
+    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally
     /// through it (design §4.2's `Pruned` row), writing no receipt or state
     /// byte.
     #[test]

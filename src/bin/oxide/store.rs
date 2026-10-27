@@ -2898,22 +2898,40 @@ impl Store {
         }
         revalidate()?;
         // Phase 1 — the refusal decision, with **nothing created**. The
-        // admission locks are only *probed*, never created: a dead or unknown
-        // custody refusal must leave the pool exactly as it found it (design
-        // §4.1 step 4: "the only lock any of them touches is the checkout
-        // binding mutex").
+        // admission locks are only *probed*: a guarded verb never creates one,
+        // so no refusal can leave a new `admission.lock` behind (design §4.1
+        // step 4 allows only the checkout binding mutex file). A pool with no
+        // admission lock has never had a controller enter its critical section;
+        // the verb cannot create one, so it retries.
         let sibling = self.sibling.as_ref().filter(|sibling| sibling.barrier);
         if let Some(sibling) = sibling {
-            if probe_admission(&sibling.control)? == AdmissionProbe::Held {
-                return Ok(Cleaning::Retry(
-                    "another oxide command holds the internal admission lock".to_owned(),
-                ));
+            match probe_admission(&sibling.control)? {
+                AdmissionProbe::Free => {}
+                AdmissionProbe::Held => {
+                    return Ok(Cleaning::Retry(
+                        "another oxide command holds the internal admission lock".to_owned(),
+                    ))
+                }
+                AdmissionProbe::Absent => {
+                    return Ok(Cleaning::Retry(
+                        "the internal pool has no admission lock to take a barrier under"
+                            .to_owned(),
+                    ))
+                }
             }
         }
-        if probe_admission(&self.control)? == AdmissionProbe::Held {
-            return Ok(Cleaning::Retry(
-                "another oxide command holds this pool's admission lock".to_owned(),
-            ));
+        match probe_admission(&self.control)? {
+            AdmissionProbe::Free => {}
+            AdmissionProbe::Held => {
+                return Ok(Cleaning::Retry(
+                    "another oxide command holds this pool's admission lock".to_owned(),
+                ))
+            }
+            AdmissionProbe::Absent => {
+                return Ok(Cleaning::Retry(
+                    "this pool has no admission lock to take a barrier under".to_owned(),
+                ))
+            }
         }
         match self.barrier_decision(checkout)? {
             BarrierState::Dead(what) => {
@@ -2922,14 +2940,14 @@ impl Store {
             BarrierState::Live(reason) => return Ok(Cleaning::Retry(reason)),
             BarrierState::Clear => {}
         }
-        // Phase 2 — the verb proceeds, so taking (and if necessary creating)
-        // the admission locks is legitimate. The decision is taken again under
-        // them, because a peer may have written state between the probe and the
-        // acquisition; a non-clear answer then refuses or retries without a
-        // mark, and only an empty admission lock file (the file every mutating
-        // command creates) can be new.
+        // Phase 2 — take the **existing** admission locks (opened, never
+        // created) and decide again under them. The caller's revalidation runs
+        // once more here, still under the checkout binding mutex, so a
+        // transition that appeared between the two decisions is refused before
+        // a mark exists. Neither decision can create anything, so a non-clear
+        // second answer leaves the pool's files exactly as they were.
         let _sibling = match sibling {
-            Some(sibling) => match try_lock_admission(&sibling.control)? {
+            Some(sibling) => match acquire_existing_admission(&sibling.control)? {
                 Some(lock) => Some(lock),
                 None => {
                     return Ok(Cleaning::Retry(
@@ -2939,11 +2957,12 @@ impl Store {
             },
             None => None,
         };
-        let Some(_admission) = try_lock_admission(&self.control)? else {
+        let Some(_admission) = acquire_existing_admission(&self.control)? else {
             return Ok(Cleaning::Retry(
                 "another oxide command holds this pool's admission lock".to_owned(),
             ));
         };
+        revalidate()?;
         let mut state = self
             .load()
             .map_err(|error| crate::one_use::barrier_unknown(&error))?;
@@ -4723,17 +4742,13 @@ pub(crate) fn probe_admission(control: &Path) -> Result<AdmissionProbe, String> 
     }
 }
 
-/// A non-blocking admission attempt on the **proceeding** path (one-use S1,
-/// design §4.1 step 4): `Some` once the lock is taken, `None` when another
-/// command holds it. It may create the lock file, which is legitimate because
-/// the caller has already decided to proceed; every refusal path uses
-/// [`probe_admission`] first and creates nothing.
-pub(crate) fn try_lock_admission(control: &Path) -> Result<Option<File>, String> {
-    let Some(file) = open_admission_file(control, true)? else {
-        return Err(format!(
-            "cannot create admission lock in {}",
-            control.display()
-        ));
+/// A non-blocking acquisition of an **existing** admission lock (one-use S1,
+/// design §4.1 step 4): `Some` once the lock is taken, `None` when it is held or
+/// has disappeared. It never creates the file, because a guarded verb may only
+/// touch the checkout binding mutex on its refusal paths.
+fn acquire_existing_admission(control: &Path) -> Result<Option<File>, String> {
+    let Some(file) = open_admission_file(control, false)? else {
+        return Ok(None);
     };
     // SAFETY: the descriptor is open for the duration of the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -6006,6 +6021,14 @@ mod tests {
         fs::read(store.control.join("state.json")).unwrap()
     }
 
+    /// The admission lock every pool that has ever run a mutating command
+    /// carries: created and released, so a guarded barrier can take it without
+    /// creating it.
+    fn lock_pool(store: &Store) {
+        drop(lock_admission(&store.control).unwrap());
+        assert!(store.control.join("admission.lock").is_file());
+    }
+
     /// A record whose lock file exists but is free: its holder ended without
     /// recovering it, so it is a *dead* record.
     fn dead_record(store: &Store, checkout: &Path, id: u64) {
@@ -6043,6 +6066,7 @@ mod tests {
     #[test]
     fn the_guarded_barrier_refuses_a_dead_record_before_any_mark() {
         let (root, internal, _removable) = paired_controls("guarded-dead-record");
+        lock_pool(&internal);
         let checkout = Path::new("/checkout");
         dead_record(&internal, checkout, 7);
         let before = state_bytes(&internal);
@@ -6069,6 +6093,7 @@ mod tests {
     #[test]
     fn the_guarded_barrier_refuses_a_dead_clean_mark() {
         let (root, internal, _removable) = paired_controls("guarded-dead-mark");
+        lock_pool(&internal);
         let checkout = Path::new("/checkout");
         let mut state = State::default();
         state.cleans.push(Clean {
@@ -6096,6 +6121,7 @@ mod tests {
     #[test]
     fn the_guarded_barrier_retries_a_live_holder_and_refuses_a_dead_one() {
         let (root, internal, _removable) = paired_controls("guarded-live-holder");
+        lock_pool(&internal);
         let checkout = Path::new("/checkout");
         let held = hold_record(&internal, checkout, 5);
         let before = state_bytes(&internal);
@@ -6125,6 +6151,7 @@ mod tests {
     #[test]
     fn a_dead_fact_outranks_a_live_holder() {
         let (root, internal, _removable) = paired_controls("guarded-dead-and-live");
+        lock_pool(&internal);
         let checkout = Path::new("/checkout");
         let held = hold_record(&internal, checkout, 5);
         let mut state = internal.load().unwrap();
@@ -6155,6 +6182,7 @@ mod tests {
     #[test]
     fn a_record_with_a_dead_lock_and_a_live_group_is_retried() {
         let (root, internal, _removable) = paired_controls("guarded-free-lock-live-group");
+        lock_pool(&internal);
         let checkout = Path::new("/checkout");
         // SAFETY: getpgid has no preconditions; the test process's own group is
         // alive for the duration of the test.
@@ -6200,12 +6228,61 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A held admission lock is a fact to retry, never a lock to block on:
+    /// that is what makes it safe for a guarded verb to hold the checkout
+    /// binding mutex across the attempt (the shipped order takes the barrier
+    /// and then the binding mutex, so blocking here could deadlock).
+    #[test]
+    fn the_guarded_barrier_never_blocks_on_a_held_admission_lock() {
+        let (root, internal, _removable) = paired_controls("guarded-admission");
+        internal.save(&State::default()).unwrap();
+        let held = lock_admission(&internal.control).unwrap();
+        let before = state_bytes(&internal);
+        match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Ok(Cleaning::Retry(reason)) => assert!(reason.contains("admission"), "{reason}"),
+            _ => panic!("a held admission lock is retried, never blocked on"),
+        }
+        assert_eq!(state_bytes(&internal), before);
+        assert!(internal.load().unwrap().cleans.is_empty());
+        drop(held);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Unreadable state is unknown custody: the guarded barrier refuses and
+    /// leaves the bytes exactly as they were.
+    #[test]
+    fn the_guarded_barrier_refuses_unknown_custody() {
+        let (root, internal, _removable) = paired_controls("guarded-unknown");
+        lock_pool(&internal);
+        internal.save(&State::default()).unwrap();
+        fs::write(internal.control.join("state.json"), b"{not json").unwrap();
+        let refused = match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("unreadable state refuses the guarded barrier"),
+        };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert_eq!(
+            fs::read(internal.control.join("state.json")).unwrap(),
+            b"{not json"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// An unreadable *sibling* state is unknown custody, not "no records": a
     /// symlinked document cannot be read (`O_NOFOLLOW`), so the guarded barrier
     /// refuses before any mark instead of treating the other pool as clear.
     #[test]
     fn the_guarded_barrier_refuses_an_unreadable_sibling_state() {
         let (root, internal, removable) = paired_controls("guarded-sibling-unknown");
+        lock_pool(&internal);
         removable.save(&State::default()).unwrap();
         let state = removable.control.join("state.json");
         let elsewhere = root.join("elsewhere.json");
@@ -6263,59 +6340,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Unreadable state is unknown custody: the guarded barrier refuses and
-    /// leaves the bytes exactly as they were.
-    #[test]
-    fn the_guarded_barrier_refuses_unknown_custody() {
-        let (root, internal, _removable) = paired_controls("guarded-unknown");
-        internal.save(&State::default()).unwrap();
-        fs::write(internal.control.join("state.json"), b"{not json").unwrap();
-        let refused = match internal.begin_clean_barrier(
-            Path::new("/checkout"),
-            &mut WaitAccounting::default(),
-            || Ok(()),
-        ) {
-            Err(reason) => reason,
-            Ok(_) => panic!("unreadable state refuses the guarded barrier"),
-        };
-        assert!(refused.contains("clean barrier refused"), "{refused}");
-        assert_eq!(
-            fs::read(internal.control.join("state.json")).unwrap(),
-            b"{not json"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A held admission lock is a fact to retry, never a lock to block on:
-    /// that is what makes it safe for a guarded verb to hold the checkout
-    /// binding mutex across the attempt (the shipped order takes the barrier
-    /// and then the binding mutex, so blocking here could deadlock).
-    #[test]
-    fn the_guarded_barrier_never_blocks_on_a_held_admission_lock() {
-        let (root, internal, _removable) = paired_controls("guarded-admission");
-        internal.save(&State::default()).unwrap();
-        let held = lock_admission(&internal.control).unwrap();
-        let before = state_bytes(&internal);
-        match internal.begin_clean_barrier(
-            Path::new("/checkout"),
-            &mut WaitAccounting::default(),
-            || Ok(()),
-        ) {
-            Ok(Cleaning::Retry(reason)) => assert!(reason.contains("admission"), "{reason}"),
-            _ => panic!("a held admission lock is retried, never blocked on"),
-        }
-        assert_eq!(state_bytes(&internal), before);
-        assert!(internal.load().unwrap().cleans.is_empty());
-        drop(held);
-        fs::remove_dir_all(root).unwrap();
-    }
-
     /// The guarded order (design §4.1 step 3): the caller's revalidation runs
     /// before any mark, and its refusal is returned unchanged with nothing
     /// allocated. The shipped `Recovering` mode never consults it.
     #[test]
     fn the_guarded_barrier_revalidates_before_any_mark() {
         let (root, internal, _removable) = paired_controls("guarded-revalidate");
+        lock_pool(&internal);
         internal.save(&State::default()).unwrap();
         let before = state_bytes(&internal);
         let mut calls = 0;
@@ -6363,6 +6394,7 @@ mod tests {
     #[test]
     fn the_guarded_barrier_marks_a_clear_checkout() {
         let (root, internal, _removable) = paired_controls("guarded-clear");
+        lock_pool(&internal);
         internal.save(&State::default()).unwrap();
         let guard = match internal
             .begin_clean_barrier(
@@ -6380,6 +6412,83 @@ mod tests {
         assert_eq!(state.next_id, 2, "exactly one id for the proceeding verb");
         internal.abandon_clean(guard).unwrap();
         assert!(internal.load().unwrap().cleans.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The reviewer's race: authority changes **between** the two guarded
+    /// decisions. The caller's revalidation runs once before each decision, so
+    /// a closure that plants the change on its second call reproduces the
+    /// window exactly. The second decision refuses and the pool's files are
+    /// unchanged — above all, no `admission.lock` is created, because the
+    /// guarded barrier never creates one.
+    #[test]
+    fn a_sibling_authority_change_between_the_guarded_decisions_creates_nothing() {
+        let (root, internal, _removable) = paired_controls("guarded-between-decisions");
+        lock_pool(&internal);
+        internal.save(&State::default()).unwrap();
+        let checkout = Path::new("/checkout");
+        let admission = internal.control.join("admission.lock");
+        let admission_before = fs::read(&admission).unwrap();
+        let mut calls = 0;
+        let outcome =
+            internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || {
+                calls += 1;
+                if calls == 2 {
+                    // Exactly the window the review names: between the preliminary
+                    // and the authoritative decision.
+                    dead_record(&internal, checkout, 7);
+                }
+                Ok(())
+            });
+        assert_eq!(calls, 2, "revalidated before each decision");
+        let refused = match outcome {
+            Ok(Cleaning::Busy(reason)) => reason,
+            _ => panic!("the second decision refuses the planted dead record"),
+        };
+        assert!(refused.contains("record 7"), "{refused}");
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        // No new lock file, no mark, no id: the existing admission lock is
+        // byte-identical and the control directory holds nothing new.
+        assert_eq!(fs::read(&admission).unwrap(), admission_before);
+        assert!(internal.load().unwrap().cleans.is_empty());
+        assert!(!internal.ticket_path(1).exists());
+        assert!(!internal.ticket_path(2).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pool with no admission lock is a retry, and the guarded barrier never
+    /// creates the lock: that is what makes "a refusal leaves only the checkout
+    /// binding mutex" structural rather than a promise.
+    #[test]
+    fn the_guarded_barrier_creates_no_admission_lock() {
+        let (root, internal, _removable) = paired_controls("guarded-no-admission");
+        internal.save(&State::default()).unwrap();
+        let admission = internal.control.join("admission.lock");
+        assert!(!admission.exists(), "the fixture starts without the lock");
+        for checkout in ["/checkout", "/other"] {
+            match internal.begin_clean_barrier(
+                Path::new(checkout),
+                &mut WaitAccounting::default(),
+                || Ok(()),
+            ) {
+                Ok(Cleaning::Retry(reason)) => {
+                    assert!(reason.contains("admission lock"), "{reason}")
+                }
+                _ => panic!("a pool without an admission lock is retried"),
+            }
+            assert!(!admission.exists(), "the guarded barrier created the lock");
+        }
+        // Non-vacuity: the shipped recovering barrier does create it, exactly
+        // as it always has.
+        let guard = match internal
+            .begin_clean(Path::new("/checkout"), &mut WaitAccounting::default())
+            .unwrap()
+        {
+            Cleaning::Guard(guard) => guard,
+            _ => panic!("the recovering barrier of an idle checkout acquires"),
+        };
+        assert!(admission.exists(), "the shipped barrier creates the lock");
+        internal.abandon_clean(guard).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
