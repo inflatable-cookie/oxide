@@ -4768,3 +4768,69 @@ fn a_symlink_before_the_repair_keeps_both_names_and_stays_pending() {
     assert_eq!(after.coverage, AccountingCoverage::Unknown);
     fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
 }
+
+/// A whole-slot capture that picks up a replacement is recorded as a foreign
+/// capture before anything is renamed: the replacement is preserved, the record
+/// survives reopening, and replay keeps the deletion pending instead of
+/// clearing it and retrying the slot as ordinary owned content.
+#[test]
+fn a_replaced_whole_slot_capture_is_foreign_and_stays_pending() {
+    let fixture = Fixture::new("slot-capture-foreign");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "slot-capture-foreign");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+
+    // The racer takes the observed slot away and leaves its own directory at
+    // the recorded name, after the walk observed it and before the capture.
+    let (slot_for_race, parent_for_race) = (slot_path.clone(), parent.clone());
+    let _race = crate::test_fs::before_walk_capture(move || {
+        fs::rename(&slot_for_race, parent_for_race.join("moved-away"))
+            .expect("the observed slot is moved aside");
+        fs::create_dir(&slot_for_race).expect("replacement at the recorded name");
+        fs::write(slot_for_race.join("racer-marker"), b"racer").expect("replacement marker");
+    });
+    assert!(
+        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
+        "a replaced whole-slot capture refuses"
+    );
+
+    // The racer's replacement was captured under the private name and kept
+    // exactly as it was; the recorded name stays free.
+    assert!(
+        !slot_path.exists(),
+        "nothing was renamed back into the recorded name"
+    );
+    let captured = private_names_in(&parent)
+        .into_iter()
+        .find(|path| path.is_dir())
+        .expect("the captured replacement");
+    assert_eq!(
+        fs::read(captured.join("racer-marker")).expect("replacement preserved"),
+        b"racer",
+        "the racer's object is preserved exactly as it was"
+    );
+
+    // The owning journal holds the unexpected object as a foreign capture, and
+    // it survives reopening: the deletion stays pending and never retries.
+    let journal = super::pool::capture_record_injected(&pool, slot_id)
+        .expect("the capture journal is retained");
+    assert_eq!(
+        journal.foreign.len(),
+        1,
+        "the unexpected object is recorded as a foreign capture: {journal:?}"
+    );
+    assert!(
+        !journal.foreign[0].restored,
+        "nothing was put back for the foreign capture"
+    );
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    let reopened = super::pool::capture_record_injected(&pool, slot_id)
+        .expect("the record survives reopening");
+    assert_eq!(reopened.foreign.len(), 1, "the foreign record is kept");
+    assert_eq!(
+        private_names_in(&parent).len(),
+        1,
+        "no second capture was made: the deletion did not retry"
+    );
+}

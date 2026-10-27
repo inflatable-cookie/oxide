@@ -489,3 +489,45 @@ pub(crate) fn run_before_child_reopen() {
         action();
     }
 }
+
+thread_local! {
+    static BEFORE_WALK_CAPTURE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside the lease's whole-tree walk, immediately
+/// after an entry was observed and strictly before it is captured under a
+/// private name. This is how a unit test races a replacement into the observed
+/// name so the capture picks up an object that is not the observed one.
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct BeforeWalkCaptureGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn before_walk_capture(action: impl FnOnce() + 'static) -> BeforeWalkCaptureGuard {
+    BEFORE_WALK_CAPTURE.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping before-walk-capture injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    BeforeWalkCaptureGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for BeforeWalkCaptureGuard {
+    fn drop(&mut self) {
+        BEFORE_WALK_CAPTURE.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed before-walk-capture action, if any.
+pub(crate) fn run_before_walk_capture() {
+    let action = BEFORE_WALK_CAPTURE.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}

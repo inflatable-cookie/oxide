@@ -973,6 +973,8 @@ fn remove_tree_owned_at(
     if root_level {
         crate::test_fs::run_root_capture(crate::test_fs::RootCaptureCrash::Planned);
     }
+    #[cfg(test)]
+    crate::test_fs::run_before_walk_capture();
     let capture = match plan.as_ref() {
         Some(plan) => capture_planned(parent, name, plan).map_err(io_error)?,
         None => capture_entry(parent, name).map_err(io_error)?,
@@ -993,10 +995,35 @@ fn remove_tree_owned_at(
         }
     }
     if verify_captured(parent, &capture, &observed).is_err() {
-        return Err(abort_capture(
-            parent,
+        // The capture holds an object this process never verified: a racer took
+        // the observed name before the exclusive rename. Record it durably as a
+        // foreign capture **before** anything is renamed, keep both names in
+        // place, and stay pending — replay never retries past a foreign record
+        // and never clears it.
+        let found = observe_entry(parent, &capture.private)
+            .map(|facts| crate::owned_delete::describe_entry(&facts))
+            .unwrap_or_else(|error| format!("unreadable capture ({error})"));
+        let foreign = crate::owned_delete::ForeignCapture {
+            path: context.chain.clone(),
+            private: capture_private(&capture),
+            original: String::from_utf8_lossy(capture.original.as_bytes()).into_owned(),
+            expected_device: observed.device,
+            expected_inode: observed.inode,
+            expected_mode: u32::from(observed.mode),
+            found,
+            restored: false,
+        };
+        if let Err(reason) = context.record_foreign(&foreign) {
+            return Err(keep_both_names(
+                &capture,
+                LeaseError::Io(format!(
+                    "an unexpected captured object could not be recorded ({reason})"
+                )),
+            ));
+        }
+        return Err(keep_both_names(
             &capture,
-            LeaseError::UnsafePath("the verified entry was replaced before its capture"),
+            LeaseError::UnsafePath("the captured entry is not the observed object"),
         ));
     }
     if observed.file_type() != libc::S_IFDIR {
