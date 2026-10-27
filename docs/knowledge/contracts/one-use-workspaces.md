@@ -752,7 +752,20 @@ wait ticket and acquired a lease, and `register_ticket` (`store.rs:3630-3647`)
 advances and saves `next_id`, while the refusal's release path
 (`main.rs:535-541`, `store.rs:1826-1843`) touches the record and saves state. So a
 command-level before/after comparison cannot be byte-identical and this design
-never claims it is. Case 19's oracle is therefore a **matched-control delta**:
+never claims it is.
+
+> **Oracle deferred — decision `dd090b31`, review `6454799468`.** The
+> command-level oracle sketched in the rest of this subsection, and the
+> "baseline" wording it rests on, are **not a proved oracle and are not
+> acceptance evidence**. They are marked here as *oracle deferred to the
+> implementation proof brief per decision `dd090b31`*; the binding requirements
+> for that later brief are the five acceptance criteria listed under native case
+> 19 E (§16.2). Nothing in this design claims the command-level oracle is
+> satisfied, and the direct verb-level no-mark/no-id assertions below are the only
+> oracle claims this document makes.
+
+The sketch, retained only as design input for that brief, is a
+**matched-control delta**:
 
 - run the guarded command twice at the same `keyed` pause — once with no planted
   transition (the control) and once with the transition planted while paused (the
@@ -2735,7 +2748,14 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       dead lease is still present. After an ordinary command recovers the dead
       lease (or the dead mark clears), the same guarded verb proceeds. Unknown
       custody is the (iii) refusal.
-    - **(E) in-custody revalidation, one exact matched boundary.** The boundary is
+    - **(E) in-custody revalidation — ORACLE DEFERRED (decision `dd090b31`,
+      review `6454799468`).** The construction below is *design input only*: it is
+      **not** a proved oracle and is **not** acceptance evidence. The oracle is
+      deferred to the implementation proof brief per decision `dd090b31`, and that
+      brief must satisfy **all five** acceptance criteria at the end of this item
+      before any counted native may claim it. Nothing in this case asserts that
+      those criteria are met.
+      *Design input:* the boundary is
       the **existing** debug-only `OXIDE_TEST_PAUSE=keyed:<gate>` point
       (`main.rs:475`, after the key and before `lease_with_gate`), restricted to
       the shared supervisor scratch (`<gate>` is a path under
@@ -2798,6 +2818,34 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       allocates no clean mark and no id, and repeated such refusals are
       byte-identical including `next_id` (asserted purely and natively where the
       receipt is planted before the verb starts).
+      **Acceptance criteria for the deferred oracle (all five required; review
+      `6454799468`, decision `dd090b31`):**
+      1. **Reusable-record premise, positively verified in both runs.** The case
+         must establish and check the *same* existing matching idle record (and
+         any other stable relevant state) in subject and control, so the
+         legitimate id allocations are known: one ticket id (`store.rs:1759`,
+         `3639`) plus, only when no reusable record exists, one record id
+         (`store.rs:3178-3184`). A correct refusal on a fresh record must not fail
+         the oracle or be misread as a clean mark.
+      2. **Per-allocation accounting, not a fixed `+1`.** The expected `next_id`
+         increment must be derived from the legitimate allocations observed in
+         that run and must *discriminate* the forbidden clean mark; the case may
+         not assert a constant increment.
+      3. **One consistent, reachable boundary and explicit matched setup.** The
+         §4.1 sketch (same pre-run baseline, optional `leased` seam) and this
+         case's gate baseline must be reconciled into a single boundary, with an
+         **executable** subject/control setup — the plant runs only in the
+         subject, so "identical fixture transitions" must be built, not asserted.
+      4. **A non-vacuous observation of the transient.** Endpoint snapshots at the
+         gate and after exit cannot observe a clean mark and waiter lock that the
+         shipped barrier creates and later removes (`store.rs:2738-2748`,
+         `2805-2810`, `outputs.rs:6151-6167`); the deferred oracle must observe
+         the transient while it would exist (or prove its absence by an equivalent
+         in-run observation) and must exclude the plant's own transitions.
+      5. **Exclusion of the successful control's lifecycle.** The comparison must
+         exclude the control's post-boundary `mark_spawning`/Cargo effects by
+         construction, together with the plant, so the alleged guarded-refusal
+         delta contains only the refusal's own effects.
     - **(C) commit, explicitly unguarded.** The prepared transition is committed
       by a deliberately **unguarded** invocation of the same build with
       `OXIDE_TEST_TEMP_ROOTS=[]` and `OXIDE_TEST_WORKSPACE_CLASS=normal` (feature
