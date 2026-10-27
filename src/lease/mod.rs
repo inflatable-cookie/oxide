@@ -830,6 +830,17 @@ fn abort_capture(parent: BorrowedFd<'_>, capture: &Capture, cause: LeaseError) -
     }
 }
 
+/// Refuse without moving anything. The recorded private name no longer holds
+/// the object that capture verified, so it is never renamed into the observed
+/// name: both names are kept, the unverified object is left exactly where the
+/// racer put it, and the caller's journal record stays outstanding (pending).
+fn keep_both_names(capture: &Capture, cause: LeaseError) -> LeaseError {
+    LeaseError::Io(format!(
+        "{cause}; the captured private name {} and its observed name are both kept and nothing was moved",
+        entry_label(std::ffi::OsStr::from_bytes(capture.private.as_bytes()))
+    ))
+}
+
 /// Restores one captured directory's exact mode on **every** exit path —
 /// explicit refusals, `?` returns and panics — so a widened mode never outlives
 /// the step that widened it. The same mode is in the durable record, which is
@@ -1071,10 +1082,11 @@ fn remove_tree_owned_at(
                 Ok(child) => child,
                 Err(error) => {
                     // The reopen sees a name that is no longer the verified
-                    // directory: only the verified repair descriptor restores
-                    // the owner's mode, and it does so before the put-back.
+                    // directory. Only the verified repair descriptor restores
+                    // the owner's mode; the object now at the private name is
+                    // never renamed, so both names are kept.
                     drop(repair_guard.take());
-                    return Err(abort_capture(parent, &capture, io_error(error)));
+                    return Err(keep_both_names(&capture, io_error(error)));
                 }
             }
         }
@@ -1083,18 +1095,18 @@ fn remove_tree_owned_at(
     let held = match descriptor_identity(child.as_fd()) {
         Ok(held) => held,
         Err(error) => {
-            // An unreadable identity is never restored through: the verified
-            // repair descriptor (if any) restores the owner's mode instead.
+            // An unreadable identity is never restored through and never
+            // renamed: the verified repair descriptor (if any) restores the
+            // owner's mode and both names are kept.
             drop(repair_guard.take());
-            return Err(abort_capture(parent, &capture, io_error(error)));
+            return Err(keep_both_names(&capture, io_error(error)));
         }
     };
     if held != (observed.device, observed.inode) {
-        // The reopened name is a replacement, so it is never chmodded. The
-        // verified repair descriptor restores the original's mode.
+        // The reopened name is a replacement: it is never chmodded and never
+        // renamed. The verified repair descriptor restores the original's mode.
         drop(repair_guard.take());
-        return Err(abort_capture(
-            parent,
+        return Err(keep_both_names(
             &capture,
             LeaseError::UnsafePath("the verified directory was replaced before it was opened"),
         ));

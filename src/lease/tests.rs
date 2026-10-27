@@ -4420,6 +4420,26 @@ fn a_nested_repair_widening_is_recorded_first_and_restored_on_refusal() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
 }
 
+/// The first directory below `root` whose name is a private capture name.
+fn find_private_dir(root: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_private = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"));
+        if is_private && path.is_dir() {
+            return Some(path);
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if let Some(found) = find_private_dir(&path) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// The first directory below `root` whose owner mode is exactly `mode`.
 fn find_dir_by_mode(root: &Path, mode: u32) -> Option<PathBuf> {
     let entries = fs::read_dir(root).ok()?;
@@ -4442,14 +4462,16 @@ fn find_dir_by_mode(root: &Path, mode: u32) -> Option<PathBuf> {
 }
 
 /// A replacement that takes the deleted private name **after** the repair
-/// widened the verified directory is never chmodded: the owner's mode is
-/// restored through the verified repair descriptor, the replacement keeps its
-/// own mode, and the deletion refuses with the tree kept.
+/// widened the verified directory is neither chmodded nor renamed: the verified
+/// original's mode is restored through its verified descriptor, the replacement
+/// stays exactly where the racer put it, the observed name stays free, and the
+/// journal record stays outstanding (pending) in the production ledger.
 #[test]
-fn a_replacement_after_the_repair_is_never_chmodded() {
+fn a_replacement_after_the_repair_keeps_both_names_and_stays_pending() {
     let fixture = Fixture::new("reopen-replacement");
-    let slot = fixture.dir("slot");
-    let locked = slot.join("locked");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "reopen-replacement");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let locked = slot_path.join("locked");
     fs::create_dir(&locked).expect("locked directory");
     fs::write(locked.join("data"), b"x").expect("data");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
@@ -4459,53 +4481,76 @@ fn a_replacement_after_the_repair_is_never_chmodded() {
         // The captured directory is under a private name inside the captured
         // slot: move the verified object aside and put a different directory at
         // that name, so the reopen sees a replacement.
-        let captured_slot = private_names_in(&fixture_path)
-            .into_iter()
-            .find(|path| path.is_dir())
-            .expect("the captured slot");
-        let captured_locked = private_names_in(&captured_slot)
-            .into_iter()
-            .find(|path| path.is_dir())
-            .expect("the captured directory");
+        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
+        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
         fs::rename(&captured_locked, captured_slot.join("moved-away"))
             .expect("the verified directory is moved aside");
         fs::create_dir(&captured_locked).expect("replacement at the private name");
         fs::set_permissions(&captured_locked, fs::Permissions::from_mode(0o500))
             .expect("replacement mode");
     });
+    assert!(
+        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
+        "a replaced capture refuses"
+    );
 
-    match remove_tree_owned(fixture.path(), &slot, None) {
-        Err(LeaseError::UnsafePath("the verified directory was replaced before it was opened")) => {
-        }
-        other => panic!("a replacement at the reopen must refuse: {other:?}"),
-    }
-    // The verified original (moved aside by the racer) has the owner's mode back
-    // and the replacement keeps its own: nothing unverified was chmodded.
-    let original = find_dir_by_mode(fixture.path(), 0o100).expect("verified original kept");
+    // The slot is back at its recorded name and both objects are preserved
+    // exactly where they were: the replacement under the private name, the
+    // verified original where the racer moved it, and the observed name free.
+    assert!(slot_path.is_dir(), "the slot is restored");
+    assert!(
+        !slot_path.join("locked").exists(),
+        "nothing was renamed into the observed name"
+    );
+    let replacement = find_dir_by_mode(&slot_path, 0o500).expect("replacement kept");
+    assert!(
+        replacement
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-")),
+        "the replacement is still at its private name"
+    );
+    let original = find_dir_by_mode(&slot_path, 0o100).expect("verified original kept");
     assert_eq!(
         mode_of(&original),
         0o100,
         "the verified directory's owner mode was restored through its verified descriptor"
     );
-    let replacement = find_dir_by_mode(fixture.path(), 0o500).expect("replacement kept");
-    assert_eq!(
-        mode_of(&replacement),
-        0o500,
-        "the replacement keeps its own mode; it is never chmodded"
+
+    // Journal disposition in the production ledger: the entry's capture record
+    // is still outstanding, so the deletion stays pending rather than complete.
+    let journal = super::pool::capture_record_injected(&pool, slot_id)
+        .expect("the capture journal is retained");
+    assert!(
+        journal
+            .captures
+            .iter()
+            .any(|record| record.original == "locked"),
+        "the replaced entry's capture record is kept: {journal:?}"
     );
-    for path in [&slot, &original, &replacement] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("cleanup");
-    }
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert!(
+        slot_path
+            .join(replacement.file_name().expect("replacement name"))
+            .is_dir(),
+        "the replacement is still at its private name after replay"
+    );
+    let _ = parent;
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).expect("cleanup");
 }
 
 /// A reopen that fails because the private name is no longer an openable
 /// directory restores the verified original's owner mode through its verified
-/// descriptor and follows nothing.
+/// descriptor, moves nothing (the link stays at the private name and the
+/// observed name stays free), follows nothing, and keeps the journal pending.
 #[test]
-fn a_failed_reopen_restores_through_the_verified_descriptor() {
+fn a_failed_reopen_keeps_both_names_and_stays_pending() {
     let fixture = Fixture::new("reopen-link");
-    let slot = fixture.dir("slot");
-    let locked = slot.join("locked");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "reopen-link");
+    let locked = slot_path.join("locked");
     fs::create_dir(&locked).expect("locked directory");
     fs::write(locked.join("data"), b"x").expect("data");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
@@ -4514,25 +4559,37 @@ fn a_failed_reopen_restores_through_the_verified_descriptor() {
 
     let (fixture_path, outside_path) = (fixture.path().to_path_buf(), outside.clone());
     let _rebind = crate::test_fs::before_child_reopen(move || {
-        let captured_slot = private_names_in(&fixture_path)
-            .into_iter()
-            .find(|path| path.is_dir())
-            .expect("the captured slot");
-        let captured_locked = private_names_in(&captured_slot)
-            .into_iter()
-            .find(|path| path.is_dir())
-            .expect("the captured directory");
+        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
+        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
         fs::rename(&captured_locked, captured_slot.join("moved-away"))
             .expect("the verified directory is moved aside");
         symlink(&outside_path, &captured_locked).expect("a link at the private name");
     });
+    assert!(
+        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
+        "a failed reopen refuses"
+    );
 
-    assert!(remove_tree_owned(fixture.path(), &slot, None).is_err());
-    let original = find_dir_by_mode(fixture.path(), 0o100).expect("verified original kept");
+    assert!(slot_path.is_dir(), "the slot is restored");
+    assert!(
+        !slot_path.join("locked").exists(),
+        "the link was not renamed into the observed name"
+    );
+    let link = fs::read_dir(&slot_path)
+        .expect("slot listed")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"))
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
+        .expect("the link is still at its private name");
     assert_eq!(
-        mode_of(&original),
-        0o100,
-        "the failed reopen restored the verified original's owner mode"
+        fs::read_link(&link).expect("link target"),
+        outside,
+        "the link still names exactly what the racer put there"
     );
     assert_eq!(
         fs::symlink_metadata(&outside)
@@ -4543,7 +4600,27 @@ fn a_failed_reopen_restores_through_the_verified_descriptor() {
         0o700,
         "nothing was chmodded through the link"
     );
-    for path in [&slot, &original, &outside] {
+    let original = find_dir_by_mode(&slot_path, 0o100).expect("verified original kept");
+    assert_eq!(
+        mode_of(&original),
+        0o100,
+        "the failed reopen restored the verified original's owner mode"
+    );
+
+    let journal = super::pool::capture_record_injected(&pool, slot_id)
+        .expect("the capture journal is retained");
+    assert!(
+        journal
+            .captures
+            .iter()
+            .any(|record| record.original == "locked"),
+        "the unresolved entry's capture record is kept"
+    );
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    for path in [&slot_path, &original, &outside] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("cleanup");
     }
+    let _ = link;
 }
