@@ -5096,8 +5096,15 @@ The stable, read-only interface other tools use to find the registered Builds dr
   child, not only an armed one: a signalled exit, any of the product's own
   unconfirmed-closure sentences (also swept from each child's recorded stderr),
   a killed or unreaped child, an unconfirmed helper closure, a non-empty session
-  or any recorded custody fault marks the run's closure unknown, and ONE shared decision then refuses the ordinary detach
-  (the backing is kept) and stops diagnostic continuation. A child that is still
+  or any recorded custody fault marks the run's closure unknown, and ONE shared
+  decision then refuses the ordinary detach (the backing is kept) and stops
+  diagnostic continuation — and SETUP stops at the first latched fault, before
+  any image attach, registration or fixture. Every restore (image mount
+  directory, registry bytes, receipt bytes, checkout chains) goes through the
+  same gate, so no fixture is written beside an unclassified writer group. That
+  bookkeeping covers only the children this script started and is never
+  presented as a process census: the qualified supervisor owns the session
+  census and retains the image when its own census disagrees. A child that is still
   running is waited for, never mistaken for a stuck one: the armed races mutate
   the fixture while the product is inside its own 11-second delay. Each
   state-mutating case puts its own fixture back (checkout chain, replaced

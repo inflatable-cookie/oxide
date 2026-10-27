@@ -23,9 +23,13 @@ Premise checklist (mandatory for a proof-authoring brief):
 (5) no external Cargo subcommand is exercised, so no argv convention is assumed.
 (6) ImageCustody attaches with `-owners on` and records exactly one ordinary
     detach in a finally path, before which the backing is never removed. The
-    detach runs only when closure is positively known: any killed, signalled or
-    unreaped child, and any recorded custody fault, latches an unknown reason
-    BEFORE the fallible cleanup and refuses the detach while keeping the backing.
+    detach runs only when THIS RUN's own bookkeeping is positively settled: any
+    killed, signalled or unreaped child, an unconfirmed-closure report or any
+    recorded fault latches an unknown reason BEFORE the fallible cleanup and
+    refuses the detach while keeping the backing. That is direct-child
+    bookkeeping and explicitly NOT a process census: this script never sees a
+    grandchild, and the qualified supervisor owns the session census and retains
+    the image when its own census disagrees.
 (7) staging scrubs the encoded and plain Rust-wrapper flags; fixtures set
     RUSTFLAGS empty and drop CARGO_ENCODED_RUSTFLAGS.
 (8) the selector fixes --root-parent /private/tmp: the missing-ancestor premise
@@ -350,11 +354,15 @@ def abnormal_child(code, stderr: str) -> str | None:
 
 
 def custody_abort_reason(proof, unclosed) -> str | None:
-    """Why this run must not continue or detach, or `None` when it may.
+    """Why THIS RUN's own bookkeeping forbids continuing or detaching, or `None`.
 
-    It joins the proof's own latch, the shared child helper's unconfirmed
-    closure and the session's un-reaped pids, so an abnormal child or group is
-    classified identically before diagnostic continuation and before detach.
+    It joins the proof's own latch, the shared child helper's unconfirmed closure
+    and the direct children it started that were never reaped. It is explicitly
+    NOT a process census: this script sees only the children it started, never a
+    grandchild that left their group, and the qualified supervisor owns the
+    session census and the closure decision — it retains the image and reports
+    `UNCLOSED` when its own census disagrees. The proof therefore refuses to
+    continue or detach on any fault it CAN see, and never claims more.
     """
     latched = getattr(proof, "custody_unknown", None)
     if latched is not None:
@@ -541,6 +549,17 @@ def sweep_unconfirmed(proof) -> None:
                 break
 
 
+def require_settled(proof, stage: str) -> None:
+    """Stop BEFORE the next effect as soon as this script's own custody faults.
+
+    Setup must not continue after a latched fault: no image attach, no fixture
+    and no further child may follow a child whose group is not positively closed.
+    """
+    reason = custody_abort_reason(proof, proof.unclosed)
+    if reason is not None:
+        raise prior.Aborted(f"{stage}: custody is not positively closed ({reason})")
+
+
 def restore_fixture(proof, label: str, steps) -> None:
     """Run one fixture restore, or refuse to touch it while custody is unknown.
 
@@ -703,8 +722,10 @@ def run_cases(proof, custody, diagnostic, cases):
     if verified_seed_source(host_home) != source:
         raise RuntimeError("the canonical Cargo cache identity changed during staging")
     provenance["seed_source"] = source
-    # A staging child is a child too: classify what it printed before any fixture.
+    # A staging child is a child too: classify what it printed before any fixture,
+    # and stop here rather than attach an image beside an unclassified group.
     sweep_unconfirmed(proof)
+    require_settled(proof, "after staging")
     (proof.evidence / "prune135-provenance.json").write_text(json.dumps(provenance, indent=2))
     adapter = Adapter(proof, oxide, proof.unclosed)
     world = prior.World(adapter, adapter.root)
@@ -726,6 +747,7 @@ def run_cases(proof, custody, diagnostic, cases):
         not adapter.unclosed,
         f"the bootstrap left an unreaped child: {sorted(adapter.unclosed)}",
     )
+    require_settled(proof, "after the private pool bootstrap")
     custody.allocate(str(proof.evidence), str(proof.root))
     world.mount = custody.attach()
     require_data_volume(adapter.root, world.mount)
@@ -745,6 +767,7 @@ def run_cases(proof, custody, diagnostic, cases):
         boot,
     )
     require(code == 0 and "registered removable pool" in out, err)
+    require_settled(proof, "after the drive registration")
 
     chains = Path(adapter.root) / "chains"
     chains.mkdir(mode=0o700)
@@ -760,6 +783,7 @@ def run_cases(proof, custody, diagnostic, cases):
             path = path / component
         checkout = chain_checkout(world, path)
         world.adopt(checkout)
+        require_settled(proof, "during fixture adoption")
         return {"checkout": checkout, "path": path, "token": token}
 
     group = adopt_chain(("a", "b", "checkout"))
@@ -771,6 +795,7 @@ def run_cases(proof, custody, diagnostic, cases):
     custody_case = adopt_chain(("checkout",))
     image = {"checkout": world.checkout("image-chain", base=world.mount)}
     world.adopt(image["checkout"])
+    require_settled(proof, "during the image fixture adoption")
     marker_template = prior.marker(world.selected(group["checkout"])["root"])
     # A receiptless root whose marker RECORDS the image's checkout volume while
     # its surviving ancestors are on the boot Data volume: the record must be
@@ -956,8 +981,10 @@ def run_cases(proof, custody, diagnostic, cases):
             require(prior.tree_snapshot(roots["image"]) == payload, "the kept image root changed")
         finally:
             # Restored: the row is an ordinary present-checkout keep again, so
-            # no later batch inherits an unprovable absence.
-            os.rename(away, checkouts)
+            # no later batch inherits an unprovable absence. Like every other
+            # fixture restore it is refused while custody is unknown, because a
+            # surviving writer group may still be reading that image.
+            restore_fixture(proof, "mount-boundaries", lambda: os.rename(away, checkouts))
         for label, spelling, root in (
             ("absent mount", plain_mount_checkout, plain_mount_root),
             ("aliased absent mount", alias_mount_checkout, alias_mount_root),
@@ -1226,8 +1253,13 @@ def run_cases(proof, custody, diagnostic, cases):
             require(not doc["candidates"], f"a competing owner left a candidate: {doc['candidates']}")
             no_effect("competing owner")
         finally:
-            restore_file(registry, registry_saved)
-            os.unlink(competitor_receipt)
+            # Registry and receipt restores are fixture restores too: no write is
+            # made while this run's writer closure is unknown.
+            def restore_competitor():
+                restore_file(registry, registry_saved)
+                os.unlink(competitor_receipt)
+
+            restore_fixture(proof, "competing owner", restore_competitor)
 
         # (b) A mismatched GROUP identity is incomplete authority: the whole
         # batch refuses and nothing is written.
@@ -1246,7 +1278,9 @@ def run_cases(proof, custody, diagnostic, cases):
             require_batch_refusal(json.loads(out), GROUP_DISAGREEMENT)
             no_effect("group mismatch")
         finally:
-            restore_file(registry, registry_saved)
+            restore_fixture(
+                proof, "group mismatch", lambda: restore_file(registry, registry_saved)
+            )
 
         # (c) A mismatched RECEIPT is incomplete authority too.
         receipt = Path(permanent.receipt_file(world.pool, owned_chain["checkout"]))
@@ -1260,7 +1294,9 @@ def run_cases(proof, custody, diagnostic, cases):
             require_batch_refusal(json.loads(out), RECEIPT_MISMATCH)
             no_effect("receipt mismatch")
         finally:
-            restore_file(receipt, receipt_saved)
+            restore_fixture(
+                proof, "receipt mismatch", lambda: restore_file(receipt, receipt_saved)
+            )
 
         # The controls leave the candidate exactly as they found it.
         _, out, _ = world.dry_run("after the controls", boot)
@@ -1524,6 +1560,21 @@ def self_check() -> int:
     else:
         raise AssertionError("a failing restore did not propagate")
     require(broken.custody_unknown is not None, "a failing restore did not latch")
+    # Setup stops at the first latched fault instead of attaching an image or
+    # writing a fixture beside an unclassified writer group.
+    require_settled(FakeProof(), "synthetic setup")
+    try:
+        require_settled(held, "synthetic setup")
+    except prior.Aborted:
+        pass
+    else:
+        raise AssertionError("setup continued after a latched custody fault")
+    try:
+        require_settled(broken, "synthetic setup")
+    except prior.Aborted:
+        pass
+    else:
+        raise AssertionError("setup continued after a failed restore latched")
     # Both /Volumes spellings are mounts, including an absent mount name; the
     # mount root itself and every non-normal spelling are invalid, and a plain
     # path is not a mount.
@@ -1575,12 +1626,14 @@ def main():
         error = exc
         traceback.print_exc()
     finally:
-        # The detach needs POSITIVE closure: one decision shared with the
-        # diagnostic's continuation check, so a killed or unreaped child, an
-        # unconfirmed helper closure or any recorded fault is classified the
-        # same way before both. Nothing is detached on the direct child alone.
-        custody_reason = custody_abort_reason(proof, proof.unclosed)
-        disposition = custody.detach_once(sessions_closed=custody_reason is None)
+        # The detach needs this run's own bookkeeping to be positively settled:
+        # one decision shared with the diagnostic's continuation check, so a
+        # killed, signalled or unreaped child, an unconfirmed closure report or
+        # any recorded fault is classified the same way before both. This is
+        # never a process census — the supervisor owns that and retains the
+        # image if its own census disagrees — so nothing here claims otherwise.
+        own_children = custody_abort_reason(proof, proof.unclosed)
+        disposition = custody.detach_once(sessions_closed=own_children is None)
     recorded = {item["case"] for item in cases}
     cases.extend(
         {"case": name, "state": "unexecuted"} for name in CASE_NAMES if name not in recorded
@@ -1589,7 +1642,7 @@ def main():
         "qualified": False if diagnostic else None,
         "cases": cases,
         "failed": sorted(item["case"] for item in cases if item["state"] == "failed"),
-        "custody_unknown": custody_reason,
+        "own_children": own_children or "settled (direct children only; the supervisor owns the census)",
         "error": None if error is None else f"{type(error).__name__}: {error}",
         "custody": custody.state,
         "detach": disposition,
@@ -1600,7 +1653,7 @@ def main():
     if error is not None:
         raise error
     require(disposition == "completed", f"the ordinary detach was {disposition}")
-    require(report["custody_unknown"] is None, f"custody is unknown: {report['custody_unknown']}")
+    require(own_children is None, f"this run's own child closure is unknown: {own_children}")
     require(all(case["state"] == "completed" for case in cases), "proof incomplete")
 
 
