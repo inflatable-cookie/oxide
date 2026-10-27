@@ -108,6 +108,27 @@ pub(crate) fn is_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Test-only: how many workspaces **this thread** has classified. A dormant
+/// command must classify nothing, which makes the dormancy claim observable at
+/// the command path instead of merely asserted. Thread-local so parallel tests
+/// cannot pollute one another's count.
+#[cfg(test)]
+thread_local! {
+    static CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: count one classification on this thread.
+#[cfg(test)]
+pub(crate) fn note_classification() {
+    CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+}
+
+/// Test-only read of this thread's classification count.
+#[cfg(test)]
+pub(crate) fn classifications() -> usize {
+    CLASSIFICATIONS.with(std::cell::Cell::get)
+}
+
 /// Run `body` with the one-use feature active (tests only), restoring the
 /// previous value afterwards. The switch is process-local rather than
 /// thread-local because the guard, the classification and a test's assertions

@@ -2065,12 +2065,19 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
 /// (oxide#163) by running the shipped layout migration transaction.
 fn adopt_command() -> Result<u8, String> {
     let context = Context::open()?;
+    adopt_at(&context, output_store()?)
+}
+
+/// `oxide outputs adopt` against one already-opened context and pool, so the
+/// guarded entry point is exercised exactly as [`adopt_command`] runs it (the
+/// verb-level regressions enter here).
+fn adopt_at(context: &Context, internal: Option<Store>) -> Result<u8, String> {
     // A guarded workspace always refuses `adopt`, whatever the receipt state,
     // and it refuses here: effect-free, before the drive-mode, pool and
     // barrier work below, so the verb never enters custody (design §4.1,
     // §4.5). The state selects only the text.
     if guarded_workspace(context.control(), &context.workspace).is_some() {
-        return Err(guarded_adopt_refusal(&context));
+        return Err(guarded_adopt_refusal(context));
     }
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
@@ -2085,7 +2092,7 @@ fn adopt_command() -> Result<u8, String> {
                 .to_owned(),
         );
     };
-    let Some(internal) = output_store()? else {
+    let Some(internal) = internal else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
     process::install_signal_handlers()?;
@@ -4018,10 +4025,21 @@ pub fn auto_adopt(
 /// detached receipt stays, so automatic first conversion never follows it.
 fn detach_command() -> Result<u8, String> {
     let context = Context::open()?;
+    // The guard's effect-free fast precheck runs before the pool is even
+    // opened: a guarded workspace refuses a `Prepared` transition, an
+    // unsettled prune intent or a listed root with literally nothing done.
+    guarded_command_precheck(&context, "outputs detach refused")?;
+    detach_at(&context, output_store()?.as_ref())
+}
+
+/// `oxide outputs detach` against one already-opened context and pool, so the
+/// guarded entry point is exercised exactly as [`detach_command`] runs it.
+fn detach_at(context: &Context, internal: Option<&Store>) -> Result<u8, String> {
+    guarded_command_precheck(context, "outputs detach refused")?;
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
-    let Some(internal) = output_store()? else {
+    let Some(internal) = internal else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
     process::install_signal_handlers()?;
@@ -4033,9 +4051,9 @@ fn detach_command() -> Result<u8, String> {
     // workspace keeps the shipped order byte for byte.
     let guarded = guarded_workspace(Some(&control), &context.workspace).is_some();
     let guard = if guarded {
-        guarded_barrier(&internal, &context, &mut waits)?
+        guarded_barrier(internal, context, &mut waits)?
     } else {
-        barrier(&internal, &context.workspace, &mut waits)?
+        barrier(internal, &context.workspace, &mut waits)?
     };
     let outcome = (|| {
         // Belt and braces: a `Prepared` transition that appeared while the
@@ -6092,10 +6110,19 @@ fn cancel_reservation(
 /// checkout's unused reservation, under its clean barrier and binding lock.
 fn cancel_command() -> Result<u8, String> {
     let context = Context::open()?;
+    // The same effect-free fast precheck as `detach`, before the pool opens.
+    guarded_command_precheck(&context, "outputs cancel-reservation refused")?;
+    cancel_at(&context, output_store()?.as_ref())
+}
+
+/// `oxide outputs cancel-reservation` against one already-opened context and
+/// pool, so the guarded entry point is exercised as [`cancel_command`] runs it.
+fn cancel_at(context: &Context, internal: Option<&Store>) -> Result<u8, String> {
+    guarded_command_precheck(context, "outputs cancel-reservation refused")?;
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
-    let Some(internal) = output_store()? else {
+    let Some(internal) = internal else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
     process::install_signal_handlers()?;
@@ -6105,9 +6132,9 @@ fn cancel_command() -> Result<u8, String> {
     // bounded `Barrier`-mode acquisition (design §4.5).
     let guarded = guarded_workspace(Some(&control), &context.workspace).is_some();
     let guard = if guarded {
-        guarded_barrier(&internal, &context, &mut waits)?
+        guarded_barrier(internal, context, &mut waits)?
     } else {
-        barrier(&internal, &context.workspace, &mut waits)?
+        barrier(internal, &context.workspace, &mut waits)?
     };
     let outcome = (|| -> Result<Option<Reservation>, String> {
         if guarded {
@@ -6265,6 +6292,8 @@ pub(crate) fn guarded_workspace(
     }
     let classification =
         crate::one_use::classify(workspace, &crate::one_use::Facts::from_control(control));
+    #[cfg(test)]
+    crate::one_use::note_classification();
     classification.guarded().then_some(classification)
 }
 
@@ -6291,6 +6320,27 @@ fn guarded_prepared_refusal(context: &Context) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// The effect-free fast precheck of a guarded output verb (design §4.1 part 1,
+/// §4.5): the checkout's authority state is read, and nothing else happens — no
+/// pool open, no signal handler, no binding mutex, no barrier, no clean mark,
+/// no id. It may refuse early; it never authorises the verb, whose
+/// authoritative revalidation still runs under the binding mutex.
+fn guarded_command_precheck(context: &Context, verb: &str) -> Result<(), String> {
+    if guarded_workspace(context.control(), &context.workspace).is_none() {
+        return Ok(());
+    }
+    unsettled_refusal(context.control(), &context.checkout_id)?;
+    guarded_prepared_refusal(context)?;
+    // The shipped `Pruning` refusal is kept: a guarded workspace never replays
+    // or repairs a listed root either.
+    if let Some(receipt) = context.receipt()? {
+        if receipt.state == ReceiptState::Pruning {
+            return Err(format!("{verb}: {PRUNING_REFUSAL}"));
+        }
+    }
+    Ok(())
 }
 
 /// The guarded `adopt` refusal and its precedence (design §4.1, §4.5): a
@@ -16365,27 +16415,51 @@ mod tests {
     /// them. The registry is ready, as every receipt write requires.
     struct GuardFixture {
         root: PathBuf,
+        checkout_root: PathBuf,
         checkout: PathBuf,
         store: Store,
     }
 
     impl GuardFixture {
+        /// A fixture whose classification is deterministic: the **checkout**
+        /// lives under the literal `/private/tmp` (a §3.2 candidate root) and
+        /// the **pool** lives under the process temporary directory, which is
+        /// never inside `/private/tmp` in the AGENTS.md recipe (its `TMPDIR` is
+        /// on the selected volume). Neither directory is a fixed path: each is
+        /// created fresh and removed by `Drop`.
+        ///
+        /// The alternative — both under one scratch root — would make the
+        /// pool's own payload sit inside the candidate root, which §3.3
+        /// deliberately drops as unsafe-broad (the design's §12.1
+        /// counterexample), so the fixture could never be guarded.
         fn new(label: &str) -> Self {
             let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir);
-            let root = base
+            let name = format!("oxide-guard-{label}-{}-{id}", std::process::id());
+            let pool_base = std::env::temp_dir()
                 .canonicalize()
-                .unwrap()
-                .join(format!("oxide-guard-{label}-{}-{id}", std::process::id()));
+                .expect("the process temporary directory resolves");
+            assert!(
+                !pool_base.starts_with("/private/tmp"),
+                "the fixture pool must live outside /private/tmp so the checkout's \
+                 temporary root stays safe-broad; set TMPDIR to a directory on the \
+                 selected volume (the AGENTS.md recipe does): {pool_base:?}"
+            );
+            let root = pool_base.join(&name);
             fs::create_dir(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-            let checkout = root.join("checkout");
+            let temporary = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT")
+                .map(PathBuf::from)
+                .filter(|path| path.is_dir())
+                .unwrap_or_else(|| PathBuf::from("/private/tmp"));
+            let checkout_root = temporary.canonicalize().unwrap().join(&name);
+            fs::create_dir(&checkout_root).unwrap();
+            fs::set_permissions(&checkout_root, fs::Permissions::from_mode(0o700)).unwrap();
+            let checkout = checkout_root.join("checkout");
             fs::create_dir(&checkout).unwrap();
             let store = pool_store(&root);
             Self {
                 root,
+                checkout_root,
                 checkout,
                 store,
             }
@@ -16447,6 +16521,7 @@ mod tests {
     impl Drop for GuardFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+            let _ = fs::remove_dir_all(&self.checkout_root);
         }
     }
 
@@ -16641,141 +16716,328 @@ mod tests {
         entries
     }
 
-    /// The leased preparation a command performs before it starts: the guard's
-    /// fast precheck (only when the guard applies), the destination plan and the
-    /// binding, in `main`'s order.
-    fn prepare(fixture: &GuardFixture, guard: Option<&LocalOutputs<'_>>) -> Vec<String> {
-        let mut trace = Vec::new();
-        if let Some(local) = guard {
-            trace.push(format!(
-                "precheck {:?}",
-                guarded_precheck(Some(&fixture.control()), &fixture.checkout, local.members)
-            ));
-        } else {
-            trace.push("precheck skipped".to_owned());
-        }
-        let declaration = crate::layout::Declaration::empty();
-        let planned = planned_destination(
-            Some(&fixture.control()),
-            &fixture.checkout,
-            &declaration,
-            None,
-            guard.is_some(),
+    /// The pool state's `next_id`, read from its own document (the pre-S1
+    /// durable fact the shipped verbs advance one clean mark at a time).
+    fn next_id(fixture: &GuardFixture) -> Option<u64> {
+        let bytes = fixture.state_bytes()?;
+        let text = String::from_utf8(bytes).ok()?;
+        text.split("\"next_id\":")
+            .nth(1)?
+            .split([',', '}'])
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// **Dormant byte identity at the actual command path, with the pre-S1
+    /// behaviour as the reference** (the brief's requirement and gate
+    /// `dormant_byte_identity`).
+    ///
+    /// The subject is the real guarded verb entry points (`detach_at`,
+    /// `cancel_at`, `adopt_at`) and the leased command's binding, entered
+    /// exactly as production enters them, while the one temporary switch is
+    /// off — which is every production binary. The reference is the pre-S1
+    /// answer: the literal shipped texts these verbs and the binding return
+    /// today (they predate this slice; e.g. `bind_ephemeral`'s pending-transition
+    /// refusal), plus the durable state those paths leave behind. The control
+    /// is the same fixture with the switch on, which refuses with the guarded
+    /// diagnostic instead — so the dormant answer is provably *not* the guarded
+    /// one, and the comparison is not two invocations of the same helper.
+    ///
+    /// While dormant nothing is classified at all: the test also asserts that
+    /// the classification counter does not move.
+    #[test]
+    fn the_dormant_command_path_answers_exactly_as_the_shipped_verbs_do() {
+        assert!(!crate::one_use::is_active());
+        let fixture = GuardFixture::new("dormant-command-path");
+        let start_classifications = crate::one_use::classifications();
+
+        // The verbs answer exactly as the release before this slice did, and
+        // their durable effect is exactly that release's: each of the two verbs
+        // that reach the shipped barrier allocates and abandons one clean mark
+        // (so `next_id` advances once per verb), `adopt` refuses before the
+        // barrier, no receipt is written, and the only other write is the
+        // shipped recorded-accounting fence.
+        let detach = detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
+        let cancel = cancel_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
+        let adopt = adopt_at(&fixture.context(), None).unwrap_err();
+        assert_eq!(
+            detach,
+            "this checkout has no owned-output receipt; nothing to detach"
         );
-        let planned = match planned {
-            Ok(plan) => {
-                if guard.is_some() {
-                    assert!(plan.is_none(), "a guarded plan owns no root");
-                }
-                trace.push(format!("plan {:?}", plan.is_some()));
-                plan
-            }
-            Err(reason) => {
-                // The shipped plan refuses this shape; `main` stops here too.
-                trace.push(format!("plan refused {reason}"));
-                return trace;
-            }
-        };
-        match bind_for_command(
+        assert_eq!(
+            cancel,
+            "this checkout has no owned-output receipt; nothing to cancel"
+        );
+        assert!(
+            adopt.starts_with("outputs adopt needs permanent drive mode (mode is unregistered)"),
+            "{adopt}"
+        );
+        for answer in [&detach, &cancel, &adopt] {
+            assert!(!answer.contains("one-use"), "{answer}");
+            assert!(
+                !answer.contains("prepared output transition unresolved"),
+                "{answer}"
+            );
+        }
+        assert_eq!(
+            next_id(&fixture),
+            Some(3),
+            "one clean mark per shipped verb"
+        );
+        let state = fixture.state_bytes().expect("the shipped fence write");
+        let text = String::from_utf8_lossy(&state);
+        assert!(!text.contains("\"class\""), "{text}");
+        assert!(
+            text.contains("\"recorded_accounting\":\"oxide.accounting/1\""),
+            "{text}"
+        );
+        assert!(text.contains("\"cleans\":[]"), "{text}");
+        assert!(text.contains("\"records\":[]"), "{text}");
+        assert!(
+            !fixture
+                .control()
+                .join("outputs")
+                .join(format!("{}.json", fixture.checkout_id()))
+                .exists(),
+            "no receipt was written"
+        );
+        // Nothing was classified while dormant, at the actual command path:
+        // the switch is the only gate.
+        assert_eq!(crate::one_use::classifications(), start_classifications);
+        assert!(!crate::one_use::is_active());
+
+        // Control (the other rollout, not the shipped path): with the switch on
+        // the same entries answer as follows. For a checkout with **no**
+        // receipt the guard has nothing of its own to refuse, so `detach` and
+        // `cancel-reservation` answer with the very same shipped texts and take
+        // the same barrier — the guard only changes owned-output states (the
+        // prepared case below). The guarded `adopt` is the exception: it refuses
+        // unconditionally, whatever the receipt state.
+        let guarded_digest_before = durable_digest(&fixture);
+        let guarded_next_before = next_id(&fixture);
+        let guarded = crate::one_use::with_active(|| {
+            assert!(
+                guarded_workspace(Some(&fixture.control()), &fixture.checkout).is_some(),
+                "the fixture's checkout is under a temporary root, so it is guarded"
+            );
+            (
+                detach_at(&fixture.context(), Some(&fixture.store)),
+                cancel_at(&fixture.context(), Some(&fixture.store)),
+                adopt_at(&fixture.context(), None).unwrap_err(),
+            )
+        });
+        assert_eq!(
+            guarded.0,
+            Err("this checkout has no owned-output receipt; nothing to detach".to_owned()),
+            "the guard changes no state it has nothing to refuse"
+        );
+        assert_eq!(
+            guarded.1,
+            Err("this checkout has no owned-output receipt; nothing to cancel".to_owned())
+        );
+        assert!(
+            guarded.2.contains("one-use (temporary) workspace"),
+            "{}",
+            guarded.2
+        );
+        // Two more shipped barriers ran, so exactly two more ids were taken;
+        // the guard differs only where it has authority, and no receipt or link
+        // appeared either way.
+        assert_eq!(next_id(&fixture), guarded_next_before.map(|id| id + 2));
+        let guarded_digest = durable_digest(&fixture);
+        assert_eq!(guarded_digest.len(), guarded_digest_before.len());
+        assert!(guarded_digest
+            .iter()
+            .all(|entry| entry.starts_with("state:") || entry.starts_with("receipt ")));
+        // The leased command's binding: a `Prepared` receipt in a checkout
+        // with no registered drive is refused by the shipped code with its own
+        // text, which is what the dormant command must produce.
+        fixture.write(&fixture.prepared());
+        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let prepared_digest = durable_digest(&fixture);
+        let refused = match bind_for_command(
             &fixture.store,
             &fixture.checkout,
             0,
-            planned.as_ref(),
+            None,
             None,
             false,
-            guard,
+            None,
         ) {
-            Ok(binding) => trace.push(format!(
-                "bind ok warnings={:?} note={:?} root={:?}",
-                binding.outcome.warnings, binding.outcome.note, binding.outcome.root
-            )),
-            Err(reason) => trace.push(format!("bind refused {reason}")),
-        }
-        trace
+            Err(reason) => reason,
+            Ok(_) => panic!("the shipped binding refuses a prepared transition"),
+        };
+        assert_eq!(
+            refused,
+            "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
+        );
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+        assert_eq!(durable_digest(&fixture), prepared_digest);
+
+        assert!(!crate::one_use::is_active());
+
+        // Control (the other rollout, not the shipped path): the same fixture
+        // with the switch on is guarded, so the very same entries answer with
+        // the guarded texts and still write nothing.
+        let active = crate::one_use::with_active(|| {
+            assert!(
+                guarded_workspace(Some(&fixture.control()), &fixture.checkout).is_some(),
+                "the fixture's checkout is under a temporary root, so it is guarded"
+            );
+            let refused = detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
+            let refused_adopt = adopt_at(&fixture.context(), None).unwrap_err();
+            let refused_bind = match bind_for_command(
+                &fixture.store,
+                &fixture.checkout,
+                0,
+                None,
+                None,
+                false,
+                Some(&LocalOutputs {
+                    members: &[],
+                    reason: "one-use",
+                }),
+            ) {
+                Err(reason) => reason,
+                Ok(_) => panic!("the guarded binding refuses a prepared transition"),
+            };
+            (refused, refused_adopt, refused_bind)
+        });
+        assert_eq!(active.0, crate::one_use::PREPARED_GUARDED);
+        // The fixture still holds the prepared receipt, so the guarded `adopt`
+        // refuses with the same exact §4.4 diagnostic (precedence: a prepared
+        // transition outranks the general adopt refusal).
+        assert_eq!(active.1, crate::one_use::PREPARED_GUARDED);
+        assert_eq!(active.2, crate::one_use::PREPARED_GUARDED);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+        assert_eq!(durable_digest(&fixture), prepared_digest);
+        // The two rollouts really differ: the dormant answer is the shipped
+        // one and the guarded answer is the guard's, on the same bytes.
+        assert_ne!(refused, active.0);
+        assert!(!crate::one_use::is_active());
     }
 
-    /// **Dormant byte identity, with a matched control** (the brief's
-    /// requirement and gate `dormant_byte_identity`). The same fixture is
-    /// prepared twice: the subject goes through the production gate exactly as
-    /// `main` does (the one temporary switch decides, and it is off in every
-    /// production binary), and the control calls the shipped path with no guard
-    /// at all, which is the pre-slice code. Both must return the same trace and
-    /// leave byte-identical durable state, and that state must equal the
-    /// pre-run digest: a dormant build writes nothing it did not write before.
-    ///
-    /// The last part is the non-vacuity control: the same fixture prepared
-    /// through the *guarded* branch refuses with the one-use text when the
-    /// classification says the workspace is guarded, and otherwise equals the
-    /// control. Either answer proves the comparison above is not comparing two
-    /// dead paths, and neither is claimed unconditionally.
+    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a
+    /// `Prepared` transition with the exact diagnostic, repeatedly and
+    /// byte-identically including `next_id`, and the refusal happens at the
+    /// effect-free fast precheck — before the binding mutex is even created
+    /// (design §4.1 part 1, §4.4, §4.5).
     #[test]
-    fn the_dormant_guard_is_byte_identical_to_the_shipped_path() {
-        assert!(!crate::one_use::is_active());
-        let fixture = GuardFixture::new("dormant-control");
-        // A real, nonempty local target beside a committed receipt: the shape
-        // in which a guard has something to refuse and today's code has a
-        // decision to make.
-        fs::create_dir_all(fixture.checkout.join("target/debug")).unwrap();
-        fs::write(fixture.checkout.join("target/debug/binary"), b"x").unwrap();
-        fixture.write(&fixture.committed());
-
-        let before = durable_digest(&fixture);
+    fn the_guarded_verbs_refuse_a_prepared_transition_before_any_lock() {
+        let fixture = GuardFixture::new("verbs-prepared");
+        fixture.write(&fixture.prepared());
+        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
         let state_before = fixture.state_bytes();
+        let classify_before = crate::one_use::classifications();
+        let mut traces = Vec::new();
+        crate::one_use::with_active(|| {
+            for _ in 0..3 {
+                let refused = detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
+                assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
+                let refused = cancel_at(&fixture.context(), Some(&fixture.store)).unwrap_err();
+                assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
+                traces.push((
+                    fs::read(&receipt_path).unwrap(),
+                    fixture.state_bytes(),
+                    fs::read_dir(fixture.control().join("waiters"))
+                        .map(|entries| entries.count())
+                        .unwrap_or(0),
+                ));
+            }
+        });
+        assert!(traces.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+        assert_eq!(fixture.state_bytes(), state_before);
+        // The fast precheck runs before this checkout's binding mutex is even
+        // created (the directory itself is made by `Store::for_tests`).
+        let binding_lock = fixture.control().join("bindings").join(format!(
+            "{}.lock",
+            identity::digest(&fixture.checkout.to_string_lossy())
+        ));
         assert!(
-            !before.iter().any(|entry| entry.starts_with("state:")),
-            "the fixture starts with no pool state"
+            !binding_lock.exists(),
+            "the refusal precedes the checkout binding mutex"
         );
+        assert!(
+            crate::one_use::classifications() > classify_before,
+            "the guarded verb did classify its workspace"
+        );
+    }
 
-        // Control: the shipped path, exactly as the release before this slice.
-        let control = prepare(&fixture, None);
-        let control_digest = durable_digest(&fixture);
-        assert_eq!(control_digest, before, "the shipped path wrote nothing new");
+    /// Verb-level: the guarded `detach` covers the busy classifier's rows — a
+    /// dead record, a dead clean mark, a live holder (the bounded busy
+    /// refusal) and unknown custody — and every refusal leaves the receipt,
+    /// the state (`next_id` included) and the `waiters/` listing unchanged.
+    #[test]
+    fn the_guarded_verbs_cover_the_busy_classifier() {
+        // A dead record.
+        let fixture = GuardFixture::new("verbs-dead-record");
+        fixture.write(&fixture.committed());
+        crate::store::dead_record_for_tests(&fixture.store, &fixture.checkout, 7);
+        let stored_receipt = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&stored_receipt).unwrap();
+        let state_before = fixture.state_bytes();
+        let refused = crate::one_use::with_active(|| {
+            detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
+        });
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(refused.contains("record 7"), "{refused}");
+        assert_eq!(fs::read(&stored_receipt).unwrap(), receipt_bytes);
         assert_eq!(fixture.state_bytes(), state_before);
 
-        // Subject: the production gate, which is dormant here.
-        let classification = crate::one_use::is_active().then(|| {
-            crate::one_use::classify(
-                &fixture.checkout,
-                &crate::one_use::Facts::from_control(Some(&fixture.control())),
-            )
+        // A dead clean mark.
+        let fixture = GuardFixture::new("verbs-dead-mark");
+        fixture.write(&fixture.committed());
+        crate::store::dead_clean_mark_for_tests(&fixture.store, &fixture.checkout, 9);
+        let stored_receipt = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&stored_receipt).unwrap();
+        let state_before = fixture.state_bytes();
+        let refused = crate::one_use::with_active(|| {
+            cancel_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
         });
-        let guarded = classification
-            .as_ref()
-            .is_some_and(crate::one_use::Classification::guarded);
-        let subject_guard: Option<LocalOutputs<'_>> = guarded.then(|| LocalOutputs {
-            members: &[],
-            reason: "dormant-control",
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(refused.contains("clean mark 9"), "{refused}");
+        assert_eq!(fs::read(&stored_receipt).unwrap(), receipt_bytes);
+        assert_eq!(fixture.state_bytes(), state_before);
+
+        // A live holder: retried on the shipped poll, then the bounded busy
+        // refusal, with nothing written.
+        let fixture = GuardFixture::new("verbs-live-holder");
+        fixture.write(&fixture.committed());
+        let _held = crate::store::hold_record_for_tests(&fixture.store, &fixture.checkout, 5);
+        let state_before = fixture.state_bytes();
+        let refused = crate::one_use::with_active(|| {
+            detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
         });
-        let subject = prepare(&fixture, subject_guard.as_ref());
-        assert_eq!(subject, control, "the gate changed the decision");
+        assert_eq!(refused, crate::one_use::BARRIER_BUSY);
+        assert_eq!(fixture.state_bytes(), state_before);
         assert_eq!(
-            durable_digest(&fixture),
-            control_digest,
-            "the gate changed the durable bytes"
+            fs::read_dir(fixture.control().join("waiters"))
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "no waiter lock was created"
         );
-        assert_eq!(fixture.state_bytes(), state_before);
 
-        // Non-vacuity: the same fixture through the guarded branch refuses with
-        // the one-use text and still writes nothing. This half does not depend
-        // on the environment: the guard's decision is the receipt's, not the
-        // classification's, so passing the guard is enough to prove the two
-        // paths above really differ.
-        let members = members(&["debug"]);
-        let local = LocalOutputs {
-            members: &members,
-            reason: "one-use control",
-        };
-        let guarded_trace = prepare(&fixture, Some(&local)).join("\n");
-        assert!(
-            guarded_trace.contains("one-use (temporary) workspace"),
-            "the guarded branch refuses this shape: {guarded_trace}"
+        // Unknown custody: an unreadable state document is protected.
+        let fixture = GuardFixture::new("verbs-unknown");
+        fixture.write(&fixture.committed());
+        crate::store::save_default_state_for_tests(&fixture.store);
+        fs::write(fixture.control().join("state.json"), b"{not json").unwrap();
+        let stored_receipt = receipt_path(&fixture.control(), &fixture.checkout_id());
+        let receipt_bytes = fs::read(&stored_receipt).unwrap();
+        let refused = crate::one_use::with_active(|| {
+            detach_at(&fixture.context(), Some(&fixture.store)).unwrap_err()
+        });
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert_eq!(fs::read(&stored_receipt).unwrap(), receipt_bytes);
+        assert_eq!(
+            fs::read(fixture.control().join("state.json")).unwrap(),
+            b"{not json"
         );
-        assert!(
-            guarded_trace.contains("precheck Err"),
-            "the refusal comes from the fast precheck: {guarded_trace}"
-        );
-        assert_eq!(durable_digest(&fixture), control_digest);
-        assert_eq!(fixture.state_bytes(), state_before);
     }
 
     /// The guarded branch keeps the shipped unsettled-prune-intent refusal, at

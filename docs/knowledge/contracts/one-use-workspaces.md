@@ -31,7 +31,17 @@ implementation review corrected:
   bounded `BARRIER_BUSY` refusal with nothing written.
 - **A dead busy fact refuses even beside a live one.** A free waiter or record
   lock never clears itself without the shipped recovery, so waiting for a live
-  holder could not make progress; the classifier reports the dead fact.
+  holder could not make progress; the classifier reports the dead fact. A free
+  *record* lock is not dead by itself: §4.1 step 5's dead row also requires no
+  live group, so a record whose recorded process group still exists is a live
+  fact the verb retries.
+- **Each guarded output verb has its effect-free fast precheck.** `detach`,
+  `cancel-reservation` (and `adopt`, which never enters custody) read the
+  checkout's authority state **before the pool is opened, before any signal
+  handler, before the binding mutex and before the barrier**, so a `Prepared`
+  transition, a pending migration journal, an unsettled prune intent or a
+  listed root refuses with literally nothing created. The authoritative
+  revalidation still runs later under the binding mutex.
 - **The payload root is unsafe-broad.** §3.3's pool test now also drops a
   candidate that *is* a registered payload root, not only ones inside or around
   it.
@@ -43,7 +53,18 @@ implementation review corrected:
 - **Guarded `adopt` never surfaces a malformed receipt.** The verb refuses
   unconditionally, so a malformed or mismatched document selects the general
   guarded refusal and only a `Prepared` transition selects the §4.4
-  diagnostic. **Dormancy is one temporary process-local switch,
+  diagnostic.
+- **The regressions enter the real verbs.** `adopt`, `detach` and
+  `cancel-reservation` are split into a command wrapper and an
+  `…_at(context, pool)` core, so the tests drive the guarded entry points
+  themselves: repeated byte-identical `Prepared` refusals (including `next_id`)
+  with the checkout binding lock absent, and a dead record, a dead clean mark, a
+  live holder (the bounded busy refusal) and unknown custody through `detach`
+  and `cancel-reservation`. The dormancy regression is a command-path
+  comparison: the dormant verbs must answer with the pre-S1 texts and durable
+  effect (one shipped clean mark per verb, the shipped fence, no `class`
+  field), the guarded rollout must answer with the guard's texts instead, and
+  the dormant path must classify nothing at all. **Dormancy is one temporary process-local switch,
 `one_use::is_active`, `false` in every production binary, settable only by
 unit tests** (S4 replaces it with the `proof-controls` readers of §11.1, which
 are the only activation path the frozen design allows). While it is off, no

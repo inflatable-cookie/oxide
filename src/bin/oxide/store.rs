@@ -2980,12 +2980,29 @@ impl Store {
                     });
                 }
                 Probe::Free(_) | Probe::Missing => {
-                    dead.get_or_insert_with(|| {
-                        format!(
-                            "the record {} for this checkout has a free lock, so its holder ended without recovering it",
-                            record.id
-                        )
-                    });
+                    // A free lock is not by itself a dead fact: the design's
+                    // dead row also requires *no live group*. A recorded group
+                    // that still exists may still write through this slot, so
+                    // it is a live fact the verb retries, and the shipped
+                    // recovery reclaims the record once that group closes.
+                    match record.process_group {
+                        Some(group) if !process::group_empty(group) => {
+                            live.get_or_insert_with(|| {
+                                format!(
+                                    "the record {} for this checkout has a free lock but its recorded group {group} is still alive",
+                                    record.id
+                                )
+                            });
+                        }
+                        _ => {
+                            dead.get_or_insert_with(|| {
+                                format!(
+                                    "the record {} for this checkout has a free lock and no live group",
+                                    record.id
+                                )
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -4783,6 +4800,34 @@ impl Store {
     }
 }
 
+/// Test-only: write a default control state, so a fixture has a durable
+/// `state.json` (with `next_id`) to compare against.
+#[cfg(test)]
+pub fn save_default_state_for_tests(store: &Store) {
+    store.save(&State::default()).unwrap();
+}
+
+/// Test-only: an active record for `checkout` whose lock file exists but is
+/// free, so the guarded barrier classifies it as a *dead* fact.
+#[cfg(test)]
+pub fn dead_record_for_tests(store: &Store, checkout: &Path, id: u64) {
+    let held = hold_record_for_tests(store, checkout, id);
+    drop(held);
+}
+
+/// Test-only: a clean mark for `checkout` with no live group and no waiter
+/// lock, so the guarded barrier classifies it as a dead fact.
+#[cfg(test)]
+pub fn dead_clean_mark_for_tests(store: &Store, checkout: &Path, id: u64) {
+    let mut state = store.load().unwrap();
+    state.cleans.push(Clean {
+        id,
+        checkout: checkout.to_path_buf(),
+        process_group: None,
+    });
+    store.save(&state).unwrap();
+}
+
 /// Open an owner-only regular control file without following symlinks.
 pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
     let mut options = OpenOptions::new();
@@ -5957,6 +6002,58 @@ mod tests {
         }
         assert_eq!(state_bytes(&internal), before);
         drop(held);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A free record lock with a recorded live group is a **live** fact, not a
+    /// dead one (design §4.1 step 5: the dead row also requires *no live
+    /// group*). The group may still write through the slot, so the verb retries;
+    /// with no group it is dead and refuses.
+    #[test]
+    fn a_record_with_a_dead_lock_and_a_live_group_is_retried() {
+        let (root, internal, _removable) = paired_controls("guarded-free-lock-live-group");
+        let checkout = Path::new("/checkout");
+        // SAFETY: getpgid has no preconditions; the test process's own group is
+        // alive for the duration of the test.
+        let group = unsafe { libc::getpgid(0) };
+        assert!(group > 1, "the test process has a live group");
+        let mut state = State::default();
+        let mut entry = record(Phase::Running, Some(group), Some("v1.a.1.1.1"));
+        entry.id = 7;
+        entry.checkout = Some(checkout.to_path_buf());
+        state.records.push(entry);
+        internal.save(&state).unwrap();
+        // The holder ended: its lock file is free.
+        let Probe::Free(file) = probe_lock(&internal.lock_path(7), true).unwrap() else {
+            panic!("a fresh record lock is free");
+        };
+        drop(file);
+        let before = state_bytes(&internal);
+        match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(())) {
+            Ok(Cleaning::Retry(reason)) => {
+                assert!(reason.contains("record 7"), "{reason}");
+                assert!(reason.contains("still alive"), "{reason}");
+            }
+            _ => panic!("a recorded live group is retried, never called dead"),
+        }
+        assert_eq!(state_bytes(&internal), before);
+        // A missing lock file with the same live group is the same live fact.
+        fs::remove_file(internal.lock_path(7)).unwrap();
+        match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(())) {
+            Ok(Cleaning::Retry(reason)) => assert!(reason.contains("still alive"), "{reason}"),
+            _ => panic!("a missing lock with a live group is retried"),
+        }
+        // Non-vacuity: the same record with no recorded group is dead, so the
+        // live group is what changed the classification.
+        let mut state = internal.load().unwrap();
+        state.records[0].process_group = None;
+        internal.save(&state).unwrap();
+        let before = state_bytes(&internal);
+        match internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || Ok(())) {
+            Ok(Cleaning::Busy(reason)) => assert!(reason.contains("no live group"), "{reason}"),
+            _ => panic!("a free lock with no group is dead"),
+        }
+        assert_eq!(state_bytes(&internal), before);
         fs::remove_dir_all(root).unwrap();
     }
 
