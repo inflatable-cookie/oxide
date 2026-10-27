@@ -36,6 +36,71 @@ pub(crate) struct Context {
     pub config_files: Vec<String>,
 }
 
+/// Facts observed in the same invocation context as the eventual Cargo child.
+/// The caller supplies a verified Cargo release, canonical Cargo home, and one
+/// resolved target after rejecting unsupported arguments; no probe runs here.
+pub(crate) struct ProducerFacts<'a> {
+    pub cargo_version: &'a str,
+    pub rustc_version: &'a str,
+    pub rustc: Option<&'a OsStr>,
+    pub target: &'a str,
+    pub recipe: &'a str,
+    pub backend: &'a str,
+    pub cargo_home: &'a Path,
+    pub command: &'a str,
+}
+
+/// Assemble only the pinned, supported producer identity. This is pure: the
+/// caller can collect configuration and probe the tools before taking seed
+/// admission, and a rejected identity never creates a sidecar.
+pub(crate) fn producer(
+    facts: ProducerFacts<'_>,
+    context: Context,
+) -> Result<oxide_storage::lease::managed::SeedProducer, &'static str> {
+    use oxide_storage::lease::managed::SeedProducer;
+    const PREFIX: &str = "cargo 1.97.1 (c980f4866 ";
+    const ADAPTER: &str = "cargo-1.97.1/c980f4866/build-dir-v1";
+    if !facts.cargo_version.starts_with(PREFIX) || facts.rustc_version.trim().is_empty() {
+        return Err("unsupported Cargo or compiler");
+    }
+    let family = match facts.command {
+        "check" => "check",
+        "build" | "test" | "run" | "bench" => "build",
+        _ => return Err("unsupported command"),
+    };
+    if facts.backend != "directory-budget-v1" {
+        return Err("seeding not yet supported on a removable pool");
+    }
+    let rustc = match facts.rustc {
+        Some(value) => value.to_str().ok_or("non-UTF-8 compiler")?,
+        None => "rustc",
+    };
+    let home = facts.cargo_home.to_str().ok_or("non-UTF-8 Cargo home")?;
+    if !facts.cargo_home.is_absolute()
+        || [facts.cargo_version, rustc, facts.target, facts.recipe, home]
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 512 || value.contains('\0'))
+        || facts.target.ends_with(".json")
+    {
+        return Err("unsupported producer identity");
+    }
+    Ok(SeedProducer {
+        cargo_version: facts.cargo_version.to_owned(),
+        rustc_digest: hash(facts.rustc_version.as_bytes()),
+        rustc: rustc.to_owned(),
+        target: facts.target.to_owned(),
+        recipe: facts.recipe.to_owned(),
+        backend: facts.backend.to_owned(),
+        adapter: ADAPTER.to_owned(),
+        context_digest: context.digest,
+        config_files: context.config_files,
+        flags_digest: context.flags_digest,
+        cargo_home: home.to_owned(),
+        command_family: family.to_owned(),
+        command_class: facts.command.to_owned(),
+    })
+}
+
 fn hash(bytes: &[u8]) -> String {
     oxide_storage::lease::seed::catalog_digest(bytes)
 }
@@ -247,6 +312,55 @@ pub(crate) fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_context() -> Context {
+        Context {
+            digest: hash(b"context"),
+            flags_digest: hash(b"flags"),
+            config_files: vec![],
+        }
+    }
+
+    fn facts() -> ProducerFacts<'static> {
+        ProducerFacts {
+            cargo_version: "cargo 1.97.1 (c980f4866 2026-01-01)",
+            rustc_version: "rustc 1.97.1\nhost: example-host\n",
+            rustc: None,
+            target: "example-host",
+            recipe: "quick:dev-recipe-2",
+            backend: "directory-budget-v1",
+            cargo_home: Path::new("/fixture/cargo"),
+            command: "check",
+        }
+    }
+
+    #[test]
+    fn producer_binds_facts_and_refuses_unsupported_inputs() {
+        let recorded = producer(facts(), test_context()).unwrap();
+        assert_eq!(recorded.adapter, "cargo-1.97.1/c980f4866/build-dir-v1");
+        assert_eq!(
+            recorded.rustc_digest,
+            hash(facts().rustc_version.as_bytes())
+        );
+        assert_eq!(recorded.command_family, "check");
+        assert_eq!(recorded.cargo_home, "/fixture/cargo");
+
+        let mut input = facts();
+        input.cargo_version = "cargo 1.97.1 (wrong 2026-01-01)";
+        assert!(producer(input, test_context()).is_err());
+        let mut input = facts();
+        input.command = "exec";
+        assert!(producer(input, test_context()).is_err());
+        let mut input = facts();
+        input.backend = "apfs-volume-v1";
+        assert!(producer(input, test_context()).is_err());
+        let mut input = facts();
+        input.target = "/fixture/custom.json";
+        assert!(producer(input, test_context()).is_err());
+        let mut input = facts();
+        input.cargo_home = Path::new("relative");
+        assert!(producer(input, test_context()).is_err());
+    }
 
     #[test]
     fn merge_uses_higher_precedence_and_keeps_unrelated_values() {
