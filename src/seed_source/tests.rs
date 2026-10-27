@@ -22,7 +22,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::fs::FileTimes;
 use std::io::{Cursor, Write};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1018,6 +1018,75 @@ fn an_unbounded_registry_listing_refuses() {
     assert_eq!(
         RegistrySource::locate(&cargo_home, TARBALL).err(),
         Some(Refusal::RegistryIndexLimit)
+    );
+}
+
+#[test]
+fn a_foreign_owned_cache_document_is_ignored() {
+    // §9.1: a foreign-owned sidecar is ignored, never adopted. A non-privileged
+    // test cannot create an inode owned by another user, so the read path's
+    // owner comparison is proved through its seam: the same document is
+    // accepted for its real owner and refused for any other expected owner.
+    let temp = TempDir::new("cache-owner");
+    let path = temp.path().join("sources.json");
+    let mut cache = SourceCache::new("store-1").expect("cache");
+    cache
+        .insert(sample_record("registry/cache/i/cfg-if-1.0.0.crate", 5))
+        .expect("insert");
+    cache.write(&path).expect("write");
+    let owner = fs::metadata(&path).expect("sidecar metadata").uid();
+    assert_eq!(SourceCache::read(&path, "store-1").len(), 1);
+    assert_eq!(SourceCache::read_owned_by(&path, "store-1", owner).len(), 1);
+    assert_eq!(
+        SourceCache::read_owned_by(&path, "store-1", owner.wrapping_add(1)).len(),
+        0,
+        "a document owned by another user is ignored"
+    );
+}
+
+#[test]
+fn a_failed_temporary_creation_never_unlinks_a_foreign_entry() {
+    // `create_new` reports a collision without opening the pre-existing entry;
+    // the failure path must not remove it.
+    let temp = TempDir::new("cache-collision");
+    let path = temp.path().join("sources.json");
+    let pre_existing = temp.path().join(".sources.json.tmp-collision");
+    write_file(&pre_existing, b"not ours", 0o600);
+    let cache = SourceCache::new("store-1").expect("cache");
+    let bytes = cache.encode().expect("encode");
+    assert_eq!(
+        SourceCache::write_at(&path, temp.path(), &pre_existing, &bytes),
+        Err(Refusal::CacheUnwritable)
+    );
+    assert_eq!(
+        fs::read(&pre_existing).expect("the pre-existing entry survives"),
+        b"not ours"
+    );
+    assert!(!path.exists(), "nothing was published");
+}
+
+#[test]
+fn a_write_that_fails_after_creating_its_temporary_removes_only_its_own_temp() {
+    // The temporary this call created is cleaned up; the destination (here a
+    // directory that the rename cannot replace) is left exactly as it was.
+    let temp = TempDir::new("cache-cleanup");
+    let path = temp.path().join("sources.json");
+    fs::create_dir(&path).expect("a directory at the destination");
+    let temporary = temp.path().join(".sources.json.tmp-owned");
+    let cache = SourceCache::new("store-1").expect("cache");
+    let bytes = cache.encode().expect("encode");
+    assert_eq!(
+        SourceCache::write_at(&path, temp.path(), &temporary, &bytes),
+        Err(Refusal::CacheUnwritable)
+    );
+    assert!(!temporary.exists(), "this call's temporary is removed");
+    assert!(path.is_dir(), "the destination is untouched");
+    assert_eq!(
+        fs::read_dir(temp.path())
+            .expect("fixture directory")
+            .count(),
+        1,
+        "only the destination remains"
     );
 }
 

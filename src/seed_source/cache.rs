@@ -18,9 +18,10 @@
 use super::digest::{validate_path, TreeDigest, MAX_PATH_BYTES};
 use super::Refusal;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -99,8 +100,17 @@ impl SourceCache {
     }
 
     /// Read the sidecar at `path`, or an empty cache when the document is
-    /// missing, oversized, malformed, symlinked, foreign or of another store.
+    /// missing, oversized, malformed, symlinked, foreign-owned or of another
+    /// store.
     pub fn read(path: &Path, store_id: &str) -> Self {
+        Self::read_owned_by(path, store_id, effective_uid())
+    }
+
+    /// The read path with the expected owner supplied. `read` passes the
+    /// process's effective uid; the seam exists because a non-privileged test
+    /// cannot create an inode owned by another user, so the foreign-owner
+    /// refusal is proved by handing the check a different expected owner.
+    pub(super) fn read_owned_by(path: &Path, store_id: &str, owner: u32) -> Self {
         let empty = || Self {
             store_id: store_id.to_owned(),
             records: Vec::new(),
@@ -118,7 +128,13 @@ impl SourceCache {
         let Ok(metadata) = file.metadata() else {
             return empty();
         };
-        if !metadata.file_type().is_file() || metadata.len() > MAX_CACHE_BYTES {
+        // §9.1: a foreign-owned sidecar is ignored, never adopted. The check is
+        // on the opened descriptor, so a swapped path cannot change the owner
+        // between the open and the decision.
+        if !metadata.file_type().is_file()
+            || metadata.len() > MAX_CACHE_BYTES
+            || metadata.uid() != owner
+        {
             return empty();
         }
         let mut bytes = Vec::new();
@@ -242,25 +258,52 @@ impl SourceCache {
             .into_owned();
         let unique = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let temporary = parent.join(format!(".{name}.tmp-{}-{unique}", std::process::id()));
+        Self::write_at(path, parent, &temporary, &bytes)
+    }
+
+    /// Write `bytes` through `temporary` and rename it to `path`.
+    ///
+    /// The temporary path is removed only when this call created it. A
+    /// `create_new` collision with a pre-existing entry fails without
+    /// unlinking a file this invocation did not create, and a failure after a
+    /// successful create (a short write, a failing rename) removes only this
+    /// call's own temporary.
+    pub(super) fn write_at(
+        path: &Path,
+        parent: &Path,
+        temporary: &Path,
+        bytes: &[u8],
+    ) -> Result<(), Refusal> {
+        let created = Cell::new(false);
         let result: Result<(), std::io::Error> = (|| {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
+                .open(temporary)?;
+            created.set(true);
+            file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, path)?;
+            fs::rename(temporary, path)?;
+            created.set(false);
             fs::File::open(parent)?.sync_all()?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+            if created.get() {
+                let _ = fs::remove_file(temporary);
+            }
             return Err(Refusal::CacheUnwritable);
         }
         Ok(())
     }
+}
+
+/// The process's effective uid, used to reject a sidecar another user owns.
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 fn valid_store_id(store_id: &str) -> bool {
