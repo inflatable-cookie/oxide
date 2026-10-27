@@ -695,6 +695,75 @@ pub fn widen_captured_mode(
     Ok(())
 }
 
+/// Open one directory for **one replay step** and return the descriptor that
+/// both the step and its mode restoration use. The name is opened without
+/// following a link, the descriptor's identity is verified against the record,
+/// the recorded mode gains the owner's read/search bits *through that
+/// descriptor*, and the returned descriptor is reopened through `.` on it — so
+/// every later effect and the restoration itself are bound to that inode, never
+/// to a name a racer could rebind.
+pub fn open_verified_directory_for_step(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    device: u64,
+    inode: u64,
+    mode: u32,
+) -> Result<OwnedFd, String> {
+    let held = open_directory_for_repair(parent, name)
+        .map_err(|error| format!("the directory cannot be opened for the step ({error})"))?;
+    match descriptor_identity(held.as_fd()) {
+        Ok(identity) if identity == (device, inode) => {}
+        Ok(_) => return Err("the directory was replaced before the step".to_owned()),
+        Err(error) => return Err(format!("the directory's identity cannot be read ({error})")),
+    }
+    let bits = ((mode & 0o7777) | 0o700) as libc::mode_t;
+    // SAFETY: `held` is a live descriptor for the verified directory.
+    if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
+        return Err(format!(
+            "the directory cannot be given access for the step ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    // Reopen through the held descriptor, never through the name.
+    let step = c".";
+    // SAFETY: `held` and the C string are live for the call.
+    let fd = unsafe {
+        libc::openat(
+            held.as_raw_fd(),
+            step.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "the verified directory cannot be read for the step ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` is a newly owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Restore an exact recorded mode through the descriptor that was opened for the
+/// step, so a name rebound in between can never redirect the chmod.
+pub fn restore_step_mode(dir: BorrowedFd<'_>, mode: u32) -> Result<(), String> {
+    let bits = (mode & 0o7777) as libc::mode_t;
+    // SAFETY: `dir` is a live descriptor for the verified directory.
+    if unsafe { libc::fchmod(dir.as_raw_fd(), bits) } != 0 {
+        return Err(format!(
+            "the step directory's recorded mode cannot be restored ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "the restored mode cannot be synced ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// Restore one captured directory's exact recorded mode through a search-only,
 /// no-follow descriptor of that very entry, after revalidating its identity.
 pub fn restore_captured_mode(

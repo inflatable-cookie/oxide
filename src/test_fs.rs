@@ -563,3 +563,46 @@ impl Drop for ForcedInvalidNameGuard {
 pub(crate) fn forced_invalid_name() -> bool {
     FORCED_INVALID_NAME.with(std::cell::Cell::get)
 }
+
+thread_local! {
+    static AFTER_RESTORED_PARENT_WIDEN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside replay, immediately after a restored parent
+/// directory was given access through its verified descriptor and strictly
+/// before its recorded children are read. This is how a test rebinds that name
+/// in the window the repair must survive without touching the replacement.
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct AfterRestoredParentWidenGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn after_restored_parent_widen(
+    action: impl FnOnce() + 'static,
+) -> AfterRestoredParentWidenGuard {
+    AFTER_RESTORED_PARENT_WIDEN.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping after-restored-parent-widen injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    AfterRestoredParentWidenGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for AfterRestoredParentWidenGuard {
+    fn drop(&mut self) {
+        AFTER_RESTORED_PARENT_WIDEN.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+pub(crate) fn run_after_restored_parent_widen() {
+    let action = AFTER_RESTORED_PARENT_WIDEN.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}

@@ -5082,3 +5082,110 @@ fn a_still_private_multibyte_capture_replays_to_its_exact_name() {
     );
     fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
 }
+
+/// A restored parent's name rebound **after** the repair widened it stops the
+/// step pending: the original object still gets its recorded 0100 mode back
+/// through the descriptor opened for the step, and the replacement is never
+/// modified.
+#[test]
+fn a_rebound_restored_parent_is_not_chmodded_and_stays_pending() {
+    let fixture = Fixture::new("rebound-parent");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "rebound-parent");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(captured.join("par")).expect("parent directory");
+    fs::write(captured.join("par").join("inner"), b"x").expect("child");
+    let held = File::open(&captured).expect("captured root descriptor");
+    let par = std::ffi::CString::new("par").expect("name");
+    let outer = crate::owned_delete::capture_entry(held.as_fd(), &par).expect("parent capture");
+    let outer_facts =
+        crate::owned_delete::observe_entry(held.as_fd(), &outer.private).expect("parent facts");
+    let par_dir = captured.join(outer.private.to_string_lossy().as_ref());
+    let par_held = File::open(&par_dir).expect("parent descriptor");
+    let inner = std::ffi::CString::new("inner").expect("name");
+    let child =
+        crate::owned_delete::capture_entry(par_held.as_fd(), &inner).expect("child capture");
+    let child_facts =
+        crate::owned_delete::observe_entry(par_held.as_fd(), &child.private).expect("child facts");
+    let outer_private = outer.private.to_string_lossy().into_owned();
+    let records = vec![
+        crate::owned_delete::CaptureRecord {
+            path: Vec::new(),
+            private: outer_private.clone(),
+            original: "par".to_owned(),
+            device: outer_facts.device,
+            inode: outer_facts.inode,
+            mode: u32::from(outer_facts.file_type()) | 0o100,
+        },
+        crate::owned_delete::CaptureRecord {
+            path: vec![outer_private.clone()],
+            private: child.private.to_string_lossy().into_owned(),
+            original: "inner".to_owned(),
+            device: child_facts.device,
+            inode: child_facts.inode,
+            mode: child_facts.mode as u32,
+        },
+    ];
+    // Both put back, the parent left search-only, exactly as a refusal leaves it.
+    fs::rename(
+        par_dir.join(child.private.to_string_lossy().as_ref()),
+        par_dir.join("inner"),
+    )
+    .expect("child put back");
+    fs::rename(&par_dir, captured.join("par")).expect("parent put back");
+    fs::set_permissions(captured.join("par"), fs::Permissions::from_mode(0o100))
+        .expect("search-only restored parent");
+    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+
+    // After the repair widened it, a racer takes the name and leaves its own
+    // directory there.
+    let fixture_path = fixture.path().to_path_buf();
+    let _rebind = crate::test_fs::after_restored_parent_widen(move || {
+        let restored_parent = find_private_dir(&fixture_path)
+            .and_then(|captured| {
+                fs::read_dir(&captured)
+                    .ok()?
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| path.file_name().is_some_and(|name| name == "par"))
+            })
+            .expect("the restored parent");
+        fs::rename(
+            &restored_parent,
+            restored_parent.with_file_name("par-aside"),
+        )
+        .expect("the restored parent is moved aside");
+        fs::create_dir(&restored_parent).expect("replacement at the observed name");
+        fs::set_permissions(&restored_parent, fs::Permissions::from_mode(0o500))
+            .expect("replacement mode");
+    });
+    let after = status_injected(&pool).expect("status");
+    drop(_rebind);
+
+    assert_eq!(
+        after.slots.len(),
+        1,
+        "the rebind keeps the deletion pending"
+    );
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    let original = find_dir_by_mode(fixture.path(), 0o100).expect("the verified original");
+    assert_eq!(
+        original.file_name().and_then(|name| name.to_str()),
+        Some("par-aside"),
+        "the verified original keeps its recorded mode through its own descriptor"
+    );
+    let replacement = find_dir_by_mode(fixture.path(), 0o500).expect("the replacement");
+    assert_eq!(
+        replacement.file_name().and_then(|name| name.to_str()),
+        Some("par"),
+        "the replacement is never chmodded and never renamed"
+    );
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    if let Some(root) = find_private_dir(fixture.path()) {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    }
+    let _ = &slot_path;
+}

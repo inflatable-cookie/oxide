@@ -16,8 +16,8 @@ use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
 use crate::owned_delete::{
     descriptor_identity, open_directory_at, put_back, reconcile_root_capture,
-    restore_captured_mode, restore_root_capture, widen_captured_mode, Capture, CaptureRecord,
-    ForeignCapture, RootCaptureJournal, RootCapturePhase, RootCapturePlan, RootCaptureState,
+    restore_captured_mode, restore_root_capture, Capture, CaptureRecord, ForeignCapture,
+    RootCaptureJournal, RootCapturePhase, RootCapturePlan, RootCaptureState,
 };
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
@@ -2341,6 +2341,33 @@ fn recorded_type(record: &CaptureRecord) -> libc::mode_t {
     (record.mode & u32::from(libc::S_IFMT)) as libc::mode_t
 }
 
+/// Whether `name` in `base` still holds exactly `(device, inode)`, with the
+/// caller's refusal text when it does not. Used to stop a step whose name was
+/// rebound after its descriptor was opened.
+fn verify_step_name(
+    base: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    device: u64,
+    inode: u64,
+    refusal: &str,
+) -> Result<(), String> {
+    match descriptor_identity_of_name(base, name) {
+        Ok(identity) if identity == (device, inode) => Ok(()),
+        Ok(_) => Err(refusal.to_owned()),
+        Err(error) => Err(format!("{refusal} ({error})")),
+    }
+}
+
+/// The `(device, inode)` of one name in a held parent, never following a link.
+fn descriptor_identity_of_name(
+    base: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+) -> Result<(u64, u64), String> {
+    let facts = crate::owned_delete::observe_entry(base, name)
+        .map_err(|error| format!("the name's identity cannot be read ({error})"))?;
+    Ok((facts.device, facts.inode))
+}
+
 /// One recorded capture must still be the object the record describes.
 fn verify_recorded(
     base: BorrowedFd<'_>,
@@ -2364,10 +2391,9 @@ fn verify_recorded(
 /// disarmed only once the object's identity has left the widened state (its
 /// put-back completed), so a retained tree never keeps a widened mode.
 struct RestoreWidenedMode<'a> {
-    base: BorrowedFd<'a>,
-    private: std::ffi::CString,
-    device: u64,
-    inode: u64,
+    /// The descriptor opened for this step. The recorded mode is restored
+    /// through **it**, never by reopening the name a racer may have rebound.
+    dir: BorrowedFd<'a>,
     mode: u32,
     armed: bool,
 }
@@ -2380,15 +2406,14 @@ impl RestoreWidenedMode<'_> {
             return Ok(());
         }
         self.armed = false;
-        restore_captured_mode(self.base, &self.private, self.device, self.inode, self.mode)
+        crate::owned_delete::restore_step_mode(self.dir, self.mode)
     }
 }
 
 impl Drop for RestoreWidenedMode<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ =
-                restore_captured_mode(self.base, &self.private, self.device, self.inode, self.mode);
+            let _ = crate::owned_delete::restore_step_mode(self.dir, self.mode);
         }
     }
 }
@@ -2403,10 +2428,11 @@ fn rollback_captures(
     root_name: &std::ffi::CStr,
     journal: &DeletionJournal,
 ) -> Result<(), String> {
-    // The captured root may carry the owner's search-only mode, so the replay
-    // gives it read access through its own verified descriptor first, exactly
-    // as the product's repair does, and restores the recorded mode afterwards.
-    widen_captured_mode(
+    // The captured root may carry the owner's search-only mode. One descriptor,
+    // opened without following a link and verified against the record, carries
+    // both the rollback and the mode restoration, so a rebound name can never
+    // redirect the chmod.
+    let root = crate::owned_delete::open_verified_directory_for_step(
         parent,
         root_name,
         journal.root.device,
@@ -2414,21 +2440,18 @@ fn rollback_captures(
         journal.root.mode,
     )?;
     let mut widened = RestoreWidenedMode {
-        base: parent,
-        private: root_name.to_owned(),
-        device: journal.root.device,
-        inode: journal.root.inode,
+        dir: root.as_fd(),
         mode: journal.root.mode,
         armed: true,
     };
     let outcome = (|| {
-        let root = open_directory_at(parent, root_name)
-            .map_err(|error| format!("the held tree root cannot be opened ({error})"))?;
-        let identity = descriptor_identity(root.as_fd())
-            .map_err(|error| format!("the held tree root's identity cannot be read ({error})"))?;
-        if identity != (journal.root.device, journal.root.inode) {
-            return Err("the held tree root is not the recorded root".to_owned());
-        }
+        verify_step_name(
+            parent,
+            root_name,
+            journal.root.device,
+            journal.root.inode,
+            "the held tree root is not the recorded root",
+        )?;
         let mut resolved = 0;
         restore_captures_in(root.as_fd(), &[], &journal.captures, &mut resolved)?;
         if resolved != journal.captures.len() {
@@ -2473,30 +2496,31 @@ fn restore_captures_in(
                 continue;
             }
             let original = recorded_name(&record.original)?;
-            // The restored parent may carry the owner's search-only mode, so it
-            // gets the same identity-bound access repair as a still-private
-            // capture: widen through its own verified descriptor, then restore
-            // exactly the recorded mode on every exit path (including a panic).
-            widen_captured_mode(base, &original, record.device, record.inode, record.mode)?;
-            let mut widened = RestoreWidenedMode {
+            // The restored parent may carry the owner's search-only mode. One
+            // descriptor, opened without following a link and verified against
+            // the record, carries both the descent and the mode restoration, so
+            // a name rebound after the widening can never redirect a chmod and
+            // the original still gets its recorded mode back.
+            let step = crate::owned_delete::open_verified_directory_for_step(
                 base,
-                private: original.clone(),
-                device: record.device,
-                inode: record.inode,
+                &original,
+                record.device,
+                record.inode,
+                record.mode,
+            )?;
+            let mut widened = RestoreWidenedMode {
+                dir: step.as_fd(),
                 mode: record.mode,
                 armed: true,
             };
+            #[cfg(test)]
+            crate::test_fs::run_after_restored_parent_widen();
             let stepped = (|| {
-                let restored = open_directory_at(base, &original).map_err(|error| {
-                    format!("the restored captured directory cannot be opened ({error})")
-                })?;
-                let identity = descriptor_identity(restored.as_fd()).map_err(|error| {
-                    format!("the restored directory's identity cannot be read ({error})")
-                })?;
-                if identity != (record.device, record.inode) {
-                    return Err("the restored directory is not the recorded capture".to_owned());
-                }
-                restore_captures_in(restored.as_fd(), &inner, records, resolved)
+                // The name must still hold the recorded object before anything
+                // is read through the held descriptor; a rebind stops the step
+                // without modifying the replacement.
+                verify_recorded(base, &original, record)?;
+                restore_captures_in(step.as_fd(), &inner, records, resolved)
             })();
             match stepped {
                 Ok(()) => {
@@ -2514,29 +2538,26 @@ fn restore_captures_in(
             continue;
         }
         verify_recorded(base, &private, record)?;
-        // The same search-only case as the root: read access for this replay
-        // step, restored to the recorded mode before the put-back below and on
-        // every error path in between (including a panicking one).
-        widen_captured_mode(base, &private, record.device, record.inode, record.mode)?;
-        let mut widened = RestoreWidenedMode {
+        // Read access for this replay step comes from one verified descriptor,
+        // and the recorded mode is restored through that same descriptor on
+        // every exit path (including a panic).
+        let step = crate::owned_delete::open_verified_directory_for_step(
             base,
-            private: private.clone(),
-            device: record.device,
-            inode: record.inode,
+            &private,
+            record.device,
+            record.inode,
+            record.mode,
+        )?;
+        let mut widened = RestoreWidenedMode {
+            dir: step.as_fd(),
             mode: record.mode,
             armed: true,
         };
         let stepped = (|| {
-            let child = open_directory_at(base, &private).map_err(|error| {
-                format!("a recorded captured directory cannot be opened ({error})")
-            })?;
             let mut inner = chain.to_vec();
             inner.push(record.private.clone());
-            restore_captures_in(child.as_fd(), &inner, records, resolved)?;
+            restore_captures_in(step.as_fd(), &inner, records, resolved)?;
             restore_recorded(base, record)?;
-            // `restore_recorded` renamed the object back, so there is no widened
-            // name left to restore.
-            widened.armed = false;
             Ok(())
         })();
         match stepped {
