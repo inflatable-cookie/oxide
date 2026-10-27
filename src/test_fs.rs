@@ -606,3 +606,54 @@ pub(crate) fn run_after_restored_parent_widen() {
         action();
     }
 }
+
+thread_local! {
+    static AFTER_STEP_CHMOD: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static STEP_OPEN_FAULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm one action that runs immediately after a replay step directory was
+/// widened through its verified descriptor and strictly before it is reopened;
+/// the action may also arm the injected open failure for that step.
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct AfterStepChmodGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn after_step_chmod(action: impl FnOnce() + 'static) -> AfterStepChmodGuard {
+    AFTER_STEP_CHMOD.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping after-step-chmod injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    AfterStepChmodGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for AfterStepChmodGuard {
+    fn drop(&mut self) {
+        AFTER_STEP_CHMOD.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+        STEP_OPEN_FAULT.with(|cell| cell.set(false));
+    }
+}
+
+pub(crate) fn run_after_step_chmod() {
+    let action = AFTER_STEP_CHMOD.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+/// Arm the injected post-widening reopen failure for the next step.
+pub(crate) fn arm_step_open_failure() {
+    STEP_OPEN_FAULT.with(|cell| cell.set(true));
+}
+
+pub(crate) fn injected_step_open_failure() -> bool {
+    STEP_OPEN_FAULT.with(std::cell::Cell::get)
+}

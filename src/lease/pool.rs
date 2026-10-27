@@ -2385,39 +2385,6 @@ fn verify_recorded(
     Ok(())
 }
 
-/// Restores one widened captured directory's recorded mode on **every** exit
-/// path of the replay step that needed the widening — an error return, a `?`
-/// and a panic — through the same verified search-only descriptor. It is
-/// disarmed only once the object's identity has left the widened state (its
-/// put-back completed), so a retained tree never keeps a widened mode.
-struct RestoreWidenedMode<'a> {
-    /// The descriptor opened for this step. The recorded mode is restored
-    /// through **it**, never by reopening the name a racer may have rebound.
-    dir: BorrowedFd<'a>,
-    mode: u32,
-    armed: bool,
-}
-
-impl RestoreWidenedMode<'_> {
-    /// Restore the recorded mode now and report a failure, so the caller stays
-    /// pending instead of keeping a widened directory.
-    fn restore(&mut self) -> Result<(), String> {
-        if !self.armed {
-            return Ok(());
-        }
-        self.armed = false;
-        crate::owned_delete::restore_step_mode(self.dir, self.mode)
-    }
-}
-
-impl Drop for RestoreWidenedMode<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = crate::owned_delete::restore_step_mode(self.dir, self.mode);
-        }
-    }
-}
-
 /// Roll back every recorded capture inside one held tree root: each recorded
 /// object is put back under its observed name, deepest first, so every put-back
 /// sees a live parent. A captured directory's own recorded mode is restored
@@ -2432,18 +2399,13 @@ fn rollback_captures(
     // opened without following a link and verified against the record, carries
     // both the rollback and the mode restoration, so a rebound name can never
     // redirect the chmod.
-    let root = crate::owned_delete::open_verified_directory_for_step(
+    let (root, mut widened) = crate::owned_delete::open_verified_step(
         parent,
         root_name,
         journal.root.device,
         journal.root.inode,
         journal.root.mode,
     )?;
-    let mut widened = RestoreWidenedMode {
-        dir: root.as_fd(),
-        mode: journal.root.mode,
-        armed: true,
-    };
     let outcome = (|| {
         verify_step_name(
             parent,
@@ -2501,18 +2463,13 @@ fn restore_captures_in(
             // the record, carries both the descent and the mode restoration, so
             // a name rebound after the widening can never redirect a chmod and
             // the original still gets its recorded mode back.
-            let step = crate::owned_delete::open_verified_directory_for_step(
+            let (step, mut widened) = crate::owned_delete::open_verified_step(
                 base,
                 &original,
                 record.device,
                 record.inode,
                 record.mode,
             )?;
-            let mut widened = RestoreWidenedMode {
-                dir: step.as_fd(),
-                mode: record.mode,
-                armed: true,
-            };
             #[cfg(test)]
             crate::test_fs::run_after_restored_parent_widen();
             let stepped = (|| {
@@ -2541,18 +2498,13 @@ fn restore_captures_in(
         // Read access for this replay step comes from one verified descriptor,
         // and the recorded mode is restored through that same descriptor on
         // every exit path (including a panic).
-        let step = crate::owned_delete::open_verified_directory_for_step(
+        let (step, mut widened) = crate::owned_delete::open_verified_step(
             base,
             &private,
             record.device,
             record.inode,
             record.mode,
         )?;
-        let mut widened = RestoreWidenedMode {
-            dir: step.as_fd(),
-            mode: record.mode,
-            armed: true,
-        };
         let stepped = (|| {
             let mut inner = chain.to_vec();
             inner.push(record.private.clone());

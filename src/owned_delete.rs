@@ -658,95 +658,37 @@ pub fn describe_entry(facts: &EntryFacts) -> String {
     )
 }
 
-/// Give one captured directory back read access for one replay step, through a
-/// search-only, no-follow descriptor of that very entry and after revalidating
-/// its identity. The recorded mode is restored again by the same path once the
-/// step is done, so this never outlives the replay work it enables.
-pub fn widen_captured_mode(
-    parent: BorrowedFd<'_>,
-    name: &CStr,
-    device: u64,
-    inode: u64,
+/// Arms the exact recorded-mode restoration of one step directory **through the
+/// verified descriptor that was widened**, so no later rebind of a name can
+/// redirect the chmod and a failure after the widening still restores the
+/// owner's mode on every exit path, including a panic.
+pub struct StepModeGuard {
+    dir: OwnedFd,
     mode: u32,
-) -> Result<(), String> {
-    let held = open_directory_for_repair(parent, name)
-        .map_err(|error| format!("the captured directory cannot be opened ({error})"))?;
-    match descriptor_identity(held.as_fd()) {
-        Ok(identity) if identity == (device, inode) => {}
-        Ok(_) => {
-            return Err(
-                "the captured directory was replaced before its mode was widened".to_owned(),
-            )
-        }
-        Err(error) => {
-            return Err(format!(
-                "the captured directory's identity cannot be read ({error})"
-            ))
-        }
-    }
-    let bits = ((mode & 0o7777) | 0o700) as libc::mode_t;
-    // SAFETY: `held` is a live descriptor for the verified directory.
-    if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
-        return Err(format!(
-            "the captured directory cannot be widened for replay ({})",
-            io::Error::last_os_error()
-        ));
-    }
-    Ok(())
+    armed: bool,
 }
 
-/// Open one directory for **one replay step** and return the descriptor that
-/// both the step and its mode restoration use. The name is opened without
-/// following a link, the descriptor's identity is verified against the record,
-/// the recorded mode gains the owner's read/search bits *through that
-/// descriptor*, and the returned descriptor is reopened through `.` on it — so
-/// every later effect and the restoration itself are bound to that inode, never
-/// to a name a racer could rebind.
-pub fn open_verified_directory_for_step(
-    parent: BorrowedFd<'_>,
-    name: &CStr,
-    device: u64,
-    inode: u64,
-    mode: u32,
-) -> Result<OwnedFd, String> {
-    let held = open_directory_for_repair(parent, name)
-        .map_err(|error| format!("the directory cannot be opened for the step ({error})"))?;
-    match descriptor_identity(held.as_fd()) {
-        Ok(identity) if identity == (device, inode) => {}
-        Ok(_) => return Err("the directory was replaced before the step".to_owned()),
-        Err(error) => return Err(format!("the directory's identity cannot be read ({error})")),
+impl StepModeGuard {
+    /// Restore the recorded mode now through the held descriptor and report a
+    /// failure, so the caller stays pending instead of keeping it widened.
+    pub fn restore(&mut self) -> Result<(), String> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        restore_mode_through(self.dir.as_fd(), self.mode)
     }
-    let bits = ((mode & 0o7777) | 0o700) as libc::mode_t;
-    // SAFETY: `held` is a live descriptor for the verified directory.
-    if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
-        return Err(format!(
-            "the directory cannot be given access for the step ({})",
-            io::Error::last_os_error()
-        ));
-    }
-    // Reopen through the held descriptor, never through the name.
-    let step = c".";
-    // SAFETY: `held` and the C string are live for the call.
-    let fd = unsafe {
-        libc::openat(
-            held.as_raw_fd(),
-            step.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "the verified directory cannot be read for the step ({})",
-            io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `fd` is a newly owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Restore an exact recorded mode through the descriptor that was opened for the
-/// step, so a name rebound in between can never redirect the chmod.
-pub fn restore_step_mode(dir: BorrowedFd<'_>, mode: u32) -> Result<(), String> {
+impl Drop for StepModeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = restore_mode_through(self.dir.as_fd(), self.mode);
+        }
+    }
+}
+
+fn restore_mode_through(dir: BorrowedFd<'_>, mode: u32) -> Result<(), String> {
     let bits = (mode & 0o7777) as libc::mode_t;
     // SAFETY: `dir` is a live descriptor for the verified directory.
     if unsafe { libc::fchmod(dir.as_raw_fd(), bits) } != 0 {
@@ -762,6 +704,84 @@ pub fn restore_step_mode(dir: BorrowedFd<'_>, mode: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Open one directory for **one replay step**: open it without following a
+/// link, verify the descriptor against the record, arm the recorded-mode
+/// restoration **immediately** after the widening chmod, and only then reopen
+/// it through `.` on that descriptor. The returned guard owns the verified
+/// descriptor, so the mode is restored through it on every exit path; the
+/// caller never restores by name.
+pub fn open_verified_step(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    device: u64,
+    inode: u64,
+    mode: u32,
+) -> Result<(OwnedFd, StepModeGuard), String> {
+    let held = open_directory_for_repair(parent, name)
+        .map_err(|error| format!("the directory cannot be opened for the step ({error})"))?;
+    match descriptor_identity(held.as_fd()) {
+        Ok(identity) if identity == (device, inode) => {}
+        Ok(_) => return Err("the directory was replaced before the step".to_owned()),
+        Err(error) => return Err(format!("the directory's identity cannot be read ({error})")),
+    }
+    let bits = ((mode & 0o7777) | 0o700) as libc::mode_t;
+    // SAFETY: `held` is a live descriptor for the verified directory.
+    if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
+        return Err(format!(
+            "the directory cannot be given access for the step ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    // Armed from this instant, before anything else can fail.
+    let mut guard = StepModeGuard {
+        dir: held,
+        mode,
+        armed: true,
+    };
+    #[cfg(test)]
+    crate::test_fs::run_after_step_chmod();
+    let fault = {
+        #[cfg(test)]
+        {
+            crate::test_fs::injected_step_open_failure()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
+    // Reopen through the held descriptor, never through the name.
+    let step = c".";
+    // SAFETY: `guard.dir` and the C string are live for the call.
+    let fd = if fault {
+        -1
+    } else {
+        unsafe {
+            libc::openat(
+                guard.dir.as_raw_fd(),
+                step.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        }
+    };
+    if fd < 0 {
+        let reason = if fault {
+            "the verified directory cannot be read for the step (injected)".to_owned()
+        } else {
+            format!(
+                "the verified directory cannot be read for the step ({})",
+                io::Error::last_os_error()
+            )
+        };
+        return match guard.restore() {
+            Ok(()) => Err(reason),
+            Err(restore_reason) => Err(format!("{reason}; {restore_reason}")),
+        };
+    }
+    // SAFETY: `fd` is a newly owned descriptor.
+    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, guard))
 }
 
 /// Restore one captured directory's exact recorded mode through a search-only,

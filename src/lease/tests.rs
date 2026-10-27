@@ -5189,3 +5189,109 @@ fn a_rebound_restored_parent_is_not_chmodded_and_stays_pending() {
     }
     let _ = &slot_path;
 }
+
+/// An injected failure of the post-widening reopen restores the verified
+/// original's recorded 0100 mode through its own descriptor, never mutates the
+/// replacement and keeps the production Evicting journal pending.
+#[test]
+fn a_post_chmod_step_failure_restores_the_original_mode_and_stays_pending() {
+    let fixture = Fixture::new("step-fault");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "step-fault");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(captured.join("par")).expect("parent directory");
+    fs::write(captured.join("par").join("inner"), b"x").expect("child");
+    let held = File::open(&captured).expect("captured root descriptor");
+    let par = std::ffi::CString::new("par").expect("name");
+    let outer = crate::owned_delete::capture_entry(held.as_fd(), &par).expect("parent capture");
+    let outer_facts =
+        crate::owned_delete::observe_entry(held.as_fd(), &outer.private).expect("parent facts");
+    let par_dir = captured.join(outer.private.to_string_lossy().as_ref());
+    let par_held = File::open(&par_dir).expect("parent descriptor");
+    let inner = std::ffi::CString::new("inner").expect("name");
+    let child =
+        crate::owned_delete::capture_entry(par_held.as_fd(), &inner).expect("child capture");
+    let child_facts =
+        crate::owned_delete::observe_entry(par_held.as_fd(), &child.private).expect("child facts");
+    let outer_private = outer.private.to_string_lossy().into_owned();
+    let records = vec![
+        crate::owned_delete::CaptureRecord {
+            path: Vec::new(),
+            private: outer_private.clone(),
+            original: "par".to_owned(),
+            device: outer_facts.device,
+            inode: outer_facts.inode,
+            mode: u32::from(outer_facts.file_type()) | 0o100,
+        },
+        crate::owned_delete::CaptureRecord {
+            path: vec![outer_private.clone()],
+            private: child.private.to_string_lossy().into_owned(),
+            original: "inner".to_owned(),
+            device: child_facts.device,
+            inode: child_facts.inode,
+            mode: child_facts.mode as u32,
+        },
+    ];
+    fs::rename(
+        par_dir.join(child.private.to_string_lossy().as_ref()),
+        par_dir.join("inner"),
+    )
+    .expect("child put back");
+    fs::rename(&par_dir, captured.join("par")).expect("parent put back");
+    fs::set_permissions(captured.join("par"), fs::Permissions::from_mode(0o100))
+        .expect("search-only restored parent");
+    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+
+    // After the widening, a racer rebinds the name and the reopen fails.
+    let fixture_path = fixture.path().to_path_buf();
+    let _fault = crate::test_fs::after_step_chmod(move || {
+        let restored_parent = find_private_dir(&fixture_path)
+            .and_then(|captured| {
+                fs::read_dir(&captured)
+                    .ok()?
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| path.file_name().is_some_and(|name| name == "par"))
+            })
+            .expect("the restored parent");
+        fs::rename(
+            &restored_parent,
+            restored_parent.with_file_name("par-aside"),
+        )
+        .expect("the restored parent is moved aside");
+        fs::create_dir(&restored_parent).expect("replacement at the observed name");
+        fs::set_permissions(&restored_parent, fs::Permissions::from_mode(0o500))
+            .expect("replacement mode");
+        crate::test_fs::arm_step_open_failure();
+    });
+    let after = status_injected(&pool).expect("status");
+    drop(_fault);
+
+    assert_eq!(
+        after.slots.len(),
+        1,
+        "the failed step keeps Evicting pending"
+    );
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert_eq!(
+        mode_of(&find_dir_by_mode(fixture.path(), 0o100).expect("verified original")),
+        0o100,
+        "the original's recorded mode was restored through the widened descriptor"
+    );
+    assert_eq!(
+        mode_of(&find_dir_by_mode(fixture.path(), 0o500).expect("replacement")),
+        0o500,
+        "the replacement was never mutated"
+    );
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+    for mode in [0o100, 0o500] {
+        if let Some(path) = find_dir_by_mode(fixture.path(), mode) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("cleanup");
+        }
+    }
+    if let Some(root) = find_private_dir(fixture.path()) {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    }
+    let _ = &slot_path;
+}
