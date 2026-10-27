@@ -40,7 +40,7 @@ fn hex(s: &str, len: usize) -> bool {
 
 /// Read a regular owner-owned lock without following the final symlink. A
 /// bounded read also handles a file that grows after metadata was sampled.
-pub(crate) fn read(path: &Path) -> Result<Vec<Package>, &'static str> {
+pub(crate) fn read(path: &Path) -> Result<Analysis, &'static str> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -58,7 +58,7 @@ pub(crate) fn read(path: &Path) -> Result<Vec<Package>, &'static str> {
         .take((MAX_LOCK_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| "lock unavailable")?;
-    eligible(&bytes)
+    analyze(&bytes)
 }
 
 /// A lock-side rejection; the producing epoch must classify its candidate
@@ -139,6 +139,32 @@ pub(crate) fn analyze(bytes: &[u8]) -> Result<Analysis, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{CStr, CString, OsStr};
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let template = std::env::temp_dir().join("oxide-seed-lock.XXXXXX");
+            let mut name = CString::new(template.as_os_str().as_bytes())
+                .unwrap()
+                .into_bytes_with_nul();
+            // SAFETY: name is writable, NUL-terminated, and ends in XXXXXX.
+            assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+            let name = CStr::from_bytes_until_nul(&name).unwrap();
+            Self(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
 
     #[test]
     fn collision_includes_path_packages_and_non_leaves_are_excluded() {
@@ -183,5 +209,28 @@ dependencies = ["cfg-if"]
         let input = b"version = 4\n[[package]]\nname = 'git'\nversion = '1'\nsource = 'git+https://example.invalid/repo#abc'\n";
         assert!(eligible(input).unwrap().is_empty());
         assert!(eligible(&vec![b' '; MAX_LOCK_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn bounded_lock_read_preserves_rejections_and_refuses_symlinks() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("Cargo.lock");
+        let input = format!(
+            "version = 4\n[[package]]\nname = 'a'\nversion = '1'\nsource = '{CRATES_IO}'\nchecksum = '{}'\n[[package]]\nname = 'a'\nversion = '2'\n",
+            "a".repeat(64)
+        );
+        fs::write(&path, input).unwrap();
+        let analysis = read(&path).unwrap();
+        assert!(analysis.eligible.is_empty());
+        assert_eq!(analysis.rejected.len(), 2);
+        assert!(analysis
+            .rejected
+            .iter()
+            .all(|rejection| rejection.reason == SeedRejectReason::AmbiguousName));
+        let link = fixture.0.join("link");
+        symlink(&path, &link).unwrap();
+        assert!(read(&link).is_err());
+        fs::write(&path, vec![b' '; MAX_LOCK_BYTES + 1]).unwrap();
+        assert!(read(&path).is_err());
     }
 }
