@@ -675,11 +675,11 @@ run = "python3 scripts/test-oxide-finder-metadata.py"
 # each run needs its own owner activation.
 [tasks."rust:finder-metadata-race"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 420 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py"
 
 [tasks."rust:finder-metadata-race:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 420 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py --diagnostic"
 
 # The pure fixture-layout check for both selectors above (oxide#155): every
 # prune image volume name and case slug must keep the product's per-command
