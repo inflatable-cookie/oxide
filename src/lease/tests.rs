@@ -5190,9 +5190,12 @@ fn a_rebound_restored_parent_is_not_chmodded_and_stays_pending() {
     let _ = &slot_path;
 }
 
-/// An injected failure of the post-widening reopen restores the verified
-/// original's recorded 0100 mode through its own descriptor, never mutates the
-/// replacement and keeps the production Evicting journal pending.
+/// An injected failure of the post-widening reopen restores the **faulted**
+/// directory's recorded 0100 mode through the descriptor that was widened, never
+/// mutates a replacement created in that window, and keeps the production
+/// Evicting record pending. The faulted object is the first replay step (the
+/// captured whole slot, itself search-only), so the injected failure fires after
+/// that exact object's mode was widened.
 #[test]
 fn a_post_chmod_step_failure_restores_the_original_mode_and_stays_pending() {
     let fixture = Fixture::new("step-fault");
@@ -5200,68 +5203,27 @@ fn a_post_chmod_step_failure_restores_the_original_mode_and_stays_pending() {
     let parent = slot_path.parent().expect("slot parent").to_path_buf();
     let plan = capture_root_state(&slot_path, slot_id, &pool, true);
     let captured = parent.join(&plan.private);
-    fs::create_dir(captured.join("par")).expect("parent directory");
-    fs::write(captured.join("par").join("inner"), b"x").expect("child");
-    let held = File::open(&captured).expect("captured root descriptor");
-    let par = std::ffi::CString::new("par").expect("name");
-    let outer = crate::owned_delete::capture_entry(held.as_fd(), &par).expect("parent capture");
-    let outer_facts =
-        crate::owned_delete::observe_entry(held.as_fd(), &outer.private).expect("parent facts");
-    let par_dir = captured.join(outer.private.to_string_lossy().as_ref());
-    let par_held = File::open(&par_dir).expect("parent descriptor");
-    let inner = std::ffi::CString::new("inner").expect("name");
-    let child =
-        crate::owned_delete::capture_entry(par_held.as_fd(), &inner).expect("child capture");
-    let child_facts =
-        crate::owned_delete::observe_entry(par_held.as_fd(), &child.private).expect("child facts");
-    let outer_private = outer.private.to_string_lossy().into_owned();
-    let records = vec![
-        crate::owned_delete::CaptureRecord {
-            path: Vec::new(),
-            private: outer_private.clone(),
-            original: "par".to_owned(),
-            device: outer_facts.device,
-            inode: outer_facts.inode,
-            mode: u32::from(outer_facts.file_type()) | 0o100,
+    // The owner left the captured slot search-only, and the record says so.
+    fs::set_permissions(&captured, fs::Permissions::from_mode(0o100))
+        .expect("search-only captured slot");
+    write_journal(
+        &pool,
+        slot_id,
+        crate::owned_delete::RootCapturePlan {
+            mode: u32::from(plan.mode & u32::from(libc::S_IFMT)) | 0o100,
+            ..plan.clone()
         },
-        crate::owned_delete::CaptureRecord {
-            path: vec![outer_private.clone()],
-            private: child.private.to_string_lossy().into_owned(),
-            original: "inner".to_owned(),
-            device: child_facts.device,
-            inode: child_facts.inode,
-            mode: child_facts.mode as u32,
-        },
-    ];
-    fs::rename(
-        par_dir.join(child.private.to_string_lossy().as_ref()),
-        par_dir.join("inner"),
-    )
-    .expect("child put back");
-    fs::rename(&par_dir, captured.join("par")).expect("parent put back");
-    fs::set_permissions(captured.join("par"), fs::Permissions::from_mode(0o100))
-        .expect("search-only restored parent");
-    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+        true,
+        Vec::new(),
+        Vec::new(),
+    );
 
-    // After the widening, a racer rebinds the name and the reopen fails.
-    let fixture_path = fixture.path().to_path_buf();
+    // In the window after that object's widening, a racer claims the recorded
+    // name and the reopen fails.
+    let replacement = slot_path.clone();
     let _fault = crate::test_fs::after_step_chmod(move || {
-        let restored_parent = find_private_dir(&fixture_path)
-            .and_then(|captured| {
-                fs::read_dir(&captured)
-                    .ok()?
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .find(|path| path.file_name().is_some_and(|name| name == "par"))
-            })
-            .expect("the restored parent");
-        fs::rename(
-            &restored_parent,
-            restored_parent.with_file_name("par-aside"),
-        )
-        .expect("the restored parent is moved aside");
-        fs::create_dir(&restored_parent).expect("replacement at the observed name");
-        fs::set_permissions(&restored_parent, fs::Permissions::from_mode(0o500))
+        fs::create_dir(&replacement).expect("replacement at the recorded name");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o500))
             .expect("replacement mode");
         crate::test_fs::arm_step_open_failure();
     });
@@ -5275,23 +5237,31 @@ fn a_post_chmod_step_failure_restores_the_original_mode_and_stays_pending() {
     );
     assert_eq!(after.coverage, AccountingCoverage::Unknown);
     assert_eq!(
-        mode_of(&find_dir_by_mode(fixture.path(), 0o100).expect("verified original")),
+        mode_of(&captured),
         0o100,
-        "the original's recorded mode was restored through the widened descriptor"
+        "the faulted directory's recorded mode was restored through the descriptor that was widened"
     );
     assert_eq!(
-        mode_of(&find_dir_by_mode(fixture.path(), 0o500).expect("replacement")),
+        mode_of(&slot_path),
         0o500,
-        "the replacement was never mutated"
+        "the replacement created in that window was never mutated"
     );
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
-    for mode in [0o100, 0o500] {
-        if let Some(path) = find_dir_by_mode(fixture.path(), mode) {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("cleanup");
-        }
-    }
-    if let Some(root) = find_private_dir(fixture.path()) {
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).expect("cleanup");
-    }
-    let _ = &slot_path;
+    assert!(
+        super::pool::capture_record_injected(&pool, slot_id).is_some(),
+        "the production Evicting record is retained"
+    );
+
+    // Counterfactual control: a search-only directory that is widened and then
+    // *not* restored reads 0700, so the 0100 assertion above fails if the
+    // restoration is omitted.
+    let control = fixture.dir("counterfactual");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o100)).expect("search-only control");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700))
+        .expect("widened, not restored");
+    assert_eq!(
+        mode_of(&control),
+        0o700,
+        "an unrestored widening is observable, which is what the control asserts"
+    );
+    fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).expect("cleanup");
 }
