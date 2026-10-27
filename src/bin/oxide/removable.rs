@@ -654,8 +654,7 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
         return Err("the removable registration is not a small owner-only regular file".to_owned());
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_REGISTRATION_BYTES + 1)
-        .read_to_end(&mut bytes)
+    crate::prune::authority_read(file.take(MAX_REGISTRATION_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
         return Err("the removable registration exceeds its byte limit".to_owned());

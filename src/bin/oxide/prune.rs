@@ -681,8 +681,7 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
         return Ok(None);
     };
     let mut bytes = Vec::new();
-    file.take(MAX_REGISTRY_BYTES + 1)
-        .read_to_end(&mut bytes)
+    authority_read(file.take(MAX_REGISTRY_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_REGISTRY_BYTES {
         return Err(format!(
@@ -1588,6 +1587,75 @@ const SNAPSHOT_MAX_RECEIPTS: usize = 8192;
 const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SNAPSHOT_TIME: Duration = Duration::from_secs(10);
 
+// A snapshot's shared input budget is scoped to this synchronous command
+// thread. The latched failure survives callers that translate an I/O error
+// into an unknown custody result.
+thread_local! {
+    static AUTHORITY: std::cell::RefCell<Option<AuthorityBudget>> = const { std::cell::RefCell::new(None) };
+}
+
+struct AuthorityBudget {
+    deadline: Instant,
+    remaining: u64,
+    failed: bool,
+}
+
+struct AuthorityScope;
+
+impl AuthorityScope {
+    fn begin() -> Result<Self, String> {
+        AUTHORITY.with(|cell| {
+            let mut active = cell.borrow_mut();
+            if active.is_some() {
+                return Err("nested authority snapshot".to_owned());
+            }
+            *active = Some(AuthorityBudget {
+                deadline: Instant::now() + SNAPSHOT_TIME,
+                remaining: SNAPSHOT_MAX_BYTES,
+                failed: false,
+            });
+            Ok(Self)
+        })
+    }
+
+    fn complete(&self) -> bool {
+        AUTHORITY.with(|cell| cell.borrow().as_ref().is_some_and(|budget| {
+            !budget.failed && budget.remaining > 0 && Instant::now() <= budget.deadline
+        }))
+    }
+}
+
+impl Drop for AuthorityScope {
+    fn drop(&mut self) {
+        AUTHORITY.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// Charge bytes actually returned by each bounded authority input read.
+/// Outside a snapshot this is exactly the ordinary read operation.
+pub(crate) fn authority_read<R: Read>(reader: R, bytes: &mut Vec<u8>) -> std::io::Result<usize> {
+    let remaining = AUTHORITY.with(|cell| cell.borrow().as_ref().map(|budget| budget.remaining));
+    let before = bytes.len();
+    let result = match remaining {
+        Some(allowance) => reader.take(allowance).read_to_end(bytes),
+        None => reader.take(u64::MAX).read_to_end(bytes),
+    };
+    let used = (bytes.len() - before) as u64;
+    let exhausted = AUTHORITY.with(|cell| {
+        let mut active = cell.borrow_mut();
+        let Some(budget) = active.as_mut() else { return false };
+        budget.remaining = budget.remaining.saturating_sub(used);
+        if result.is_err() || budget.remaining == 0 || Instant::now() > budget.deadline {
+            budget.failed = true;
+        }
+        budget.failed
+    });
+    if exhausted && result.is_ok() {
+        return Err(std::io::Error::other("the snapshot exceeded its input or time budget"));
+    }
+    result
+}
+
 /// One evaluated root: either a candidate or an explicit keep reason.
 struct Evaluated {
     row: Row,
@@ -1624,6 +1692,7 @@ impl<'a> IntoIterator for &'a Evaluation {
 fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
     let store = paired_store()?;
     let control = store.owner_control().to_path_buf();
+    let authority = AuthorityScope::begin()?;
     let list = match operator_list {
         Some(path) => Some(read_operator_list(path)?),
         None => None,
@@ -1644,7 +1713,8 @@ fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
             ),
         ));
     }
-    let evaluated = evaluate(&store, &control, &registry, list.as_ref())?;
+    let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &authority)?;
+    drop(authority);
     let preview = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete);
     preview.validate()?;
     let bytes = serde_json::to_vec(&preview).map_err(|error| error.to_string())?;
@@ -1787,9 +1857,27 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             }
         };
     }
-    // Fresh revalidation: the plan's root identity set must match one-to-one,
-    // with roots completed by an exact intent replay excluded.
-    let evaluated = match evaluate(&store, &control, &registry, list.as_ref()) {
+    // Start one fresh authority window after any exact intent replay. The
+    // registry and optional list are re-read inside that window.
+    let authority = AuthorityScope::begin()?;
+    registry = match ready_registry(&control) {
+        Ok(registry) => registry,
+        Err(reason) if !completed_roots.is_empty() => {
+            return Ok(partial(&completed_roots, &format!("the fresh registry failed ({reason})")));
+        }
+        Err(reason) => return Ok(refused(&reason)),
+    };
+    let fresh_list = match operator_list {
+        Some(path) => {
+            let fresh = read_operator_list(path)?;
+            if list.as_ref().map(|old| &old.sha256) != Some(&fresh.sha256) {
+                return Ok(refused("the operator list changed during revalidation"));
+            }
+            Some(fresh)
+        }
+        None => None,
+    };
+    let evaluated = match evaluate(&store, &control, &registry, fresh_list.as_ref(), &authority) {
         Ok(evaluated) => evaluated,
         Err(reason) if !completed_roots.is_empty() => {
             return Ok(partial(
@@ -1799,7 +1887,8 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         }
         Err(reason) => return Err(reason),
     };
-    let fresh = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete);
+    drop(authority);
+    let fresh = build_preview(&registry, &evaluated, fresh_list.as_ref(), evaluated.complete);
     if !fresh.coverage.complete {
         let reason = "the fresh authority snapshot is incomplete, so every remaining root is kept";
         return Ok(if completed_roots.is_empty() {
@@ -2057,8 +2146,7 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
     let file = File::open(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
+    authority_read(file.take(limit as u64 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the {what} {}: {error}", path.display()))?;
     if bytes.len() > limit {
         return Err(format!(
@@ -2077,8 +2165,8 @@ fn evaluate(
     control: &Path,
     registry: &Registry,
     list: Option<&OperatorList>,
+    authority: &AuthorityScope,
 ) -> Result<Evaluation, String> {
-    let deadline = Instant::now() + SNAPSHOT_TIME;
     let mut budget = SNAPSHOT_MAX_BYTES;
     let mut receipts: std::collections::HashMap<String, Result<Receipt, String>> =
         std::collections::HashMap::new();
@@ -2139,9 +2227,7 @@ fn evaluate(
     };
     for row in rows {
         let entry = receipts.entry(row.checkout_id.clone()).or_insert_with(|| {
-            match outputs::read_receipt_for_prune_budgeted(
-                control, &row.checkout, &row.checkout_id, &mut budget,
-            ) {
+            match outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id) {
                 Ok(Some(receipt)) => Ok(receipt),
                 Ok(None) => Err(format!(
                     "the receipt {} is missing",
@@ -2151,13 +2237,19 @@ fn evaluate(
             }
         });
         let receipt = match entry.as_ref() {
+            Ok(receipt) if receipt.checkout() != row.checkout
+                || receipt.checkout_id() != row.checkout_id
+                || row.receipt != outputs::receipt_path_public(control, &row.checkout_id) => {
+                snapshot_error.get_or_insert_with(|| "the registry and receipt identity disagree".to_owned());
+                None
+            }
             Ok(receipt) => Some(receipt),
             Err(reason) => {
                 snapshot_error.get_or_insert_with(|| reason.clone());
                 None
             }
         };
-        if Instant::now() > deadline {
+        if !authority.complete() {
             snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
         }
         let mut out = Evaluated {
@@ -2247,14 +2339,43 @@ fn evaluate(
                     );
                 }
             }
+            if entry.candidate.is_none() {
+                let reason = entry.kept.as_deref().unwrap_or("receiptless authority is unknown");
+                if reason != "the checkout is present, so its root is kept"
+                    && reason != "an active writer still holds this checkout"
+                    && !reason.starts_with("a recorded writer still holds this checkout (")
+                {
+                    snapshot_error.get_or_insert_with(|| reason.to_owned());
+                }
+            }
             evaluated.push(entry);
         }
     }
-    if Instant::now() > deadline {
+    if !authority.complete() {
         snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
     }
-    // A representative row is not the transaction authority. Verify every
-    // group's selected references against the already-read checkout receipt.
+    // Verify selected receipt references for every complete group, including
+    // ordinary kept roots. A representative is not full transaction authority.
+    for entry in &evaluated {
+        if entry.row.checkout_id.is_empty() || entry.candidate.as_ref().is_some_and(|c| c.receiptless) {
+            continue;
+        }
+        let group: Vec<GroupRow> = group_rows(registry, &entry.row.checkout_id, &entry.row.root)
+            .iter().map(|row| GroupRow {
+                member: row.member.clone(), generation: row.generation, nonce: row.nonce.clone(),
+                root_dev: row.root_dev, root_ino: row.root_ino,
+                marker_digest: row.marker_digest.clone(), selected: row.selected,
+            }).collect();
+        if let Some(Ok(receipt)) = receipts.get(&entry.row.checkout_id) {
+            if receipt.prepared_ref().is_some() {
+                continue;
+            }
+            if let Err(reason) = verify_group_against_receipt(receipt, &entry.row.root, &group) {
+                snapshot_error.get_or_insert(reason);
+            }
+        }
+    }
+    // Candidate identity also requires all of the group's recorded facts.
     for entry in &evaluated {
         if let Some(candidate) = &entry.candidate {
             if candidate.receiptless {
@@ -2271,8 +2392,17 @@ fn evaluate(
             }
         }
     }
-    if Instant::now() > deadline {
+    if !authority.complete() {
         snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
+    }
+    let mut roots: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    for candidate in evaluated.iter().filter_map(|entry| entry.candidate.as_ref()) {
+        if !roots.insert(&candidate.root) {
+            snapshot_error.get_or_insert_with(|| "more than one live registry reference names this root".to_owned());
+        }
+    }
+    if !authority.complete() {
+        snapshot_error.get_or_insert_with(|| "the snapshot exceeded its input or time budget".to_owned());
     }
     if let Some(reason) = snapshot_error {
         for entry in &mut evaluated {
@@ -2283,25 +2413,16 @@ fn evaluate(
         }
         return Ok(Evaluation { entries: evaluated, complete: false });
     }
-    // One root may not be selected by two live references.
-    let mut counts: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
-    for entry in &evaluated {
-        if let Some(candidate) = &entry.candidate {
-            *counts.entry(candidate.root.clone()).or_insert(0) += 1;
-        }
-    }
-    for entry in &mut evaluated {
-        let duplicated = entry
-            .candidate
-            .as_ref()
-            .is_some_and(|candidate| counts.get(&candidate.root).copied().unwrap_or(0) > 1);
-        if duplicated {
-            entry.kept = Some("more than one live registry reference names this root".to_owned());
-            entry.candidate = None;
-        }
-    }
-    account_candidates(&mut evaluated);
+    // Diagnostics do not consume authority time or input budget.
+    AUTHORITY.with(|cell| *cell.borrow_mut() = None);
+    account_candidates(&mut evaluated, control);
     Ok(Evaluation { entries: evaluated, complete: true })
+}
+
+#[cfg(test)]
+fn evaluate_test(store: &Store, control: &Path, registry: &Registry, list: Option<&OperatorList>) -> Result<Evaluation, String> {
+    let authority = AuthorityScope::begin()?;
+    evaluate(store, control, registry, list, &authority)
 }
 
 /// The eligibility predicates for one row. `Ok(None)` means every predicate
@@ -2315,7 +2436,7 @@ fn eligibility(
     row: &Row,
     receipt: Option<&Receipt>,
     list: Option<&OperatorList>,
-    budget: &mut u64,
+    _budget: &mut u64,
     under_barrier: bool,
 ) -> Result<Option<String>, String> {
     if !registry.complete {
@@ -2420,9 +2541,6 @@ fn eligibility(
         if let Err(reason) = custody_clear_under_barrier(store, control, &row.checkout) {
             return Ok(Some(reason));
         }
-        if *budget > 0 {
-            *budget = budget.saturating_sub(row.root.to_string_lossy().len() as u64);
-        }
         return Ok(None);
     }
     match store.checkout_custody(&row.checkout, 0)? {
@@ -2456,9 +2574,6 @@ fn eligibility(
                 "the removable pool's writer records are unreadable ({reason})"
             ))
         }
-    }
-    if *budget > 0 {
-        *budget = budget.saturating_sub(row.root.to_string_lossy().len() as u64);
     }
     Ok(None)
 }
@@ -2987,9 +3102,7 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
     // SAFETY: `marker_fd` is a newly owned descriptor.
     let marker_file = unsafe { File::from_raw_fd(marker_fd) };
     let mut bytes = Vec::new();
-    marker_file
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut bytes)
+    authority_read(marker_file.take(64 * 1024 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the owner marker: {error}"))?;
     if bytes.len() > 64 * 1024 {
         return Ok(RootState::Unknown(
@@ -3037,12 +3150,17 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
     }))
 }
 
-fn account_candidates(evaluated: &mut [Evaluated]) {
+fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
     let deadline = Instant::now() + Duration::from_millis(OBSERVATION_MS);
     let mut remaining = OBSERVATION_ENTRIES;
     for candidate in evaluated.iter_mut().filter_map(|entry| entry.candidate.as_mut()) {
         let now = Instant::now();
         if remaining == 0 || now >= deadline {
+            break;
+        }
+        diagnostic_delay(control, &candidate.root);
+        let now = Instant::now();
+        if now >= deadline {
             break;
         }
         let limits = InventoryLimits {
@@ -3061,6 +3179,35 @@ fn account_candidates(evaluated: &mut [Evaluated]) {
         candidate.accounting_complete = report.coverage.complete && Instant::now() <= deadline;
     }
 }
+
+/// This test-only delay is armed only for a private control directory inside
+/// the supervisor's scratch. It never relaxes inventory's mutation-hook rules.
+#[cfg(debug_assertions)]
+fn diagnostic_delay(control: &Path, root: &Path) {
+    let Some(evidence) = proof_evidence() else { return };
+    let Some(scratch) = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+        .and_then(|path| fs::canonicalize(path).ok()) else { return };
+    let Ok(canonical_control) = fs::canonicalize(control) else { return };
+    if canonical_control != control || canonical_control == scratch
+        || !canonical_control.starts_with(&scratch)
+        || !matches!(store::open_control_directory(control), Ok(Some(_)))
+    {
+        return;
+    }
+    let Some(target) = std::env::var_os("OXIDE_TEST_PRUNE_DIAGNOSTIC_DELAY") else { return };
+    if Path::new(&target) != root {
+        return;
+    }
+    let recorded = OpenOptions::new().create_new(true).write(true).mode(0o600)
+        .open(evidence.join("prune-diagnostic-delay-fired"))
+        .and_then(|mut file| writeln!(file, "{}", root.display()));
+    if recorded.is_ok() {
+        std::thread::sleep(Duration::from_secs(11));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn diagnostic_delay(_control: &Path, _root: &Path) {}
 
 fn build_preview(
     registry: &Registry,
@@ -6960,6 +7107,19 @@ mod tests {
     }
 
     #[test]
+    fn authority_budget_charges_actual_reads_and_latches_exhaustion() {
+        let scope = AuthorityScope::begin().unwrap();
+        AUTHORITY.with(|cell| cell.borrow_mut().as_mut().unwrap().remaining = 5);
+        let mut first = Vec::new();
+        assert_eq!(authority_read(&b"abc"[..], &mut first).unwrap(), 3);
+        assert!(scope.complete());
+        let mut second = Vec::new();
+        assert!(authority_read(&b"xyz"[..], &mut second).is_err());
+        assert_eq!(second, b"xy");
+        assert!(!scope.complete());
+    }
+
+    #[test]
     fn a_malformed_receipt_keeps_the_whole_snapshot_batch() {
         let fixture = Fixture::new();
         let control = fixture.root.join("control");
@@ -6986,7 +7146,7 @@ mod tests {
         };
         write_registry(&control, &registry).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
-        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, None).unwrap();
         assert!(!evaluated.complete);
         assert!(!build_preview(&registry, &evaluated, None, evaluated.complete).coverage.complete);
         assert!(evaluated.iter().all(|entry| entry.candidate.is_none()));
@@ -7128,7 +7288,7 @@ mod tests {
         }
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
         let registry = ready_registry(&control).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, None).unwrap();
         assert_eq!(evaluated.len(), 3);
         for entry in &evaluated {
             let reason = entry.kept.clone().unwrap_or_default();
@@ -7142,7 +7302,7 @@ mod tests {
             roots: vec![one.root.clone(), two.root.clone(), three.root.clone()],
             sha256: "d".repeat(64),
         };
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert_eq!(evaluated.len(), 3);
         for entry in &evaluated {
             let reason = entry.kept.clone().unwrap_or_default();
@@ -7169,7 +7329,7 @@ mod tests {
             Some(&row.root),
         );
         publish_snapshot_receipt(&control, &row, &legacy);
-        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, None).unwrap();
         assert!(evaluated[0]
             .kept
             .as_deref()
@@ -7178,7 +7338,7 @@ mod tests {
             roots: vec![row.root.clone()],
             sha256: "d".repeat(64),
         };
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert!(evaluated[0]
             .kept
             .as_deref()
@@ -7196,7 +7356,7 @@ mod tests {
                 Some(&elsewhere),
             ),
         );
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert!(evaluated[0]
             .kept
             .as_deref()
@@ -7209,7 +7369,7 @@ mod tests {
         recorded.nonce = Some("b".repeat(32));
         write_snapshot_registry(&control, vec![recorded.clone()], Vec::new());
         let registry = ready_registry(&control).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert!(evaluated[0].kept.as_deref().is_some_and(
             |reason| reason.contains("does not match the checkout's committed receipt")
         ));
@@ -7230,7 +7390,7 @@ mod tests {
         });
         publish_snapshot_receipt(&control, &row, &prepared);
         let registry = ready_registry(&control).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         let reason = evaluated[0].kept.clone().unwrap_or_default();
         assert!(reason.contains("not committed for this root"), "{reason}");
 
@@ -7239,7 +7399,7 @@ mod tests {
         let mut contradictory = legacy.clone();
         contradictory["state"] = serde_json::json!("pruned");
         publish_snapshot_receipt(&control, &row, &contradictory);
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         let reason = evaluated[0].kept.clone().unwrap_or_default();
         assert!(reason.contains("whole batch"), "{reason}");
         assert!(
@@ -7253,7 +7413,7 @@ mod tests {
 
         // A missing receipt names its own file in the same bounded summary.
         fs::remove_file(outputs::receipt_path_public(&control, &row.checkout_id)).unwrap();
-        let evaluated = evaluate(&store, &control, &registry, Some(&list)).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         let reason = evaluated[0].kept.clone().unwrap_or_default();
         assert!(reason.contains("whole batch"), "{reason}");
         assert!(reason.contains("is missing"), "{reason}");
