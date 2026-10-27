@@ -1,6 +1,22 @@
 //! Bounded human-readable descriptions of recorded seed facts.
 
 use oxide_storage::lease::managed::{SeedLast, SeedRejectReason};
+use std::path::Path;
+
+/// Read a recorded seed only after the front door has enabled qualified
+/// seeding. The disabled branch performs no sidecar read.
+pub(crate) fn recorded_if_enabled(pool: &Path, enabled: bool) -> Option<String> {
+    recorded_with(enabled, || {
+        oxide_storage::lease::managed::read_seed_last(pool)
+    })
+}
+
+fn recorded_with(enabled: bool, read: impl FnOnce() -> Option<SeedLast>) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    read().map(|last| recorded(&last))
+}
 
 fn reason(reason: SeedRejectReason) -> &'static str {
     match reason {
@@ -78,6 +94,12 @@ pub(crate) fn recorded(last: &SeedLast) -> String {
 mod tests {
     use super::*;
     use oxide_storage::lease::managed::SeedBucket;
+
+    #[test]
+    fn disabled_status_never_reads_the_sidecar() {
+        assert!(recorded_with(false, || panic!("unexpected sidecar read")).is_none());
+        assert!(recorded_with(true, || None).is_none());
+    }
 
     #[test]
     fn summary_distinguishes_unknown_from_counted_units() {

@@ -364,6 +364,12 @@ fn test_pause_with(point: &str, detail: &str) {
 }
 
 /// Opt-in is deliberately held until the pinned Cargo layout is qualified.
+const COLD_SEED_QUALIFIED: bool = false;
+
+fn cold_seed_active(value: Option<&std::ffi::OsStr>) -> bool {
+    COLD_SEED_QUALIFIED && value == Some(std::ffi::OsStr::new("1"))
+}
+
 fn cold_seed_qualification_notice(value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
     (value == Some(std::ffi::OsStr::new("1")))
         .then_some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
@@ -509,6 +515,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     }
     let started = Instant::now();
     let mut waits = store::WaitAccounting::default();
+    let mut grants = LeaseGrants::new();
     let resolution = cli::resolution(&invocation.cargo_args);
     let label = exec_label(&invocation.tool);
     let (mut held, gate) = match lease_with_gate(
@@ -518,6 +525,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         &resolution,
         label.as_deref(),
         &mut waits,
+        &mut grants,
     )? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
@@ -1161,6 +1169,24 @@ enum Stop {
 /// builds cold. A `--locked` or `--frozen` lock refusal is the command's own
 /// failure: the slot goes back unchanged and the command ends as plain Cargo
 /// would.
+struct LeaseGrants {
+    remaining: u8,
+    share: bool,
+}
+
+impl LeaseGrants {
+    fn new() -> Self {
+        Self {
+            remaining: 9,
+            share: true,
+        }
+    }
+
+    fn taken(&mut self) {
+        self.remaining -= 1;
+    }
+}
+
 fn lease_with_gate(
     store: &Store,
     key: &SlotKey,
@@ -1168,17 +1194,18 @@ fn lease_with_gate(
     resolution: &cli::Resolution,
     label: Option<&str>,
     waits: &mut store::WaitAccounting,
+    grants: &mut LeaseGrants,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
-    let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot. At most nine grants: the eight project slots a
     // refused command can try plus one cold fallback (oxide#118).
-    for _ in 0..9 {
-        let mut held = match store.acquire(key, profile, share, label, waits)? {
+    while grants.remaining > 0 {
+        let mut held = match store.acquire(key, profile, grants.share, label, waits)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
             Acquired::AdmissionExpired => return Ok(Err(Stop::Admission)),
         };
+        grants.taken();
         let refusal = freshness::prepare(&key.checkout, &held.prior, resolution);
         // Taken just now, or left on this checkout's record by a command
         // that died before Cargo.
@@ -1201,7 +1228,7 @@ fn lease_with_gate(
                 return Ok(Err(Stop::Cargo(code)));
             }
         };
-        share = false;
+        grants.share = false;
         if held.shared_from.is_some() || foreign.is_some() {
             eprintln!(
                 "oxide: freshness gate refused another checkout's slot ({reason}); building cold"
@@ -1533,6 +1560,11 @@ fn print_pools(
             Section::Internal(note) => {
                 let header = format!("internal pool: {}{note}", internal.pool.display());
                 print_pool(internal, &header, &[], &internal_report, mode)?;
+                let seed_enabled = cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref());
+                if let Some(line) = seed_summary::recorded_if_enabled(&internal.pool, seed_enabled)
+                {
+                    println!("{line}");
+                }
                 for line in crate::prune::status_lines(internal.control()) {
                     println!("  {line}");
                 }
@@ -2184,12 +2216,28 @@ mod tests {
 
     #[test]
     fn cold_seed_opt_in_is_qualification_held() {
+        assert!(!cold_seed_active(None));
+        assert!(!cold_seed_active(Some(OsStr::new("1"))));
         assert_eq!(cold_seed_qualification_notice(None), None);
         assert_eq!(cold_seed_qualification_notice(Some(OsStr::new("0"))), None);
         assert_eq!(
             cold_seed_qualification_notice(Some(OsStr::new("1"))),
             Some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
         );
+    }
+
+    #[test]
+    fn lease_grant_limit_is_retained_across_admission_passes() {
+        let mut grants = LeaseGrants::new();
+        assert!(grants.share);
+        for _ in 0..8 {
+            grants.taken();
+        }
+        grants.share = false;
+        assert_eq!(grants.remaining, 1);
+        grants.taken();
+        assert_eq!(grants.remaining, 0);
+        assert!(!grants.share);
     }
 
     fn const_scan() -> oxide_storage::lease::AccountingScan {
