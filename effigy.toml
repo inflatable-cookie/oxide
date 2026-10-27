@@ -506,6 +506,40 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 [tasks."proof:prune-authority:test"]
 run = "python3 scripts/test-prune-authority.py --self-check"
 
+# oxide#135 focused checked-out-absence proof: one fixed script under the
+# qualified shared supervisor. A checkout path outside /Volumes may be proved
+# absent with missing ancestors only from a no-follow descriptor walk whose held
+# nearest existing ancestor is on the boot Data volume, and the real run's own
+# ancestry witness is compared again under the barrier and immediately before
+# publication. `--root-parent /private/tmp` is the owner-accepted
+# internal-placement exception (decision bd357a4c) for BOTH premises: the
+# missing-chain fixtures must sit on the boot Data volume, and the fixture's
+# directory-budget pool is a genuine internal pool the product correctly refuses
+# on an external volume. One owned 128 MiB scratch image is the non-Data and
+# ownership control. Prospective, UNMEASURED: 300 s, 512 MiB monitored scratch
+# including cleanup, staging at two Cargo jobs, fixtures run no Cargo child.
+# Each side's native run needs its own counted owner activation; its fit is
+# unmeasured and no native has run.
+[tasks."rust:prune-absence"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-absence.py"
+
+# The same fixed script in its opt-in keep-going diagnostic mode: the same guard,
+# root, image and limits with `--diagnostic` appended. It records reached,
+# completed, failed, dependency-skipped and unexecuted cases plus the latched
+# first fault in a bounded `qualified: false` receipt and never grants native
+# PASS credit. Owner-activated only.
+[tasks."rust:prune-absence:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-absence.py --diagnostic"
+
+# Pure, effect-free apparatus check for that proof: the same fixed script's
+# `--self-check`, which stages nothing, starts no child and touches no fixture,
+# pool or image. It drives the real oracles, the mount-spelling classifier and
+# the case/allocation table with in-memory counterfactuals.
+[tasks."proof:prune-absence:test"]
+run = "python3 scripts/test-prune-absence.py --self-check"
+
 [tasks."rust:outputs-prune"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py"
