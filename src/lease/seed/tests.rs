@@ -2611,6 +2611,7 @@ fn catalog_publication_requires_matching_unseeded_attempt() {
 fn last_seed_read_requires_current_ledger_generation() {
     reset_hooks();
     let rig = Rig::new("last-generation");
+    rig.affinity_dir(1);
     let (grant, _) = lease_recipient(&rig, "last");
     let last = SeedLast {
         schema: "oxide.cold-seed/1".into(),
