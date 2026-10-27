@@ -5110,7 +5110,24 @@ The stable, read-only interface other tools use to find the registered Builds dr
   census is authoritative for the run's reported closure but cannot retroactively
   retain an image the proof already detached, and no such retention is claimed. A
   writer that escaped its parent's group is outside the cooperative custody
-  boundary both this proof and the product document. A child that is still
+  boundary both this proof and the product document. The detach itself follows
+  the Oxide Supervisor's pre-detach protocol (shared `ImageCustody` in
+  `scripts/test-outputs-prune.py`, opt-in so the other proofs keep their
+  historical behaviour): the image is positively rebound from a fresh
+  `hdiutil info` for THIS backing and a fresh `diskutil info` for its bound
+  device (backing path inside the never-auto-cleaned evidence directory, mounted
+  entity, bound device, volume UUID and whole-disk device), the proof's own
+  session is censused with a bounded readable `kinfo_proc` snapshot where only
+  the script itself may appear, ONE ordinary `hdiutil detach` of the bound
+  device runs (never `-force`, never retried), the mount and device must then be
+  positively absent, the session is censused again, and only after both clean
+  censuses is the evidence backing removed and
+  `removed-after-clean-pre/post-census-and-ordinary-detach` recorded. An extra
+  member, an unreadable row, a row-bound hit, a rebind mismatch, a failed detach
+  (including EBUSY) or a lingering device all retain the image, its backing and
+  its record, with the members recorded. A process that calls `setsid` leaves
+  the proof's session and is outside the census — the coordinator's own residual
+  limitation — so no claim is made that such a writer is observed. A child that is still
   running is waited for, never mistaken for a stuck one: the armed races mutate
   the fixture while the product is inside its own 11-second delay. Each
   state-mutating case puts its own fixture back (checkout chain, replaced

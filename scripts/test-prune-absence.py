@@ -32,9 +32,19 @@ Premise checklist (mandatory for a proof-authoring brief):
     children's outcomes and exits, and the qualified supervisor censuses the
     session only AFTER its leader has ended, so that census is authoritative for
     the run's reported closure but cannot retroactively retain an image this
-    script has already detached. A writer that escaped its parent's group is
-    outside the cooperative custody boundary this proof and the product both
-    document, and no claim is made that it is.
+    script has already detached. The detach itself now follows the Oxide
+    Supervisor's pre-detach protocol: the image is positively rebound (backing,
+    mounted entity, bound device, volume UUID and whole-disk device), this
+    proof's own session is censused with a bounded readable reader before the
+    detach, ONE ordinary `hdiutil detach` of the bound device is made (never
+    `-force` and never retried), the mount and device must be positively gone, the
+    session is censused again, and only then is the evidence backing removed. Any
+    unknown, unreadable row, row-bound hit or extra session member retains the
+    image, its backing and its record for the owner. The residual limitation is
+    named: a process that calls `setsid` leaves this session and is outside the
+    census — exactly the coordinator's own scope statement — so no claim is made
+    that such a writer is observed, and the backing never leaves the guard's
+    never-auto-cleaned evidence directory.
 (7) staging scrubs the encoded and plain Rust-wrapper flags; fixtures set
     RUSTFLAGS empty and drop CARGO_ENCODED_RUSTFLAGS.
 (8) the selector fixes --root-parent /private/tmp: the missing-ancestor premise
@@ -135,6 +145,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+from types import SimpleNamespace
 import stat
 import subprocess
 import sys
@@ -778,6 +789,9 @@ def run_cases(proof, custody, diagnostic, cases):
     )
     require(code == 0 and "registered removable pool" in out, err)
     require_settled(proof, "after the drive registration")
+    # The image's own volume UUID, as the product recorded it for this pool. The
+    # pre-detach rebind requires exactly this value.
+    proof.expected_volume_uuid = permanent.real_uuid(world.pool)
 
     chains = Path(adapter.root) / "chains"
     chains.mkdir(mode=0o700)
@@ -1325,6 +1339,204 @@ def run_cases(proof, custody, diagnostic, cases):
     return cases
 
 
+class FakeCustodyEffects:
+    """In-memory custody effects for the pre-detach counterfactuals.
+
+    It records the ORDER of the censuses, the detach and the backing removal, and
+    it can inject an EBUSY detach, a lingering device or a failing removal. No
+    file, image or process is touched.
+    """
+
+    def __init__(self, entities, volume, detach_code=0, lingering=(), remove_error=None):
+        self.entities = entities
+        self.volume = volume
+        self.detach_code = detach_code
+        self.lingering = set(lingering)
+        self.remove_error = remove_error
+        self.records = {}
+        self.events = []
+        self.detached = []
+        self.removed = []
+
+    def stat(self, path):
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=os.geteuid(),
+            st_dev=7,
+            st_ino=1,
+            st_size=128 * 1024 * 1024,
+            st_nlink=1,
+        )
+
+    def realpath(self, path):
+        return path
+
+    def euid(self):
+        return os.geteuid()
+
+    def exists(self, path):
+        return path in self.lingering
+
+    def write_record(self, path, text):
+        self.records[path] = text
+
+    def image_entities(self, backing):
+        return self.entities
+
+    def volume_facts(self, device):
+        return self.volume
+
+    def detach_device(self, device):
+        self.events.append("detach")
+        self.detached.append(device)
+        return self.detach_code, ""
+
+    def detach(self, mount):
+        raise AssertionError("the legacy mount detach is not used by the pre-detach protocol")
+
+    def remove(self, path):
+        self.events.append("remove")
+        if self.remove_error is not None:
+            raise OSError(self.remove_error)
+        self.removed.append(path)
+
+
+def fake_custody(effects, volume_uuid="UUID-135", whole_disk="/dev/disk9"):
+    """One attached ImageCustody over in-memory effects (no allocation, no image)."""
+    custody = prior.ImageCustody("Ox135Fake", effects=effects)
+    custody.evidence = "/evidence"
+    custody.backing = "/evidence/152-image-Ox135Fake.sparseimage"
+    custody.record = "/evidence/152-image-Ox135Fake-custody.json"
+    custody.attach_document = "/evidence/152-image-Ox135Fake-attach.plist"
+    custody.expected_mount = "/Volumes/Ox135Fake"
+    custody.mount = "/Volumes/Ox135Fake"
+    custody.device = "/dev/disk9s1"
+    custody.volume_uuid = volume_uuid
+    custody.whole_disk = whole_disk
+    custody.state = "attached"
+    custody.disposition = None
+    return custody
+
+
+def fake_census(events, extra_after=None):
+    """A census that records its order and reports an extra member after a count.
+
+    `extra_after=None` never reports one; `0` reports one on every call; `1`
+    reports one only from the second call on (a clean pre-census, a dirty post)."""
+    calls = {"n": 0}
+
+    def census(owner, allowed):
+        calls["n"] += 1
+        events.append("census")
+        extra = [4242] if extra_after is not None and calls["n"] > extra_after else []
+        return {
+            "certain": not extra,
+            "members": [owner],
+            "extra": extra,
+            "reason": None if not extra else "synthetic extra member",
+        }
+
+    return census
+
+
+def detach_counterfactuals() -> None:
+    """The four pre-detach counterfactuals, plus `-force` being unreachable."""
+    # No `-force` is reachable: the program tuple is detach-only and a device
+    # argument is never a flag.
+    require("force" not in prior.detach_argv("/dev/disk9s1"), "a force flag is reachable")
+    try:
+        prior.detach_argv("-force")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a flag passed as the device was accepted")
+    entities = [
+        {"mount-point": "/Volumes/Ox135Fake", "dev-entry": "/dev/disk9s1"},
+        {"dev-entry": "/dev/disk9"},
+    ]
+    volume = {"uuid": "UUID-135", "whole_disk": "/dev/disk9"}
+    # Extra PRE-detach member: nothing is detached and the backing is kept.
+    effects = FakeCustodyEffects(entities, volume)
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(
+            os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events, extra_after=0)
+        ),
+    )
+    require(disposition == "refused:census", f"an extra pre member was not refused: {disposition}")
+    require(not effects.detached and not effects.removed, "an extra pre member still detached")
+    require(effects.events == ["census"], f"the pre-census was not the only effect: {effects.events}")
+    # Extra POST-detach member: detached once, backing kept, no retry.
+    effects = FakeCustodyEffects(entities, volume)
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(
+            os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events, extra_after=1)
+        ),
+    )
+    require(
+        disposition == "retained:post-census",
+        f"an extra post member did not retain the backing: {disposition}",
+    )
+    require(len(effects.detached) == 1, "the detach was replayed")
+    require(not effects.removed, "the backing was removed despite an extra post member")
+    require(effects.events == ["census", "detach", "census"], f"unexpected order: {effects.events}")
+    # Injected EBUSY: retained, never retried, never forced.
+    effects = FakeCustodyEffects(entities, volume, detach_code=16)
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events)),
+    )
+    require(
+        disposition == "retained:detach-failed",
+        f"an EBUSY detach was not retained: {disposition}",
+    )
+    require(len(effects.detached) == 1 and not effects.removed, "an EBUSY detach retried or removed")
+    # Success removes the backing only AFTER the pre-census, the detach, the
+    # absence check and the post-census.
+    effects = FakeCustodyEffects(entities, volume)
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events)),
+    )
+    require(disposition == "completed", f"a clean detach did not complete: {disposition}")
+    require(
+        effects.events == ["census", "detach", "census", "remove"],
+        f"the backing was not removed after both censuses: {effects.events}",
+    )
+    require(effects.removed == [custody.backing], "the backing was not the removed object")
+    require(
+        '"removed-after-clean-pre/post-census-and-ordinary-detach"'
+        in effects.records[custody.record],
+        "the success record does not carry the two-census removal marker",
+    )
+    # A lingering device after a successful detach retains the backing.
+    effects = FakeCustodyEffects(entities, volume, lingering={"/dev/disk9s1"})
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "UUID-135", fake_census(effects.events)),
+    )
+    require(
+        disposition == "retained:lingering",
+        f"a lingering device did not retain the backing: {disposition}",
+    )
+    require(not effects.removed, "the backing was removed with a lingering device")
+    # A wrong volume UUID refuses before any detach.
+    effects = FakeCustodyEffects(entities, volume)
+    custody = fake_custody(effects)
+    disposition = custody.detach_once(
+        True,
+        prior.DetachCustody(os.getpid(), (os.getpid(),), "OTHER", fake_census(effects.events)),
+    )
+    require(disposition == "refused:unbound", f"a wrong volume UUID was not refused: {disposition}")
+    require(not effects.detached and effects.events == [], "a wrong volume UUID still detached")
+
+
 def source_structure_problems(source: str) -> list:
     """Static problems in THIS script's own source, checked without an effect.
 
@@ -1419,6 +1631,8 @@ def self_check() -> int:
     # This file's own structure: the case table and every unpacked helper.
     structure = source_structure_problems(Path(__file__).read_text())
     require(not structure, f"the proof's own structure is inconsistent: {structure}")
+    # The pre-detach protocol's counterfactuals (injectable effects only).
+    detach_counterfactuals()
     # A different incomplete-authority reason never satisfies an oracle, even
     # though it also keeps the whole batch.
     for expected in (
@@ -1664,7 +1878,17 @@ def main():
         # run reports, not a retention this script can rely on. Nothing here
         # claims otherwise.
         own_children = custody_abort_reason(proof, proof.unclosed)
-        disposition = custody.detach_once(sessions_closed=own_children is None)
+        # The pre-detach protocol: rebind the image, census THIS proof's own
+        # session, detach the bound device ordinarily (never -force), verify the
+        # mount/device are gone, census again, and only then remove the backing.
+        detach_custody = prior.DetachCustody(
+            owner_pid=os.getpid(),
+            allowed_pids=(os.getpid(),),
+            volume_uuid=getattr(proof, "expected_volume_uuid", "") or "",
+        )
+        disposition = custody.detach_once(
+            sessions_closed=own_children is None, custody=detach_custody
+        )
     recorded = {item["case"] for item in cases}
     cases.extend(
         {"case": name, "state": "unexecuted"} for name in CASE_NAMES if name not in recorded
@@ -1688,6 +1912,14 @@ def main():
     if error is not None:
         raise error
     require(disposition == "completed", f"the ordinary detach was {disposition}")
+    recorded = permanent.read_json(custody.record)
+    require(
+        recorded.get("census") == "pre-clean,post-clean"
+        and str(recorded.get("backing", "")).startswith(
+            "removed-after-clean-pre/post-census-and-ordinary-detach"
+        ),
+        f"the recorded detach disposition is not the two-census one: {recorded}",
+    )
     require(own_children is None, f"this run's own child closure is unknown: {own_children}")
     require(all(case["state"] == "completed" for case in cases), "proof incomplete")
 
