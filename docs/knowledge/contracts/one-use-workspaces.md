@@ -10,6 +10,32 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 5** answers the CHANGES REQUIRED design review of `0de3d22`
+(comment `6453147896`, 2026-10-27) with four corrections. **The pre-effect
+hand-off now covers the real removable path**: the installed reader peeks
+`<control>/removable/state.json` while the removable store loads and saves
+`<control>/removable/oxide-managed/state.json`, and a pool whose only state is
+removable has no internal document to carry a version — so the design adds a
+durable **legacy fence document** at the peeked path (version N+1, written before
+the first v6 removable state write), corrects the candidate's own peek to the
+real path, and proves both with a positive control (older artifact exits 75
+before any output effect), a negative control (fence removed → the old artifact
+effects then fails at load) and a candidate control, using the identified
+pre-feature artifact `489eecc` staged by role on the real control paths. **Seed
+headroom is now measured fresh inside the seed transaction** under its own
+custody, never inherited from admission, because admission releases its lock
+before binding and two one-use commands could otherwise share a stale remainder
+and over-clone; unknown or unfit headroom skips cold, and #137's
+untrusted-recipient and failed-walk dispositions are preserved. **The reserve
+wiring is withdrawn and returned to the owner**: making the prune branch reachable
+would add a deletion behaviour the brief forbids inventing, so the design keeps
+the shipped refusal, asserts it natively as a negative case, specifies the
+class-scoped policy purely, and returns the reserve-path protection requirement
+plus its wiring change for a scoped ruling. **Byte pressure is stated correctly**
+for retries: a removable pool's effective cap is the recorded registration cap,
+not `OXIDE_POOL_CAP`, so the retry premises use the effective cap. The declared
+bound moves to 480 s with a 430 s cutoff for the added older-artifact staging
+(~296 s typical / ~370 s upper, ~298 MiB), put to the freeze for acceptance.
 **Revision 4** answers the CHANGES REQUIRED design review of `0fb9396`
 (comment `6452964156`, 2026-10-27) with three corrections. **The eviction
 custody facts no longer reacquire locks**: `Store::checkout_custody` takes
@@ -19,7 +45,8 @@ same process's own `flock`. The design now specifies one **in-custody reader**
 (§5.5.2) that consumes the two state snapshots the admission already holds, with
 the inherited internal-then-this-store lock order, `Unknown` for an unreadable
 sibling, the same `Clear`/`Writers`/`Unknown` verdicts, no lock or file creation,
-and a regression on both backends. **The reserve case is now achievable**: a
+and a regression on both backends. **The reserve case was reworked** (superseded
+by revision 5, which withdrew it and returned the requirement to the owner): a
 ~128 MiB image is always below the fixed 10 GiB floor, so
 `unknown_removable_step` can only `Evict` then `Refuse` there; the case therefore
 asserts one-use (`Only`) protection — retire the eligible idle members in rank
@@ -35,22 +62,16 @@ without changing anything; no new seam is proposed, and an interleaved
 observation is explicitly not claimed. The time/disk allocation is recalculated
 (~267 s typical / ~335 s upper of the 420 s bound, ~258 MiB of 512).
 
-**Revision 4 also records one product fact the reserve case exposed.** The
-removable reserve prune is **unreachable in the current source**: `attempt` sets
-`LeaseRequest.reserve_bytes` from `crate::removable::registration(self)`
-(`store.rs:3277-3280`), and for a removable-store admission `self.control()` is
-`<owner>/removable/oxide-managed` (`removable.rs:30`, `store.rs:1546-1547`)
-while the registration is written at `<owner>/removable.json`
-(`removable.rs:28,298`). `registration` therefore returns `None`, the request
-carries no reserve, and `unknown_removable_step` takes its
-`(available, reserve)` miss branch and refuses with the incomplete scan
-(`pool.rs:2848-2852`) before any prune. The design therefore adds an explicit S3
-item — bind the reserve fact from the **internal** control for a removable
-admission — flagged as a behaviour change on a currently unreachable path that
-needs its own review, and states that the native reserve case exists only once
-that item lands; without it, the reserve case is returned to the owner as a
-scoped case/bound change rather than dropped or reported unexecuted (§16.2 case
-8, §19).
+**Revision 4 also recorded one product fact** (revision 5 changed its
+disposition): the removable reserve prune is **unreachable in the current
+source** — `attempt` sets `LeaseRequest.reserve_bytes` from
+`crate::removable::registration(self)` (`store.rs:3277-3280`), and for a
+removable-store admission `self.control()` is `<owner>/removable/oxide-managed`
+(`removable.rs:30`, `store.rs:1546-1547`) while the registration is written at
+`<owner>/removable.json` (`removable.rs:28,298`) — so the request carries no
+reserve and `unknown_removable_step` refuses with the incomplete scan
+(`pool.rs:2848-2852`) before any prune. Revision 5 **withdraws** the wiring item
+and the reserve case and returns them to the owner (§10.2, §19).
 **Revision 3** answers the CHANGES REQUIRED design review of `1ac22ca`
 (comment `6452712728`, 2026-10-27) with five corrections. **Guarded verbs are now
 race-safe**: a fast, effect-free precheck is explicitly never authoritative, and
@@ -179,9 +200,9 @@ fact.
 | Proof staging helper | `scripts/test-oxide-pool-layout.py:96` (`stage_at`, imported by eight scripts) | **Explicit per-call `features` parameter**; a helper default never adds a feature, and each caller's role and fixture controls are edited where they live (§11.2). |
 | Custody and closure facts | `store.rs:2572` (`checkout_custody`), `store.rs:4500` (`probe_lock`; non-creating use at `3155`), `store.rs:630-639` (`settle`), `store.rs:3374-3420` (`recover_settled`), `store.rs:399-406` (`settle_idle`) | **Read** by the front door to derive the `evictable` subset (§5.5.1); the library never reads them. |
 | Per-checkout throughput custody | `outputs.rs:6151-6167` (`barrier` = `begin_clean`, `release_barrier`), `outputs.rs:4243` (checkout binding mutex), `outputs.rs:4008,5873,6000` (other binding-mutex sites) | **Read.** Guarded revalidation runs under one of these before any effect (§4.1, §4.6). |
-| Debug proof controls (existing) | `main.rs:327-352` (`OXIDE_TEST_PAUSE` = `<point>:<gate>`, debug only; `bound` fires **after** `bind_for_command`); `outputs.rs:90,7191-7200` (`OXIDE_TEST_OUTPUTS_CRASH` = a `crash_point` name, debug only; `prepared`/`migration-p0` stop after the durable prepared write); `src/inventory.rs:1402-1445,1559-1600` (`OXIDE_TEST_WALK_MUTATIONS`: ≤4 specs, ≤8192 bytes, canonical paths under the owned scratch/evidence roots, `delay_ms` 1..=65,000, one delay per spec) | **Reused, not extended**, for the custody-exclusion, prepared-state and reserve native cases (§4.6, §16.2 cases 8 and 19). |
+| Debug proof controls (existing) | `main.rs:327-352` (`OXIDE_TEST_PAUSE` = `<point>:<gate>`, debug only; `bound` fires **after** `bind_for_command`); `outputs.rs:90,7191-7200` (`OXIDE_TEST_OUTPUTS_CRASH` = a `crash_point` name, debug only; `prepared`/`migration-p0` stop after the durable prepared write); `src/inventory.rs:1402-1445,1559-1600` (`OXIDE_TEST_WALK_MUTATIONS`: ≤4 specs, ≤8192 bytes, canonical paths under the owned scratch/evidence roots, `delay_ms` 1..=65,000, one delay per spec) | **Reused, not extended**, for the custody-exclusion, prepared-state and removable unknown-figure native cases (§4.6, §16.2 cases 8 and 19). |
 | Mark spawning / release / scratch discard | `store.rs:1803-1825` (`mark_spawning`), `1826-1850` (`release`), `1878-1930` (`discard_scratch`, `flush_before_idle`) | **Read.** Class never changes at release; the slot keeps its class record (§7.2). |
-| Hand-off and capability probe | `src/bin/oxide/handoff.rs:39-72` (`__oxide-build-capabilities`, `hidden`), `96` (`preflight`), called from `main.rs:203` | **Add one boolean `proof_controls`** and the installer refusal (§10.4). |
+| Hand-off and capability probe | `src/bin/oxide/handoff.rs:39-72` (`__oxide-build-capabilities`, `hidden`), `96` (`preflight`), `112-163` (`Observed`, `observe`, `peek_version`: internal state, legacy `removable/state.json`, registration); the real removable state is `<control>/removable/oxide-managed/state.json` (`store.rs:1534-1548`, `lease/mod.rs:84`) | **Add one boolean `proof_controls`**, the installer refusal, the corrected candidate peek and the durable **legacy fence document** the installed reader actually observes (§10.4). |
 | Proof-control parsing precedent | `src/bin/oxide/config.rs:159-205` (`proof_controls`: debug-only, exact values, malformed refuses) | **Pattern reused** for the new controls (§11.1). |
 | Removable registration | `src/bin/oxide/removable.rs:33-34` (`REGISTRATION_VERSION = 2`) | **Unchanged.** Registration facts are read for the unsafe-broad test (§3.3). |
 | Child temporary directory | `src/bin/oxide/child_temp.rs:66-100` (`Identity`), `153-200` (`choose`, `choose_with`, `inheritable`), `main.rs:594-630` | **Unchanged, and never a classification input** (§9.1). |
@@ -793,11 +814,10 @@ Rules, all inherited from `checkout_custody` so the facts do not diverge:
   member whose record lives in the sibling pool uses the same function with that
   pool's snapshot.
 
-**Required regression.** Cases 5 and 7 (internal) and case 8 (removable, once its
-S3 reserve wiring premise lands) each run an admission with at least one one-use
-member and assert that it reaches its ordinary decision — admit, evict or
-refuse — **within the guard's deadline** and never blocks on a re-acquired
-admission lock. A pure regression asserts that
+**Required regression.** Cases 5 and 7 (internal) and case 8 (removable) each run
+an admission with at least one one-use member and assert that it reaches its
+ordinary decision — admit, evict or refuse — **within the guard's deadline** and
+never blocks on a re-acquired admission lock. A pure regression asserts that
 the in-custody reader takes no lock (no lock file is created, no `flock` is
 attempted) and returns the same verdict as `checkout_custody` for each of the
 `Clear`/`Writers`/`Unknown` fixtures. `Store::checkout_custody` keeps its
@@ -1019,7 +1039,9 @@ custody was not established for this moment.
 
 So restore runs before **every** new-slot admission (normal or one-use) and
 before **every** one-use admission including warm reuse, and never on a normal
-warm reuse. Concretely, with 16 idle one-use members within the byte bound: a
+warm reuse. The measured union is an **observation at admission**, not a
+reservation: nothing survives the admission lock to reserve slice bytes for a
+later step, and the seed transaction re-measures under its own custody (§8.3). Concretely, with 16 idle one-use members within the byte bound: a
 17th workspace's new-slot admission reclaims the oldest idle member (because
 `16 >= 16`) and then admits; a warm reuse of an existing member admits without
 reclaiming anything; and only a slice whose remaining members are all protected
@@ -1087,7 +1109,7 @@ is eligible".
 | slot count ceiling `evict_idle_until(MAX_SLOTS - 1)` (`pool.rs:1084`) | `Prefer` | `Only` (a normal victim is impossible) |
 | byte budget `evict_idle_until_under_cap` (`pool.rs:1759`) | `Prefer` | `Only` |
 | project-cap replacement `replace_idle_slot_for_admission` (`pool.rs:1399`) | named victim from the **normal-only** front-door list, re-verified as a non-member | not reachable (one-use is not subject to the project cap) |
-| removable reserve route `admit_unknown_removable` (`pool.rs:1455`) | `Prefer` | `Only` |
+| removable reserve route `admit_unknown_removable` (`pool.rs:1455`) | `Prefer` | `Only`. The route's prune branch is **unreachable today** (no reserve is carried, §10.2); the policy is specified so a scoped wiring could not pick a normal victim for one-use, and this design changes no behaviour |
 | post-eviction pressure re-read (`allocate`, `pool.rs:1088-1115`) | unchanged; a `Full` that remains is today's `Full` | unchanged; a `Full` that remains is a safety refusal, never a normal victim |
 | retry after a victim refusal | stops with the shipped error (`Busy`/`unknown_accounting`) | stops; never falls through to a normal victim |
 | unknown accounting (`recorded_total`, `pool.rs:1546`) | unchanged refusal (`unknown_accounting`) | unchanged refusal |
@@ -1279,11 +1301,25 @@ slice:
 
 - the seed's cloned bytes are ordinary new inodes and are counted by the next
   member-union walk (§6.4); no early record is fabricated;
-- the seed's own eligibility check gets the remaining headroom (slice minus the
-  measured union). If the headroom cannot be measured, or the frozen estimate
-  cannot safely fit the remaining admission policy, seeding is **skipped** with
-  its own bounded reason and the command builds cold in the same slot — it never
-  violates normal protection and never invents free bytes;
+- **the seed's headroom is measured fresh inside the seed transaction, never
+  inherited from admission.** The admission-time union is only a *precondition
+  for attempting* seeding; it is not an amount reserved. Admission releases its
+  lock before output binding, and #137's seed transaction runs later
+  (`cold-slot-seeding.md` §6.1-6.3), so two one-use commands can both be admitted
+  while their new slots are empty, both carry the same stale headroom, and then
+  clone one after the other. The seed decision therefore re-measures, under the
+  seed transaction's own custody (its donor-record-then-pool lock, which
+  serialises clones), the bounded union over the **current** verified membership —
+  every member's cloned bytes already on disk plus the recipient's own slot — and
+  requires the frozen estimate to fit that fresh remainder. A stale, incomplete
+  or unknown measurement, or one that cannot fit, **skips seeding** with a
+  bounded reason and builds cold in the same slot: it never violates normal
+  protection, never invents free bytes and never relies on a reservation the
+  brief does not grant. #137's untrusted-recipient rule and its
+  failed-post-clone-walk dispositions are unchanged: a failed walk abandons
+  seeding and cold-builds, every other post-clone fault refuses and retains, and
+  an abandoned generation keeps counting toward the slice until it is evicted or
+  closed;
 - an abandoned seed leaves the untrusted generation counting toward the slice
   until it is evicted or closed, exactly as any other retained member.
 
@@ -1370,15 +1406,21 @@ records.
 ### 10.2 Ledger, receipts and registration unchanged
 
 - Ledger: format and `CAPACITY_POLICY_VERSION = 2` unchanged (§6.11).
-- **One wiring defect is corrected, with no format change:** a removable
-  admission must carry the registration's reserve, which today it does not
-  (`store.rs:3277-3280` reads `registration(self.control())`, but the file lives
-  in the internal control — `removable.rs:28,298`, `POOL_DIR`/`MANAGED_NAME` at
-  `removable.rs:30`/`lease/mod.rs:84`). S3 binds the reserve from the internal
-  control for a removable admission, so `unknown_removable_step`'s reserve branch
-  becomes reachable. This is a behaviour change on a currently unreachable path,
-  reviewed on its own; the format, the reserve value and the floor are unchanged
-  and no cleanup is invented.
+- **A wiring gap is recorded and returned to the owner, not changed here.** A
+  removable admission carries **no** reserve today: `attempt` reads
+  `registration(self.control())` (`store.rs:3277-3280`) while the registration
+  lives in the internal control (`removable.rs:28,298`), and a removable store's
+  `control()` is `<control>/removable/oxide-managed` (`store.rs:1546-1547`,
+  `removable.rs:30`). `unknown_removable_step` therefore always takes its
+  no-reserve branch and refuses with the incomplete scan
+  (`pool.rs:2848-2852`), so **the reserve prune never runs**. Wiring the reserve
+  would make a previously unreachable branch delete slots — a *new* cleanup
+  behaviour, which the brief expressly forbids inventing ("if a reserve path does
+  not evict today, do not invent a cleanup to satisfy it"). This design therefore
+  leaves the path's behaviour exactly as shipped and **returns the reserve-path
+  protection requirement, together with that wiring change, to the owner for a
+  scoped ruling or a revised brief** (§19). No format, reserve value, floor or
+  deletion behaviour changes here.
 - Receipts: `oxide.outputs.transition/2` (whole target) and `/3` (profile),
   marker `oxide.outputs.root/2`, plan `oxide.outputs.plan/2` — all unchanged.
   No new receipt state, field or nonce semantics.
@@ -1404,18 +1446,72 @@ receipt without `proof_controls` cannot authorize installing a candidate
 (matching the brief: "older pins lacking that artifact-probe field cannot be
 installed by the revised installer"). This design performs no install.
 
-### 10.4 Pre-effect hand-off covers both state paths
+### 10.4 Pre-effect hand-off: the real removable path and its legacy fence
 
-`handoff::preflight` runs at `main.rs:203`, before any store command arm, and
-peeks the internal state, the removable state and the removable registration.
-A version-6 (or one-use-fenced) document therefore hands off or refuses **before**
-any output, reservation, receipt or slot effect on **both** the internal and the
-removable path. The native case plants a version-6 document in each control
-directory with no matching installed receipt and proves exit 75 with no effect
-(§16.2, case 15). Pre-#122 binaries cannot be assumed pre-effect fenced; the
-existing installer QA-window and old-running-binary limits are unchanged, and
-the planner must confirm the installed receipt covers #122 before any host
-install of this format.
+`handoff::preflight` runs at `main.rs:203`, before any store command arm. It
+peeks the internal state (`<control>/state.json`), a removable document at
+`<control>/removable/state.json` and the registration (`handoff.rs:122-135`,
+`STATE_FILE`, `POOL_DIR`, `REGISTRATION`). **But the removable store's state is
+not at that path.** `Store::open_removable` sets `control =
+<control>/removable/oxide-managed` (`store.rs:1534-1548`, `MANAGED_NAME` at
+`lease/mod.rs:84`), so the removable state a v6 binary loads and saves is
+`<control>/removable/oxide-managed/state.json`. The legacy peek therefore
+**cannot see** a newer removable state, which is a real gap for an already
+installed reader:
+
+- a pool whose only state is the removable one (a user who only ever built via a
+  registered drive) has no internal `state.json` to carry a version, so an
+  installed v5 reader's preflight observes nothing newer, runs `auto_adopt` and
+  binding, and only then refuses at its strict `Store::load`. That is exactly the
+  "refuses after output effects" outcome the brief forbids.
+
+Two changes, in a fixed order, close it:
+
+1. **A durable legacy fence document.** Before the first v6 write to
+   `<control>/removable/oxide-managed/state.json`, the v6 binary atomically
+   publishes a bounded, owner-only document at `<control>/removable/state.json`
+   whose `version` is `N+1` (6) and which also records the pool's `store_id` and
+   the fence name (`oxide.one-use/1`). `peek_version` reads only the numeric
+   `version` through a plain `serde_json::Value` (`handoff.rs:148-163`), so any
+   #122-era reader that peeks that path sees `6 > 5` and hands off **before** its
+   own output effects; the fence is never removed by this feature and is written
+   once per pool. It is not a second ledger: the v6 binary never reads it as
+   state, and its own `peek_version` ignores it because `6 > 6` is false.
+2. **The candidate's own peek is corrected** to read the real removable state
+   path as well (`<control>/removable/oxide-managed/state.json`), so a future
+   version bump is observed through the path the store actually uses. This alone
+   would not help already-installed binaries — which is why (1) carries the
+   ordering guarantee.
+
+**Ordering** (all durable before the state they protect): legacy fence document →
+removable v6 state write → first class-bearing removable record → any later
+command's effects. Because the fence precedes the v6 state, an installed reader
+that can ever meet v6 removable state has already been signalled at the path it
+actually reads. Pre-#122 binaries still cannot be assumed pre-effect fenced; that
+limit is unchanged and the planner must confirm the installed receipt covers #122
+before any host install of this format.
+
+**Proof (native case 15)** uses an **identified older artifact**: this
+repository's own pre-feature commit `489eecc` (`STATE_VERSION = 5`, no
+one-use fence) staged by role from its unchanged source and flags (A3-style, no
+`proof-controls`). On the **real** control paths, with a private `HOME` and
+control:
+
+- **positive control**: with the legacy fence document present and the removable
+  state at v6, the older artifact exits 75 (hand-off refusal) **before** any
+  output effect — no receipt, no root, no link, no outputs fence — and its
+  stderr names the re-run line;
+- **negative control**: with the fence removed and the same v6 removable state,
+  the older artifact's preflight observes nothing newer, performs its output
+  effect and only then refuses at `Store::load`. This negative control is what
+  proves the fence is load-bearing; it runs on a throwaway fixture pool and its
+  effect is deleted with that fixture;
+- **candidate control**: the v6 candidate itself neither hands off nor refuses
+  because of the fence, reads its real removable state, and classifies normally;
+  a pure stub reader reproduces the old peek's `6 > 5` decision without a second
+  binary.
+The internal path keeps its existing positive control (a v6 internal state with
+no matching installed receipt → exit 75, no effect).
 
 ### 10.5 Visibility
 
@@ -1625,23 +1721,25 @@ claimed for a statically edited selector.
 11. **A tool that writes through `target` after the guard.** Not contained
     (§4.7); the hierarchical inspection of §4.3 catches a link *at* one of the
     declared components, not one created later.
-12. **The reserve route is driven natively on a sub-floor volume once S3 wires
-    the reserve, and its reachable outcomes are stated.** A ~128 MiB image always has less than the
-    fixed 10 GiB floor, so `unknown_removable_step` can only return `Evict`
-    (while an eligible slot remains) or `Refuse`; `Admit`/`AdmitAtFloor` are
-    unreachable by design and are **not** claimed. The case therefore asserts
-    the protection that matters: a one-use (`Only`) admission with a genuine
-    bounds-only gap retires exactly the eligible idle one-use members in rank
-    order, never the normal slot, then refuses with the shipped incomplete scan.
-    A normal (`Prefer`) admission on the same volume legitimately falls back to a
-    normal victim once the members are gone — that is `Prefer`, not a
-    protection failure (§16.2 case 8).
-13. **A retry is not a second attempt at a victim.** After the reserve refusal
-    (or a failure-stop, or a protected-slice refusal) the retried admission
-    performs the whole class-scoped selection again, with the premises it needs
-    — a fresh member and an explicit `OXIDE_POOL_CAP` byte pressure for the
-    ordinary path — and it never resumes at the next candidate or converts an
-    earlier failure into a normal victim (§16.2 cases 8b, 26, 27).
+12. **The reserve path is not changed, and its protection requirement is
+    returned to the owner.** A removable admission carries no reserve today
+    (`store.rs:3277-3280` reads the registration from the wrong control
+    directory), so `unknown_removable_step` always refuses with the incomplete
+    scan and the prune branch never runs. Making it run would be a new deletion
+    behaviour, which the brief forbids inventing, so this design leaves it as
+    shipped, asserts that shipped behaviour natively (case 8), and returns the
+    reserve-path protection requirement plus the wiring change to the owner for a
+    scoped ruling (§19). The class-scoped policy that route's victim choice uses
+    is specified and asserted purely, so a scoped wiring could not select a
+    normal victim for a one-use admission — but that is not claimed as current
+    behaviour.
+13. **A retry is not a second attempt at a victim.** After a failure-stop or a
+    protected-slice refusal the retried admission performs the whole class-scoped
+    selection again, with the premises it needs — a fresh member and real byte
+    pressure (the effective cap, which for a removable pool is the **recorded
+    registration cap** and not `OXIDE_POOL_CAP`; `store.rs:1534-1553,3270-3280`,
+    `pool.rs:925-936`) — and it never resumes at the next candidate or converts
+    an earlier failure into a normal victim (§16.2 cases 26, 27).
 14. **A ledger-idle slot is not proof of writer closure.** The ledger's idle
     write and the control record's idle write are separate, so the two sides can
     disagree; a record whose lock is held (or whose group is not positively
@@ -1675,9 +1773,8 @@ claimed for a statically edited selector.
 | automatic adoption on a guarded workspace | **skipped**, no receipt write, no notice |
 | normal warm reuse | unchanged, no slice measurement |
 | normal new slot with slice overage or class-unknown rows | restoration + `Prefer`, then continue with a measured overage or a lower-bound note |
-| removable reserve route on a **sub-floor** volume, one-use admission, bounds-only gap (after the S3 reserve wiring) | prune eligible idle **one-use** members in rank order, then refuse with the original incomplete scan; a normal slot is never the victim |
-| removable reserve route, normal admission, same volume | may legitimately fall back to a normal victim after the members are gone (`Prefer`), then refuse below the floor |
-| removable admission in **today's** source (no reserve wired) | the step returns the incomplete scan before any prune; the reserve case is returned to the owner, never reported `unexecuted` in a counted run |
+| removable unknown-figure admission (no reserve is carried today) | refuses with the shipped incomplete scan and evicts nothing; the reserve-path protection requirement is returned to the owner (§10.2, §19) |
+| any admission whose retry needs byte pressure on a removable pool | the effective cap is the **recorded registration cap**; `OXIDE_POOL_CAP` does not override an existing removable pool |
 | retried admission after a failure-stop | full class-scoped reselection; never the next candidate, never a normal victim |
 | member whose control record is active (ledger idle, custody uncertain) | **protected**: counted, never a victim, not a wait reason |
 | one-use new slot with 16 idle members | reclaim the oldest idle member, then admit |
@@ -1733,10 +1830,11 @@ claimed for a statically edited selector.
   and `evictable` split with the in-custody custody reader (§5.5.2), `restore`
   with its two thresholds and reuse-candidate exclusion, the union walk, the
   class-scoped pressure paths, the `one_use_budget` and `unknown_accounting`
-  refusals, and the **reserve wiring correction** for a removable admission
-  (§10.2) — a reviewed behaviour change on a currently unreachable branch, with
-  its own unit regression (`unknown_removable_step` reached with a real reserve)
-  and the native reserve case it enables.
+  refusals, and the class-scoped policy applied to the reserve route's victim
+  choice (`admit_unknown_removable` passes the admission's `Prefer`/`Only` to the
+  same selector). The route's own behaviour is **not** changed: its reserve
+  branch is unreachable today and wiring it is returned to the owner (§10.2,
+  §19).
 - **S4 proof controls.** The feature, the two readers, the capability field and
   the installer refusal, the `stage_at` feature parameter and the static edits
   to the exposed scripts.
@@ -1825,43 +1923,20 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
    under byte pressure reclaims one-use first, then a normal victim if still
    over — and with every one-use member protected it continues with a measured
    overage and no stall.
-8. one-use **`Only` reserve protection**, on the owned image's registered and
-   **selected** removable pool (positive selected-removable control), with one
-   idle normal slot and two idle one-use members in that pool. **Premise owned by
-   S3:** the admission carries the registration's reserve, which the current
-   source does not do for a removable store (§10.2 and the revision-4 note);
-   this case exists only once that wiring item lands. If it does not, the case is
-   returned to the owner as a scoped case/bound change and is **not** reported
-   `unexecuted` inside a counted run. The image is
-   ~128 MiB, so `available` is far below the fixed 10 GiB floor and
-   `unknown_removable_step` (`pool.rs:2827-2885`) can only reach `Evict` while
-   an eligible slot remains, then `Refuse` — `Admit`/`AdmitAtFloor` are
-   unreachable on a sub-floor volume **by design**, and this case does not claim
-   them:
-   - (a) *unknown figure, one-use admission*: the existing debug walk mutation
-     (`OXIDE_TEST_WALK_MUTATIONS`, `DelayBeforeReadDir` on the payload root,
-     6,000 ms > the 5 s removable figure bound) makes the pool figure a
-     bounds-only gap. Because the admission is `Only`, the reserve loop retires
-     **exactly the eligible one-use members in rank order (both)** and never the
-     normal slot, then refuses with the original incomplete scan once nothing is
-     left to prune. Assertions: both member roots and ledger rows are gone, the
-     normal slot's ledger row and payload bytes are identical, the refusal is
-     the shipped incomplete scan, and no extra cleanup ran.
-   - (b) *retry, ordinary byte pressure*: a fresh one-use member is created, the
-     delay is disarmed (the figure is complete again) and the pool gets a small
-     `OXIDE_POOL_CAP`. The retried one-use admission takes the **ordinary byte
-     path**, reclaims that one-use member first and admits; the normal slot
-     survives byte-identically. Separate failure-stop and retry cases are 26 and
-     27, and the internal-pool count/byte paths are cases 5 and 7, so the reserve
-     route's `Only` protection is non-vacuous evidence rather than a shared
-     selector claim.
-   A **normal** admission on the same sub-floor volume may legitimately fall
-   back to a normal victim after the one-use members are gone (that is `Prefer`,
-   not a protection failure); this case therefore asserts the one-use `Only`
-   path, which is the protection the brief names. Because the volume is below
-   the 10 GiB floor, `Admit`/`AdmitAtFloor` are not reachable and are not
-   claimed; the design does not enlarge the image, lower the floor or invent
-   free-space evidence to reach them.
+8. removable unknown-figure admission, **today's behaviour asserted**: on the
+   owned image's registered and **selected** removable pool (positive
+   selected-removable control) with one idle normal slot and one idle one-use
+   member, a new-slot admission made to see a bounds-only pool figure
+   (`OXIDE_TEST_WALK_MUTATIONS`, `DelayBeforeReadDir` on the payload root,
+   6,000 ms > the 5 s removable figure bound) **refuses with the shipped
+   incomplete scan and evicts nothing**: no member is retired, the normal slot
+   is byte-identical, and the message carries `elapsed_deadline`. This is the
+   negative case that pins the reserve path's shipped behaviour (no reserve is
+   carried today, so no prune happens) and it is the evidence that this design
+   invents no cleanup; the class-scoped policy that route would use is asserted
+   purely (§16.1) and is not claimed natively. The brief's reserve-protection
+   requirement and the wiring change that would reach it are returned to the
+   owner (§19).
 9. one-use `Only` under pressure with no eligible one-use victim: refuses, and
    every normal slot's ledger bytes and payload digest are identical afterwards.
 10. normal warm reuse target-only: with members present, a normal warm reuse
@@ -1881,9 +1956,19 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
 14. state class/version: a version-5 fixture state reads as normal; a version-6
     document without the fence refuses; an unknown class refuses; the capability
     probe reports state version 6.
-15. pre-effect hand-off, both paths: a version-6 document planted in the internal
-    control and in a private removable control, with no matching installed
-    receipt: exit 75 before any output, receipt, root or slot effect.
+15. pre-effect hand-off on the **real** paths, with an identified older
+    artifact: pre-feature `489eecc` (state 5) staged by role, no feature. Internal
+    positive control: a v6 internal state and no matching installed receipt →
+    exit 75 before any output, receipt, root or slot effect. Removable positive
+    control: the legacy fence document at
+    `<control>/removable/state.json` with the removable state at
+    `<control>/removable/oxide-managed/state.json` at v6 → the older artifact
+    exits 75 **before** its output effect. Removable negative control: the same
+    v6 removable state with the fence removed → the older artifact performs its
+    output effect and only then refuses at `Store::load` (the gap the fence
+    closes). Candidate control: the v6 candidate ignores the fence, reads the
+    real removable path and classifies normally; a pure stub reader reproduces
+    the old `6 > 5` decision.
 
 16. guarded outputs, absent/real: a temp workspace with no receipt, and with a
     real local `target`, builds locally; no receipt, root or link is created.
@@ -1995,17 +2080,21 @@ retry is authorized by this text.
     receipt; its execution needs its own owner activation, pins and window, and
     it is never a PASS. A source sweep complements it and never replaces it.
 - One fixed script, the whole command of the qualified shared supervisor:
-  `bounded-test.py --root-parent /private/tmp --limit 420 --scratch-budget-mib
+  `bounded-test.py --root-parent /private/tmp --limit 480 --scratch-budget-mib
   512 -- python3 scripts/test-one-use-workspaces.py`. The explicit internal root
   is the owner-accepted internal-placement exception (decision `bd357a4c`)
   because a private `directory-budget-v1` pool is a genuine internal pool that
   the product correctly refuses on an external volume; it stays inside one
   monitored 512 MiB owned root.
-- **Fixed bound: 420 s, not the 300 s default.** The image attach/detach cycles,
-  the 128-slot ceiling fixture and the reserve route's two real 6 s walk delays
-  are the reasons; §16.4 gives the arithmetic and the 380 s work cutoff. This is a declared fixed higher bound under the
-  brief's rule, put to the freeze for acceptance before any activation — never a
-  silent extension, and 300 s is not claimed to fit.
+- **Fixed bound: 480 s, not the 300 s default.** The reasons are the image
+  attach/detach cycle, the 128-slot ceiling fixture, the 6 s removable walk delay
+  and — new in revision 5 — the **third staging**: the fixed older artifact
+  (`489eecc`, state 5) the hand-off case needs, built from its own source and
+  flags with no shared target. §16.4 gives the arithmetic and the 430 s work
+  cutoff. This is a declared fixed higher bound under the brief's rule, put to
+  the freeze for acceptance before any activation — never a silent extension, and
+  300 s is not claimed to fit. If the freeze prefers to keep 420 s, the
+  older-artifact case moves to its own scoped proof (§18 Q12).
 - Cumulative author bound **180 min** from actual activation, including
   authoring, admission/waits, coverings, diagnostic, native, cleanup and report;
   reviewer **60 min**. No historical clock is active or reset. Exactly **one**
@@ -2027,18 +2116,19 @@ retry is authorized by this text.
 | --- | --- | --- |
 | Stage current feature artifact (offline, 1.97.1) | ~37 s | measured at `rust:installed-handoff` (58.3 MiB peak) |
 | Stage feature-disabled artifact, shared target dependencies | ~37 s | same, with dependency reuse (inference, not a budget guarantee) |
-| 27 tiny fixture cases, including the 128-slot hand-made ceiling pool | ~130 s | ~4–6 s per case, ~10 s for the ceiling pool, ~11 s for the reserve sub-cases (one 6 s walk delay plus a fresh-member retry with byte pressure) and ~6 s for the failure-stop/retry cases |
+| Stage the **older artifact** for the hand-off case (fixed `489eecc`, state 5, no feature) by role | ~35 s | separate target, its own source and flags (A3); no dependency reuse across commits |
+| 27 tiny fixture cases, including the 128-slot hand-made ceiling pool | ~124 s | ~4–6 s per case, ~10 s for the ceiling pool, ~6 s for the removable unknown-figure negative case (one 6 s walk delay) and ~6 s for the failure-stop/retry cases; the older-artifact hand-off case adds a fixed pre-feature staging (~37 s, included in the staging row) |
 | Image: attach (`-owners on`), registration, selected control, ordinary detach | ~18 s | two attach/detach cycles at ~9 s each |
 | Fixture creation, member walks, digests, receipt | ~25 s | bounded metadata work on tiny trees |
 | Cleanup | ~20 s | inside the owned root, with the image custody record |
-| **Total** | **~267 s, upper ~335 s of 420** | arithmetic only; the script's work cutoff is 380 s |
+| **Total** | **~296 s, upper ~370 s of 480** | arithmetic only; the script's work cutoff is 430 s |
 
 Disk, inside the 512 MiB monitored root: one owned 128 MiB APFS sparse image
-(no free-space filler is needed: the sub-floor premise is what drives the
-prune-then-refuse path); staged targets ≈ 60 MiB shared (the second build reuses
-dependencies); the 128-slot ceiling pool with one tiny file per slot plus ≤ 24
+(no free-space filler is needed); three staged targets — the feature and
+feature-disabled builds share one (~60 MiB) and the fixed older artifact uses its
+own (~40 MiB); the 128-slot ceiling pool with one tiny file per slot plus ≤ 24
 medium tiny private slots ≈ 50 MiB; fixtures, logs and the bounded receipt
-≈ 20 MiB. Total ≈ **258 MiB of 512**.
+≈ 20 MiB. Total ≈ **298 MiB of 512**.
 
 These are estimates; the qualified guard measures actual owned bytes and time
 and the receipt reports them, and neither figure is an acceptance gate. If the
@@ -2103,10 +2193,11 @@ positive-absence policy are unchanged by either papercut.
 11. Is the staging inventory (§11.2) complete now that helper-mediated stagers
     are explicit and `stage_at` takes a per-call feature, including the
     suspended `test-oxide-cli.py` gap and every capability assertion?
-12. Is the fixed **420 s** bound with ~275 s typical / ~345 s upper and
-    ~290 MiB credible for the 27 cases including the owned image, the 128-slot
-    fixture and the two 6 s reserve delays, or must the freeze revise it (and
-    the case list) before activation?
+12. Is the fixed **480 s** bound with ~296 s typical / ~370 s upper and
+    ~298 MiB credible for the 27 cases including the owned image, the 128-slot
+    fixture, the 6 s removable delay and the **third** (older-artifact) staging,
+    or should the older-artifact case move to its own scoped proof and the bound
+    return to 420 s?
 13. Is the seeding dependency handled correctly by making case 24 mandatory and
     offering only a scope split — no unexecuted case in a counted native?
 14. Is the race-safe guard protocol (§4.1, §4.6) sound: the fast precheck is
@@ -2123,13 +2214,13 @@ positive-absence policy are unchanged by either papercut.
     that an internal and a removable admission with a member reach a decision
     without re-acquiring either admission lock?
 17. Is the reserve disposition right: the prune branch is unreachable today
-    because a removable admission carries no reserve (`store.rs:3277-3280` versus
-    `removable.rs:28,298`), S3 corrects that wiring as a reviewed behaviour change,
-    and the native case (§16.2 case 8) — one-use `Only`, bounds-only gap, sub-floor
-    image, members retired in rank order then refusal, then a byte-pressure retry
-    — exists only after that correction, otherwise it returns to the owner? Is the
-    explicit statement that `Admit` is unreachable on a sub-floor volume
-    acceptable?
+    (no reserve is carried; `store.rs:3277-3280` versus `removable.rs:28,298`),
+    wiring it would be new deletion behaviour the brief forbids inventing, so the
+    design leaves it as shipped, asserts the shipped refusal natively (case 8),
+    specifes the class-scoped policy purely, and **returns the reserve-path
+    protection requirement and the wiring change to the owner** for a scoped
+    ruling (§19)? Is that the correct Queue disposition rather than a design
+    claim?
 18. Is custody **exclusion** (the `bound` pause) plus the product's own
     write-ahead stop (`OXIDE_TEST_OUTPUTS_CRASH=prepared|migration-p0`) enough
     for the race-safety assertion, given that an interleaved observation would
@@ -2147,18 +2238,21 @@ positive-absence policy are unchanged by either papercut.
 - The seeding interaction (§8) is a requirement on a frozen but unimplemented
   interface; case 24 is mandatory, so the counted native waits for oxide#137's
   implementation or moves into a scope split.
-- The reserve and guarded-state sub-cases depend on three **existing** debug
+- The removable and guarded-state sub-cases depend on three **existing** debug
   controls (`OXIDE_TEST_WALK_MUTATIONS`, `OXIDE_TEST_PAUSE`,
   `OXIDE_TEST_OUTPUTS_CRASH`) staying available and unchanged; if any is removed
   or narrowed, those cases return to the owner for a scoped ruling rather than
   being dropped or reported unexecuted.
-- The reserve case additionally depends on the S3 reserve-wiring correction
-  (§10.2): today the removable admission carries no reserve, so the prune branch
-  is unreachable. Without that correction the case is returned to the owner; it
-  is never reported `unexecuted` in a counted run and the reserve protection is
-  then claimed only at unit/source level. The reserve case claims the
-  prune-then-refuse protection on a sub-floor volume, never the unreachable
-  admit branch; the concurrency case claims custody **exclusion**, never an
+- **Returned to the owner (not a design claim):** the brief requires the fixed
+  native to cover normal-slot protection under the **reserve** path. That path's
+  prune branch is unreachable in the current source because a removable
+  admission carries no reserve (`store.rs:3277-3280` versus
+  `removable.rs:28,298`), and reaching it would add a new deletion behaviour that
+  the brief forbids inventing. This design therefore does **not** claim the
+  reserve-path protection, keeps the shipped refusal, and returns the
+  requirement with its wiring change for a scoped ruling or a revised brief
+  (§10.2, §16.2 case 8). Everything else the brief lists remains in the fixed
+  case list. The concurrency case claims custody **exclusion**, never an
   interleaved observation.
 - No arbitrary-write containment, no byte-saving claim, no free-space guarantee
   and no claim that a one-use slot's warm build is as fast as a normal one.
