@@ -9,7 +9,17 @@ exact-head design review, then stop for the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 merge hold are separate and unchanged.
 
-**Revision 2** answers the CHANGES REQUIRED review of `62d05c36` (review
+**Revision 3** answers the CHANGES REQUIRED review of `c60f433a` (review
+comment `6449728021`, 2026-10-27): the configuration digest now follows
+Cargo's own working-directory-to-root lookup with its precedence and relative
+`[env]` resolution (§3.1); dependency-unit content is bounded by a
+leaf-package rule, because a proc macro's ambient reads are not fingerprinted,
+and that narrowing is returned to the Supervisor (§3.2); git verification
+reuses the repository's sanitized bounded `freshness::Git` protocol with
+cleared Git environment and refusal on unknown closure (§4.3); and the
+proof allocation is corrected for coexisting archives and extracted sources,
+the new dependencies and a per-case schedule with a stated basis (§16.4).
+Revision 2 answered the CHANGES REQUIRED review of `62d05c36` (review
 comment `6449252752`, 2026-10-27). The amendments are: a complete per-role Cargo
 unit manifest including the fingerprint directory's encoded dep-info (§4.2,
 §5.1); registry source verification through the cached archive bytes and a
@@ -21,7 +31,7 @@ covering the compiler, wrapper, flag, profile, config and environment inputs
 Cargo does not fully vouch for (§3); a reserve start gate plus monitored stop
 during clone and reset, with the removable path separated (§8.3); and the real
 SQLite/`cc`/`OUT_DIR` proof retained with a source-derived time and disk
-allocation (§16). Each finding is dispositioned in §3.2.
+allocation (§16). Each finding is dispositioned in §3.3.
 
 Written against clean pushed `main` at
 `cec65daff49a2961c9b9d1dd2cad235251c02e48`. Every `file:line` anchor below is
@@ -88,7 +98,9 @@ Checked against the design input. "Read" means this design reads the fact;
 | Slot origin (checkout, content, anchor, uncertain paths) and `Built` | `store.rs:251-259`; `src/bin/oxide/freshness.rs:168-200`; `store.rs:3577-3591` (`trusted_origin` needs a matching `mark`) | Read, never widened. It remains the only trust record for reuse. |
 | Cargo identity | `freshness.rs:75-84` (`VERIFIED_CARGO`), `freshness.rs:419-445` (`verified_cargo`) — probed per command, **not persisted** | Recorded explicitly in the new donor catalog; legacy slots have no such fact and are not donors. |
 | Encoded dep-info in the fingerprint directory | Cargo's `.fingerprint/<pkg>-<hash>/dep-<kind>-<target>`, marker `01 00 00 00 ff`, version 1; the repository's own bounded reader documents the format (`src/dep_info.rs:1-30`) and the version-matrix proof decodes every `dep-*` file (`workflow.md#cargo-version-matrix`) | Part of every offered unit's manifest (§4.2, §5.1); a unit without it is not offered. |
-| Cargo configuration and environment that Cargo does not fully fingerprint | `workflow.md#cargo-version-matrix` names `build.rustc`, `CARGO_BUILD_RUSTC`, `RUSTC_WORKSPACE_WRAPPER` and a kept wrapper as outside the slot key | A bounded context digest over the named environment variables and config tables must be equal on both sides; anything unsupported skips (§3). |
+| Cargo configuration and environment that Cargo does not fully fingerprint | `workflow.md#cargo-version-matrix` names `build.rustc`, `CARGO_BUILD_RUSTC`, `RUSTC_WORKSPACE_WRAPPER` and a kept wrapper as outside the slot key; Cargo merges `.cargo/config*` from the command's working directory to the filesystem root, then the Cargo home (`cargo-1.97.1/c980f4866` `doc/src/reference/config.md`) | A bounded context digest over the named environment variables and config tables, looked up from the command's working directory with Cargo's precedence, must be equal on both sides; anything unsupported skips (§3.1). |
+| Ambient inputs a proc macro can read while compiling a dependency | not in the consuming crate's dep-info; Cargo fingerprints only a small part of the environment (`cargo-1.97.1/c980f4866` `core/compiler/fingerprint/mod.rs`) | Eligibility is restricted to lock entries with no dependency edges, so no proc macro can be invoked (§3.2); the narrowing is returned to the Supervisor. |
+| Git verification process | `src/bin/oxide/freshness.rs:453-500` (`freshness::Git`): `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `submodule.recurse=0`, `core.fsmonitor=false`, bounded calls/time/output and a settle window | Reused verbatim for every seed-side git call, with cleared `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`; unknown closure refuses (§4.3). |
 | Registry source integrity | Cargo verifies the downloaded `.crate` bytes against the lock checksum and writes `.cargo-ok` after unpack (`cargo-1.97.1/c980f4866` `sources/registry/download.rs`, `sources/registry/mod.rs`); it does **not** keep a per-file manifest for registry trees | Verification goes through the cached archive bytes and a canonical archive-to-tree comparison, not a self-declared checksum file (§4.3). |
 | Host reserve watchdog | `store.rs:49-53` (`HOST_RESERVE_BYTES` 20 GiB at creation), `src/bin/oxide/watchdog.rs:22-30` (22 GiB trigger, `MARGIN_BYTES`), `store.rs:1716-1726` (removable pool uses a removal-only watchdog), `store.rs:4028-4038` | The seed has its own start gate and monitored stop at the same trigger; a breach or unknown reading refuses, never a cold fallback (§8.3). |
 | rustc identity | Digested into the key at `identity.rs:41-61`; not independently recoverable | The in-memory `rustc -vV` text of the current command is kept for the seed identity; the catalog records its digest. No key change. |
@@ -155,41 +167,103 @@ converted checkout — may donate to each other's dependency units. Nothing abou
 finals moves: the recipient's own placement still decides where its binaries,
 tests and uplifts go, and the donor's links, receipts and roots are untouched.
 
-### 3.1 The producer-context digest
+### 3.1 Configuration lookup and the producer-context digest
 
 Cargo's own unit fingerprint binds the compiler hash, resolved flags, profile,
 features, dependencies, target and path. It does **not** promise to bind the
 whole inherited environment, and `workflow.md#cargo-version-matrix` names
 exactly the inputs the slot key misses: `build.rustc`, `CARGO_BUILD_RUSTC`,
 `RUSTC_WORKSPACE_WRAPPER` and a kept inherited wrapper. So the seed predicate
-also requires a **context digest** that both sides compute from the same fixed
-key set, and anything it cannot read or represent makes the packages that
-depend on it ineligible (in v1: the whole seed skips).
+also requires a **context digest** whose lookup follows Cargo, not Oxide's
+guess.
 
-The digest is SHA-256 over an ordered, canonical `key = value` record list and
-covers:
+**Lookup (Cargo's own, pinned `cargo-1.97.1/c980f4866`,
+`doc/src/reference/config.md`).** Cargo merges configuration files walking from
+the command's **current working directory** upward through every parent to the
+filesystem root, then `$CARGO_HOME/config.toml` and `$CARGO_HOME/config` at the
+lowest precedence; a file closer to the working directory wins, environment
+variables override files for the variables Cargo reads, and `--config` wins
+over both. It does not start at the workspace root and does not stop at the
+account home. The adapter therefore:
 
-- the environment variables named in the table above, each as
-  `absent` or a hex digest of its exact bytes (no shell expansion);
-- the Cargo configuration Cargo itself would merge for the command: the
-  checkout's ancestor chain up to the account home plus `$CARGO_HOME/config`
-  and `$CARGO_HOME/config.toml` (every existing regular file of those names, no
-  symlink followed), parsed with the repository's `basic-toml` dependency and
-  reduced to the `[build]`, `[profile]`, `[target]`, `[env]` and `[net]`
-  tables — the tables that can change compiler selection, flags, linker,
-  profile settings, build-script environment or source identity;
-- the presence of `[source]`, `[patch]`, `[registries]` or `[unstable]`
-  anywhere in those files, and any `--config` argument, as **unsupported**
-  (skip);
-- the `registries`/`replace-with` machinery is likewise unsupported.
+- walks from the command's inherited working directory (the same directory
+  Cargo and the `rustc -vV` probe use) to `/`, collecting every existing
+  `.cargo/config.toml` and `.cargo/config`, bounded to 16 files and 4 MiB of
+  config bytes, with no symlink followed and no file created;
+- adds `$CARGO_HOME/config.toml` and `$CARGO_HOME/config`;
+- parses each with the repository's `basic-toml` dependency, reduces it to the
+  `[build]`, `[profile]`, `[target]`, `[env]` and `[net]` tables, and renders
+  the records in precedence order as
+  `(absolute file path, table, key, canonical value)`;
+- **resolves `[env]` relative values** as Cargo does: a `relative = true`
+  value is made absolute against the directory that config file applies to
+  (the parent of its `.cargo` directory; for `$CARGO_HOME` config, the parent
+  of the Cargo home), and the resolved absolute path is what enters the
+  digest. A value that cannot be resolved to a canonical path, a non-UTF-8
+  path or value, or an unresolved `relative` flag makes the seed skip;
+- treats `[source]`, `[patch]`, `[registries]`, `[unstable]`, the
+  `replace-with` machinery, any `--config` argument, an unreadable or
+  unparseable file, an oversized or duplicate-key file, and any table the
+  adapter does not model as **unsupported** (skip);
+- when one directory holds both `.cargo/config` and `.cargo/config.toml`, it
+  follows Cargo's pinned precedence for that pair; if the adapter cannot
+  establish it, it skips rather than guessing.
 
-Bounds: at most 8 config files, 4 MiB of config bytes and 128 KiB of rendered
-key records; an unreadable, unparseable, oversized or duplicated-key file,
-and any table the adapter does not model, skips. The catalog records the
-digest together with the file list (relative-to-home paths only), so a
-reviewer can see what was compared. Tests use synthetic configs only.
+The digest is SHA-256 over the **effective merged** value set — one sorted
+`table.key = canonical value` record per key after Cargo's precedence has been
+applied, with `[env]` relative values already resolved to absolute paths — plus
+the environment variables named in §3, each as `absent` or a hex digest of its
+exact bytes. Merging rather than hashing the raw file concatenation avoids a
+false mismatch when two working directories merely carry different irrelevant
+files, while a value that actually differs still changes the digest. Both
+sides must produce the same digest; the catalog records the digest and, as
+review evidence only, the absolute config-file list in precedence order, so a
+reviewer can see exactly what Cargo merged. Bounds: 16 config files, 4 MiB of
+config bytes, 128 KiB of rendered records. Tests use synthetic config trees only, including a member
+working directory, an ancestor above the account home, and a differing
+relative `[env]` value.
 
-### 3.2 Prior review findings, resolved or dispositioned
+### 3.2 Ambient inputs and the leaf-package boundary
+
+A fixed environment list and the selected config tables still do not prove
+equal compiled output for a *dependency* unit. A proc macro invoked while
+compiling such a unit may read any inherited environment variable or any file
+and generate different code; that access is not in the consuming crate's
+rustc dep-info, and Cargo documents that only a small part of the environment
+is fingerprinted. Equal locked source, Cargo/rustc identity and the listed
+flags therefore do **not** establish equal output for arbitrary dependency
+units, so the v1 eligible set must exclude every unit whose compilation can
+invoke a proc macro.
+
+The positive, checkable boundary is the lock's own dependency graph: a
+package is eligible only when its lock entry has **no dependency edges at
+all** (no normal and no build dependencies). Proc macros can only be invoked
+through a dependency, so a unit with no dependency edges cannot run one; its
+other compile-time inputs (`env!`, `option_env!`, `include_str!`,
+`include_bytes!`, `#[path]` modules, build-script output for a same-package
+script) are exactly the inputs Cargo fingerprints, and a same-package build
+script's run unit is already excluded so its library rebuilds.
+
+Consequences, stated rather than hidden:
+
+- the eligible set is the **leaf** dependency set. Most proc-macro crates
+  depend on `syn`/`quote`/`proc-macro2` and are therefore ineligible, as are
+  most libraries with dependencies. Proc-macro scope is preserved
+  structurally — a git or registry proc-macro crate with no dependency edges
+  is eligible, and seeded proc-macro dylibs are only ever *used* to compile
+  units that are themselves ineligible and rebuilt — but its practical reach
+  is small;
+- this narrows the approved scope, which names proc macros and dependency
+  libraries generally. The design therefore **returns that narrowing to the
+  Supervisor** rather than deciding it: the alternatives are the deferred
+  artifact-JSON/unit-graph capture plus a reviewed proc-macro input-tracking
+  mechanism, or accepting the leaf boundary for v1;
+- the leaf rule is applied on both sides (donor and recipient lock entries),
+  recorded as evidence in the catalog, and a non-vacuous native control proves
+  that a non-leaf dependency whose proc macro reads an environment variable is
+  ineligible and rebuilds with the recipient's own environment.
+
+### 3.3 Prior review findings, resolved or dispositioned
 
 | `0ca2bd7f` finding | Disposition in this design |
 | --- | --- |
@@ -211,6 +285,13 @@ reviewer can see what was compared. Tests use synthetic configs only.
 | 5. Compatibility omitted effective producer inputs | §3 and §3.1 add the compiler selection, wrapper context, full flag set, profile/target overrides and a bounded Cargo configuration digest, with every unreadable, unsupported or unrepresentable fact skipping. |
 | 6. Reserve handling turned an unsafe start into a cold build | §8.3 now gives the seed its own start gate at the existing 22 GiB watchdog trigger (`HOST_RESERVE_BYTES` + `MARGIN_BYTES`) and monitors at the watchdog's own cadence during clone and reset; a below-trigger, unknown or lost reading aborts the seed and **refuses the command before any child**, never a cold build. The removable path keeps its own removal-only watchdog and registration reserve instead of the internal space trigger. |
 | 7. The plan replaced the required SQLite fixture | §16.2 keeps the real `libsqlite3-sys`-with-`bundled`-SQLite case and §16.4 supplies a source-derived time and disk allocation, including staging, seeded Cargo home, two coexisting slots, the owned image, fixtures and cleanup, with a fit gate that stops and reports instead of trimming a case. |
+
+| `6449728021` finding (revision 3) | Amendment |
+| --- | --- |
+| 1. The configuration digest did not follow Cargo's lookup | §3.1 now walks from the command's working directory through every parent to the filesystem root, then the Cargo home, with Cargo's precedence, `[env]` relative resolution to canonical absolute paths, and refusal of `/.cargo/config.toml`-style ancestors it cannot model; member-cwd, ancestor-above-home and differing relative-config regressions are required. |
+| 2. The fixed environment list did not bound dependency-unit content | §3.2 adds the leaf-package boundary: eligibility needs a lock entry with **no dependency edges at all**, because a proc macro can only be invoked through a dependency and its ambient reads are not fingerprinted. The narrowing of proc-macro reach is returned to the Supervisor, and a non-vacuous differing-environment/proc-macro control is required. |
+| 3. Git verification had no bounded, effect-free process protocol | §4.3 now reuses the repository's sanitized `freshness::Git` protocol: exact argv/environment (`GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `submodule.recurse=0`, `core.fsmonitor=false`, no network, no config write, no prompts), cleared `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`, bounded calls, wall wait, stdout and settle window, and positive closure; unknown closure refuses. |
+| 4. The proof allocation arithmetic was not sound | §16.4 corrects the Cargo-home figure (archives and extracted trees coexist), adds the new dependencies to staging, and gives a per-case schedule with a stated basis and a total that fits the 300 s / 512 MiB bound with margin; an unresolved conflict would return to the Supervisor. |
 
 ## 4. Unit provenance: the producing epoch and the donor catalog
 
@@ -265,6 +346,9 @@ The association rule for one package, applied on both sides independently:
 
 - its **name** maps to exactly one lock entry across **all** source kinds
   (so a registry `foo` and a git `foo` make `foo` ineligible on that side);
+- its lock entry has **no dependency edges at all** (§3.2), so its compilation
+  cannot invoke a proc macro; a package with any dependency edge is ineligible
+  on both sides;
 - its lock source is a supported immutable kind: crates.io-style registry with
   a recorded `checksum`, or git with a full 40-hex revision;
 - path/workspace/vendored/source-replaced and `[[patch]]`-replaced entries are
@@ -340,11 +424,25 @@ The check must bind content to the lock, not to a directory's own claim:
   key. If the project declines those dependencies, registry packages become
   ineligible and only git dependencies seed; that is a scope narrowing and
   must return to the Supervisor rather than being decided here;
-- **git.** The checkout must be at the locked revision, `git status
-  --porcelain` empty, no declared submodule initialized or modified, and the
-  tree digest recomputed from the index and the worktree must match. A dirty,
+- **git, through the repository's sanitized bounded process protocol.** Every
+  invocation reuses `freshness::Git` (`src/bin/oxide/freshness.rs:453-500`),
+  which is the reviewed effect-free adapter: the same argv and environment
+  (`GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `-c submodule.recurse=0`,
+  `-c core.fsmonitor=false`), so reading the index never rewrites it, no
+  configured fsmonitor hook or daemon runs, no submodule is descended into,
+  and no credential prompt can block. The seed clears `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_CONFIG_*` from the child
+  environment, passes `-C <verified root>` only, uses no network and writes no
+  config. Each call is bounded in wall wait, stdout and settle window, and the
+  whole context is bounded in call count and total time exactly as the
+  freshness gate does; a pipe held by a process Git started can never hold the
+  gate past its clock, and exhausting the budget refuses. The verifier reads
+  `rev-parse HEAD`, `status --porcelain` (no optional locks, no hooks) and the
+  tracked tree digest, and requires: the locked revision, an empty status, no
+  initialized or modified submodule, and a matching digest. A dirty,
   ambiguous, submodule-bearing or unreadable checkout makes the package
-  ineligible. Present cleanliness alone is never accepted as producing-build
+  ineligible, and an unconfirmed child closure is a **refusal**, never a cold
+  skip. Present cleanliness alone is never accepted as producing-build
   evidence;
 - **uniform failures.** A missing cached archive (pruned cache, vendored or
   source-replaced source), an ambiguous registry-index directory, an
@@ -396,12 +494,12 @@ Written while the producing lease is still held and before release, into
   times, and the seed-attempt record's terminal state (§4.1);
 - producing identity and context: Cargo version, rustc digest and `RUSTC`
   value, target, recipe key, backend, adapter id, the §3.1 context digest and
-  its config file list, the flag digests, Cargo home, command family and
-  command class;
+  its absolute config-file list in precedence order, the flag digests, Cargo
+  home, command family and command class;
 - per package: name, version, source string, checksum or full revision,
-  uniqueness evidence for the donor lock, source-root kind, and the
-  **canonical source tree digest** verified at both ends of the producing
-  window (§4.3);
+  uniqueness evidence for the donor lock, the **leaf evidence** (the lock entry
+  has no dependency edges, §3.2), source-root kind, and the **canonical source
+  tree digest** verified at both ends of the producing window (§4.3);
 - per unit: role (`lib`, `proc-macro`, `build-script-compile`), target name,
   and the exact relative file list (the manifest of §4.2 plus the role's
   artifacts), each with size, mtime and a **SHA-256 content digest computed
@@ -466,6 +564,11 @@ metadata hash, copied verbatim and never predicted.
 | workspace/path package units | **excluded** | never classified |
 | final outputs, uplifted binaries, test/bench executables | **excluded** | live in the checkout `target/` or are final uplifts |
 | `incremental/**` | **excluded** | |
+
+Every role below additionally requires the §3.2 leaf boundary: a package with
+any dependency edge is not offered, so a proc-macro dylib can be seeded only
+from a dependency-free proc-macro package, and it can only ever be *used* to
+compile units that are themselves ineligible and rebuilt.
 
 The three fingerprint entries are the unit's complete Cargo-visible state and
 are all required: the hash file, the encoded components, and the encoded
@@ -599,7 +702,7 @@ lease library:
    donation source cap (§4.3). All of this is read-only against the recipient
    lock, the Cargo home and the donor catalog; a plan or source failure skips
    without touching the recipient.
-4. **Untrusted recipient, always before the first clone.** Immediately before
+6. **Untrusted recipient, always before the first clone.** Immediately before
    the seed transaction the command persists
    `<pool>/oxide-managed/origins/<record>.json` with `origin: null` and the
    current use mark through the existing writer, and syncs it. With the mark
@@ -611,7 +714,7 @@ lease library:
    door never computes or writes a trust record itself. That untrusted record
    is superseded only by the normal `release` write of a `Built` origin after
    Cargo closes — never by the seed, and never by a successful copy.
-5. **Seed transaction (library, custody).** `managed::seed` receives the
+7. **Seed transaction (library, custody).** `managed::seed` receives the
    recipient lease, the donor slot/incarnation/lease identity, that relative
    plan and each file's recorded digest. It takes the donor's record lock
    non-blocking with `create: false` (`store.rs:4509`, `probe_lock`) and then
@@ -631,7 +734,7 @@ lease library:
    `EDQUOT`, an unexpected file type, a permission change or an unreadable
    path aborts the whole seed. No partial unit is ever published: either the
    entire plan verifies against the producing-epoch manifest or nothing stays.
-6. **Publication.** On complete success the library returns a receipt (units,
+8. **Publication.** On complete success the library returns a receipt (units,
    files, logical bytes, donor identity, catalog digest, elapsed) and the
    command re-reads the two safety facts it can still check — the donor's
    ledger/control state and the host free-space reserve — before continuing.
@@ -740,7 +843,8 @@ is abandoned: the recipient is reset as in §6.5 and Cargo runs cold.
 | donor candidates examined | 8 | chosen by most recent rank then slot id; catalogs only |
 | donor catalogs read | ≤ 8 × 2 MiB | strict schema; unknown → ineligible |
 | recipient lock parsed | 4 MiB, 2048 packages | read only; no Cargo call |
-| producer context digest | 8 config files, 4 MiB config bytes, 128 KiB rendered keys | unreadable/unsupported → skip |
+| producer context digest | 16 config files (working directory to `/`, then the Cargo home), 4 MiB config bytes, 128 KiB rendered keys | unreadable/unsupported/unresolvable → skip |
+| git source verification | `freshness::Git` bounds: 64 calls, 60 s total, 30 s per call, 16 MiB stdout, 2 s settle | exhaustion or unconfirmed closure → refuse |
 | producing source verification (pre and post) | 2048 packages, 100,000 entries, 128 MiB file content, 64 MiB archive-derived content, 4 s each | deterministic lock order; overflow packages are not catalogued |
 | producing-time artifact hashing | 8,192 files, 256 MiB, 4 s | a unit without all digests is not offered |
 | catalog | 2 MiB, 2048 packages, 8,192 files, 3 units per package | overflow: no catalog |
@@ -853,8 +957,11 @@ new catalog is not written.
   physical-saving figure; the design says so in the text and the summary
   wording does not say "reused" or "saved".
 - A miss prints `seeding skipped: <reason>` with a bounded reason token
-  (no donor, donor busy, no overlap, unsupported layout, unverified source,
-  cap, reserve, deadline, refused ownership).
+  (no donor, donor busy, no overlap, non-leaf or ambiguous name, unsupported
+  context or layout, unverified source, cap, deadline). Reserve, ownership,
+  device and custody faults are refusals, not skip tokens (§8.3, §13). The
+  reason token also covers the ambiguous-name and leaf skips that binding
+  `bb151a59` requires the summary and status to report.
 - `oxide status` shows at most one bounded recorded line from `last.json`,
   labelled as recorded: the recipient slot, the donor slot, units, MiB, file
   count, elapsed and when. It does not claim which copies Cargo kept fresh —
@@ -983,37 +1090,47 @@ missing lock, and any package/unit outside the whitelist.
    older can be fresh even for a fresh checkout. What is never true is that
    seeding makes a recipient's own artifacts fresh, and Oxide never touches
    recipient source files to manufacture freshness, so the reach is bounded by
-   §5.2 and by Cargo's own checks — exactly what the separate measured
+   §3.2, §5.2 and Cargo's own checks — exactly what the separate measured
    comparison must observe rather than assume.
 3. **One same-name dependency blocks that name.** Two registry versions, or a
    registry plus a git source of one name, make the name ineligible on both
    sides; this is the price of partial association.
-4. **A producing build that downloads or extracts sources excludes those
+4. **The leaf boundary removes most of the graph.** Any package with a normal
+   or build dependency edge is ineligible (§3.2), so practical reach is narrow
+   and most proc-macro crates never seed. That is the price of a positively
+   supported ambient-input boundary, and the narrowing is returned to the
+   Supervisor rather than decided here.
+5. **Configuration is looked up where Cargo looks.** A `.cargo/config.toml` in
+   a member working directory, an ancestor above the account home or at the
+   filesystem root is part of the digest (§3.1), so two commands with different
+   working directories cannot be accepted as equal contexts merely because
+   their workspace roots match.
+6. **A producing build that downloads or extracts sources excludes those
    packages** until the archive and tree verification succeeds: a file newer
    than the producing start drops the package, and a tree verified for the
    first time in this build is catalogued only within the 64 MiB
    archive-derivation budget. Donors are strongest when the Cargo home is
    already warm and verified.
-5. **A dirty git cache compiled and restored** is caught when the restore
+7. **A dirty git cache compiled and restored** is caught when the restore
    updates mtimes (§4.3); the mtime-preserving adversarial case remains a
    stated residual.
-6. **A tampered registry tree is caught by the archive, not by itself.** An
+8. **A tampered registry tree is caught by the archive, not by itself.** An
    extra or altered file, a symlink and a pre-existing local edit all fail the
    archive-to-tree comparison even when the tree carries a plausible checksum
    file (§4.3); a source directory name is never evidence.
-7. **A context difference skips rather than guesses.** A configured compiler,
-   a workspace or kept wrapper, a flag/profile override, `--config`, a
-   source replacement or a `[patch]` makes the seed skip, so a project whose
-   build depends on them simply never donates (§3.1).
-8. **A seeded recipient never donates.** Its attempt record says `seeded`
-   durably, so the design cannot attribute a donor's units to the recipient's
-   own source and tool identity (§4.1).
-9. **Copy-on-write is not a saving claim.** Cloned bytes are counted in full
-   until a measurement proves otherwise, and this design does not measure
-   physical savings.
-10. **A held donor cannot be read.** So D-4's in-session respawn is not helped
+9. **A context difference skips rather than guesses.** A configured compiler,
+   a workspace or kept wrapper, a flag/profile override, `--config`, a source
+   replacement or a `[patch]` makes the seed skip, so a project whose build
+   depends on them simply never donates (§3.1).
+10. **A seeded recipient never donates.** Its attempt record says `seeded`
+    durably, so the design cannot attribute a donor's units to the recipient's
+    own source and tool identity (§4.1).
+11. **Copy-on-write is not a saving claim.** Cloned bytes are counted in full
+    until a measurement proves otherwise, and this design does not measure
+    physical savings.
+12. **A held donor cannot be read.** So D-4's in-session respawn is not helped
     by the session's own slot (§11).
-11. **Debug information** of a recipient's *new* links uses the recipient's own
+13. **Debug information** of a recipient's *new* links uses the recipient's own
     cloned object files, so it does not point into the donor; binaries the donor
     already linked keep pointing into the donor slot, exactly as they do today.
     No debugger behaviour is claimed by this design.
@@ -1023,6 +1140,7 @@ missing lock, and any package/unit outside the whitelist.
 | Situation | Result |
 | --- | --- |
 | no eligible donor / no catalog / no overlap / package ineligible | skip, cold build, one reason |
+| package not a leaf, or its name is ambiguous on either side | skip, cold build, the reason names it |
 | unsupported Cargo, adapter, command family, `exec`/external tool | skip, cold build |
 | recipient lock missing, empty allowlist, malformed or oversized | skip, cold build (Cargo may create the lock itself) |
 | unsupported producer context (compiler, wrapper, flags, profile, config, source replacement, patch) | skip, cold build |
@@ -1106,24 +1224,33 @@ fixed script, and a source sweep never replaces it.
 
 ### 16.1 Pure checks (no child, no Cargo, no pool)
 
-Lock parsing and the uniqueness rule; manifest target-name rule; the complete
-per-role triple (hash, `.json`, `dep-…`) with every negative (missing
-`dep-…`, an extra `dep-…`, a duplicate suffix, an unclassifiable
-fingerprint-dir entry, symlink, `..`, absolute path, unknown suffix, `.dSYM`,
-Finder metadata, oversized); archive-reader negatives (tampered archive, extra
-tree file, missing tree file, symlink/hardlink/device entry, duplicate path,
-absolute path, pax/gnu long name, truncation); git verification negatives
-(dirty, wrong revision, submodule, unreadable); the §3.1 context digest
-(equal, differing flag, differing config table, unsupported `--config`,
-`[source]`, `[patch]`, unreadable/oversized config, and an environment
-override); catalog schema, per-file digest records, caps and generation
-binding; the durable attempt record's states and the unseeded publication rule;
-producing-window mtime rule; plan intersection and determinism; reset list
-derivation; reserve gate and monitored-stop decision points against a fake
-reader; receipt and summary/status rendering and their caps; adapter dispatch
-and unsupported-version skip; donor predicate matrix (held, retired, evicting,
-pending recovery, rank/lease mismatch, volume mismatch, missing lock, `seeded`
-attempt); and the fail-closed matrix of §13.
+Lock parsing, the uniqueness rule, the **leaf rule** (a lock entry with any
+dependency edge is ineligible on either side, including build and dev edges
+the lock records) and the manifest target-name rule; the complete per-role
+triple (hash, `.json`, `dep-…`) with every negative (missing `dep-…`, an extra
+`dep-…`, a duplicate suffix, an unclassifiable fingerprint-dir entry, symlink,
+`..`, absolute path, unknown suffix, `.dSYM`, Finder metadata, oversized);
+archive-reader negatives (tampered archive, extra tree file, missing tree file,
+symlink/hardlink/device entry, duplicate path, absolute path, pax/gnu long
+name, truncation); git verification negatives (dirty, wrong revision,
+submodule, unreadable) and the **exact argv/environment** of every git call
+(`GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `submodule.recurse=0`,
+`core.fsmonitor=false`, `-C` only, cleared `GIT_DIR`/`GIT_WORK_TREE`/
+`GIT_INDEX_FILE`/`GIT_CONFIG_*`) plus a fake-git control that would run a
+configured fsmonitor hook and a bounded-budget exhaustion refusal; the §3.1
+context digest with a synthetic config tree: equal contexts, differing flag,
+differing table, **member working directory**, **ancestor above the account
+home**, a config at the filesystem root, **differing relative `[env]` values**,
+both `config`/`config.toml` in one directory, unsupported `--config`,
+`[source]`, `[patch]`, `[registries]`, `[unstable]`, and unreadable/oversized/
+non-UTF-8 config; catalog schema, leaf and source evidence, per-file digest
+records, caps and generation binding; the durable attempt record's states and
+the unseeded publication rule; producing-window mtime rule; plan intersection
+and determinism; reset list derivation; reserve gate and monitored-stop
+decision points against a fake reader; receipt and summary/status rendering and
+their caps; adapter dispatch and unsupported-version skip; donor predicate
+matrix (held, retired, evicting, pending recovery, rank/lease mismatch, volume
+mismatch, missing lock, `seeded` attempt); and the fail-closed matrix of §13.
 
 ### 16.2 Native cases (one fixed script)
 
@@ -1144,59 +1271,68 @@ the selected-volume rule.
    or its consumer rebuilding, and the program's runtime `env!("OUT_DIR")`
    value and SQLite version correct after the donor slot is deleted. This is
    the non-vacuous proof that an excluded run never becomes fresh;
-2. **complete-manifest registry positive.** A small registry dependency with
-   no build script (`cfg-if`) is offered with its full triple
+2. **leaf registry positive and complete manifest.** A small registry leaf
+   (`cfg-if`, no dependency edges) is offered with its full triple
    (hash/`.json`/`dep-…`) plus artifacts; two checkouts share one lock and
    Cargo home, the second leases a new slot that is seeded, and Cargo reports
    the offered dependency unit fresh (`--message-format` is caller-supplied by
    the proof, never injected). A debug-only proof control that drops only the
    `dep-…` entry from the plan must make the same unit rebuild, proving the
    manifest is the complete one;
-3. proc macro: a small proc-macro dependency's dylib and fingerprint are
-   offered, and a macro expansion compiles and runs;
-4. build-script **compile** unit: offered, but the excluded run unit makes it
+3. **ambient-input control (leaf boundary, non-vacuous).** A dependency with
+   an edge whose proc macro reads an inherited environment variable is
+   **ineligible**; two recipient builds under different values of that
+   variable both run cold and produce the two different values, proving the
+   leaf rule prevents the donor's expansion-time ambient input from leaking
+   into the recipient's code. Its control is the leaf case 2;
+4. **leaf proc macro over git.** An owned scratch git repository holds a
+   dependency-free proc-macro crate; it is verified by the sanitized git
+   protocol, offered as a leaf, and the recipient's expansion compiles and
+   runs. A non-leaf proc-macro crate is ineligible (its `syn`/`quote` edges),
+   and a configured `core.fsmonitor` hook in that repository is never run;
+5. build-script **compile** unit: offered, but the excluded run unit makes it
    inert — the package's lib is rebuilt (the non-vacuous control);
-5. donor deleted before the recipient builds: the recipient still compiles and
+6. donor deleted before the recipient builds: the recipient still compiles and
    runs, with no link to the donor;
-6. changed dependency: a recipient lock with a different version or source
-   does not offer that unit, and the build is correct;
-7. held donor: a gated writer holds the only compatible donor → `donor busy`
+7. changed dependency: a recipient lock with a different version or source does
+   not offer that unit, and the build is correct;
+8. held donor: a gated writer holds the only compatible donor → `donor busy`
    skip, the recipient builds cold, and the donor is unchanged;
-8. cross-toolchain and producer context: a donor built under a different
-   recorded compiler/Cargo identity, and one built with a different
-   `RUSTFLAGS` or a differently configured linker/profile in its Cargo config,
-   are not eligible and build cold;
-9. crash mid-seed: a debug-only hook (absent from release builds, scoped like
-   the existing `OXIDE_TEST_*` hooks) crashes after the first clone; the next
-   command must evict the untrusted generation, run no Cargo over partial
-   state, and build cold;
-10. caps each skip without donor mutation: logical bytes, units, files and the
+9. **differing context.** A donor built under a different recorded
+   compiler/Cargo identity, with a different `RUSTFLAGS`, or from a different
+   working directory whose member `.cargo/config.toml` sets a different
+   `[build] rustflags`/`[env]` value, is not eligible and the recipient builds
+   cold; the equal-context control still seeds;
+10. crash mid-seed: a debug-only hook (absent from release builds, scoped like
+    the existing `OXIDE_TEST_*` hooks) crashes after the first clone; the next
+    command must evict the untrusted generation, run no Cargo over partial
+    state, and build cold;
+11. caps each skip without donor mutation: logical bytes, units, files and the
     seed's own deadline;
-11. git identity: a fully verified git dependency seeds; a dirty, submodule or
-    differently-revisioned checkout does not; a same-name registry/git
-    collision is ineligible;
-12. unsupported layout: a fake `cargo` that reports an unverified version
+12. git identity negatives: a dirty, submodule or differently-revisioned
+    checkout is ineligible; a same-name registry/git collision is ineligible;
+13. unsupported layout: a fake `cargo` that reports an unverified version
     makes the command skip seeding while Cargo still runs normally;
-13. no donor writes: donor tree content digest, its catalog, ledger bytes and
+14. no donor writes: donor tree content digest, its catalog, ledger bytes and
     control bytes are identical before and after a seed, and its rank, use mark
     and recorded figure are unchanged;
-14. removable path: one owned 128 MiB APFS image (`hdiutil attach -owners on`)
+15. removable path: one owned 128 MiB APFS image (`hdiutil attach -owners on`)
     registered as a removable pool seeds a tiny `cfg-if` workspace across two
     of its slots and detaches ordinarily, proving the same-volume predicate and
     that the recipient's bytes are on the image;
-15. registry tamper controls: the cached `.crate` replaced with a different
+16. registry tamper controls: the cached `.crate` replaced with a different
     archive (checksum mismatch), the extracted tree with one extra file, one
     altered file, one symlink and one missing file each make the package
     ineligible and the command cold — never a seeded copy;
-16. seeded recipient never donates: after a successful seed and build, the
+17. seeded recipient never donates: after a successful seed and build, the
     recipient's `attempt` record says `seeded` and a third cold slot must not
     receive a catalog from it, even though its build began empty and
     succeeded;
-17. reserve gate: an injected below-trigger reading (the existing debug-only
+18. reserve gate: an injected below-trigger reading (the existing debug-only
     free-space seam) makes a command whose only available donor would seed
     **refuse before any child**; a mid-seed breach aborts, resets and refuses;
     the non-seeding control still runs Cargo as today;
-18. partial-trust negative: a fault-injected partial recipient is never reused
+19. partial-trust negative: a fault-injected partial recipient is never reused
     as warm by a later command.
 
 ### 16.3 Runner, bounds, clocks and activation
@@ -1240,88 +1376,103 @@ the selected-volume rule.
 
 ### 16.4 Fixed-script time and disk allocation (source-derived, UNMEASURED)
 
-Disk, against the 512 MiB monitored scratch budget:
+Disk, against the 512 MiB monitored scratch budget. Archives and extracted
+sources coexist in a Cargo home, and the new verification dependencies are
+part of staging:
 
 | Item | Estimate | Basis |
 | --- | --- | --- |
-| debug staging of this HEAD's `oxide` (offline 1.97.1, 4 jobs, stripped) | 50-70 MiB | the #122 recipe measured a 58.3 MiB peak |
-| seeded private `CARGO_HOME` (archives + extracted sources) | 25-35 MiB | SQLite amalgamation about 9.5 MiB compressed and 30 MiB extracted, plus `libsqlite3-sys`, `cc`, `cfg-if` and a tiny proc macro |
-| donor slot (SQLite build intermediates) | 90-140 MiB | amalgamation object files plus the fixture's units, one `debug` profile |
-| recipient slot (seeded dependency units only) | 40-90 MiB | the offered subset; workspace bins stay local |
-| checkout fixtures, logs, receipts | 8 MiB or less | tiny sources and bounded receipts |
-| one owned 128 MiB sparse image (removable case only) | 128 MiB allocated at most | separate phase after the SQLite slots are released; sparse backing |
+| debug staging of this HEAD's `oxide` (offline 1.97.1, 4 jobs, stripped) | 60-85 MiB | the #122 recipe measured a 58.3 MiB peak before the archive-reader dependencies; `flate2`/`miniz_oxide`/`tar` add build objects and one stripped binary copy |
+| seeded private `CARGO_HOME`: `.crate` archives + extracted sources + index entries | 50-70 MiB | SQLite amalgamation about 10 MiB compressed **and** about 30 MiB extracted at the same time, plus `libsqlite3-sys`, `cc`, `cfg-if`, `flate2`, `tar` and the tiny proc-macro git checkout |
+| donor slot (SQLite build intermediates) | 90-140 MiB | amalgamation object files plus the fixture's units at the `debug` profile |
+| recipient slot (offered leaf units only) | 20-50 MiB | `cfg-if`-sized units; SQLite is not a leaf and is never offered |
+| checkout fixtures, receipts, logs | 8 MiB or less | tiny sources and bounded receipts |
+| one owned 128 MiB sparse image (removable case only) | 128 MiB allocated at most | a separate phase after the SQLite slots are released; sparse backing |
 
-Peak internal phase is about 205-343 MiB; the removable phase about 85-200 MiB.
-The script reports the monitored peak and stops if it exceeds 480 MiB instead
-of trimming a case.
+Peak internal phase is about 230-345 MiB; the removable phase is about
+140-290 MiB; both stay under the 512 MiB monitored budget with margin. The
+script reports the monitored peak and stops if it exceeds 480 MiB instead of
+trimming a case.
 
-Time, against the 300 s wall clock:
+Time, per required case, against the 300 s wall clock. Every figure is an
+estimate; the basis column names the measured analogue or the work the case
+does:
 
-| Phase | Estimate |
-| --- | --- |
-| staging `oxide` once | 35-45 s |
-| SQLite donor epoch (`libsqlite3-sys` bundled, `cc` at debug opt-level) plus fixture bins | 35-70 s |
-| SQLite seeded recipient (run unit reruns, SQLite recompiles, consumer rebuilds) | 30-60 s |
-| twelve tiny registry/git/proc-macro/caps/context cases at 3-8 s each | 40-90 s |
-| crash, reserve-gate, tamper and partial-trust controls | 20-40 s |
-| image attach, removable seed and ordinary detach | 8-15 s |
-| cleanup and receipt inside the guard | 5-10 s |
+| Case | Estimate | Basis |
+| --- | --- | --- |
+| staging `oxide` once (including the two new dependencies) | 40-50 s | #122 measured 37 s for the same recipe without them |
+| 1 SQLite donor epoch (`libsqlite3-sys` bundled) plus fixture bins | 8-20 s | #123's SQLite+serde donor build measured 7.97 s; `cc` compiles one amalgamation |
+| 1 SQLite seeded recipient (run unit reruns, SQLite recompiles, consumer rebuilds) | 8-20 s | the same compile repeated; #123's post-donor-delete build measured 0.55 s without an excluded run |
+| 2 leaf positive, `dep-…` counterfactual, 3 ambient control, 4 leaf proc macro over git | 4-10 s each, 16-40 s total | two tiny Cargo calls each over `cfg-if`-sized crates |
+| 5, 6, 7, 12 build-script, donor-deleted, changed dependency, git negatives | 2-6 s each, 10-24 s total | tiny fixtures, one Cargo call each |
+| 8, 9 held donor and differing context | 2-5 s each, 5-10 s total | a gated writer and one Cargo call; no large build |
+| 10, 11, 13, 17, 18, 19 crash, caps, unsupported layout, seeded-recipient, reserve, partial trust | 1-4 s each, 10-24 s total | mostly seeded-fixture copies and one tiny Cargo call or no Cargo |
+| 14 no donor writes | 2-4 s | one seed plus digests |
+| 15 removable image: attach, seed, detach | 8-15 s | image attach/detach of an owned 128 MiB sparse image plus a tiny build |
+| 16 registry tamper controls | 2-4 s each, 8-16 s total | archive and tree mutations, no Cargo |
+| cleanup, receipts and the phase table inside the guard | 5-10 s | bounded writes and one detach |
 
-The total is about 173-330 s, which straddles the 300 s bound; the estimate is
-not a demonstrated fit. The script prints a phase table, and if the first
-diagnostic run's projection exceeds 270 s it **stops and reports** rather than
-dropping a required case. If the required SQLite case cannot fit even with a
-single staging and one Cargo job, the conflict returns to the Supervisor for a
-scoped bound amendment; this design does not substitute a cheaper fixture and
-does not treat the separate real-project comparison as the proof.
+The total is about 130-240 s, with a worst case near 260 s when every case
+runs at its upper estimate; the 300 s bound therefore has margin on this
+accounting. The estimate is still UNMEASURED: the script prints the phase
+table, and if the first diagnostic's projection or measurement exceeds 270 s
+it **stops and reports** rather than dropping a required case. If the required
+SQLite case cannot fit even so, the conflict returns to the Supervisor for a
+scoped bound amendment before freeze; this design does not substitute a
+cheaper fixture and does not treat the separate real-project comparison as the
+proof.
 
 ## 17. Independent review questions
 
-1. Is the archive-to-tree rule in §4.3 sound as specified — cached `.crate`
+1. Is the §3.2 leaf boundary accepted as the positive ambient-input boundary,
+   with proc-macro reach returned to the Supervisor rather than silently
+   narrowed — or does the Supervisor want the broader dependency graph, which
+   would require the deferred artifact-JSON/unit-graph capture plus a reviewed
+   proc-macro input-tracking mechanism?
+2. Is the §3.1 configuration lookup accepted as Cargo's own: working directory
+   to the filesystem root, then the Cargo home, Cargo precedence, `[env]`
+   relative values resolved to canonical absolute paths, and skip on anything
+   unreadable, unparseable or unmodelled?
+3. Is `freshness::Git` (§4.3) accepted as the seed-side git verifier, including
+   the cleared Git environment, the bounded call/time/output/settle budget and
+   the rule that unconfirmed closure refuses rather than skips?
+4. Is the archive-to-tree rule in §4.3 sound as specified — cached `.crate`
    bytes against the lock checksum, a canonical derivation with strict entry
-   grammar and extra/missing entries failing closed, `.cargo-ok` never treated
-   as evidence, and a verification cache keyed by checksum and tree identity —
-   and is the pinned `flate2` + `tar` reader acceptable as a new locked
-   dependency, or should registry packages be withheld until a different
-   reviewed mechanism exists?
-2. Is the complete per-role manifest in §5.1 (fingerprint hash, `.json` and
-   `dep-<kind>-<target>`, plus the role's artifacts) accepted as the exact
+   grammar, extra/missing entries failing closed, `.cargo-ok` never evidence,
+   and a verification cache keyed by checksum and tree identity — and is the
+   pinned `flate2` + `tar` reader acceptable as a new locked dependency?
+5. Is the complete per-role manifest in §5.1 accepted as the exact
    completeness boundary, with an unclassifiable fingerprint-dir entry making
-   the whole package ineligible rather than being silently dropped?
-3. Is recording per-file producing-epoch SHA-256 digests in the catalog (§4.4)
-   with a 256 MiB / 4 s producing-time hashing cap the right stale-content
-   evidence, and is abandoning the whole seed on a single offered-file mismatch
-   (rather than dropping that unit) the intended fail-closed behaviour?
-4. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
-   the unseeded fact, including the case where an older binary reuses a slot?
-   The older binary neither reads nor publishes catalogs, and it cannot clear
-   the record.
-5. Is the §3.1 context digest — compiler selection, wrapper context, full flag
-   set, profile/target overrides and the named config tables, with `--config`,
-   `[source]`, `[patch]`, `[registries]` and `[unstable]` unsupported — the
-   right bounded boundary, and are the unsupported cases the ones the reviewer
-   expects to skip?
-6. Is the §8.3 reserve treatment accepted: a 22 GiB start gate and monitored
-   stop for the seeding path that **refuses** rather than cold-builds, with the
-   removable volume on its own removal-only watchdog and registration reserve,
-   and the non-seeding path deliberately unchanged pending a separate
-   unification decision?
-7. Does the §16.2 case list and the §16.4 allocation make the required SQLite
-   proof plausible within one 300 s / 512 MiB session, or should the conflict
-   go to the Supervisor for a scoped bound amendment before freeze?
-8. Is the D-4 interface in §11 the intended reading — seeding cannot help while
-   the only donor is the session's held slot — or should a scoped follow-up
-   consider a read-only held-slot donor under stricter closure rules?
+   the whole package ineligible rather than being dropped?
+6. Is recording per-file producing-epoch SHA-256 digests (§4.4) with a
+   256 MiB / 4 s cap the right stale-content evidence, and is abandoning the
+   whole seed on one mismatch the intended fail-closed behaviour?
+7. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
+   the unseeded fact, including an older binary reusing a slot?
+8. Is the §8.3 reserve treatment accepted: a 22 GiB start gate and monitored
+   stop for the seeding path that refuses rather than cold-builds, the removable
+   volume on its own removal-only watchdog and registration reserve, and the
+   non-seeding path deliberately unchanged pending a separate unification?
+9. Does the corrected §16.4 allocation (coexisting archives and extracted
+   sources, new dependencies in staging, a per-case schedule with a stated
+   basis, total about 130-260 s of 300 s and a peak about 230-345 MiB of
+   512 MiB) make the required SQLite proof plausible, or should the bound
+   conflict go to the Supervisor before freeze?
+10. Is the D-4 interface in §11 the intended reading — seeding cannot help
+    while the only donor is the session's held slot — or should a scoped
+    follow-up consider a read-only held-slot donor under stricter closure?
 
 ## 18. Limits of this design
 
 - It establishes no native evidence, no selected-volume fit, no timing, no
   reach, no saving and no benefit. The separate measured real-Effigy
   seeded-versus-unseeded comparison stays non-gating and separately scoped.
-- It does not implement the registry archive reader; it names the dependency
-  and the strictness the implementation must prove, and it records that
-  declining that dependency would narrow the approved registry scope and must
-  return to the Supervisor.
+- Its eligible set is the leaf dependency set. That is narrower than the
+  approved scope's wording about dependency libraries and proc macros, and the
+  narrowing is returned to the Supervisor rather than decided here.
+- It does not implement the registry archive reader or the configuration
+  walker; it names the dependency, the strictness and the skip rules the
+  implementation must prove.
 - It does not qualify removable media beyond the pinned adapter's own proofs,
   does not touch a real drive, and makes no persistence claim about physical
   disconnection.
