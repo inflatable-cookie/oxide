@@ -4624,3 +4624,147 @@ fn a_failed_reopen_keeps_both_names_and_stays_pending() {
     }
     let _ = link;
 }
+
+/// A replacement created at the private name **before** the repair opens it is
+/// neither repaired nor renamed: the whole deletion refuses, the replacement
+/// stays at its private name with its own mode, the observed name stays free,
+/// and the production ledger keeps the capture record so the slot stays pending.
+#[test]
+fn a_replacement_before_the_repair_keeps_both_names_and_stays_pending() {
+    let fixture = Fixture::new("repair-replacement");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "repair-replacement");
+    let locked = slot_path.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
+
+    let fixture_path = fixture.path().to_path_buf();
+    let _rebind = crate::test_fs::before_repair(move || {
+        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
+        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
+        fs::rename(&captured_locked, captured_slot.join("moved-away"))
+            .expect("the verified directory is moved aside");
+        fs::create_dir(&captured_locked).expect("replacement at the private name");
+        fs::set_permissions(&captured_locked, fs::Permissions::from_mode(0o500))
+            .expect("replacement mode");
+    });
+    assert!(
+        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
+        "a replacement before the repair refuses"
+    );
+
+    assert!(slot_path.is_dir(), "the slot is restored");
+    assert!(
+        !slot_path.join("locked").exists(),
+        "the replacement was not renamed into the observed name"
+    );
+    let replacement = find_dir_by_mode(&slot_path, 0o500).expect("replacement kept");
+    assert!(
+        replacement
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-")),
+        "the replacement is still at its private name"
+    );
+    assert_eq!(
+        mode_of(&replacement),
+        0o500,
+        "the replacement keeps its own mode"
+    );
+    assert_eq!(
+        mode_of(&find_dir_by_mode(&slot_path, 0o100).expect("verified original kept")),
+        0o100,
+        "the verified original keeps the owner's mode"
+    );
+
+    let journal = super::pool::capture_record_injected(&pool, slot_id)
+        .expect("the capture journal is retained");
+    assert!(
+        journal
+            .captures
+            .iter()
+            .any(|record| record.original == "locked"),
+        "the replaced entry's capture record is kept"
+    );
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
+}
+
+/// A symlink planted at the private name before the repair opens it is never
+/// followed, never repaired and never renamed: both names and the production
+/// journal stay exactly as they were, pending.
+#[test]
+fn a_symlink_before_the_repair_keeps_both_names_and_stays_pending() {
+    let fixture = Fixture::new("repair-link");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "repair-link");
+    let locked = slot_path.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
+    let outside = fixture.dir("outside");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).expect("outside mode");
+
+    let (fixture_path, outside_path) = (fixture.path().to_path_buf(), outside.clone());
+    let _rebind = crate::test_fs::before_repair(move || {
+        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
+        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
+        fs::rename(&captured_locked, captured_slot.join("moved-away"))
+            .expect("the verified directory is moved aside");
+        symlink(&outside_path, &captured_locked).expect("a link at the private name");
+    });
+    assert!(
+        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
+        "a link before the repair refuses"
+    );
+
+    assert!(slot_path.is_dir(), "the slot is restored");
+    assert!(
+        !slot_path.join("locked").exists(),
+        "the link was not renamed into the observed name"
+    );
+    let link = fs::read_dir(&slot_path)
+        .expect("slot listed")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"))
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
+        .expect("the link is still at its private name");
+    assert_eq!(
+        fs::read_link(&link).expect("link target"),
+        outside,
+        "the link still names exactly what the racer put there"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&outside)
+            .expect("outside kept")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700,
+        "nothing was repaired or chmodded through the link"
+    );
+    assert_eq!(
+        mode_of(&find_dir_by_mode(&slot_path, 0o100).expect("verified original kept")),
+        0o100,
+        "the verified original keeps the owner's mode"
+    );
+
+    let journal = super::pool::capture_record_injected(&pool, slot_id)
+        .expect("the capture journal is retained");
+    assert!(
+        journal
+            .captures
+            .iter()
+            .any(|record| record.original == "locked"),
+        "the unresolved entry's capture record is kept"
+    );
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
+}

@@ -830,6 +830,31 @@ fn abort_capture(parent: BorrowedFd<'_>, capture: &Capture, cause: LeaseError) -
     }
 }
 
+/// Put a captured entry back only while the private name still holds exactly
+/// the object this process captured and verified. A name that now holds
+/// anything else (a replacement, a link, or something unreadable) is left
+/// exactly where it is: an unverified occupant is never renamed into the
+/// observed name, and the caller's journal record stays outstanding.
+fn put_back_verified(
+    parent: BorrowedFd<'_>,
+    capture: &Capture,
+    observed: &crate::owned_delete::EntryFacts,
+    cause: LeaseError,
+) -> LeaseError {
+    let still_captured = crate::owned_delete::observe_entry(parent, &capture.private)
+        .map(|facts| {
+            facts.device == observed.device
+                && facts.inode == observed.inode
+                && facts.file_type() == observed.file_type()
+        })
+        .unwrap_or(false);
+    if still_captured {
+        abort_capture(parent, capture, cause)
+    } else {
+        keep_both_names(capture, cause)
+    }
+}
+
 /// Refuse without moving anything. The recorded private name no longer holds
 /// the object that capture verified, so it is never renamed into the observed
 /// name: both names are kept, the unverified object is left exactly where the
@@ -1039,23 +1064,39 @@ fn remove_tree_owned_at(
             ) {
                 Ok(repair) => repair,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    return Err(abort_capture(
+                    return Err(put_back_verified(
                         parent,
                         &capture,
+                        &observed,
                         LeaseError::UnsafePath(
                             "an owned directory that cannot be opened is kept, never chmodded through its name",
                         ),
                     ));
                 }
-                Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
+                Err(error) => {
+                    return Err(put_back_verified(
+                        parent,
+                        &capture,
+                        &observed,
+                        io_error(error),
+                    ))
+                }
             };
             let identity = match descriptor_identity(repair.as_fd()) {
                 Ok(identity) => identity,
-                Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
+                Err(error) => {
+                    return Err(put_back_verified(
+                        parent,
+                        &capture,
+                        &observed,
+                        io_error(error),
+                    ))
+                }
             };
             if identity != (observed.device, observed.inode) {
-                return Err(abort_capture(
-                    parent,
+                // The private name now holds a replacement: it is neither
+                // chmodded nor renamed.
+                return Err(keep_both_names(
                     &capture,
                     LeaseError::UnsafePath(
                         "the verified directory was replaced before its access was repaired",
@@ -1063,7 +1104,12 @@ fn remove_tree_owned_at(
                 ));
             }
             if let Err(error) = crate::owned_delete::restore_owner_access(repair.as_fd()) {
-                return Err(abort_capture(parent, &capture, io_error(error)));
+                return Err(put_back_verified(
+                    parent,
+                    &capture,
+                    &observed,
+                    io_error(error),
+                ));
             }
             // The repair widened this entry's own mode. From here every exit
             // path — an error, a `?` or a panic — restores the owner's recorded
@@ -1090,7 +1136,14 @@ fn remove_tree_owned_at(
                 }
             }
         }
-        Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
+        Err(error) => {
+            return Err(put_back_verified(
+                parent,
+                &capture,
+                &observed,
+                io_error(error),
+            ))
+        }
     };
     let held = match descriptor_identity(child.as_fd()) {
         Ok(held) => held,
