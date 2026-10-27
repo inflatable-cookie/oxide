@@ -39,6 +39,8 @@ thread_local! {
     static CLONE_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
     static REMOVE_CREATED_DIRECTORY: Cell<bool> = const { Cell::new(false) };
     static UNREADABLE_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
+    static HARDLINK_CLONE: Cell<bool> = const { Cell::new(false) };
+    static RACE_DESTINATION: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(super) fn walk_limits_override() -> Option<SeedWalkLimits> {
@@ -60,6 +62,8 @@ fn reset_hooks() {
     CLONE_DELAY_MS.with(|cell| cell.set(None));
     REMOVE_CREATED_DIRECTORY.with(|cell| cell.set(false));
     UNREADABLE_CLONE.with(|cell| cell.set(None));
+    HARDLINK_CLONE.with(|cell| cell.set(false));
+    RACE_DESTINATION.with(|cell| cell.set(false));
 }
 
 pub(super) fn inject(point: TestPoint<'_>) {
@@ -97,6 +101,13 @@ pub(super) fn inject(point: TestPoint<'_>) {
                     .expect("unreadable clone");
             }
         }
+        TestPoint::BeforeDestinationMkdir { path } => {
+            if RACE_DESTINATION.with(Cell::get) {
+                // An unknown writer creates the directory first, so the seed's
+                // `mkdirat` fails with `EEXIST`.
+                let _ = fs::create_dir(path);
+            }
+        }
         TestPoint::AfterDestinationMkdir { path } => {
             if REMOVE_CREATED_DIRECTORY.with(Cell::get) {
                 fs::remove_dir(path).expect("remove created destination");
@@ -105,6 +116,13 @@ pub(super) fn inject(point: TestPoint<'_>) {
         TestPoint::BeforeWalk { slot } => {
             if PLANT_SYMLINK.with(Cell::get) {
                 symlink("missing-target", slot.join("foreign-link")).expect("plant symlink");
+            }
+            if HARDLINK_CLONE.with(Cell::get) {
+                // A hard-linked pair inside the recipient slot: one inode, two
+                // directory entries.
+                let build = slot.join("build");
+                fs::hard_link(build.join(ARTIFACT), build.join(format!("{ARTIFACT}.link")))
+                    .expect("hard link the clone");
             }
         }
         TestPoint::BeforeFinalDonorCheck { pool } => {
@@ -1469,12 +1487,15 @@ fn seed_refuses_a_fault_after_the_destination_directory_is_created() {
     let before_ledger = rig.ledger_bytes();
     let before_sidecars = rig.sidecars();
     // The destination directory was created (a recipient write), and the
-    // destination itself already exists, so `clonefile` fails with `EEXIST`.
-    // That is after the first write: it refuses and retains, and there is no
-    // byte-copy or hard-link fallback.
+    // destination itself already exists, so `clonefile` fails with `EEXIST`:
+    // an unknown writer's entry, which refuses and retains (a safety refusal,
+    // not a cold skip) and has no byte-copy or hard-link fallback.
     BREAK_DONOR.with(|cell| cell.set(Some(0)));
     let refused = seed(&rig.pool, &donor.request(&recipient));
-    assert!(matches!(refused, Err(LeaseError::Io(_))));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
     let destination = grant.env.cargo_build_build_dir.join(&donor.files[0].0);
     assert!(fs::symlink_metadata(&destination)
         .expect("planted entry")
@@ -1642,6 +1663,54 @@ fn seed_refuses_a_slot_folder_symlink_on_either_side() {
         .join(&recipient_leaf)
         .join("build");
     assert!(tree(&redirected).is_empty());
+}
+
+#[test]
+fn seed_refuses_a_destination_entry_that_races_the_first_mkdir() {
+    reset_hooks();
+    let rig = Rig::new("mkdir-race");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let before_ledger = rig.ledger_bytes();
+    // No recipient write has happened yet, but an entry appears where the seed
+    // would create its first destination directory: that is an unknown
+    // writer's entry, so it refuses instead of cold-skipping.
+    RACE_DESTINATION.with(|cell| cell.set(true));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    assert_eq!(rig.ledger_bytes(), before_ledger);
+    assert!(!grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
+}
+
+#[test]
+fn the_recipient_walk_unions_hard_linked_inodes() {
+    reset_hooks();
+    let rig = Rig::new("walk-hardlink");
+    let donor = make_donor(&rig, "a");
+    let (_, recipient) = lease_recipient(&rig, "a");
+    // A hard-linked pair inside the recipient slot is two directory entries of
+    // one inode: the within-slot union counts its bytes once.
+    HARDLINK_CLONE.with(|cell| cell.set(true));
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    let SeedOutcome::Seeded(receipt) = outcome else {
+        panic!("expected a published seed, got {outcome:?}");
+    };
+    let cloned: u64 = donor
+        .files
+        .iter()
+        .map(|(_, content)| content.len() as u64)
+        .sum();
+    assert_eq!(receipt.observation.logical_bytes, cloned);
+    assert!(receipt.observation.complete());
+    // The extra directory entry is counted as an entry, not as extra bytes.
+    assert!(receipt.observation.entries > receipt.files);
 }
 
 #[test]
@@ -1860,6 +1929,41 @@ fn join_parser_accepts_rustc_shapes_and_refuses_others() {
         join::parse(many_inputs.as_bytes()),
         Err(JoinRefusal::Budget)
     );
+}
+
+#[test]
+fn publish_refuses_when_a_cap_drop_cannot_be_removed() {
+    reset_hooks();
+    let rig = Rig::new("cap-delete-failure");
+    let first = make_donor(&rig, "a");
+    let seeds = rig.pool.join(MANAGED_NAME).join("seeds");
+    let first_catalog = fs::metadata(seeds.join(format!("{}.catalog.json", first.grant.slot_id)))
+        .expect("first catalog")
+        .len();
+    // A second producing lease, still held, whose catalog would need the first
+    // one dropped to fit the family ceiling.
+    let record_id = rig.next_record_id();
+    let second = rig.lease_at("donor-b", "donor", rig.affinity_dir(record_id));
+    let files = default_files();
+    write_files(&second.env.cargo_build_build_dir, &files);
+    let second_catalog = catalog_for(&second, record_id, &files);
+    FAMILY_CAP.with(|cell| cell.set(Some(first_catalog + 8)));
+    // The drop cannot be performed: the write must refuse rather than credit
+    // space the failed deletion did not free.
+    fs::set_permissions(&seeds, fs::Permissions::from_mode(0o500)).expect("read-only seeds");
+    let refused = publish_seed_catalog(&rig.pool, &second_catalog);
+    fs::set_permissions(&seeds, fs::Permissions::from_mode(0o700)).expect("writable seeds");
+    assert!(
+        matches!(refused, Err(LeaseError::LedgerExhausted)),
+        "{refused:?}"
+    );
+    assert!(seeds
+        .join(format!("{}.catalog.json", first.grant.slot_id))
+        .exists());
+    assert!(!seeds
+        .join(format!("{}.catalog.json", second.slot_id))
+        .exists());
+    release_injected(&rig.pool, &second.lease_id).expect("release second");
 }
 
 #[test]

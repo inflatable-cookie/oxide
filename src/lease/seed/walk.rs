@@ -11,6 +11,10 @@
 //! other outcome is a gap, including a root that cannot be opened, stat'd or
 //! proven owned, and a directory read that fails: a walk never reports clean
 //! coverage it did not establish. The caller abandons seeding on any gap.
+//!
+//! Byte figures apply the capacity contract's **within-slot inode union**: a
+//! hard-linked pair inside this one slot is counted once, because the figure
+//! describes this slot's own bytes and the seed never creates a link itself.
 
 use super::super::current_uid;
 use crate::owned_delete::open_directory_at;
@@ -105,8 +109,7 @@ pub fn walk_slot_in(
         deadline: Duration::from_millis(limits.max_elapsed_ms),
         device,
         entries: 0,
-        logical_bytes: 0,
-        allocated_bytes: 0,
+        inodes: std::collections::HashMap::new(),
         gap: None,
     };
     match stat(root) {
@@ -120,8 +123,8 @@ pub fn walk_slot_in(
     }
     WalkOutcome {
         entries: walk.entries,
-        logical_bytes: walk.logical_bytes,
-        allocated_bytes: walk.allocated_bytes,
+        logical_bytes: walk.logical_bytes(),
+        allocated_bytes: walk.allocated_bytes(),
         gap: walk.gap,
         elapsed_ms: walk.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
     }
@@ -139,9 +142,26 @@ struct Walk {
     deadline: Duration,
     device: u64,
     entries: u64,
-    logical_bytes: u64,
-    allocated_bytes: u64,
+    /// The within-slot inode union: one record per `(device, inode)`, so a
+    /// hard-linked pair in this slot contributes its bytes once.
+    inodes: std::collections::HashMap<(u64, u64), (u64, u64)>,
     gap: Option<WalkGap>,
+}
+
+impl Walk {
+    fn logical_bytes(&self) -> u64 {
+        self.inodes
+            .values()
+            .map(|(logical, _)| *logical)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.inodes
+            .values()
+            .map(|(_, allocated)| *allocated)
+            .fold(0u64, u64::saturating_add)
+    }
 }
 
 impl Walk {
@@ -221,12 +241,13 @@ impl Walk {
                             return;
                         }
                     }
-                    self.logical_bytes = self
-                        .logical_bytes
-                        .saturating_add(entry.st_size.max(0) as u64);
-                    self.allocated_bytes = self
-                        .allocated_bytes
-                        .saturating_add((entry.st_blocks.max(0) as u64).saturating_mul(512));
+                    self.inodes.insert(
+                        (entry.st_dev as u64, entry.st_ino as u64),
+                        (
+                            entry.st_size.max(0) as u64,
+                            (entry.st_blocks.max(0) as u64).saturating_mul(512),
+                        ),
+                    );
                 }
                 _ => {
                     // A symlink, device, socket or FIFO is never something the

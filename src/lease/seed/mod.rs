@@ -38,9 +38,12 @@
 //!
 //! The first **recipient write** — creating the `build/` directory, creating a
 //! destination directory, or `clonefile` itself — is the point of no return:
-//! before any write abandoning is free and the same slot builds cold; from the
-//! first write onward an unsafe path, `EEXIST` at a destination and every other
-//! fault refuse and retain the untrusted generation.
+//! before any write a benign fault abandons and the same slot builds cold; from
+//! the first write onward every fault refuses and retains the untrusted
+//! generation. A **safety refusal** — unknown ownership, a wrong device, a
+//! mismatched backing, unknown custody, or an entry that appeared where the
+//! seed would create one — refuses on either side of that boundary, because a
+//! safety fault is never disguised as a cold fallback.
 //!
 //! **Tier and scope: internal pools only.** This slice writes only a
 //! `directory-budget-v1` pool's payload. Removable `apfs-volume-v1` custody is
@@ -309,7 +312,9 @@ pub struct SeedAbandon {
 }
 
 /// The generation-bound `observed-while-held` walk fact. Never a closed
-/// record, never an admission figure.
+/// record, never an admission figure. Its byte figures apply the capacity
+/// contract's within-slot inode union: a hard-linked pair inside this one slot
+/// is counted once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeedObservation {
     pub store_id: String,
@@ -625,9 +630,11 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
                 Some(fd) => fd.as_fd(),
                 None => recipient_build.as_fd(),
             };
-            match open_optional_directory(parent_fd, &component, payload_device) {
+            match open_destination_directory(parent_fd, &component, payload_device) {
                 Ok(Some(next)) => deepest = Some(next),
                 Ok(None) => {
+                    destination.push(component.to_string_lossy().as_ref());
+                    test_point(TestPoint::BeforeDestinationMkdir { path: &destination });
                     if let Err(error) = mkdir_owned(parent_fd, &component) {
                         return pre_write(wrote_any, error);
                     }
@@ -635,7 +642,6 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
                     // the reopen: a fault between mkdir and reopen refuses and
                     // retains rather than cold-skipping in the same slot.
                     wrote_any = true;
-                    destination.push(component.to_string_lossy().as_ref());
                     test_point(TestPoint::AfterDestinationMkdir { path: &destination });
                     match open_optional_directory(parent_fd, &component, payload_device) {
                         Ok(Some(next)) => deepest = Some(next),
@@ -961,9 +967,17 @@ fn work_deadline_after_clone() -> LeaseError {
 /// generation is retained (§6.5).
 fn pre_write(wrote_any: bool, error: LeaseError) -> Result<SeedOutcome, LeaseError> {
     if wrote_any {
-        Err(error)
-    } else {
-        Ok(skip(SeedSkipReason::CloneFailed))
+        return Err(error);
+    }
+    // A safety refusal is never a cold fallback, with or without a write:
+    // unknown ownership, a foreign or wrong-device path, a mismatched backing
+    // or unknown custody all refuse. Only a benign first-write fault (a
+    // directory or clone that could not be created) may skip.
+    match error {
+        LeaseError::UnsafePath(_) | LeaseError::BackingMismatch | LeaseError::UnknownAccounting => {
+            Err(error)
+        }
+        _ => Ok(skip(SeedSkipReason::CloneFailed)),
     }
 }
 
@@ -1221,13 +1235,13 @@ fn sidecar_slot_id(name: &str) -> Option<u64> {
 /// write if it still would not fit.
 fn enforce_family_bytes(dir: &Path, adding: u64, keep_slot: &str) -> Result<(), LeaseError> {
     let cap = family_cap();
-    let mut total = sidecar_bytes(dir)?;
+    let total = sidecar_bytes(dir)?;
     if total.saturating_add(adding) <= cap {
         return Ok(());
     }
     let mut catalogs: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     for entry in fs::read_dir(dir).map_err(io_error)? {
-        let Ok(entry) = entry else { continue };
+        let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
         let Some(text) = name.to_str() else { continue };
         let Some(id) = sidecar_slot_id(text) else {
@@ -1236,9 +1250,9 @@ fn enforce_family_bytes(dir: &Path, adding: u64, keep_slot: &str) -> Result<(), 
         if id.to_string() == keep_slot || !text.ends_with(CATALOG_SUFFIX) {
             continue;
         }
-        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
+        // A sidecar whose size cannot be read makes the family figure unknown,
+        // so the write refuses instead of assuming it fits.
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
         if !metadata.file_type().is_file() || metadata.uid() != current_uid() {
             continue;
         }
@@ -1248,19 +1262,28 @@ fn enforce_family_bytes(dir: &Path, adding: u64, keep_slot: &str) -> Result<(), 
     catalogs.sort_by(|left, right| left.0.cmp(&right.0).then(left.2.cmp(&right.2)));
     // Plan the drops first: a write that cannot fit even after dropping the
     // oldest catalogs must not destroy any of them.
-    let mut planned = Vec::new();
+    let mut planned: Vec<(u64, PathBuf)> = Vec::new();
+    let mut projected = total;
     for (_, len, path) in catalogs {
-        if total.saturating_add(adding) <= cap || planned.len() >= SEED_FAMILY_DROP_MAX {
+        if projected.saturating_add(adding) <= cap || planned.len() >= SEED_FAMILY_DROP_MAX {
             break;
         }
-        total = total.saturating_sub(len);
-        planned.push(path);
+        projected = projected.saturating_sub(len);
+        planned.push((len, path));
     }
-    if total.saturating_add(adding) > cap {
+    if projected.saturating_add(adding) > cap {
         return Err(LeaseError::LedgerExhausted);
     }
-    for path in planned {
-        let _ = fs::remove_file(path);
+    // Only a successful removal frees bytes; a failed one refuses the write
+    // rather than crediting space that is still occupied.
+    let mut freed = 0u64;
+    for (len, path) in planned {
+        if fs::remove_file(&path).is_ok() {
+            freed = freed.saturating_add(len);
+        }
+    }
+    if total.saturating_sub(freed).saturating_add(adding) > cap {
+        return Err(LeaseError::LedgerExhausted);
     }
     Ok(())
 }
@@ -1276,10 +1299,8 @@ fn family_cap() -> u64 {
 fn sidecar_bytes(dir: &Path) -> Result<u64, LeaseError> {
     let mut total = 0u64;
     for entry in fs::read_dir(dir).map_err(io_error)? {
-        let Ok(entry) = entry else { continue };
-        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
+        let entry = entry.map_err(io_error)?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
         if metadata.file_type().is_file() {
             total = total.saturating_add(metadata.len());
         }
@@ -1417,12 +1438,37 @@ fn open_recipient_build(slot: BorrowedFd<'_>, device: u64) -> Result<Option<Owne
     Ok(Some(build))
 }
 
+/// Open a destination component, distinguishing a missing entry (create it)
+/// from a link-shaped or foreign one (an unknown writer's entry: refuse).
+fn open_destination_directory(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    device: u64,
+) -> Result<Option<OwnedFd>, LeaseError> {
+    match open_directory_at(parent, name) {
+        Ok(fd) => Ok(Some(require_owned_directory(fd, device)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(destination_error(error)),
+    }
+}
+
 fn mkdir_owned(parent: BorrowedFd<'_>, name: &std::ffi::CStr) -> Result<(), LeaseError> {
     // SAFETY: the descriptor and the name are live for the call.
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
-        Ok(())
-    } else {
-        Err(io_error(std::io::Error::last_os_error()))
+        return Ok(());
+    }
+    Err(destination_error(std::io::Error::last_os_error()))
+}
+
+/// A destination fault: an entry that appeared where a new directory belongs
+/// (`EEXIST`) or a link-shaped path is an unknown writer's entry and refuses;
+/// any other filesystem error is a benign write failure.
+fn destination_error(error: std::io::Error) -> LeaseError {
+    match error.raw_os_error() {
+        Some(libc::EEXIST) | Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
+            LeaseError::UnsafePath("a destination entry appeared where the seed would create one")
+        }
+        _ => io_error(error),
     }
 }
 
@@ -1582,7 +1628,7 @@ fn clone_file(
         if result == 0 {
             Ok(())
         } else {
-            Err(io_error(std::io::Error::last_os_error()))
+            Err(destination_error(std::io::Error::last_os_error()))
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -1623,6 +1669,9 @@ enum TestPoint<'a> {
     /// Immediately after a destination directory was created, before its
     /// reopen: the first-write boundary.
     AfterDestinationMkdir { path: &'a Path },
+    /// Immediately before a destination directory is created (the `EEXIST`
+    /// race window).
+    BeforeDestinationMkdir { path: &'a Path },
     /// After every clone, before the recipient walk.
     BeforeWalk { slot: &'a Path },
     /// After the walk, before the final ledger recheck.
