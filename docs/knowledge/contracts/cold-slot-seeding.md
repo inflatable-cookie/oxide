@@ -9,7 +9,21 @@ exact-head design review, then stop for the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 merge hold are separate and unchanged.
 
-**Revision 8** answers the CHANGES REQUIRED review of `88e9a2c` (review
+**Revision 9** answers the CHANGES REQUIRED review of `b4f374b` (review
+comment `6451045780`, 2026-10-27): the dep-info grammar now distinguishes
+**output rules** (the `.d` itself plus the whitelisted role artifacts) from
+rustc 1.97.1's **empty phony source rules** (`passes.rs:653-666`), accepting a
+phony target only when it is byte-identical to an already accepted
+prerequisite and resolves inside the verified source root, and rejecting any
+other unexpected, nonempty, out-of-root or unmatched rule (§4.2); for every
+supported role the fingerprint-directory hash and the artifact/`.d` hash must
+be the same 16-hex `unit_id` rendering, with every other shape skipping cold;
+a complete representative pinned dep-info fixture with its trailing phony
+targets is a required non-vacuous pure positive, alongside the `cfg-if` and
+build-script positives, and the positive native oracle stays; and the budget
+statement keeps the corrected 265 s upper / 133 s lower of the 300 s with 35 s
+remaining, marked UNMEASURED with the diagnostic still mandatory.
+**Revision 8** answered the CHANGES REQUIRED review of `88e9a2c` (review
 comment `6450792089`, 2026-10-27): the adapter now freezes **two name
 identities** — the fingerprint package directory uses the **literal** lock
 package name (`.fingerprint/cfg-if-<hash>/`,
@@ -386,6 +400,13 @@ Consequences, stated rather than hidden:
 | 1. The fingerprint directory prefix used the normalized target name | §4.2/§5.1 and §10 now separate the **literal package-directory identity** (`.fingerprint/<literal package>-<hex>/`, `build/<literal package>-<hex>/`) from the **normalized target identity** (unit suffix `lib-<target>`, `dep-lib-<target>`, artifact stems `lib<target>-<hex>`), with the opaque `<16hex>` never predicted, normalization still the uniqueness/collision rule across all source kinds, and association restricted to the named role/layout cases. Pure grammar regression: `cfg-if-<hash>/lib-cfg_if` plus `foo-bar`/`foo_bar`; native cases 2 and 16 reconciled with that grammar. |
 | 2. Time arithmetic corrected | §16.4 now states the upper estimates sum to 265 s of the 300 s (lower about 133 s), leaving 35 s; the uncounted diagnostic remains required and fit remains UNMEASURED, with no counted-native implication. |
 
+| `6451045780` finding (revision 9) | Amendment |
+| --- | --- |
+| 1. The all-rules predicate rejected rustc's phony source targets | §4.2 now separates output rules from rustc's empty phony source rules, accepts a phony target only when it is byte-identical to an accepted prerequisite and inside the verified source root, and still rejects any unexpected, nonempty, out-of-root or unmatched rule plus duplicate artifact claims. §4.4's join record keeps the phony set separate from artifacts, and §5.1/§10 name the shape. |
+| 2. Hash relationship was implicit | §4.2/§10 state that for every supported role the fingerprint-directory `<hex>` and the artifact/`.d` `<hex>` are the same 16-hex `unit_id` rendering; a differing pair, a non-16-hex value or a shape with either optional choice absent skips cold, and neither hash is predicted. |
+| 3. No representative dep-info positive | §16.1 carries a complete pinned 1.97.1 dep-info fixture including the trailing phony source rules as a required positive beside the `cfg-if` and build-script fixtures, with counterfactuals (phony handling removed, an unmatched phony target, an out-of-root phony target) that must fail, and the positive native oracle retained. |
+| 4. Budget arithmetic restated | §16.4 states the upper estimates sum to 265 s and the lower to about 133 s of the 300 s bound, leaving 35 s; both are marked UNMEASURED and the uncounted diagnostic remains mandatory, with no counted-native implication. |
+
 ## 4. Unit provenance: the producing epoch and the donor catalog
 
 Review finding 1–3 of `0ca2bd7f` are the reason this section exists: Cargo
@@ -536,25 +557,59 @@ held:
    `build/<package>-<hex>/` for a build-script compile unit (Cargo's
    custom-build units take that directory as `output_dir`). Its file name is
    rustc's `<target-stem>-<hex>.d` with the **normalized** target stem (for a
-   build script, the literal target stem `build-script-build`). The rules:
-   - the set of rule **targets** must include exactly the `.d` file itself and
-     at least one role artifact in the whitelist — `deps/lib<stem>-<hex>.rmeta`
-     (the ordinary `metadata` emit), `deps/lib<stem>-<hex>.rlib`,
+   build script, the literal target stem `build-script-build`).
+
+   Pinned 1.97.1 also writes an **empty phony rule for every input file**
+   after the output rules (`passes.rs:653-666`: `src/lib.rs:` with no
+   prerequisites, repeated for each source), and Cargo reads that file for its
+   translation (`core/compiler/mod.rs:289-296,454-465`). Those source-file
+   targets are not artifacts, so the grammar separates the two kinds of rule
+   instead of requiring every target to be inside the slot:
+
+   - **output rules.** A rule whose target is the `.d` file itself, or one of
+     the whitelisted role artifacts — `deps/lib<stem>-<hex>.rmeta` (the
+     ordinary `metadata` emit), `deps/lib<stem>-<hex>.rlib`,
      `deps/lib<stem>-<hex>.{dylib,so}` for a proc macro, or
-     `build/<package>-<hex>/build-script-build` — and no target outside the
-     slot; the stem is the normalized target identity, while the build-script
-     directory keeps the literal package name;
-   - the union of rule **prerequisites** must be non-empty and **entirely**
-     inside the package's verified source root (§4.3); a same-target
-     workspace/path package resolves to its own checkout root and is rejected;
-   - exactly one `.d` in that directory may claim the artifact path; a second
-     claim makes the package ineligible.
+     `build/<package>-<hex>/build-script-build`. At least one output rule must
+     name a whitelisted artifact, every output target must resolve inside the
+     unit's own output directory, and its prerequisites must be non-empty and
+     **entirely** inside the package's verified source root (§4.3); a
+     same-target workspace/path package resolves to its own checkout root and
+     is rejected. The stem is the normalized target identity, while the
+     build-script directory keeps the literal package name;
+   - **phony source rules.** A rule with **no prerequisites** whose target is
+     not the `.d` and not an output artifact is accepted only when that target
+     is byte-identical to a path already accepted as a prerequisite in an
+     output rule, and resolves inside the same verified source root. It
+     contributes no artifact and no prerequisite of its own;
+   - **everything else is rejected.** A rule that is neither an accepted
+     output rule nor a matched phony source rule — a nonempty unexpected
+     target, an out-of-root or unresolvable phony target, a phony target that
+     was never a prerequisite, a target outside the slot that is not a phony
+     source rule, or a duplicate/conflicting claim — makes the package
+     ineligible. Exactly one `.d` in the directory may claim the artifact
+     path; a second claim makes the package ineligible.
+
+   **Hash relationship per role.** For the supported roles (dependency
+   library, proc macro, build-script compile unit) Cargo derives both the
+   fingerprint directory's `<hex>` and the artifact/dep-info `<hex>` from the
+   same `unit_id`, and only when both optional choices are enabled
+   (`compilation_files.rs` unit-id and extra-filename paths). The adapter
+   therefore requires the fingerprint directory suffix and the artifact and
+   `.d` stem hash to be **equal** for every supported unit, and rejects a
+   shape where they differ, where either optional choice is absent, or where
+   either hash is not 16 lowercase hex digits. Neither hash is predicted; the
+   equality is a checked property of the producing slot, and every other
+   shape skips cold.
 
    This binds the source root, the artifact and the unit's dep-info together.
    The catalog records the `.d`'s relative path, the artifact paths and the
-   produced **join record** (its rule targets and prerequisite roots plus the
-   file's SHA-256), so selection can decide association without reading the
-   donor payload (§6.3).
+   produced **join record** (its output-rule targets, the accepted phony
+   source targets, the prerequisite roots and the file's SHA-256), so
+   selection can decide association without reading the donor payload (§6.3).
+   The join record keeps the phony targets separate from artifacts, so a later
+   re-verification can prove the phony set still matches the prerequisite set
+   without treating a source file as an output.
 3. **Re-verify under the pin.** Every artifact, `.d` and fingerprint file the
    plan names is re-read under the donor pin and donor record lock (§6.3 step
    6), hashed against the catalog, and its `.d` rules re-checked against the
@@ -769,9 +824,10 @@ verbatim and never predicted.
 Every offered unit requires its **join file**: rustc's dep-info in the unit's
 own output directory — `deps/<stem>-<hex>.d` for a library or proc macro and
 `build/<literal package>-<hex>/build-script-build.d` for a build-script
-compile unit. All
-of its rules are parsed; rule order is irrelevant because rustc writes the
-`.d`'s own rule first (§4.2). The `.d` is required, not optional; a unit
+compile unit. All of its rules are parsed; rule order is irrelevant because
+rustc writes the `.d`'s own rule first, and the empty phony rule rustc writes
+for each input file is matched against the accepted prerequisite set rather
+than rejected as an output (§4.2). The `.d` is required, not optional; a unit
 without a proven join is not offered.
 
 | Role | Complete fingerprint triple (inside the package directory) | Artifacts (with the required `.d`) |
@@ -1307,8 +1363,10 @@ verifies (`workflow.md#cargo-version-matrix`):
   is the slot's `build/`, Cargo creates `<profile>/` beneath it, fingerprints
   live in `<profile>/.fingerprint/<literal package>-<hex>/` with the
   three-entry unit manifest of §5.1 whose suffix and artifact stem use the
-  **normalized** target name, and only the §4.2 role/layout cases are
-  accepted, artifacts in `<profile>/deps/`, build scripts in
+  **normalized** target name, whose fingerprint-directory and
+  artifact/dep-info hashes are the same 16-hex `unit_id` rendering, and whose
+  dep-info carries rustc's empty phony source rules, and only the §4.2
+  role/layout cases are accepted, artifacts in `<profile>/deps/`, build scripts in
   `<profile>/build/<literal package>-<hex>/`, the profile directory name is
   Cargo's, and
   uplift copies finals to `CARGO_TARGET_DIR`;
@@ -1559,10 +1617,15 @@ unclassifiable entry makes that directory unusable; **artifact join, all rules
 parsed**: a `.d` whose first rule is the `.d` itself (the ordinary rustc shape)
 still joins through its later artifact rule; `--emit=dep-info,metadata`
 (`.rmeta`) and `link` (`.rlib`) both join; a proc-macro `.dylib`; a
-build-script `.d` under `build/<literal package>-<hex>/`; conflicts — two `.d`
-files
-claiming one artifact, prerequisites outside the verified source root or empty,
-a target outside the slot, a `.d` whose recorded join record no longer matches;
+build-script `.d` under `build/<literal package>-<hex>/`; rustc's **empty
+phony source rules** are matched against the accepted prerequisite set and
+contribute no artifact, while a phony rule whose target was never a
+prerequisite, is out of root or is nonempty is rejected; the
+fingerprint-directory hash and the artifact/`.d` hash must be the same 16-hex
+`unit_id` rendering, and a differing or non-16-hex pair skips; conflicts — two
+`.d` files claiming one artifact, prerequisites outside the verified source
+root or empty, an unexpected nonempty target outside the slot, a `.d` whose
+recorded join record no longer matches;
 a workspace/path package with a renamed equal-named lib target and a
 same-target different-source collision are rejected; a build-script compile
 unit whose join cannot be proven is not offered; **skip counts**: summary and
@@ -1603,6 +1666,26 @@ and summary/status rendering and their caps; adapter dispatch and
 unsupported-version skip; donor predicate matrix (held, retired, evicting,
 pending recovery, rank/lease mismatch, volume mismatch, missing lock, `seeded`
 attempt); and the fail-closed matrix of §13.
+
+**Representative pinned 1.97.1 dep-info (positive fixture, non-vacuous).** The
+pure suite parses this complete shape, with the output rules followed by
+rustc's empty phony source rules, and requires a *successful* join for a
+`cfg-if` leaf (literal `cfg-if-<hash>` directory, `lib-cfg_if` unit,
+`libcfg_if-<hex>.rmeta` artifact) and for a build-script compile unit:
+
+```make
+deps/libcfg_if-<hex>.rmeta: /root/.cargo/registry/src/index.crates.io-<idx>/cfg-if-1.0.0/src/lib.rs
+/root/.cargo/registry/src/index.crates.io-<idx>/cfg-if-1.0.0/src/lib.rs:
+```
+
+(The real file writes the `.d`'s own output rule first and one empty phony rule
+per input; the fixture covers both the `.d` rule and the phony rules.) The
+counterfactual runs the same fixture with phony-target handling removed and
+must **fail** with an unexpected-target rejection, so the regression is
+non-vacuous. A second fixture adds a phony target that is not a prerequisite
+and must fail, and a third carries an out-of-root phony target and must fail.
+The positive native oracle of cases 2 and 3 remains the end-to-end
+counterpart.
 
 ### 16.2 Native cases (one fixed script)
 
@@ -1845,19 +1928,24 @@ comparison as the proof.
 
 ## 17. Independent review questions
 
-1. Is the §3.2 leaf boundary accepted as the positive ambient-input boundary,
+1. Is the §4.2 dep-info grammar accepted — output rules distinguished from
+   rustc's empty phony source rules, phony targets matched to accepted
+   prerequisites inside the verified source root, and the fingerprint /
+   artifact `unit_id` hash equality required for every supported role — with
+   the representative pinned fixture as the non-vacuous pure positive?
+2. Is the §3.2 leaf boundary accepted as the positive ambient-input boundary,
    with proc-macro reach returned to the Supervisor rather than silently
    narrowed — or does the Supervisor want the broader dependency graph, which
    would need the deferred artifact-JSON/unit-graph capture plus a reviewed
    proc-macro input-tracking mechanism?
-2. Is the §4.2 **two-identity** rule accepted — the fingerprint package
+3. Is the §4.2 **two-identity** rule accepted — the fingerprint package
    directory uses the literal lock name (`.fingerprint/cfg-if-<hash>/`) while
    the unit suffix and artifact stem use the normalized target
    (`lib-cfg_if`), normalization is the uniqueness/collision rule across all
    source kinds, the association is restricted to the named role/layout
    cases, and the rejection record reports donor-side candidate-unit counts
    (or `units_unknown`) rather than package counts?
-3. Is the §4.2 per-unit association accepted — each `<literal package>-<hex>` directory
+4. Is the §4.2 per-unit association accepted — each `<literal package>-<hex>` directory
    classified as one unit or a run-only directory (variants offered, run
    payload never copied); each artifact set joined by parsing **all** rules of
    the unit's dep-info in its own output directory (the `.d`'s own rule first,
@@ -1865,7 +1953,7 @@ comparison as the proof.
    target and sources entirely inside the verified source root; the join
    recorded at producing time and re-verified under the pin; and no offering
    when the join is unprovable?
-4. Is the §6.3/§7 sequencing accepted as the brief's admission barrier: one
+5. Is the §6.3/§7 sequencing accepted as the brief's admission barrier: one
    admission lifetime (recipient record → sibling barrier → admission) across
    call 1 (pool lock alone, **catalog bytes only, no donor payload**), the
    effect-free selection from the recorded join and the reserve gate, then call
@@ -1873,32 +1961,32 @@ comparison as the proof.
    and hashed** and held through the final donor revalidation, with a competing
    `managed::lease` acquire/eviction between the calls aborting the seed and
    the pool hold bounded in work rather than wall time?
-5. Is the §4.3 archive-to-tree rule sound — cached `.crate` bytes against the
+6. Is the §4.3 archive-to-tree rule sound — cached `.crate` bytes against the
    lock checksum, a canonical derivation with strict entry grammar, a cache hit
    bound to the archive's recorded device/inode/size/mtime identity — and is the
    pinned `flate2` + `tar` reader acceptable as a new locked dependency?
-6. Is the complete per-role manifest in §5.1, including the required `.d` join,
+7. Is the complete per-role manifest in §5.1, including the required `.d` join,
    accepted as the completeness and association boundary?
-7. Is recording per-file producing-epoch SHA-256 digests (§4.4) with a
+8. Is recording per-file producing-epoch SHA-256 digests (§4.4) with a
    256 MiB / 4 s cap the right stale-content evidence, and is abandoning the
    whole seed on one mismatch the intended fail-closed behaviour?
-8. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
+9. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
    the unseeded fact, including an older binary reusing a slot?
-9. Is the §8.3 reserve treatment accepted: the gate sampled only after the
+10. Is the §8.3 reserve treatment accepted: the gate sampled only after the
    effect-free selection produced a non-empty plan and before the durable
    markers, a 22 GiB start gate and monitored stop that refuses rather than
    cold-builds, the removable volume on its own removal-only watchdog and
    registration reserve, and a no-plan command keeping today's behaviour (no
    sample, no marker)?
-10. Is the §9.2 bounded skip-count reporting accepted as satisfying binding
+11. Is the §9.2 bounded skip-count reporting accepted as satisfying binding
    `bb151a59`'s ambiguous-name visibility for both the summary and `oxide
    status`, without adding a walk or reconciliation?
-11. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, and
+12. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, and
    upper time estimates summing to 265 s of the 300 s with the required SQLite
    and offered-run cases retained) leave enough room for an unmeasured fit
    whose diagnostic is still mandatory, or should the conflict go to the
    Supervisor before freeze?
-12. Is the D-4 interface in §11 the intended reading — seeding cannot help
+13. Is the D-4 interface in §11 the intended reading — seeding cannot help
     while the only donor is the session's held slot — or should a scoped
     follow-up consider a read-only held-slot donor under stricter closure?
 
