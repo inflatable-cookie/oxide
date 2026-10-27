@@ -188,10 +188,23 @@ CASE_NAMES = (
     "competing-owner-and-mismatch",
 )
 # Which earlier cases a case depends on. A recoverable failure records itself and
-# blocks only its dependents; every case below is independent of the others, so
-# the uncounted diagnostic genuinely keeps going after one ordinary failure and
-# stops only on an unclassifiable custody, infrastructure or deadline outcome.
+# blocks only its dependents.
 CASE_NEEDS: dict[str, tuple] = {name: () for name in CASE_NAMES}
+# A case that MUTATES the fixture, the registry or a receipt is TAINTING: after
+# its failure this run no longer knows the state it left behind, so the
+# uncounted diagnostic stops instead of continuing into that state. Only the two
+# read-only cases (a listed dry run over a static fixture) are genuinely
+# recoverable; every other case vanishes a chain, renames a mount directory,
+# edits the registry or a receipt, or races a child.
+CASE_TAINTS: dict[str, bool] = {
+    "data-missing-chains": True,
+    "mount-boundaries": True,
+    "symlink-and-nondir": False,
+    "eacces": False,
+    "custody-and-group": True,
+    "witness-races": True,
+    "competing-owner-and-mismatch": True,
+}
 # The product's debug-only fixture seams used here, with the marker file each
 # writes. A firing is an observation of the fixture, never a gate.
 EACCES_VAR, EACCES_MARKER = "OXIDE_TEST_PRUNE_EACCES", "prune-eacces-fired"
@@ -320,6 +333,22 @@ def closure_unknown(code, killed: bool, reaped: bool, unclosed) -> str | None:
     return None
 
 
+def abnormal_child(code, stderr: str) -> str | None:
+    """Why one child's writer closure is NOT positively known, or `None`.
+
+    A signalled exit and any of the product's own unconfirmed-closure sentences
+    both mean the child's group may still be live, so neither may be read as a
+    closed writer. Pure: the adapter hook, `settle_child` and the pure check
+    share one decision.
+    """
+    if code is not None and code < 0:
+        return f"the child ended on signal {-code}, so its group closure is unknown"
+    for marker in permanent.UNCONFIRMED_CUSTODY_MARKERS:
+        if marker in stderr:
+            return f"the child reported an unconfirmed group closure ({marker!r})"
+    return None
+
+
 def custody_abort_reason(proof, unclosed) -> str | None:
     """Why this run must not continue or detach, or `None` when it may.
 
@@ -371,7 +400,7 @@ def settle_child(world, child, proof, label: str, unclosed, wait: float = 120.0)
     except BaseException as error:
         latch_unknown(proof, f"{label}: the child could not be reaped ({error})")
         raise
-    reason = closure_unknown(code, killed, True, unclosed)
+    reason = closure_unknown(code, killed, True, unclosed) or abnormal_child(code, err)
     if reason is not None:
         latch_unknown(proof, f"{label}: {reason}")
     return code, out, err, reason
@@ -390,9 +419,13 @@ class Adapter:
 
     def run(self, argv, cwd=None, env=None, timeout=120):
         self.serial += 1
-        code, out, err = self.inner.run(
-            argv, cwd=cwd, env=env, label=f"prune135-{self.serial:03d}", limit=timeout
-        )
+        label = f"prune135-{self.serial:03d}"
+        code, out, err = self.inner.run(argv, cwd=cwd, env=env, label=label, limit=timeout)
+        # Every ordinary fixture child is classified too: a signalled exit or the
+        # product's own unconfirmed-closure sentence is never read as closed.
+        reason = abnormal_child(code, err)
+        if reason is not None:
+            latch_unknown(self.inner, f"{label}: {reason}")
         return subprocess.CompletedProcess(argv, code, out.encode(), err.encode())
 
 
@@ -483,6 +516,50 @@ def restore_file(path: Path, saved: tuple) -> None:
     os.chmod(path, mode)
     require(path.read_bytes() == original, f"{path} was not restored byte-exactly")
     require(stat.S_IMODE(os.lstat(path).st_mode) == mode, f"{path} lost its mode")
+
+
+def sweep_unconfirmed(proof) -> None:
+    """Latch if ANY child this run recorded an unconfirmed-closure sentence.
+
+    Every wrapper child writes its stderr into the evidence directory, so this is
+    a complete sweep over the children this proof ran, not a per-label guess. It
+    applies the same pure `abnormal_child` decision and only observes: the latch
+    then gates diagnostic continuation and the ordinary detach.
+    """
+    for path in sorted(proof.evidence.glob("*.stderr")):
+        try:
+            text = path.read_text(errors="replace")
+        except OSError as error:
+            latch_unknown(proof, f"cannot classify {path.name} ({error})")
+            continue
+        for marker in permanent.UNCONFIRMED_CUSTODY_MARKERS:
+            if marker in text:
+                latch_unknown(
+                    proof,
+                    f"{path.name}: the child reported an unconfirmed group closure ({marker!r})",
+                )
+                break
+
+
+def restore_fixture(proof, label: str, steps) -> None:
+    """Run one fixture restore, or refuse to touch it while custody is unknown.
+
+    A killed or unreaped child may still be walking the fixture, so restoring it
+    would mutate state whose writer is unknown. The state is then RETAINED (the
+    evidence is the next operator's) and the collection aborts. A restore that
+    itself fails latches the reason before it propagates.
+    """
+    reason = custody_abort_reason(proof, proof.unclosed)
+    if reason is not None:
+        print(f"{label}: fixture state retained, custody unknown ({reason})", file=sys.stderr)
+        raise prior.Aborted(f"{label}: custody is not positively closed ({reason})")
+    try:
+        steps()
+    except BaseException as error:
+        latch_unknown(
+            proof, f"{label}: the fixture restore failed ({type(error).__name__}: {error})"
+        )
+        raise
 
 
 def armed_real_run(world, plan: str, sha: str, extra: dict):
@@ -626,6 +703,8 @@ def run_cases(proof, custody, diagnostic, cases):
     if verified_seed_source(host_home) != source:
         raise RuntimeError("the canonical Cargo cache identity changed during staging")
     provenance["seed_source"] = source
+    # A staging child is a child too: classify what it printed before any fixture.
+    sweep_unconfirmed(proof)
     (proof.evidence / "prune135-provenance.json").write_text(json.dumps(provenance, indent=2))
     adapter = Adapter(proof, oxide, proof.unclosed)
     world = prior.World(adapter, adapter.root)
@@ -787,7 +866,14 @@ def run_cases(proof, custody, diagnostic, cases):
             failed.add(name)
             if not diagnostic:
                 raise
-            print(f"---- {name} failed (diagnostic continues): {error!r}", flush=True)
+            custody_reason = custody_abort_reason(proof, proof.unclosed)
+            if custody_reason is not None or CASE_TAINTS[name]:
+                raise prior.Aborted(
+                    f"{name} failed and this run cannot prove the state it left "
+                    f"({custody_reason or 'the case mutates shared fixture or authority state'}); "
+                    "collection aborted"
+                )
+            print(f"---- {name} failed (read-only case, diagnostic continues): {error!r}", flush=True)
         # An unclassifiable custody or deadline outcome aborts the collection:
         # no later case may run beside an unknown writer group. The SAME
         # decision gates the ordinary detach in `main`.
@@ -944,8 +1030,13 @@ def run_cases(proof, custody, diagnostic, cases):
             require(os.path.isdir(roots["custody"]), "the custody fixture root vanished")
         finally:
             # Put this case's own chain back: a later batch must see exactly its
-            # own candidate, never a leftover from this one.
-            os.rename(away, str(custody_case["token"]))
+            # own candidate, never a leftover from this one. It is only touched
+            # when this run's writer closure is positively known.
+            restore_fixture(
+                proof,
+                "custody-and-group",
+                lambda: os.rename(away, str(custody_case["token"])),
+            )
         group = [
             row
             for row in world.registry_doc()["rows"]
@@ -1001,7 +1092,8 @@ def run_cases(proof, custody, diagnostic, cases):
                 code, out, err, reason = settle_child(
                     world, child, proof, "recreate race", adapter.unclosed
                 )
-            require(reason is None, f"the recreate race left custody unknown: {reason}")
+            if reason is not None:
+                raise prior.Aborted(f"the recreate race left custody unknown: {reason}")
             require(code != 0, f"a recreated checkout was pruned: {out}{err}")
             require(
                 PRESENT_KEEP in err, f"the recreated checkout was not refused as present: {err}"
@@ -1019,14 +1111,18 @@ def run_cases(proof, custody, diagnostic, cases):
             marker.unlink()
         finally:
             # The race mutation made an empty checkout directory where the chain
-            # was; remove exactly that and put the original chain back.
-            if os.path.lexists(recreate_race["checkout"]):
-                require(
-                    not os.listdir(recreate_race["checkout"]),
-                    "the recreated checkout is not empty; the fixture state is unknown",
-                )
-                os.rmdir(recreate_race["checkout"])
-            os.rename(away, str(recreate_race["token"]))
+            # was; remove exactly that and put the original chain back, but only
+            # while custody is positively known.
+            def restore_recreate():
+                if os.path.lexists(recreate_race["checkout"]):
+                    require(
+                        not os.listdir(recreate_race["checkout"]),
+                        "the recreated checkout is not empty; the fixture state is unknown",
+                    )
+                    os.rmdir(recreate_race["checkout"])
+                os.rename(away, str(recreate_race["token"]))
+
+            restore_fixture(proof, "recreate race", restore_recreate)
         # (b) An EXISTING ancestor replaced by a DIFFERENT empty directory while
         # the checkout stays absent. A fresh absence proof still succeeds, so
         # only the real run's own witness comparison can refuse this.
@@ -1049,7 +1145,8 @@ def run_cases(proof, custody, diagnostic, cases):
                 code, out, err, reason = settle_child(
                     world, child, proof, "replace race", adapter.unclosed
                 )
-            require(reason is None, f"the replace race left custody unknown: {reason}")
+            if reason is not None:
+                raise prior.Aborted(f"the replace race left custody unknown: {reason}")
             require(code != 0, f"a replaced ancestor was pruned: {out}{err}")
             require(WITNESS_REFUSAL in err, f"the witness comparison did not refuse: {err}")
             require(prior.tree_snapshot(roots["replace_race"]) == before, "the refused root changed")
@@ -1060,12 +1157,16 @@ def run_cases(proof, custody, diagnostic, cases):
         finally:
             # Undo the replacement and the vanished child exactly, so no later
             # batch inherits an unprovable path from this case. The replacement
-            # only exists when the mutation ran.
-            if os.path.lexists(ancestor + "-away"):
-                os.rmdir(ancestor)
-                os.rename(ancestor + "-away", ancestor)
-            require(os.path.isdir(ancestor), "the replaced ancestor was not restored")
-            os.rename(child_away, str(replace_race["path"].parent))
+            # only exists when the mutation ran, and nothing is touched while
+            # custody is unknown.
+            def restore_replace():
+                if os.path.lexists(ancestor + "-away"):
+                    os.rmdir(ancestor)
+                    os.rename(ancestor + "-away", ancestor)
+                require(os.path.isdir(ancestor), "the replaced ancestor was not restored")
+                os.rename(child_away, str(replace_race["path"].parent))
+
+            restore_fixture(proof, "replace race", restore_replace)
 
     case("witness-races", witness_races)
 
@@ -1174,6 +1275,7 @@ def run_cases(proof, custody, diagnostic, cases):
         not adapter.unclosed,
         f"a proof child was never reaped: {sorted(adapter.unclosed)}",
     )
+    sweep_unconfirmed(proof)
     return cases
 
 
@@ -1243,6 +1345,12 @@ def self_check() -> int:
     require(all(seconds > 0 for _, seconds in ALLOCATION_SECONDS), "a phase has no time")
     require(all(mib > 0 for _, mib in ALLOCATION_MIB), "a phase has no scratch")
     require(set(CASE_NEEDS) == set(CASE_NAMES), "a case has no dependency entry")
+    require(set(CASE_TAINTS) == set(CASE_NAMES), "a case has no taint entry")
+    require(
+        {name for name, taints in CASE_TAINTS.items() if not taints}
+        == {"symlink-and-nondir", "eacces"},
+        "only the two read-only cases may be treated as recoverable",
+    )
     # This file's own structure: the case table and every unpacked helper.
     structure = source_structure_problems(Path(__file__).read_text())
     require(not structure, f"the proof's own structure is inconsistent: {structure}")
@@ -1359,6 +1467,7 @@ def self_check() -> int:
     class FakeProof:
         closure_known = True
         custody_unknown = None
+        unclosed: set = set()
 
     fake = FakeProof()
     require(custody_abort_reason(fake, set()) is None, "a clean proof could not continue")
@@ -1379,6 +1488,42 @@ def self_check() -> int:
         custody_abort_reason(FakeProof(), {11}) is not None,
         "an un-reaped session was read as closed",
     )
+    # EVERY child's abnormal outcome is classified: a signalled exit and each of
+    # the product's own unconfirmed-closure sentences are not closed writers.
+    require(abnormal_child(0, "") is None, "a clean child was classified abnormal")
+    require(abnormal_child(2, "kept\n") is None, "a normal refusal was classified abnormal")
+    require(abnormal_child(-15, "") is not None, "a signalled child was read as closed")
+    for marker in permanent.UNCONFIRMED_CUSTODY_MARKERS:
+        require(
+            abnormal_child(0, f"oxide: {marker} 77\n") is not None,
+            f"an unconfirmed closure was read as closed: {marker!r}",
+        )
+    # A fixture restore is REFUSED while custody is unknown, runs once when it is
+    # known, and latches when it fails.
+    ran = []
+    held = FakeProof()
+    latch_unknown(held, "held")
+    try:
+        restore_fixture(held, "synthetic", lambda: ran.append(1))
+    except prior.Aborted:
+        pass
+    else:
+        raise AssertionError("a fixture restore ran under unknown custody")
+    require(not ran, "the fixture was mutated under unknown custody")
+    restore_fixture(FakeProof(), "synthetic", lambda: ran.append(1))
+    require(ran == [1], "a clean restore did not run exactly once")
+    broken = FakeProof()
+
+    def failing():
+        raise RuntimeError("synthetic restore failure")
+
+    try:
+        restore_fixture(broken, "synthetic", failing)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a failing restore did not propagate")
+    require(broken.custody_unknown is not None, "a failing restore did not latch")
     # Both /Volumes spellings are mounts, including an absent mount name; the
     # mount root itself and every non-normal spelling are invalid, and a plain
     # path is not a mount.
