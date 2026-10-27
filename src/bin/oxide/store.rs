@@ -1558,6 +1558,7 @@ impl Store {
         successful: bool,
         origin: Option<&Built>,
         profile: &str,
+        source_cache: &oxide_storage::seed_source::SourceCache,
     ) -> Result<(), String> {
         use oxide_storage::lease::managed::{
             held_seed_attempt, publish_seed_catalog, SeedAttemptState, SeedCatalog, SeedPackage,
@@ -1656,7 +1657,12 @@ impl Store {
             rejected,
         };
         publish_seed_catalog(&self.pool, &catalog)
-            .map_err(|error| lease_error("cannot publish seed catalog", &error))
+            .map_err(|error| lease_error("cannot publish seed catalog", &error))?;
+        // A cache miss is safe: this sidecar is only a performance hint and
+        // never a trust root. Keep a malformed or over-cap cache untouched.
+        let _ =
+            oxide_storage::lease::managed::write_seed_sources(&self.pool, &recipient, source_cache);
+        Ok(())
     }
 
     /// One admission lifetime spans the catalog read, effect-free plan,

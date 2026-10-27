@@ -136,6 +136,103 @@ pub(crate) struct GitHint {
     pub package_root: PathBuf,
 }
 
+/// Evidence captured before a producing Cargo command and rechecked after its
+/// writer group has closed. Creating it never publishes a sidecar.
+pub(crate) struct Production {
+    pub producer: oxide_storage::lease::managed::SeedProducer,
+    pub lock: crate::seed_lock::Analysis,
+    cargo_home: PathBuf,
+    cache: SourceCache,
+    before: Vec<VerifiedSource>,
+    started: SystemTime,
+    started_ms: u64,
+}
+
+impl Production {
+    pub fn begin(
+        producer: oxide_storage::lease::managed::SeedProducer,
+        lock: crate::seed_lock::Analysis,
+        cargo_home: PathBuf,
+        mut cache: SourceCache,
+    ) -> Result<Self, &'static str> {
+        let before = verify_pass(&cargo_home, &lock.eligible, &mut cache)?;
+        Ok(Self {
+            producer,
+            lock,
+            cargo_home,
+            cache,
+            before,
+            started: SystemTime::now(),
+            started_ms: crate::process::now_ms(),
+        })
+    }
+
+    /// Attempt seeding using the same lock, context and verified Cargo home
+    /// that will be used for producing evidence. Store::seed_verified owns
+    /// the single admission lifetime and re-verifies sources inside it.
+    pub fn seed(
+        &mut self,
+        store: &crate::store::Store,
+        held: &crate::store::Lease,
+    ) -> Result<crate::store::SeedRun, String> {
+        store.seed_verified(
+            held,
+            &self.producer,
+            &self.lock,
+            &self.cargo_home,
+            &mut self.cache,
+        )
+    }
+
+    /// Called only after positive writer closure. Incomplete source evidence
+    /// makes individual packages ineligible; unknown Git closure refuses.
+    pub fn publish(
+        mut self,
+        store: &crate::store::Store,
+        held: &crate::store::Lease,
+        successful: bool,
+        origin: Option<&crate::freshness::Built>,
+        profile: &str,
+    ) -> Result<(), String> {
+        if !successful || origin.is_none() {
+            return Ok(());
+        }
+        let after = verify_pass(&self.cargo_home, &self.lock.eligible, &mut self.cache)
+            .map_err(str::to_owned)?;
+        store.publish_seed_catalog(
+            held,
+            self.producer,
+            &self.lock,
+            &self.before,
+            &after,
+            self.started,
+            self.started_ms,
+            successful,
+            origin,
+            profile,
+            &self.cache,
+        )
+    }
+}
+
+fn verify_pass(
+    cargo_home: &Path,
+    packages: &[Package],
+    cache: &mut SourceCache,
+) -> Result<Vec<VerifiedSource>, &'static str> {
+    let mut pass = Pass::new(Duration::from_secs(4));
+    let hints = pass
+        .discover_git_hints(cargo_home, packages)
+        .unwrap_or_default();
+    pass.locked(
+        cargo_home,
+        packages,
+        &hints,
+        cache,
+        crate::process::now_ms(),
+    )
+}
+
 fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> Option<&'a GitHint> {
     let base = cargo_home.join("git/checkouts");
     let mut found = None;
@@ -530,5 +627,13 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].checkout, checkout);
         assert_eq!(hints[0].package_root, root);
+    }
+
+    #[test]
+    fn empty_producing_source_pass_is_read_only() {
+        let fixture = Fixture::new();
+        let mut cache = SourceCache::new("store-1").unwrap();
+        assert!(verify_pass(&fixture.0, &[], &mut cache).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
     }
 }
