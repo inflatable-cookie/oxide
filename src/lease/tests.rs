@@ -4934,3 +4934,140 @@ fn a_live_putback_restores_the_exact_non_ascii_name() {
     assert!(!slot_path.exists());
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
+
+/// A journaled parent capture that was already put back, holding its own
+/// journaled child capture, resolves through the verified **restored** parent:
+/// an obstruction keeps it pending, and the next open after the obstruction is
+/// removed restores and replays both and completes.
+#[test]
+fn a_restored_parent_with_a_child_capture_resolves_once_the_obstruction_goes() {
+    let fixture = Fixture::new("restored-parent");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "restored-parent");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    // A parent directory and its child, both captured and recorded…
+    fs::create_dir(captured.join("par")).expect("parent directory");
+    fs::write(captured.join("par").join("inner"), b"x").expect("child");
+    let held = File::open(&captured).expect("captured root descriptor");
+    let par = std::ffi::CString::new("par").expect("name");
+    let outer = crate::owned_delete::capture_entry(held.as_fd(), &par).expect("parent capture");
+    let outer_facts =
+        crate::owned_delete::observe_entry(held.as_fd(), &outer.private).expect("parent facts");
+    let par_dir = captured.join(outer.private.to_string_lossy().as_ref());
+    let par_held = File::open(&par_dir).expect("parent descriptor");
+    let inner = std::ffi::CString::new("inner").expect("name");
+    let child =
+        crate::owned_delete::capture_entry(par_held.as_fd(), &inner).expect("child capture");
+    let child_facts =
+        crate::owned_delete::observe_entry(par_held.as_fd(), &child.private).expect("child facts");
+    let outer_private = outer.private.to_string_lossy().into_owned();
+    let records = vec![
+        crate::owned_delete::CaptureRecord {
+            path: Vec::new(),
+            private: outer_private.clone(),
+            original: "par".to_owned(),
+            device: outer_facts.device,
+            inode: outer_facts.inode,
+            mode: outer_facts.mode as u32,
+        },
+        crate::owned_delete::CaptureRecord {
+            path: vec![outer_private.clone()],
+            private: child.private.to_string_lossy().into_owned(),
+            original: "inner".to_owned(),
+            device: child_facts.device,
+            inode: child_facts.inode,
+            mode: child_facts.mode as u32,
+        },
+    ];
+    // …and both put back before the crash, exactly as a refusal leaves them.
+    fs::rename(
+        par_dir.join(child.private.to_string_lossy().as_ref()),
+        par_dir.join("inner"),
+    )
+    .expect("child put back");
+    fs::rename(&par_dir, captured.join("par")).expect("parent put back");
+    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+
+    // An obstruction on the parent's observed name keeps the replay pending.
+    fs::rename(captured.join("par"), captured.join("par-aside")).expect("parent aside");
+    fs::create_dir(captured.join("par")).expect("obstruction");
+    let blocked = status_injected(&pool).expect("status");
+    assert_eq!(blocked.slots.len(), 1, "the obstruction keeps it pending");
+    assert_eq!(blocked.coverage, AccountingCoverage::Unknown);
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+
+    // Removing it lets the next open resolve the parent and its child through
+    // the verified restored directory, then replay and complete.
+    fs::remove_dir(captured.join("par")).expect("obstruction removed");
+    fs::rename(captured.join("par-aside"), captured.join("par")).expect("parent restored");
+    let after = status_injected(&pool).expect("status");
+    assert!(
+        after.slots.is_empty(),
+        "both recorded captures resolved and the deletion completed"
+    );
+    assert!(!slot_path.exists());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}
+
+/// An interrupted capture that is still private replays to its **exact**
+/// multi-byte UTF-8 original name — never a replacement-character name.
+#[test]
+fn a_still_private_multibyte_capture_replays_to_its_exact_name() {
+    let fixture = Fixture::new("exact-replay");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "exact-replay");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(captured.join("café")).expect("multibyte directory");
+    let held = File::open(&captured).expect("captured root descriptor");
+    let name = std::ffi::CString::new("café").expect("name");
+    let entry = crate::owned_delete::capture_entry(held.as_fd(), &name).expect("capture");
+    let facts = crate::owned_delete::observe_entry(held.as_fd(), &entry.private).expect("facts");
+    let record = crate::owned_delete::CaptureRecord {
+        path: Vec::new(),
+        private: entry.private.to_string_lossy().into_owned(),
+        original: "café".to_owned(),
+        device: facts.device,
+        inode: facts.inode,
+        mode: facts.mode as u32,
+    };
+    // An unrecorded private name makes the resumed walk refuse, so the restored
+    // name is observable after replay instead of being deleted again.
+    fs::write(
+        captured.join(".oxide-capture-0123456789abcdef"),
+        b"unrecorded",
+    )
+    .expect("unrecorded private name");
+    write_journal(&pool, slot_id, plan, true, vec![record.clone()], Vec::new());
+    assert_eq!(record.original, "café");
+    assert!(
+        !record.original.contains('\u{fffd}'),
+        "the journal never holds a replacement-character name"
+    );
+
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1, "the unrecorded name keeps it pending");
+    let restored = slot_path.join("café");
+    assert!(
+        restored.is_dir(),
+        "the captured entry replayed to its exact original name"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&restored)
+            .expect("restored name")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755,
+        "and the restored directory keeps its own mode"
+    );
+    assert!(
+        std::fs::read_dir(&slot_path)
+            .expect("slot listed")
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().contains('\u{fffd}')),
+        "no replacement-character name exists anywhere in the tree"
+    );
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
+}

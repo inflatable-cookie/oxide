@@ -2459,10 +2459,25 @@ fn restore_captures_in(
     for record in here.iter().filter(|record| record.is_directory()) {
         let private = recorded_name(&record.private)?;
         if crate::owned_delete::observe_entry(base, &private).is_err() {
-            // Already put back before the crash: nothing is inside it to
-            // resolve, and the observed name must hold exactly the record.
+            // The capture was already put back before the crash. The observed
+            // name must hold exactly the recorded object — and its own recorded
+            // children are then resolved *through* that verified directory, so
+            // a put-back parent never strands its child captures.
             restore_recorded(base, record)?;
+            let original = recorded_name(&record.original)?;
+            let restored = open_directory_at(base, &original).map_err(|error| {
+                format!("the restored captured directory cannot be opened ({error})")
+            })?;
+            let identity = descriptor_identity(restored.as_fd()).map_err(|error| {
+                format!("the restored directory's identity cannot be read ({error})")
+            })?;
+            if identity != (record.device, record.inode) {
+                return Err("the restored directory is not the recorded capture".to_owned());
+            }
             *resolved += 1;
+            let mut inner = chain.to_vec();
+            inner.push(record.private.clone());
+            restore_captures_in(restored.as_fd(), &inner, records, resolved)?;
             continue;
         }
         verify_recorded(base, &private, record)?;
