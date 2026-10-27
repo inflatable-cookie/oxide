@@ -5101,10 +5101,16 @@ The stable, read-only interface other tools use to find the registered Builds dr
   diagnostic continuation — and SETUP stops at the first latched fault, before
   any image attach, registration or fixture. Every restore (image mount
   directory, registry bytes, receipt bytes, checkout chains) goes through the
-  same gate, so no fixture is written beside an unclassified writer group. That
+  same gate, so no fixture is written beside an unclassified writer group, and a
+  classified child fault stops the run before its next fixture effect. That
   bookkeeping covers only the children this script started and is never
-  presented as a process census: the qualified supervisor owns the session
-  census and retains the image when its own census disagrees. A child that is still
+  presented as a process census, and the ORDER is stated honestly: the proof
+  detaches from its own children's outcomes and exits, while the qualified
+  supervisor's session census runs only after its leader has ended — so that
+  census is authoritative for the run's reported closure but cannot retroactively
+  retain an image the proof already detached, and no such retention is claimed. A
+  writer that escaped its parent's group is outside the cooperative custody
+  boundary both this proof and the product document. A child that is still
   running is waited for, never mistaken for a stuck one: the armed races mutate
   the fixture while the product is inside its own 11-second delay. Each
   state-mutating case puts its own fixture back (checkout chain, replaced

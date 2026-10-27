@@ -25,11 +25,16 @@ Premise checklist (mandatory for a proof-authoring brief):
     detach in a finally path, before which the backing is never removed. The
     detach runs only when THIS RUN's own bookkeeping is positively settled: any
     killed, signalled or unreaped child, an unconfirmed-closure report or any
-    recorded fault latches an unknown reason BEFORE the fallible cleanup and
-    refuses the detach while keeping the backing. That is direct-child
-    bookkeeping and explicitly NOT a process census: this script never sees a
-    grandchild, and the qualified supervisor owns the session census and retains
-    the image when its own census disagrees.
+    recorded fault latches an unknown reason BEFORE the fallible cleanup, stops
+    the run before its next fixture effect, and refuses the detach while keeping
+    the backing. That is direct-child bookkeeping and explicitly NOT a process
+    census, and the ORDER is stated honestly: this script detaches from its own
+    children's outcomes and exits, and the qualified supervisor censuses the
+    session only AFTER its leader has ended, so that census is authoritative for
+    the run's reported closure but cannot retroactively retain an image this
+    script has already detached. A writer that escaped its parent's group is
+    outside the cooperative custody boundary this proof and the product both
+    document, and no claim is made that it is.
 (7) staging scrubs the encoded and plain Rust-wrapper flags; fixtures set
     RUSTFLAGS empty and drop CARGO_ENCODED_RUSTFLAGS.
 (8) the selector fixes --root-parent /private/tmp: the missing-ancestor premise
@@ -359,9 +364,11 @@ def custody_abort_reason(proof, unclosed) -> str | None:
     It joins the proof's own latch, the shared child helper's unconfirmed closure
     and the direct children it started that were never reaped. It is explicitly
     NOT a process census: this script sees only the children it started, never a
-    grandchild that left their group, and the qualified supervisor owns the
-    session census and the closure decision — it retains the image and reports
-    `UNCLOSED` when its own census disagrees. The proof therefore refuses to
+    grandchild that left their group. The qualified supervisor's session census
+    runs AFTER this leader exits, so it is authoritative for the run's reported
+    closure but cannot prevent a detach this script already completed; a writer
+    that escaped its parent's group is outside the cooperative custody boundary
+    both this proof and the product document. The proof therefore refuses to
     continue or detach on any fault it CAN see, and never claims more.
     """
     latched = getattr(proof, "custody_unknown", None)
@@ -434,6 +441,9 @@ class Adapter:
         reason = abnormal_child(code, err)
         if reason is not None:
             latch_unknown(self.inner, f"{label}: {reason}")
+            # Stop HERE: the next fixture effect must not follow a child whose
+            # group is not positively closed.
+            require_settled(self.inner, f"{label}")
         return subprocess.CompletedProcess(argv, code, out.encode(), err.encode())
 
 
@@ -1357,6 +1367,25 @@ def source_structure_problems(source: str) -> list:
                 )
     if dispatched != list(CASE_NAMES):
         problems.append(f"the dispatcher does not match the case table: {dispatched}")
+    # A classified child fault must stop the run before its next fixture effect:
+    # the adapter that runs every ordinary child has to call the settled check.
+    adapter_run = [
+        node
+        for node in _ast.walk(tree)
+        if isinstance(node, _ast.ClassDef)
+        and node.name == "Adapter"
+        for node in node.body
+        if isinstance(node, _ast.FunctionDef) and node.name == "run"
+    ]
+    if not adapter_run:
+        problems.append("the adapter's child runner is missing")
+    elif not any(
+        isinstance(call, _ast.Call)
+        and isinstance(call.func, _ast.Name)
+        and call.func.id == "require_settled"
+        for call in _ast.walk(adapter_run[0])
+    ):
+        problems.append("a classified child fault could return to a later fixture effect")
     return problems
 
 
@@ -1630,8 +1659,10 @@ def main():
         # one decision shared with the diagnostic's continuation check, so a
         # killed, signalled or unreaped child, an unconfirmed closure report or
         # any recorded fault is classified the same way before both. This is
-        # never a process census — the supervisor owns that and retains the
-        # image if its own census disagrees — so nothing here claims otherwise.
+        # never a process census, and it is decided before the supervisor's
+        # post-leader census can run: that census is authoritative for what the
+        # run reports, not a retention this script can rely on. Nothing here
+        # claims otherwise.
         own_children = custody_abort_reason(proof, proof.unclosed)
         disposition = custody.detach_once(sessions_closed=own_children is None)
     recorded = {item["case"] for item in cases}
@@ -1642,7 +1673,11 @@ def main():
         "qualified": False if diagnostic else None,
         "cases": cases,
         "failed": sorted(item["case"] for item in cases if item["state"] == "failed"),
-        "own_children": own_children or "settled (direct children only; the supervisor owns the census)",
+        "own_children": own_children
+        or (
+            "settled from this script's own direct children before the supervisor's "
+            "post-leader census; that census is authoritative for the reported closure"
+        ),
         "error": None if error is None else f"{type(error).__name__}: {error}",
         "custody": custody.state,
         "detach": disposition,
