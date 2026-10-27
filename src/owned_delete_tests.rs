@@ -30,9 +30,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        // Ordinary unit fixtures live on the recipe's ordinary test temp
+        // (`TMPDIR`, on the selected volume), never inside
+        // `OXIDE_TASK_SCRATCH_ROOT`: the shared proof supervisor measures that
+        // root while tests run, and these fixtures deliberately hold
+        // owner-unreadable directories (0100/0300/0000) to prove the repair and
+        // refusal paths. A fixture the supervisor cannot walk would fault its
+        // own measurement, so the unreadable windows stay outside it.
+        let base = std::env::temp_dir();
         let parent = base.join("owned-delete");
         fs::create_dir_all(&parent).expect("fixture parent");
         loop {
