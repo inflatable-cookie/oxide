@@ -31,13 +31,23 @@ pub(crate) struct Producer {
 
 impl Producer {
     pub fn new(root: &Path) -> Option<Self> {
-        let root = fs::canonicalize(root).ok()?;
-        let metadata = fs::symlink_metadata(&root).ok()?;
-        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        let metadata = fs::symlink_metadata(root).ok()?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return None;
+        }
+        let canonical = fs::canonicalize(root).ok()?;
+        if canonical != root {
+            return None;
+        }
+        let checked = fs::symlink_metadata(&canonical).ok()?;
+        if !checked.is_dir() || checked.dev() != metadata.dev() || checked.ino() != metadata.ino() {
             return None;
         }
         Some(Self {
-            root,
+            root: canonical,
             started: Instant::now(),
             files: 0,
             bytes: 0,
@@ -559,6 +569,20 @@ mod tests {
             .units("debug", &source)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn producer_refuses_a_symlinked_build_root() {
+        let fixture = Fixture::new();
+        let build = fixture.0.join("build");
+        fs::create_dir(&build).unwrap();
+        let link = fixture.0.join("link");
+        std::os::unix::fs::symlink(&build, &link).unwrap();
+        assert!(Producer::new(&build).is_some());
+        assert!(Producer::new(&link).is_none());
+        fs::create_dir(fixture.0.join("container")).unwrap();
+        std::os::unix::fs::symlink(&fixture.0, fixture.0.join("container/alias")).unwrap();
+        assert!(Producer::new(&fixture.0.join("container/alias/build")).is_none());
     }
     #[test]
     fn ambiguous_name_counts_classifiable_units_and_marks_unknown() {

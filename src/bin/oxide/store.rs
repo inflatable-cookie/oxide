@@ -1629,6 +1629,7 @@ impl Store {
         &self,
         held: &Lease,
         producer: &oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
         verify_sources: impl FnOnce(
             &[oxide_storage::lease::managed::SeedCandidate],
         ) -> Result<Vec<crate::seed_plan::VerifiedSource>, String>,
@@ -1644,6 +1645,9 @@ impl Store {
         }
         if held.reused || !matches!(held.prior, Prior::Fresh) {
             return Ok(SeedRun::Skipped("recipient not fresh"));
+        }
+        if lock.eligible.is_empty() {
+            return Ok(SeedRun::Skipped("no eligible locked packages"));
         }
         let recipient = SeedRecipient {
             slot_id: held.slot_id.clone(),
@@ -1662,9 +1666,13 @@ impl Store {
         let candidates = seed_candidates(&self.pool, &recipient, 8)
             .map_err(|error| lease_error("cannot inspect seed candidates", &error))?;
         let sources = verify_sources(&candidates.candidates)?;
-        let Some(request) =
-            crate::seed_plan::select(&recipient, producer, &sources, &candidates.candidates)
-        else {
+        let Some(request) = crate::seed_plan::select(
+            &recipient,
+            producer,
+            &lock.eligible,
+            &sources,
+            &candidates.candidates,
+        ) else {
             return Ok(SeedRun::Skipped("no eligible donor"));
         };
         let rejected = candidates

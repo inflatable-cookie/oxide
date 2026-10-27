@@ -43,6 +43,7 @@ fn same_context(a: &SeedProducer, b: &SeedProducer) -> bool {
 pub(crate) fn select(
     recipient: &SeedRecipient,
     producer: &SeedProducer,
+    allowed: &[Package],
     sources: &[VerifiedSource],
     candidates: &[SeedCandidate],
 ) -> Option<SeedRequest> {
@@ -57,7 +58,8 @@ pub(crate) fn select(
         for package in &candidate.catalog.packages {
             let matching_source = sources.iter().find(|source| {
                 let lock = &source.package;
-                package.unique
+                allowed.contains(lock)
+                    && package.unique
                     && package.leaf
                     && package.name == lock.name
                     && package.target == lock.name.replace('-', "_")
@@ -200,7 +202,7 @@ mod tests {
             incarnation: "i".into(),
             lease_id: "l".into(),
         };
-        assert!(select(&recipient, &producer(), &[], &[]).is_none());
+        assert!(select(&recipient, &producer(), &[], &[], &[]).is_none());
     }
     fn candidate(id: &str, rank: u64, digest: &str) -> SeedCandidate {
         use oxide_storage::lease::managed::{
@@ -277,7 +279,9 @@ mod tests {
             candidate("new", 2, "tree"),
             candidate("wrong", 3, "other"),
         ];
-        let selected = select(&recipient, &producer(), &[source], &candidates).unwrap();
+        assert!(select(&recipient, &producer(), &[], &[source.clone()], &candidates).is_none());
+        let allowed = [source.package.clone()];
+        let selected = select(&recipient, &producer(), &allowed, &[source], &candidates).unwrap();
         assert_eq!(selected.donor.slot_id, "new");
         assert_eq!(selected.units.len(), 1);
     }
