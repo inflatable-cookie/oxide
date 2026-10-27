@@ -453,8 +453,7 @@ fn read_attempt_at(pool: &Path, slot: &str) -> AttemptRead {
         return AttemptRead::Invalid;
     }
     let mut bytes = Vec::new();
-    if file
-        .by_ref()
+    if Read::by_ref(&mut file)
         .take((ATTEMPT_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .is_err()
@@ -608,7 +607,10 @@ pub fn read_seed_last(pool: &Path) -> Option<SeedLast> {
         return None;
     }
     let mut bytes = Vec::new();
-    file.by_ref().take(2049).read_to_end(&mut bytes).ok()?;
+    Read::by_ref(&mut file)
+        .take(2049)
+        .read_to_end(&mut bytes)
+        .ok()?;
     if bytes.len() > 2048 {
         return None;
     }

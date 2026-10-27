@@ -1513,11 +1513,13 @@ fn the_work_budget_is_capped_at_five_seconds_and_checked_within_reads() {
     let file = std::fs::File::open(&path).expect("open fixture file");
     let past = Instant::now() - Duration::from_millis(1);
     assert!(matches!(
-        hash_fd(file.as_fd(), past),
+        hash_fd(file.as_fd(), past, &mut || false),
         Err(StreamError::Deadline)
     ));
     let future = Instant::now() + Duration::from_secs(60);
-    assert!(matches!(hash_fd(file.as_fd(), future), Ok(digest) if digest == sha("rmeta-fixture")));
+    assert!(
+        matches!(hash_fd(file.as_fd(), future, &mut || false), Ok(digest) if digest == sha("rmeta-fixture"))
+    );
 }
 
 #[test]
