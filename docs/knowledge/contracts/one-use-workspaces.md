@@ -10,6 +10,35 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 12** answers the CHANGES REQUIRED design review of `3df605d`
+(comment `6454298750`, 2026-10-27) with two corrections. **Case 19's part E
+oracle is reachable and honest**: a guarded build that reaches binding has
+already registered a wait ticket and taken a lease, and `register_ticket`
+(`store.rs:3630-3647`) advances and saves `next_id`, while the refusal's release
+path touches the record and saves state — so a whole-command byte-identical
+comparison (including `next_id`) cannot hold and is no longer claimed. The
+command-level oracle is now a **matched-control delta**: the same guarded command
+runs twice at the same `keyed` pause, once with nothing planted and once with the
+transition planted; the ordinary lease/ticket/record deltas must match and the
+test-specific delta must be empty (no clean mark, no `waiters/` entry from the
+refusal, no receipt/link/marker/root/reservation change, no id beyond the
+control's count). The exact `next_id` invariance is claimed only for the
+**verb-level** refusals — guarded `detach`, `cancel-reservation` and the binding
+revalidation — which happen before any mark exists. An exact post-lease
+command-level baseline would need one new debug-only `leased:<gate>` pause point
+between the lease and `outputs::bind_for_command`; it is **proposed for scoped
+review**, not assumed, and the matched-control delta is the fallback oracle.
+**The guarded-verb ordering is now one unambiguous contract** in every summary,
+matrix and slice: `adopt` refuses unconditionally at the effect-free precheck and
+never enters custody (state selects only the text); `detach` and
+`cancel-reservation` revalidate the receipt and migration journal under the
+checkout binding mutex **before any clean mark, id, `waiters/` file or state
+save**, and only then take the `Barrier`-mode barrier across their
+fence/cancellation/replay with a bounded non-blocking acquisition; a leased
+command binding revalidates inside its own mutex before `gated_replay`; `clean`
+keeps its refusal and the guarded text. The residual sentences that put an
+`adopt` revalidation after a barrier or a `detach` revalidation under the barrier
+are removed.
 **Revision 11** answers the CHANGES REQUIRED design review of `281af04`
 (comment `6454103541`, 2026-10-27). **The guarded `Prepared` refusal no longer
 writes durable control state.** The `Barrier` mode suppressed tickets and
@@ -26,14 +55,17 @@ the mutex would invert the shipped order and could deadlock; releasing between
 attempts keeps it acyclic, and budget expiry refuses without a mark) → the
 `Barrier`-mode barrier held across the effects, with the live/dead/unknown
 classifier deciding before the mark. The id and lock-file lifecycle is stated for
-the refusal, proceeding, concurrent and crash cases, and case 19 gains part **E**
-— a `Detached` receipt, a `keyed` pause, a transition published while the guarded
-command is paused, then the revalidation refusal across **three repeated runs**
-with `state.json` (including `next_id`), the `waiters/` directory, receipt, links,
-markers, roots and reservations all byte-identical — while A stays the separate
-precheck control. `detach`/`cancel-reservation` have no pause point, so their
-identical order is asserted purely and a native interleaving for them is returned
-for scoped review. **The two returned owner items are unchanged and not
+the refusal, proceeding, concurrent and crash cases. Case 19 gains part **E** — a
+`Detached` receipt, a `keyed` pause, a transition published while the guarded
+command is paused, then the revalidation refusal — with a **matched-control
+delta** oracle: the control and test runs' ordinary lease/ticket/record deltas
+match and the test-specific output-transition delta is empty (no clean mark, no
+`waiters/` file from the refusal, no receipt/link/marker/root/reservation change,
+no id beyond the control's count). The `next_id` invariance is claimed exactly
+only for the **verb-level** refusals, which happen before any mark. An exact
+post-lease command-level baseline needs the proposed `leased` pause point and is
+returned for scoped review; `detach`/`cancel-reservation` have no pause point, so
+their identical order is asserted purely. **The two returned owner items are unchanged and not
 adopted:** the removable reserve-path wiring/protection question and the 480 s /
 512 MiB bound fit.
 **Revision 10** answers the CHANGES REQUIRED design review of `389a510`
@@ -683,10 +715,37 @@ reservation, adoption fence, migration-journal step or slot state, or replays
 anything; the only lock any of them touches is the checkout binding mutex, whose
 single durable file may be created on first use and is never removed. The mark
 and its id exist only on the **proceeding** path, exactly as for a shipped
-`oxide clean`. Case 19's regression compares the complete relevant control state
-— `state.json` bytes including `next_id`, the `waiters/` lock files, the receipt,
-links, markers, roots and reservations — across **repeated** refusals, which must
-be byte-identical and must not consume ids.
+`oxide clean`.
+
+**The `next_id` claim is scoped to the verb-level refusals.** It is exact for
+`detach`, `cancel-reservation` and the guarded command's binding revalidation,
+because those refusals happen before any mark exists. It is **not** a claim about
+a whole command: a guarded *build* that reaches binding has already registered a
+wait ticket and acquired a lease, and `register_ticket` (`store.rs:3630-3647`)
+advances and saves `next_id`, while the refusal's release path
+(`main.rs:535-541`, `store.rs:1826-1843`) touches the record and saves state. So a
+command-level before/after comparison cannot be byte-identical and this design
+never claims it is. Case 19's oracle is therefore a **matched-control delta**:
+
+- run the guarded command twice at the same `keyed` pause — once with no planted
+  transition (the control) and once with the transition planted while paused (the
+  test);
+- compare the two runs' **deltas** from the same pre-run baseline: the ordinary
+  lease/ticket/record lifecycle deltas must match, and the **test-specific delta**
+  must show zero output-transition effect — no clean mark, no `waiters/<id>.lock`,
+  no receipt, link, marker, root or reservation change, and no id consumed
+  *beyond the control run's count*;
+- keep the direct, non-vacuous verb-level assertions (a `detach` or
+  `cancel-reservation` refusal allocates no mark and no id; repeated such
+  refusals are byte-identical including `next_id`).
+
+An exact post-lease baseline would make the command-level comparison exact, but it
+needs one **new debug-only pause point** immediately after `lease_with_gate` and
+before `outputs::bind_for_command` (a `leased:<gate>` marker, bounded like
+`bound`: marker file under the owned scratch, 120 s self-release, absent from
+release builds). That seam is **proposed for scoped review**, not assumed; if it
+is rejected, the matched-control delta above is the oracle and the design does not
+claim an exact command-level `next_id`.
 
 If the freeze instead prefers the shipped barrier order to be kept exactly (so
 the guarded revalidation stays after a mark), that conflict is **returned to the
@@ -791,29 +850,32 @@ normal checkout keeps the shipped wording byte for byte.
 
 ### 4.5 Adopt, detach, clean, plan and status
 
-- **`oxide outputs adopt`** on a guarded workspace **refuses**, with the
-diagnostic chosen by §4.1's precedence (a `Prepared` receipt or pending
-migration journal gets the exact diagnosis; every other state gets the general
-refusal naming that this workspace is one-use/temporary and cannot own an output
-root). The fast precheck refuses before any effect at all; if state changed
-before custody, the authoritative revalidation refuses after the barrier and
-still writes no receipt, root, link, marker, reservation or fence.
+- **`oxide outputs adopt`** on a guarded workspace **refuses unconditionally at
+the effect-free precheck and never enters custody** — it allocates no mark, no
+id and no lock, and no later verb state can turn the refusal into an effect. The
+receipt state selects only the *text* (§4.1 precedence): `Prepared` or a pending
+migration journal → the exact diagnosis; every other state → the general refusal
+naming that this workspace is one-use/temporary and cannot own an output root.
 - **`oxide outputs detach`** remains available and safe exactly as shipped: for
 a `Committed` placement whose live path is the exact owned link it becomes a
 real directory again (profile layout: every owned member link becomes a real
 directory, `target` stays real) with **no root moved, copied or deleted**, and
-for a valid `Detached` receipt it is the existing no-op. On a guarded workspace a
-`Prepared` receipt (or a pending migration journal) is re-read **under the
-barrier, before the fence/cancellation/replay** and refuses per §4.4; a normal
-checkout keeps the shipped order.
+for a valid `Detached` receipt it is the existing no-op. On a guarded workspace the receipt and the migration journal are re-read
+**under the checkout binding mutex, before any clean mark, id, `waiters/` file
+or state save exists**, and a `Prepared` receipt (or pending migration journal)
+refuses per §4.4; only after that passing revalidation does the verb take the
+`Barrier`-mode barrier (bounded non-blocking acquisition) across its
+fence/cancellation/replay. A normal checkout keeps the shipped order.
 - **`oxide clean`** keeps its refusal for `Prepared`; on a guarded workspace its
 text is the exact guarded diagnostic (§4.4). Everything else about clean is
 unchanged, and clean is not a one-use-specific verb.
 - **`oxide outputs cancel-reservation`** is the one additional receipt-writing
-verb: a guarded workspace refuses it when the receipt is `Prepared` or a
-migration journal is pending (same diagnostic, no advice), because cancelling
-would rewrite a receipt that carries an unresolved transition. Otherwise the
-shipped cancellation runs unchanged; it publishes no root and selects nothing.
+verb, and it follows the same order as `detach`: the receipt and migration
+journal are re-read **under the checkout binding mutex, before any clean mark or
+id exists**, and a guarded workspace refuses a `Prepared` receipt or pending
+journal there (same diagnostic, no advice). Only a passing revalidation takes
+the `Barrier`-mode barrier and runs the shipped cancellation; it publishes no
+root and selects nothing.
 - **`oxide outputs plan`** on a guarded workspace prints a bounded local plan:
   the existing mode/state lines plus one line stating that this workspace is
   temporary/one-use and that final outputs are local (no owned root is
@@ -863,7 +925,7 @@ proposes **no new seam**:
 | **B1** binding mutex | receipt **`Detached`** (§4.2 lets a guarded command proceed) | peer paused at `OXIDE_TEST_PAUSE=bound:<gate>`: because a receipt-bearing binding takes `store.lock_binding` (`outputs.rs:4214-4235`) and keeps it until `mark_running` (`main.rs:701`), the peer holds the mutex at `bound` (`main.rs:545`). Observed by the peer's own `bound` marker file, then the guarded command stays alive and writes nothing; after the gate opens the **guarded command's own `bound` marker appears**, proving it acquired the mutex and passed the pause | no outputs write while blocked; both `bound` markers observed; final state matches |
 | **B2** barrier, live holder | receipt **`Committed`** (guarded `detach` is allowed; `cancel-reservation` too) | live peer paused at `bound` = an active same-checkout record; the guarded verb enters `begin_clean(Barrier)`, finds only **live** facts, and waits | the verb has not exited while the gate is closed and wrote nothing; after release it completes with the shipped detach output |
 | **B3** barrier, dead facts | receipt **`Committed`** (so the precheck passes) | (i) a same-checkout **dead record**: free record lock over a held lease; (ii) a same-checkout **dead clean mark**: free waiter lock, no live group; (iii) unreadable state/sibling | **bounded refusal** with the non-progress diagnostic inside the case's wall clock; record, lease and recovery log byte-identical; the dead lease still present. After an ordinary command recovers it, the same guarded `detach` proceeds |
-| **E** in-custody revalidation | receipt **`Detached`**, so the fast precheck **accepts**; the guarded command pauses at `OXIDE_TEST_PAUSE=keyed:<gate>` (`main.rs:475`, after the key and before the lease) | the fixture publishes a `Prepared` receipt (`OXIDE_TEST_OUTPUTS_CRASH=prepared`, unguarded invocation) while the guarded command is paused, then opens the gate; the guarded command proceeds to its binding mutex, revalidates, and refuses | exact diagnostic **from the revalidation** (the precheck had accepted, proven by the `keyed` marker); the complete control state — `state.json` bytes including `next_id`, `waiters/` lock files, receipt, links, markers, roots, reservations — is **byte-identical** across three repeated runs; no id is consumed |
+| **E** in-custody revalidation | receipt **`Detached`**, so the fast precheck **accepts**; the guarded command pauses at `OXIDE_TEST_PAUSE=keyed:<gate>` (`main.rs:475`, after the key and before the lease) | the fixture publishes a `Prepared` receipt (`OXIDE_TEST_OUTPUTS_CRASH=prepared`, unguarded invocation) while the guarded command is paused, then opens the gate; the guarded command proceeds to its binding mutex, revalidates, and refuses | exact diagnostic **from the revalidation** (the precheck had accepted, proven by the `keyed` marker), asserted as a **matched-control delta**: the control run (same pause, nothing planted) and the test run must have matching lease/ticket/record deltas and a **zero** test-specific delta — no clean mark, no `waiters/<id>.lock`, no receipt/link/marker/root/reservation change, and no id beyond the control's count. A whole-command byte-identical `next_id` is **not** claimed (the ticket/lease lifecycle legitimately advances it). An exact post-lease baseline needs the new `leased` pause point, proposed for scoped review |
 | **C** commit | prepared transition committed by an explicitly **unguarded** invocation (`OXIDE_TEST_TEMP_ROOTS=[]`, `OXIDE_TEST_WORKSPACE_CLASS=normal`) | — | the shipped `oxide outputs adopt` replays and commits; the guarded invocation afterwards sees `Committed` and refuses per §4.2 |
 
 Two premises are recorded as **not** established, and the case does not assert
@@ -2328,8 +2390,12 @@ claimed for a statically edited selector.
   that decides the `Prepared` refusal under the checkout binding mutex *before*
   any mark, id or `waiters/` file exists, with a bounded non-blocking barrier
   attempt afterwards. Regressions cover a dead record, a dead clean mark, a live
-  holder, unknown custody, repeated refusals (idempotent including `next_id`) and
-  the busy-barrier refusal.
+  holder, unknown custody, the busy-barrier refusal, and **verb-level**
+  repeated refusals (byte-identical including `next_id`); the command-level case
+  uses a matched-control delta, since a build's ticket/lease lifecycle advances
+  `next_id` independently of the output path, and an exact post-lease baseline
+  would need the proposed `leased:<gate>` pause point (returned for scoped
+  review).
 - **S2 record class and front-door scoping.** `Record.class`/`class_reason` with
   the omission rule (§5.1), the bounded **presence-aware decode** in
   `Store::load` that refuses a sub-6 document carrying either field, the fence,
@@ -2397,12 +2463,13 @@ its own validation tier and native activation.
   refusal** with no mutation; any unknown → refusal. `Recovering` keeps today's
   behaviour for every existing caller.
 - The **order** of §4.1: a `Prepared` receipt observed at the binding-mutex
-  revalidation yields the exact diagnostic with `next_id`, the `waiters/`
-  directory, the receipt, links, markers, roots and reservations unchanged (the
-  mark and its id are allocated only after a passing revalidation); the busy
-  barrier is bounded by the attempt/deadline budget and refuses without a mark;
-  a `Prepared` appearing at the effect read is a custody defect that refuses
-  rather than replaying.
+  revalidation yields the exact diagnostic, and **the refusal step itself** adds
+  no `next_id`, no `waiters/` entry, no receipt/link/marker/root/reservation
+  change (the mark and its id are allocated only after a passing revalidation);
+  the busy barrier is bounded by the attempt/deadline budget and refuses without
+  a mark; a `Prepared` appearing at the effect read is a custody defect that
+  refuses rather than replaying; and the matched-control delta separates a
+  build's ordinary ticket/lease delta from any output-transition delta.
 - The fallback exclusion of §6.7: with a protected (or unverified) one-use pair
   ranked before an eligible normal slot, an idle class-unknown orphan and a
   second evictable member, `Prefer` never returns the protected pair; the
@@ -2432,7 +2499,10 @@ its own validation tier and native activation.
   build's own.
 - Guarded `adopt` refuses at the effect-free precheck for **every** receipt state
   (only the text differs), and never reaches a barrier; `detach`,
-  `cancel-reservation` and a command binding each revalidate under their custody.
+  `cancel-reservation` and a command binding each revalidate under their custody
+  — `detach`/`cancel-reservation` under the **checkout binding mutex before any
+  clean mark or id**, the command binding inside its own mutex before
+  `gated_replay` — and `adopt` never reaches custody at all.
 - The custody premises of case 19: a receipt-bearing binding holds the checkout
   mutex across `bound`, a receipt-absent binding holds none, and a paused peer is
   an active record for the barrier.
@@ -2615,14 +2685,24 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       unguarded `crash_point` invocation, and the gate is then opened. The
       guarded command proceeds to its binding mutex, **revalidates there**, and
       refuses with the exact diagnostic — proven to be the *revalidation* and not
-      the precheck by the `keyed` marker (the precheck had already accepted). The
-      complete relevant control state is compared across **three repeated runs**:
-      `state.json` bytes including `next_id`, every `waiters/` lock file, the
-      receipt, links, markers, roots and reservations are byte-identical, and no
-      id is consumed. The same order is asserted purely for `detach` and
-      `cancel-reservation`, which have no pause point; a native interleaving for
-      them would need one new pause point inside their binding section and is
-      returned for scoped review.
+      the precheck by the `keyed` marker (the precheck had already accepted).
+      **Oracle: a matched-control delta, not a whole-command byte comparison.**
+      The same guarded command is run twice at the same pause: a control run with
+      nothing planted and the test run with the transition planted. Both runs'
+      ordinary lease/ticket/record deltas must match (they include the ticket
+      registration that advances `next_id`), and the **test-specific** delta must
+      be empty: no clean mark, no `waiters/<id>.lock` created by the refusal, no
+      receipt, link, marker, root or reservation change, and no id beyond the
+      control's count. The case does **not** claim a byte-identical whole-command
+      `next_id`. Separately and non-vacuously, the **verb-level** refusals keep
+      their exact claim: a guarded `detach` or `cancel-reservation` refusal
+      allocates no clean mark and no id, and repeated such refusals are
+      byte-identical including `next_id` (asserted purely and, where a native
+      sequence reaches it, by planting the receipt before the verb starts). An
+      exact post-lease command-level baseline would need one new debug-only
+      `leased:<gate>` pause point between the lease and `outputs::bind_for_command`
+      (bounded like `bound`: owned-scratch marker, 120 s self-release, absent from
+      release builds); that seam is proposed for scoped review, not assumed.
     - **(C) commit, explicitly unguarded.** The prepared transition is committed
       by a deliberately **unguarded** invocation of the same build with
       `OXIDE_TEST_TEMP_ROOTS=[]` and `OXIDE_TEST_WORKSPACE_CLASS=normal` (feature
