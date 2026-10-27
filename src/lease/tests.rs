@@ -3592,6 +3592,8 @@ struct RecordingJournal<'a> {
     )>,
     /// Every per-capture and root-removal record, in the order it was written.
     records: Vec<String>,
+    /// The live mode of each recorded capture at the moment it was recorded.
+    seen_modes: Vec<(String, u32)>,
 }
 
 impl crate::owned_delete::RootCaptureJournal for RecordingJournal<'_> {
@@ -3601,6 +3603,11 @@ impl crate::owned_delete::RootCaptureJournal for RecordingJournal<'_> {
     ) -> Result<(), String> {
         self.records
             .push(format!("captured {} {}", record.original, record.private));
+        let mode = find_entry(self.slot.parent().expect("fixture"), &record.private)
+            .and_then(|path| fs::symlink_metadata(path).ok())
+            .map(|metadata| metadata.permissions().mode() & 0o7777)
+            .unwrap_or(u32::MAX);
+        self.seen_modes.push((record.original.clone(), mode));
         Ok(())
     }
 
@@ -3673,6 +3680,7 @@ fn the_root_capture_record_is_durable_before_the_rename() {
         slot: &slot,
         events: Vec::new(),
         records: Vec::new(),
+        seen_modes: Vec::new(),
     };
     remove_tree_owned(fixture.path(), &slot, Some(&mut journal)).expect("owned tree removed");
 
@@ -4050,6 +4058,22 @@ fn a_crash_after_widening_the_capture_restores_the_owners_exact_mode() {
     assert!(capture_names(&parent).is_empty());
 }
 
+/// The first entry named `name` anywhere below `dir`, for a test observation.
+fn find_entry(dir: &Path, name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy() == name {
+            return Some(entry.path());
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if let Some(found) = find_entry(&entry.path(), name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// Remove every private-name file below `dir` (the modelled live vanish).
 fn remove_private_files(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -4349,4 +4373,49 @@ fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
         "the captured tree is kept, not put back past the failure"
     );
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
+/// The owner-access repair widens a captured nested directory, so its durable
+/// capture record must be written **before** that widening, and a later refusal
+/// in the same tree must restore the owner's exact mode. Both are asserted
+/// through the real deletion and a journal that reads the live mode at the
+/// moment it records the capture.
+#[test]
+fn a_nested_repair_widening_is_recorded_first_and_restored_on_refusal() {
+    let fixture = Fixture::new("repair-record");
+    let slot = fixture.dir("slot");
+    let locked = slot.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
+
+    // The race refuses inside `locked`, i.e. after the repair widened it.
+    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("locked"), "foreign", false);
+    let mut journal = RecordingJournal {
+        slot: &slot,
+        events: Vec::new(),
+        records: Vec::new(),
+        seen_modes: Vec::new(),
+    };
+    assert!(
+        remove_tree_owned(fixture.path(), &slot, Some(&mut journal)).is_err(),
+        "the raced nested directory refuses"
+    );
+
+    let recorded = journal
+        .seen_modes
+        .iter()
+        .find(|(original, _)| original == "locked")
+        .expect("the captured directory was recorded");
+    assert_eq!(
+        recorded.1, 0o100,
+        "the durable record was written while the directory still had the owner's mode"
+    );
+    assert_eq!(
+        mode_of(&locked),
+        0o100,
+        "the refusal restored the owner's exact mode after the repair widened it"
+    );
+    assert!(slot.is_dir(), "the refused slot is kept");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
 }

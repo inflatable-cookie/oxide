@@ -843,7 +843,7 @@ fn restore_mode(dir: BorrowedFd<'_>, mode: libc::mode_t) {
 /// the step that widened it. The same mode is in the durable record, which is
 /// what a crash restores it from.
 struct WidenedMode<'a> {
-    dir: &'a std::os::fd::OwnedFd,
+    dir: BorrowedFd<'a>,
     original: libc::mode_t,
     widened: bool,
 }
@@ -1001,9 +1001,28 @@ fn remove_tree_owned_at(
         }
         return Ok(());
     }
+    // The record keeps the owner's original mode and is durable **before any
+    // permission change** — including the owner-access repair below — so a
+    // failed write, a crash or a later refusal never leaves a widened directory
+    // without a durable original mode. The **root** is recorded by its plan, not
+    // as a nested capture: a nested record is located by the chain of captured
+    // private names *below* the root.
+    let record = (!root_level).then(|| capture_record(context, &capture, &observed));
+    if let Some(record) = &record {
+        if let Err(reason) = context.record_captured(record) {
+            return Err(abort_capture(
+                parent,
+                &capture,
+                LeaseError::Io(format!(
+                    "a captured directory could not be recorded ({reason})"
+                )),
+            ));
+        }
+    }
     // The owner's exact mode is restored on every refusal after a repair, so a
     // kept directory never stays widened just because a later step refused.
     let mut repaired: Option<std::os::fd::OwnedFd> = None;
+    let mut repair_guard: Option<WidenedMode<'_>> = None;
     let child = match open_directory_at(parent, &capture.private) {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1043,18 +1062,24 @@ fn remove_tree_owned_at(
             if let Err(error) = crate::owned_delete::restore_owner_access(repair.as_fd()) {
                 return Err(abort_capture(parent, &capture, io_error(error)));
             }
+            // The repair widened this entry's own mode. From here every exit
+            // path — an error, a `?` or a panic — restores the owner's recorded
+            // mode through the verified repair descriptor, and the child guard
+            // takes over once the reopen succeeds.
+            repaired = Some(repair);
+            repair_guard = Some(WidenedMode {
+                dir: repaired.as_ref().expect("repair descriptor").as_fd(),
+                original: observed.mode_bits(),
+                widened: true,
+            });
             match open_directory_at(parent, &capture.private) {
                 Ok(child) => {
-                    repaired = Some(repair);
+                    if let Some(guard) = repair_guard.as_mut() {
+                        guard.widened = false;
+                    }
                     child
                 }
-                Err(error) => {
-                    // The repair widened this entry's own mode; put the owner's
-                    // exact mode back through the verified descriptor before the
-                    // capture is returned.
-                    restore_mode(repair.as_fd(), observed.mode_bits());
-                    return Err(abort_capture(parent, &capture, io_error(error)));
-                }
+                Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
             }
         }
         Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
@@ -1062,40 +1087,22 @@ fn remove_tree_owned_at(
     let held = match descriptor_identity(child.as_fd()) {
         Ok(held) => held,
         Err(error) => {
-            if let Some(repair) = &repaired {
-                restore_mode(repair.as_fd(), observed.mode_bits());
-            }
+            restore_mode(child.as_fd(), observed.mode_bits());
             return Err(abort_capture(parent, &capture, io_error(error)));
         }
     };
     if held != (observed.device, observed.inode) {
-        if let Some(repair) = &repaired {
-            restore_mode(repair.as_fd(), observed.mode_bits());
-        }
+        restore_mode(child.as_fd(), observed.mode_bits());
         return Err(abort_capture(
             parent,
             &capture,
             LeaseError::UnsafePath("the verified directory was replaced before it was opened"),
         ));
     }
+    // The repair descriptor is no longer needed: the child guard below restores
+    // the same recorded mode on every later exit path.
+    drop(repair_guard);
     drop(repaired);
-    // The record keeps the owner's original mode and is durable before the mode
-    // ever changes, so a crash can always restore exactly the owner's mode. The
-    // **root** is recorded by its plan, not as a nested capture: a nested record
-    // is located by the chain of captured private names *below* the root, and
-    // the root's own private name is not inside itself.
-    let record = (!root_level).then(|| capture_record(context, &capture, &observed));
-    if let Some(record) = &record {
-        if let Err(reason) = context.record_captured(record) {
-            return Err(abort_capture(
-                parent,
-                &capture,
-                LeaseError::Io(format!(
-                    "a captured directory could not be recorded ({reason})"
-                )),
-            ));
-        }
-    }
     let original_mode = observed.mode_bits();
     let widened = original_mode & 0o700 != 0o700;
     if widened {
@@ -1111,7 +1118,7 @@ fn remove_tree_owned_at(
     // From here the widened mode is restored on every exit path, including a
     // `?` return or a panic.
     let _mode = WidenedMode {
-        dir: &child,
+        dir: child.as_fd(),
         original: original_mode,
         widened,
     };
