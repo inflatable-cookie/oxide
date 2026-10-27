@@ -40,16 +40,22 @@ fn hex(s: &str, len: usize) -> bool {
 /// Read a regular owner-owned lock without following the final symlink. A
 /// bounded read also handles a file that grows after metadata was sampled.
 pub(crate) fn read(path: &Path) -> Result<Vec<Package>, &'static str> {
-    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path).map_err(|_| "lock unavailable")?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "lock unavailable")?;
     let metadata = file.metadata().map_err(|_| "lock unavailable")?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.len() > MAX_LOCK_BYTES as u64
     {
         return Err("lock unavailable");
     }
     let mut bytes = Vec::new();
-    file.by_ref().take((MAX_LOCK_BYTES + 1) as u64).read_to_end(&mut bytes)
+    file.by_ref()
+        .take((MAX_LOCK_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|_| "lock unavailable")?;
     eligible(&bytes)
 }
@@ -67,26 +73,41 @@ pub(crate) fn eligible(bytes: &[u8]) -> Result<Vec<Package>, &'static str> {
     }
     let mut names = HashMap::new();
     for package in &lock.package {
-        if package.name.is_empty() || package.name.len() > 255 || package.version.is_empty()
+        if package.name.is_empty()
+            || package.name.len() > 255
+            || package.version.is_empty()
             || package.version.len() > 255
-            || !package.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !package
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             || package.source.as_ref().is_some_and(|s| s.len() > 1024)
         {
             return Err("invalid lock");
         }
-        *names.entry(package.name.replace('-', "_")).or_insert(0usize) += 1;
+        *names
+            .entry(package.name.replace('-', "_"))
+            .or_insert(0usize) += 1;
     }
-    Ok(lock.package.into_iter().filter(|package| {
-        if names[&package.name.replace('-', "_")] != 1 || !package.dependencies.is_empty() {
-            return false;
-        }
-        match package.source.as_deref() {
-            Some(CRATES_IO) => package.checksum.as_deref().is_some_and(|value| hex(value, 64)),
-            Some(source) if source.starts_with("git+") => source.rsplit_once('#')
-                .is_some_and(|(_, revision)| hex(revision, 40)),
-            _ => false,
-        }
-    }).collect())
+    Ok(lock
+        .package
+        .into_iter()
+        .filter(|package| {
+            if names[&package.name.replace('-', "_")] != 1 || !package.dependencies.is_empty() {
+                return false;
+            }
+            match package.source.as_deref() {
+                Some(CRATES_IO) => package
+                    .checksum
+                    .as_deref()
+                    .is_some_and(|value| hex(value, 64)),
+                Some(source) if source.starts_with("git+") => source
+                    .rsplit_once('#')
+                    .is_some_and(|(_, revision)| hex(revision, 40)),
+                _ => false,
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -95,7 +116,8 @@ mod tests {
 
     #[test]
     fn collision_includes_path_packages_and_non_leaves_are_excluded() {
-        let input = format!(r#"version = 4
+        let input = format!(
+            r#"version = 4
 [[package]]
 name = "cfg-if"
 version = "1.0.0"
@@ -115,7 +137,11 @@ version = "1"
 source = "{CRATES_IO}"
 checksum = "{}"
 dependencies = ["cfg-if"]
-"#, "a".repeat(64), "b".repeat(64), "c".repeat(64));
+"#,
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64)
+        );
         let packages = eligible(input.as_bytes()).unwrap();
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "cfg-if");

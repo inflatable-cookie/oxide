@@ -204,6 +204,12 @@ impl Watchdog {
         )
     }
 
+    /// The same reading used by the running watchdog, including its scoped
+    /// debug fixture seam, for a seed's pre-child reserve gate.
+    pub(crate) fn seed_sample(&self) -> Option<u64> {
+        self.sample()
+    }
+
     fn sample(&self) -> Option<u64> {
         match &self.source {
             Source::Statfs(path) => available_bytes(path),

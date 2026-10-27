@@ -1493,7 +1493,207 @@ pub fn admission_budget(settings: &Settings) -> u64 {
     settings.budget
 }
 
+/// Outcome of one pre-child seed attempt. An abandoned recipient must be
+/// released untrusted and the command admitted normally again.
+pub(crate) enum SeedRun {
+    Skipped(&'static str),
+    Seeded(
+        oxide_storage::lease::managed::SeedReceipt,
+        oxide_storage::lease::managed::SeedLast,
+    ),
+    Abandoned,
+}
+
 impl Store {
+    /// One admission lifetime spans the catalog read, effect-free plan,
+    /// reserve gate, durable intent and pinned library transaction. `held`
+    /// already owns the outermost recipient record lock.
+    pub(crate) fn seed(
+        &self,
+        held: &Lease,
+        producer: &oxide_storage::lease::managed::SeedProducer,
+        verify_sources: impl FnOnce(
+            &[oxide_storage::lease::managed::SeedCandidate],
+        ) -> Result<Vec<crate::seed_plan::VerifiedSource>, String>,
+    ) -> Result<SeedRun, String> {
+        use oxide_storage::lease::managed::{
+            seed_candidates, seed_monitored, write_seed_attempt, write_seed_last, SeedAttempt,
+            SeedAttemptState, SeedBucket, SeedLast, SeedOutcome, SeedRecipient, ATTEMPT_SCHEMA,
+        };
+        if self.backend == Backend::ApfsVolume {
+            return Ok(SeedRun::Skipped(
+                "seeding not yet supported on a removable pool",
+            ));
+        }
+        if held.reused || !matches!(held.prior, Prior::Fresh) {
+            return Ok(SeedRun::Skipped("recipient not fresh"));
+        }
+        let recipient = SeedRecipient {
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+        };
+        let _sibling = self.sibling_admission()?;
+        let _admission = self.admission()?;
+        let state = self.load()?;
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == held.record)
+            .filter(|record| record.lease_id.as_deref() == Some(held.lease_id.as_str()))
+            .ok_or("the recipient record is no longer held")?;
+        let candidates = seed_candidates(&self.pool, &recipient, 8)
+            .map_err(|error| lease_error("cannot inspect seed candidates", &error))?;
+        let sources = verify_sources(&candidates.candidates)?;
+        let Some(request) =
+            crate::seed_plan::select(&recipient, producer, &sources, &candidates.candidates)
+        else {
+            return Ok(SeedRun::Skipped("no eligible donor"));
+        };
+        let rejected = candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.slot_id == request.donor.slot_id)
+            .ok_or("the selected donor disappeared")?
+            .catalog
+            .rejected
+            .clone();
+        let watchdog = Watchdog::for_pool(&self.payload);
+        let trigger = HOST_RESERVE_BYTES + crate::watchdog::MARGIN_BYTES;
+        let first = watchdog.seed_sample();
+        if first.is_none_or(|bytes| bytes < trigger) {
+            return Err(format!(
+                "seed reserve stop: available space {first:?}, trigger {trigger} bytes"
+            ));
+        }
+        let mut minimum = first.unwrap();
+        let mut attempt = SeedAttempt {
+            schema: ATTEMPT_SCHEMA.to_owned(),
+            store_id: held.store_id.clone(),
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+            state: SeedAttemptState::Intent,
+            donor_slot: None,
+            units: None,
+            files: None,
+            logical_bytes: None,
+            catalog_digest: None,
+            observation: None,
+        };
+        write_seed_attempt(&self.pool, &attempt)
+            .map_err(|error| lease_error("cannot record seed intent", &error))?;
+        self.write_origin(held.record, record.last_used, None)?;
+        let mut next_sample = Instant::now() + crate::watchdog::INTERVAL;
+        let mut steps = 0usize;
+        let mut stopped = false;
+        let mut admission_stopped = false;
+        let mut monitor = || {
+            if crate::budget::admission_expired() {
+                admission_stopped = true;
+                return true;
+            }
+            steps += 1;
+            if steps < 64 && Instant::now() < next_sample {
+                return false;
+            }
+            steps = 0;
+            next_sample = Instant::now() + crate::watchdog::INTERVAL;
+            match watchdog.seed_sample() {
+                Some(bytes) if bytes >= trigger => {
+                    minimum = minimum.min(bytes);
+                    false
+                }
+                Some(bytes) => {
+                    minimum = minimum.min(bytes);
+                    stopped = true;
+                    true
+                }
+                None => {
+                    stopped = true;
+                    true
+                }
+            }
+        };
+        let outcome = seed_monitored(&self.pool, &request, &mut monitor);
+        drop(monitor);
+        match outcome {
+            Ok(SeedOutcome::Skipped(skip)) => {
+                attempt.state = SeedAttemptState::Skipped;
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record seed skip", &error))?;
+                Ok(SeedRun::Skipped(skip.reason.as_str()))
+            }
+            Ok(SeedOutcome::Abandoned(_)) => {
+                attempt.state = SeedAttemptState::Reset;
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record abandoned seed", &error))?;
+                Ok(SeedRun::Abandoned)
+            }
+            Ok(SeedOutcome::Seeded(receipt)) => {
+                attempt.state = SeedAttemptState::Seeded;
+                attempt.donor_slot = Some(receipt.donor_slot.clone());
+                attempt.units = Some(receipt.units);
+                attempt.files = Some(receipt.files);
+                attempt.logical_bytes = Some(receipt.logical_bytes);
+                attempt.catalog_digest = Some(receipt.catalog_digest.clone());
+                attempt.observation = Some(receipt.observation.clone());
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record completed seed", &error))?;
+                let mut buckets = std::collections::BTreeMap::new();
+                let mut unknown = 0u32;
+                for rejection in rejected {
+                    if let Some(count) = rejection.units {
+                        let current: &mut u32 = buckets.entry(rejection.reason).or_default();
+                        *current = current
+                            .checked_add(count)
+                            .ok_or("seed rejection count overflow")?;
+                    } else {
+                        unknown = unknown
+                            .checked_add(1)
+                            .ok_or("seed rejection count overflow")?;
+                    }
+                }
+                let last = SeedLast {
+                    schema: "oxide.cold-seed/1".into(),
+                    store_id: held.store_id.clone(),
+                    slot_id: held.slot_id.clone(),
+                    incarnation: held.incarnation.clone(),
+                    lease_id: held.lease_id.clone(),
+                    donor_slot: receipt.donor_slot.clone(),
+                    units: receipt.units,
+                    files: receipt.files,
+                    logical_bytes: receipt.logical_bytes,
+                    elapsed_ms: receipt.elapsed_ms,
+                    when_ms: process::now_ms(),
+                    buckets: buckets
+                        .into_iter()
+                        .filter(|(_, units)| *units > 0)
+                        .map(|(reason, units)| SeedBucket { reason, units })
+                        .collect(),
+                    unknown,
+                };
+                write_seed_last(&self.pool, &last)
+                    .map_err(|error| lease_error("cannot record last seed", &error))?;
+                Ok(SeedRun::Seeded(receipt, last))
+            }
+            Err(error) => {
+                attempt.state = SeedAttemptState::Reset;
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record stopped seed", &error))?;
+                if stopped {
+                    return Err(format!(
+                        "seed reserve stop: minimum {minimum} bytes, trigger {trigger} bytes"
+                    ));
+                }
+                if admission_stopped {
+                    return Err("seed admission deadline expired".to_owned());
+                }
+                Err(lease_error("cannot seed slot", &error))
+            }
+        }
+    }
+
     /// Open the pool, creating it on first use above the host reserve. A
     /// macOS pool is excluded from Time Machine before any build writes into
     /// it; an unverified exclusion refuses before Cargo starts.

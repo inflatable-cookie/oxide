@@ -6,7 +6,8 @@
 
 use crate::seed_lock::Package;
 use oxide_storage::lease::managed::{
-    SeedCandidate, SeedDonor, SeedProducer, SeedRecipient, SeedRequest, SeedSourceKind, SeedUnitRef,
+    SeedCandidate, SeedDonor, SeedProducer, SeedRecipient, SeedRequest, SeedRole, SeedSourceKind,
+    SeedUnitRef,
 };
 use oxide_storage::lease::seed::{
     SEED_MAX_PLAN_BYTES, SEED_MAX_PLAN_FILES, SEED_MAX_PLAN_INPUTS, SEED_MAX_PLAN_UNITS,
@@ -18,6 +19,8 @@ pub(crate) struct VerifiedSource {
     pub package: Package,
     pub tree_digest: String,
     pub kind: SeedSourceKind,
+    pub root: std::path::PathBuf,
+    pub proc_macro: bool,
 }
 
 fn same_context(a: &SeedProducer, b: &SeedProducer) -> bool {
@@ -52,7 +55,7 @@ pub(crate) fn select(
         let (mut files, mut bytes, mut inputs) = (0usize, 0u64, 0usize);
         let mut capped = false;
         for package in &candidate.catalog.packages {
-            let matches = sources.iter().any(|source| {
+            let matching_source = sources.iter().find(|source| {
                 let lock = &source.package;
                 package.unique
                     && package.leaf
@@ -64,45 +67,82 @@ pub(crate) fn select(
                     && package.source_root.kind == source.kind
                     && package.source_root.digest == source.tree_digest
             });
-            if !matches {
+            let Some(source) = matching_source else {
                 continue;
-            }
+            };
             for unit in &package.units {
+                if matches!(unit.role, SeedRole::Lib) && source.proc_macro
+                    || matches!(unit.role, SeedRole::ProcMacro) && !source.proc_macro
+                {
+                    continue;
+                }
+                // These are recorded prerequisites, not donor payload reads.
+                // Reject lexical escapes and roots other than the reverified
+                // source tree. Source verification forbids links inside it.
+                if unit.join.inputs.is_empty()
+                    || unit.join.inputs.iter().any(|input| {
+                        let path = std::path::Path::new(input);
+                        !path.is_absolute()
+                            || !path.starts_with(&source.root)
+                            || path
+                                .components()
+                                .any(|part| matches!(part, std::path::Component::ParentDir))
+                    })
+                {
+                    continue;
+                }
                 files = match files.checked_add(unit.files.len()) {
                     Some(value) => value,
-                    None => { capped = true; break; }
+                    None => {
+                        capped = true;
+                        break;
+                    }
                 };
                 inputs = match inputs.checked_add(unit.join.inputs.len()) {
                     Some(value) => value,
-                    None => { capped = true; break; }
+                    None => {
+                        capped = true;
+                        break;
+                    }
                 };
                 for file in &unit.files {
                     match bytes.checked_add(file.size) {
                         Some(value) => bytes = value,
-                        None => { capped = true; break; }
+                        None => {
+                            capped = true;
+                            break;
+                        }
                     }
                 }
                 units.push(SeedUnitRef {
                     fingerprint_dir: unit.fingerprint_dir.clone(),
                     role: unit.role,
                 });
-                if units.len() > SEED_MAX_PLAN_UNITS || files > SEED_MAX_PLAN_FILES
-                    || inputs > SEED_MAX_PLAN_INPUTS || bytes > SEED_MAX_PLAN_BYTES
+                if units.len() > SEED_MAX_PLAN_UNITS
+                    || files > SEED_MAX_PLAN_FILES
+                    || inputs > SEED_MAX_PLAN_INPUTS
+                    || bytes > SEED_MAX_PLAN_BYTES
                 {
                     capped = true;
                     break;
                 }
             }
-            if capped { break; }
+            if capped {
+                break;
+            }
         }
-        if capped || units.is_empty() { continue; }
+        if capped || units.is_empty() {
+            continue;
+        }
         let better = best.as_ref().is_none_or(|(old, old_units)| {
             units.len() > old_units.len()
                 || (units.len() == old_units.len()
                     && (candidate.rank > old.rank
                         || (candidate.rank == old.rank && candidate.slot_id < old.slot_id)))
         });
-        if better { best = Some((candidate, units)); }
+        if better {
+            best = Some((candidate, units));
+        }
     }
     best.map(|(candidate, units)| SeedRequest {
         recipient: recipient.clone(),
@@ -124,12 +164,19 @@ mod tests {
 
     fn producer() -> SeedProducer {
         SeedProducer {
-            cargo_version: "1.97.1".into(), rustc_digest: "rustc-digest".into(),
-            rustc: "/rustc".into(), target: "target".into(), recipe: "quick".into(),
-            backend: "directory-budget-v1".into(), adapter: "adapter".into(),
-            context_digest: "context".into(), config_files: vec!["/first".into()],
-            flags_digest: "flags".into(), cargo_home: "/cargo".into(),
-            command_family: "build".into(), command_class: "build".into(),
+            cargo_version: "1.97.1".into(),
+            rustc_digest: "rustc-digest".into(),
+            rustc: "/rustc".into(),
+            target: "target".into(),
+            recipe: "quick".into(),
+            backend: "directory-budget-v1".into(),
+            adapter: "adapter".into(),
+            context_digest: "context".into(),
+            config_files: vec!["/first".into()],
+            flags_digest: "flags".into(),
+            cargo_home: "/cargo".into(),
+            command_family: "build".into(),
+            command_class: "build".into(),
         }
     }
 
@@ -149,32 +196,56 @@ mod tests {
     #[test]
     fn no_candidate_means_no_plan() {
         let recipient = SeedRecipient {
-            slot_id: "1".into(), incarnation: "i".into(), lease_id: "l".into(),
+            slot_id: "1".into(),
+            incarnation: "i".into(),
+            lease_id: "l".into(),
         };
         assert!(select(&recipient, &producer(), &[], &[]).is_none());
     }
     fn candidate(id: &str, rank: u64, digest: &str) -> SeedCandidate {
         use oxide_storage::lease::managed::{
-            SeedAttemptState, SeedCatalog, SeedJoin, SeedPackage, SeedRole,
-            SeedSourceRoot, SeedUnit,
+            SeedAttemptState, SeedCatalog, SeedJoin, SeedPackage, SeedRole, SeedSourceRoot,
+            SeedUnit,
         };
         SeedCandidate {
-            slot_id: id.into(), incarnation: "i".into(), rank,
+            slot_id: id.into(),
+            incarnation: "i".into(),
+            rank,
             catalog_digest: "catalog".into(),
             catalog: SeedCatalog {
-                schema: "oxide.cold-seed.catalog/1".into(), store_id: "store".into(),
-                slot_id: id.into(), incarnation: "i".into(), lease_id: "lease".into(),
-                record_id: 1, mark: 1, started_at_ms: 0, finished_at_ms: 1,
-                attempt: SeedAttemptState::None, producer: producer(),
+                schema: "oxide.cold-seed.catalog/1".into(),
+                store_id: "store".into(),
+                slot_id: id.into(),
+                incarnation: "i".into(),
+                lease_id: "lease".into(),
+                record_id: 1,
+                mark: 1,
+                started_at_ms: 0,
+                finished_at_ms: 1,
+                attempt: SeedAttemptState::None,
+                producer: producer(),
                 packages: vec![SeedPackage {
-                    name: "cfg-if".into(), target: "cfg_if".into(), version: "1".into(),
+                    name: "cfg-if".into(),
+                    target: "cfg_if".into(),
+                    version: "1".into(),
                     source: "registry+https://github.com/rust-lang/crates.io-index".into(),
-                    checksum: Some("a".repeat(64)), unique: true, leaf: true,
-                    source_root: SeedSourceRoot { kind: SeedSourceKind::Registry, digest: digest.into() },
+                    checksum: Some("a".repeat(64)),
+                    unique: true,
+                    leaf: true,
+                    source_root: SeedSourceRoot {
+                        kind: SeedSourceKind::Registry,
+                        digest: digest.into(),
+                    },
                     units: vec![SeedUnit {
                         fingerprint_dir: "debug/.fingerprint/cfg-if-a".into(),
-                        role: SeedRole::Lib, target: "cfg_if".into(),
-                        join: SeedJoin { path: "d".into(), targets: vec![], inputs: vec![], digest: "d".into() },
+                        role: SeedRole::Lib,
+                        target: "cfg_if".into(),
+                        join: SeedJoin {
+                            path: "d".into(),
+                            targets: vec![],
+                            inputs: vec!["/fixture/src/lib.rs".into()],
+                            digest: "d".into(),
+                        },
                         files: vec![],
                     }],
                 }],
@@ -186,13 +257,28 @@ mod tests {
     #[test]
     fn selection_requires_verified_matching_source_and_breaks_ties_by_rank() {
         let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
-        let package = crate::seed_lock::eligible(lock.as_bytes()).unwrap().remove(0);
-        let source = VerifiedSource { package, tree_digest: "tree".into(), kind: SeedSourceKind::Registry };
-        let recipient = SeedRecipient { slot_id: "recipient".into(), incarnation: "i".into(), lease_id: "l".into() };
-        let candidates = [candidate("old", 1, "tree"), candidate("new", 2, "tree"), candidate("wrong", 3, "other")];
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = VerifiedSource {
+            package,
+            tree_digest: "tree".into(),
+            kind: SeedSourceKind::Registry,
+            root: "/fixture".into(),
+            proc_macro: false,
+        };
+        let recipient = SeedRecipient {
+            slot_id: "recipient".into(),
+            incarnation: "i".into(),
+            lease_id: "l".into(),
+        };
+        let candidates = [
+            candidate("old", 1, "tree"),
+            candidate("new", 2, "tree"),
+            candidate("wrong", 3, "other"),
+        ];
         let selected = select(&recipient, &producer(), &[source], &candidates).unwrap();
         assert_eq!(selected.donor.slot_id, "new");
         assert_eq!(selected.units.len(), 1);
     }
-
 }

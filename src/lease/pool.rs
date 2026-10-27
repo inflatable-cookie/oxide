@@ -507,11 +507,13 @@ pub mod managed {
     use std::time::Duration;
 
     pub use super::super::seed::{
-        publish_seed_catalog, seed, seed_candidates, SeedAbandon, SeedAttemptState, SeedCandidate,
-        SeedCandidates, SeedCatalog, SeedDonor, SeedFile, SeedFileKind, SeedJoin, SeedObservation,
-        SeedOutcome, SeedPackage, SeedProducer, SeedReceipt, SeedRecipient, SeedRejectReason,
-        SeedRejection, SeedRequest, SeedRole, SeedSkip, SeedSkipReason, SeedSourceKind,
-        SeedSourceRoot, SeedUnit, SeedUnitRef, SeedWalkGap, SeedWalkLimits,
+        publish_seed_catalog, read_seed_last, seed, seed_candidates, seed_monitored,
+        write_seed_attempt, write_seed_last, SeedAbandon, SeedAttempt, SeedAttemptState,
+        SeedBucket, SeedCandidate, SeedCandidates, SeedCatalog, SeedDonor, SeedFile, SeedFileKind,
+        SeedJoin, SeedLast, SeedObservation, SeedOutcome, SeedPackage, SeedProducer, SeedReceipt,
+        SeedRecipient, SeedRejectReason, SeedRejection, SeedRequest, SeedRole, SeedSkip,
+        SeedSkipReason, SeedSourceKind, SeedSourceRoot, SeedUnit, SeedUnitRef, SeedWalkGap,
+        SeedWalkLimits, ATTEMPT_SCHEMA,
     };
 
     /// Create an `apfs-volume-v1` pool: config, ledger and lock in `pool`

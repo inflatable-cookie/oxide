@@ -104,6 +104,46 @@ impl ParsedJoin {
     }
 }
 
+/// Match an output's slot-relative manifest name to rustc's recorded target.
+/// Cargo passes an absolute `--out-dir`, so ordinary `.d` files name outputs
+/// under the producing build root. A relative spelling is accepted for the
+/// existing bounded fixture grammar. Both spellings claiming the same output
+/// are ambiguous and refused. The `.d` bytes and recorded target set are never
+/// rewritten.
+pub fn output_rule_proven(
+    parsed: &ParsedJoin,
+    build_root: &std::path::Path,
+    relative: &str,
+    recorded_inputs: &[String],
+) -> bool {
+    let absolute = build_root.join(relative);
+    let Some(absolute) = absolute.to_str() else {
+        return false;
+    };
+    let mut found = None;
+    for rule in &parsed.rules {
+        if rule
+            .targets
+            .iter()
+            .any(|target| target == relative || target == absolute)
+        {
+            if found.is_some() || rule.targets.len() != 1 {
+                return false;
+            }
+            found = Some(rule);
+        }
+    }
+    let inputs: std::collections::BTreeSet<&str> =
+        recorded_inputs.iter().map(String::as_str).collect();
+    found.is_some_and(|rule| {
+        !rule.inputs.is_empty()
+            && rule
+                .inputs
+                .iter()
+                .all(|input| inputs.contains(input.as_str()))
+    })
+}
+
 /// Parse one bounded `.d`.
 pub fn parse(bytes: &[u8]) -> Result<ParsedJoin, JoinRefusal> {
     if bytes.len() > MAX_JOIN_BYTES {
@@ -143,7 +183,7 @@ fn strip_continuation(line: &str) -> Option<&str> {
 fn flush_line(line: &mut String, parsed: &mut ParsedJoin) -> Result<(), JoinRefusal> {
     let text = std::mem::take(line);
     let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.starts_with('#') {
         return Ok(());
     }
     let colon = first_unescaped_colon(trimmed).ok_or(JoinRefusal::Malformed)?;

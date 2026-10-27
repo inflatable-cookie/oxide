@@ -2534,3 +2534,73 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     // The catalog's own byte ceiling is enforced before parsing.
     assert!(SeedCatalog::parse(&vec![b' '; SEED_CATALOG_MAX_BYTES + 1]).is_err());
 }
+
+#[test]
+fn join_accepts_absolute_donor_outputs_and_rejects_ambiguous_aliases() {
+    let root = Path::new("/fixture/pool/slot/build");
+    let source = "/fixture/source/lib.rs";
+    let dep = "debug/deps/cfg_if-aaaaaaaaaaaaaaaa.d";
+    let artifact = "debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta";
+    let contents = format!(
+        "{}/{dep}: {source}\n{}/{artifact}: {source}\n{source}:\n# env-dep:EXAMPLE=value\n",
+        root.display(),
+        root.display(),
+    );
+    let parsed = join::parse(contents.as_bytes()).expect("absolute rustc dep-info");
+    let inputs = vec![source.to_owned()];
+    assert!(join::output_rule_proven(&parsed, root, dep, &inputs));
+    assert!(join::output_rule_proven(&parsed, root, artifact, &inputs));
+    let duplicate = format!("{contents}{artifact}: {source}\n");
+    let parsed = join::parse(duplicate.as_bytes()).expect("duplicate rules parse");
+    assert!(!join::output_rule_proven(&parsed, root, artifact, &inputs));
+    assert!(!join::output_rule_proven(
+        &parsed,
+        Path::new("/other"),
+        dep,
+        &inputs
+    ));
+}
+
+#[test]
+fn monitor_stop_after_a_recipient_write_refuses_and_keeps_the_write() {
+    reset_hooks();
+    let rig = Rig::new("monitor-stop");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let fingerprint = grant.env.cargo_build_build_dir.join(FINGERPRINT);
+    let mut monitor = || fingerprint.exists();
+    let result = seed_monitored(&rig.pool, &donor.request(&recipient), &mut monitor);
+    assert!(
+        matches!(result, Err(LeaseError::Io(ref reason)) if reason.contains("monitor stopped"))
+    );
+    assert!(fingerprint.exists());
+}
+
+#[test]
+fn catalog_publication_requires_matching_unseeded_attempt() {
+    reset_hooks();
+    let rig = Rig::new("attempt-catalog");
+    let (grant, mut catalog) = held_catalog(&rig, "a");
+    let mut attempt = SeedAttempt {
+        schema: ATTEMPT_SCHEMA.into(),
+        store_id: grant.store_id.clone(),
+        slot_id: grant.slot_id.clone(),
+        incarnation: grant.incarnation.clone(),
+        lease_id: grant.lease_id.clone(),
+        state: SeedAttemptState::Intent,
+        donor_slot: None,
+        units: None,
+        files: None,
+        logical_bytes: None,
+        catalog_digest: None,
+        observation: None,
+    };
+    write_seed_attempt(&rig.pool, &attempt).expect("intent");
+    assert!(publish_seed_catalog(&rig.pool, &catalog).is_err());
+    attempt.state = SeedAttemptState::Skipped;
+    write_seed_attempt(&rig.pool, &attempt).expect("terminal skip");
+    assert!(publish_seed_catalog(&rig.pool, &catalog).is_err());
+    catalog.attempt = SeedAttemptState::Skipped;
+    publish_seed_catalog(&rig.pool, &catalog).expect("unseeded terminal generation");
+    assert!(write_seed_attempt(&rig.pool, &attempt).is_err());
+}

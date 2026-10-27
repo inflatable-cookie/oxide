@@ -26,9 +26,15 @@ mod process;
 mod prune;
 mod removable;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_catalog;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_context;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_lock;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_plan;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_sources;
 mod store;
 mod version;
 mod watchdog;
