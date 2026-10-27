@@ -10,6 +10,32 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 3** answers the CHANGES REQUIRED design review of `1ac22ca`
+(comment `6452712728`, 2026-10-27) with five corrections. **Guarded verbs are now
+race-safe**: a fast, effect-free precheck is explicitly never authoritative, and
+the authoritative revalidation runs under the verb's own custody — the clean
+barrier for adopt/detach/cancel-reservation, the checkout binding mutex for a
+command's binding — before any fence, cancellation or replay, with the custody
+mutual-exclusion property named, a stop condition if a writer lacks it, a
+precise "nothing changed" scope, a `Prepared`-before-general diagnostic
+precedence at adopt, and a concurrent-transition regression using the shipped
+debug pause gate. **Victim eligibility now binds control-record custody**: the
+front door derives a separate `evictable` subset from record phase, lock,
+holder/lease/recovery facts, `process_group`, `checkout_custody` and donor/clean
+facts, the library victimises only that subset and stops rather than
+substituting, and a ledger-idle/control-active crash state is a protected,
+counted member. **Reserve and retry are now required native cases**: the reserve
+route is driven with the product's existing debug walk mutation and pause gate
+(above-reserve admit, at-reserve prune of exactly one one-use member, then the
+honest below-floor refusal, then a retry), with dedicated failure-stop and
+retry cases; the earlier "not induced" limitation is withdrawn and the 420 s /
+512 MiB arithmetic is revised to ~275 s / ~345 s upper and ~290 MiB. **The
+staging inventory is now complete for current candidates**, including all six
+current-HEAD roles in `test-permanent-outputs.py` (`:589`, `:1583`, `:1837`,
+`:2297`, `:4775`, `:6238`) beside its fixed pre-feature role. **The class-change
+oracle is corrected**: one-use → warm reuse of the same record/slot → a distinct
+normal record → a warm return to the *original* one-use record, exactly two
+records, never a third.
 **Revision 2** answers the CHANGES REQUIRED design review of `2a4f6a9`
 (comment `6452514295`, 2026-10-27) by correcting six defects: the slice now has
 **two thresholds** (a new slot restores down to 15 members and a warm reuse is
@@ -17,12 +43,14 @@ admissible at the cap), so 16 idle members no longer refuse a 17th workspace;
 **class-unknown rows** make the slice a lower bound and refuse a one-use
 admission instead of reading as empty capacity; a **committed receipt refuses in
 every member shape**, the guarded `Prepared` check runs before the barrier,
-fence, reservation cancellation and both replays at all **four** mutation sites,
+fence, reservation cancellation and both replays at all **four** mutation sites
+(revision 3 replaces that ordering with the in-custody protocol of §4.1),
 `clean` keeps its refusal without adopt advice, and every modelled
 `target/<triple>` directory is inspected itself so an intermediate link is never
 followed; the fixed proof now uses **one owned 128 MiB image** so the removable
 and permanent-mode cases are genuinely reachable, and it states that the
-unknown-figure reserve route is not induced; the seeding case is **mandatory**
+unknown-figure reserve route is not induced (withdrawn in revision 3, which
+binds it as case 8); the seeding case is **mandatory**
 (no unexecuted case in a counted native) with the alternative expressed only as
 a scope split, and the proof declares **HIGH** complexity, the fixed premise
 checklist and a separately activated uncounted diagnostic; and the staging
@@ -104,9 +132,11 @@ fact.
 | Automatic first conversion | `outputs.rs:3843-3886` (`AutoFacts`/`auto_adopts`), `3888-3970` (`auto_adopt`), called from `main.rs:414` | **Skipped for a guarded workspace, before any effect** (§4.1). |
 | Reservation and declared destination | `outputs.rs:5851` (`reserve`), `5355` (`lease_declaration`), `5265` (`planned_destination`), `6094` (`destination_facts`) | **Guarded commands reserve nothing and plan a local destination** (§4.1). |
 | Binding and prepared replay | `outputs.rs:4196-4270` (`bind_for_command`), `4301-4324` (`gated_replay`), `7203-7330` (`replay`) | **Guard branch added**; the three production replay sites refuse before replay (§4.4). |
-| Output mutation verbs | `outputs.rs:2037-2100` (`adopt_command`: barrier `2057`, fence `2075`, migration replay `2081`, receipt replay `2099`), `3983-4030` (`detach_command`: barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014`), `5988-6010` (`cancel_command`), `8450-8470` (`clean_placement`, `Prepared` refusal at `8467`) | **Measured guard before every effect**: adopt refuses before the barrier; detach and cancel-reservation refuse a `Prepared`/pending-migration receipt before their barrier; clean keeps its refusal with the guarded text (§4.1, §4.4, §4.5). |
+| Output mutation verbs | `outputs.rs:2037-2100` (`adopt_command`: barrier `2057`, fence `2075`, migration replay `2081`, receipt replay `2099`), `3983-4030` (`detach_command`: barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014`), `5988-6010` (`cancel_command`), `8450-8470` (`clean_placement`, `Prepared` refusal at `8467`) | **Fast precheck, then an authoritative revalidation under the verb's own custody before every effect**: adopt refuses after the barrier and before the fence/replays; detach and cancel-reservation refuse a `Prepared`/pending-migration receipt under the barrier before their fence/cancellation/replay; clean keeps its refusal with the guarded text (§4.1, §4.4, §4.5). |
 | Proof staging helper | `scripts/test-oxide-pool-layout.py:96` (`stage_at`, imported by eight scripts) | **Explicit per-call `features` parameter**; a helper default never adds a feature, and each caller's role and fixture controls are edited where they live (§11.2). |
-| Custody check | `store.rs:2572` (`checkout_custody`) | **Read.** Guarded binding repeats receipt/path validation under the same binding custody (§4.6). |
+| Custody and closure facts | `store.rs:2572` (`checkout_custody`), `store.rs:4500` (`probe_lock`; non-creating use at `3155`), `store.rs:630-639` (`settle`), `store.rs:3374-3420` (`recover_settled`), `store.rs:399-406` (`settle_idle`) | **Read** by the front door to derive the `evictable` subset (§5.5.1); the library never reads them. |
+| Per-checkout throughput custody | `outputs.rs:6151-6167` (`barrier` = `begin_clean`, `release_barrier`), `outputs.rs:4243` (checkout binding mutex), `outputs.rs:4008,5873,6000` (other binding-mutex sites) | **Read.** Guarded revalidation runs under one of these before any effect (§4.1, §4.6). |
+| Debug proof controls (existing) | `main.rs:327-352` (`OXIDE_TEST_PAUSE` pause gate, debug only); `src/inventory.rs:1402-1445,1559-1600` (`OXIDE_TEST_WALK_MUTATIONS` walk mutations: ≤4 specs, ≤8192 bytes, canonical paths under the owned scratch/evidence roots, `delay_ms` 1..=65,000, one delay per spec) | **Reused, not extended**, for the concurrent-transition and reserve-route native cases (§4.6, §16.2). |
 | Mark spawning / release / scratch discard | `store.rs:1803-1825` (`mark_spawning`), `1826-1850` (`release`), `1878-1930` (`discard_scratch`, `flush_before_idle`) | **Read.** Class never changes at release; the slot keeps its class record (§7.2). |
 | Hand-off and capability probe | `src/bin/oxide/handoff.rs:39-72` (`__oxide-build-capabilities`, `hidden`), `96` (`preflight`), called from `main.rs:203` | **Add one boolean `proof_controls`** and the installer refusal (§10.4). |
 | Proof-control parsing precedent | `src/bin/oxide/config.rs:159-205` (`proof_controls`: debug-only, exact values, malformed refuses) | **Pattern reused** for the new controls (§11.1). |
@@ -297,21 +327,71 @@ is exactly the key an unconverted checkout has. This preserves the existing
 rule that a slot's key describes where Cargo writes: a guarded slot is keyed for
 a local `target`, and nothing later repoints it.
 
-The guard is not only a *read*. Each output verb performs effects in a fixed
-order — the clean barrier, the forward fence (`prune::ensure_ready`), a stale
-reservation's cancellation journal, then a transition replay — so a guarded
-refusal is evaluated **before any of them**, not merely before the replay loop:
+The guard is not only a *read*, and a read alone cannot make its refusal
+race-safe. Each output verb performs effects in a fixed order — the clean
+barrier, the forward fence (`prune::ensure_ready`), a stale reservation's
+cancellation journal, then a transition replay — and **another process can
+publish a `Prepared` receipt or a migration journal between an unlocked read and
+the barrier**. So the guard has two parts, and only the second one is
+authoritative:
 
-| Verb | Effects that precede the transition replay today | Guarded pre-check |
-| --- | --- | --- |
-| `oxide outputs adopt` (`outputs.rs:2037`) | barrier `2057`, fence `2075`, migration replay `2081`, receipt/migration replay `2099` | **refuses before `2057`**, so no barrier, fence, migration replay, reservation change or receipt write |
-| `oxide outputs detach` (`3993`) | barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014` | reads the receipt first: `Prepared` (or a pending migration) **refuses before `3993`**; any other state continues into the shipped order |
-| `oxide outputs cancel-reservation` (`5988`) | barrier `5998`, binding lock, receipt write | `Prepared` (or a pending migration) **refuses before `5998`**; otherwise the shipped cancellation runs |
-| leased command binding (`4196`) | check of prune intent, binding mutex, `gated_replay` `4253`, `replay` `4301` | **refuses before the mutex and both replays**, from the read-only pre-check at `main.rs:456` and again under the guard at `4253` |
-| automatic first conversion (`3888`, called at `main.rs:414`) | barrier `3936`, fence `3941`, adoption transaction | **skipped before `3936`** |
+1. a **fast precheck** at the earliest safe point, with no effect at all. It may
+   refuse early (and then literally nothing, not even a clean mark, was
+   created), but it never authorises a command to proceed;
+2. an **authoritative revalidation inside the verb's own custody and before any
+   effect**, re-reading the receipt and every relevant component (and the
+   migration journal) once the custody that excludes concurrent output
+   transactions is held. Only this revalidation can let the verb continue, and
+   only it produces the "nothing changed" refusal.
 
-A guarded workspace therefore cannot write a fence, cancel a reservation,
-replay a migration, or replay an ordinary prepared transition.
+The custody differs per verb, and each is the lock the shipped code already uses
+to exclude the writers of that state:
+
+| Verb | Custody that excludes concurrent transitions | Authoritative revalidation point | Effects it therefore precedes |
+| --- | --- | --- | --- |
+| `oxide outputs adopt` (`outputs.rs:2037`) | clean barrier (`outputs.rs:2057`, `begin_clean`) | immediately after the barrier is acquired | fence `2075`, migration replay `2081`, receipt/migration replay `2099`, any reservation change |
+| `oxide outputs detach` (`3993`) | clean barrier (`3993`) | after the barrier, before the closure's first effect | fence `4000`, `cancel_reservation` `4009`, replay `4014` |
+| `oxide outputs cancel-reservation` (`5988`) | clean barrier (`5998`) | after the barrier | binding lock, cancellation journal, receipt write |
+| leased command binding (`4196`) | checkout binding mutex (`4243`) | inside the mutex, before `gated_replay` (`4253`) | `gated_replay`, `replay` (`4301`), any prepared transition |
+| automatic first conversion (`3888`, called at `main.rs:414`) | clean barrier (`3936`) | never: the whole verb is **skipped** for a guarded workspace | barrier, fence `3941`, adoption transaction |
+
+Two properties make that sound, and both are verified in S1 rather than assumed:
+
+- every writer of a receipt's `prepared` field and of the migration journal
+  takes the same per-checkout custody — the clean barrier for the output verbs
+  and for the prune transitions that write a checkout receipt
+  (`prune.rs:4596-4621`), and the binding mutex for a command's binding — so no
+  transition can appear between the authoritative revalidation and the effect it
+  guards. A receipt state written by any other path (`Pruning`, `Pruned`, an
+  unsettled prune intent) is refused by §4.2's table, so a writer outside that
+  custody can only cause a refusal, never a wrong build;
+- barrier and binding custody exclude each other for one checkout (a barrier
+  waits for the checkout's commands to finish, and a command that starts after
+  a barrier waits), so neither kind of writer can slip past the other.
+
+If implementation finds a writer that takes neither custody, or a verb whose
+effect runs after its custody is released, the work **stops** and returns to
+design; the ordering claim is not widened to cover it.
+
+**What "nothing changed" means, precisely.** The fast-path refusal creates
+nothing. The in-custody refusal creates and then abandons one control-state
+clean mark (the shipped `barrier`/`release_barrier`, `outputs.rs:6151-6167`);
+it writes **no** receipt, link, sibling, root, marker, reservation, adoption
+fence, migration-journal step or slot state, and it replays nothing. The
+regression compares a bounded digest of every one of those before and after,
+plus the clean mark's absence.
+
+**Diagnostic precedence at `adopt`.** `adopt` on a guarded workspace always
+refuses, but the text depends on state, decided in this order:
+
+1. receipt `Prepared`, or a pending migration journal (or both) → the exact
+   `Prepared` diagnostic below;
+2. any other state (absent, `Committed`, `Detached`, `Pruned`, malformed,
+   mismatched, `Pruning`, unsettled intent) → the general guarded `adopt`
+   refusal described in §4.5.
+
+So the brief's exact diagnostic is never shadowed by the general refusal, and
+the general refusal never offers adopt advice for a `Prepared` transition.
 
 ### 4.2 Receipt and path states
 
@@ -371,10 +451,10 @@ Today an interrupted transition is replayed at three production sites:
 | explicit detach (`outputs.rs:4014`) | `replay(&context, receipt)?` |
 | command binding (`outputs.rs:4253` → `gated_replay` at `4301`) | `replay(context, receipt)` when custody is `Clear` |
 
-For a **guarded** workspace the guard runs **before** each of them and before
-every effect that precedes them (§4.1), and refuses with exactly this one line,
-before any read of a sibling, marker or root and before any rename, fence or
-reservation write:
+For a **guarded** workspace the authoritative revalidation (§4.1) runs under
+the verb's custody **before** each of them and before every effect that precedes
+them, and refuses with exactly this one line, before any read of a sibling,
+marker or root and before any rename, fence or reservation write:
 
 ```text
 prepared output transition unresolved; this guarded workspace cannot replay it; nothing changed
@@ -398,17 +478,21 @@ normal checkout keeps the shipped wording byte for byte.
 
 ### 4.5 Adopt, detach, clean, plan and status
 
-- **`oxide outputs adopt`** on a guarded workspace **refuses before any
-effect** (before the barrier, the fence, the migration journal replay and the
-receipt replay), naming that this workspace is one-use/temporary and cannot own
-an output root. It publishes nothing, cancels nothing and writes nothing.
+- **`oxide outputs adopt`** on a guarded workspace **refuses**, with the
+diagnostic chosen by §4.1's precedence (a `Prepared` receipt or pending
+migration journal gets the exact diagnosis; every other state gets the general
+refusal naming that this workspace is one-use/temporary and cannot own an output
+root). The fast precheck refuses before any effect at all; if state changed
+before custody, the authoritative revalidation refuses after the barrier and
+still writes no receipt, root, link, marker, reservation or fence.
 - **`oxide outputs detach`** remains available and safe exactly as shipped: for
 a `Committed` placement whose live path is the exact owned link it becomes a
 real directory again (profile layout: every owned member link becomes a real
 directory, `target` stays real) with **no root moved, copied or deleted**, and
 for a valid `Detached` receipt it is the existing no-op. On a guarded workspace a
-`Prepared` receipt (or a pending migration journal) is re-read **before the
-barrier** and refuses per §4.4; a normal checkout keeps the shipped order.
+`Prepared` receipt (or a pending migration journal) is re-read **under the
+barrier, before the fence/cancellation/replay** and refuses per §4.4; a normal
+checkout keeps the shipped order.
 - **`oxide clean`** keeps its refusal for `Prepared`; on a guarded workspace its
 text is the exact guarded diagnostic (§4.4). Everything else about clean is
 unchanged, and clean is not a one-use-specific verb.
@@ -428,24 +512,45 @@ shipped cancellation runs unchanged; it publishes no root and selects nothing.
   most once; the shipped "not converted; `oxide outputs adopt` performs it"
   warning is **not** printed for a guarded workspace.
 
-### 4.6 Races
+### 4.6 Races, and the concurrent-transition regression
 
-The guard is evaluated in both places the shipped code already evaluates the
-destination:
+The guard is evaluated in three places, and only the last two are authoritative:
 
 1. during planning (`planned_destination`, `main.rs:456`), where the expected
-   destination is `None` for a guarded command;
-2. again inside `bind_for_command` under the checkout's binding custody
-   (`store.lock_binding`), where the receipt state and every relevant component
-   are re-read and re-classified.
+   destination is `None` for a guarded command. This is the fast precheck: it
+   can refuse, but it can never authorise;
+2. inside `bind_for_command` **under the checkout's binding mutex**
+   (`store.lock_binding`, `outputs.rs:4243`) before `gated_replay`, where the
+   receipt, the migration journal and every relevant component are re-read;
+3. for the output verbs, under the **clean barrier** before their first effect
+   (§4.1).
 
-If the receipt/path state changed between the two (a concurrent explicit
-detach, a peer's conversion, a planted link), the second check refuses with the
-existing "this checkout was … while this command waited … nothing was built"
-shape or the guard's own refusal. The command never proceeds on the strength of
-the first read. `bind_for_command`'s `expected = None` path already exists
+A transition published between (1) and (2)/(3) — by a concurrent adopt, detach,
+cancel-reservation or command binding — is therefore always seen by the
+authoritative revalidation, which refuses with the guard's own diagnostic or,
+for a changed destination, the shipped "this checkout was … while this command
+waited … nothing was built" shape. A guarded command never proceeds on the
+strength of the precheck, and a slot keyed for one destination never binds
+another. `bind_for_command`'s `expected = None` path already exists
 (`keyed_state_matches(None, expected)`), so a guarded command fails closed if a
-receipt appeared.
+receipt appeared while it waited.
+
+**Regression (native case 19).** The fixed script uses the shipped debug pause
+gate (`OXIDE_TEST_PAUSE=<gate>:bound`, `main.rs:333-352`, debug builds only) to
+stop a normal checkout's command *inside* its binding custody with a transition
+prepared, then starts each guarded verb in that checkout:
+
+- while the peer is paused, a guarded command either waits for the checkout or
+  refuses; it never proceeds and never writes;
+- after the peer commits and the pause is released, the guarded command sees the
+  committed receipt and applies §4.2 (committed → refuse; `Prepared` only if the
+  peer is killed before commit, which the case also drives once, producing the
+  exact diagnostic);
+- the bounded digest of the receipt, links, markers, roots and reservations is
+  identical across every refusal.
+
+The pause gate is debug-only and inert in a release build; it is a proof control
+of the existing product, not a new product behaviour.
 
 ### 4.7 What the guard does not claim
 
@@ -531,16 +636,18 @@ today's gate, origin and custodian rules unchanged.
 ### 5.5 Bounded membership for the library
 
 Under the admission lock (`store.attempt`, `store.rs:2978`) the front door
-derives, from the control state and the ledger view it already reads, two
+derives, from the control state and the ledger view it already reads, **three**
 bounded sets:
 
 ```text
-members = for each record with class == OneUse:
-              for each ledger slot whose project == affinity_dir(record.id):
-                  (slot_id, incarnation)
-unknown = for each ledger slot that no record owns (no record's affinity
-              directory equals its project, or its owning record is
-              unreadable): (slot_id, incarnation)
+members   = for each record with class == OneUse:
+                for each ledger slot whose project == affinity_dir(record.id):
+                    (slot_id, incarnation)
+evictable = the subset of members whose owning record positively establishes
+                control-record closure at this admission (below)
+unknown   = for each ledger slot that no record owns (no record's affinity
+                directory equals its project, or its owning record is
+                unreadable): (slot_id, incarnation)
 ```
 
 bounded by `MAX_SLOTS` (128) pairs each and encoded as fixed-size vectors. Each
@@ -548,13 +655,82 @@ pair is verified by the library against the ledger under the pool lock (§6.2).
 A slot with a stale incarnation or a missing ledger row is **unverified** and is
 reported as such; it is never a victim and never free quota.
 
-`members` and `unknown` are disjoint, and together with the verified **normal**
-slots they account for every ledger row exactly once. That totality is what
-makes the slice figure honest: the slice is either the verified member union
-with **no** class-unknown row (`known`), or the same union labelled a **lower
-bound** beside the number of unattributed rows (`lower bound, k unknown`). It is
-never presented as a complete figure, and never as zero headroom created by an
-oonly-unknown pool.
+`members`, `evictable` and `unknown` are disjoint (`evictable ⊆ members`), and
+together with the verified **normal** slots the members and unknown rows account
+for every ledger row exactly once. That totality is what makes the slice figure
+honest: the slice is either the verified member union with **no** class-unknown
+row (`known`), or the same union labelled a **lower bound** beside the number of
+unattributed rows (`lower bound, k unknown`). It is never presented as a complete
+figure, and never as zero headroom created by an only-unknown pool.
+
+**A ledger row is not a writer-closure proof.** The ledger's `Idle` state and
+the control record's phase are written by **separate** atomic updates
+(`store.rs:1826-1850`: the library release marks the slot idle, then
+`Store::save` marks the record idle), so a crash between them leaves a ledger-idle
+slot whose record is still active. `recover_settled` (`store.rs:3374-3420`)
+deliberately **keeps** an active record when `settle` (`store.rs:630-639`) cannot
+prove closure — a non-empty, unrecorded or non-owned group is `Settle::Keep`, not
+a recovery. And the library itself reads no Oxide record, phase or lock, so it
+**cannot** establish writer closure from the ledger alone. The `evictable`
+subset is therefore derived here, and a member that fails any item of the
+checklist is a **protected member**: still counted in the slice, never a victim.
+
+### 5.5.1 The evictable checklist (control-record custody)
+
+A member is evictable only when **every** item below holds, each read by the
+front door at this admission under the control-state admission lock and with the
+existing bounded readers; any doubt means protected:
+
+| # | Fact | Where | Doubt means |
+| --- | --- | --- | --- |
+| 1 | record phase exactly `Idle` (`store.rs:139-153`) | control state | protected |
+| 2 | no `holder`, no `lease_id`, no `pending_recovery`, no `retired`, no `lost` | control state | protected |
+| 3 | the owning record lock is free and not missing: `probe_lock(lock_path, false) == Probe::Free` (`probe_lock` at `store.rs:4500`; the same non-creating probe the project-cap path uses at `store.rs:3155`). `Missing` is **not** free | control state | protected |
+| 4 | `Store::checkout_custody(record.checkout, 0)` is `CheckoutCustody::Clear` (`store.rs:2572`) — no other command of **that** checkout may be writing, no lost-slot custody. (`own` is 0 because the member belongs to another checkout; the command's own record is excluded only where it is the member's owner) | control state | protected |
+| 5 | `process_group` is `None`: a recorded group means a writer may still exist. `settle_idle` (`store.rs:399-406`) clears it, and `recover_settled`'s `Reset` (`store.rs:3397-3402`) only drops a pending recovery — it leaves the active record and its group in place, so phase-`Idle` plus no recorded group is the positive closure fact | control state | protected |
+| 6 | the ledger slot is `Idle`, `lease_id` is `None`, and its `(slot_id, incarnation)` equals the member pair | ledger view | protected |
+| 7 | no donor pin covers the slot (§8.2) and no `oxide clean` for that checkout is recorded | control state | protected |
+
+The `evictable` set is passed to the library as its **only** allowed victim
+source; membership in `members` alone is never enough. A member that is counted
+but protected is reported in the bounded observation (`protected: n`) and never
+silently turned into free quota.
+
+**Revalidation through the deletion.** The library re-verifies, under the pool
+lock and immediately before the deletion, that the pair is still a ledger row
+whose `incarnation` matches, still `Idle` and unleased, and still passes
+`validate_idle_slot_scope`. A pair that no longer verifies **stops** the
+deletion (`UnknownAccounting`/`Busy` as shipped) — the library never falls
+through to the next candidate, because the next candidate's custody was not
+established for this moment. The front door holds the admission lock across the
+whole call, so no other Oxide command can transition a slot while this happens;
+an external writer is excluded by the shipped positive-closure rules the
+checklist above re-uses.
+
+**The ledger-idle/control-uncertain counterexample.** A slot's ledger row is
+`Idle` while its owning record still says a command may be live: the record lock
+is held by a running command, `recover_settled` therefore `continue`s without
+settling it, and `settle` (`store.rs:630-639`) would `Keep` a ledger-`Held`
+record whose group is not positively empty. The library's predicate
+(`Idle && no lease_id`) accepts that row; the checklist does not: phase is not
+`Idle` (or the lock is not `Free`), so the member is **protected** — counted,
+never a victim, and a one-use admission that needs its bytes refuses (it is not
+a progress-capable holder either, because its custody is uncertain) rather than
+deleting a slot that may still have a writer.
+
+Two narrower facts must be stated exactly, because they bound what the
+checklist proves:
+
+- a crash between the library's `Held → Idle` write and `Store::save`
+  (`store.rs:1826-1850`) is *not* left active by the shipped recovery: with the
+  ledger already idle, `settle` returns `Reset`, and `recover_settled` then
+  calls `settle_idle` (`store.rs:3448`) — so the record becomes `Idle` only
+  through that positive settle, and only then does it pass the checklist;
+- a record kept by `Settle::Keep` always has a ledger-`Held` slot, which the
+  existing ledger-only predicate already refuses.
+
+So the checklist does not duplicate the ledger; it adds the control-record facts
+the library cannot see. Native case 25 drives the live-record-lock state.
 
 ### 5.6 Class-unknown rows and the slice
 
@@ -611,6 +787,9 @@ slice: Option<OneUseSlice>,     // Some for every new-slot admission and every
                                 // forbids a measurement (normal warm reuse)
 
 pub struct MemberSet(/* at most MAX_SLOTS (slot_id, incarnation) pairs */);
+// Two sets, never interchangeable: `accounting` counts bytes and slots,
+// `evictable` is the only victim source and is derived by the front door's
+// control-record custody checklist (§5.5.1). `evictable ⊆ accounting`.
 pub struct OneUseSlice {
     pub max_slots: usize,       // 16 verified members
     pub max_bytes: u64,         // min(admission_budget / 10, 32 GiB), at least 1
@@ -661,14 +840,20 @@ Under the pool lock, before any victim decision:
 2. a pair that does not verify is **dropped** from the candidate set (and
    reported as unverified in the restore observation); it is never replaced by
    another slot;
-3. a verified pair becomes an **accounting member** immediately, but is an
-   **eviction candidate** only while it is also `Idle`, `lease_id` is `None`,
-   no donor pin covers it (§8.2), and the existing
-   `validate_idle_slot_scope` ownership/device/accounting checks pass;
-4. `Held`, `Retired`, `Evicting`, interrupted, unknown-custody and pinned
-   (donor-locked) members continue to **count** toward the slice, count and
-   known overage; they are never made free quota because they cannot be
-   deleted.
+3. a verified pair is an **accounting member** immediately. It is an
+   **eviction candidate** only when it is *also* in the front door's `evictable`
+   set (§5.5.1 — record phase `Idle`, no holder/lease/recovery/retired/lost, a
+   free and existing record lock, `Clear` custody, no recorded process group,
+   no donor pin, no clean mark) *and* the ledger row is `Idle` with no
+   `lease_id` *and* the existing `validate_idle_slot_scope`
+   ownership/device/accounting checks pass. A member in `accounting` but not in
+   `evictable` is **protected**;
+4. `Held`, `Retired`, `Evicting`, interrupted, control-uncertain, unknown-custody
+   and pinned (donor-locked) members continue to **count** toward the slice,
+   count and known overage; they are never made free quota because they cannot
+   be deleted. The library cannot verify control-record custody itself and does
+   not try: it trusts only the `evictable` subset, and it re-checks that subset
+   against the ledger under the pool lock.
 
 The mapping is stable because the front door holds its control-state admission
 lock (`store.attempt`, `store.rs:2978`) across the whole library call, so no
@@ -678,8 +863,10 @@ verify a record lock; that is the caller's custody, stated here so no reader
 assumes the library proves it.
 
 A safety failure on a selected victim (a foreign entry, a device mismatch, an
-incomplete walk) **stops** the decision with the shipped error. It never skips
-to a different, less-checked victim.
+incomplete walk, a pair that left the `evictable` set, a ledger transition to
+`Held`) **stops** the decision with the shipped error. It never skips to a
+different, less-checked victim, and it never falls through to a candidate whose
+custody was not established for this moment.
 
 ### 6.3 Restore runs before admission
 
@@ -833,14 +1020,16 @@ class-unknown rows exist) and the front door decides:
   (§5.6). There is no wait: no member's deletion can change an unknown row, and
   an unknown byte total must not be spent as if it were bounded. A normal
   admission is unaffected (§6.8);
-- `Full` with `held > 0` **and** at least one held member's owning record
-  positively progress-capable — its record lock is held by a live process, its
-  phase is `Acquiring`/`Spawning`/`Running`, and the custody facts do not report
-  unknown writer closure — takes the existing bounded wait (`Busy` →
+- `Full` with at least one **progress-capable** member holder — its record lock
+  is held by a live process, its phase is `Acquiring`/`Spawning`/`Running`, and
+  the custody facts do not report unknown writer closure (so it is a held, not a
+  control-uncertain, member) — takes the existing bounded wait (`Busy` →
   `Wait::Uncertain` for that specific member). That is a wait for a holder that
-  can finish, not for a deletion a safety gate forbids;
-- `Full` otherwise (no held member, no progress-capable holder), or
-  `Unmeasured`: the admission **refuses** with a dedicated bounded error naming
+  can finish, not for a deletion a safety gate forbids. A **control-uncertain**
+  member (§5.5.1) is never progress-capable: it is protected and counted, and it
+  is not a reason to wait;
+- `Full` otherwise (no progress-capable holder), or `Unmeasured`: the admission
+  **refuses** with a dedicated bounded error naming
   the measured union, the bound and the protected member count. There is no
   indefinite wait and no fall-through to a normal victim.
 
@@ -912,9 +1101,21 @@ any other slot.
 
 Deletion is the shipped `Evicting` transaction with its journalled capture
 (`pool.rs:1808-1900`, `reconcile_evicting`). A retained interrupted generation,
-an `Evicting` member, a quarantined lost slot and an untrusted member all keep
-counting toward the slice while they exist, and are never candidates. The slice
-therefore never turns "cannot delete safely" into "free bytes".
+a control-uncertain member (§5.5.1), an `Evicting` member, a quarantined lost
+slot and an untrusted member all keep counting toward the slice while they
+exist, and none is ever a candidate. The slice therefore never turns "cannot
+delete safely" into "free bytes".
+
+The control-record side matters as much as the ledger side. `settle`
+(`store.rs:630-639`) keeps a record whose group is non-empty, unrecorded or not
+owned (and such a record's slot is ledger-`Held`, so it is already no
+candidate); `recover_settled` (`store.rs:3374-3448`) skips a record whose lock is
+held and settles the rest. Because the ledger's `Held → Idle` write and the
+control record's idle write are separate atomic updates
+(`store.rs:1826-1850`), the two sides can disagree between crashes, and the
+library can read only one of them. This design's `evictable` checklist (§5.5.1)
+reads the control record, not just the ledger, and protects every disagreement.
+The native case that drives the live-lock disagreement is case 25.
 
 ### 7.4 No class is ever shared, borrowed or converted
 
@@ -1171,7 +1372,7 @@ adds **no** feature, so no historical or unrelated role changes by accident.
 | Caller | Role | Feature |
 | --- | --- | --- |
 | `test-oxide-pool-layout.py:210-211` | current HEAD **candidate**; fixed `BASE = 850260c` | candidate only |
-| `test-permanent-outputs.py:589,778,1583,1837` | current HEAD candidate (incl. focused modes); fixed `PRE_FEATURE = 8c9b5ae` | candidate only |
+| `test-permanent-outputs.py` — **seven** calls: `:589` (counted), `:1583` (`detach-permanent`), `:1837` (`auto-adopt`), `:2297` (`ignore-safety`), `:4775` (`exec-inference`), `:6238` (`auto-ineligible`), and `:778` (fixed `PRE_FEATURE = 8c9b5ae`) | six current-HEAD candidates, each its own role, **plus** the fixed historical pre-feature role; every focused mode has scratch fixtures | feature + class/roots on all six current candidates (each call, not a helper default); the pre-feature role keeps its source and flags; all seven are marked next-needed-run |
 | `test-profile-outputs.py:2695-2697` | current HEAD **candidate**; fixed `BASE = 4a70b83` | candidate only |
 | `test-oxide-removable-removal.py:358,621` | current HEAD candidate (and boot-closure mode) | candidate only |
 | `test-drive-mode.py:172` | current HEAD candidate; fixture workspace, pool, `HOME`, `CARGO_HOME` and `TMPDIR` under owned scratch (`scripts/test-drive-mode.py:174-230`) | candidate only, plus class/roots for its fixtures |
@@ -1301,15 +1502,32 @@ claimed for a statically edited selector.
 11. **A tool that writes through `target` after the guard.** Not contained
     (§4.7); the hierarchical inspection of §4.3 catches a link *at* one of the
     declared components, not one created later.
-12. **The reserve route is not triggered natively here.** `admit_unknown_removable`
-    only runs when the removable pool's own figure has a genuine bound gap (5 s
-    or 2M entries), which a tiny fixture cannot produce. Its class scoping is
-    shared with the count/byte selector proven natively and is source-checked;
-    this design does not claim the reserve *route* ran (§16.2 case 8).
-13. **`clean` on a guarded `Prepared` receipt.** The refusal is retained and its
+12. **The reserve route is driven natively, and its price is stated.** It needs
+    two premises: a genuine `elapsed_deadline` gap in the removable pool's own
+    figure, and free space at or below the registered reserve. The fixed proof
+    produces the first with the product's existing debug walk mutation
+    (`DelayBeforeReadDir`, 6 s > the 5 s bound) and the second by filling the
+    image outside its payload during the shipped `keyed` pause gate. The
+    128 MiB image is below the 10 GiB floor, so the at-reserve sub-case must
+    ultimately refuse with the original incomplete scan — that refusal is the
+    honest outcome, and the assertion is that exactly one idle **one-use**
+    member was retired and no normal slot was touched. Nothing is invented to
+    make the route admit (§16.2 case 8).
+13. **A retry is not a second attempt at a victim.** After a failure-stop (a
+    foreign entry in the selected victim) or a protected-slice refusal, the
+    retried admission performs the whole class-scoped selection again. It never
+    resumes at the next candidate, and it never converts an earlier failure into
+    a normal victim (§16.2 cases 26, 27).
+14. **A ledger-idle slot is not proof of writer closure.** The ledger's idle
+    write and the control record's idle write are separate, so the two sides can
+    disagree; a record whose lock is held (or whose group is not positively
+    empty) is skipped or kept by the shipped recovery. The `evictable` checklist
+    reads the control record and protects the slot, and a record is evictable
+    only after a positive settle has made it `Idle` (§5.5.1, §16.2 case 25).
+15. **`clean` on a guarded `Prepared` receipt.** The refusal is retained and its
     text becomes the exact guarded diagnostic, so it names no adopt step and
     offers no repair route (§4.4).
-14. **Pending papercuts.** A temp checkout's intentional Cargo escapes and the
+16. **Pending papercuts.** A temp checkout's intentional Cargo escapes and the
     positively-vanished-checkout idle-slot preference (papercuts `84f2bc18`,
     `dab1b5b8`) are folded here; §17 states exactly what this design does and
     does not deliver, and neither is claimed closed by design.
@@ -1329,10 +1547,14 @@ claimed for a statically edited selector.
 | guard: `Committed` receipt in any member shape | **refuses**, names detach |
 | guard: `Prepared` at adopt/detach/cancel-reservation/bind, and `clean` | **refuses before every effect** with the exact diagnostic, nothing changed |
 | guard: malformed/mismatched/unsupported receipt, `Pruning`, unsettled prune intent | **refuses** through the shipped validation |
-| explicit adopt on a guarded workspace | **refuses before the barrier** |
+| explicit adopt on a guarded workspace | **refuses** — fast precheck before any effect, or the in-custody revalidation before the fence/replays; a `Prepared` state takes the exact diagnostic first (§4.1) |
 | automatic adoption on a guarded workspace | **skipped**, no receipt write, no notice |
 | normal warm reuse | unchanged, no slice measurement |
 | normal new slot with slice overage or class-unknown rows | restoration + `Prefer`, then continue with a measured overage or a lower-bound note |
+| removable reserve route, unknown figure above the reserve | admit with a bounded note; nothing evicted |
+| removable reserve route, unknown figure at/below the reserve | prune the oldest idle **one-use** member, re-read, then refuse with the original incomplete scan if nothing is left; a normal slot is never the victim |
+| retried admission after a failure-stop | full class-scoped reselection; never the next candidate, never a normal victim |
+| member whose control record is active (ledger idle, custody uncertain) | **protected**: counted, never a victim, not a wait reason |
 | one-use new slot with 16 idle members | reclaim the oldest idle member, then admit |
 | one-use warm reuse with 16 members | admits when the candidate is a member and the bytes fit |
 | one-use admission, protected slice, progress-capable holder | wait (`Busy` → existing bounded wait) |
@@ -1439,18 +1661,24 @@ its own validation tier and native activation.
 One short fixed script, the whole command of the qualified shared proof
 supervisor, with tiny std-only fixtures, private `HOME`/`CARGO_HOME`/pool, one
 `cfg-if` 1.0.0 crate seeded offline from the verified host cache for the seeding
-case, and one owned 128 MiB scratch APFS image for the removable and
-permanent-mode cases. Fixed case list (no case may be reported `unexecuted` in a
-counted run, §16.3):
+case, and one owned 128 MiB scratch APFS image for the removable, reserve and
+permanent-mode cases. Fixed case list, 27 cases (no case may be reported
+`unexecuted` in a counted run, §16.3):
 
 1. classification: canonical alias under a root; root equality; component
    prefix; `/`, `/Volumes/<x>`, HOME, pool ancestor and pool-inside each dropped
    with one bounded report; dedup; an unreadable registration drops a root.
 2. opt-in: `1` classifies, `0`/`true`/text are ignored and reported, and the
    membership classification survives an ignored opt-out.
-3. repeat and class change: the same checkout used twice as one-use (warm
-   reuse), then normal, then one-use again; three distinct records, no relabel,
-   no borrow, no shared slot.
+3. repeat and class change, asserted exactly as §5.2 describes: the same
+   checkout with the same key is used as one-use twice (the second is a **warm
+   reuse of the same record and slot**), then as normal (a **distinct** normal
+   record with its own slot, the one-use slot untouched), then as one-use again
+   (the **original one-use record and slot are recovered warm**, not a third
+   record). Assertions: exactly two records exist across the four commands, the
+   one-use record's id and slot id are identical at step 1 and step 4, no record
+   changed class, no slot was borrowed or relabelled, and the normal record's
+   slot is byte-identical after the one-use commands.
 4. slice admission, exact cap: 16 idle members within the byte bound, then a
    17th one-use workspace's **new** slot reclaims the **oldest** idle member and
    admits (16 again); a **warm reuse** at 16 admits without reclaiming; one
@@ -1468,13 +1696,31 @@ counted run, §16.3):
    under byte pressure reclaims one-use first, then a normal victim if still
    over — and with every one-use member protected it continues with a measured
    overage and no stall.
-8. removable selected pool: on the owned image's registered and **selected**
-   pool (positive selected-removable control), a normal byte-pressure admission
-   prefers a one-use member over a normal victim. **Stated limit:** the
-   unknown-figure reserve route's own trigger needs a genuine 5 s / 2M-entry
-   walk gap, which a tiny fixture cannot induce; its class scoping is covered by
-   case 7's shared selector and §16.1's source-level check, and this proof makes
-   no claim that the reserve *route* ran.
+8. removable **reserve** route, on the owned image's registered and **selected**
+   pool (positive selected-removable control), with one idle normal slot and two
+   idle one-use members prepared in that pool:
+   - (a) *unknown figure above the reserve*: the existing debug walk mutation
+     (`OXIDE_TEST_WALK_MUTATIONS`, `DelayBeforeReadDir` on the pool payload root,
+     6,000 ms — longer than the 5 s removable figure bound) makes the pool
+     figure incomplete with only an `elapsed_deadline` gap, and free space is
+     above the registration's reserve. The route **admits with its bounded
+     note**, evicting nothing: both members' bytes, the normal slot and every
+     ledger byte are identical afterwards.
+   - (b) *unknown figure at/below the reserve*: the same delay, plus
+     `OXIDE_TEST_PAUSE=<gate>:keyed` holding the command after selection, while
+     the fixture writes a filler **outside the payload** (`<mount>/proof-filler`,
+     never inside the pool payload) until free space is at or below the reserve.
+     The route **prunes exactly the oldest idle one-use member**, leaves the
+     normal slot and the other member untouched, re-reads, finds nothing left to
+     prune and refuses with the original incomplete scan (the 128 MiB image is
+     far below the 10 GiB floor). The assertion is the protection, not a
+     pass: one member retired, no normal victim, no invented cleanup.
+   - (c) *retry after that refusal*: the filler is removed and the delay disarmed,
+     and the same normal admission is **retried**. It now takes the ordinary
+     path and reclaims the remaining idle one-use member before admitting, never
+     the normal slot.
+   This is the concrete reserve/retry evidence the brief requires; the earlier
+   "not induced" limitation is withdrawn.
 9. one-use `Only` under pressure with no eligible one-use victim: refuses, and
    every normal slot's ledger bytes and payload digest are identical afterwards.
 10. normal warm reuse target-only: with members present, a normal warm reuse
@@ -1497,6 +1743,7 @@ counted run, §16.3):
 15. pre-effect hand-off, both paths: a version-6 document planted in the internal
     control and in a private removable control, with no matching installed
     receipt: exit 75 before any output, receipt, root or slot effect.
+
 16. guarded outputs, absent/real: a temp workspace with no receipt, and with a
     real local `target`, builds locally; no receipt, root or link is created.
 17. guarded outputs, valid `Detached`: runs locally, requires no historical
@@ -1529,10 +1776,32 @@ counted run, §16.3):
     frozen skip/seed path once oxide#137's interface exists, its seeded bytes
     enter the next member union, and an unfit headroom skips to a cold build in
     the same slot.
+25. control-uncertain victim custody (§5.5.1): a fixture plants a one-use
+    slot whose ledger row is `Idle` while its control record is still active and
+    its **record lock is held** by a live fixture process (a real "a command may
+    be writing" state: `recover_settled` skips it, `settle` would `Keep`). It is
+    reported as a **protected** member. A one-use admission that needs its bytes
+    refuses (no wait: no progress-capable holder), the slot's root and ledger row
+    are byte-identical afterwards, and a normal admission continues with the
+    protected member counted. Releasing the fixture's lock and letting the next
+    command's `recover_settled` settle the record makes the member evictable, and
+    the following one-use admission reclaims it.
+26. failure-stop and victim substitution: at byte pressure the LRU-selected
+    idle one-use victim is made unremovable (an unowned foreign entry planted
+    inside it). The admission **stops** with the shipped ownership error, never
+    substituting the second one-use member and never a normal slot; both are
+    byte-identical afterwards. After the foreign entry is removed, the same
+    admission retried reclaims the oldest member and admits.
+27. retry protection: a one-use admission that refused with `one_use_budget`
+    (protected holder) succeeds when retried after that holder releases, and a
+    one-use admission retried while only normal idle slots exist still refuses
+    and never touches a normal slot.
 
-Every case uses its own private pool and checkout; cleanup stays inside the
-supervisor's owned root, and the image is detached ordinarily with its custody
-record written before each effect. Native failure stops at the first fault; no
+Every case in this list is a **required** case: §16.3 fixes the activation
+order (uncounted diagnostic first) and forbids an `unexecuted` required case in
+a counted run. Every case uses its own private pool and checkout; cleanup stays
+inside the supervisor's owned root, and the image is detached ordinarily with
+its custody record written before each effect. Native failure stops at the first fault; no
 retry is authorized by this text.
 
 ### 16.3 Runner, bounds, complexity and activation
@@ -1553,7 +1822,14 @@ retry is authorized by this text.
     checkout for the positive-control case, `hdiutil attach -owners on` on every
     attach/reattach with a read-only mount observation, one frozen
     `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`, the internal monitored scratch root,
-    and `mktemp` templates under the owned parent;
+    and `mktemp` templates under the owned parent; plus the two **existing**
+    debug controls this proof reuses: `OXIDE_TEST_PAUSE` (debug-only, 120 s
+    self-release, marker path under the owned scratch) and
+    `OXIDE_TEST_WALK_MUTATIONS` (debug-only, requires `OXIDE_PROOF_DEADLINE_NS`,
+    a canonical `OXIDE_TASK_SCRATCH_ROOT` and `OXIDE_PROOF_EVIDENCE` under one
+    owned root, at most 4 specs / 8192 bytes, canonical absolute paths, one
+    `delay_ms` in 1..=65,000) — each armed only inside its own fixture and
+    disarmed afterwards;
   - run a **separately activated, uncounted keep-going diagnostic** of the same
     fixed script before any counted run. The script provides a minimal opt-in
     `--diagnostic` mode that records reached/completed/failed/skipped/aborted/
@@ -1569,9 +1845,9 @@ retry is authorized by this text.
   because a private `directory-budget-v1` pool is a genuine internal pool that
   the product correctly refuses on an external volume; it stays inside one
   monitored 512 MiB owned root.
-- **Fixed bound: 420 s, not the 300 s default.** The image attach/detach cycles
-  and the 128-slot ceiling fixture are the reasons; §16.4 gives the arithmetic
-  and the 380 s work cutoff. This is a declared fixed higher bound under the
+- **Fixed bound: 420 s, not the 300 s default.** The image attach/detach cycles,
+  the 128-slot ceiling fixture and the reserve route's two real 6 s walk delays
+  are the reasons; §16.4 gives the arithmetic and the 380 s work cutoff. This is a declared fixed higher bound under the
   brief's rule, put to the freeze for acceptance before any activation — never a
   silent extension, and 300 s is not claimed to fit.
 - Cumulative author bound **180 min** from actual activation, including
@@ -1595,17 +1871,19 @@ retry is authorized by this text.
 | --- | --- | --- |
 | Stage current feature artifact (offline, 1.97.1) | ~37 s | measured at `rust:installed-handoff` (58.3 MiB peak) |
 | Stage feature-disabled artifact, shared target dependencies | ~37 s | same, with dependency reuse (inference, not a budget guarantee) |
-| 24 tiny fixture cases, including the 128-slot hand-made ceiling pool | ~115 s | ~4–6 s per case, ~10 s for the ceiling pool |
+| 27 tiny fixture cases, including the 128-slot hand-made ceiling pool | ~138 s | ~4–6 s per case, ~10 s for the ceiling pool, ~17 s for the reserve sub-cases (two 6 s walk delays, a filler write/remove, a pause window) and ~6 s for the failure-stop/retry cases |
 | Image: attach (`-owners on`), registration, selected control, ordinary detach | ~18 s | two attach/detach cycles at ~9 s each |
 | Fixture creation, member walks, digests, receipt | ~25 s | bounded metadata work on tiny trees |
 | Cleanup | ~20 s | inside the owned root, with the image custody record |
-| **Total** | **~252 s, upper ~320 s of 420** | arithmetic only; the script's work cutoff is 380 s |
+| **Total** | **~275 s, upper ~345 s of 420** | arithmetic only; the script's work cutoff is 380 s |
 
-Disk, inside the 512 MiB monitored root: one owned 128 MiB APFS sparse image;
-staged targets ≈ 60 MiB shared (the second build reuses dependencies); the
-128-slot ceiling pool with one tiny file per slot plus ≤ 24 medium tiny private
-slots ≈ 50 MiB; fixtures, logs and the bounded receipt ≈ 20 MiB.
-Total ≈ **258 MiB of 512**.
+Disk, inside the 512 MiB monitored root: one owned 128 MiB APFS sparse image,
+whose backing grows by the lowest-free-space filler the reserve sub-case writes
+(≤ 32 MiB, written **outside** the pool payload and removed in cleanup); staged
+targets ≈ 60 MiB shared (the second build reuses dependencies); the 128-slot
+ceiling pool with one tiny file per slot plus ≤ 24 medium tiny private slots
+≈ 50 MiB; fixtures, logs and the bounded receipt ≈ 20 MiB.
+Total ≈ **290 MiB of 512**.
 
 These are estimates; the qualified guard measures actual owned bytes and time
 and the receipt reports them, and neither figure is an acceptance gate. If the
@@ -1642,9 +1920,12 @@ positive-absence policy are unchanged by either papercut.
 3. Does the guarded table (§4.2) now match the brief for every committed shape,
    and is refusing a mixed or real-member committed receipt (rather than
    treating that member as local) the intended reading?
-4. Is the guarded pre-check placed before the barrier, fence, reservation
-   cancellation and every replay at all four mutation sites (§4.1), and is the
-   guarded `clean` refusal text (retained refusal, no adopt advice) acceptable?
+4. Is the race-safe protocol of §4.1/§4.6 sound at all four mutation sites: a
+   fast precheck that never authorises, an in-custody revalidation before the
+   fence, reservation cancellation and every replay, custody mutual exclusion for
+   every writer with a stop condition, and the `Prepared`-before-general
+   diagnostic precedence at adopt? Is the guarded `clean` refusal text (retained
+   refusal, no adopt advice) acceptable?
 5. Is the hierarchical component inspection (§4.3) sufficient for a modelled
    triple and its members, and does it refuse without following an intermediate
    link?
@@ -1660,20 +1941,28 @@ positive-absence policy are unchanged by either papercut.
    lock, and is the stop condition precise enough?
 9. Are `Prefer`/`Only` complete for the count, project-cap, byte, reserve,
    unknown-accounting and retry paths, with no row able to select a normal
-   victim for one-use admission, and is the reserve route's source-level
-   coverage enough given the stated unreachable-in-fixture limit?
+   victim for one-use admission, and are the reserve/retry fixtures of §16.2
+   cases 8, 26 and 27 feasible, safe and non-vacuous as written?
 10. Is N+1 = 6 with a durable one-use fence the right numeric fence, and is the
     installer's `proof_controls` refusal correct for older receipts?
 11. Is the staging inventory (§11.2) complete now that helper-mediated stagers
     are explicit and `stage_at` takes a per-call feature, including the
     suspended `test-oxide-cli.py` gap and every capability assertion?
-12. Is the fixed **420 s** bound with ~252 s typical / ~320 s upper and
-    ~258 MiB credible for the 24 cases including the owned image and the
-    128-slot fixture, or must the freeze revise it (and the case list) before
-    activation?
+12. Is the fixed **420 s** bound with ~275 s typical / ~345 s upper and
+    ~290 MiB credible for the 27 cases including the owned image, the 128-slot
+    fixture and the two 6 s reserve delays, or must the freeze revise it (and
+    the case list) before activation?
 13. Is the seeding dependency handled correctly by making case 24 mandatory and
     offering only a scope split — no unexecuted case in a counted native?
-14. Are the HIGH complexity, premise checklist and separately activated
+14. Is the race-safe guard protocol (§4.1, §4.6) sound: the fast precheck is
+    never authoritative, the in-custody revalidation precedes every effect, the
+    custody mutual exclusion holds for every writer, and the adopt diagnostic
+    precedence puts the exact `Prepared` text first?
+15. Is the `evictable` custody checklist (§5.5.1) complete enough that the
+    library can never delete a ledger-idle slot whose control record has not
+    positively closed, and is "protected, counted, not a wait reason" the right
+    treatment?
+16. Are the HIGH complexity, premise checklist and separately activated
     uncounted diagnostic correctly placed before the first counted native?
 
 ## 19. Limits of this design
@@ -1686,8 +1975,11 @@ positive-absence policy are unchanged by either papercut.
 - The seeding interaction (§8) is a requirement on a frozen but unimplemented
   interface; case 24 is mandatory, so the counted native waits for oxide#137's
   implementation or moves into a scope split.
-- The reserve route's own trigger is not induced by the fixed proof; its class
-  scoping is shared-selector and source evidence only (§12 item 12).
+- The reserve route's sub-cases depend on two **existing** debug controls
+  (`OXIDE_TEST_WALK_MUTATIONS` and `OXIDE_TEST_PAUSE`) staying available and
+  unchanged; if either is removed or narrowed, the reserve/retry cases return to
+  the owner for a scoped ruling rather than being dropped or reported
+  unexecuted.
 - No arbitrary-write containment, no byte-saving claim, no free-space guarantee
   and no claim that a one-use slot's warm build is as fast as a normal one.
 - Platform scope follows the existing proofs: macOS fixtures with the pool's
