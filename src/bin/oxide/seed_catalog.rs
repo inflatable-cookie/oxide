@@ -534,6 +534,7 @@ mod tests {
             tree_digest: "b".repeat(64),
             kind: SeedSourceKind::Registry,
             root: source_root.clone(),
+            verification_root: source_root.clone(),
             proc_macro: false,
         };
         let dir = "build/debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa";

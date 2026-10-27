@@ -12,7 +12,7 @@ use oxide_storage::seed_source::{
 use serde::Deserialize;
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -133,9 +133,10 @@ pub(crate) struct Pass {
 pub(crate) struct GitHint {
     pub package: Package,
     pub checkout: PathBuf,
+    pub package_root: PathBuf,
 }
 
-fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> Option<&'a Path> {
+fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> Option<&'a GitHint> {
     let base = cargo_home.join("git/checkouts");
     let mut found = None;
     for hint in hints.iter().filter(|hint| hint.package == *package) {
@@ -143,10 +144,16 @@ fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> O
         // Hints are required to be canonical: otherwise a link in a checkout
         // path could silently redirect Git outside the selected Cargo home.
         let canonical = std::fs::canonicalize(path).ok()?;
-        if canonical != *path || !canonical.starts_with(&base) || canonical == base {
+        let package_root = std::fs::canonicalize(&hint.package_root).ok()?;
+        if canonical != *path
+            || !canonical.starts_with(&base)
+            || canonical == base
+            || package_root != hint.package_root
+            || !package_root.starts_with(&canonical)
+        {
             return None;
         }
-        if found.replace(path.as_path()).is_some() {
+        if found.replace(hint).is_some() {
             return None;
         }
     }
@@ -163,6 +170,103 @@ impl Pass {
             derived: 0,
             git: GitVerifier::new(),
         }
+    }
+
+    /// Discover candidate Cargo Git packages without following links or
+    /// reading a donor slot. These remain hints until `locked` verifies the
+    /// checkout's commit, content and manifest.
+    pub fn discover_git_hints(
+        &mut self,
+        cargo_home: &Path,
+        packages: &[Package],
+    ) -> Result<Vec<GitHint>, &'static str> {
+        if packages.len() > 2048
+            || std::fs::canonicalize(cargo_home).ok().as_deref() != Some(cargo_home)
+        {
+            return Err("unresolved Cargo home");
+        }
+        if !packages.iter().any(|package| {
+            package
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("git+"))
+        }) {
+            return Ok(Vec::new());
+        }
+        let base = cargo_home.join("git/checkouts");
+        let meta = match std::fs::symlink_metadata(&base) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err("unreadable Git checkouts"),
+        };
+        if !meta.is_dir() || std::fs::canonicalize(&base).ok().as_deref() != Some(base.as_path()) {
+            return Err("unsafe Git checkouts");
+        }
+        let mut checkouts = Vec::new();
+        for repository in self.directories(&base, meta.dev())? {
+            for checkout in self.directories(&repository, meta.dev())? {
+                checkouts.push(checkout);
+                if checkouts.len() > 2048 {
+                    return Err("source cap");
+                }
+            }
+        }
+        let mut hints = Vec::new();
+        for checkout in checkouts {
+            let mut pending = vec![(checkout.clone(), 0usize)];
+            while let Some((directory, depth)) = pending.pop() {
+                if self.limits().is_none() || depth > 64 {
+                    return Err("source cap");
+                }
+                for package in packages.iter().filter(|package| {
+                    package
+                        .source
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("git+"))
+                }) {
+                    if self.limits().is_none() {
+                        return Err("source cap");
+                    }
+                    if manifest_matches(&directory, package).is_some() {
+                        if hints.len() == 2048 {
+                            return Err("source cap");
+                        }
+                        hints.push(GitHint {
+                            package: package.clone(),
+                            checkout: checkout.clone(),
+                            package_root: directory.clone(),
+                        });
+                    }
+                }
+                for child in self.directories(&directory, meta.dev())?.into_iter().rev() {
+                    if child.file_name() != Some(std::ffi::OsStr::new(".git")) {
+                        pending.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+        Ok(hints)
+    }
+
+    fn directories(&mut self, parent: &Path, device: u64) -> Result<Vec<PathBuf>, &'static str> {
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(parent).map_err(|_| "unreadable Git checkouts")? {
+            if self.limits().is_none() {
+                return Err("source cap");
+            }
+            self.entries = self.entries.checked_add(1).ok_or("source cap")?;
+            if self.entries > SourceLimits::default().max_entries {
+                return Err("source cap");
+            }
+            let entry = entry.map_err(|_| "unreadable Git checkouts")?;
+            let meta =
+                std::fs::symlink_metadata(entry.path()).map_err(|_| "unreadable Git checkouts")?;
+            if meta.is_dir() && meta.dev() == device && meta.uid() == unsafe { libc::geteuid() } {
+                result.push(entry.path());
+            }
+        }
+        result.sort();
+        Ok(result)
     }
 
     /// Verify eligible locked sources in lock order under one shared pass
@@ -190,7 +294,7 @@ impl Pass {
             let source = match package.source.as_deref() {
                 Some(source) if source.starts_with("git+") => {
                     match git_hint(cargo_home, package, git_hints) {
-                        Some(root) => self.git(root, package)?,
+                        Some(hint) => self.git(&hint.checkout, &hint.package_root, package)?,
                         None => None,
                     }
                 }
@@ -295,13 +399,15 @@ impl Pass {
             tree_digest: verified.digest.to_hex(),
             kind: SeedSourceKind::Registry,
             root: source.tree().to_path_buf(),
+            verification_root: source.tree().to_path_buf(),
             proc_macro,
         })
     }
 
     pub fn git(
         &mut self,
-        root: &Path,
+        checkout: &Path,
+        package_root: &Path,
         package: &Package,
     ) -> Result<Option<VerifiedSource>, &'static str> {
         let Some(source) = package
@@ -317,7 +423,7 @@ impl Pass {
         let Some(limits) = self.limits() else {
             return Ok(None);
         };
-        let verified = match self.git.verify(root, revision, &limits) {
+        let verified = match self.git.verify(checkout, revision, &limits) {
             Ok(verified) => verified,
             Err(GitRefusal::Unconfirmed) => return Err("git source verification closure unknown"),
             Err(_) => return Ok(None),
@@ -330,14 +436,15 @@ impl Pass {
             .content
             .checked_add(verified.content_bytes)
             .ok_or("source cap")?;
-        let Some(proc_macro) = manifest_matches(root, package) else {
+        let Some(proc_macro) = manifest_matches(package_root, package) else {
             return Ok(None);
         };
         Ok(Some(VerifiedSource {
             package: package.clone(),
             tree_digest: verified.digest.to_hex(),
             kind: SeedSourceKind::Git,
-            root: PathBuf::from(root),
+            root: package_root.to_path_buf(),
+            verification_root: checkout.to_path_buf(),
             proc_macro,
         }))
     }
@@ -379,15 +486,17 @@ mod tests {
         let hint = || GitHint {
             package: package.clone(),
             checkout: root.clone(),
+            package_root: root.clone(),
         };
         assert_eq!(
-            git_hint(&fixture.0, &package, &[hint()]),
-            Some(root.as_path())
+            git_hint(&fixture.0, &package, &[hint()]).map(|value| value.checkout.clone()),
+            Some(root.clone())
         );
         assert!(git_hint(&fixture.0, &package, &[hint(), hint()]).is_none());
         let outside = GitHint {
             package: package.clone(),
             checkout: fixture.0.clone(),
+            package_root: fixture.0.clone(),
         };
         assert!(git_hint(&fixture.0, &package, &[outside]).is_none());
         let alias = fixture.0.join("git/checkouts/alias");
@@ -395,7 +504,31 @@ mod tests {
         let linked = GitHint {
             package: package.clone(),
             checkout: alias,
+            package_root: root.clone(),
         };
         assert!(git_hint(&fixture.0, &package, &[linked]).is_none());
+    }
+
+    #[test]
+    fn discovery_finds_nested_packages_and_ignores_symlinked_checkouts() {
+        let fixture = Fixture::new();
+        let package = crate::seed_lock::eligible(
+            format!("version = 4\n[[package]]\nname = 'sample'\nversion = '1'\nsource = 'git+https://example.invalid/r#{}'\n", "a".repeat(40)).as_bytes(),
+        ).unwrap().remove(0);
+        let checkout = fixture.0.join("git/checkouts/repo/revision");
+        let root = checkout.join("member");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='sample'\nversion='1'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&checkout, fixture.0.join("git/checkouts/repo/alias")).unwrap();
+        let mut pass = Pass::new(Duration::from_secs(4));
+        let hints = pass.discover_git_hints(&fixture.0, &[package]).unwrap();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].checkout, checkout);
+        assert_eq!(hints[0].package_root, root);
     }
 }

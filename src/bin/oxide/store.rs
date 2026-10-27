@@ -1514,19 +1514,30 @@ impl Store {
         producer: &oxide_storage::lease::managed::SeedProducer,
         lock: &crate::seed_lock::Analysis,
         cargo_home: &Path,
-        git_hints: &[crate::seed_sources::GitHint],
         cache: &mut oxide_storage::seed_source::SourceCache,
     ) -> Result<SeedRun, String> {
-        self.seed(held, producer, lock, |_candidates| {
+        self.seed(held, producer, lock, |candidates| {
             let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(3));
-            pass.locked(
-                cargo_home,
-                &lock.eligible,
-                git_hints,
-                cache,
-                process::now_ms(),
-            )
-            .map_err(str::to_owned)
+            let offered: Vec<_> = lock
+                .eligible
+                .iter()
+                .filter(|entry| {
+                    candidates.iter().any(|candidate| {
+                        candidate.catalog.packages.iter().any(|package| {
+                            package.name == entry.name
+                                && package.version == entry.version
+                                && Some(package.source.as_str()) == entry.source.as_deref()
+                                && package.checksum == entry.checksum
+                        })
+                    })
+                })
+                .cloned()
+                .collect();
+            let git_hints = pass
+                .discover_git_hints(cargo_home, &offered)
+                .unwrap_or_default();
+            pass.locked(cargo_home, &offered, &git_hints, cache, process::now_ms())
+                .map_err(str::to_owned)
         })
     }
 
@@ -1593,12 +1604,13 @@ impl Store {
                 post.package == source.package
                     && post.kind == source.kind
                     && post.root == source.root
+                    && post.verification_root == source.verification_root
                     && post.tree_digest == source.tree_digest
                     && post.proc_macro == source.proc_macro
             }) else {
                 continue;
             };
-            if !pass.unchanged_since(&post.root, post.kind, started) {
+            if !pass.unchanged_since(&post.verification_root, post.kind, started) {
                 continue;
             }
             let Some(units) = classifier.units(profile, post) else {
@@ -1690,6 +1702,9 @@ impl Store {
             .ok_or("the recipient record is no longer held")?;
         let candidates = seed_candidates(&self.pool, &recipient, 8)
             .map_err(|error| lease_error("cannot inspect seed candidates", &error))?;
+        if candidates.candidates.is_empty() {
+            return Ok(SeedRun::Skipped("no eligible donor"));
+        }
         let sources = verify_sources(&candidates.candidates)?;
         let Some(request) = crate::seed_plan::select(
             &recipient,

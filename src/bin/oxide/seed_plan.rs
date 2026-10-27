@@ -20,6 +20,9 @@ pub(crate) struct VerifiedSource {
     pub tree_digest: String,
     pub kind: SeedSourceKind,
     pub root: std::path::PathBuf,
+    /// Root whose complete content was verified. For a Git workspace this
+    /// can contain the package root as a subdirectory.
+    pub verification_root: std::path::PathBuf,
     pub proc_macro: bool,
 }
 
@@ -267,6 +270,7 @@ mod tests {
             tree_digest: "tree".into(),
             kind: SeedSourceKind::Registry,
             root: "/fixture".into(),
+            verification_root: "/fixture".into(),
             proc_macro: false,
         };
         let recipient = SeedRecipient {
