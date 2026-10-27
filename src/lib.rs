@@ -12,6 +12,15 @@ pub mod inventory;
 #[cfg(unix)]
 pub mod lease;
 
+/// Descriptor-relative deletion of a verified owned tree, with the fixed
+/// Finder-metadata race bound (oxide#155).
+#[cfg(unix)]
+pub mod owned_delete;
+
+/// Debug-only guard for product proof hooks (oxide#155).
+#[cfg(debug_assertions)]
+pub mod proof;
+
 /// Bounded decoder for Cargo's encoded dep-info, kept as input for the
 /// cross-checkout freshness gate.
 pub mod dep_info;

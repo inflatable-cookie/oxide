@@ -22,6 +22,12 @@ use crate::process;
 use crate::removable;
 use crate::store::{self, CheckoutCustody, Store};
 use oxide_storage::inventory::{self, InventoryLimits};
+use oxide_storage::owned_delete::{
+    capture_entry, clear_errno, descriptor_identity, enumeration_error, observe_entry,
+    only_finder_metadata, open_directory_at, put_back, rmdir_draining_finder_metadata,
+    unlink_captured, verify_captured, Capture, CaptureContext, DrainStop, EntryFacts, Rmdir,
+    FINDER_RACE_ATTEMPTS, FINDER_RACE_PAUSE,
+};
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2705,17 +2711,13 @@ fn injected_eacces(_directory: &Path) -> bool {
 /// /private/tmp, evidence nested in it or its `evidence/` sibling).
 #[cfg(debug_assertions)]
 fn proof_evidence() -> Option<PathBuf> {
-    std::env::var("OXIDE_PROOF_DEADLINE_NS")
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
+    // The shared guard (`oxide_storage::proof`) requires the supervisor's
+    // deadline, canonical owned scratch and nested-or-sibling evidence; the
+    // prune hooks additionally stay on the internal volume, which is where
+    // their own proofs run.
+    let evidence = oxide_storage::proof::evidence()?;
     let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
-    let evidence = fs::canonicalize(std::env::var_os("OXIDE_PROOF_EVIDENCE")?).ok()?;
-    let nested = evidence.starts_with(&scratch);
-    let sibling = scratch.file_name() == Some(std::ffi::OsStr::new("scratch"))
-        && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
-        && scratch.parent() == evidence.parent();
-    if !scratch.starts_with("/private/tmp") || !(nested || sibling) {
+    if !scratch.starts_with("/private/tmp") {
         return None;
     }
     Some(evidence)
@@ -2730,8 +2732,30 @@ fn proof_evidence() -> Option<PathBuf> {
 ///   once at least n quarantined entries were actually deleted.
 /// It fires once, records itself in the evidence directory and changes no
 /// production reserve policy.
+/// Decide whether one check reads a low reserve. One mode at a time; an absent,
+/// malformed or combined set disarms every mode. The modes are the n-th check,
+/// the first check after n deletions of any kind, and the first check after n
+/// **recovered Finder metadata** entries — the last keys on the bounded seam's
+/// own work, never on the pass's total.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn low_reserve_decision(
+    check: u64,
+    deleted: u64,
+    recovered: u64,
+    at: Option<u64>,
+    after_entries: Option<u64>,
+    after_recovered: Option<u64>,
+) -> Option<&'static str> {
+    match (at, after_entries, after_recovered) {
+        (Some(at), None, None) if check == at => Some("check"),
+        (None, Some(after), None) if deleted >= after => Some("entries"),
+        (None, None, Some(after)) if recovered >= after => Some("recovered"),
+        _ => None,
+    }
+}
+
 #[cfg(debug_assertions)]
-fn injected_low_reserve(deleted: u64) -> bool {
+fn injected_low_reserve(deleted: u64, recovered: u64) -> bool {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     static CHECKS: AtomicU64 = AtomicU64::new(0);
     static FIRED: AtomicBool = AtomicBool::new(false);
@@ -2741,15 +2765,17 @@ fn injected_low_reserve(deleted: u64) -> bool {
             .map(|value| value.parse::<u64>().ok().filter(|n| *n > 0))
     };
     let count = CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
-    let (mode, fire) = match (
-        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AT"),
-        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES"),
-    ) {
-        (Some(Some(at)), None) => ("check", count == at),
-        (None, Some(Some(after))) => ("entries", deleted >= after),
-        _ => return false,
+    let Some(mode) = low_reserve_decision(
+        count,
+        deleted,
+        recovered,
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AT").flatten(),
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES").flatten(),
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_RECOVERED").flatten(),
+    ) else {
+        return false;
     };
-    if !fire || FIRED.load(Ordering::Relaxed) {
+    if FIRED.load(Ordering::Relaxed) {
         return false;
     }
     let Some(evidence) = proof_evidence() else {
@@ -2761,12 +2787,17 @@ fn injected_low_reserve(deleted: u64) -> bool {
         .append(true)
         .mode(0o600)
         .open(evidence.join("prune-low-reserve-fired"))
-        .and_then(|mut file| writeln!(file, "{mode}: check {count}, {deleted} entries deleted"));
+        .and_then(|mut file| {
+            writeln!(
+                file,
+                "{mode}: check {count}, {deleted} entries deleted, {recovered} recovered"
+            )
+        });
     true
 }
 
 #[cfg(not(debug_assertions))]
-fn injected_low_reserve(_deleted: u64) -> bool {
+fn injected_low_reserve(_deleted: u64, _recovered: u64) -> bool {
     false
 }
 
@@ -3184,7 +3215,7 @@ impl RootSession {
     /// The prune worker's own monitoring: the registered volume's identity
     /// and reserve, and the host reserve of the internal control volume
     /// (where every journal write lands). Unknown readings stop.
-    fn check(&self, control: &Path, deleted: u64) -> Result<(), Stop> {
+    fn check(&self, control: &Path, deleted: u64, recovered: u64) -> Result<(), Stop> {
         let host = oxide_storage::volume::observe_path(control).map_err(|error| {
             Stop::Pending(format!(
                 "the internal control volume cannot be read ({error}); no further writes"
@@ -3210,7 +3241,7 @@ impl RootSession {
             ))
         })?;
         // Unknown free space is not above the reserve: stop.
-        let available = if injected_low_reserve(deleted) {
+        let available = if injected_low_reserve(deleted, recovered) {
             Some(0)
         } else {
             facts.available_bytes
@@ -3285,20 +3316,65 @@ impl RootSession {
         Ok(target)
     }
 
-    /// Remove the empty quarantine leaf itself.
-    fn remove_quarantine(&self, quarantine: &str) -> Result<(), String> {
+    /// Remove the quarantine leaf itself. Finder metadata recreated in it after
+    /// the delete pass is drained under the shared fixed bound (oxide#155);
+    /// anything else and an exhausted bound keep the intent pending. A leaf
+    /// that is simply missing is NOT positive deletion proof for a journaled
+    /// intent, so it stays pending here.
+    fn remove_quarantine(
+        &self,
+        quarantine: &str,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         let name =
             std::ffi::CString::new(quarantine.as_bytes()).map_err(|error| error.to_string())?;
-        // SAFETY: the descriptor and C string are live for the call.
-        let status =
-            unsafe { libc::unlinkat(self.outputs.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
-        if status != 0 {
-            return Err(format!(
-                "cannot remove the quarantine leaf ({})",
-                std::io::Error::last_os_error()
-            ));
+        for attempt in 1..=FINDER_RACE_ATTEMPTS {
+            if attempt > 1 {
+                std::thread::sleep(FINDER_RACE_PAUSE);
+            }
+            // Immediately before the leaf's own removal: the volume, reserve
+            // and host control volume are checked again.
+            check()?;
+            // The leaf drain recovers metadata too, so it runs the same caller
+            // check after every unlink it performs, not a no-op.
+            let mut between = || check().map_err(DrainStop::Stopped);
+            let mut context = CaptureContext {
+                chain: Vec::new(),
+                journal: None,
+            };
+            let outcome = rmdir_draining_finder_metadata(
+                self.outputs.as_fd(),
+                &name,
+                self.root.as_fd(),
+                std::ffi::OsStr::new(quarantine),
+                &mut context,
+                &mut between,
+            );
+            match &outcome {
+                Rmdir::Removed => return sync_fd(&self.outputs),
+                Rmdir::Drained { .. } => continue,
+                Rmdir::Vanished => {
+                    return Err(
+                        "the quarantine leaf is missing without positive deletion proof; the intent stays pending"
+                            .to_owned(),
+                    )
+                }
+                Rmdir::Replaced { .. }
+                | Rmdir::Refused { .. }
+                | Rmdir::RefusedMany { .. }
+                | Rmdir::Exhausted { .. }
+                | Rmdir::Stopped { .. }
+                | Rmdir::Mismatch { .. }
+                | Rmdir::CaptureFailed { .. }
+                | Rmdir::Unproven { .. }
+                | Rmdir::Failed { .. } => {
+                    return Err(race_pending("the quarantine leaf", &outcome))
+                }
+            }
         }
-        sync_fd(&self.outputs)
+        Err(format!(
+            "the quarantine leaf is still not empty after {FINDER_RACE_ATTEMPTS} Finder-metadata attempts; it is kept"
+        ))
     }
 }
 
@@ -3376,20 +3452,65 @@ fn sync_fd(fd: &OwnedFd) -> Result<(), String> {
     Ok(())
 }
 
+/// Where one bounded delete pass reads its volume identity and reserves.
+///
+/// The real caller answers through the registered removable volume; the
+/// test-only branch lets a unit test drive this same traversal — observe,
+/// capture, verify, descend, remove — against a plain fixture directory, so
+/// the production path is what the replacement tests exercise.
+enum DeleteControl<'a> {
+    /// The registered removable volume and the internal control volume.
+    Session(&'a RootSession),
+    /// A plain test fixture directory on this host, with no registered drive.
+    #[cfg(test)]
+    Fixture { device: u64 },
+}
+
 /// One bounded delete pass over a verified quarantine directory.
 struct Deleter<'a> {
-    session: &'a RootSession,
+    volume: DeleteControl<'a>,
     control: &'a Path,
     deadline: Instant,
     entries: u64,
+    /// Finder metadata entries this pass recovered through the bounded seam,
+    /// counted separately from `entries` so a proof trigger can key on the
+    /// recovered work itself rather than on every deletion the pass made.
+    recovered: u64,
     /// The last volume and reserve check: rechecked every `DELETE_BATCH`
     /// entries and at least at the existing watchdog cadence.
     checked: Instant,
 }
 
 impl Deleter<'_> {
+    /// The device every entry this pass removes must live on: the registered
+    /// volume's own device.
+    fn device(&self) -> u64 {
+        match self.volume {
+            DeleteControl::Session(session) => session.dev,
+            #[cfg(test)]
+            DeleteControl::Fixture { device } => device,
+        }
+    }
+
     fn check(&mut self) -> Result<(), Stop> {
-        self.session.check(self.control, self.entries)?;
+        let (deleted, recovered) = (self.entries, self.recovered);
+        let _ = (deleted, recovered);
+        // One bounded check: the delete pass's own deadline first, then the
+        // registered volume and both reserves. Every caller of `check` — the
+        // per-unlink drain check, the quarantine leaf's recheck and the
+        // terminal recheck — therefore tests the deadline too.
+        if Instant::now() > self.deadline {
+            return Err(Stop::Pending(
+                "the delete batch exceeded its time window; the quarantine is kept".to_owned(),
+            ));
+        }
+        match self.volume {
+            DeleteControl::Session(session) => session.check(self.control, deleted, recovered)?,
+            // A fixture has no registered volume or reserve to prove; its
+            // deadline was still tested above.
+            #[cfg(test)]
+            DeleteControl::Fixture { .. } => {}
+        }
         self.checked = Instant::now();
         Ok(())
     }
@@ -3401,10 +3522,512 @@ impl Deleter<'_> {
         }
         Ok(())
     }
+
+    /// A pass over a plain fixture directory: no registered volume to prove,
+    /// but the same traversal, same-device rule and deadline. This is how the
+    /// replacement tests drive the production path without a removable drive.
+    #[cfg(test)]
+    fn fixture<'a>(root: &'a Path) -> Deleter<'a> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(root).expect("fixture root must be readable");
+        Self::fixture_on(root, metadata.dev())
+    }
+
+    /// A fixture pass whose volume reading is the given device, so a test can
+    /// drive the same-device refusal without a second mounted filesystem.
+    #[cfg(test)]
+    fn fixture_on(root: &Path, device: u64) -> Deleter<'_> {
+        Deleter {
+            volume: DeleteControl::Fixture { device },
+            control: root,
+            deadline: Instant::now() + Duration::from_secs(30),
+            entries: 0,
+            recovered: 0,
+            checked: Instant::now(),
+        }
+    }
+}
+
+/// Remove one quarantined directory through the held descriptors. A
+/// list-then-rmdir race with Finder metadata is drained by the shared seam
+/// under its fixed bound (oxide#155); every other new entry, and an exhausted
+/// bound, keeps the intent pending.
+fn remove_quarantined_directory(
+    deleter: &mut Deleter,
+    parent: BorrowedFd,
+    name_c: &std::ffi::CString,
+    name: &str,
+    child: BorrowedFd,
+) -> Result<(), Stop> {
+    let mut drained = 0_u64;
+    for attempt in 1..=FINDER_RACE_ATTEMPTS {
+        if attempt > 1 {
+            std::thread::sleep(FINDER_RACE_PAUSE);
+        }
+        // The caller's bounded check runs after *every* recovered metadata
+        // unlink, not once per batch: a reserve, volume or deadline failure
+        // stops the drain at that entry and keeps the intent pending.
+        let mut between = || {
+            // This entry was unlinked *before* the check that follows it, so both
+            // counts advance one recovered unlink at a time: `entries` for every
+            // deletion this pass made and `recovered` for the Finder metadata the
+            // bounded seam itself removed.
+            deleter.entries += 1;
+            deleter.recovered += 1;
+            deleter
+                .check()
+                .map_err(|stop| DrainStop::Stopped(stop_text(stop)))
+        };
+        let mut context = CaptureContext {
+            chain: Vec::new(),
+            journal: None,
+        };
+        let outcome = rmdir_draining_finder_metadata(
+            parent,
+            name_c,
+            child,
+            std::ffi::OsStr::new(name),
+            &mut context,
+            &mut between,
+        );
+        match &outcome {
+            Rmdir::Removed => return Ok(()),
+            Rmdir::Drained { entries } => {
+                // Each recovered entry was already counted and checked by the
+                // between-unlinks callback; only this pass's tally remains.
+                drained += entries;
+            }
+            // A mid-drain stop already ran the caller's check and carries its
+            // reason: the intent stays pending, nothing is cleared.
+            Rmdir::Stopped { reason } => return Err(Stop::Pending(reason.clone())),
+            // A nested directory that vanished under us is finished work
+            // inside this bounded pass; unlike the quarantine leaf, its
+            // absence never proves the intent's deletion.
+            Rmdir::Vanished => return Ok(()),
+            Rmdir::Replaced { .. }
+            | Rmdir::Refused { .. }
+            | Rmdir::RefusedMany { .. }
+            | Rmdir::Exhausted { .. }
+            | Rmdir::Mismatch { .. }
+            | Rmdir::CaptureFailed { .. }
+            | Rmdir::Unproven { .. }
+            | Rmdir::Failed { .. } => {
+                return Err(Stop::Pending(race_pending(
+                    "a quarantined directory",
+                    &outcome,
+                )))
+            }
+        }
+    }
+    Err(Stop::Pending(format!(
+        "a quarantined directory is still not empty after {FINDER_RACE_ATTEMPTS} Finder-metadata attempts ({drained} Finder-managed entries removed); it is kept"
+    )))
+}
+
+/// The pending reason for a Finder-metadata race outcome that did not remove
+/// the directory. Every terminal race outcome keeps the intent pending: an
+/// unfinished deletion never becomes a success, an intent phase is never
+/// rewritten or cleared to recover it, and a name that is no longer the
+/// verified directory is never treated as that directory's removal.
+fn race_pending(what: &str, outcome: &Rmdir) -> String {
+    match outcome {
+        // The name is already escaped by the seam.
+        Rmdir::Refused { entry } => format!(
+            "{what} holds an entry that is not tolerated Finder metadata ({entry}); deletion stops and the intent stays pending"
+        ),
+        Rmdir::Replaced { entry } => format!(
+            "{what} is no longer the verified directory ({entry}); nothing was removed and the intent stays pending"
+        ),
+        Rmdir::RefusedMany { .. } | Rmdir::Exhausted { .. } => format!(
+            "{what} gained more content than {FINDER_RACE_ATTEMPTS} Finder-metadata attempts may recover; it is kept"
+        ),
+        // The caller's own bounded check stopped the drain and already gave the
+        // reason; that reason is the pending text.
+        Rmdir::Stopped { reason } => reason.clone(),
+        // A captured object that is not the observed one is never removed; both
+        // names are reported so the pending intent names exactly what is left.
+        Rmdir::Mismatch {
+            original,
+            private,
+            restored,
+            kind,
+        } => format!(
+            "{what} captured {private} for {original}, but {kind}; {}; nothing was deleted",
+            if *restored {
+                "it was put back under its original name"
+            } else {
+                "the original name was taken, so both names are kept"
+            }
+        ),
+        Rmdir::CaptureFailed { error } => {
+            format!("{what} could not capture an entry ({error}); it is kept")
+        }
+        Rmdir::Unproven { reason } => format!("{what} could not durably prove a capture's removal ({reason}); it is kept"),
+        Rmdir::Failed { error } => format!("cannot remove {what} ({error}); it is kept"),
+        // Completed or retryable outcomes are handled by every caller before
+        // this function; reaching them here is still a pending intent, never
+        // a success.
+        Rmdir::Removed | Rmdir::Drained { .. } | Rmdir::Vanished => format!(
+            "{what} was not positively removed by this step; the intent stays pending"
+        ),
+    }
+}
+
+/// Deterministic replacement injection at the traversal's own effect
+/// boundaries (oxide#155). Absent from every non-test build: a unit test arms
+/// one action that swaps the entry the traversal just observed, so the
+/// production capture-and-verify path is driven at exactly that boundary
+/// instead of racing on timing.
+#[cfg(test)]
+mod test_replace_arm {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Phase {
+        /// After the entry was observed and before it is captured.
+        Observed,
+        /// After a captured directory verified and before this pass descends
+        /// into it.
+        Descending,
+        /// After a captured directory's own content was deleted and before the
+        /// directory itself is removed: the Finder-metadata window.
+        BeforeRmdir,
+    }
+
+    struct Armed {
+        phase: Phase,
+        label: String,
+        action: Box<dyn FnOnce()>,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    /// One armed replacement for one entry label at one phase.
+    #[must_use = "dropping the guard ends the armed replacement"]
+    pub(super) struct Guard {
+        _private: (),
+    }
+
+    pub(super) fn arm(phase: Phase, label: &str, action: impl FnOnce() + 'static) -> Guard {
+        ARMED.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            assert!(cell.is_none(), "overlapping replacement injections");
+            *cell = Some(Armed {
+                phase,
+                label: label.to_owned(),
+                action: Box::new(action),
+            });
+        });
+        Guard { _private: () }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|cell| {
+                let _ = cell.borrow_mut().take();
+            });
+        }
+    }
+
+    /// Run the armed action, if it is for this phase and label.
+    pub(super) fn fire(phase: Phase, label: &str) {
+        let action = ARMED.with(|cell| {
+            let matched = {
+                let armed = cell.borrow();
+                armed
+                    .as_ref()
+                    .is_some_and(|armed| armed.phase == phase && armed.label == label)
+            };
+            if !matched {
+                return None;
+            }
+            cell.borrow_mut().take().map(|armed| armed.action)
+        });
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
+
+/// Deterministic directory-enumeration failure for the deletion pass
+/// (oxide#155). Absent from every non-test build: APFS cannot fail a listing on
+/// demand, so a unit test injects the failure once the pass has already
+/// collected a bounded number of names and asserts that no partial list is ever
+/// acted on.
+#[cfg(test)]
+mod test_enumeration_fault {
+    use std::cell::RefCell;
+
+    struct Armed {
+        after: u64,
+        error: std::io::Error,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    /// One armed enumeration failure, ending on drop.
+    #[must_use = "dropping the guard ends the armed enumeration failure"]
+    pub(super) struct Guard {
+        _private: (),
+    }
+
+    pub(super) fn arm(after: u64, code: i32) -> Guard {
+        ARMED.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            assert!(cell.is_none(), "overlapping enumeration faults");
+            *cell = Some(Armed {
+                after,
+                error: std::io::Error::from_raw_os_error(code),
+            });
+        });
+        Guard { _private: () }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|cell| {
+                let _ = cell.borrow_mut().take();
+            });
+        }
+    }
+
+    /// The armed failure, once `listed` names have been collected.
+    pub(super) fn fire(listed: u64) -> Option<std::io::Error> {
+        ARMED.with(|cell| {
+            let armed = cell.borrow_mut().take()?;
+            if listed < armed.after {
+                *cell.borrow_mut() = Some(armed);
+                return None;
+            }
+            Some(armed.error)
+        })
+    }
 }
 
 fn delete_contents(deleter: &mut Deleter, dir: BorrowedFd, top: bool) -> Result<(), Stop> {
     delete_contents_at(deleter, dir, top, 0)
+}
+
+/// Remove one observed entry of a quarantined directory through the shared
+/// capture-and-verify mechanism (oxide#155).
+///
+/// The traversal never acts on a listed name. It observes the entry with a
+/// no-follow `fstatat`, captures it with one exclusive same-directory rename to
+/// an unguessable private name, and verifies the **captured** object against
+/// that observation before any effect. A directory is descended and removed
+/// only through the verified capture and its verified descriptor; anything else
+/// is unlinked by the private name. A capture that does not verify is put back
+/// under its original name (the private name is kept when a racer took the
+/// original name, and nothing is renamed when the private name no longer holds
+/// the capture) and stops the caller pending, so a replacement is never
+/// removed, recursed into or followed.
+///
+/// Returns whether this pass removed the entry: one that had already vanished
+/// before its observation or its own capture is not this pass's success.
+fn remove_observed_entry(
+    deleter: &mut Deleter,
+    dir: BorrowedFd,
+    name: &str,
+    depth: usize,
+) -> Result<bool, Stop> {
+    let name_c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| Stop::Refuse("a quarantined name contains a NUL".to_owned()))?;
+    // 1. Observe the entry, never following a link.
+    let observed = match observe_entry(dir, &name_c) {
+        Ok(facts) => facts,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(Stop::Refuse(format!(
+                "cannot inspect a quarantined entry: {error}"
+            )))
+        }
+    };
+    if observed.device != deleter.device() {
+        return Err(Stop::Pending(
+            "a quarantined entry is on another device; no further delete".to_owned(),
+        ));
+    }
+    // A symbolic link inside the quarantine is never followed, captured or
+    // removed: the delete stops and the intent stays pending (exit 3).
+    if observed.is_symlink() {
+        return Err(Stop::Pending(format!(
+            "the quarantine holds a symbolic link ({name}); deletion stops and the intent stays pending"
+        )));
+    }
+    #[cfg(test)]
+    test_replace_arm::fire(test_replace_arm::Phase::Observed, name);
+    // 2. Capture it. From here on only a private name this process just
+    //    created can name the object, so nothing a racer does to the original
+    //    name can redirect the effect below.
+    let capture = match capture_entry(dir, &name_c) {
+        Ok(capture) => capture,
+        // The entry vanished between the listing and its own capture: nothing
+        // was renamed and nothing is this pass's work.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(Stop::Pending(format!(
+                "cannot capture a quarantined entry ({error}); it is kept"
+            )))
+        }
+    };
+    // 3. Verify the *captured* object against the observation, never the name
+    //    a racer could still be holding.
+    let verified = match verify_captured(dir, &capture, &observed) {
+        Ok(facts) => facts,
+        Err(reason) => {
+            // The capture is a different object from the one observed: the
+            // observed entry was replaced. Nothing was verified, so nothing is
+            // removed; the capture goes back if its private name still holds
+            // it, and the intent stops pending either way.
+            let restore = restore_capture(dir, &capture, None);
+            return Err(Stop::Pending(format!(
+                "the quarantined entry captured under {} is not the observed {name} ({reason}); {}; nothing was deleted",
+                lossy_name(&capture.private),
+                restore.note()
+            )));
+        }
+    };
+    // 4. Remove only the verified capture.
+    if verified.is_directory() {
+        // Descend through a descriptor opened at the private name, never
+        // through the original name, and require it to be the verified object.
+        let child = match open_directory_at(dir, &capture.private) {
+            Ok(child) => child,
+            Err(error) => {
+                return Err(capture_kept(
+                    dir,
+                    &capture,
+                    &verified,
+                    name,
+                    &format!("cannot open its captured directory ({error})"),
+                ))
+            }
+        };
+        match descriptor_identity(child.as_fd()) {
+            Ok(identity) if identity == (verified.device, verified.inode) => {}
+            Ok(_) | Err(_) => {
+                return Err(capture_kept(
+                    dir,
+                    &capture,
+                    &verified,
+                    name,
+                    "its captured directory is not the verified object",
+                ))
+            }
+        }
+        #[cfg(test)]
+        test_replace_arm::fire(test_replace_arm::Phase::Descending, name);
+        if let Err(stop) = delete_contents_at(deleter, child.as_fd(), false, depth + 1) {
+            return Err(capture_kept(
+                dir,
+                &capture,
+                &verified,
+                name,
+                &format!(
+                    "its content was not removed ({}); it is kept",
+                    stop_text(stop)
+                ),
+            ));
+        }
+        #[cfg(test)]
+        test_replace_arm::fire(test_replace_arm::Phase::BeforeRmdir, name);
+        // Metadata recreated inside while this pass descended is drained under
+        // the shared fixed bound; the private name is the one removed.
+        if let Err(stop) =
+            remove_quarantined_directory(deleter, dir, &capture.private, name, child.as_fd())
+        {
+            return Err(capture_kept(
+                dir,
+                &capture,
+                &verified,
+                name,
+                &format!("it was not removed ({})", stop_text(stop)),
+            ));
+        }
+    } else if let Err(error) = unlink_captured(dir, &capture) {
+        // Only the private name this process created is removed, and a name
+        // that vanished before its removal is never this pass's success.
+        return Err(capture_kept(
+            dir,
+            &capture,
+            &verified,
+            name,
+            &format!("cannot remove its captured entry ({error})"),
+        ));
+    }
+    Ok(true)
+}
+
+/// The display form of a private capture name, for a pending reason.
+fn lossy_name(name: &std::ffi::CStr) -> String {
+    String::from_utf8_lossy(name.to_bytes()).into_owned()
+}
+
+/// A pending reason for a capture that stopped before its removal: the object
+/// is put back while the private name still holds exactly it, and a racer that
+/// took the original name leaves both names in place.
+fn capture_kept(
+    dir: BorrowedFd,
+    capture: &Capture,
+    verified: &EntryFacts,
+    name: &str,
+    reason: &str,
+) -> Stop {
+    let restore = restore_capture(dir, capture, Some(verified));
+    Stop::Pending(format!(
+        "the quarantined entry {name}: {reason}; {}; the intent stays pending",
+        restore.note()
+    ))
+}
+
+/// What became of a capture this pass did not remove.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Restore {
+    /// Back under its original name.
+    Restored,
+    /// The original name is taken again, so both names are kept.
+    NameTaken,
+    /// The private name no longer holds the captured object, so nothing was
+    /// renamed and nothing was deleted.
+    CaptureGone,
+}
+
+impl Restore {
+    fn note(self) -> &'static str {
+        match self {
+            Restore::Restored => "it was put back under its original name",
+            Restore::NameTaken => "the original name was taken again, so both names are kept",
+            Restore::CaptureGone => {
+                "the private capture name no longer held the captured object, so nothing was renamed"
+            }
+        }
+    }
+}
+
+/// Put a capture back under its original name, but only while the private name
+/// still holds the object this pass means to keep.
+///
+/// `verified` is the object the capture verified as; `None` is used for a
+/// capture that failed verification, where only the private name still holding
+/// *some* object is required. Every other case leaves both names alone rather
+/// than renaming a replacement into the original name.
+fn restore_capture(dir: BorrowedFd, capture: &Capture, verified: Option<&EntryFacts>) -> Restore {
+    match verified {
+        Some(verified) if verify_captured(dir, capture, verified).is_err() => {
+            return Restore::CaptureGone
+        }
+        Some(_) => {}
+        None if observe_entry(dir, &capture.private).is_err() => return Restore::CaptureGone,
+        None => {}
+    }
+    match put_back(dir, capture) {
+        Ok(()) => Restore::Restored,
+        Err(_) => Restore::NameTaken,
+    }
 }
 
 fn delete_contents_at(
@@ -3433,84 +4056,21 @@ fn delete_contents_at(
                 "the delete batch exceeded its time window; the quarantine is kept".to_owned(),
             ));
         }
-        let name_c = std::ffi::CString::new(name.as_bytes())
-            .map_err(|_| Stop::Refuse("a quarantined name contains a NUL".to_owned()))?;
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: the descriptor and C string are live for the call.
-        let status = unsafe {
-            libc::fstatat(
-                dir.as_raw_fd(),
-                name_c.as_ptr(),
-                &mut stat,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if status != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                continue;
-            }
-            return Err(Stop::Refuse(format!(
-                "cannot inspect a quarantined entry: {error}"
-            )));
-        }
-        let dev = u64::try_from(stat.st_dev).unwrap_or(u64::MAX);
-        if dev != deleter.session.dev {
+        // A private capture name is never ordinary content. This caller keeps
+        // no capture journal of its own, so a leftover private name here is
+        // unrecorded: it is kept and the intent stays pending, never unlinked
+        // by name.
+        if oxide_storage::owned_delete::is_capture_name(std::ffi::OsStr::new(&name)) {
             return Err(Stop::Pending(
-                "a quarantined entry is on another device; no further delete".to_owned(),
+                "the quarantine holds a private capture name no record names; it is kept"
+                    .to_owned(),
             ));
         }
-        // A symbolic link inside the quarantine is never followed or removed:
-        // the delete stops and the intent stays pending (exit 3).
-        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            return Err(Stop::Pending(format!(
-                "the quarantine holds a symbolic link ({name}); deletion stops and the intent stays pending"
-            )));
+        // Only an entry this pass positively removed is counted as deletion
+        // work: one that had already vanished is not its success.
+        if remove_observed_entry(deleter, dir, &name, depth)? {
+            deleter.entries += 1;
         }
-        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            // SAFETY: the parent descriptor and C string are live for the call.
-            let child = unsafe {
-                libc::openat(
-                    dir.as_raw_fd(),
-                    name_c.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if child < 0 {
-                return Err(Stop::Pending(format!(
-                    "cannot open a quarantined directory ({})",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            // SAFETY: `child` is a newly owned descriptor.
-            let child = unsafe { OwnedFd::from_raw_fd(child) };
-            delete_contents_at(deleter, child.as_fd(), false, depth + 1)?;
-            // SAFETY: the descriptor and C string are live for the call.
-            let removed =
-                unsafe { libc::unlinkat(dir.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) };
-            if removed != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    continue;
-                }
-                return Err(Stop::Pending(format!(
-                    "a quarantined directory is not empty after deletion ({error}); new content appeared"
-                )));
-            }
-        } else {
-            // SAFETY: the descriptor and C string are live for the call.
-            let removed = unsafe { libc::unlinkat(dir.as_raw_fd(), name_c.as_ptr(), 0) };
-            if removed != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    continue;
-                }
-                return Err(Stop::Pending(format!(
-                    "cannot unlink a quarantined entry ({error})"
-                )));
-            }
-        }
-        deleter.entries += 1;
         if deleter.entries % DELETE_BATCH == 0 {
             deleter.check()?;
         } else {
@@ -3522,6 +4082,36 @@ fn delete_contents_at(
 
 /// Most names one quarantined directory may hold in one bounded pass.
 const MAX_DIRECTORY_NAMES: usize = 200_000;
+
+/// One listed name, with the end of the directory separated from a failure.
+///
+/// `readdir` reports both the end of a directory and a failure with the same
+/// null return, so `errno` is cleared before the call and read after a null
+/// one: a listing that stopped early stops the pass pending instead of letting
+/// it act on the partial list it had collected. A directory whose enumeration
+/// cannot be proven is never read as an empty one.
+fn next_listed_name(stream: *mut libc::DIR, listed: u64) -> Result<Option<String>, Stop> {
+    #[cfg(test)]
+    if let Some(error) = test_enumeration_fault::fire(listed) {
+        return Err(Stop::Pending(format!(
+            "cannot finish reading a quarantined directory ({error}); it is kept"
+        )));
+    }
+    clear_errno();
+    // SAFETY: `stream` is a live directory stream.
+    let entry = unsafe { libc::readdir(stream) };
+    if entry.is_null() {
+        return match enumeration_error() {
+            None => Ok(None),
+            Some(error) => Err(Stop::Pending(format!(
+                "cannot finish reading a quarantined directory ({error}); it is kept"
+            ))),
+        };
+    }
+    // SAFETY: `d_name` is a live NUL-terminated array for this entry.
+    let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+    Ok(Some(name.to_string_lossy().into_owned()))
+}
 
 /// `list_directory` for deletion: the deleter's cadence check runs every
 /// `DELETE_BATCH` names, and more than `MAX_DIRECTORY_NAMES` stops with the
@@ -3547,14 +4137,11 @@ fn list_directory_checked(dir: BorrowedFd, deleter: &mut Deleter) -> Result<Vec<
     }
     let mut names = Vec::new();
     let outcome = loop {
-        // SAFETY: `stream` is a live directory stream.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break Ok(());
-        }
-        // SAFETY: `d_name` is a live NUL-terminated array for this entry.
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        let name = name.to_string_lossy().into_owned();
+        let name = match next_listed_name(stream, names.len() as u64) {
+            Ok(Some(name)) => name,
+            Ok(None) => break Ok(()),
+            Err(stop) => break Err(stop),
+        };
         if name == "." || name == ".." {
             continue;
         }
@@ -3574,45 +4161,6 @@ fn list_directory_checked(dir: BorrowedFd, deleter: &mut Deleter) -> Result<Vec<
     // SAFETY: `stream` is live and closed once.
     unsafe { libc::closedir(stream) };
     outcome.map(|()| names)
-}
-
-fn list_directory(dir: BorrowedFd) -> Result<Vec<String>, String> {
-    // SAFETY: `dup` returns a new descriptor.
-    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
-    if dup < 0 {
-        return Err(format!(
-            "cannot read a directory ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `dup` is a live descriptor that `fdopendir` takes ownership of.
-    let stream = unsafe { libc::fdopendir(dup) };
-    if stream.is_null() {
-        // SAFETY: the duplicate is still owned here.
-        unsafe { libc::close(dup) };
-        return Err(format!(
-            "cannot read a directory ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let mut names = Vec::new();
-    loop {
-        // SAFETY: `stream` is a live directory stream.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        // SAFETY: `d_name` is a live NUL-terminated array for this entry.
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        let name = name.to_string_lossy().into_owned();
-        if name == "." || name == ".." {
-            continue;
-        }
-        names.push(name);
-    }
-    // SAFETY: `stream` is live and closed once.
-    unsafe { libc::closedir(stream) };
-    Ok(names)
 }
 
 fn unlink_marker(root: &OwnedFd) -> Result<(), String> {
@@ -3701,7 +4249,7 @@ fn prune_one_barrier(
     let (session, id, quarantine) = (|| {
         let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
         session.verify_marker(candidate).map_err(Stop::Refuse)?;
-        session.check(control, 0)?;
+        session.check(control, 0, 0)?;
         // The locked recheck keeps the operator-list legacy classification
         // the preview validated: a receiptless root, or a listed registry
         // row without a v2 identity, takes the boot Data volume rule.
@@ -4216,10 +4764,11 @@ fn finish_quarantine(
     id: &str,
 ) -> Result<(), Stop> {
     let mut deleter = Deleter {
-        session,
+        volume: DeleteControl::Session(session),
         control,
         deadline: Instant::now() + Duration::from_secs(120),
         entries: 0,
+        recovered: 0,
         checked: Instant::now(),
     };
     crash_point("deleting").map_err(Stop::Pending)?;
@@ -4231,18 +4780,22 @@ fn finish_quarantine(
     update_intent(control, id, IntentPhase::MarkerLast)
         .map_err(|error| Stop::Pending(format!("cannot record marker-last: {error}")))?;
     unlink_marker(&session.root).map_err(Stop::Refuse)?;
-    if !list_directory(session.root.as_fd())
-        .map_err(Stop::Refuse)?
-        .is_empty()
+    // Content gained after the marker was removed keeps the intent pending,
+    // except the Finder metadata the bounded removal recovers (oxide#155).
+    if !only_finder_metadata(session.root.as_fd())
+        .map_err(|error| Stop::Refuse(format!("cannot read the quarantine ({error})")))?
     {
         return Err(Stop::Pending(
             "the quarantine gained content after its marker was removed".to_owned(),
         ));
     }
     deleter.check()?;
+    let mut check = || deleter.check().map_err(stop_text);
     session
-        .remove_quarantine(&format!("{QUARANTINE_PREFIX}{id}"))
+        .remove_quarantine(&format!("{QUARANTINE_PREFIX}{id}"), &mut check)
         .map_err(Stop::Pending)?;
+    // Immediately before the terminal journal writes: the same bounded check.
+    deleter.check()?;
     complete_intent(store, control, id, "deleted")
 }
 
@@ -5418,7 +5971,411 @@ pub(crate) fn test_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// oxide#155: a Finder-metadata race that did not remove the quarantine is
+    /// a pending intent for every caller, never a completed deletion. The
+    /// journal phases are not rewritten to recover it, and a name that is
+    /// missing is not positive deletion proof.
+    /// oxide#155: the low-reserve fault modes are decided purely, and the
+    /// recovered-metadata mode keys on the seam's own work rather than on the
+    /// pass's total. The counterfactual is the old total-count trigger: with
+    /// nine ordinary deletions and no recovered entry it stays disarmed, so a
+    /// recovered-mode proof cannot be satisfied by ordinary delete work.
+    #[test]
+    fn the_low_reserve_modes_key_on_their_own_counter() {
+        // Recovered mode: disarmed by ordinary deletions, armed by one recovery.
+        assert_eq!(
+            low_reserve_decision(5, 9, 0, None, None, Some(1)),
+            None,
+            "ordinary deletions must not satisfy the recovered mode"
+        );
+        assert_eq!(
+            low_reserve_decision(5, 9, 1, None, None, Some(1)),
+            Some("recovered")
+        );
+        // The check mode and the older total-count mode keep their meanings.
+        assert_eq!(
+            low_reserve_decision(3, 0, 0, Some(3), None, None),
+            Some("check")
+        );
+        assert_eq!(
+            low_reserve_decision(1, 2, 0, None, Some(2), None),
+            Some("entries")
+        );
+        // One mode at a time; a combined or absent set disarms.
+        assert_eq!(low_reserve_decision(1, 1, 1, Some(1), Some(1), None), None);
+        assert_eq!(low_reserve_decision(1, 1, 1, None, None, None), None);
+    }
+
+    #[test]
+    fn every_terminal_finder_race_outcome_keeps_the_intent_pending() {
+        let pending = |outcome: Rmdir| race_pending("the quarantine leaf", &outcome);
+        let refused = pending(Rmdir::Refused {
+            entry: "stray\\x07".to_owned(),
+        });
+        assert!(refused.contains("stray\\x07"), "{refused}");
+        assert!(pending(Rmdir::Replaced {
+            entry: "leaf".to_owned()
+        })
+        .contains("no longer the verified directory"));
+        assert!(!pending(Rmdir::RefusedMany { entries: 65 }).is_empty());
+        assert!(!pending(Rmdir::Exhausted { entries: 6 }).is_empty());
+        assert!(!pending(Rmdir::Failed {
+            error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        })
+        .is_empty());
+        // Absence is uncertainty, never completion: a missing quarantine leaf
+        // and a removal this seam did not positively make both stay pending.
+        assert!(!pending(Rmdir::Vanished).is_empty());
+        // A mid-drain caller stop carries its own reason and stays pending.
+        assert!(pending(Rmdir::Stopped {
+            reason: "the registered volume's reserve was reached".to_owned()
+        })
+        .contains("reserve"));
+        assert!(!pending(Rmdir::Removed).is_empty());
+        assert!(!pending(Rmdir::Drained { entries: 1 }).is_empty());
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// oxide#155: the prune traversal deletes only what it captured and
+    /// verified. These cases drive the production pass (`delete_contents`) over
+    /// a plain fixture directory and inject one replacement at the traversal's
+    /// own effect boundary, so a name the traversal merely listed is never the
+    /// thing it acts on.
+    ///
+    /// The pass is the step `finish_quarantine` runs after it records the
+    /// intent as `deleting` and before it writes `marker_last`: a pending stop
+    /// here is returned to the caller, so the intent phase keeps its recorded
+    /// value and the root stays pending rather than completing.
+    fn delete_fixture(root: &Path) -> (Result<(), Stop>, PassCounts) {
+        let dir = fs::File::open(root).expect("fixture directory must open");
+        let mut deleter = Deleter::fixture(root);
+        let outcome = delete_contents(&mut deleter, dir.as_fd(), false);
+        let counts = PassCounts {
+            entries: deleter.entries,
+            recovered: deleter.recovered,
+        };
+        (outcome, counts)
+    }
+
+    /// The counts one pass reported: ordinary deletions and recovered Finder
+    /// metadata, kept apart exactly as the production deleter keeps them.
+    struct PassCounts {
+        entries: u64,
+        recovered: u64,
+    }
+
+    fn pass_reason(outcome: &Result<(), Stop>) -> String {
+        match outcome {
+            Ok(()) => String::new(),
+            Err(stop) => stop_text(match stop {
+                Stop::Pending(reason) | Stop::Refuse(reason) => Stop::Pending(reason.clone()),
+            }),
+        }
+    }
+
+    fn fixture_dir(root: &Path, name: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn names_in(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The ordinary pass is unchanged: every entry of the quarantine goes,
+    /// including a tolerated-metadata name at this level (it is verified like
+    /// any other owned entry here) and a nested tree.
+    #[test]
+    fn an_ordinary_quarantined_tree_is_deleted_through_verified_captures() {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("owned.txt"), b"owned").unwrap();
+        fs::write(root.join(".DS_Store"), b"metadata").unwrap();
+        let nested = fixture_dir(&root, "nested");
+        fs::write(nested.join("deep.txt"), b"deep").unwrap();
+        let (outcome, deleter) = delete_fixture(&root);
+        assert!(outcome.is_ok(), "{}", pass_reason(&outcome));
+        assert!(names_in(&root).is_empty());
+        assert_eq!(deleter.entries, 4);
+    }
+
+    /// A regular entry replaced after it was observed is not removed: the
+    /// capture is not the observed object, so the pass puts it back and stops
+    /// pending, and the racer's object is exactly where it left it. The old
+    /// list-then-unlink parent would have unlinked the replacement, which is
+    /// what the surviving inode falsifies.
+    #[test]
+    fn a_replacement_after_the_observation_is_not_removed() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt;
+        use std::rc::Rc;
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        let target = root.join("owned.txt");
+        fs::write(&target, b"owned").unwrap();
+        let fired = Rc::new(Cell::new(false));
+        let replaced = Rc::new(Cell::new(0));
+        let (fired_in_arm, replaced_in_arm, target_in_arm) =
+            (Rc::clone(&fired), Rc::clone(&replaced), target.clone());
+        let _armed =
+            test_replace_arm::arm(test_replace_arm::Phase::Observed, "owned.txt", move || {
+                fs::remove_file(&target_in_arm).unwrap();
+                fs::write(&target_in_arm, b"the racer's object").unwrap();
+                replaced_in_arm.set(fs::metadata(&target_in_arm).unwrap().ino());
+                fired_in_arm.set(true);
+            });
+        let (outcome, deleter) = delete_fixture(&root);
+        assert!(fired.get(), "the replacement injection never fired");
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("is not the observed"), "{reason}");
+        assert!(reason.contains("nothing was deleted"), "{reason}");
+        assert_eq!(fs::read(&target).unwrap(), b"the racer's object");
+        // Exactly the racer's object survives under its name: a traversal that
+        // unlinked the listed name would have lost this inode.
+        assert_ne!(replaced.get(), 0, "the injection did not record its object");
+        assert_eq!(fs::metadata(&target).unwrap().ino(), replaced.get());
+        assert_eq!(names_in(&root), vec!["owned.txt".to_owned()]);
+        assert_eq!(deleter.entries, 0);
+    }
+
+    /// A directory replaced by a symbolic link after the observation is not
+    /// followed, captured as a directory, recursed into or moved into: the
+    /// capture fails verification on its type, goes back, and the link and its
+    /// referent are untouched.
+    #[test]
+    fn a_directory_replaced_by_a_link_is_not_followed() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let fixture = Fixture::new();
+        let (root, outside) = (
+            fixture.root.join("quarantine"),
+            fixture.root.join("outside"),
+        );
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        let sub = fixture_dir(&root, "sub");
+        fs::write(sub.join("owned.txt"), b"owned").unwrap();
+        let fired = Rc::new(Cell::new(false));
+        let (fired_in_arm, sub_in_arm, outside_in_arm) =
+            (Rc::clone(&fired), sub.clone(), outside.clone());
+        let _armed = test_replace_arm::arm(test_replace_arm::Phase::Observed, "sub", move || {
+            fs::remove_dir_all(&sub_in_arm).unwrap();
+            std::os::unix::fs::symlink(&outside_in_arm, &sub_in_arm).unwrap();
+            fired_in_arm.set(true);
+        });
+        let (outcome, _deleter) = delete_fixture(&root);
+        assert!(fired.get(), "the replacement injection never fired");
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("is not the observed"), "{reason}");
+        assert!(fs::symlink_metadata(&sub).unwrap().is_symlink());
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    /// A directory replaced at the descend boundary is not descended into: the
+    /// pass removes the object it captured and verified, and the racer's new
+    /// directory keeps its own content. The old traversal opened the listed
+    /// name and would have deleted that content.
+    #[test]
+    fn a_directory_replaced_before_the_descent_is_not_descended_into() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        let sub = fixture_dir(&root, "sub");
+        fs::write(sub.join("owned.txt"), b"owned").unwrap();
+        let fired = Rc::new(Cell::new(false));
+        let (fired_in_arm, root_in_arm) = (Rc::clone(&fired), root.clone());
+        let _armed = test_replace_arm::arm(test_replace_arm::Phase::Descending, "sub", move || {
+            let replacement = root_in_arm.join("sub");
+            fs::create_dir(&replacement).unwrap();
+            fs::write(replacement.join("racer.txt"), b"racer").unwrap();
+            fired_in_arm.set(true);
+        });
+        let (outcome, _deleter) = delete_fixture(&root);
+        assert!(fired.get(), "the replacement injection never fired");
+        assert!(outcome.is_ok(), "{}", pass_reason(&outcome));
+        // The verified capture was removed; the racer's replacement is the one
+        // name left, with its own content intact.
+        assert_eq!(names_in(&root), vec!["sub".to_owned()]);
+        assert_eq!(fs::read(sub.join("racer.txt")).unwrap(), b"racer");
+        assert_eq!(fs::read_dir(&sub).unwrap().count(), 1);
+    }
+
+    /// Finder metadata recreated inside a directory after its content was
+    /// deleted and before the directory's own removal is drained under the
+    /// shared fixed bound, so the directory completes.
+    #[test]
+    fn finder_metadata_recreated_before_the_rmdir_is_drained() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        let sub = fixture_dir(&root, "sub");
+        fs::write(sub.join("owned.txt"), b"owned").unwrap();
+        let fired = Rc::new(Cell::new(false));
+        let (fired_in_arm, root_in_arm) = (Rc::clone(&fired), root.clone());
+        let _armed =
+            test_replace_arm::arm(test_replace_arm::Phase::BeforeRmdir, "sub", move || {
+                // The captured directory is the only private capture name in
+                // the quarantine at this boundary.
+                let captured = fs::read_dir(&root_in_arm)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with(".oxide-capture-")
+                        })
+                    })
+                    .expect("the captured directory must be visible under its private name");
+                fs::write(captured.join(".DS_Store"), b"metadata").unwrap();
+                fs::write(captured.join("._owned.txt"), b"metadata").unwrap();
+                fired_in_arm.set(true);
+            });
+        let (outcome, deleter) = delete_fixture(&root);
+        assert!(fired.get(), "the metadata injection never fired");
+        assert!(outcome.is_ok(), "{}", pass_reason(&outcome));
+        assert!(names_in(&root).is_empty());
+        // The two recovered entries are counted as recovered work, not as
+        // ordinary deletions of this pass.
+        assert_eq!(deleter.recovered, 2);
+    }
+
+    /// A foreign entry recreated at the same boundary is refused by the shared
+    /// seam: the directory goes back under its original name with the foreign
+    /// file untouched, and the pass stops pending.
+    #[test]
+    fn a_foreign_entry_before_the_rmdir_is_refused_and_untouched() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        let sub = fixture_dir(&root, "sub");
+        fs::write(sub.join("owned.txt"), b"owned").unwrap();
+        let fired = Rc::new(Cell::new(false));
+        let (fired_in_arm, root_in_arm) = (Rc::clone(&fired), root.clone());
+        let _armed =
+            test_replace_arm::arm(test_replace_arm::Phase::BeforeRmdir, "sub", move || {
+                let captured = fs::read_dir(&root_in_arm)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with(".oxide-capture-")
+                        })
+                    })
+                    .expect("the captured directory must be visible under its private name");
+                fs::write(captured.join("foreign.txt"), b"foreign").unwrap();
+                fired_in_arm.set(true);
+            });
+        let (outcome, _deleter) = delete_fixture(&root);
+        assert!(fired.get(), "the foreign injection never fired");
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("not tolerated Finder metadata"), "{reason}");
+        assert!(reason.contains("intent stays pending"), "{reason}");
+        // The directory is back under its own name, with the foreign entry and
+        // nothing else, so a replay names exactly what is left.
+        assert_eq!(names_in(&root), vec!["sub".to_owned()]);
+        assert_eq!(names_in(&sub), vec!["foreign.txt".to_owned()]);
+        assert_eq!(fs::read(sub.join("foreign.txt")).unwrap(), b"foreign");
+    }
+
+    /// A symbolic link in the quarantine is never followed, captured or
+    /// removed: the pass stops pending and the referent is untouched.
+    #[test]
+    fn an_observed_link_stops_the_pass_without_following_it() {
+        let fixture = Fixture::new();
+        let (root, outside) = (
+            fixture.root.join("quarantine"),
+            fixture.root.join("outside"),
+        );
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".DS_Store")).unwrap();
+        let (outcome, _deleter) = delete_fixture(&root);
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("symbolic link"), "{reason}");
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+        assert!(fs::symlink_metadata(root.join(".DS_Store"))
+            .unwrap()
+            .is_symlink());
+    }
+
+    /// A private capture name this pass did not create is never ordinary
+    /// content: it is kept and the intent stays pending.
+    #[test]
+    fn an_unrecorded_private_capture_name_is_kept() {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        let leftover = root.join(format!(
+            "{}{}",
+            oxide_storage::owned_delete::CAPTURE_PREFIX,
+            "a".repeat(32)
+        ));
+        fs::write(&leftover, b"leftover").unwrap();
+        let (outcome, _deleter) = delete_fixture(&root);
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("private capture name"), "{reason}");
+        assert_eq!(fs::read(&leftover).unwrap(), b"leftover");
+    }
+
+    /// An entry whose reading is another device stops the pass before any
+    /// effect, and the entry is untouched.
+    #[test]
+    fn an_entry_on_another_device_stops_the_pass() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        let file = root.join("owned.txt");
+        fs::write(&file, b"owned").unwrap();
+        let device = fs::metadata(&root).unwrap().dev();
+        let dir = fs::File::open(&root).unwrap();
+        // One injected volume reading: the pass proves every entry against the
+        // volume it was opened for.
+        let mut deleter = Deleter::fixture_on(&root, device.wrapping_add(1));
+        let outcome = delete_contents(&mut deleter, dir.as_fd(), false);
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("another device"), "{reason}");
+        assert_eq!(fs::read(&file).unwrap(), b"owned");
+        assert_eq!(names_in(&root), vec!["owned.txt".to_owned()]);
+    }
+
+    /// An enumeration that stops with an error is never read as an ended
+    /// directory: the pass stops pending before it removes anything, even though
+    /// the partial list it had already collected held a real owned entry.
+    #[test]
+    fn an_incomplete_listing_stops_the_pass_before_any_effect() {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("owned.txt"), b"owned").unwrap();
+        fs::write(root.join("second.txt"), b"second").unwrap();
+        let _fault = test_enumeration_fault::arm(1, libc::EIO);
+        let (outcome, counts) = delete_fixture(&root);
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("cannot finish reading"), "{reason}");
+        assert_eq!(
+            names_in(&root),
+            vec!["owned.txt".to_owned(), "second.txt".to_owned()]
+        );
+        assert_eq!(counts.entries, 0);
+    }
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
