@@ -5013,8 +5013,22 @@ The stable, read-only interface other tools use to find the registered Builds dr
   interleaving is one possible cause. The focused script
   `effigy rust:prune-authority` and its uncounted `:diagnostic` twin use the
   qualified shared supervisor, 300 seconds, 512 MiB and one owned 128 MiB
-  image; their fit is unmeasured and neither has run. Each needs independent
-  source-fit, fresh headroom and separate activation. This does not qualify
+  image; their fit is unmeasured. The one activated diagnostic at `10377c0`
+  was spent and failed before staging: the strict offline seeder refused the
+  account Cargo home's symlinked registry and Git directories. All four cases
+  were unexecuted, no image was attached, and the guard closed with status 1
+  and a certain empty census. Its preserved diagnostic receipt is
+  `/private/tmp/oxide-proof.jqmd3cyc/evidence/prune134-diagnostic.json`
+  (SHA-256 `d8f56d3d4d0648b1830ebd050e19b70431f454ac327da6a824cfc5272c16e8cc`);
+  the guard receipt SHA-256 is
+  `fb038e4e5b3d1f9d90aa3b5d81f93e7140054574cfe345627a71460100ed503d`.
+  The corrected proof verifies a common canonical real cache root before and
+  after strict seeding into its private Cargo home; its pure counterfactual
+  is `effigy proof:prune-authority:test`. No counted native has run.
+  Effigy heavy admission unavailable (f6b3b50 retired host-run client;
+  Queue #381 pending); not host-admitted. Any later activation needs fresh
+  owner scheduler headroom, independent source-fit and separate activation.
+  This does not qualify
   oxide#133's affected checkout-detach path or authorize a live prune.
 
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.

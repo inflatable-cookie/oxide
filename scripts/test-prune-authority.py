@@ -47,6 +47,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 import subprocess
 import sys
 import traceback
@@ -75,6 +76,106 @@ prior.DIAG = prior.Diagnostics(enabled=False)
 def require(value, message):
     if not value:
         raise RuntimeError(message)
+
+
+def canonical_layout(registry: Path, git: Path) -> Path:
+    """Only the same canonical parent with the seeder's exact names qualifies."""
+    if registry.name != "registry" or git.name != "git" or registry.parent != git.parent:
+        raise RuntimeError("registry and git do not share one canonical Cargo cache root")
+    return registry.parent
+
+
+def verified_seed_source(home: Path) -> dict:
+    """Resolve the two account-home links, then positively bind one real root.
+
+    The strict seeder still opens that root and every descendant no-follow on
+    the same device. This function never writes to the host cache.
+    """
+    if not home.is_absolute():
+        raise RuntimeError("host Cargo home is not absolute")
+    registry = Path(os.path.realpath(home / "registry", strict=True))
+    git = Path(os.path.realpath(home / "git", strict=True))
+    root = canonical_layout(registry, git)
+    if not root.is_absolute() or Path(os.path.realpath(root, strict=True)) != root:
+        raise RuntimeError("Cargo cache root is not canonical")
+    identity = {}
+    with wrapper.offline_seed.Anchor(root, "canonical host Cargo cache") as anchor:
+        root_metadata = os.lstat(root)
+        if not stat.S_ISDIR(root_metadata.st_mode) or (root_metadata.st_dev, root_metadata.st_ino) != anchor.identity:
+            raise RuntimeError("Cargo cache root changed while binding")
+        identity["root"] = list(anchor.identity)
+        for name, path in (("registry", registry), ("git", git)):
+            metadata = os.lstat(path)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != anchor.dev:
+                raise RuntimeError(f"{name} is not a real directory on the cache device")
+            descriptor = anchor.open_dir((name,))
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise RuntimeError(f"{name} changed while binding the cache")
+                followed = os.stat(home / name)
+                if (followed.st_dev, followed.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise RuntimeError(f"{name} account-home link changed")
+                identity[name] = [opened.st_dev, opened.st_ino]
+            finally:
+                os.close(descriptor)
+    return {"root": str(root), "home": str(home), "identity": identity}
+
+
+def self_check() -> int:
+    """Pure counterfactual: exercise the real no-follow seam with fake fds."""
+    import errno
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    seed = wrapper.offline_seed
+    directory = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=7, st_ino=11)
+    def fake_open(path, flags, **kwargs):
+        if path == "registry":
+            raise OSError(errno.ENOTDIR, "synthetic symlink")
+        return 10
+    with patch.object(seed.os, "open", side_effect=fake_open), \
+         patch.object(seed.os, "fstat", return_value=directory), \
+         patch.object(seed.os, "dup", return_value=11), \
+         patch.object(seed.os, "close"):
+        with seed.Anchor(Path("/fake/home"), "host") as anchor:
+            try:
+                anchor.open_dir(("registry",))
+            except seed.SeedRefusal as error:
+                require("not a real directory" in str(error), str(error))
+            else:
+                raise AssertionError("the symlinked-home counterfactual was accepted")
+    require(canonical_layout(Path("/cache/registry"), Path("/cache/git")) == Path("/cache"), "canonical root")
+    try:
+        canonical_layout(Path("/cache/registry"), Path("/other/git"))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("different cache roots were accepted")
+    registry = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=7, st_ino=12)
+    git = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=7, st_ino=13)
+    resolved = {"/fake/home/registry": "/cache/registry", "/fake/home/git": "/cache/git", "/cache": "/cache"}
+    metadata = {"/cache": directory, "/cache/registry": registry, "/cache/git": git,
+                "/fake/home/registry": registry, "/fake/home/git": git}
+    def open_real(path, flags, **kwargs):
+        return {"/cache": 10, "registry": 12, "git": 13}[str(path)]
+    with patch.object(os.path, "realpath", side_effect=lambda path, **kwargs: resolved[str(path)]), \
+         patch.object(os, "lstat", side_effect=lambda path: metadata[str(path)]), \
+         patch.object(os, "stat", side_effect=lambda path: metadata[str(path)]), \
+         patch.object(os, "open", side_effect=open_real), \
+         patch.object(os, "fstat", side_effect=lambda fd: {10: directory, 12: registry, 13: git}[fd]), \
+         patch.object(os, "dup", return_value=11), patch.object(os, "close"):
+        bound = verified_seed_source(Path("/fake/home"))
+        require(bound["root"] == "/cache" and bound["identity"]["git"] == [7, 13], "verified cache binding")
+        metadata["/fake/home/git"] = directory
+        try:
+            verified_seed_source(Path("/fake/home"))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("changed account-home link was accepted")
+    print("prune authority seed-source self-check: OK")
+    return 0
 
 
 class PruneProof(wrapper.Proof):
@@ -106,7 +207,12 @@ CASE_NAMES = ("accounting", "authority-refusals", "revalidation", "positive-grou
 
 
 def run_cases(proof, custody, diagnostic, cases):
-    oxide, provenance = wrapper.seed_and_stage(proof, jobs=6)
+    host_home = Path(os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo"))
+    source = verified_seed_source(host_home)
+    oxide, provenance = wrapper.seed_and_stage(proof, jobs=6, host_cargo_home=source["root"])
+    if verified_seed_source(host_home) != source:
+        raise RuntimeError("canonical Cargo cache identity changed during staging")
+    provenance["seed_source"] = source
     (proof.evidence / "prune134-provenance.json").write_text(json.dumps(provenance, indent=2))
     adapter = Adapter(proof, oxide)
     world = prior.World(adapter, adapter.root)
@@ -292,6 +398,8 @@ def run_cases(proof, custody, diagnostic, cases):
 
 
 def main():
+    if sys.argv[1:] == ["--self-check"]:
+        return self_check()
     diagnostic = sys.argv[1:] == ["--diagnostic"]
     if sys.argv[1:] not in ([], ["--diagnostic"]):
         raise SystemExit("expected no argument or --diagnostic")

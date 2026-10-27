@@ -273,7 +273,9 @@ def toolchain_channel() -> str:
     return text[start : text.index('"', start)]
 
 
-def seed_and_stage(proof: Proof, jobs: int | None = None) -> tuple[Path, dict]:
+def seed_and_stage(
+    proof: Proof, jobs: int | None = None, host_cargo_home: Path | str | None = None
+) -> tuple[Path, dict]:
     """Seed HEAD's lock into a private Cargo home, then build this HEAD's oxide."""
     seed_root = proof.root / "stage"
     seed_root.mkdir(parents=True, exist_ok=True)
@@ -287,7 +289,8 @@ def seed_and_stage(proof: Proof, jobs: int | None = None) -> tuple[Path, dict]:
     if code:
         fail(f"cannot read HEAD's Cargo.lock: {lock_err[-800:]}")
     lock_bytes = lock_text.encode()
-    host_cargo_home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    if host_cargo_home is None:
+        host_cargo_home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
     try:
         seed = offline_seed.seed_cargo_home(
             host_cargo_home, cargo_home, lock_bytes, deadline_ns=proof.deadline_ns
