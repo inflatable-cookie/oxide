@@ -4988,8 +4988,10 @@ The stable, read-only interface other tools use to find the registered Builds dr
 - **Dry run first.** `oxide outputs prune --dry-run [--operator-list FILE]` writes one bounded canonical JSON preview to stdout (`oxide.outputs.prune-preview/1`, at most 256 KiB and 512 roots) and its SHA-256 to stderr. Stdout is exactly the bytes the digest covers (no trailing newline is added), so redirecting stdout yields the plan file. It mutates nothing: it never initializes the forward format, replays an intent or writes a file. A pool whose registry is not ready refuses with exit 2; `oxide outputs adopt` (which may find the checkout already converted) establishes the format first.
 - **Real run.** `oxide outputs prune --plan FILE --plan-sha256 HEX [--operator-list FILE]` requires the exact preview bytes and an unchanged operator-list byte digest. A missing or mismatched plan refuses before any effect (exit 2). The real run revalidates every predicate and requires the eligible root identity set (checkout, member, root, nonce, device, inode, marker digest) to match the plan one-to-one.
 - **Exit codes.** `0` when the run completed, with the explicit deleted and kept lists; `2` for a usage error or any refusal before an effect; `3` when an intent is unsettled or contradictory, or when an operation's own proof/transaction is incomplete after a published effect, and needs `resolve-intent` or exact replay. A fresh per-root check that fails before that root's intent is journaled (the checkout reappeared, the barrier, binding, volume, reserve or marker check refused) keeps the root unchanged with its reason and the batch continues: the run exits `0` listing the exact partial completion when any root was deleted and no intent is unfinished, and `2` when every root was kept. Once a root's intent is journaled, any stop leaves it pending and exits `3`. A completed exact replay followed by a changed eligible set or a failed fresh snapshot also exits `0`, listing the replayed roots and keeping every other root. These commands do not use the front door's generic failure exit; signal handling is the existing policy and a timeout is never a success.
-- **Eligibility.** A root is only a candidate when the registry is complete and ready, the row has no pending, reservation or other live reference, and the checkout's receipt either still selects exactly that root (committed, matching nonce, generation and kind) or no longer references it as current (a released root: relinked away or detached; its receipt's own current selection is never rewritten when it is pruned), the checkout's no-follow component walk ends in a real leaf `ENOENT`, every writer is positively closed across both pools, the owner marker and nonce match the recorded identity, and the registered volume UUID and mount are verified. A registered checkout outside `/Volumes` also needs its recorded checkout volume: the nearest existing ancestor must be on a local APFS or HFS volume with that UUID, so a network, autofs or unknown file system is kept. A present checkout (including a present detached one), missing or unreadable ancestor, absent volume, unknown writer, marker-only legacy root, history-only root or another selection keeps the root. A missing ancestor is uncertainty, never absence: only the actual checkout leaf may return `ENOENT`. Any missing, malformed, unreadable or over-cap referenced receipt keeps the whole snapshot batch, not just that row. A checkout-local fallback below an absent checkout is recorded only; the prune never recreates a checkout.
-- **Operator list.** `--operator-list` is a JSON array of absolute, duplicate-free root paths (at most 512 and 256 KiB). It waives only the receipt-history completeness for exactly those listed legacy roots. It still requires a well-formed owner marker, the actual absent checkout, closed writers, no current registry selection, a complete registry and custody snapshot, and the verified volume. A legacy recorded checkout below `/Volumes` is kept. Elsewhere the proof is volume-based, not a path prefix: the checkout's nearest existing ancestor must be on the same device and APFS volume UUID as the boot Data volume (`/System/Volumes/Data`), and the no-follow walk must end in a leaf `ENOENT`; any other or unverifiable volume is kept. A moved-but-live checkout loses regenerable outputs by explicit operator choice; its next command safely re-adopts with a fresh nonce or refuses a missing root.
+- **Eligibility.** A root is only a candidate when the registry is complete and ready, the row has no pending, reservation or other live reference, and the checkout's receipt either still selects exactly that root (committed, matching nonce, generation and kind) or no longer references it as current (a released root: relinked away or detached; its receipt's own current selection is never rewritten when it is pruned), the checkout is positively absent under the protocol below, every writer is positively closed across both pools, the owner marker and nonce match the recorded identity, and the registered volume UUID and mount are verified. A registered checkout outside `/Volumes` also needs its recorded checkout volume, read through the held nearest existing ancestor's own descriptor: that ancestor must be on a local APFS or HFS volume with the recorded UUID, so a network, autofs or unknown file system, or a conflicting or unknown recorded volume, is kept. A present checkout (including a present detached one), a symlinked, non-directory or unreadable ancestor, an absent volume, an unknown writer, a marker-only legacy root, a history-only root or another selection keeps the root.
+
+  **Absent checkout chains beneath a verified boot Data ancestor (oxide#135).** The recorded checkout path is validated before anything is walked: a relative path, a NUL, a `.` or `..` component, a repeated or trailing separator or any other non-exact absolute spelling is refused, never resolved or canonicalized. The walk then holds a descriptor for every observed component, no-follow, revalidates each named entry against the descriptor it opened (device and inode, then the named entry again), and KEEPS every descriptor of the chain it opened: at the first exact `ENOENT` it revalidates the whole named ancestry — each observed named entry, then each held descriptor — so no ancestor can be swapped between the walk and its decision. A verified mount spelling is re-verified through the same held binding after the walk, and the first exact `ENOENT` is the only positive answer. The actual leaf may be absent under a fully present ancestry. A missing **ancestor** chain is also provable, but only when the held nearest existing ancestor is a readable directory on the same device and APFS volume UUID as `/System/Volumes/Data`, read from held descriptors rather than from a reopened path; that extension never applies below a volume mount, and both `/Volumes/<name>` and its boot Data alias `/System/Volumes/Data/Volumes/<name>` (including an absent mount name) keep the existing leaf-only rule. A conflicting or unknown **recorded** checkout volume is never waived because today's surviving ancestor sits on the boot Data volume: whenever a row — or a receiptless root's owner marker, which records `checkout_volume_uuid` in the current shape — names a checkout volume, the held ancestor must be on it. The genuine legacy exception (an operator-listed row that predates the version-2 identity, and a version-1 marker without the field) adds the boot Data rule but never replaces a recorded volume, and only a row with no recorded volume at all may rely on that rule alone. The real run keeps an EPHEMERAL witness of that ancestry — the exact path, every observed component's identity, the start descriptor, the first missing component, the held ancestor facts and the held boot Data facts — and compares it again under the checkout's clean barrier and binding as an early refusal and, last, as the DECIDING comparison under publication custody immediately before the journal (for a receiptless root, before its pruning receipt). Publication custody is taken for every root, not only a receiptless one, and it is taken before that deciding comparison, so an ancestry that changed while this root waited for the lock cannot be published. A recreated checkout, a replaced ancestor, a changed first-missing component or a changed start descriptor refuses before any intent, receipt or quarantine effect, and a revision retry keeps the original witness instead of adopting a new baseline. No witness is persisted: the preview's bytes carry none, so a dry run's absence proof is never authority for an effect, and immutable ancestry from dry run through effect is explicitly not claimed. A fresh traversal that still positively proves absence is the contract, and the boundary is cooperative: Oxide's custody excludes cooperating bindings, not arbitrary filesystem creators, so this is repeated descriptor and entry revalidation, never atomic exclusion of a checkout or ancestor being recreated. On non-macOS there are no held volume facts, so neither an absent leaf nor a missing chain is ever proved and every root is kept. **Ordinary path ineligibility is per-root.** An unprovable checkout path keeps THAT root and leaves the snapshot complete, so a sibling root can still be a candidate in the same batch (a mixed batch proves both sides: a positively absent Data chain is pruned while a recorded-volume conflict and a symlinked ancestor beside it are kept, byte-identical). Incomplete required authority — a missing, malformed, contradictory or over-cap receipt or registry reference, or unknown writer custody — still refuses the whole batch. Any missing, malformed, unreadable or over-cap referenced receipt keeps the whole snapshot batch, not just that row. A checkout-local fallback below an absent checkout is recorded only; the prune never recreates a checkout.
+- **Operator list.** `--operator-list` is a JSON array of absolute, duplicate-free root paths (at most 512 and 256 KiB). It waives only the receipt-history completeness for exactly those listed legacy roots; it is a distinct permission from volume identity and never replaces one. It still requires a well-formed owner marker, the actual absent checkout, closed writers, no current registry selection, a complete registry and custody snapshot, and the verified volume. A listed row that records a checkout volume must still be on it, whatever the row's age, and the boot Data rule is the genuine legacy exception's additional requirement rather than a replacement for it. A legacy recorded checkout below a volume mount is kept. Elsewhere the proof is volume-based, not a path prefix, and read from held descriptors: the nearest existing ancestor must be on the same device and APFS volume UUID as the boot Data volume (`/System/Volumes/Data`), and the no-follow walk must end in the checkout's own `ENOENT` (the missing-ancestor extension above applies); any other or unverifiable volume is kept. A moved-but-live checkout loses regenerable outputs by explicit operator choice; its next command safely re-adopts with a fresh nonce or refuses a missing root.
 - **Quarantine and deletion.** Each root first gets a durable `oxide.outputs.prune-intent/1` journal entry with a fresh random 128-bit intent ID (the root's own nonce is separate and immutable). The verified root is then renamed exclusively inside the `oxide-outputs` tree to a `.prune-<intent>` leaf, deleted only through the held descriptor of the verified device. A resumed deletion opens the quarantine leaf only when its device and inode both equal the recorded root's (no-follow traversal, links unlinked but never followed, a cross-device or changed entry stops the batch), and the owner marker is unlinked last. The pass itself is the [capture-then-verify](#finder-metadata-in-pools) mechanism (oxide#155), one entry at a time: it observes the entry by no-follow `fstatat`, captures it with one exclusive rename to a private `.oxide-capture-` name, verifies the **captured** object's device, inode and type against that observation, and only then removes the private name — a file or link by `unlinkat`, a directory through a descriptor opened at the private name and revalidated by device and inode, its content deleted, its own recreated metadata drained, and the private name removed. An entry replaced after it was listed is therefore never removed or recursed into: the capture goes back under its original name and the intent stays pending, and a private capture name this pass holds no record for is kept rather than unlinked. A directory listing that ends in a `readdir` error is likewise never an ended directory: the pass stops the intent pending rather than deleting from the partial list it had collected. Every directory removal, the quarantine leaf's own removal and the check that the leaf gained nothing after the marker was unlinked use the [bounded Finder-metadata race](#finder-metadata-in-pools) (oxide#155): a tolerated metadata entry recreated in the window is verified and unlinked within the fixed bound, and every other new entry, an unverifiable one, a name that no longer names the verified leaf, a missing leaf and an exhausted bound all leave the intent pending (exit 3) with nothing cleared or rewritten. A nested directory that vanished inside the pass is finished work; the leaf's own absence is not positive deletion proof. The prune worker monitors itself (no Cargo group is assumed): the registered volume's identity and reserve and the host reserve of the internal control volume are checked at fixed points (before the rename, before the first and after the last deletion of every run or replay, every 512 deleted entries) and, once at least 1 s has elapsed since the previous check, before each directory enumeration, every 512 names while a directory is listed (at most 200,000 names per directory) and after each unlink; after each directory's names are sorted, and before the marker and the quarantine leaf are removed, a check always runs before the next write. A single directory listing or system call is not interrupted, and one delete pass has a 120 s deadline; this is cooperative checking, not a hard 1 s watchdog. Any loss stops further writes and leaves the intent pending; unknown free space is not above a reserve and stops too. The admission lock is not held during long deletes; the checkout binding barrier is. Before each root's intent, under that root's clean barrier and binding lock, the run rereads the ready registry and the root's receipt and re-runs every eligibility predicate for its row (writer custody and command records in both pools, the caller's own barrier excepted; the root's device, inode, marker, nonce and generation unchanged). The intent is then published only if the registry revision still equals the one that reread saw; one changed revision gets one more locked reread, and a second keeps the root. Every registry write, including each intent phase, holds the internal publication lock. Replaying an unfinished intent (rollback, resumed deletion or a terminal receipt) takes the same checkout barrier and binding lock.
 - **Journal order.** `intent` → `renamed` → `deleting` → `marker_last` → `deleted`; every phase is durable before its effect. While a transition is prepared, the registry keeps the committed root selected and adds the proposed root as pending; a missing reference is never read as non-selection. The registry terminal state (row no longer selected, `pruned_ms`) is durable before the checkout's `oxide.outputs.transition/2` receipt records `deleted`, and diagnostic observations are best-effort afterwards. The intent then records that its receipt committed; until it does, a `deleted` or `resolved` intent is still unfinished, so adopt refuses, prune replays the receipt step and `resolve-intent` finishes only that step (exit 3 if it fails). A missing quarantine or marker without positive deletion proof, or an unknown volume, is `pending` (exit 3), never inferred as done. `oxide outputs resolve-intent <intent-id>` is the only settlement verb: it never initializes the format, and it takes the checkout's clean barrier and binding lock for the recheck through the committed terminal transaction. Both leaves must be positively absent under the verified volume descriptor, the registry must be complete with the intent's exact blocking row, the checkout must select no other root, and no recorded writer may hold it in either pool. It publishes a durable `oxide.outputs.prune-resolution/1` receipt and records `resolved-by-operator` in the checkout receipt under the same custody ordering. Completed resolution rows are removed from live selection only after that proof; unfinished intents and resolutions are safety journals that are never compacted.
 - **Forward format.** Prune establishes the shared forward fence first: numeric state version 3 with `owned_outputs: "oxide.outputs/2"`, receipt `oxide.outputs.transition/2` (one `target` placement member in this tranche) and marker `oxide.outputs.root/2` with the root nonce. The internal control records `initializing` then `ready` durably before the paired removable control, and only then is `outputs/registry.json` (`oxide.outputs.registry/1`, numeric schema 1) created exclusively. Version-2 root markers also record the checkout's volume UUID. Initialization, and resuming an `initializing` record, first requires positive writer closure across both pools with both admission locks held together: no active or held command record, no lost slot with unclosed writers and no clean barrier other than the initializing checkout's own. A quarantined lost slot whose holder predates the current boot session is closed by the restart and does not block initialization; it is released and deleted whole at the next admission, through the same volume-bound path (oxide#161). An older binary's in-flight command is a record in the same state, so it must close first; otherwise initialization refuses and nothing is written. A newly paired or reappearing removable control is fenced under the same check. Every paired-control branch accepts exactly the released `oxide.outputs/1` fence and the published `oxide.outputs/2` fence as predecessors of the successor fence, plus an absent fence where the control may be new, so a pool fenced by a released binary is never migrated by one branch and refused as unknown by another; any other value refuses at the shared state parser before any effect (oxide#159). A missing, unreadable, foreign or sticky-incomplete registry refuses mutation and keeps every root; it is never rebuilt from markers. Version-1 state and the version-1 receipt shape remain readable as legacy, the latter only on the prune paths above; a legacy root has no nonce and is never given one from a missing root's receipt. A prune publishes a kept root's receipt never, and a pruned root's receipt only through its existing terminal transaction (see the version-1 bullet). The numeric state version advances only with the `oxide.outputs/2` fence or its initialization record: an ordinary mutation of a pool that has not opted into owned outputs keeps the previous numeric version, and a released `oxide.outputs/1` fence does not itself advance it, so an older binary is not refused merely because a build ran. A pool whose state records `ready` but whose registry file is missing refuses every mutation and prune keeps every root; the registry is never recreated from markers or receipts. A pool adopted before this format has no registry: `oxide outputs adopt` and `oxide outputs detach` with an existing receipt initialize it behind the fence (under that closure rule) before their first receipt write, and a command's own transition or replay refuses before any effect, naming that upgrade, because a command holding a slot is itself an open writer.
@@ -5056,6 +5058,202 @@ The stable, read-only interface other tools use to find the registered Builds dr
   owner scheduler headroom, independent source-fit and separate activation.
   This does not qualify
   oxide#133's affected checkout-detach path or authorize a live prune.
+
+- **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
+  is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under the
+  qualified shared supervisor `bc24b238…`, the merged oxide#151 guard) with
+  `--root-parent /private/tmp`, the owner-accepted internal-placement exception
+  (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data
+  volume, and the fixture's directory-budget pool is a genuine internal pool.
+  Prospective, UNMEASURED fit: 300 seconds, 512 MiB monitored scratch including
+  cleanup, one owned 128 MiB image as both the ownership and the non-Data
+  control, staging at two Cargo jobs, and the private pool bootstrap's ONE
+  product Cargo child (its own process group, two jobs, its time and scratch
+  declared in the same allocation; no other fixture runs Cargo). Its seven cases
+  prove a MIXED batch — a registered profile group and a listed receiptless
+  legacy root, each with multiple missing ancestors on Data, are candidates while
+  a marker-recorded conflicting checkout volume and a symlinked ancestor are
+  ordinary per-root keeps in the same complete snapshot — completing one real
+  private prune through the journal, terminal receipts and tombstones with no
+  intent left and both kept roots byte-identical; the exact list still being
+  required; a missing ancestor below the attached mount kept by the leaf-only
+  rule and an absent mount name kept in both `/Volumes` spellings; a non-directory
+  component kept with unchanged bytes; an existing ancestor replaced by a
+  different empty directory after the real run's own snapshot refused by the
+  witness comparison (with checkout recreation refused as present as its distinct
+  control, and the exclusively created fixture marker reset and bound to each
+  race's own root); the debug-only `OXIDE_TEST_PRUNE_EACCES` injection firing and
+  keeping its root against a positively proven uninjected control, with no real
+  unreadable directory; the unknown-custody fault keeping the whole batch with
+  the kept root's group rows, receipt bytes and registry bytes unchanged; and, on
+  a positively absent missing-chain candidate, another checkout's live reference
+  keeping it as ONE per-root keep in a complete snapshot while a mismatched group
+  identity and a mismatched receipt each refuse the whole batch — every control
+  leaving no intent, quarantine, tombstone or changed root byte. Every negative
+  case asserts the exact source sentence that refused it and unchanged root
+  bytes, and no case claims arbitrary-creator exclusion.
+  Child custody is latched before any fallible cleanup and applies to EVERY
+  child, not only an armed one: a signalled exit, any of the product's own
+  unconfirmed-closure sentences (also swept from each child's recorded stderr),
+  a killed or unreaped child, an unconfirmed helper closure, a non-empty session
+  or any recorded custody fault marks the run's closure unknown, and ONE shared
+  decision then refuses the ordinary detach (the backing is kept) and stops
+  diagnostic continuation — and SETUP stops at the first latched fault, before
+  any image attach, registration or fixture. Every restore (image mount
+  directory, registry bytes, receipt bytes, checkout chains) goes through the
+  same gate, so no fixture is written beside an unclassified writer group, and a
+  classified child fault stops the run before its next fixture effect. That
+  bookkeeping covers only the children this script started and is never
+  presented as a process census, and the ORDER is stated honestly: the proof
+  detaches from its own children's outcomes and exits, while the qualified
+  supervisor's session census runs only after its leader has ended — so that
+  census is authoritative for the run's reported closure but cannot retroactively
+  retain an image the proof already detached, and no such retention is claimed. A
+  writer that escaped its parent's group is outside the cooperative custody
+  boundary both this proof and the product document. The detach itself follows
+  the Oxide Supervisor's pre-detach protocol (shared `ImageCustody` in
+  `scripts/test-outputs-prune.py`, opt-in so the other proofs keep their
+  historical behaviour): the image is positively rebound from a fresh
+  `hdiutil info` for THIS backing and a fresh `diskutil info` for its bound
+  device (backing path inside the never-auto-cleaned evidence directory, mounted
+  entity, bound device, volume UUID and whole-disk device), with the backing's
+  recorded `(dev, ino, size)` identity — taken at attach and kept on the custody
+  object — compared at that rebind AND again immediately before the pathname
+  removal, so a replaced backing is retained and never unlinked by name; the
+  proof's own session is censused with a bounded readable `kinfo_proc` snapshot where only
+  the script itself may appear, ONE ordinary `hdiutil detach` of the bound
+  device runs (never `-force`, never retried), the mount and device must then be
+  positively absent, the session is censused again, and only after both clean
+  censuses is the evidence backing removed and
+  `removed-after-clean-pre/post-census-and-ordinary-detach` recorded. An extra
+  member, an unreadable row, a row-bound hit, a rebind mismatch, a failed detach
+  (including EBUSY) or a lingering device all retain the image, its backing and
+  its record, with the members recorded. A process that calls `setsid` leaves
+  the proof's session and is outside the census — the coordinator's own residual
+  limitation — so no claim is made that such a writer is observed.
+
+  **Authority and fit reconciliation (pre-detach protocol).** The protocol and
+  its in-process census are adopted under ROOT's proof-custody apparatus
+  clarification (brief v8), which itself records the Oxide Supervisor's #135
+  ruling. It is proof-side custody observation only: it adds no supervisor (the
+  fixed `scripts/bounded-test.py` remains the sole supervisor), no product seam,
+  no persisted format, no watchdog or signal timer, and it never signals or kills
+  a census member. `ImageCustody` stays opt-in: a caller that does not select the
+  protocol receives the historical attach behaviour exactly — no `diskutil`
+  volume probe and no new record fields — and may not take a custodied detach
+  (`refused:no-protocol`).
+
+  Every identity compared at the rebind is the ORIGINAL attach-time observation:
+  image path, backing `(dev, ino, size)`, whole-disk device, mount and volume
+  UUID. A missing original identity is Unknown and is never filled in from a
+  fresh detach-time observation; a whole disk or volume UUID that differs from
+  the attached one refuses; the backing's original identity is re-checked again
+  immediately before the pathname removal, and only then is a backing inside the
+  evidence directory removed. The guard's own post-leader census remains separate
+  closure evidence and never authorizes a backing removal in an unknown branch,
+  and no backing is ever placed in guard scratch.
+
+  The prospective fit absorbs all of it inside the published envelope — the
+  detach phase carries the rebind probes (two bounded read-only `hdiutil info` /
+  `diskutil info` calls) and the two bounded censuses (30 s of the 300 s, with the
+  supervisor contingency reduced to 20 s; 512 MiB unchanged) — and remains
+  UNMEASURED. Outstanding ROOT-owned activations: the uncounted diagnostic, the
+  counted author native and the distinct counted reviewer native are each still
+  unactivated, so no native credit exists at any head and the Elevated merge hold
+  stays. Heavy admission is tested normally at activation; the earlier
+  "Queue #381 pending" note is withdrawn. A child that is still
+  running is waited for, never mistaken for a stuck one: the armed races mutate
+  the fixture while the product is inside its own 11-second delay. Each
+  state-mutating case puts its own fixture back (checkout chain, replaced
+  ancestor, vanished child, registry and receipt bytes) so a later batch sees
+  exactly its own candidate, and NO fixture is touched while custody is unknown —
+  that state is retained for the next operator and the collection aborts. An
+  uncontrolled candidate set aborts the collection instead of being read as a
+  case result. The uncounted diagnostic records each case and continues only into
+  the two read-only cases after a recoverable failure; every other case mutates
+  shared fixture or authority state, so its failure aborts rather than
+  continuing into a state this run cannot prove. The pure check also parses this
+  script's own source: the dispatcher must match the published case table in
+  order, and every helper whose value is unpacked must be unpacked into the
+  number of values it returns.
+  `effigy rust:prune-absence:diagnostic` is the same guard, root, image and
+  limits with `--diagnostic`: an uncounted keep-going collection with a bounded
+  `qualified: false` receipt in the evidence directory, never a counted PASS.
+  `effigy proof:prune-absence:test` runs only the pure `--self-check`: the real
+  oracles, the mount-spelling classifier and the case/allocation table with
+  in-memory counterfactuals, staging nothing and starting no child. The script's
+  docstring carries the nine-premise dispositions and the authoritative case
+  table. **No native has run at any head**: the author's diagnostic, counted
+  author and distinct counted reviewer natives are each separately
+  owner-activated (ELEVATED: this changes deletion authority), so its fit is
+  unmeasured and this is not a benchmark or an alias for full QA. No live prune,
+  host install, mode, settings or consumer change is authorized by this
+  implementation.
+
+  **Spent native start (preserved, not credit).** Under an explicit ROOT
+  activation the ONE uncounted diagnostic ran once at `fe3228b` and stopped with
+  exit 1: guard receipt `44ec0dab…` (run_id `b1907e58753d75b6c0b91a61f7803349`,
+  closure closed, status 1, **no deadline**, 48.37 s of 300 s, reserve minimum
+  2221.2 GiB over 191 samples, owned peak 279.2 MiB of 512 MiB, post-leader census
+  certain with zero members and zero uncertain) and proof receipt `40037b5c…`
+  under `/private/tmp/oxide-proof.l82e88u0/evidence`, both kept untouched. Five
+  cases completed and produced the first native evidence of the protocol: the one
+  real private prune deleted two roots whose checkout was positively absent (a
+  registered Data missing-chain profile group and a receiptless legacy Data
+  missing-chain root; `0` by exact intent replay) while the SAME complete batch
+  kept six live checkouts plus a recorded-volume conflict
+  (`…not on the checkout's recorded volume`) and a symlinked ancestor
+  (`…not a directory`); the image-custody record `e3bbb547…` shows the full
+  pre-detach protocol completed end to end (original identity rebind, clean
+  pre/post session censuses, ordinary device detach, positive absence, backing
+  removed only then, no stale volume, image or process). `witness-races` then
+  failed on a FIXTURE ORACLE, not on the product: the recreate race's real run
+  correctly refused under publication custody with "the checkout reappeared
+  before the prune" and "every candidate root was kept by a fresh check before
+  its intent; no output root was changed" (root unchanged, no intent, exit 2),
+  while the oracle demanded the dry-run eligibility sentence "the checkout is
+  present, so its root is kept". The oracle is now the pure `race_refusal_ok`
+  predicate (both real-run sentences required, the eligibility keep explicitly
+  rejected) with a pure counterfactual built from the spent run's own recorded
+  text, and the live-checkout keep keeps its separate `dry_run_live_keep`
+  oracle. That start is SPENT: it is not a counted PASS and grants no credit. The
+  author's counted native, the distinct counted reviewer native and any fresh
+  diagnostic each still need their own ROOT activation after an independent
+  exact-head source-fit review.
+
+  **Second spent native start and the group-mismatch fixture (preserved, not
+  credit).** A second, separately activated uncounted diagnostic ran once at
+  `c8fd10b` and stopped with exit 1: guard receipt `5f9697bf…` (run_id
+  `c94e227c05fc987784aadf7378ee0154`, closed, status 1, **no deadline**, 51.62 s
+  of 300 s, reserve minimum 2221.32 GiB over 204 samples, owned peak 278.84 MiB
+  of 512 MiB, post-leader census certain with zero members) and proof receipt
+  `4ba6241c…` under `/private/tmp/oxide-proof.cz_9ao0b/evidence`, both kept. Six
+  of seven cases COMPLETED, including the whole `data-missing-chains` mixed batch
+  with its real prune, the mount/volume boundaries, the scoped EACCES pair, the
+  kept-group custody refusal, the corrected `witness-races` (its real-run refusal
+  `the checkout reappeared before the prune` plus
+  `every candidate root was kept by a fresh check before its intent; no output
+  root was changed` matched the oracle, `prune135-033/034.stdout`), and the
+  competing-owner per-root keep (`another checkout's live reference also names
+  this root`, complete snapshot, zero candidates). The image-custody record
+  `e2f61dca…` again shows the full pre-detach protocol end to end. The run then
+  failed on the `competing-owner-and-mismatch` fixture, not on the product: the
+  group sub-control edited a selected row's `nonce`, which the earlier
+  receipt-placement cross-check (`prune.rs:2435-2454`, exactly one selected row
+  per checkout/member/root with the same `generation` and `nonce`) catches before
+  the selected-group identity loop (`prune.rs:2478-2490`) can run, so the batch
+  was correctly refused as incomplete authority but with
+  "a receipt reference is missing or contradictory in the registry"
+  (`prune135-035.stdout 8bb1abb6…`) instead of the group sentence. The fixture
+  now edits a genuinely GROUP-ONLY field, `root_ino` — the receipt's `Selected`
+  reference carries only kind, root, volume_uuid, nonce and generation, so no
+  receipt reference changes and only the group gate can fire — the group oracle
+  keeps requiring exactly `selected group references disagree about root
+  identity` with zero candidates and no effect, the separate receipt sub-control
+  keeps requiring `the registry row does not match the checkout's committed
+  receipt`, and a pure counterfactual proves both edits and both distinct
+  sentences (each oracle rejects the other's). That start is SPENT and is not
+  credit.
 
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.
 - **Tombstones.** After a positive completion (both the registry terminal state and the receipt's terminal state committed), the completed row and the settled intent leave the live registry in one revision, and a diagnostic entry is appended best effort to `outputs/tombstones.json` (`oxide.outputs.tombstones/1`, at most 16,384 entries and 4 MiB, oldest compacted first). The ring is never a safety journal or a live cap; unfinished intents and reservations stay in the registry and are never compacted. A recreated root always gets a fresh nonce.

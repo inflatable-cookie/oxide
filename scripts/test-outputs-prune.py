@@ -821,6 +821,135 @@ def parse_attach_entities(document: bytes, expected_mount: str) -> dict:
     }
 
 
+# The bounded, readable pre-detach custody protocol (Oxide Supervisor #135
+# ruling). A detach is refused unless the image is positively rebound and this
+# proof's own session is clean before AND after it.
+CENSUS_MAX_ROWS = 4096
+MAX_PROBE_BYTES = 256 * 1024
+# Ordinary detach only. `-force` is unreachable by construction: it is not in
+# the program tuple and a device argument is never a flag.
+DETACH_PROGRAM = ("/usr/bin/hdiutil", "detach")
+
+
+def detach_argv(device: str) -> list:
+    """The one ordinary detach command: the BOUND DEVICE, never `-force`."""
+    if not device.startswith("/dev/") or device.count("/") != 2:
+        raise ValueError(f"{device!r} is not a bound device path")
+    return [*DETACH_PROGRAM, device]
+
+
+def census_reader():
+    """The guard's own bounded, readable process snapshot (read-only reuse).
+
+    `scripts/bounded-test.py` is the qualified supervisor. Importing its
+    `Kinfo` layout (self-checked against this process) is not a second
+    supervisor: it gives this proof the same readable `kinfo_proc` rows the
+    guard censuses with. On any other platform the import fails and the census
+    is UNREADABLE, which is unknown and keeps the image.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "census_guard", os.path.join(HERE, "bounded-test.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.Kinfo.check()
+    return module.Kinfo
+
+
+def bounded_session_census(owner_pid: int, allowed, snapshot=None, getsid=None) -> dict:
+    """Bounded readable census of THIS proof's own session.
+
+    The guard's leader `setsid`s and execs the proof, so the proof is the
+    session leader and its own session is exactly itself and its descendants.
+    Only `owner_pid` and the pids this proof positively reaped may be present.
+    An extra member, a row over the bound, a failed snapshot and any unreadable
+    or contradictory read are UNKNOWN — never a clean result.
+    """
+    allowed_set = {pid for pid in allowed if type(pid) is int and pid > 0}
+    if type(owner_pid) is not int or owner_pid <= 0:
+        return {"certain": False, "members": [], "extra": [], "reason": "no owner pid"}
+    reader = getsid or os.getsid
+    if snapshot is None:
+        try:
+            kinfo = census_reader()
+            rows = kinfo.all()
+            reread = kinfo.one
+        except BaseException as error:
+            return {
+                "certain": False,
+                "members": [],
+                "extra": [],
+                "reason": f"census snapshot is unreadable ({type(error).__name__}: {error})",
+            }
+    else:
+        try:
+            rows = snapshot()
+        except BaseException as error:
+            return {
+                "certain": False,
+                "members": [],
+                "extra": [],
+                "reason": f"census snapshot is unreadable ({type(error).__name__}: {error})",
+            }
+        reread = None
+    if not isinstance(rows, (list, tuple)):
+        return {"certain": False, "members": [], "extra": [], "reason": "census snapshot is malformed"}
+    if len(rows) > CENSUS_MAX_ROWS:
+        return {
+            "certain": False,
+            "members": [],
+            "extra": [],
+            "reason": f"census hit its {CENSUS_MAX_ROWS}-row bound ({len(rows)} rows)",
+        }
+    members, extra = [], []
+    for row in rows:
+        pid = row.get("pid") if isinstance(row, dict) else None
+        if type(pid) is not int or pid <= 0:
+            return {"certain": False, "members": members, "extra": extra, "reason": "a census row is malformed"}
+        if pid in allowed_set:
+            members.append(pid)
+            continue
+        try:
+            session = reader(pid)
+        except ProcessLookupError:
+            # Gone between the snapshot and this read: ONE confirmation read.
+            if reread is None or reread(pid) is None:
+                continue
+            return {
+                "certain": False,
+                "members": members,
+                "extra": extra,
+                "reason": f"pid {pid} is still present after ESRCH",
+            }
+        except BaseException as error:
+            return {
+                "certain": False,
+                "members": members,
+                "extra": extra,
+                "reason": f"census read for pid {pid} failed ({type(error).__name__}: {error})",
+            }
+        if session == owner_pid:
+            extra.append(pid)
+    return {
+        "certain": not extra,
+        "members": sorted(members),
+        "extra": sorted(extra),
+        "reason": None if not extra else "extra session members",
+    }
+
+
+class DetachCustody:
+    """What the pre-detach protocol needs from the calling proof."""
+
+    def __init__(self, owner_pid: int, allowed_pids, volume_uuid: str, census=None):
+        self.owner_pid = owner_pid
+        self.allowed_pids = tuple(allowed_pids)
+        self.volume_uuid = volume_uuid
+        self.census = census or (
+            lambda owner, allowed: bounded_session_census(owner, allowed)
+        )
+
+
 class CustodyEffects:
     """The filesystem and hdiutil effects image custody needs, so the pure
     selector can drive this real seam with in-memory stubs."""
@@ -874,6 +1003,70 @@ class CustodyEffects:
     def detach(self, mount: str) -> tuple:
         detached = subprocess.run(
             ["/usr/bin/hdiutil", "detach", mount],
+            capture_output=True,
+            timeout=min(60, permanent.work_left()),
+        )
+        return detached.returncode, detached.stderr.decode(errors="replace")
+
+    def image_entities(self, backing: str) -> list:
+        """Fresh `hdiutil info` entities for THIS backing file, bounded.
+
+        A failed, oversized, malformed or ambiguous read raises: the caller then
+        keeps the image and records no detach.
+        """
+        reported = subprocess.run(
+            ["/usr/bin/hdiutil", "info", "-plist"],
+            capture_output=True,
+            timeout=min(60, permanent.work_left()),
+        )
+        if reported.returncode or len(reported.stdout) > MAX_PROBE_BYTES:
+            raise RuntimeError("hdiutil info is unavailable or oversized; attachment is unknown")
+        try:
+            document = plistlib.loads(reported.stdout)
+        except Exception as error:
+            raise RuntimeError(f"hdiutil info is malformed ({type(error).__name__})") from error
+        images = document.get("images")
+        if not isinstance(images, list):
+            raise RuntimeError("hdiutil info names no images; attachment is unknown")
+        matching = [
+            image
+            for image in images
+            if isinstance(image, dict) and image.get("image-path") == backing
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"hdiutil info names {len(matching)} images for this backing, not one"
+            )
+        entities = matching[0].get("system-entities")
+        if not isinstance(entities, list) or not entities:
+            raise RuntimeError("the attached image has no system entities")
+        return entities
+
+    def volume_facts(self, device: str) -> dict:
+        """The attached volume's UUID and whole-disk device, read read-only."""
+        reported = subprocess.run(
+            ["/usr/sbin/diskutil", "info", "-plist", device],
+            capture_output=True,
+            timeout=min(60, permanent.work_left()),
+        )
+        if reported.returncode or len(reported.stdout) > MAX_PROBE_BYTES:
+            raise RuntimeError(f"diskutil info for {device} is unavailable or oversized")
+        try:
+            document = plistlib.loads(reported.stdout)
+        except Exception as error:
+            raise RuntimeError(f"diskutil info for {device} is malformed ({type(error).__name__})") from error
+        uuid = document.get("VolumeUUID")
+        if document.get("WholeDisk") is True:
+            whole = device
+        else:
+            parent = document.get("ParentWholeDisk")
+            whole = f"/dev/{parent}" if isinstance(parent, str) and parent else ""
+        return {"uuid": uuid or "", "whole_disk": whole}
+
+    def detach_device(self, device: str) -> tuple:
+        """One ordinary detach of the BOUND DEVICE. `-force` is never used."""
+        detached = subprocess.run(
+            detach_argv(device),
             capture_output=True,
             timeout=min(60, permanent.work_left()),
         )
@@ -951,9 +1144,13 @@ class ImageCustody:
     guard's never-auto-cleaned evidence directory, allocated BEFORE attachment,
     with exactly one recorded ordinary-detach disposition."""
 
-    def __init__(self, name: str, effects=REAL_CUSTODY_EFFECTS):
+    def __init__(self, name: str, effects=REAL_CUSTODY_EFFECTS, custody_protocol: bool = False):
         self.name = name
         self.effects = effects
+        # Opt-in. A caller that does not select the pre-detach protocol keeps the
+        # historical attach behaviour exactly: no volume probe, no new record
+        # fields, and no custodied detach.
+        self.custody_protocol = custody_protocol is True
         self.expected_mount = f"/Volumes/{name}"
         self.evidence = ""
         self.backing = ""
@@ -961,6 +1158,12 @@ class ImageCustody:
         self.attach_document = ""
         self.mount = ""
         self.device = ""
+        self.volume_uuid = ""
+        self.whole_disk = ""
+        # The backing's own (dev, ino, size) at attach: the rebind and the
+        # removal both compare it, so a replaced backing is never removed by
+        # pathname alone.
+        self.backing_identity: dict | None = None
         self.state = "unallocated"
         self.disposition: str | None = None
         self.notes: list[str] = []
@@ -1036,16 +1239,116 @@ class ImageCustody:
             raise Aborted(f"image attach is unknown; backing kept: {error}") from error
         self.mount = facts["mount"]
         self.device = facts["device"]
+        self.backing_identity = identity
+        recorded = {}
+        if self.custody_protocol:
+            # The ORIGINAL volume identity the pre-detach rebind compares with.
+            # A missing reading here stays missing: it is never filled in later
+            # from a fresh detach-time observation.
+            try:
+                volume = self.effects.volume_facts(self.device)
+                self.volume_uuid = volume.get("uuid") or ""
+                self.whole_disk = volume.get("whole_disk") or ""
+            except BaseException as error:
+                self.notes.append(f"volume facts unavailable at attach: {error}")
+            recorded = {
+                "volume_uuid": self.volume_uuid or None,
+                "whole_disk": self.whole_disk or None,
+            }
         self._write(
             "attached",
             backing_identity=identity,
             attach_entities=facts["entities"],
             attach_device_entries=facts["device_entries"],
+            **recorded,
         )
         return self.mount
 
-    def detach_once(self, sessions_closed: bool) -> str:
-        """One recorded ordinary-detach disposition; never replays an attempt."""
+    def bind_for_detach(self, custody) -> dict:
+        """Positively rebind the image immediately BEFORE any detach.
+
+        The backing path, the mounted entity for THAT backing, the bound device
+        and the volume UUID are all read fresh and matched against the attach
+        facts and the caller's expected volume UUID. Anything unknown raises:
+        the caller then keeps the image, its backing and its record.
+        """
+        if not self.custody_protocol:
+            raise Aborted("the pre-detach protocol is not selected for this image")
+        if (
+            self.backing_identity is None
+            or not self.volume_uuid
+            or not self.whole_disk
+            or not self.mount
+            or not self.device
+        ):
+            raise Aborted(
+                "the attach-time image identity is incomplete; a missing original is"
+                " never filled in from a fresh observation"
+            )
+        identity = self.verify_backing()
+        if not self.evidence or os.path.dirname(self.backing) != self.evidence:
+            raise Aborted(
+                f"the image backing {self.backing} is not inside the verified evidence directory"
+            )
+        if identity != self.backing_identity:
+            raise Aborted(
+                f"the image backing {self.backing} is not the object attached"
+                f" ({identity} != {self.backing_identity})"
+            )
+        entities = self.effects.image_entities(self.backing)
+        if len(entities) > MAX_ATTACH_ENTITIES:
+            raise Aborted("the image reports more entities than the bound")
+        mounted = [
+            entity
+            for entity in entities
+            if isinstance(entity, dict)
+            and entity.get("mount-point")
+            and entity.get("dev-entry")
+        ]
+        if len(mounted) != 1:
+            raise Aborted(f"the attached image has {len(mounted)} mounted entities, not one")
+        mount = mounted[0]["mount-point"]
+        device = mounted[0]["dev-entry"]
+        if mount != self.mount or mount != self.expected_mount:
+            raise Aborted(f"the image is mounted at {mount!r}, not its owned {self.mount!r}")
+        if device != self.device:
+            raise Aborted(f"the image's bound device is {device!r}, not the attached {self.device!r}")
+        volume = self.effects.volume_facts(device)
+        if volume.get("uuid") != self.volume_uuid:
+            raise Aborted(
+                f"the image volume UUID {volume.get('uuid')!r} is not its attached"
+                f" {self.volume_uuid!r}"
+            )
+        if custody.volume_uuid and custody.volume_uuid != self.volume_uuid:
+            raise Aborted(
+                f"the expected volume UUID {custody.volume_uuid!r} is not the attached"
+                f" {self.volume_uuid!r}"
+            )
+        whole = volume.get("whole_disk") or ""
+        if not whole or whole != self.whole_disk:
+            raise Aborted(
+                f"the image's whole-disk device {whole!r} is not its attached"
+                f" {self.whole_disk!r}"
+            )
+        return {
+            "backing": self.backing,
+            "mount": mount,
+            "device": device,
+            "whole_disk": whole,
+            "volume_uuid": volume["uuid"],
+            "identity": identity,
+        }
+
+    def detach_once(self, sessions_closed: bool, custody=None) -> str:
+        """One recorded ordinary-detach disposition; never replays an attempt.
+
+        With `custody` (a DetachCustody) the pre-detach protocol runs: rebind,
+        a clean pre-detach census, ONE ordinary detach of the bound device, a
+        positive mount/device absence check, a clean post-detach census, and only
+        then the backing removal. Any unknown or failure retains the image and
+        its backing in the evidence directory and records the members. The
+        legacy path without `custody` is unchanged for the other proofs.
+        """
         if self.disposition is not None:
             self.notes.append(f"detach replay refused (already {self.disposition})")
             return self.disposition
@@ -1060,6 +1363,13 @@ class ImageCustody:
             self.notes.append("sessions were not positively closed, so no detach ran and the backing is kept")
             self._write("unknown", detach_refused="unclosed-sessions")
             return self.disposition
+        if custody is not None:
+            if not self.custody_protocol:
+                return self._retain(
+                    "refused:no-protocol",
+                    "a custodied detach was requested for an image without the protocol",
+                )
+            return self._detach_custodied(custody)
         self.disposition = "attempted"
         self._write("attached")
         code, stderr = self.effects.detach(self.mount)
@@ -1081,6 +1391,106 @@ class ImageCustody:
         except OSError as error:
             self.notes.append(f"the backing was kept after a completed detach ({error})")
         self._write("detached")
+        return self.disposition
+
+    def _retain(self, disposition: str, reason: str, **extra) -> str:
+        """Keep the image, its backing and its record; record why and the members."""
+        self.disposition = disposition
+        self.notes.append(reason)
+        self._write("unknown", detach_refused=reason[:400], **extra)
+        return self.disposition
+
+    def _detach_custodied(self, custody) -> str:
+        try:
+            facts = self.bind_for_detach(custody)
+        except BaseException as error:
+            return self._retain("refused:unbound", f"the image could not be rebound ({error})")
+        pre = custody.census(custody.owner_pid, custody.allowed_pids)
+        if not pre.get("certain") or pre.get("extra"):
+            return self._retain(
+                "refused:census",
+                f"the pre-detach census is not clean ({pre.get('reason')})",
+                census="pre",
+                census_members=pre.get("members", []),
+                census_extra=pre.get("extra", []),
+            )
+        self.disposition = "attempted"
+        self._write(
+            "attached",
+            detach_device=facts["device"],
+            volume_uuid=facts["volume_uuid"],
+            whole_disk=facts["whole_disk"],
+            census="pre-clean",
+            census_members=pre.get("members", []),
+        )
+        code, stderr = self.effects.detach_device(facts["device"])
+        if code != 0:
+            # EBUSY or any other failure: retain, never retry, never -force.
+            return self._retain(
+                "retained:detach-failed",
+                f"the ordinary detach of {facts['device']} failed (code {code})",
+                detach_stderr=stderr[:400],
+                census="pre-clean",
+                census_members=pre.get("members", []),
+            )
+        lingering = [
+            path
+            for path in (facts["mount"], facts["device"], facts["whole_disk"])
+            if path and self.effects.exists(path)
+        ]
+        if lingering:
+            return self._retain(
+                "retained:lingering",
+                f"the ordinary detach left {lingering} present",
+                census="pre-clean",
+                census_members=pre.get("members", []),
+            )
+        post = custody.census(custody.owner_pid, custody.allowed_pids)
+        if not post.get("certain") or post.get("extra"):
+            return self._retain(
+                "retained:post-census",
+                f"the post-detach census is not clean ({post.get('reason')})",
+                census="post",
+                census_members=post.get("members", []),
+                census_extra=post.get("extra", []),
+            )
+        # Only now, after the rebind, the bound ordinary detach, the positive
+        # absence check and BOTH clean censuses, is the backing removed — and
+        # only while it is still the SAME object that was attached and rebound,
+        # never by pathname alone.
+        if self.backing_identity is not None:
+            try:
+                current = self.verify_backing()
+            except BaseException as error:
+                return self._retain(
+                    "retained:backing-identity",
+                    f"the backing identity cannot be re-read before its removal ({error})",
+                    census="pre-clean,post-clean",
+                    census_members=post.get("members", []),
+                )
+            if current != self.backing_identity:
+                return self._retain(
+                    "retained:backing-identity",
+                    f"the backing is not the attached object ({current} != {self.backing_identity})",
+                    census="pre-clean,post-clean",
+                    census_members=post.get("members", []),
+                )
+        try:
+            self.effects.remove(self.backing)
+            removed = "removed-after-clean-pre/post-census-and-ordinary-detach"
+        except OSError as error:
+            removed = f"kept: backing removal failed ({error})"
+        self.disposition = "completed"
+        self.notes.append("ordinary detach completed; both censuses clean")
+        self._write(
+            "detached",
+            detach_device=facts["device"],
+            volume_uuid=facts["volume_uuid"],
+            whole_disk=facts["whole_disk"],
+            census="pre-clean,post-clean",
+            census_members=post.get("members", []),
+            backing=removed,
+        )
         return self.disposition
 
 

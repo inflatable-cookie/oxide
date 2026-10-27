@@ -1671,6 +1671,9 @@ struct Evaluated {
     candidate: Option<Candidate>,
     kept: Option<String>,
     legacy: bool,
+    /// The real run's own ephemeral absence evidence for this root. It is not
+    /// part of the preview or any other serialized document.
+    evidence: Option<SnapshotEvidence>,
 }
 
 /// The authority result is distinct from per-root eligibility. A partial
@@ -1960,7 +1963,16 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     // the batch continues; only a journaled intent stops it.
     let mut refusals: Vec<(PathBuf, String)> = Vec::new();
     for candidate in &fresh.candidates {
-        match prune_one(&store, &control, candidate, sha, list.as_ref()) {
+        // The real run's own ancestry witness is the baseline every later
+        // proof is compared with. A candidate without one is never pruned.
+        let Some(evidence) = evidence_for(&evaluated, candidate) else {
+            refusals.push((
+                candidate.root.clone(),
+                "the real run holds no ancestry witness for this root".to_owned(),
+            ));
+            continue;
+        };
+        match prune_one(&store, &control, candidate, sha, list.as_ref(), evidence) {
             Ok(()) => outcomes.push((candidate.clone(), None)),
             Err(Stop::Pending(reason)) => {
                 let _ = write_observations(
@@ -2032,6 +2044,25 @@ fn partial(completed: &[PathBuf], kept: &str) -> u8 {
         completed.len()
     );
     0
+}
+
+/// The real run's own ephemeral absence evidence for one fresh candidate. It
+/// is looked up in the snapshot that produced the candidate, so the plan's
+/// bytes never have to carry an ancestry witness.
+fn evidence_for<'a>(
+    evaluated: &'a Evaluation,
+    candidate: &Candidate,
+) -> Option<&'a SnapshotEvidence> {
+    evaluated
+        .iter()
+        .find(|entry| {
+            entry.candidate.as_ref().is_some_and(|current| {
+                current.checkout_id == candidate.checkout_id
+                    && current.member == candidate.member
+                    && current.root == candidate.root
+            })
+        })
+        .and_then(|entry| entry.evidence.as_ref())
 }
 
 fn same_candidates(plan: &[&Candidate], fresh: &[&Candidate]) -> bool {
@@ -2236,6 +2267,7 @@ fn evaluate(
                 .map(|row| Evaluated {
                     row,
                     candidate: None,
+                    evidence: None,
                     kept: Some(
                         "the registry exceeds the snapshot receipt cap; the whole batch is kept"
                             .to_owned(),
@@ -2286,7 +2318,9 @@ fn evaluate(
             candidate: None,
             kept: None,
             legacy: row.nonce.is_none(),
+            evidence: None,
         };
+        let mut evidence = None;
         let reason = if snapshot_error.is_some() {
             Ok(Some("the registry snapshot is incomplete".to_owned()))
         } else {
@@ -2299,6 +2333,7 @@ fn evaluate(
                 list,
                 &mut budget,
                 false,
+                &mut evidence,
             )
         };
         match reason {
@@ -2322,6 +2357,7 @@ fn evaluate(
                 if facts.legacy {
                     out.legacy = true;
                 }
+                out.evidence = evidence;
                 out.candidate = Some(Candidate {
                     checkout_id: row.checkout_id.clone(),
                     checkout: row.checkout.clone(),
@@ -2373,9 +2409,12 @@ fn evaluate(
                     .kept
                     .as_deref()
                     .unwrap_or("receiptless authority is unknown");
+                // Ordinary path ineligibility is a per-root keep, never an
+                // incomplete-authority verdict for the whole batch.
                 if reason != "the checkout is present, so its root is kept"
                     && reason != "an active writer still holds this checkout"
                     && !reason.starts_with("a recorded writer still holds this checkout (")
+                    && !reason.starts_with("checkout absence is unknown (")
                 {
                     snapshot_error.get_or_insert_with(|| reason.to_owned());
                 }
@@ -2554,6 +2593,7 @@ fn eligibility(
     list: Option<&OperatorList>,
     _budget: &mut u64,
     under_barrier: bool,
+    evidence: &mut Option<SnapshotEvidence>,
 ) -> Result<Option<String>, String> {
     if !registry.complete {
         return Ok(Some(
@@ -2643,16 +2683,32 @@ fn eligibility(
             "the root is not an external owned output root".to_owned(),
         ));
     }
-    // Checkout absence: no-follow walk, actual leaf ENOENT only.
-    match checkout_absence(row, listed) {
-        Ok(Absence::Absent) => {}
+    // Checkout absence: a no-follow descriptor walk. The operator list can
+    // only ever admit the genuine legacy exception (a listed row that
+    // predates the version-2 identity); every other row proves its own
+    // recorded checkout volume, and no row's volume requirement is waived.
+    let legacy_exception = listed && legacy;
+    match checkout_absence(row, legacy_exception) {
+        Ok(Absence::Absent(witness)) => {
+            *evidence = Some(SnapshotEvidence {
+                witness: *witness,
+                legacy_exception,
+            });
+        }
         Ok(Absence::Present) => {
             return Ok(Some(
                 "the checkout is present, so its root is kept".to_owned(),
             ))
         }
         Ok(Absence::Unknown(reason)) | Err(reason) => {
-            return Err(format!("checkout absence is unknown ({reason})"))
+            // Ordinary path ineligibility keeps THIS root and nothing else:
+            // an unprovable path is not an untrustworthy snapshot. Incomplete
+            // required authority (a missing, malformed or contradictory
+            // receipt or registry, or unknown writer custody) still refuses
+            // the whole batch where it is found.
+            return Ok(Some(format!(
+                "checkout absence is unknown ({reason}), so its root is kept"
+            )));
         }
     }
     // Writer custody across both pools, and library ledger holders. A
@@ -2727,136 +2783,258 @@ impl Row {
     }
 }
 
+/// Positive absence of a checkout, and the ancestry the run observed to prove
+/// it. A witness is ephemeral: it is never serialized into a registry,
+/// receipt, plan, preview or observation document.
+#[derive(Debug)]
 enum Absence {
-    Absent,
+    Absent(Box<AncestryWitness>),
     Present,
     Unknown(String),
 }
 
-/// Positive absence of a checkout: every ancestor opens as a real directory
-/// without following a link, and the actual leaf returns ENOENT from
-/// `fstatat(AT_SYMLINK_NOFOLLOW)`. Any other answer is uncertainty.
-/// The path components a checkout walk visits after its start descriptor.
-/// For `/Volumes/<mount>/...` the walk starts at the verified mount root, so
-/// the volume name itself is not visited again; for any other absolute path
-/// it starts at `/`.
-fn checkout_walk(checkout: &Path) -> Result<(bool, Vec<&std::ffi::OsStr>), String> {
-    let components: Vec<_> = checkout.components().collect();
-    // An absolute path is `RootDir` then `Volumes`; the mount root is the
-    // next component and is already the walk's start descriptor.
-    let under_volumes = matches!(
-        components.get(1),
-        Some(std::path::Component::Normal(first)) if first.to_str() == Some("Volumes")
-    );
-    let skip = if under_volumes { 3 } else { 1 };
-    let rest: Vec<&std::ffi::OsStr> = components
-        .iter()
-        .skip(skip)
-        .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(*name),
-            _ => None,
+/// One directory entry observed without following it: the name, and the
+/// identity shared by the named entry and the descriptor opened for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedEntry {
+    name: std::ffi::OsString,
+    dev: u64,
+    ino: u64,
+}
+
+impl ObservedEntry {
+    /// Whether one `fstat`/`fstatat` reading is still this observed directory
+    /// entry. Only the device, inode and directory type are compared: an
+    /// ancestor replaced by a different object of the same name is a change.
+    fn matches(&self, stat: &libc::stat) -> bool {
+        u64::try_from(stat.st_dev).unwrap_or(u64::MAX) == self.dev
+            && stat.st_ino == self.ino
+            && stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+    }
+}
+
+/// What one no-follow descriptor walk saw, and what proves it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AncestryWitness {
+    /// The exact recorded checkout path this walk was made for.
+    checkout: PathBuf,
+    /// The walk's start descriptor: `/`, or a verified mount root.
+    start_dev: u64,
+    start_ino: u64,
+    /// Every component below the start that the walk observed, in walk order.
+    observed: Vec<ObservedEntry>,
+    /// The index in `observed` of the first component that did not exist; the
+    /// last observed entry is then the nearest existing ancestor.
+    missing: Option<usize>,
+    /// The device and volume facts read through the last observed descriptor
+    /// (or the start descriptor). Every proof binds to this held identity.
+    ancestor: HeldFacts,
+    /// The separately held boot Data facts, when the proof used them.
+    boot_data: Option<HeldFacts>,
+}
+
+/// A held descriptor's device and volume identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HeldFacts {
+    dev: u64,
+    fstype: String,
+    uuid: Option<String>,
+}
+
+impl HeldFacts {
+    fn of(fd: BorrowedFd<'_>) -> Result<Self, String> {
+        let facts = oxide_storage::volume::observe_held(fd)?;
+        Ok(Self {
+            dev: facts.dev,
+            fstype: facts.fstype,
+            uuid: facts.uuid,
         })
-        .collect();
-    if rest.is_empty() {
+    }
+}
+
+/// The real run's own ephemeral evidence for one candidate: the ancestry it
+/// positively proved absent and the volume rule it proved under. It is
+/// compared again under the checkout's clean barrier and binding and, last,
+/// under publication custody immediately before the journal. It is never
+/// serialized, so a plan's bytes carry no ancestry witness and a preview's
+/// absence proof is never read as authority for an effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SnapshotEvidence {
+    witness: AncestryWitness,
+    /// The genuine legacy exception (boot Data ancestry) instead of the row's
+    /// recorded checkout volume. Classified once, from the snapshot's row.
+    legacy_exception: bool,
+}
+
+/// Where a checkout walk starts. Both `/Volumes/<mount>/...` and its boot Data
+/// alias `/System/Volumes/Data/Volumes/<mount>/...` are mount spellings,
+/// recognized by their exact components. An absent mount name is therefore a
+/// mount refusal, never a plain missing chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WalkStart {
+    /// `/`, for every checkout outside a volume mount spelling.
+    Root,
+    /// A registered `/Volumes/<name>` mount root.
+    Mount(PathBuf),
+}
+
+/// What one no-follow descriptor walk found.
+enum Walk {
+    /// The leaf itself exists.
+    Present,
+    /// A component did not exist; the witness names which one and holds the
+    /// identity of the nearest existing ancestor.
+    Missing(Box<AncestryWitness>),
+    /// Anything else is uncertainty.
+    Unknown(String),
+}
+
+/// The refusal for a checkout path that is not one exact absolute spelling:
+/// a `.` or `..` component, a repeated or trailing separator or any other
+/// non-normal form is refused, never canonicalized.
+fn non_normal_spelling(checkout: &Path) -> String {
+    format!(
+        "{} is not one exact absolute spelling (a dot or parent component, a repeated separator or a trailing separator)",
+        checkout.display()
+    )
+}
+
+/// The exact components of one absolute checkout path, and where its walk
+/// starts. Nothing is canonicalized: a relative path, NUL, `.`/`..`, a
+/// repeated or trailing separator and every other non-normal spelling is
+/// refused rather than repaired through a symlink.
+fn checkout_path(checkout: &Path) -> Result<(WalkStart, Vec<std::ffi::OsString>), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = checkout.as_os_str().as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return Err(format!(
+            "{} is not an absolute checkout path",
+            checkout.display()
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err("the checkout path contains a NUL".to_owned());
+    }
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for component in checkout.components() {
+        match component {
+            std::path::Component::RootDir if names.is_empty() => {}
+            std::path::Component::Normal(name) => names.push(name.to_os_string()),
+            _ => return Err(non_normal_spelling(checkout)),
+        }
+    }
+    if names.is_empty() {
         return Err("the checkout path has no components below its start".to_owned());
     }
-    Ok((under_volumes, rest))
-}
-
-/// The mount root of a `/Volumes/<mount>/...` checkout: `RootDir`,
-/// `Volumes`, then the mount name (component 2).
-fn volumes_mount(checkout: &Path) -> Option<PathBuf> {
-    match checkout.components().nth(2) {
-        Some(std::path::Component::Normal(volume)) => Some(Path::new("/Volumes").join(volume)),
-        _ => None,
+    let mut rebuilt = PathBuf::from("/");
+    for name in &names {
+        rebuilt.push(name);
     }
+    // The bytes, not the normalized components, decide: a repeated or trailing
+    // separator or a dropped dot component is a different spelling and is
+    // refused rather than quietly repaired.
+    if rebuilt.as_os_str().as_bytes() != bytes {
+        return Err(format!(
+            "{} is not one exact absolute spelling (a repeated or trailing separator or a dot component)",
+            checkout.display()
+        ));
+    }
+    let named = |index: usize, name: &str| {
+        names
+            .get(index)
+            .is_some_and(|component| component.as_os_str() == std::ffi::OsStr::new(name))
+    };
+    let (mount_index, below) = if named(0, "Volumes") {
+        (1, 2)
+    } else if named(0, "System") && named(1, "Volumes") && named(2, "Data") && named(3, "Volumes") {
+        (4, 5)
+    } else {
+        return Ok((WalkStart::Root, names));
+    };
+    if names.len() <= below {
+        return Err(format!(
+            "{} names no checkout below a volume mount",
+            checkout.display()
+        ));
+    }
+    let mount = Path::new("/Volumes").join(&names[mount_index]);
+    Ok((WalkStart::Mount(mount), names[below..].to_vec()))
 }
 
-fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String> {
+/// Revalidate the WHOLE named ancestry of one walk against the descriptors the
+/// walk opened: every observed descriptor must still be the recorded object and
+/// every observed named entry must still name it. No parent path is ever
+/// re-resolved, so no ancestor can be swapped between the walk and this check.
+fn revalidate_chain(descriptors: &[OwnedFd], observed: &[ObservedEntry]) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
-    let checkout = &row.checkout;
-    let (under_volumes, rest) = match checkout_walk(checkout) {
-        Ok(found) => found,
-        Err(reason) => return Ok(Absence::Unknown(reason)),
-    };
-    let mut cursor: OwnedFd = open_root()?;
-    if under_volumes {
-        // A recorded checkout below /Volumes needs the registered volume's
-        // UUID and a live matching mount; a legacy row without one is kept.
-        let Some(uuid) = row.checkout_volume_uuid.as_deref() else {
-            return Ok(Absence::Unknown(
-                "a /Volumes checkout has no recorded volume UUID".to_owned(),
-            ));
-        };
-        let Some(mount) = volumes_mount(checkout) else {
-            return Ok(Absence::Unknown(
-                "the /Volumes path is malformed".to_owned(),
-            ));
-        };
-        let binding = match Binding::open(&mount, Some(uuid)) {
-            Ok(binding) => binding,
-            Err(error) => {
-                return Ok(Absence::Unknown(format!(
-                    "the recorded volume is not mounted and matching ({error})"
-                )))
-            }
-        };
-        // Continue the walk from the mount root descriptor.
-        // SAFETY: `dup` returns a new owned descriptor on success.
-        let opened = unsafe { libc::dup(binding.fd().as_raw_fd()) };
-        if opened < 0 {
-            return Ok(Absence::Unknown(
-                "cannot duplicate the mount descriptor".to_owned(),
-            ));
-        }
-        // SAFETY: `opened` is a newly owned descriptor.
-        cursor = unsafe { OwnedFd::from_raw_fd(opened) };
-    } else if !operator_legacy {
-        // A registered checkout outside /Volumes still needs its recorded
-        // volume: the nearest existing ancestor must be on that APFS/HFS
-        // volume; network, autofs or unknown file systems are kept.
-        let Some(uuid) = row.checkout_volume_uuid.as_deref() else {
-            return Ok(Absence::Unknown(
-                "the checkout has no recorded volume UUID".to_owned(),
-            ));
-        };
-        if let Err(reason) = on_recorded_volume(checkout, uuid) {
-            return Ok(Absence::Unknown(reason));
-        }
-    } else {
-        // The explicit legacy exception allows only a positively mounted,
-        // readable APFS data-volume ancestry below /Users.
-        // The explicit legacy exception is volume-based: the nearest existing
-        // ancestor must be on the same device and APFS volume UUID as the
-        // boot Data volume. Any other or unverifiable volume is kept.
-        if let Err(reason) = on_boot_data_volume(checkout) {
-            return Ok(Absence::Unknown(reason));
-        }
+    if descriptors.len() != observed.len() + 1 {
+        return Err("the checkout ancestry chain is not one descriptor per component".to_owned());
     }
-    // The directory each walk step reads, for the debug-only EACCES fixture.
-    let mut walked = if under_volumes {
-        volumes_mount(checkout).unwrap_or_else(|| PathBuf::from("/Volumes"))
-    } else {
-        PathBuf::from("/")
-    };
-    for (index, name) in rest.iter().enumerate() {
-        let last = index + 1 == rest.len();
-        let name = std::ffi::CString::new(name.as_bytes())
+    for (index, entry) in observed.iter().enumerate() {
+        let opened = fstat_fd(&descriptors[index + 1])?;
+        if !entry.matches(&opened) {
+            return Err("an ancestor of the checkout changed while it was read".to_owned());
+        }
+        let name = std::ffi::CString::new(entry.name.as_bytes())
             .map_err(|_| "the checkout path contains a NUL".to_owned())?;
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the held parent descriptor and C string are live for the call.
+        let status = unsafe {
+            libc::fstatat(
+                descriptors[index].as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if !entry.matches(&stat) {
+            return Err("an ancestor of the checkout changed while it was read".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Walk `names` from the held `cursor` without following any component. Every
+/// observed entry is opened as a real directory, and the walk keeps EVERY
+/// descriptor of the chain it opened, so the whole named ancestry is
+/// revalidated — named entry, then opened descriptor — at the first exact
+/// `ENOENT` that decides the nearest existing ancestor. Any other error, a
+/// symlink, a non-directory component or a changed entry is uncertainty.
+fn walk_checkout(
+    checkout: &Path,
+    start: &WalkStart,
+    names: &[std::ffi::OsString],
+    cursor: OwnedFd,
+) -> Result<Walk, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let start_stat = fstat_fd(&cursor)?;
+    let start_dev = u64::try_from(start_stat.st_dev).unwrap_or(u64::MAX);
+    let start_ino = start_stat.st_ino;
+    let mut walked = match start {
+        WalkStart::Root => PathBuf::from("/"),
+        WalkStart::Mount(mount) => mount.clone(),
+    };
+    let leaf = names.len() - 1;
+    let mut observed: Vec<ObservedEntry> = Vec::new();
+    // The pinned chain: `descriptors[0]` is the start and `descriptors[i + 1]`
+    // is the descriptor `observed[i]` was opened as. Every one stays open for
+    // the whole walk.
+    let mut descriptors: Vec<OwnedFd> = vec![cursor];
+    for (index, name) in names.iter().enumerate() {
+        let entry = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| "the checkout path contains a NUL".to_owned())?;
+        let parent = descriptors[index].as_raw_fd();
+        // The debug-only fixture: the walk "cannot read" this directory.
         let injected = injected_eacces(&walked);
-        // SAFETY: the descriptor and C string are live for the call.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the held parent descriptor and C string are live for the call.
         let status = if injected {
             -1
         } else {
-            unsafe {
-                libc::fstatat(
-                    cursor.as_raw_fd(),
-                    name.as_ptr(),
-                    &mut stat,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            }
+            unsafe { libc::fstatat(parent, entry.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
         };
         if status != 0 {
             let error = if injected {
@@ -2864,110 +3042,287 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
             } else {
                 std::io::Error::last_os_error()
             };
-            return Ok(if error.kind() != std::io::ErrorKind::NotFound {
-                Absence::Unknown(error.to_string())
-            } else if last {
-                // Only the actual checkout leaf may be absent by ENOENT.
-                Absence::Absent
-            } else {
-                Absence::Unknown(
-                    "an ancestor of the checkout is missing, so the checkout path cannot be proved absent"
-                        .to_owned(),
-                )
-            });
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Ok(Walk::Unknown(error.to_string()));
+            }
+            // ENOENT is decided from the HELD nearest-ancestor descriptor, and
+            // only after the whole named ancestry has been revalidated against
+            // the descriptors this walk still holds.
+            revalidate_chain(&descriptors, &observed)?;
+            let ancestor = HeldFacts::of(descriptors[index].as_fd())?;
+            return Ok(Walk::Missing(Box::new(AncestryWitness {
+                checkout: checkout.to_path_buf(),
+                start_dev,
+                start_ino,
+                observed,
+                missing: Some(index),
+                ancestor,
+                boot_data: None,
+            })));
         }
-        if last {
-            return Ok(Absence::Present);
+        if index == leaf {
+            return Ok(Walk::Present);
         }
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Ok(Absence::Unknown(format!(
-                "an ancestor of the checkout is not a directory"
-            )));
+            return Ok(Walk::Unknown(
+                "an ancestor of the checkout is not a directory".to_owned(),
+            ));
         }
-        // SAFETY: the parent descriptor and C string are live for the call.
+        // SAFETY: the held parent descriptor and C string are live for the call.
         let next = unsafe {
             libc::openat(
-                cursor.as_raw_fd(),
-                name.as_ptr(),
+                parent,
+                entry.as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if next < 0 {
-            return Ok(Absence::Unknown(
-                std::io::Error::last_os_error().to_string(),
-            ));
+            return Ok(Walk::Unknown(std::io::Error::last_os_error().to_string()));
         }
         // SAFETY: `next` is a newly owned descriptor.
-        cursor = unsafe { OwnedFd::from_raw_fd(next) };
-        walked.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
-    }
-    Ok(Absence::Unknown("the checkout walk ended early".to_owned()))
-}
-
-/// The nearest existing ancestor of `checkout`, found without following it.
-fn nearest_ancestor(checkout: &Path) -> Result<&Path, String> {
-    let mut ancestor = checkout.parent();
-    while let Some(candidate) = ancestor {
-        match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.is_dir() => return Ok(candidate),
-            Ok(_) => {
-                return Err(format!(
-                    "the nearest existing ancestor {} is not a directory",
-                    candidate.display()
-                ))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ancestor = candidate.parent();
-            }
-            Err(error) => return Err(format!("the checkout's ancestry is unreadable ({error})")),
+        let opened = unsafe { OwnedFd::from_raw_fd(next) };
+        let opened_stat = fstat_fd(&opened)?;
+        if opened_stat.st_dev != stat.st_dev || opened_stat.st_ino != stat.st_ino {
+            return Ok(Walk::Unknown(
+                "the directory the walk opened is not the entry it named".to_owned(),
+            ));
         }
+        // The named entry must still be the descriptor that was opened.
+        let mut again: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the held parent descriptor and C string are live for the call.
+        let revalidated = unsafe {
+            libc::fstatat(
+                parent,
+                entry.as_ptr(),
+                &mut again,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if revalidated != 0 {
+            return Ok(Walk::Unknown(std::io::Error::last_os_error().to_string()));
+        }
+        let observed_entry = ObservedEntry {
+            name: name.clone(),
+            dev: u64::try_from(opened_stat.st_dev).unwrap_or(u64::MAX),
+            ino: opened_stat.st_ino,
+        };
+        if !observed_entry.matches(&again) {
+            return Ok(Walk::Unknown(
+                "an ancestor of the checkout changed while it was read".to_owned(),
+            ));
+        }
+        observed.push(observed_entry);
+        descriptors.push(opened);
+        walked.push(name);
     }
-    Err("the checkout has no existing ancestor".to_owned())
+    Ok(Walk::Unknown("the checkout walk ended early".to_owned()))
 }
 
-/// A registered checkout's volume proof: its nearest existing ancestor is on
-/// a local APFS or HFS volume with the recorded UUID.
-fn on_recorded_volume(checkout: &Path, uuid: &str) -> Result<(), String> {
-    let ancestor = nearest_ancestor(checkout)?;
-    let facts = oxide_storage::volume::observe_path(ancestor)
-        .map_err(|error| format!("{} is unverifiable ({error})", ancestor.display()))?;
-    if !matches!(facts.fstype.as_str(), "apfs" | "hfs") {
+/// The recorded-volume rule for a registered checkout: the held nearest
+/// existing ancestor is on a local APFS or HFS volume with the checkout's
+/// recorded UUID. A conflicting or unknown recorded volume is never waived
+/// because today's ancestor happens to sit on the boot Data volume.
+fn judge_recorded_volume(ancestor: &HeldFacts, uuid: &str) -> Result<(), String> {
+    if !matches!(ancestor.fstype.as_str(), "apfs" | "hfs") {
         return Err(format!(
-            "{} is on a {} file system, not a verified local volume",
-            ancestor.display(),
-            facts.fstype
+            "the checkout's nearest existing ancestor is on a {} file system, not a verified local volume",
+            ancestor.fstype
         ));
     }
-    if facts.uuid.as_deref() != Some(uuid) {
-        return Err(format!(
-            "{} is not on the checkout's recorded volume",
-            ancestor.display()
-        ));
+    if ancestor.uuid.as_deref() != Some(uuid) {
+        return Err(
+            "the checkout's nearest existing ancestor is not on the checkout's recorded volume"
+                .to_owned(),
+        );
     }
     Ok(())
 }
 
-/// The legacy operator-list exception's volume proof: the nearest existing
-/// ancestor of `checkout` (found without following its leaf) is a directory
-/// on the same device and APFS volume UUID as `/System/Volumes/Data`.
-fn on_boot_data_volume(checkout: &Path) -> Result<(), String> {
-    let ancestor = nearest_ancestor(checkout)?;
-    let data = oxide_storage::volume::observe_path(Path::new("/System/Volumes/Data"))
-        .map_err(|error| format!("the boot Data volume is unverifiable ({error})"))?;
-    let here = oxide_storage::volume::observe_path(ancestor)
-        .map_err(|error| format!("{} is unverifiable ({error})", ancestor.display()))?;
+/// The boot Data rule, judged only from held descriptors: the nearest existing
+/// ancestor is a readable directory on the same device and APFS volume UUID as
+/// `/System/Volumes/Data`.
+fn judge_boot_data(ancestor: &HeldFacts, data: &HeldFacts) -> Result<(), String> {
     if data.fstype != "apfs" || data.uuid.is_none() {
         return Err("the boot Data volume is not a verified APFS volume".to_owned());
     }
-    if here.fstype != "apfs" || here.dev != data.dev || here.uuid != data.uuid {
-        return Err(format!(
-            "{} is not on the boot Data volume (device and APFS volume UUID differ)",
-            ancestor.display()
-        ));
+    if ancestor.fstype != "apfs" || ancestor.dev != data.dev || ancestor.uuid != data.uuid {
+        return Err(
+            "the checkout's nearest existing ancestor is not on the boot Data volume (device and APFS volume UUID differ)"
+                .to_owned(),
+        );
     }
     Ok(())
 }
 
+/// The held boot Data identity the missing-chain and legacy rules bind to.
+fn boot_data_facts() -> Result<HeldFacts, String> {
+    let text = std::ffi::CString::new("/System/Volumes/Data")
+        .map_err(|_| "the boot Data path contains a NUL".to_owned())?;
+    // SAFETY: a NUL-terminated absolute path; the last component is not
+    // followed and the result is a newly owned descriptor.
+    let raw = unsafe {
+        libc::openat(
+            libc::AT_FDCWD,
+            text.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(format!(
+            "the boot Data volume is unverifiable ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `raw` is a newly owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    HeldFacts::of(fd.as_fd())
+}
+
+/// Positive absence of a checkout.
+///
+/// Every observed component opens as a real directory without following a
+/// link and is revalidated against the descriptor the walk holds; the walk's
+/// first exact `ENOENT` is the only positive answer. The actual leaf may be
+/// absent under a fully present ancestry, and a missing ancestor chain is
+/// provable only when the held nearest existing ancestor is a readable
+/// directory on the boot Data volume. A mount spelling never takes the
+/// missing-chain rule, every other answer is uncertainty, and every refusal
+/// keeps the root.
+///
+/// A RECORDED checkout volume is never waived: whatever the row's age, a row
+/// (or receiptless marker) that records one must find its held ancestor on that
+/// volume. Only a row with no recorded volume at all may use the genuine legacy
+/// boot Data rule, and a missing chain needs the boot Data proof in every case.
+fn checkout_absence(row: &Row, legacy_exception: bool) -> Result<Absence, String> {
+    let checkout = &row.checkout;
+    let (start, names) = match checkout_path(checkout) {
+        Ok(found) => found,
+        Err(reason) => return Ok(Absence::Unknown(reason)),
+    };
+    let (cursor, binding) = match &start {
+        WalkStart::Root => match open_root() {
+            Ok(fd) => (fd, None),
+            Err(reason) => return Ok(Absence::Unknown(reason)),
+        },
+        WalkStart::Mount(mount) => {
+            // A checkout below a volume mount keeps the existing leaf-only
+            // rule: the recorded volume must be mounted and match, and the
+            // walk continues from its verified mount root.
+            let Some(uuid) = row.checkout_volume_uuid.as_deref() else {
+                return Ok(Absence::Unknown(
+                    "a /Volumes checkout has no recorded volume UUID".to_owned(),
+                ));
+            };
+            let binding = match Binding::open(mount, Some(uuid)) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    return Ok(Absence::Unknown(format!(
+                        "the recorded volume is not mounted and matching ({error})"
+                    )))
+                }
+            };
+            // SAFETY: `dup` returns a new owned descriptor on success.
+            let opened = unsafe { libc::dup(binding.fd().as_raw_fd()) };
+            if opened < 0 {
+                return Ok(Absence::Unknown(
+                    "cannot duplicate the mount descriptor".to_owned(),
+                ));
+            }
+            // SAFETY: `opened` is a newly owned descriptor.
+            (unsafe { OwnedFd::from_raw_fd(opened) }, Some(binding))
+        }
+    };
+    let mut witness = match walk_checkout(checkout, &start, &names, cursor) {
+        Ok(Walk::Present) => return Ok(Absence::Present),
+        Ok(Walk::Unknown(reason)) => return Ok(Absence::Unknown(reason)),
+        Ok(Walk::Missing(witness)) => witness,
+        Err(reason) => return Ok(Absence::Unknown(reason)),
+    };
+    // The verified mount must still be the same mounted volume after the walk.
+    if let Some(binding) = &binding {
+        if let Err(reason) = binding.verify() {
+            return Ok(Absence::Unknown(format!(
+                "the recorded volume changed during the walk ({reason})"
+            )));
+        }
+    }
+    let Some(missing) = witness.missing else {
+        return Ok(Absence::Unknown("the checkout walk ended early".to_owned()));
+    };
+    let leaf = names.len() - 1;
+    let mount_start = matches!(start, WalkStart::Mount(_));
+    if mount_start && missing < leaf {
+        return Ok(Absence::Unknown(
+            "an ancestor of the checkout below its mount is missing, so only the actual leaf may be absent"
+                .to_owned(),
+        ));
+    }
+    if !mount_start {
+        let recorded = row.checkout_volume_uuid.as_deref();
+        if recorded.is_none() && !legacy_exception {
+            return Ok(Absence::Unknown(
+                "the checkout has no recorded volume UUID".to_owned(),
+            ));
+        }
+        // A recorded volume is required whatever the row's age. The operator
+        // list is a distinct permission and never replaces it, so a conflicting
+        // recorded volume keeps the root even when a surviving parent sits on
+        // the boot Data volume.
+        if let Some(uuid) = recorded {
+            if let Err(reason) = judge_recorded_volume(&witness.ancestor, uuid) {
+                return Ok(Absence::Unknown(reason));
+            }
+        }
+        if legacy_exception {
+            // The genuine legacy exception keeps its already-authorized boot
+            // Data ancestry rule. It is an additional requirement, never a
+            // replacement for a recorded volume above.
+            let data = match boot_data_facts() {
+                Ok(facts) => facts,
+                Err(reason) => return Ok(Absence::Unknown(reason)),
+            };
+            if let Err(reason) = judge_boot_data(&witness.ancestor, &data) {
+                return Ok(Absence::Unknown(reason));
+            }
+            witness.boot_data = Some(data);
+        }
+    }
+    if missing < leaf {
+        // A missing parent chain never waives a mount boundary or a non-Data
+        // volume: the held nearest existing ancestor must itself be on the
+        // boot Data volume, proved from held descriptors only.
+        let data = match boot_data_facts() {
+            Ok(facts) => facts,
+            Err(reason) => return Ok(Absence::Unknown(reason)),
+        };
+        if let Err(reason) = judge_boot_data(&witness.ancestor, &data) {
+            return Ok(Absence::Unknown(reason));
+        }
+        witness.boot_data = Some(data);
+    }
+    Ok(Absence::Absent(witness))
+}
+
+/// Re-prove one candidate's absence and compare it with the real run's own
+/// ancestry witness. It runs under the checkout's clean barrier and binding,
+/// and again under publication custody immediately before the journal. Only
+/// the call made under publication custody DECIDES: it is a fresh descriptor
+/// walk, so a checkout recreated, an ancestor replaced, a changed start
+/// descriptor or a different first-missing component is refused before any
+/// intent, receipt or quarantine effect even when the change lands while this
+/// root waits for that custody.
+fn confirm_absence(candidate: &Candidate, evidence: &SnapshotEvidence) -> Result<(), String> {
+    let row = candidate_row(candidate);
+    match checkout_absence(&row, evidence.legacy_exception)? {
+        Absence::Absent(current) if *current == evidence.witness => Ok(()),
+        Absence::Absent(_) => Err(
+            "the checkout's ancestry changed after the real run's snapshot, so its root is kept"
+                .to_owned(),
+        ),
+        Absence::Present => Err("the checkout reappeared before the prune".to_owned()),
+        Absence::Unknown(reason) => Err(reason),
+    }
+}
 /// Debug builds only: inject EACCES when the checkout walk reads inside the
 /// directory named by `OXIDE_TEST_PRUNE_EACCES`, so a proof drives an
 /// unreadable ancestor without a real unreadable directory. Bound like the
@@ -4582,12 +4937,14 @@ fn crash_point(point: &str) -> Result<(), String> {
 /// Prune one fresh candidate. Every journal entry is durable before its
 /// effect; an incomplete phase returns [`Stop::Pending`] and keeps the
 /// quarantine.
+#[allow(clippy::too_many_arguments)]
 fn prune_one(
     store: &Store,
     control: &Path,
     candidate: &Candidate,
     plan_sha: &str,
     list: Option<&OperatorList>,
+    evidence: &SnapshotEvidence,
 ) -> Result<(), Stop> {
     // The checkout's bounded clean barrier excludes a concurrent command in
     // both pools; the binding lock then holds through the prune's effect.
@@ -4603,7 +4960,7 @@ fn prune_one(
             )))
         }
     };
-    let outcome = prune_one_barrier(store, control, candidate, plan_sha, list);
+    let outcome = prune_one_barrier(store, control, candidate, plan_sha, list, evidence);
     store
         .abandon_clean(guard)
         .map_err(|error| Stop::Pending(format!("cannot release the clean barrier: {error}")))?;
@@ -4616,30 +4973,20 @@ fn prune_one_barrier(
     candidate: &Candidate,
     plan_sha: &str,
     list: Option<&OperatorList>,
+    evidence: &SnapshotEvidence,
 ) -> Result<(), Stop> {
     let _binding = store
         .lock_binding(&candidate.checkout)
         .map_err(Stop::Refuse)?;
     // Everything up to the journal is a per-root refusal: the root, its
-    // registry row and every receipt are unchanged.
+    // registry row and every receipt are unchanged. This first ancestry proof
+    // runs under the clean barrier and binding and is an EARLY refusal only;
+    // the deciding comparison is the one taken under publication custody below.
     let (session, id, quarantine) = (|| {
         let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
         session.verify_marker(candidate).map_err(Stop::Refuse)?;
         session.check(control, 0, 0)?;
-        // The locked recheck keeps the operator-list legacy classification
-        // the preview validated: a receiptless root, or a listed registry
-        // row without a v2 identity, takes the boot Data volume rule.
-        let listed = list.is_some_and(|list| list.roots.iter().any(|root| root == &candidate.root));
-        let legacy = candidate.receiptless || (listed && candidate.nonce.is_none());
-        match checkout_absence_for_candidate(candidate, legacy) {
-            Ok(Absence::Absent) => {}
-            Ok(Absence::Present) => {
-                return Err(Stop::Refuse(
-                    "the checkout reappeared before the prune".to_owned(),
-                ))
-            }
-            Ok(Absence::Unknown(reason)) | Err(reason) => return Err(Stop::Refuse(reason)),
-        }
+        confirm_absence(candidate, evidence).map_err(Stop::Refuse)?;
         let id = fresh_nonce().map_err(Stop::Refuse)?;
         let quarantine = candidate
             .root
@@ -4655,23 +5002,28 @@ fn prune_one_barrier(
     let mut attempts = 0;
     loop {
         let revision = if candidate.receiptless {
-            recheck_receiptless(store, control, candidate)
+            recheck_receiptless(store, control, candidate, evidence)
         } else {
-            recheck_candidate(store, control, candidate, list)
+            recheck_candidate(store, control, candidate, list, evidence)
         }
         .map_err(Stop::Refuse)?;
-        // A receiptless legacy root is protected by its exclusive `pruning`
-        // receipt before the intent exists; if the intent is not published
-        // the receipt is discarded again, with no output effect. The
-        // receipt publication and the journal run under one internal
-        // publication lock: the receipt is compare-and-set on the recheck's
-        // revision and the journal's expected revision is exactly the one
-        // that own publication produced, so no unrelated change is adopted.
-        let _publication = if candidate.receiptless {
-            Some(store::publication_guard(control).map_err(Stop::Refuse)?)
-        } else {
-            None
-        };
+        // Publication custody is taken for EVERY root, not only a receiptless
+        // one, and it is taken BEFORE the deciding ancestry comparison below:
+        // the reread above is an early refusal, and nothing it proved may be
+        // published while this root waited for the lock. A receiptless root is
+        // additionally protected by its exclusive `pruning` receipt before the
+        // intent exists; if the intent is not published the receipt is
+        // discarded again, with no output effect. The receipt publication and
+        // the journal run under this one internal publication lock: the
+        // receipt is compare-and-set on the recheck's revision and the
+        // journal's expected revision is exactly the one that own publication
+        // produced, so no unrelated change is adopted.
+        let _publication = store::publication_guard(control).map_err(Stop::Refuse)?;
+        // The DECIDING ancestry confirmation: a fresh descriptor walk compared
+        // with the real run's ORIGINAL witness, run under publication custody
+        // and immediately before the receipt/journal publication. A revision
+        // retry keeps that original baseline rather than adopting a new one.
+        confirm_absence(candidate, evidence).map_err(Stop::Refuse)?;
         let revision = if candidate.receiptless {
             match outputs::create_pruning_receipt(
                 control,
@@ -4716,7 +5068,6 @@ fn prune_one_barrier(
                     ))
                 })?;
         }
-        drop(_publication);
         if published? {
             break;
         }
@@ -4740,6 +5091,7 @@ fn recheck_candidate(
     control: &Path,
     candidate: &Candidate,
     list: Option<&OperatorList>,
+    evidence: &SnapshotEvidence,
 ) -> Result<u64, String> {
     if prune_fixture_fault(
         control,
@@ -4771,6 +5123,11 @@ fn recheck_candidate(
     let receipt = outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id)?
         .ok_or("the root's receipt is missing")?;
     let mut budget = SNAPSHOT_MAX_BYTES;
+    // The snapshot evidence this recheck produces is compared with the real
+    // run's witness as an EARLY refusal, under the checkout's clean barrier and
+    // binding. The deciding comparison is made again under publication custody
+    // in `prune_one_barrier`, immediately before the journal.
+    let mut fresh = None;
     if let Some(reason) = eligibility(
         store,
         control,
@@ -4780,8 +5137,17 @@ fn recheck_candidate(
         list,
         &mut budget,
         true,
+        &mut fresh,
     )? {
         return Err(reason);
+    }
+    match &fresh {
+        Some(current) if current == evidence => {}
+        Some(_) => return Err(
+            "the checkout's ancestry changed after the real run's snapshot, so its root is kept"
+                .to_owned(),
+        ),
+        None => return Err("the checkout's absence is no longer positively proved".to_owned()),
     }
     match observe_row_root(&row)? {
         RootState::Present(facts)
@@ -5471,8 +5837,11 @@ fn compact_tombstones(ring: &mut Tombstones) -> Result<(), String> {
     Ok(())
 }
 
-fn checkout_absence_for_candidate(candidate: &Candidate, legacy: bool) -> Result<Absence, String> {
-    let row = Row {
+/// The row a candidate's own absence proof needs: the recorded checkout path,
+/// its recorded volume and the root's recorded identity. It is built here so
+/// the locked proof asks exactly the question the snapshot asked.
+fn candidate_row(candidate: &Candidate) -> Row {
+    Row {
         checkout_id: candidate.checkout_id.clone(),
         checkout: candidate.checkout.clone(),
         checkout_volume_uuid: candidate.checkout_volume_uuid.clone(),
@@ -5493,8 +5862,7 @@ fn checkout_absence_for_candidate(candidate: &Candidate, legacy: bool) -> Result
         pruned_ms: None,
         reservation: None,
         cancelling: None,
-    };
-    checkout_absence(&row, legacy)
+    }
 }
 
 /// What resuming one unfinished intent settled.
@@ -5798,19 +6166,30 @@ fn evaluate_receiptless(
         reservation: None,
         cancelling: None,
     };
-    let outcome = receiptless_candidate(store, control, registry, root, under_barrier, &mut row);
+    let mut evidence = None;
+    let outcome = receiptless_candidate(
+        store,
+        control,
+        registry,
+        root,
+        under_barrier,
+        &mut row,
+        &mut evidence,
+    );
     match outcome {
         Ok(candidate) => Evaluated {
             row,
             candidate: Some(candidate),
             kept: None,
             legacy: true,
+            evidence,
         },
         Err(reason) => Evaluated {
             row,
             candidate: None,
             kept: Some(reason),
             legacy: true,
+            evidence: None,
         },
     }
 }
@@ -5822,6 +6201,7 @@ fn receiptless_candidate(
     root: &Path,
     under_barrier: bool,
     row: &mut Row,
+    evidence: &mut Option<SnapshotEvidence>,
 ) -> Result<Candidate, String> {
     if !registry.complete {
         return Err("the registry is sticky-incomplete, so prune keeps every root".to_owned());
@@ -5863,6 +6243,10 @@ fn receiptless_candidate(
     }
     row.receipt = outputs::receipt_path_public(control, &row.checkout_id);
     row.volume_uuid = Some(registration.volume_uuid.clone());
+    // A marker that records the checkout's own volume keeps that requirement:
+    // only a marker without one (the version-1 shape) may use the genuine
+    // legacy boot Data rule, and a conflicting recorded volume keeps the root.
+    row.checkout_volume_uuid = marker.checkout_volume_uuid().map(str::to_owned);
     row.nonce = marker.nonce().map(str::to_owned);
     row.generation = marker.generation();
     row.root_dev = Some(metadata.dev());
@@ -5891,7 +6275,12 @@ fn receiptless_candidate(
         }
     }
     match checkout_absence(row, true)? {
-        Absence::Absent => {}
+        Absence::Absent(witness) => {
+            *evidence = Some(SnapshotEvidence {
+                witness: *witness,
+                legacy_exception: true,
+            });
+        }
         Absence::Present => return Err("the checkout is present, so its root is kept".to_owned()),
         Absence::Unknown(reason) => return Err(format!("checkout absence is unknown ({reason})")),
     }
@@ -5911,7 +6300,7 @@ fn receiptless_candidate(
         root: row.root.clone(),
         root_kind: RootKind::External,
         volume_uuid: row.volume_uuid.clone(),
-        checkout_volume_uuid: None,
+        checkout_volume_uuid: row.checkout_volume_uuid.clone(),
         nonce: row.nonce.clone(),
         generation: row.generation,
         dev: facts.dev,
@@ -5930,6 +6319,7 @@ fn recheck_receiptless(
     store: &Store,
     control: &Path,
     candidate: &Candidate,
+    evidence: &SnapshotEvidence,
 ) -> Result<u64, String> {
     let authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
@@ -5942,6 +6332,16 @@ fn recheck_receiptless(
     };
     if !same_candidates(&[candidate], &[&current]) {
         return Err("the listed root's identity changed".to_owned());
+    }
+    match &entry.evidence {
+        Some(fresh) if fresh == evidence => {}
+        Some(_) => {
+            return Err(
+                "the listed root's checkout ancestry changed after the real run's snapshot"
+                    .to_owned(),
+            )
+        }
+        None => return Err("the listed root's absence is no longer positively proved".to_owned()),
     }
     if !authority.complete() {
         return Err("the locked authority recheck exceeded its input or time budget".to_owned());
@@ -7102,28 +7502,159 @@ mod tests {
         // Regression for the review finding: the mount root descriptor is
         // opened already, so the volume name must not be visited again. A
         // live checkout previously read as absent and its root was prunable.
-        let (under, rest) = checkout_walk(Path::new("/Volumes/Builds/oxide-outputs/app")).unwrap();
-        assert!(under);
+        let (start, rest) = checkout_path(Path::new("/Volumes/Builds/oxide-outputs/app")).unwrap();
+        assert!(matches!(&start, WalkStart::Mount(mount) if mount == Path::new("/Volumes/Builds")));
         assert_eq!(
             rest,
             vec![
-                std::ffi::OsStr::new("oxide-outputs"),
-                std::ffi::OsStr::new("app")
+                std::ffi::OsString::from("oxide-outputs"),
+                std::ffi::OsString::from("app")
             ]
         );
-        let (under, rest) = checkout_walk(Path::new("/Users/tom/src/app")).unwrap();
-        assert!(!under);
+        // The boot Data alias of /Volumes is the same mount spelling, so an
+        // absent mount name can never fall through to the plain-path rule.
+        let (start, rest) = checkout_path(Path::new(
+            "/System/Volumes/Data/Volumes/Builds/oxide-outputs/app",
+        ))
+        .unwrap();
+        assert!(matches!(&start, WalkStart::Mount(mount) if mount == Path::new("/Volumes/Builds")));
         assert_eq!(
             rest,
             vec![
-                std::ffi::OsStr::new("Users"),
-                std::ffi::OsStr::new("tom"),
-                std::ffi::OsStr::new("src"),
-                std::ffi::OsStr::new("app")
+                std::ffi::OsString::from("oxide-outputs"),
+                std::ffi::OsString::from("app")
             ]
         );
-        assert!(checkout_walk(Path::new("/Volumes/Builds")).is_err());
-        assert!(checkout_walk(Path::new("/")).is_err());
+        let (start, rest) = checkout_path(Path::new("/Users/tom/src/app")).unwrap();
+        assert!(matches!(&start, WalkStart::Root));
+        assert_eq!(
+            rest,
+            vec![
+                std::ffi::OsString::from("Users"),
+                std::ffi::OsString::from("tom"),
+                std::ffi::OsString::from("src"),
+                std::ffi::OsString::from("app")
+            ]
+        );
+        assert!(checkout_path(Path::new("/Volumes/Builds")).is_err());
+        assert!(checkout_path(Path::new("/System/Volumes/Data/Volumes")).is_err());
+        assert!(checkout_path(Path::new("/")).is_err());
+    }
+
+    /// The path is validated before it is walked: a spelling that is not one
+    /// exact absolute form is refused, never repaired or canonicalized.
+    #[test]
+    fn a_non_exact_checkout_spelling_is_never_resolved() {
+        for spelling in [
+            "relative/checkout",
+            "",
+            "/Users//tom/app",
+            "/Users/tom/app/",
+            "/Users/./tom/app",
+            "/Users/tom/../tom/app",
+            "/Users/tom/app\u{0}",
+        ] {
+            assert!(
+                checkout_path(Path::new(spelling)).is_err(),
+                "{spelling:?} was accepted"
+            );
+        }
+        assert!(checkout_path(Path::new("/Users/tom/app")).is_ok());
+        let mut row = row_for(Path::new("/private/tmp"));
+        row.checkout = PathBuf::from("/Users//tom/app");
+        assert!(matches!(
+            checkout_absence(&row, true).unwrap(),
+            Absence::Unknown(_)
+        ));
+    }
+
+    /// The volume rules are pure decisions over held facts, so a device or
+    /// UUID mismatch is isolated from the lexical mount exclusion.
+    #[test]
+    fn the_volume_rules_judge_held_facts_only() {
+        let data = HeldFacts {
+            dev: 7,
+            fstype: "apfs".to_owned(),
+            uuid: Some("data-uuid".to_owned()),
+        };
+        let ancestor = data.clone();
+        assert!(judge_boot_data(&ancestor, &data).is_ok());
+        assert!(judge_boot_data(
+            &HeldFacts {
+                dev: 8,
+                ..data.clone()
+            },
+            &data
+        )
+        .is_err());
+        assert!(judge_boot_data(
+            &HeldFacts {
+                uuid: Some("pool-uuid".to_owned()),
+                ..data.clone()
+            },
+            &data
+        )
+        .is_err());
+        assert!(judge_boot_data(
+            &HeldFacts {
+                fstype: "hfs".to_owned(),
+                ..data.clone()
+            },
+            &data
+        )
+        .is_err());
+        assert!(judge_boot_data(
+            &HeldFacts {
+                uuid: None,
+                ..data.clone()
+            },
+            &data
+        )
+        .is_err());
+        assert!(judge_boot_data(
+            &ancestor,
+            &HeldFacts {
+                uuid: None,
+                ..data.clone()
+            }
+        )
+        .is_err());
+        assert!(judge_boot_data(
+            &ancestor,
+            &HeldFacts {
+                fstype: "nfs".to_owned(),
+                ..data.clone()
+            }
+        )
+        .is_err());
+        assert!(judge_recorded_volume(&ancestor, "data-uuid").is_ok());
+        assert!(judge_recorded_volume(&ancestor, "pool-uuid").is_err());
+        // The recorded-volume rule keeps its existing APFS-or-HFS shape; the
+        // boot Data rule is APFS only, because /System/Volumes/Data is APFS.
+        assert!(judge_recorded_volume(
+            &HeldFacts {
+                fstype: "hfs".to_owned(),
+                ..data.clone()
+            },
+            "data-uuid"
+        )
+        .is_ok());
+        assert!(judge_recorded_volume(
+            &HeldFacts {
+                uuid: None,
+                ..data.clone()
+            },
+            "data-uuid"
+        )
+        .is_err());
+        assert!(judge_recorded_volume(
+            &HeldFacts {
+                fstype: "exfat".to_owned(),
+                ..data.clone()
+            },
+            "data-uuid"
+        )
+        .is_err());
     }
 
     #[test]
@@ -7193,10 +7724,14 @@ mod tests {
             Absence::Unknown(_)
         ));
         row.checkout_volume_uuid = checkout_volume_uuid(&fixture.root);
-        assert!(matches!(
-            checkout_absence(&row, false).unwrap(),
-            Absence::Absent
-        ));
+        let Absence::Absent(witness) = checkout_absence(&row, false).unwrap() else {
+            panic!("the actual leaf's ENOENT did not prove absence");
+        };
+        assert_eq!(witness.missing, Some(witness.observed.len()));
+        assert!(
+            witness.boot_data.is_none(),
+            "a fully present ancestry needs no boot Data proof"
+        );
         // A different recorded volume keeps it.
         let mut other = row.clone();
         other.checkout_volume_uuid = Some("00000000-0000-0000-0000-000000000000".to_owned());
@@ -7209,13 +7744,46 @@ mod tests {
             checkout_absence(&row, false).unwrap(),
             Absence::Present
         ));
-        // A missing ancestor is uncertainty, never absence.
+        // A missing ancestor chain is never absence on a volume that is not
+        // the boot Data volume. This chain's nearest existing ancestor is `/`,
+        // the read-only system volume, so even the legacy exception keeps it.
         let mut deep = row_for(&fixture.root);
-        deep.checkout = fixture.root.join("missing-ancestor/checkout");
+        deep.checkout = PathBuf::from(format!(
+            "/oxide-absent-{}-chain/checkout",
+            std::process::id()
+        ));
         assert!(matches!(
             checkout_absence(&deep, false).unwrap(),
             Absence::Unknown(_)
         ));
+        assert!(matches!(
+            checkout_absence(&deep, true).unwrap(),
+            Absence::Unknown(_)
+        ));
+        // A missing chain below an absent mount name is a MOUNT refusal in
+        // both spellings, never a plain missing chain.
+        for spelling in [
+            "/Volumes/OxideAbsentNoSuchMount/deep/checkout".to_owned(),
+            "/System/Volumes/Data/Volumes/OxideAbsentNoSuchMount/deep/checkout".to_owned(),
+        ] {
+            let mut unmounted = row_for(&fixture.root);
+            unmounted.checkout = PathBuf::from(&spelling);
+            unmounted.checkout_volume_uuid = checkout_volume_uuid(&fixture.root);
+            assert!(
+                matches!(
+                    checkout_absence(&unmounted, false).unwrap(),
+                    Absence::Unknown(_)
+                ),
+                "{spelling} was not kept as a mount refusal"
+            );
+            assert!(
+                matches!(
+                    checkout_absence(&unmounted, true).unwrap(),
+                    Absence::Unknown(_)
+                ),
+                "{spelling} was not kept as a mount refusal"
+            );
+        }
         // A symlinked ancestor is never followed.
         let link = fixture.root.join("linked");
         std::os::unix::fs::symlink(&missing, &link).unwrap();
@@ -7223,6 +7791,15 @@ mod tests {
         linked.checkout = link.join("child");
         assert!(matches!(
             checkout_absence(&linked, false).unwrap(),
+            Absence::Unknown(_)
+        ));
+        // A non-directory component is never walked through.
+        let file = fixture.root.join("plain-file");
+        fs::write(&file, b"file").unwrap();
+        let mut through_file = row_for(&fixture.root);
+        through_file.checkout = file.join("child");
+        assert!(matches!(
+            checkout_absence(&through_file, false).unwrap(),
             Absence::Unknown(_)
         ));
     }
@@ -7332,6 +7909,82 @@ mod tests {
             .kept
             .as_deref()
             .is_some_and(|reason| reason.contains("whole batch"))));
+    }
+
+    /// Ordinary path ineligibility keeps ONE root and leaves the snapshot
+    /// COMPLETE, so an unprovable sibling never prevents another root from being
+    /// considered. Only incomplete required authority refuses the whole batch.
+    #[test]
+    fn an_unprovable_checkout_keeps_only_its_own_root() {
+        // The recipe's internal root: a selected-volume fixture path is a
+        // /Volumes mount spelling, where the recorded-volume rule applies first.
+        let fixture = Fixture::at_internal_root();
+        let present = legacy_snapshot_row(&fixture, &"a".repeat(64));
+        fs::create_dir_all(&present.checkout).unwrap();
+        fs::create_dir(fixture.root.join("real")).unwrap();
+        std::os::unix::fs::symlink(
+            fixture.root.join("real"),
+            fixture.root.join("linked-parent"),
+        )
+        .unwrap();
+        let mut linked = legacy_snapshot_row(&fixture, &"b".repeat(64));
+        linked.checkout = fixture.root.join("linked-parent").join("child");
+        let control = ready_control(&fixture, vec![present.clone(), linked.clone()], Vec::new());
+        for row in [&present, &linked] {
+            publish_snapshot_receipt(
+                &control,
+                row,
+                &snapshot_receipt(
+                    row,
+                    "oxide.outputs.transition/1",
+                    "committed",
+                    Some(&row.root),
+                ),
+            );
+        }
+        let list = OperatorList {
+            roots: vec![present.root.clone(), linked.root.clone()],
+            sha256: "d".repeat(64),
+        };
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let registry = ready_registry(&control).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(
+            evaluated.complete,
+            "an unprovable sibling made the whole snapshot incomplete"
+        );
+        assert!(evaluated.iter().all(|entry| entry.candidate.is_none()));
+        let reason = |id: &str| {
+            evaluated
+                .iter()
+                .find(|entry| entry.row.checkout_id == id)
+                .and_then(|entry| entry.kept.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            reason(&present.checkout_id),
+            "the checkout is present, so its root is kept"
+        );
+        let absent = reason(&linked.checkout_id);
+        assert!(
+            absent.starts_with("checkout absence is unknown ("),
+            "{absent}"
+        );
+        assert!(!absent.contains("whole batch"), "{absent}");
+        // Incomplete required authority is DIFFERENT: a missing receipt still
+        // refuses the whole batch, naming its exact file.
+        let missing = outputs::receipt_path_public(&control, &linked.checkout_id);
+        fs::remove_file(&missing).unwrap();
+        let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(
+            !evaluated.complete,
+            "a missing receipt did not refuse the batch"
+        );
+        for entry in &evaluated {
+            let reason = entry.kept.clone().unwrap_or_default();
+            assert!(reason.contains("whole batch"), "{reason}");
+            assert!(reason.contains("is missing"), "{reason}");
+        }
     }
 
     /// One synthetic checkout whose recorded root sits inside a `/Volumes`
@@ -7483,11 +8136,13 @@ mod tests {
         };
         let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert_eq!(evaluated.len(), 3);
-        assert!(!evaluated.complete);
+        // An unprovable checkout path is ordinary per-root ineligibility: it
+        // keeps each of these roots and leaves the snapshot COMPLETE.
+        assert!(evaluated.complete);
         for entry in &evaluated {
             let reason = entry.kept.clone().unwrap_or_default();
             assert!(reason.contains("checkout absence is unknown"), "{reason}");
-            assert!(reason.contains("whole batch"), "{reason}");
+            assert!(!reason.contains("whole batch"), "{reason}");
             assert!(entry.candidate.is_none());
         }
     }
@@ -7520,6 +8175,10 @@ mod tests {
             sha256: "d".repeat(64),
         };
         let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
+        assert!(
+            evaluated.complete,
+            "an unprovable path is not incomplete authority"
+        );
         assert!(evaluated[0]
             .kept
             .as_deref()
@@ -7968,6 +8627,7 @@ mod tests {
             None,
             &mut budget,
             false,
+            &mut None,
         )
         .unwrap();
         assert!(
@@ -7989,6 +8649,7 @@ mod tests {
             None,
             &mut budget,
             false,
+            &mut None,
         )
         .unwrap();
         assert_eq!(
@@ -8296,8 +8957,212 @@ mod tests {
     #[test]
     fn legacy_eligibility_is_proved_by_the_boot_data_volume() {
         let fixture = Fixture::at_internal_root();
-        on_boot_data_volume(&fixture.root.join("gone/deeper/checkout")).unwrap();
+        let mut row = row_for(&fixture.root);
+        row.checkout = fixture.root.join("gone/deeper/checkout");
+        row.checkout_volume_uuid = None;
+        let Absence::Absent(witness) = checkout_absence(&row, true).unwrap() else {
+            panic!("the legacy exception did not prove the boot Data ancestry");
+        };
+        assert_eq!(witness.missing, Some(witness.observed.len()));
+        let data = witness
+            .boot_data
+            .clone()
+            .expect("the legacy rule holds the boot Data facts");
+        assert_eq!(witness.ancestor, data);
+        assert_eq!(data.fstype, "apfs");
+        // The same legacy row is never eligible as a registered root: the
+        // genuine exception is the only one that may lack a recorded volume.
+        assert!(matches!(
+            checkout_absence(&row, false).unwrap(),
+            Absence::Unknown(_)
+        ));
         assert!(!injected_eacces(&fixture.root));
+    }
+
+    /// The missing-parent extension: a checkout whose ancestors are gone is
+    /// positively absent when the held nearest existing ancestor is a readable
+    /// directory on the boot Data volume. The recipe's explicit internal root
+    /// is the premise here (the proof is about the internal volume), never the
+    /// pool's own volume.
+    #[test]
+    fn a_missing_ancestor_chain_on_the_boot_data_volume_is_proved_absent() {
+        let fixture = Fixture::at_internal_root();
+        let mut row = row_for(&fixture.root);
+        row.checkout = fixture.root.join("first").join("second").join("checkout");
+        row.checkout_volume_uuid = checkout_volume_uuid(&fixture.root);
+        let Absence::Absent(witness) = checkout_absence(&row, false).unwrap() else {
+            panic!("a boot Data missing chain did not prove absence");
+        };
+        assert_eq!(witness.missing, Some(witness.observed.len()));
+        assert_eq!(
+            witness.observed.last().map(|entry| entry.name.clone()),
+            fixture.root.file_name().map(std::ffi::OsStr::to_os_string)
+        );
+        assert_eq!(
+            witness.boot_data.clone().expect("the held boot Data proof"),
+            witness.ancestor
+        );
+        // The genuine legacy exception proves the same chain with no recorded
+        // volume, because the boot Data ancestry is its own rule.
+        let mut legacy = row.clone();
+        legacy.checkout_volume_uuid = None;
+        let Absence::Absent(legacy_witness) = checkout_absence(&legacy, true).unwrap() else {
+            panic!("the legacy exception did not prove the Data ancestry");
+        };
+        assert_eq!(legacy_witness, witness);
+        // A registered row whose recorded volume conflicts is never waived by
+        // today's Data ancestor.
+        let mut conflicting = row.clone();
+        conflicting.checkout_volume_uuid = Some("00000000-0000-0000-0000-000000000000".to_owned());
+        assert!(matches!(
+            checkout_absence(&conflicting, false).unwrap(),
+            Absence::Unknown(_)
+        ));
+        // Recreating the checkout is presence, never absence.
+        fs::create_dir_all(&row.checkout).unwrap();
+        assert!(matches!(
+            checkout_absence(&row, false).unwrap(),
+            Absence::Present
+        ));
+        assert!(matches!(
+            checkout_absence(&legacy, true).unwrap(),
+            Absence::Present
+        ));
+        fs::remove_dir_all(fixture.root.join("first")).unwrap();
+        // An existing nearest ancestor is observed as its own entry, and
+        // replacing it by a DIFFERENT empty directory keeps absence provable
+        // while changing the witness. That difference is what the real run's
+        // comparison refuses; a fresh absence proof alone would not notice.
+        let anchor = fixture.root.join("first");
+        fs::create_dir(&anchor).unwrap();
+        let Absence::Absent(before) = checkout_absence(&row, false).unwrap() else {
+            panic!("the observed anchor did not prove absence");
+        };
+        assert_eq!(
+            before.observed.last().map(|entry| entry.name.clone()),
+            Some(std::ffi::OsString::from("first"))
+        );
+        assert_eq!(before.missing, Some(before.observed.len()));
+        fs::rename(&anchor, fixture.root.join("first-away")).unwrap();
+        fs::create_dir(&anchor).unwrap();
+        let Absence::Absent(after) = checkout_absence(&row, false).unwrap() else {
+            panic!("the replacement anchor did not prove absence");
+        };
+        assert_eq!(after.missing, before.missing);
+        assert_eq!(after.observed.len(), before.observed.len());
+        assert_ne!(after, before);
+    }
+
+    /// A RECORDED checkout volume is never waived, whatever the row's age: the
+    /// operator list is a distinct permission from volume identity, so a
+    /// conflicting recorded volume keeps the root even when the surviving
+    /// ancestor sits on the boot Data volume, and the genuine legacy exception
+    /// remains an additional requirement rather than a replacement.
+    #[test]
+    fn a_recorded_checkout_volume_is_never_waived_by_a_listed_legacy_row() {
+        let fixture = Fixture::at_internal_root();
+        let mut row = row_for(&fixture.root);
+        row.checkout = fixture.root.join("one").join("two").join("checkout");
+        row.nonce = None;
+        row.checkout_volume_uuid = checkout_volume_uuid(&fixture.root);
+        // The matching recorded volume and the genuine legacy exception agree.
+        let Absence::Absent(witness) = checkout_absence(&row, true).unwrap() else {
+            panic!("the matching recorded volume and legacy rule did not prove absence");
+        };
+        assert!(
+            witness.boot_data.is_some(),
+            "the legacy permission is still required"
+        );
+        // A conflicting recorded volume is kept, list or no list.
+        let mut conflicting = row.clone();
+        conflicting.checkout_volume_uuid = Some("00000000-0000-0000-0000-000000000000".to_owned());
+        for legacy in [true, false] {
+            let refused = checkout_absence(&conflicting, legacy).unwrap();
+            assert!(
+                matches!(
+                    refused,
+                    Absence::Unknown(ref reason)
+                        if reason.contains("not on the checkout's recorded volume")
+                ),
+                "a conflicting recorded volume was waived (legacy {legacy}): {refused:?}"
+            );
+        }
+        // A row with NO recorded volume keeps the genuine exception's scope:
+        // the boot Data rule alone, and only when the exception is granted.
+        let mut unrecorded = row.clone();
+        unrecorded.checkout_volume_uuid = None;
+        assert!(matches!(
+            checkout_absence(&unrecorded, false).unwrap(),
+            Absence::Unknown(_)
+        ));
+        assert!(matches!(
+            checkout_absence(&unrecorded, true).unwrap(),
+            Absence::Absent(_)
+        ));
+    }
+
+    /// The walk keeps every descriptor of the chain it opened, so a replaced
+    /// ancestor is detected without re-resolving any path: the named entry and
+    /// the opened descriptor must still be the same object at EVERY level.
+    #[test]
+    fn a_replaced_ancestor_is_detected_against_the_held_chain() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = Fixture::new();
+        let top = fixture.root.join("top");
+        let inner = top.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let held = |path: &Path| {
+            let stat = fs::symlink_metadata(path).unwrap();
+            let descriptor = OwnedFd::from(File::open(path).unwrap());
+            (descriptor, stat)
+        };
+        let (root_fd, _) = held(&fixture.root);
+        let (top_fd, top_stat) = held(&top);
+        let (inner_fd, inner_stat) = held(&inner);
+        let entry = |name: &str, stat: &fs::Metadata| ObservedEntry {
+            name: std::ffi::OsString::from(name),
+            dev: stat.dev(),
+            ino: stat.ino(),
+        };
+        let observed = vec![entry("top", &top_stat), entry("inner", &inner_stat)];
+        let descriptors = vec![root_fd, top_fd, inner_fd];
+        revalidate_chain(&descriptors, &observed).unwrap();
+        // A chain with one descriptor per component is required.
+        assert!(revalidate_chain(&descriptors, &observed[..1]).is_err());
+        assert!(revalidate_chain(&descriptors[..2], &observed).is_err());
+        // Replace the FIRST ancestor by a different empty directory of the same
+        // name: the held chain still describes the object it opened.
+        fs::rename(&top, fixture.root.join("top-away")).unwrap();
+        fs::create_dir(&top).unwrap();
+        let refused = revalidate_chain(&descriptors, &observed).unwrap_err();
+        assert!(refused.contains("changed while it was read"), "{refused}");
+        // And the same replacement is invisible to a witness comparison only
+        // if nothing compares identities, which is why the walk keeps them.
+        let replacement = fs::symlink_metadata(&top).unwrap();
+        assert_ne!(
+            (replacement.dev(), replacement.ino()),
+            (top_stat.dev(), top_stat.ino())
+        );
+    }
+
+    /// Non-macOS builds have no held volume facts, so neither a missing chain
+    /// nor a plain absent leaf may be proved: every root is kept. Compile and
+    /// behaviour are stated honestly and never claimed as a macOS runtime
+    /// result. Compiled out on macOS.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_missing_chain_is_never_proved_without_apfs_facts() {
+        let fixture = Fixture::new();
+        let mut row = row_for(&fixture.root);
+        row.checkout = fixture.root.join("gone/checkout");
+        assert!(matches!(
+            checkout_absence(&row, false).unwrap(),
+            Absence::Unknown(_)
+        ));
+        assert!(matches!(
+            checkout_absence(&row, true).unwrap(),
+            Absence::Unknown(_)
+        ));
     }
 
     /// A row evaluated from the snapshot is a clone: it must not count as
@@ -8320,6 +9185,7 @@ mod tests {
             None,
             &mut budget,
             false,
+            &mut None,
         )
         .unwrap()
         .unwrap();
@@ -8342,6 +9208,7 @@ mod tests {
             None,
             &mut budget,
             false,
+            &mut None,
         )
         .unwrap()
         .unwrap();
@@ -8352,14 +9219,27 @@ mod tests {
     }
 
     /// A registered `/Volumes` checkout's mount is `/Volumes/<name>`
-    /// (component 2), never `/Volumes/Volumes`.
+    /// (component 2), never `/Volumes/Volumes`, and its boot Data alias names
+    /// the same mount.
     #[test]
     fn a_volumes_checkout_names_its_own_mount() {
         assert_eq!(
-            volumes_mount(Path::new("/Volumes/Builds/work/app")),
-            Some(PathBuf::from("/Volumes/Builds"))
+            checkout_path(Path::new("/Volumes/Builds/work/app"))
+                .unwrap()
+                .0,
+            WalkStart::Mount(PathBuf::from("/Volumes/Builds"))
         );
-        assert_eq!(volumes_mount(Path::new("/Volumes")), None);
+        assert_eq!(
+            checkout_path(Path::new("/System/Volumes/Data/Volumes/Builds/work/app"))
+                .unwrap()
+                .0,
+            WalkStart::Mount(PathBuf::from("/Volumes/Builds"))
+        );
+        assert_eq!(
+            checkout_path(Path::new("/Users/tom/app")).unwrap().0,
+            WalkStart::Root
+        );
+        assert!(checkout_path(Path::new("/Volumes")).is_err());
     }
 
     /// A receiptless legacy root's own `pruning` receipt publication yields
