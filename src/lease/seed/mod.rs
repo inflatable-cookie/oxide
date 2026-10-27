@@ -671,7 +671,7 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
             recipient_slot: &recipient_slot,
             relative: &file.path,
         });
-        if let Err(error) = clone_file(sources[index].as_fd(), directory, &name) {
+        if let Err(error) = clone_file(index, sources[index].as_fd(), directory, &name) {
             return pre_write(wrote_any, error);
         }
         // The clone exists from here: the recipient is untrusted and every
@@ -1341,9 +1341,21 @@ fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
         return Err(io_error(error));
     }
     drop(file);
+    // Test-only: a fault here models an interruption with the whole temp written
+    // and the rename not yet done (the temp stays behind, inert).
+    #[cfg(test)]
+    if let Some(error) = tests::catalog_fault(false) {
+        return Err(error);
+    }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
         return Err(io_error(error));
+    }
+    // Test-only: a fault here models an interruption after the atomic rename,
+    // before the directory fsync (the catalog is whole at its real name).
+    #[cfg(test)]
+    if let Some(error) = tests::catalog_fault(true) {
+        return Err(error);
     }
     File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -1624,11 +1636,22 @@ fn read_bounded(fd: BorrowedFd<'_>, max: usize, deadline: Instant) -> Result<Vec
 
 /// `clonefile` only: there is no byte-copy, hard-link or shell fallback. A
 /// platform without it never seeds (the caller skips before any effect).
+///
+/// `index` is the plan position the call writes, so a regression can interrupt
+/// the clone operation itself — before the syscall (no entry) or after it (the
+/// entry exists, unverified) — and then inspect the durable state.
 fn clone_file(
+    index: usize,
     source: BorrowedFd<'_>,
     destination: BorrowedFd<'_>,
     name: &std::ffi::CStr,
 ) -> Result<(), LeaseError> {
+    #[cfg(test)]
+    if let Some(error) = tests::clone_fault(index, false) {
+        return Err(error);
+    }
+    #[cfg(not(test))]
+    let _ = index;
     #[cfg(target_os = "macos")]
     {
         // SAFETY: both descriptors and the name are live for the call, and
@@ -1642,6 +1665,10 @@ fn clone_file(
             )
         };
         if result == 0 {
+            #[cfg(test)]
+            if let Some(error) = tests::clone_fault(index, true) {
+                return Err(error);
+            }
             Ok(())
         } else {
             Err(destination_error(std::io::Error::last_os_error()))

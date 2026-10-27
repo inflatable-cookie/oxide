@@ -41,6 +41,22 @@ thread_local! {
     static UNREADABLE_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
     static HARDLINK_CLONE: Cell<bool> = const { Cell::new(false) };
     static RACE_DESTINATION: Cell<bool> = const { Cell::new(false) };
+    static CLONE_FAULT: Cell<Option<(usize, bool)>> = const { Cell::new(None) };
+    static CATALOG_FAULT: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The injected clone-operation interruption, if this thread set one: `true`
+/// means after the syscall created its entry, `false` before it.
+pub(super) fn clone_fault(index: usize, after_call: bool) -> Option<LeaseError> {
+    (CLONE_FAULT.with(Cell::get) == Some((index, after_call)))
+        .then(|| LeaseError::Io("injected clone interruption".to_owned()))
+}
+
+/// The injected sidecar-write interruption: `true` after the atomic rename,
+/// `false` with the temp written and the rename not yet done.
+pub(super) fn catalog_fault(after_rename: bool) -> Option<LeaseError> {
+    (CATALOG_FAULT.with(Cell::get) == Some(after_rename))
+        .then(|| LeaseError::Io("injected catalog-write interruption".to_owned()))
 }
 
 pub(super) fn walk_limits_override() -> Option<SeedWalkLimits> {
@@ -64,6 +80,8 @@ fn reset_hooks() {
     UNREADABLE_CLONE.with(|cell| cell.set(None));
     HARDLINK_CLONE.with(|cell| cell.set(false));
     RACE_DESTINATION.with(|cell| cell.set(false));
+    CLONE_FAULT.with(|cell| cell.set(None));
+    CATALOG_FAULT.with(|cell| cell.set(None));
 }
 
 pub(super) fn inject(point: TestPoint<'_>) {
@@ -667,6 +685,21 @@ fn make_donor_in(
         digest,
         files,
     }
+}
+
+/// A held producing lease and the catalog it would publish, before release:
+/// the exact state a `publish_seed_catalog` call starts from.
+fn held_catalog(rig: &Rig, label: &str) -> (LeaseGrant, SeedCatalog) {
+    let record_id = rig.next_record_id();
+    let grant = rig.lease_at(
+        &format!("donor-{label}"),
+        "donor",
+        rig.affinity_dir(record_id),
+    );
+    let files = default_files();
+    write_files(&grant.env.cargo_build_build_dir, &files);
+    let catalog = catalog_for(&grant, record_id, &files);
+    (grant, catalog)
 }
 
 fn lease_recipient(rig: &Rig, label: &str) -> (LeaseGrant, SeedRecipient) {
@@ -1927,6 +1960,177 @@ fn crash_row_interrupted_catalog_write_is_inert_and_publish_is_atomic() {
         })
     );
     assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
+fn crash_row_clone_interruption_before_the_call_retains_the_prefix() {
+    reset_hooks();
+    let rig = Rig::new("clone-interrupt-before");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let donor_tree = tree(&donor.grant.env.cargo_build_build_dir);
+    let donor_catalog = fs::read(
+        rig.pool
+            .join(MANAGED_NAME)
+            .join("seeds")
+            .join(format!("{}.catalog.json", donor.grant.slot_id)),
+    )
+    .expect("donor catalog");
+    let ledger = rig.ledger_bytes();
+    let control = fs::read(rig.control().join("state.json")).expect("control state");
+    // The clone operation itself is interrupted at the third file, before its
+    // syscall creates an entry.
+    CLONE_FAULT.with(|cell| cell.set(Some((2, false))));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(refused, Err(LeaseError::Io(_))), "{refused:?}");
+    let build = &grant.env.cargo_build_build_dir;
+    // The persisted state of an interruption mid-clone: the earlier clones only.
+    assert!(build.join(&donor.files[0].0).exists());
+    assert!(build.join(&donor.files[1].0).exists());
+    assert!(!build.join(&donor.files[2].0).exists());
+    // Unrelated state is untouched: the donor's own tree, its catalog, the
+    // ledger and the front-door control state.
+    assert_eq!(tree(&donor.grant.env.cargo_build_build_dir), donor_tree);
+    assert_eq!(
+        fs::read(
+            rig.pool
+                .join(MANAGED_NAME)
+                .join("seeds")
+                .join(format!("{}.catalog.json", donor.grant.slot_id))
+        )
+        .expect("donor catalog"),
+        donor_catalog
+    );
+    assert_eq!(rig.ledger_bytes(), ledger);
+    assert_eq!(
+        fs::read(rig.control().join("state.json")).expect("control state"),
+        control
+    );
+    // The persisted partial recipient is not offered as a donor and cannot be
+    // seeded into again through the library.
+    CLONE_FAULT.with(|cell| cell.set(None));
+    let (_, other_recipient) = lease_recipient(&rig, "b");
+    assert!(candidates(&rig, &other_recipient)
+        .candidates
+        .iter()
+        .all(|candidate| candidate.slot_id != grant.slot_id));
+    let again = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(again, Err(LeaseError::UnsafePath(_))), "{again:?}");
+}
+
+#[test]
+fn crash_row_clone_interruption_after_the_call_leaves_an_untrusted_entry() {
+    reset_hooks();
+    let rig = Rig::new("clone-interrupt-after");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let ledger = rig.ledger_bytes();
+    // The clone operation creates its entry and is then interrupted before the
+    // clone is verified: an untrusted entry that is never published.
+    CLONE_FAULT.with(|cell| cell.set(Some((1, true))));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(refused, Err(LeaseError::Io(_))), "{refused:?}");
+    let build = &grant.env.cargo_build_build_dir;
+    assert!(build.join(&donor.files[0].0).exists());
+    assert!(build.join(&donor.files[1].0).exists());
+    assert!(!build.join(&donor.files[2].0).exists());
+    // No sidecar, no ledger fact, and the partial recipient is neither offered
+    // as a donor nor seedable again through the library.
+    assert!(rig
+        .sidecars()
+        .iter()
+        .all(|name| !name.starts_with(&format!("{}.", grant.slot_id))));
+    assert_eq!(rig.ledger_bytes(), ledger);
+    CLONE_FAULT.with(|cell| cell.set(None));
+    let (_, other_recipient) = lease_recipient(&rig, "b");
+    assert!(candidates(&rig, &other_recipient)
+        .candidates
+        .iter()
+        .all(|candidate| candidate.slot_id != grant.slot_id));
+    let again = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(again, Err(LeaseError::UnsafePath(_))), "{again:?}");
+}
+
+#[test]
+fn crash_row_catalog_interruption_before_the_rename_keeps_only_an_inert_temp() {
+    reset_hooks();
+    let rig = Rig::new("catalog-before-rename");
+    let (grant, catalog) = held_catalog(&rig, "a");
+    let seeds = rig.pool.join(MANAGED_NAME).join("seeds");
+    let real = seeds.join(format!("{}.catalog.json", grant.slot_id));
+    let ledger = rig.ledger_bytes();
+    let control = fs::read(rig.control().join("state.json")).ok();
+    // The temp is written and the rename has not happened: the real name stays
+    // absent and the leftover temp is inert.
+    CATALOG_FAULT.with(|cell| cell.set(Some(false)));
+    let refused = publish_seed_catalog(&rig.pool, &catalog);
+    assert!(matches!(refused, Err(LeaseError::Io(_))), "{refused:?}");
+    assert!(!real.exists());
+    assert_eq!(
+        rig.sidecars()
+            .iter()
+            .filter(|name| name.starts_with("catalog.tmp-"))
+            .count(),
+        1
+    );
+    // Pre-rename state is not trusted: once the producing generation is idle,
+    // the temp offers no candidate and the seed skips.
+    assert_eq!(rig.ledger_bytes(), ledger);
+    assert_eq!(fs::read(rig.control().join("state.json")).ok(), control);
+    release_injected(&rig.pool, &grant.lease_id).expect("release donor");
+    rig.donor_lock(catalog.record_id);
+    let (_, recipient) = lease_recipient(&rig, "b");
+    assert!(candidates(&rig, &recipient).candidates.is_empty());
+    let request = SeedRequest {
+        recipient: recipient.clone(),
+        donor: SeedDonor {
+            slot_id: grant.slot_id.clone(),
+            incarnation: grant.incarnation.clone(),
+            lease_id: grant.lease_id.clone(),
+            record_id: catalog.record_id,
+            catalog_digest: catalog_digest(&catalog.to_bytes().expect("catalog bytes")),
+        },
+        units: vec![SeedUnitRef {
+            fingerprint_dir: FINGERPRINT.to_owned(),
+            role: SeedRole::Lib,
+        }],
+        work_budget_ms: None,
+    };
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::CatalogChanged
+        })
+    );
+}
+
+#[test]
+fn crash_row_catalog_interruption_after_the_rename_leaves_the_whole_catalog() {
+    reset_hooks();
+    let rig = Rig::new("catalog-after-rename");
+    let (grant, catalog) = held_catalog(&rig, "a");
+    let seeds = rig.pool.join(MANAGED_NAME).join("seeds");
+    let real = seeds.join(format!("{}.catalog.json", grant.slot_id));
+    let ledger = rig.ledger_bytes();
+    // The rename happened and the directory fsync was interrupted: the catalog
+    // is whole at its real name and no temp file remains.
+    CATALOG_FAULT.with(|cell| cell.set(Some(true)));
+    let refused = publish_seed_catalog(&rig.pool, &catalog);
+    assert!(matches!(refused, Err(LeaseError::Io(_))), "{refused:?}");
+    assert!(SeedCatalog::parse(&fs::read(&real).expect("catalog bytes")).is_ok());
+    assert!(!rig
+        .sidecars()
+        .iter()
+        .any(|name| name.starts_with("catalog.tmp-")));
+    // The write touched no ledger or control fact, and the post-rename catalog
+    // is a candidate once the generation is idle.
+    assert_eq!(rig.ledger_bytes(), ledger);
+    release_injected(&rig.pool, &grant.lease_id).expect("release donor");
+    let (_, recipient) = lease_recipient(&rig, "b");
+    let listed = candidates(&rig, &recipient);
+    assert_eq!(listed.candidates.len(), 1);
+    assert_eq!(listed.candidates[0].slot_id, grant.slot_id);
 }
 
 #[test]
