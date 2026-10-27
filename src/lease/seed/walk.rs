@@ -16,7 +16,9 @@ use super::super::current_uid;
 use crate::owned_delete::open_directory_at;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(test)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(test)]
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -70,7 +72,33 @@ pub struct WalkOutcome {
 /// stat'd or proven to be an owned directory on the pool's device is a gap,
 /// never an error and never a clean zero-byte observation: the caller abandons
 /// seeding on any gap.
+///
+/// This path-based entry exists for direct root-failure regressions. The
+/// seeding call walks [`walk_slot_in`], from the slot descriptor it already
+/// verified, so no path component can be redirected between the check and the
+/// walk.
+#[cfg(test)]
 pub fn walk_slot(root: &Path, device: u64, limits: WalkLimits, started: Instant) -> WalkOutcome {
+    match open_root(root) {
+        Ok(fd) => walk_slot_in(fd.as_fd(), device, limits, started),
+        Err(_) => WalkOutcome {
+            entries: 0,
+            logical_bytes: 0,
+            allocated_bytes: 0,
+            gap: Some(WalkGap::Unreadable),
+            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        },
+    }
+}
+
+/// Walk an already-open slot root. The descriptor is the one custody verified,
+/// so the walk cannot be redirected to another directory by a path change.
+pub fn walk_slot_in(
+    root: BorrowedFd<'_>,
+    device: u64,
+    limits: WalkLimits,
+    started: Instant,
+) -> WalkOutcome {
     let mut walk = Walk {
         limits,
         started,
@@ -81,18 +109,13 @@ pub fn walk_slot(root: &Path, device: u64, limits: WalkLimits, started: Instant)
         allocated_bytes: 0,
         gap: None,
     };
-    match open_root(root) {
-        Ok(fd) => match stat(fd.as_fd()) {
-            Ok(root_stat) if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR => {
-                walk.stop(WalkGap::UnexpectedType)
-            }
-            Ok(root_stat) if root_stat.st_uid != current_uid() => walk.stop(WalkGap::ForeignOwner),
-            Ok(root_stat) if root_stat.st_dev as u64 != device => {
-                walk.stop(WalkGap::DeviceBoundary)
-            }
-            Ok(_) => walk.visit(fd.as_fd(), 0),
-            Err(_) => walk.stop(WalkGap::Unreadable),
-        },
+    match stat(root) {
+        Ok(root_stat) if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR => {
+            walk.stop(WalkGap::UnexpectedType)
+        }
+        Ok(root_stat) if root_stat.st_uid != current_uid() => walk.stop(WalkGap::ForeignOwner),
+        Ok(root_stat) if root_stat.st_dev as u64 != device => walk.stop(WalkGap::DeviceBoundary),
+        Ok(_) => walk.visit(root, 0),
         Err(_) => walk.stop(WalkGap::Unreadable),
     }
     WalkOutcome {
@@ -216,6 +239,7 @@ impl Walk {
     }
 }
 
+#[cfg(test)]
 fn open_root(root: &Path) -> std::io::Result<OwnedFd> {
     let root = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("slot root holds a NUL"))?;

@@ -69,16 +69,33 @@ impl ParsedJoin {
         set(&self.targets) == set(targets) && set(&self.inputs) == set(inputs)
     }
 
+    /// The one rule whose target set is exactly this artifact, or `None` when
+    /// the artifact has no rule, two rules name it, or a rule names it among
+    /// several targets. Duplicate or conflicting evidence is refused before
+    /// any flattened-set comparison: two rules for one artifact never
+    /// establish which prerequisites produce it.
+    pub fn sole_rule_for(&self, artifact: &str) -> Option<&JoinRule> {
+        let mut found: Option<&JoinRule> = None;
+        for rule in &self.rules {
+            if rule.targets.iter().any(|target| target == artifact) {
+                if found.is_some() || rule.targets.len() != 1 {
+                    return None;
+                }
+                found = Some(rule);
+            }
+        }
+        found
+    }
+
     /// Whether `artifact` has its own single-target rule whose prerequisites
     /// are nonempty and all drawn from the recorded inputs. A flattened rule
-    /// that names several targets, or a rule with no source, establishes
-    /// nothing about that artifact.
+    /// that names several targets, a duplicate or conflicting rule, or a rule
+    /// with no source establishes nothing about that artifact.
     pub fn artifact_rule_proven(&self, artifact: &str, recorded_inputs: &[String]) -> bool {
         let inputs: std::collections::BTreeSet<&str> =
             recorded_inputs.iter().map(String::as_str).collect();
-        self.rule_for(artifact).is_some_and(|rule| {
-            rule.targets.len() == 1
-                && !rule.inputs.is_empty()
+        self.sole_rule_for(artifact).is_some_and(|rule| {
+            !rule.inputs.is_empty()
                 && rule
                     .inputs
                     .iter()

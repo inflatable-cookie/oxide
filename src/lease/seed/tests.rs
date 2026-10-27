@@ -10,7 +10,7 @@ use super::super::pool::{
     tamper_idle_generations_injected,
 };
 use super::super::{
-    LeaseError, LeaseGrant, LeaseRequest, Profile, BUDGET_BACKEND_DIRECTORY_V1,
+    LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, BUDGET_BACKEND_DIRECTORY_V1,
     VOLUME_BACKEND_APFS_V1,
 };
 use super::*;
@@ -34,10 +34,11 @@ thread_local! {
     static TAMPER_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
     static BREAK_DONOR: Cell<Option<usize>> = const { Cell::new(None) };
     static PLANT_SYMLINK: Cell<bool> = const { Cell::new(false) };
-    static REMOVE_SLOT: Cell<bool> = const { Cell::new(false) };
     static TAMPER_LEDGER: Cell<bool> = const { Cell::new(false) };
     static VERIFY_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
     static CLONE_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
+    static REMOVE_CREATED_DIRECTORY: Cell<bool> = const { Cell::new(false) };
+    static UNREADABLE_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 pub(super) fn walk_limits_override() -> Option<SeedWalkLimits> {
@@ -54,10 +55,11 @@ fn reset_hooks() {
     TAMPER_CLONE.with(|cell| cell.set(None));
     BREAK_DONOR.with(|cell| cell.set(None));
     PLANT_SYMLINK.with(|cell| cell.set(false));
-    REMOVE_SLOT.with(|cell| cell.set(false));
     TAMPER_LEDGER.with(|cell| cell.set(false));
     VERIFY_DELAY_MS.with(|cell| cell.set(None));
     CLONE_DELAY_MS.with(|cell| cell.set(None));
+    REMOVE_CREATED_DIRECTORY.with(|cell| cell.set(false));
+    UNREADABLE_CLONE.with(|cell| cell.set(None));
 }
 
 pub(super) fn inject(point: TestPoint<'_>) {
@@ -86,14 +88,23 @@ pub(super) fn inject(point: TestPoint<'_>) {
                 file.write_all(b"tampered").expect("tamper clone");
             }
         }
-        TestPoint::DuringClone { index: 0 } => sleep_opt(CLONE_DELAY_MS.with(Cell::get)),
-        TestPoint::DuringClone { .. } => {}
+        TestPoint::DuringClone { index, path } => {
+            if index == 0 {
+                sleep_opt(CLONE_DELAY_MS.with(Cell::get));
+            }
+            if UNREADABLE_CLONE.with(Cell::get) == Some(index) {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o000))
+                    .expect("unreadable clone");
+            }
+        }
+        TestPoint::AfterDestinationMkdir { path } => {
+            if REMOVE_CREATED_DIRECTORY.with(Cell::get) {
+                fs::remove_dir(path).expect("remove created destination");
+            }
+        }
         TestPoint::BeforeWalk { slot } => {
             if PLANT_SYMLINK.with(Cell::get) {
                 symlink("missing-target", slot.join("foreign-link")).expect("plant symlink");
-            }
-            if REMOVE_SLOT.with(Cell::get) {
-                fs::remove_dir_all(slot).expect("remove recipient slot");
             }
         }
         TestPoint::BeforeFinalDonorCheck { pool } => {
@@ -260,6 +271,32 @@ impl Rig {
     }
 
     fn lease_at(&self, label: &str, holder: &str, project: PathBuf) -> LeaseGrant {
+        self.lease_full(label, holder, project, None)
+    }
+
+    /// A lease whose slot goes into its own project-named folder, so the
+    /// `slots/<folder>/<leaf>` intermediate components are exercised.
+    fn lease_layout(&self, label: &str, holder: &str, folder: &str) -> LeaseGrant {
+        let project = self.fx.dir(&format!("project-{label}"));
+        self.lease_full(
+            label,
+            holder,
+            project,
+            Some(SlotLayout {
+                folders: vec![folder.to_owned()],
+                same_repository: Vec::new(),
+                profile: "quick".to_owned(),
+            }),
+        )
+    }
+
+    fn lease_full(
+        &self,
+        label: &str,
+        holder: &str,
+        project: PathBuf,
+        layout: Option<SlotLayout>,
+    ) -> LeaseGrant {
         let workspace = self.fx.dir(&format!("workspace-{label}"));
         lease_injected(LeaseRequest {
             pool: self.pool.clone(),
@@ -269,7 +306,7 @@ impl Rig {
             holder: holder.to_owned(),
             budget_bytes: None,
             reserve_bytes: None,
-            layout: None,
+            layout,
             replace_slot: None,
         })
         .expect("lease")
@@ -550,14 +587,47 @@ fn make_donor_with(
     targets: &[String],
     inputs: &[String],
 ) -> Donor {
+    make_donor_in(rig, label, None, files, targets, inputs)
+}
+
+fn make_donor_in_folder(rig: &Rig, label: &str, folder: &str) -> Donor {
+    make_donor_in(
+        rig,
+        label,
+        Some(folder),
+        default_files(),
+        &dep_targets(),
+        &dep_inputs(),
+    )
+}
+
+fn make_donor_in(
+    rig: &Rig,
+    label: &str,
+    folder: Option<&str>,
+    files: Vec<(String, String)>,
+    targets: &[String],
+    inputs: &[String],
+) -> Donor {
     // A front-door lease records its record's affinity directory as the
     // project, which is the binding a catalog's record id must match.
     let record_id = rig.next_record_id();
-    let grant = rig.lease_at(
-        &format!("donor-{label}"),
-        "donor",
-        rig.affinity_dir(record_id),
-    );
+    let project = rig.affinity_dir(record_id);
+    let holder = "donor";
+    let name = format!("donor-{label}");
+    let grant = match folder {
+        Some(folder) => rig.lease_full(
+            &name,
+            holder,
+            project,
+            Some(SlotLayout {
+                folders: vec![folder.to_owned()],
+                same_repository: Vec::new(),
+                profile: "quick".to_owned(),
+            }),
+        ),
+        None => rig.lease_at(&name, holder, project),
+    };
     write_files(&grant.env.cargo_build_build_dir, &files);
     let dep = files
         .iter()
@@ -585,12 +655,26 @@ fn lease_recipient(rig: &Rig, label: &str) -> (LeaseGrant, SeedRecipient) {
     // One holder holds one lease at a time, so each recipient fixture has its
     // own holder identity.
     let grant = rig.lease(&format!("recipient-{label}"), &format!("recipient-{label}"));
-    let recipient = SeedRecipient {
+    let recipient = seed_recipient(&grant);
+    (grant, recipient)
+}
+
+fn lease_recipient_in_folder(rig: &Rig, label: &str, folder: &str) -> (LeaseGrant, SeedRecipient) {
+    let grant = rig.lease_layout(
+        &format!("recipient-{label}"),
+        &format!("recipient-{label}"),
+        folder,
+    );
+    let recipient = seed_recipient(&grant);
+    (grant, recipient)
+}
+
+fn seed_recipient(grant: &LeaseGrant) -> SeedRecipient {
+    SeedRecipient {
         slot_id: grant.slot_id.clone(),
         incarnation: grant.incarnation.clone(),
         lease_id: grant.lease_id.clone(),
-    };
-    (grant, recipient)
+    }
 }
 
 fn candidates(rig: &Rig, recipient: &SeedRecipient) -> SeedCandidates {
@@ -865,6 +949,32 @@ fn seed_skips_a_join_that_does_not_prove_each_artifact() {
         &dep_inputs(),
     );
     refused(&donor, "missing");
+
+    // Two rules name the same artifact: duplicate evidence.
+    let duplicate = format!(
+        "{DEP}: {SOURCE_A} {SOURCE_B}\n{ARTIFACT}: {SOURCE_A}\n{ARTIFACT}: {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n"
+    );
+    let donor = make_donor_with(
+        &rig,
+        "duplicate",
+        files_with_dep(&duplicate),
+        &dep_targets(),
+        &dep_inputs(),
+    );
+    refused(&donor, "duplicate");
+
+    // Two rules name it with different prerequisite sets: conflicting.
+    let conflicting = format!(
+        "{DEP}: {SOURCE_A} {SOURCE_B}\n{ARTIFACT}: {SOURCE_A}\n{ARTIFACT}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n"
+    );
+    let donor = make_donor_with(
+        &rig,
+        "conflicting",
+        files_with_dep(&conflicting),
+        &dep_targets(),
+        &dep_inputs(),
+    );
+    refused(&donor, "conflicting");
 
     // An unparseable `.d`.
     let donor = make_donor_with(
@@ -1377,20 +1487,116 @@ fn seed_abandons_on_an_entry_limit_walk() {
 }
 
 #[test]
-fn seed_abandons_when_the_recipient_root_is_gone_before_the_walk() {
+fn seed_abandons_on_an_unreadable_recipient_entry() {
     reset_hooks();
-    let rig = Rig::new("walk-root-gone");
+    let rig = Rig::new("walk-unreadable");
     let donor = make_donor(&rig, "a");
-    let (_, recipient) = lease_recipient(&rig, "a");
-    // The walk root itself disappears after the clone: a root that cannot be
-    // opened is a gap, never a refusal and never clean coverage.
-    REMOVE_SLOT.with(|cell| cell.set(true));
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let before_sidecars = rig.sidecars();
+    // One cloned file cannot be read by its owner: the walk is incomplete, so
+    // seeding abandons (nothing published) instead of refusing.
+    UNREADABLE_CLONE.with(|cell| cell.set(Some(0)));
     let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
     assert_eq!(abandon.observation.gap, Some(SeedWalkGap::Unreadable));
-    assert_eq!(abandon.observation.entries, 0);
+    // The clone is retained, untrusted, and nothing was published.
+    assert!(grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
+    assert_eq!(rig.sidecars(), before_sidecars);
+}
+
+#[test]
+fn a_missing_walk_root_is_an_unreadable_gap() {
+    reset_hooks();
+    let rig = Rig::new("walk-missing-root");
+    let missing = rig.pool.join("payload").join("slots").join("no-such-slot");
+    let outcome = walk::walk_slot(
+        &missing,
+        0,
+        SeedWalkLimits {
+            max_entries: 10,
+            max_depth: 4,
+            max_elapsed_ms: 1_000,
+        },
+        Instant::now(),
+    );
+    assert_eq!(outcome.gap, Some(SeedWalkGap::Unreadable));
+    assert_eq!(outcome.entries, 0);
+}
+
+#[test]
+fn seed_refuses_a_slot_folder_symlink_on_either_side() {
+    reset_hooks();
+    let rig = Rig::new("slot-folder-symlink");
+    let donor = make_donor_in_folder(&rig, "a", "donor-folder");
+    let (grant, recipient) = lease_recipient_in_folder(&rig, "a", "recipient-folder");
+    let slots = rig.pool.join("payload").join("slots");
+    let outside = rig.fx.dir("outside");
+    let donor_folder = slots.join("donor-folder");
+    let recipient_folder = slots.join("recipient-folder");
+    let recipient_leaf = grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .expect("slot dir")
+        .file_name()
+        .expect("slot leaf")
+        .to_owned();
+
+    // Donor side: the project folder becomes a link to a directory outside the
+    // payload. Custody refuses it instead of following the redirect.
+    fs::rename(&donor_folder, outside.join("donor-folder")).expect("move donor folder");
+    symlink(outside.join("donor-folder"), &donor_folder).expect("donor symlink");
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+    fs::remove_file(&donor_folder).expect("remove donor symlink");
+    fs::rename(outside.join("donor-folder"), &donor_folder).expect("restore donor folder");
+
+    // Recipient side: the same redirect on the recipient's own folder.
+    fs::rename(&recipient_folder, outside.join("recipient-folder")).expect("move recipient folder");
+    symlink(outside.join("recipient-folder"), &recipient_folder).expect("recipient symlink");
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    let redirected = outside
+        .join("recipient-folder")
+        .join(&recipient_leaf)
+        .join("build");
+    assert!(tree(&redirected).is_empty());
+}
+
+#[test]
+fn seed_refuses_a_fault_between_the_destination_mkdir_and_its_reopen() {
+    reset_hooks();
+    let rig = Rig::new("mkdir-reopen");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let before_ledger = rig.ledger_bytes();
+    let before_sidecars = rig.sidecars();
+    // The first destination directory is created and then disappears before
+    // its reopen. The write already happened, so this refuses and retains
+    // rather than cold-skipping in the same slot.
+    REMOVE_CREATED_DIRECTORY.with(|cell| cell.set(true));
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(matches!(refused, Err(LeaseError::Io(_))), "{refused:?}");
+    assert_eq!(rig.ledger_bytes(), before_ledger);
+    assert_eq!(rig.sidecars(), before_sidecars);
+    assert!(!grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
 }
 
 #[test]
@@ -1540,6 +1746,22 @@ fn join_parser_accepts_rustc_shapes_and_refuses_others() {
     assert!(
         !parsed.artifact_rule_proven("debug/deps/libcfg_if-bbbbbbbbbbbbbbbb.rmeta", &dep_inputs())
     );
+    // Duplicate and conflicting artifact rules never prove the artifact.
+    let duplicate =
+        join::parse(format!("{ARTIFACT}: {SOURCE_A}\n{ARTIFACT}: {SOURCE_B}\n").as_bytes())
+            .expect("duplicate rules");
+    assert!(duplicate.sole_rule_for(ARTIFACT).is_none());
+    assert!(!duplicate.artifact_rule_proven(ARTIFACT, &dep_inputs()));
+    let conflicting = join::parse(
+        format!("{ARTIFACT}: {SOURCE_A}\n{ARTIFACT}: {SOURCE_A} {SOURCE_B}\n").as_bytes(),
+    )
+    .expect("conflicting rules");
+    assert!(conflicting.sole_rule_for(ARTIFACT).is_none());
+    assert!(!conflicting.artifact_rule_proven(ARTIFACT, &dep_inputs()));
+    let sole =
+        join::parse(format!("{ARTIFACT}: {SOURCE_A} {SOURCE_B}\n").as_bytes()).expect("sole rule");
+    assert!(sole.sole_rule_for(ARTIFACT).is_some());
+    assert!(sole.artifact_rule_proven(ARTIFACT, &dep_inputs()));
 
     // Escaped space, escaped colon, literal `$` and a continued line.
     let text = "out/one\\ two: /src/a\\ b.rs /src/c.rs \\\n /src/d.rs\n/srv/\\$x: /src/e.rs\n";

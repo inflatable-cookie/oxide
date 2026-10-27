@@ -489,17 +489,13 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     let payload_device = fs::symlink_metadata(&view.payload_root)
         .map_err(io_error)?
         .dev();
-    let donor_slot = opened.seed_slot_path(donor)?;
-    let recipient_slot = opened.seed_slot_path(recipient)?;
-    if !donor_slot.starts_with(&view.payload_root)
-        || !recipient_slot.starts_with(&view.payload_root)
-    {
-        return Err(LeaseError::UnsafePath(
-            "a slot resolves outside the pool's payload root",
-        ));
-    }
-    let donor_fd = open_owned_directory(&donor_slot, payload_device)?;
-    let recipient_fd = open_owned_directory(&recipient_slot, payload_device)?;
+    // Every slot directory is opened one no-follow step at a time beneath the
+    // verified payload root, so a project folder (or the slots root) replaced
+    // by a symlink is refused rather than followed to another directory.
+    // The returned path is for messages; the descriptor is the custody.
+    let (donor_fd, _donor_slot_path) = open_slot_dirs(&view.payload_root, payload_device, donor)?;
+    let (recipient_fd, recipient_slot) =
+        open_slot_dirs(&view.payload_root, payload_device, recipient)?;
     // The recipient is this command's fresh slot: its `build/` is absent or
     // an empty owned directory. Anything else is refused, never cleaned.
     let recipient_build = open_recipient_build(recipient_fd.as_fd(), payload_device)?;
@@ -591,13 +587,19 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     let mut wrote_any = false;
     let recipient_build = match recipient_build {
         Some(build) => build,
-        None => match create_owned_directory(recipient_fd.as_fd(), c"build", payload_device) {
-            Ok(build) => {
-                wrote_any = true;
-                build
+        None => {
+            if let Err(error) = mkdir_owned(recipient_fd.as_fd(), c"build") {
+                return pre_write(wrote_any, error);
             }
-            Err(error) => return pre_write(wrote_any, error),
-        },
+            // The directory exists now: record the write before any reopen,
+            // so a reopen or stat failure refuses instead of cold-skipping.
+            wrote_any = true;
+            match open_optional_directory(recipient_fd.as_fd(), c"build", payload_device) {
+                Ok(Some(build)) => build,
+                Ok(None) => return pre_write(wrote_any, missing_directory()),
+                Err(error) => return pre_write(wrote_any, error),
+            }
+        }
     };
     for (index, planned) in plan.files.iter().enumerate() {
         let file = &planned.file;
@@ -610,16 +612,30 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         }
         let (parents, name) = split_relative(&file.path);
         let mut deepest: Option<OwnedFd> = None;
+        let mut destination = recipient_slot.join("build");
         for component in parents {
             let component = cstring(component)?;
             let parent_fd = match deepest.as_ref() {
                 Some(fd) => fd.as_fd(),
                 None => recipient_build.as_fd(),
             };
-            match open_or_create_directory(parent_fd, &component, payload_device) {
-                Ok((next, created)) => {
-                    wrote_any |= created;
-                    deepest = Some(next);
+            match open_optional_directory(parent_fd, &component, payload_device) {
+                Ok(Some(next)) => deepest = Some(next),
+                Ok(None) => {
+                    if let Err(error) = mkdir_owned(parent_fd, &component) {
+                        return pre_write(wrote_any, error);
+                    }
+                    // Mark the write the moment the directory exists, before
+                    // the reopen: a fault between mkdir and reopen refuses and
+                    // retains rather than cold-skipping in the same slot.
+                    wrote_any = true;
+                    destination.push(component.to_string_lossy().as_ref());
+                    test_point(TestPoint::AfterDestinationMkdir { path: &destination });
+                    match open_optional_directory(parent_fd, &component, payload_device) {
+                        Ok(Some(next)) => deepest = Some(next),
+                        Ok(None) => return pre_write(wrote_any, missing_directory()),
+                        Err(error) => return pre_write(wrote_any, error),
+                    }
                 }
                 Err(error) => return pre_write(wrote_any, error),
             }
@@ -677,7 +693,10 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
                 LeaseError::UnsafePath("a seeded clone does not match its recorded digest"),
             );
         }
-        test_point(TestPoint::DuringClone { index });
+        test_point(TestPoint::DuringClone {
+            index,
+            path: &recipient_path,
+        });
         if Instant::now() > deadline {
             return Err(work_deadline_after_clone());
         }
@@ -699,7 +718,7 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     let limits = walk_limits();
     // The walk's own cooperative deadline starts here; the seed's 5 s work
     // budget above is a separate bound and is not charged to the walk.
-    let walked = walk::walk_slot(&recipient_slot, payload_device, limits, Instant::now());
+    let walked = walk::walk_slot_in(recipient_fd.as_fd(), payload_device, limits, Instant::now());
     let observation = SeedObservation {
         store_id: view.store_id.clone(),
         slot_id: recipient.id.to_string(),
@@ -1289,18 +1308,52 @@ fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
         .map_err(io_error)
 }
 
-fn open_owned_directory(path: &Path, device: u64) -> Result<OwnedFd, LeaseError> {
-    let fd = open_path_directory(path).map_err(io_error)?;
-    let metadata = fstat(fd.as_fd()).map_err(io_error)?;
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || metadata.st_uid != current_uid()
-        || metadata.st_dev as u64 != device
-    {
-        return Err(LeaseError::UnsafePath(
-            "a slot is not an owned directory on the pool's device",
-        ));
+/// A custody failure on a slot path: an ownership, device or symlink fact
+/// that is not establishable is a refusal, never a cold fallback.
+fn slot_custody_error() -> LeaseError {
+    LeaseError::UnsafePath("a slot directory is not an owned directory on the pool's device")
+}
+
+fn missing_directory() -> LeaseError {
+    LeaseError::Io("a created seed directory is missing".to_owned())
+}
+
+/// Open one recorded slot beneath the payload's own descriptors, one
+/// no-follow step at a time: payload root, `slots`, an optional project folder,
+/// and the slot leaf. A project folder or `slots` entry replaced by a symlink
+/// fails here instead of being followed, so a recorded slot path can never
+/// resolve outside the payload. The returned path is for messages only.
+fn open_slot_dirs(
+    payload_root: &Path,
+    device: u64,
+    slot: &SeedSlotView,
+) -> Result<(OwnedFd, PathBuf), LeaseError> {
+    let payload = open_path_directory(payload_root).map_err(|_| slot_custody_error())?;
+    let payload = require_owned_directory(payload, device)?;
+    let slots = open_slot_component(payload.as_fd(), c"slots", device)?;
+    let root = payload_root.join("slots");
+    match slot.dir.as_deref() {
+        None => {
+            let name = cstring(&slot.id.to_string())?;
+            let fd = open_slot_component(slots.as_fd(), &name, device)?;
+            Ok((fd, root.join(slot.id.to_string())))
+        }
+        Some(dir) => {
+            let (folder, leaf) = dir.split_once('/').ok_or_else(slot_custody_error)?;
+            let folder_fd = open_slot_component(slots.as_fd(), &cstring(folder)?, device)?;
+            let leaf_fd = open_slot_component(folder_fd.as_fd(), &cstring(leaf)?, device)?;
+            Ok((leaf_fd, root.join(dir)))
+        }
     }
-    Ok(fd)
+}
+
+fn open_slot_component(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    device: u64,
+) -> Result<OwnedFd, LeaseError> {
+    let fd = open_directory_at(parent, name).map_err(|_| slot_custody_error())?;
+    require_owned_directory(fd, device)
 }
 
 fn open_path_directory(path: &Path) -> std::io::Result<OwnedFd> {
@@ -1357,47 +1410,6 @@ fn open_recipient_build(slot: BorrowedFd<'_>, device: u64) -> Result<Option<Owne
         ));
     }
     Ok(Some(build))
-}
-
-fn create_owned_directory(
-    parent: BorrowedFd<'_>,
-    name: &std::ffi::CStr,
-    device: u64,
-) -> Result<OwnedFd, LeaseError> {
-    match open_optional_directory(parent, name, device)? {
-        Some(fd) => Ok(fd),
-        None => match mkdir_owned(parent, name) {
-            Ok(()) => match open_optional_directory(parent, name, device)? {
-                Some(fd) => Ok(fd),
-                None => Err(LeaseError::Io(
-                    "a created seed directory is missing".to_owned(),
-                )),
-            },
-            Err(error) => Err(error),
-        },
-    }
-}
-
-/// Open a destination directory, creating it when absent. The flag is `true`
-/// only when this call created it, which is what makes it a recipient write.
-fn open_or_create_directory(
-    parent: BorrowedFd<'_>,
-    name: &std::ffi::CStr,
-    device: u64,
-) -> Result<(OwnedFd, bool), LeaseError> {
-    match open_optional_directory(parent, name, device) {
-        Ok(Some(fd)) => Ok((fd, false)),
-        Ok(None) => {
-            mkdir_owned(parent, name)?;
-            match open_optional_directory(parent, name, device)? {
-                Some(fd) => Ok((fd, true)),
-                None => Err(LeaseError::Io(
-                    "a created seed directory is missing".to_owned(),
-                )),
-            }
-        }
-        Err(error) => Err(error),
-    }
 }
 
 fn mkdir_owned(parent: BorrowedFd<'_>, name: &std::ffi::CStr) -> Result<(), LeaseError> {
@@ -1590,7 +1602,10 @@ enum TestPoint<'a> {
     /// After one clone was created, before it is verified.
     AfterClone { index: usize, path: &'a Path },
     /// After one clone was verified, before the next step.
-    DuringClone { index: usize },
+    DuringClone { index: usize, path: &'a Path },
+    /// Immediately after a destination directory was created, before its
+    /// reopen: the first-write boundary.
+    AfterDestinationMkdir { path: &'a Path },
     /// After every clone, before the recipient walk.
     BeforeWalk { slot: &'a Path },
     /// After the walk, before the final ledger recheck.
