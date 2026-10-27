@@ -4266,3 +4266,75 @@ fn a_failed_root_restore_stays_pending_then_replay_restores_and_finishes() {
     assert!(!slot_path.exists());
     assert!(private_names_in(&parent).is_empty());
 }
+
+/// A descendant that cannot be resolved after a **nested** directory was
+/// widened for the rollback must not leave that directory widened: the replay
+/// restores its recorded search-only mode through the verified descriptor,
+/// keeps the journal and stays pending.
+#[test]
+fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
+    let fixture = Fixture::new("nested-widen");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "nested-widen");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    // A search-only nested directory, captured, holding one captured child.
+    fs::create_dir(captured.join("nested")).expect("nested directory");
+    fs::write(captured.join("nested").join("inner"), b"x").expect("inner");
+    let held = File::open(&captured).expect("captured root descriptor");
+    let nested = std::ffi::CString::new("nested").expect("name");
+    let outer = crate::owned_delete::capture_entry(held.as_fd(), &nested).expect("nested capture");
+    let outer_facts =
+        crate::owned_delete::observe_entry(held.as_fd(), &outer.private).expect("outer facts");
+    let nested_dir = captured.join(outer.private.to_string_lossy().as_ref());
+    let nested_held = File::open(&nested_dir).expect("nested descriptor");
+    let inner = std::ffi::CString::new("inner").expect("name");
+    let child = crate::owned_delete::capture_entry(nested_held.as_fd(), &inner).expect("inner");
+    let child_facts =
+        crate::owned_delete::observe_entry(nested_held.as_fd(), &child.private).expect("facts");
+    let outer_private = String::from_utf8_lossy(outer.private.as_bytes()).into_owned();
+    let records = vec![
+        crate::owned_delete::CaptureRecord {
+            path: Vec::new(),
+            private: outer_private.clone(),
+            original: "nested".to_owned(),
+            device: outer_facts.device,
+            inode: outer_facts.inode,
+            // The owner left the ancestor search-only; the record keeps that.
+            mode: u32::from(outer_facts.file_type()) | 0o100,
+        },
+        crate::owned_delete::CaptureRecord {
+            path: vec![outer_private.clone()],
+            private: String::from_utf8_lossy(child.private.as_bytes()).into_owned(),
+            original: "inner".to_owned(),
+            device: child_facts.device,
+            inode: child_facts.inode,
+            mode: child_facts.mode as u32,
+        },
+    ];
+    // The descendant vanishes, so the rollback cannot resolve it, and the owner
+    // left the ancestor search-only.
+    fs::remove_file(nested_dir.join(child.private.to_string_lossy().as_ref()))
+        .expect("descendant removed");
+    fs::set_permissions(&nested_dir, fs::Permissions::from_mode(0o100))
+        .expect("search-only ancestor");
+    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(
+        after.slots.len(),
+        1,
+        "the unresolved descendant stays pending"
+    );
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert_eq!(
+        mode_of(&nested_dir),
+        0o100,
+        "the widened ancestor's recorded mode was restored on the error path"
+    );
+    assert!(
+        captured.exists(),
+        "the captured tree is kept, not put back past the failure"
+    );
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}

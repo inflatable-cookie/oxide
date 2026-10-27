@@ -2358,6 +2358,41 @@ fn verify_recorded(
     Ok(())
 }
 
+/// Restores one widened captured directory's recorded mode on **every** exit
+/// path of the replay step that needed the widening — an error return, a `?`
+/// and a panic — through the same verified search-only descriptor. It is
+/// disarmed only once the object's identity has left the widened state (its
+/// put-back completed), so a retained tree never keeps a widened mode.
+struct RestoreWidenedMode<'a> {
+    base: BorrowedFd<'a>,
+    private: std::ffi::CString,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    armed: bool,
+}
+
+impl RestoreWidenedMode<'_> {
+    /// Restore the recorded mode now and report a failure, so the caller stays
+    /// pending instead of keeping a widened directory.
+    fn restore(&mut self) -> Result<(), String> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        restore_captured_mode(self.base, &self.private, self.device, self.inode, self.mode)
+    }
+}
+
+impl Drop for RestoreWidenedMode<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ =
+                restore_captured_mode(self.base, &self.private, self.device, self.inode, self.mode);
+        }
+    }
+}
+
 /// Roll back every recorded capture inside one held tree root: each recorded
 /// object is put back under its observed name, deepest first, so every put-back
 /// sees a live parent. A captured directory's own recorded mode is restored
@@ -2378,6 +2413,14 @@ fn rollback_captures(
         journal.root.inode,
         journal.root.mode,
     )?;
+    let mut widened = RestoreWidenedMode {
+        base: parent,
+        private: root_name.to_owned(),
+        device: journal.root.device,
+        inode: journal.root.inode,
+        mode: journal.root.mode,
+        armed: true,
+    };
     let outcome = (|| {
         let root = open_directory_at(parent, root_name)
             .map_err(|error| format!("the held tree root cannot be opened ({error})"))?;
@@ -2398,14 +2441,9 @@ fn rollback_captures(
         }
         Ok(())
     })();
-    let restored = restore_captured_mode(
-        parent,
-        root_name,
-        journal.root.device,
-        journal.root.inode,
-        journal.root.mode,
-    );
-    outcome.and(restored)
+    // The root stays under its private name here (its put-back is later), so its
+    // recorded mode is restored now, and on any error before this point too.
+    outcome.and(widened.restore())
 }
 
 fn restore_captures_in(
@@ -2429,15 +2467,41 @@ fn restore_captures_in(
         }
         verify_recorded(base, &private, record)?;
         // The same search-only case as the root: read access for this replay
-        // step, restored to the recorded mode before the put-back below.
+        // step, restored to the recorded mode before the put-back below and on
+        // every error path in between (including a panicking one).
         widen_captured_mode(base, &private, record.device, record.inode, record.mode)?;
-        let child = open_directory_at(base, &private)
-            .map_err(|error| format!("a recorded captured directory cannot be opened ({error})"))?;
-        let mut inner = chain.to_vec();
-        inner.push(record.private.clone());
-        restore_captures_in(child.as_fd(), &inner, records, resolved)?;
-        restore_recorded(base, record)?;
-        *resolved += 1;
+        let mut widened = RestoreWidenedMode {
+            base,
+            private: private.clone(),
+            device: record.device,
+            inode: record.inode,
+            mode: record.mode,
+            armed: true,
+        };
+        let stepped = (|| {
+            let child = open_directory_at(base, &private).map_err(|error| {
+                format!("a recorded captured directory cannot be opened ({error})")
+            })?;
+            let mut inner = chain.to_vec();
+            inner.push(record.private.clone());
+            restore_captures_in(child.as_fd(), &inner, records, resolved)?;
+            restore_recorded(base, record)?;
+            // `restore_recorded` renamed the object back, so there is no widened
+            // name left to restore.
+            widened.armed = false;
+            Ok(())
+        })();
+        match stepped {
+            Ok(()) => *resolved += 1,
+            Err(reason) => {
+                return match widened.restore() {
+                    Ok(()) => Err(reason),
+                    Err(restore_reason) => Err(format!(
+                        "{reason}; the captured directory's recorded mode could not be restored ({restore_reason})"
+                    )),
+                }
+            }
+        }
     }
     for record in here.iter().filter(|record| !record.is_directory()) {
         restore_recorded(base, record)?;
