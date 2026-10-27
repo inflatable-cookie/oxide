@@ -5022,6 +5022,16 @@ The stable, read-only interface other tools use to find the registered Builds dr
   (SHA-256 `d8f56d3d4d0648b1830ebd050e19b70431f454ac327da6a824cfc5272c16e8cc`);
   the guard receipt SHA-256 is
   `fb038e4e5b3d1f9d90aa3b5d81f93e7140054574cfe345627a71460100ed503d`.
+  A second activated diagnostic at `95c10eb` was also spent, failing before
+  staging because Python 3.9 rejects `realpath(strict=True)`. All four cases
+  were unexecuted, no image was attached, and the guard closed with status 1
+  and a certain empty census. Its diagnostic receipt is
+  `/private/tmp/oxide-proof.8baumhti/evidence/prune134-diagnostic.json`
+  (SHA-256 `a68cf3b0915af2923158cdfd1a3338821c189d44fe5332f9a8d3162e9d91fb4f`);
+  its guard receipt SHA-256 is
+  `8473f38a4bd563dfae3358650ca2023ef29648a14621b319e9ac52e3e12c0098`.
+  The proof now uses Python 3.9-compatible strict path resolution, exercised
+  by the pure check on an existing file and a missing path.
   The corrected proof verifies a common canonical real cache root before and
   after strict seeding into its private Cargo home; its pure counterfactual
   is `effigy proof:prune-authority:test`. No counted native has run.

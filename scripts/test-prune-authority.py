@@ -93,10 +93,10 @@ def verified_seed_source(home: Path) -> dict:
     """
     if not home.is_absolute():
         raise RuntimeError("host Cargo home is not absolute")
-    registry = Path(os.path.realpath(home / "registry", strict=True))
-    git = Path(os.path.realpath(home / "git", strict=True))
+    registry = (home / "registry").resolve(strict=True)
+    git = (home / "git").resolve(strict=True)
     root = canonical_layout(registry, git)
-    if not root.is_absolute() or Path(os.path.realpath(root, strict=True)) != root:
+    if not root.is_absolute() or root.resolve(strict=True) != root:
         raise RuntimeError("Cargo cache root is not canonical")
     identity = {}
     with wrapper.offline_seed.Anchor(root, "canonical host Cargo cache") as anchor:
@@ -127,6 +127,17 @@ def self_check() -> int:
     import errno
     from types import SimpleNamespace
     from unittest.mock import patch
+
+    # Exercise the actual host Python API, without creating a fixture: this
+    # script exists and a child below the script file cannot exist.
+    existing = Path(__file__).resolve(strict=True)
+    require(existing.is_file(), "strict resolution of an existing file")
+    try:
+        (existing / "missing").resolve(strict=True)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("strict resolution accepted a missing path")
 
     seed = wrapper.offline_seed
     directory = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=7, st_ino=11)
@@ -159,7 +170,7 @@ def self_check() -> int:
                 "/fake/home/registry": registry, "/fake/home/git": git}
     def open_real(path, flags, **kwargs):
         return {"/cache": 10, "registry": 12, "git": 13}[str(path)]
-    with patch.object(os.path, "realpath", side_effect=lambda path, **kwargs: resolved[str(path)]), \
+    with patch.object(Path, "resolve", autospec=True, side_effect=lambda path, **kwargs: Path(resolved[str(path)])), \
          patch.object(os, "lstat", side_effect=lambda path: metadata[str(path)]), \
          patch.object(os, "stat", side_effect=lambda path: metadata[str(path)]), \
          patch.object(os, "open", side_effect=open_real), \
