@@ -4419,3 +4419,131 @@ fn a_nested_repair_widening_is_recorded_first_and_restored_on_refusal() {
     assert!(slot.is_dir(), "the refused slot is kept");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
 }
+
+/// The first directory below `root` whose owner mode is exactly `mode`.
+fn find_dir_by_mode(root: &Path, mode: u32) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        if metadata.permissions().mode() & 0o7777 == mode {
+            return Some(path);
+        }
+        if let Some(found) = find_dir_by_mode(&path, mode) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// A replacement that takes the deleted private name **after** the repair
+/// widened the verified directory is never chmodded: the owner's mode is
+/// restored through the verified repair descriptor, the replacement keeps its
+/// own mode, and the deletion refuses with the tree kept.
+#[test]
+fn a_replacement_after_the_repair_is_never_chmodded() {
+    let fixture = Fixture::new("reopen-replacement");
+    let slot = fixture.dir("slot");
+    let locked = slot.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
+
+    let fixture_path = fixture.path().to_path_buf();
+    let _rebind = crate::test_fs::before_child_reopen(move || {
+        // The captured directory is under a private name inside the captured
+        // slot: move the verified object aside and put a different directory at
+        // that name, so the reopen sees a replacement.
+        let captured_slot = private_names_in(&fixture_path)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("the captured slot");
+        let captured_locked = private_names_in(&captured_slot)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("the captured directory");
+        fs::rename(&captured_locked, captured_slot.join("moved-away"))
+            .expect("the verified directory is moved aside");
+        fs::create_dir(&captured_locked).expect("replacement at the private name");
+        fs::set_permissions(&captured_locked, fs::Permissions::from_mode(0o500))
+            .expect("replacement mode");
+    });
+
+    match remove_tree_owned(fixture.path(), &slot, None) {
+        Err(LeaseError::UnsafePath("the verified directory was replaced before it was opened")) => {
+        }
+        other => panic!("a replacement at the reopen must refuse: {other:?}"),
+    }
+    // The verified original (moved aside by the racer) has the owner's mode back
+    // and the replacement keeps its own: nothing unverified was chmodded.
+    let original = find_dir_by_mode(fixture.path(), 0o100).expect("verified original kept");
+    assert_eq!(
+        mode_of(&original),
+        0o100,
+        "the verified directory's owner mode was restored through its verified descriptor"
+    );
+    let replacement = find_dir_by_mode(fixture.path(), 0o500).expect("replacement kept");
+    assert_eq!(
+        mode_of(&replacement),
+        0o500,
+        "the replacement keeps its own mode; it is never chmodded"
+    );
+    for path in [&slot, &original, &replacement] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    }
+}
+
+/// A reopen that fails because the private name is no longer an openable
+/// directory restores the verified original's owner mode through its verified
+/// descriptor and follows nothing.
+#[test]
+fn a_failed_reopen_restores_through_the_verified_descriptor() {
+    let fixture = Fixture::new("reopen-link");
+    let slot = fixture.dir("slot");
+    let locked = slot.join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
+    let outside = fixture.dir("outside");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).expect("outside mode");
+
+    let (fixture_path, outside_path) = (fixture.path().to_path_buf(), outside.clone());
+    let _rebind = crate::test_fs::before_child_reopen(move || {
+        let captured_slot = private_names_in(&fixture_path)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("the captured slot");
+        let captured_locked = private_names_in(&captured_slot)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("the captured directory");
+        fs::rename(&captured_locked, captured_slot.join("moved-away"))
+            .expect("the verified directory is moved aside");
+        symlink(&outside_path, &captured_locked).expect("a link at the private name");
+    });
+
+    assert!(remove_tree_owned(fixture.path(), &slot, None).is_err());
+    let original = find_dir_by_mode(fixture.path(), 0o100).expect("verified original kept");
+    assert_eq!(
+        mode_of(&original),
+        0o100,
+        "the failed reopen restored the verified original's owner mode"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&outside)
+            .expect("outside kept")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700,
+        "nothing was chmodded through the link"
+    );
+    for path in [&slot, &original, &outside] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("cleanup");
+    }
+}

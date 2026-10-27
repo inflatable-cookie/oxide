@@ -446,3 +446,46 @@ pub(crate) fn run_root_capture(stage: RootCaptureCrash) {
         panic!("test: modelled crash at root capture stage {stage:?}");
     }
 }
+
+thread_local! {
+    static BEFORE_CHILD_REOPEN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside the lease deletion, immediately after an
+/// unreadable owned directory's access was repaired and strictly before the
+/// deleted private name is reopened and its identity verified. This is how a
+/// unit test replaces that name at the exact boundary where a restoration must
+/// only ever act on the verified descriptor.
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct BeforeChildReopenGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn before_child_reopen(action: impl FnOnce() + 'static) -> BeforeChildReopenGuard {
+    BEFORE_CHILD_REOPEN.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping before-child-reopen injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    BeforeChildReopenGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for BeforeChildReopenGuard {
+    fn drop(&mut self) {
+        BEFORE_CHILD_REOPEN.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed before-child-reopen action, if any.
+pub(crate) fn run_before_child_reopen() {
+    let action = BEFORE_CHILD_REOPEN.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}

@@ -830,14 +830,6 @@ fn abort_capture(parent: BorrowedFd<'_>, capture: &Capture, cause: LeaseError) -
     }
 }
 
-/// Restore one directory's exact mode through an already-verified descriptor,
-/// so a refusal never leaves an owner's directory widened.
-fn restore_mode(dir: BorrowedFd<'_>, mode: libc::mode_t) {
-    // SAFETY: the descriptor is live for the call and its identity has been
-    // revalidated by the caller.
-    unsafe { libc::fchmod(dir.as_raw_fd(), mode) };
-}
-
 /// Restores one captured directory's exact mode on **every** exit path —
 /// explicit refusals, `?` returns and panics — so a widened mode never outlives
 /// the step that widened it. The same mode is in the durable record, which is
@@ -1064,22 +1056,26 @@ fn remove_tree_owned_at(
             }
             // The repair widened this entry's own mode. From here every exit
             // path — an error, a `?` or a panic — restores the owner's recorded
-            // mode through the verified repair descriptor, and the child guard
-            // takes over once the reopen succeeds.
+            // mode through the **verified repair descriptor**, until the
+            // reopened child's identity is established below. Nothing after this
+            // point chmods a name or descriptor that has not been verified.
             repaired = Some(repair);
             repair_guard = Some(WidenedMode {
                 dir: repaired.as_ref().expect("repair descriptor").as_fd(),
                 original: observed.mode_bits(),
                 widened: true,
             });
+            #[cfg(test)]
+            crate::test_fs::run_before_child_reopen();
             match open_directory_at(parent, &capture.private) {
-                Ok(child) => {
-                    if let Some(guard) = repair_guard.as_mut() {
-                        guard.widened = false;
-                    }
-                    child
+                Ok(child) => child,
+                Err(error) => {
+                    // The reopen sees a name that is no longer the verified
+                    // directory: only the verified repair descriptor restores
+                    // the owner's mode, and it does so before the put-back.
+                    drop(repair_guard.take());
+                    return Err(abort_capture(parent, &capture, io_error(error)));
                 }
-                Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
             }
         }
         Err(error) => return Err(abort_capture(parent, &capture, io_error(error))),
@@ -1087,20 +1083,27 @@ fn remove_tree_owned_at(
     let held = match descriptor_identity(child.as_fd()) {
         Ok(held) => held,
         Err(error) => {
-            restore_mode(child.as_fd(), observed.mode_bits());
+            // An unreadable identity is never restored through: the verified
+            // repair descriptor (if any) restores the owner's mode instead.
+            drop(repair_guard.take());
             return Err(abort_capture(parent, &capture, io_error(error)));
         }
     };
     if held != (observed.device, observed.inode) {
-        restore_mode(child.as_fd(), observed.mode_bits());
+        // The reopened name is a replacement, so it is never chmodded. The
+        // verified repair descriptor restores the original's mode.
+        drop(repair_guard.take());
         return Err(abort_capture(
             parent,
             &capture,
             LeaseError::UnsafePath("the verified directory was replaced before it was opened"),
         ));
     }
-    // The repair descriptor is no longer needed: the child guard below restores
-    // the same recorded mode on every later exit path.
+    // Identity established: the child guard below restores the same recorded
+    // mode on every later exit path, so the repair guard is no longer needed.
+    if let Some(guard) = repair_guard.as_mut() {
+        guard.widened = false;
+    }
     drop(repair_guard);
     drop(repaired);
     let original_mode = observed.mode_bits();
