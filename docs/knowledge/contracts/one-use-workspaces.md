@@ -10,6 +10,30 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 9** answers the CHANGES REQUIRED design review of `1f46767`
+(comment `6453776549`, 2026-10-27) with three corrections. **Unknown seed
+accounting is no longer converted into a cold build**: §8.3 now separates a
+**known** complete measurement whose estimate does not fit (the only case the
+brief permits to skip cold) from an **unknown** measurement — an unreadable
+member root, a failed ownership/device/boundary check, partial coverage, a stale
+mapping — which **refuses the command before any clone** with the predecessor's
+shipped error class, exactly as the frozen contract requires of unknown
+ownership/accounting/device/custody; case 24 adds the non-vacuous unreadable
+regression and any loosening is returned to the owner. **The guarded Prepared
+refusal no longer relies on a mutating barrier**: `Store::begin_clean`
+(`store.rs:2708-2760`) drops dead tickets and runs `recover_settled` before
+creating its mark, so the design adds one bounded `begin_clean` **mode** —
+`Recovering` for every existing caller, `Barrier` (no ticket drop, no recovery,
+no write while busy) for guarded `detach`/`cancel-reservation`, held across their
+effects — with a regression that a dead lease survives the refusal
+byte-identically and is recovered later by an ordinary command, and the
+owner-return alternative stated if the freeze rejects the seam. **The v5
+field-presence fence is now implementable**: `validate_state` sees only the
+deserialized `State`, where a defaulted `class`/`class_reason` is
+indistinguishable from absence, so `Store::load` gains one bounded
+presence-aware decode (`serde_json::Value`/raw schema over the same
+≤ `MAX_STATE_BYTES` bytes) that refuses a sub-6 document carrying either field in
+any value, with six regression inputs including both explicit defaults.
 **Revision 8** answers the CHANGES REQUIRED design review of `b130728`
 (comment `6453630462`, 2026-10-27) with two corrections. **The normal `Prefer`
 fallback now names its eligibility explicitly**: `evict_one_idle`
@@ -495,8 +519,8 @@ to exclude the writers of that state:
 | Verb | Custody that excludes concurrent transitions | Authoritative revalidation point | Effects it therefore precedes |
 | --- | --- | --- | --- |
 | `oxide outputs adopt` (`outputs.rs:2037`) | **none — never entered** | at the effect-free precheck, unconditionally (state selects only the text) | barrier `2057`, fence `2075`, migration replay `2081`, receipt/migration replay `2099`, any reservation change |
-| `oxide outputs detach` (`3993`) | clean barrier (`3993`) | after the barrier, before the closure's first effect | fence `4000`, `cancel_reservation` `4009`, replay `4014` |
-| `oxide outputs cancel-reservation` (`5988`) | clean barrier (`5998`) | after the barrier | binding lock, cancellation journal, receipt write |
+| `oxide outputs detach` (`3993`) | clean barrier in **non-recovering** mode (`3993`, `begin_clean(..., Barrier)`), held across the effects | after the barrier, before the closure's first effect | fence `4000`, `cancel_reservation` `4009`, replay `4014` |
+| `oxide outputs cancel-reservation` (`5988`) | clean barrier in **non-recovering** mode (`5998`), held across the effects | after the barrier | binding lock, cancellation journal, receipt write |
 | leased command binding (`4196`) | checkout binding mutex (`4243`) | inside the mutex, before `gated_replay` (`4253`) | `gated_replay`, `replay` (`4301`), any prepared transition |
 | automatic first conversion (`3888`, called at `main.rs:414`) | clean barrier (`3936`) | never: the whole verb is **skipped** for a guarded workspace | barrier, fence `3941`, adoption transaction |
 
@@ -518,15 +542,48 @@ If implementation finds a writer that takes neither custody, or a verb whose
 effect runs after its custody is released, the work **stops** and returns to
 design; the ordering claim is not widened to cover it.
 
+**The shipped barrier mutates, so the guarded revalidation uses a non-recovering
+acquisition.** `Store::begin_clean` (`store.rs:2708-2760`) calls
+`drop_dead_tickets` and `recover_settled` **before** it creates the clean mark,
+and `recover_settled` can flush, recover a dead command's held lease and write
+records plus recovery evidence. A guarded `detach` that acquired the shipped
+barrier and then revalidated would therefore have changed slot state before its
+refusal — so the asserted no-change guarantee would not follow from that order.
+The design specifies one bounded seam instead of a weaker claim:
+
+- `begin_clean` gains an explicit **mode**: `Recovering` (today's behaviour, for
+  every existing caller) and `Barrier` (no `drop_dead_tickets`, no
+  `recover_settled`, and **no state write while the checkout is busy**; when the
+  checkout is free it writes exactly one clean mark, as today);
+- guarded `detach` and `cancel-reservation` acquire the barrier in `Barrier`
+  mode, revalidate under it, and — if the revalidation passes — run their
+  shipped effect sequence while holding it. So the exclusion still covers the
+  fence, the cancellation and the replay, and no transition can appear between
+  the revalidation and the effect;
+- the difference is bounded and stated: a guarded `detach`/`cancel-reservation`
+  does **not** perform the barrier's opportunistic recovery. Nothing depends on
+  it — `recover_settled` also runs at the start of every `Store::attempt`, which
+  is where a dead lease is normally cleared — and the next ordinary command of
+  that pool performs it. A regression asserts exactly that (a dead lease plus a
+  pending `Prepared` transition: the guarded verb refuses with the exact
+  diagnostic and the dead record, lease and recovery log are byte-identical,
+  then the next ordinary command recovers it).
+
+If the freeze prefers no barrier-mode difference at all, the alternative is to
+**return the conflict to the owner** for a scoped ruling: the brief's exact
+"nothing changed" text cannot then hold for the window in which a transition
+appears between the precheck and the shipped barrier. Either way the design does
+not claim the barrier is side-effect free.
+
 **What "nothing changed" means, precisely.** Every refusal of a guarded
 workspace creates nothing on the `adopt` path — that verb never reaches the
-barrier. The detach, cancel-reservation and binding refusals create and then
-abandon one control-state clean mark (the shipped
-`barrier`/`release_barrier`, `outputs.rs:6151-6167`); none of them writes a
-receipt, link, sibling, root, marker, reservation, adoption fence,
-migration-journal step or slot state, and none replays anything. The regression
-compares a bounded digest of every one of those before and after, plus the clean
-mark's absence.
+barrier. The detach and cancel-reservation refusals create and then abandon one
+control-state clean mark under the non-recovering barrier, and the binding
+refusal holds only the checkout mutex; none of them drops a ticket, recovers a
+lease, or writes a receipt, link, sibling, root, marker, reservation, adoption
+fence, migration-journal step or slot state, and none replays anything. The
+regression compares a bounded digest of every one of those before and after,
+plus the clean mark's absence and an unchanged dead-lease state.
 
 **Diagnostic precedence at `adopt`.** `adopt` on a guarded workspace always
 refuses, but the text depends on state, decided in this order:
@@ -671,8 +728,9 @@ authoritative:
 2. inside `bind_for_command` **under the checkout's binding mutex**
    (`store.lock_binding`, `outputs.rs:4243`) before `gated_replay`, where the
    receipt, the migration journal and every relevant component are re-read;
-3. for `detach` and `cancel-reservation`, under the **clean barrier** before
-   their first effect (§4.1).
+3. for `detach` and `cancel-reservation`, under the **non-recovering clean
+   barrier**, which they hold across their effects (§4.1). The shipped
+   recovering barrier is unchanged for every other caller.
 
 A transition published between (1) and (2)/(3) — by a concurrent adopt, detach,
 cancel-reservation or command binding — is therefore always seen by the
@@ -702,8 +760,17 @@ each with a **positively established custody premise**, and the design proposes
 - **Barrier exclusion (B2).** The peer is any normal command paused at `bound`
   (an active record), and the guarded verbs are `detach` and
   `cancel-reservation`, which may proceed to their barrier. They must wait for
-  the checkout and write nothing; guarded `adopt` is *not* used here, because it
-  refuses at the precheck and never reaches a barrier.
+  the checkout and write nothing — no ticket drop, no recovery, no mark left
+  behind — because the barrier is acquired in its non-recovering mode. Guarded
+  `adopt` is *not* used here, because it refuses at the precheck and never
+  reaches a barrier.
+- **Non-recovering barrier (B3).** A pool holds a recoverable dead command (a
+  free record lock over a held lease) **and** the checkout has a pending
+  `Prepared` transition written by the `crash_point` control. A guarded `detach`
+  refuses with the exact diagnostic; the dead record, its lease and the recovery
+  log are **byte-identical** afterwards, and the next ordinary command of that
+  pool recovers the lease exactly as today (its recovering barrier path is
+  unchanged). This is what makes "nothing changed" a proof rather than a claim.
 - **Persisted prepared state (A).** `OXIDE_TEST_OUTPUTS_CRASH`
   (`outputs.rs:90,7191-7200`, debug-only) stops a peer transition **after its
   durable prepared receipt write and before any link effect**
@@ -783,12 +850,30 @@ save in the front door:
 3. a version-5-or-below document never contains `class`/`class_reason`, so a
    v5 reader's ordinary rewrite stays readable by a v5 binary.
 
-Reading is defensive in both directions: `#[serde(default)]` makes a legacy
-document read as `normal`; an **unknown class variant refuses** through serde;
-`validate_state` additionally refuses an unknown class value, a reason over its
-bound, a `one_use` record without bounded facts, and — as defence in depth — a
-document **below** version 6 that contains either field (a state that skipped its
-fence).
+Reading is defensive in both directions, and the field **presence** check needs
+its own pass, because `Store::load` (`store.rs:3744-3774`) hands
+`validate_state` only the deserialized `State`: with `#[serde(default)]`, an
+explicit `"class":"normal"` is indistinguishable from an absent field and an
+explicit `"class_reason":null` from absence. `#[serde(default)]` alone therefore
+makes the described fence necessary; it does not implement it. The load path
+gains one **bounded presence-aware decode** before the typed parse:
+
+- over the *same* bounded bytes (≤ `MAX_STATE_BYTES`) and with no re-serialisation
+  and no walk of the payload, it parses the document once as
+  `serde_json::Value` (or an equivalent `#[serde(default)]` raw schema) and, for
+  a numeric `version` below 6, refuses when **any** object in `records` has a
+  `class` key with any value (including `"normal"`) **or** a `class_reason` key
+  with any value (including `null`);
+- at version 6 with the fence, presence is expected and the typed parse decides
+  as before; at version 6 without the fence it refuses (existing rule);
+- the pass is effect-free and bounded, and it runs **before** `validate_state`;
+  `validate_state` keeps its structural checks (unknown class value, reason
+  bound, `one_use` facts) and no longer carries the presence rule, which it
+  cannot see;
+- regression inputs cover **both explicit default values as well as absence**: v5
+  with no fields (accepted), v5 with `"class":"normal"` (refused), v5 with
+  `"class_reason":null` (refused), v5 with `"class":"one_use"` (refused), v6 with
+  the fence and a class (accepted), v6 without the fence (refused).
 
 **Proof of the legacy serializer.** A pure regression serialises (a) a freshly
 created normal record and (b) a rewritten normal-only state and asserts the bytes
@@ -1537,17 +1622,29 @@ slice:
   seed transaction's own custody (its donor-record-then-pool lock, which
   serialises clones), the bounded union over the **current** verified membership —
   every member's cloned bytes already on disk plus the recipient's own slot — and
-  requires the frozen estimate to fit that fresh remainder. A stale, incomplete
-  or unknown measurement, or one that cannot fit, **skips seeding** with a
-  bounded reason and builds cold in the same slot: it never violates normal
-  protection, never invents free bytes and never relies on a reservation the
-  brief does not grant. #137's untrusted-recipient rule and its
-  failed-post-clone-walk dispositions are unchanged: a failed walk abandons
-  seeding and cold-builds, every other post-clone fault refuses and retains, and
-  an abandoned generation keeps counting toward the slice until it is evicted or
-  closed;
-- an abandoned seed leaves the untrusted generation counting toward the slice
-  until it is evicted or closed, exactly as any other retained member.
+  requires the frozen estimate to fit that fresh remainder. **Two different
+  outcomes, never conflated:**
+
+  - a **known** measurement that is complete and positively shows the estimate
+    does not fit the remaining slice → **skip seeding** with a bounded reason and
+    build cold in the same slot. That is the only case the brief permits to skip
+    cold;
+  - an **unknown** measurement — an unreadable member root, a failed
+    ownership/device/boundary check, a partial coverage, a stale or missing
+    mapping, or any other safety/accounting fault in this new pre-clone walk →
+    **refuse the command**, before the first clone, with the predecessor's
+    shipped error class (`unknown_accounting`, ownership, device or custody
+    refusal). This is exactly what the frozen contract requires of unknown
+    ownership, accounting, device or custody (`cold-slot-seeding.md` §8.3, §13);
+    it is not a harmless miss and it is **never** converted into a cold build in
+    the same slot. Loosening this needs an owner ruling or a revised brief, not a
+    design choice here.
+
+  #137's untrusted-recipient rule and its failed-post-clone-walk dispositions are
+  unchanged: only a failed **post-clone recipient walk** abandons seeding and
+  cold-builds (releasing and retaining the untrusted generation first), every
+  other post-clone fault refuses and retains, and an abandoned generation keeps
+  counting toward the slice until it is evicted or closed.
 
 Actual reach is measured later; no native figure in this design claims a seed
 hit or a byte saving.
@@ -2077,7 +2174,9 @@ claimed for a statically edited selector.
 | version-6 state with an older installed binary | pre-effect hand-off or exit 75; no output or slot effect |
 | valid legacy fence at the removable pool root | the candidate validates and ignores it; `Pool::open`, `Pool::open_passive`, `snapshot` and `describe_volume` all succeed |
 | invalid or foreign fence at the removable pool root | shipped `unexpected_entry` refusal, exactly as any other foreign pool entry; the validator never repairs, ignores or waits |
-| seed headroom unknown or unfit | seed skipped, cold build in the same slot |
+| seed headroom **known** and unfit | seed skipped, cold build in the same slot |
+| seed headroom **unknown** (unreadable member, ownership/device/boundary fault, partial walk) | **refuses before any clone** with the shipped error class; never a cold build |
+| guarded `detach`/`cancel-reservation` barrier mode | `Barrier` (no ticket drop, no recovery); a dead lease survives the refusal and the next ordinary command recovers it |
 
 ## 14. Alternatives rejected
 
@@ -2113,10 +2212,15 @@ claimed for a statically edited selector.
 - **S1 classification and guard.** `classify`, the guarded plan/declaration/
   binding branch, the local-output refusal table, the exact `Prepared`
   diagnostic before every effect at all four mutation sites, the guarded
-  `clean` refusal text, plan/status wording, the forward fence and version 6.
-- **S2 record class and front-door scoping.** `Record.class`/`class_reason`, the
-  fence, project-cap and sharing class filters, membership and class-unknown
-  derivation, status/summary visibility.
+  `clean` refusal text, plan/status wording, the forward fence and version 6, and
+  the `begin_clean` **mode** seam (§4.1: `Recovering` for every existing caller,
+  `Barrier` for the two guarded revalidation paths) with its regression that the
+  mode performs no ticket drop and no recovery.
+- **S2 record class and front-door scoping.** `Record.class`/`class_reason` with
+  the omission rule (§5.1), the bounded **presence-aware decode** in
+  `Store::load` that refuses a sub-6 document carrying either field, the fence,
+  project-cap and sharing class filters, membership and class-unknown derivation,
+  status/summary visibility.
 - **S3 library admission protocol.** `LeaseRequest` additions, the `MemberSet`
   and `evictable` split with the in-custody custody reader (§5.5.2), `restore`
   with its two thresholds and reuse-candidate exclusion, the union walk, the
@@ -2130,7 +2234,9 @@ claimed for a statically edited selector.
   the installer refusal, the `stage_at` feature parameter and the static edits
   to the exposed scripts.
 - **S5 seeding interaction.** Binds S3's headroom rule to #137's actual
-  interface. **Blocked on oxide#137's implementation**, and the counted native
+  interface, including the split between a **known-unfit** estimate (skip cold,
+  the brief permits) and an **unknown** measurement (refuse, the frozen
+  contract's rule; §8.3). **Blocked on oxide#137's implementation**, and the counted native
   cannot run before it: an unexecuted required case is not a pass. The one
   legitimate alternative is a **scope split** in a new brief that lands S1–S4
   with their own counted native and required-case list and carries S5 into a
@@ -2159,6 +2265,18 @@ its own validation tier and native activation.
   normal-only state serialise with **neither** `class` nor `class_reason`, a
   `one_use` record carries both the class and the v6 fence, and a round trip
   through the v5-shaped `Record` succeeds for the normal bytes.
+- The **presence-aware decode** of §5.1 over six inputs: v5 absent (accept),
+  v5 `"class":"normal"` (refuse), v5 `"class_reason":null` (refuse), v5
+  `"class":"one_use"` (refuse), v6 with fence and class (accept), v6 without
+  fence (refuse); plus a bounded-input assertion (the pass runs once, over the
+  same ≤ `MAX_STATE_BYTES` bytes, with no re-serialisation).
+- The seed headroom split of §8.3: a complete measurement that does not fit
+  yields the cold skip; an unreadable member root, an ownership/device failure
+  or a partial walk yields the shipped refusal **before** any clone, and the two
+  are distinguishable in the outcome.
+- The `begin_clean` mode: `Recovering` still drops dead tickets and recovers a
+  dead lease; `Barrier` performs neither and writes nothing while the checkout is
+  busy; both create exactly one mark when it is free.
 - The fallback exclusion of §6.7: with a protected (or unverified) one-use pair
   ranked before an eligible normal slot, an idle class-unknown orphan and a
   second evictable member, `Prefer` never returns the protected pair; the
@@ -2345,9 +2463,15 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
       asserts no exclusion there.
     - **(B2) barrier exclusion.** The peer is a normal command paused at `bound`
       (an active record), and the guarded verbs are `detach` and
-      `cancel-reservation`: each waits at the barrier and writes nothing.
-      Guarded `adopt` is not used, because it refuses at its effect-free
-      precheck and never reaches a barrier.
+      `cancel-reservation`: each waits at the non-recovering barrier and writes
+      nothing (no ticket drop, no recovery, no mark left behind). Guarded `adopt`
+      is not used, because it refuses at its effect-free precheck and never
+      reaches a barrier.
+    - **(B3) non-recovering barrier.** A recoverable dead command (free record
+      lock over a held lease) plus a pending `Prepared` transition: the guarded
+      `detach` refuses with the exact diagnostic, the dead record, lease and
+      recovery log are byte-identical, and the next ordinary command recovers the
+      lease as today.
     - **(C) commit, explicitly unguarded.** The prepared transition is committed
       by a deliberately **unguarded** invocation of the same build with
       `OXIDE_TEST_TEMP_ROOTS=[]` and `OXIDE_TEST_WORKSPACE_CLASS=normal` (feature
@@ -2371,8 +2495,14 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
     the two staged artifacts report `proof_controls` true and false.
 24. seeding interaction (mandatory, §16.3): a one-use recipient receives the
     frozen skip/seed path once oxide#137's interface exists, its seeded bytes
-    enter the next member union, and an unfit headroom skips to a cold build in
-    the same slot.
+    enter the next member union, and a **known-unfit** headroom skips to a cold
+    build in the same slot. Non-vacuously separated from it: an **unreadable**
+    member root (a planted unreadable directory inside an idle member) during the
+    fresh pre-clone headroom walk **refuses** the command with the shipped
+    `unknown_accounting`/ownership error before any clone, the recipient slot
+    stays empty and untrusted-free, and nothing is seeded; the same fixture with
+    the directory readable takes the known-unfit or fit path. This pins the
+    predecessor's unknown-is-not-a-miss rule.
 25. victim custody in both directions (§5.5.1, §5.5.2):
     - *same pool, ledger-idle / control-uncertain*: a fixture plants a one-use
       slot whose ledger row is `Idle` while its control record is still active and
@@ -2614,14 +2744,27 @@ positive-absence policy are unchanged by either papercut.
 18. Are case 19's premises now reachable as written: a receipt-bearing peer
     paused at `bound` positively holding the binding mutex (with the
     receipt-absent non-premise recorded), `detach`/`cancel-reservation` waiting at
-    the barrier for an active peer, and the prepared transition committed by an
-    explicitly **unguarded** invocation (`OXIDE_TEST_TEMP_ROOTS=[]`,
-    `OXIDE_TEST_WORKSPACE_CLASS=normal`)?
+    the **non-recovering** barrier (B2/B3: no ticket drop, no recovery, a dead
+    lease byte-identical and recovered later by an ordinary command), and the
+    prepared transition committed by an explicitly **unguarded** invocation
+    (`OXIDE_TEST_TEMP_ROOTS=[]`, `OXIDE_TEST_WORKSPACE_CLASS=normal`)? If the
+    freeze rejects the `begin_clean` mode seam, is returning that conflict to the
+    owner the intended disposition?
 19. Is the scoped fence validator (§10.4) the right shape — one allowlisted name,
     strict ownership/schema/identity validation, the same `unexpected_entry`
     failure-stop for anything else, never read as state, with candidate controls
     on `Pool::open`, `Pool::open_passive`, `snapshot` and `describe_volume`?
-20. Are the HIGH complexity, premise checklist and separately activated
+20. Is the seed-headroom split of §8.3 the right reading of the frozen
+    contract: a complete measured shortfall skips cold, while an unreadable
+    member root or an ownership/device/partial-walk fault refuses before any
+    clone? Is case 24's non-vacuous pair (unreadable refuses; readable takes the
+    known path) sufficient evidence?
+21. Is the presence-aware decode of §5.1 the right mechanism — one bounded
+    `serde_json::Value`/raw pass before the typed parse, refusing a sub-6
+    document that carries `class` or `class_reason` in any value — and are the
+    six regression inputs (including both explicit default values) the right
+    set?
+22. Are the HIGH complexity, premise checklist and separately activated
     uncounted diagnostic correctly placed before the first counted native?
 
 ## 19. Limits of this design
@@ -2653,6 +2796,14 @@ positive-absence policy are unchanged by either papercut.
   (§10.2, §16.2 case 8). Everything else the brief lists remains in the fixed
   case list. The concurrency case claims custody **exclusion**, never an
   interleaved observation.
+- **Two small seams are specified and need their own review.** (1)
+  `begin_clean` gains a mode so the guarded revalidation path performs no ticket
+  drop and no recovery; every existing caller keeps `Recovering`. (2)
+  `Store::load` gains one bounded presence-aware decode before the typed parse.
+  Both are safety-bearing changes outside the pure guard logic; if the freeze
+  rejects either, the affected claim returns to the owner rather than being
+  weakened silently. Unknown seed accounting is **not** a seam: it keeps the
+  frozen contract's refusal.
 - **Cross-pool custody is deliberately not a victim premise.** The internal store
   reads the removable sibling's state without its lock, so no internal admission
   can establish a stable cross-pool fact without acquiring it in the shipped
