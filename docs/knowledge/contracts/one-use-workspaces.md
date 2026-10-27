@@ -10,6 +10,31 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 7** answers the CHANGES REQUIRED design review of `f6276a4`
+(comment `6453458971`, 2026-10-27) with three corrections. **Cross-pool eviction
+custody is dropped from the victim predicate**, because the two directions are
+not symmetric: a removable admission holds the internal admission lock first,
+but an internal admission holds only its own and reads the removable sibling's
+state **without** its lock (`with_sibling`/`sibling_state`,
+`store.rs:2509-2525`; `sibling_barrier` returns no lock when `barrier` is false,
+`2652-2654`), and a removable command can move `Acquiring → Spawning` under only
+its own admission lock (`1803-1814`). The design now specifies an executable
+two-direction protocol: the predicate uses only admission-guarded facts of the
+pool that owns the slot (plus a non-blocking record-lock probe and an active
+same-pool record for the checkout), never a cross-pool fact, with a stop
+condition for any future cross-pool decision, and three non-vacuous regressions
+(same-pool phase protection, cross-pool inertness, no recursive acquisition).
+**The proof-control predicate is stated consistently**: the readers and the
+capability boolean are the *same* `feature = "proof-controls"` predicate (not
+`debug_assertions`), so the boolean describes whether the readers exist in that
+artifact; a feature-enabled **release** artifact reports `true` and the installer
+refuses it before replacement, which is the guarantee — no artifact built without
+the feature contains a reader, and no installed binary has one. **The resource
+gates are reconciled**: the supervisor's `--limit` wall clock and its monitored
+512 MiB scratch budget are **enforced** gates (a breach fails the run), while the
+per-phase estimates and other counters are observations; the stale revision-4
+"420 s" references are marked superseded, and the 480 s estimate remains
+unmeasured pending the freeze.
 **Revision 6** answers the CHANGES REQUIRED design review of `0265ad1`
 (comment `6453290716`, 2026-10-27) with two corrections. **The legacy fence is
 now scoped-recognised by the pool opener**: `<control>/removable/state.json` is a
@@ -82,7 +107,8 @@ and uses the product's own write-ahead stop,
 `Prepared` receipt or migration journal that every guarded verb must refuse
 without changing anything; no new seam is proposed, and an interleaved
 observation is explicitly not claimed. The time/disk allocation is recalculated
-(~267 s typical / ~335 s upper of the 420 s bound, ~258 MiB of 512).
+(~267 s typical / ~335 s upper of the 420 s bound, ~258 MiB of 512; superseded
+by revision 5's 480 s bound and ~296 s / ~298 MiB).
 
 **Revision 4 also recorded one product fact** (revision 5 changed its
 disposition): the removable reserve prune is **unreachable in the current
@@ -114,7 +140,8 @@ route is driven with the product's existing debug walk mutation and pause gate
 honest below-floor refusal, then a retry — superseded by revision 4's sub-floor
 premises, which withdraw the unreachable admit branch and the
 one-member-then-two-intact oracle), with dedicated failure-stop and
-retry cases; the earlier "not induced" limitation is withdrawn and the 420 s /
+retry cases; the earlier "not induced" limitation is withdrawn (that case is
+itself withdrawn in revision 5) and the 420 s /
 512 MiB arithmetic is revised to ~275 s / ~345 s upper and ~290 MiB. **The
 staging inventory is now complete for current candidates**, including all six
 current-HEAD roles in `test-permanent-outputs.py` (`:589`, `:1583`, `:1837`,
@@ -142,8 +169,9 @@ a scope split, and the proof declares **HIGH** complexity, the fixed premise
 checklist and a separately activated uncounted diagnostic; and the staging
 inventory now lists **helper-mediated** `stage_at` callers explicitly, with a
 per-call feature parameter and per-call fixture controls. The declared fixed
-bound is revised to **420 s** with the arithmetic in §16.4, put to the freeze
-for acceptance rather than silently extending anything.
+bound is revised to **420 s** with the arithmetic in §16.4 (superseded by
+revision 5's 480 s), put to the freeze for acceptance rather than silently
+extending anything.
 **Revision 1.** Written against clean pushed `main`
 `489eecc79398a1c0bfb17fd879fb5513914a6d52`, static reads only. Prerequisites
 oxide#136 (child temporary files) is merged and oxide#137's design of record
@@ -221,7 +249,7 @@ fact.
 | Binding and prepared replay | `outputs.rs:4196-4270` (`bind_for_command`), `4301-4324` (`gated_replay`), `7203-7330` (`replay`) | **Guard branch added**; the three production replay sites refuse before replay (§4.4). |
 | Output mutation verbs | `outputs.rs:2037-2100` (`adopt_command`: barrier `2057`, fence `2075`, migration replay `2081`, receipt replay `2099`), `3983-4030` (`detach_command`: barrier `3993`, fence `4000`, `cancel_reservation` `4009`, replay `4014`), `5988-6010` (`cancel_command`), `8450-8470` (`clean_placement`, `Prepared` refusal at `8467`) | **Fast precheck, then an authoritative revalidation under the verb's own custody before every effect**: `adopt` refuses entirely at the effect-free precheck (it always refuses; state selects only the text) and never enters custody; detach and cancel-reservation refuse a `Prepared`/pending-migration receipt under the barrier before their fence/cancellation/replay; clean keeps its refusal with the guarded text (§4.1, §4.4, §4.5). |
 | Proof staging helper | `scripts/test-oxide-pool-layout.py:96` (`stage_at`, imported by eight scripts) | **Explicit per-call `features` parameter**; a helper default never adds a feature, and each caller's role and fixture controls are edited where they live (§11.2). |
-| Custody and closure facts | `store.rs:2572` (`checkout_custody`), `store.rs:4500` (`probe_lock`; non-creating use at `3155`), `store.rs:630-639` (`settle`), `store.rs:3374-3420` (`recover_settled`), `store.rs:399-406` (`settle_idle`) | **Read** by the front door to derive the `evictable` subset (§5.5.1); the library never reads them. |
+| Custody and closure facts | `store.rs:2572` (`checkout_custody`, an **external-command** rule and not a victim premise), `store.rs:2509-2525` (`with_sibling`/`sibling_state`: the sibling is read without its lock), `store.rs:2652-2654` (`sibling_barrier` returns no lock when `barrier` is false), `store.rs:4500` (`probe_lock`; non-creating use at `3155`), `store.rs:630-639` (`settle`), `store.rs:3374-3420` (`recover_settled`), `store.rs:399-406` (`settle_idle`), `store.rs:1803-1825` (`mark_spawning` takes this pool's admission) | **Read** by the front door to derive the same-pool `evictable` subset (§5.5.1, §5.5.2); the library never reads them. |
 | Per-checkout throughput custody | `outputs.rs:6151-6167` (`barrier` = `begin_clean`, `release_barrier`), `outputs.rs:4243` (checkout binding mutex), `outputs.rs:4008,5873,6000` (other binding-mutex sites) | **Read.** Guarded revalidation runs under one of these before any effect (§4.1, §4.6). |
 | Debug proof controls (existing) | `main.rs:327-352` (`OXIDE_TEST_PAUSE` = `<point>:<gate>`, debug only; `bound` fires **after** `bind_for_command`); `outputs.rs:90,7191-7200` (`OXIDE_TEST_OUTPUTS_CRASH` = a `crash_point` name, debug only; `prepared`/`migration-p0` stop after the durable prepared write); `src/inventory.rs:1402-1445,1559-1600` (`OXIDE_TEST_WALK_MUTATIONS`: ≤4 specs, ≤8192 bytes, canonical paths under the owned scratch/evidence roots, `delay_ms` 1..=65,000, one delay per spec) | **Reused, not extended**, for the custody-exclusion, prepared-state and removable unknown-figure native cases (§4.6, §16.2 cases 8 and 19). |
 | Mark spawning / release / scratch discard | `store.rs:1803-1825` (`mark_spawning`), `1826-1850` (`release`), `1878-1930` (`discard_scratch`, `flush_before_idle`) | **Read.** Class never changes at release; the slot keeps its class record (§7.2). |
@@ -816,63 +844,113 @@ already holds.
 | 1 | record phase exactly `Idle` (`store.rs:139-153`) | control state | protected |
 | 2 | no `holder`, no `lease_id`, no `pending_recovery`, no `retired`, no `lost` | control state | protected |
 | 3 | the owning record lock is free and not missing: `probe_lock(lock_path, false) == Probe::Free` (`probe_lock` at `store.rs:4500`; the same non-creating probe the project-cap path uses at `store.rs:3155`). `Missing` is **not** free | control state | protected |
-| 4 | **in-custody custody facts** (§5.5.2) for `record.checkout` are `Clear` — no other command of **that** checkout may be writing, no lost-slot custody with unclosed writers. Computed from the two state snapshots this admission already holds, never by calling `Store::checkout_custody` | control state | protected |
+| 4 | no other record **in this pool** for `record.checkout` is active (`Acquiring`/`Spawning`/`Running`), and no `Retired` record's `lost.unclosed` is open for this boot session. Same-pool only, from the snapshot this admission holds (§5.5.2); cross-pool state is never a premise | control state | protected |
 | 5 | `process_group` is `None`: a recorded group means a writer may still exist. `settle_idle` (`store.rs:399-406`) clears it, and `recover_settled`'s `Reset` (`store.rs:3397-3402`) only drops a pending recovery — it leaves the active record and its group in place, so phase-`Idle` plus no recorded group is the positive closure fact | control state | protected |
 | 6 | the ledger slot is `Idle`, `lease_id` is `None`, and its `(slot_id, incarnation)` equals the member pair | ledger view | protected |
 | 7 | no donor pin covers the slot (§8.2) and no `oxide clean` for that checkout is recorded | control state | protected |
 
-### 5.5.2 The in-custody reader (no lock reacquisition)
+### 5.5.2 The in-custody reader and the two custody directions
 
-`Store::checkout_custody` (`store.rs:2572-2637`) is **not** usable here. It takes
-`sibling_admission()` and then `self.admission()` on fresh descriptors
-(`store.rs:2639-2654`), and `Store::attempt` already holds both — the internal
-sibling admission lock through `sibling_barrier` (`store.rs:2656-2680`) and this
-store's admission lock (`store.rs:2978`). On macOS `flock` is per open file
-description, so a second acquisition from the same process does not succeed
-recursively: it **blocks**, which would make every ordinary admission with a
-one-use member hang instead of admitting or refusing. The removable path holds
-both locks and would repeat the same mistake twice.
+`Store::checkout_custody` (`store.rs:2572-2637`) is **not** usable from inside an
+admission. It takes `sibling_admission()` and then `self.admission()` on fresh
+descriptors (`store.rs:2639-2654`); `Store::attempt` already holds its own
+admission lock (`store.rs:2978`), and for a **removable** admission it also holds
+the internal one through `sibling_barrier` (`store.rs:2656-2680`). On macOS
+`flock` is per open file description, so a second acquisition from the same
+process does not succeed recursively: it **blocks**, which would make every
+admission with a one-use member hang instead of admitting or refusing.
 
-The design therefore specifies one new **in-custody reader** with no lock of its
-own:
+**The two directions are not symmetric, and the victim predicate must respect
+that.** `with_sibling` documents it (`store.rs:2509-2525`): the other pool's
+state is "read without its own lock". `sibling_barrier` returns no lock at all
+when `sibling.barrier` is `false` (`store.rs:2652-2654`), and the internal store
+carries exactly that (`removable::select` pairs it with `barrier = false`). So:
+
+| Admission | Locks actually held | Stable cross-pool snapshot? |
+| --- | --- | --- |
+| **removable** store | internal sibling admission first, then this store's admission | **yes** for both pools |
+| **internal** store | this store's admission only; the removable sibling is read unlocked | **no** |
+
+The shipped lock order is internal-admission → this-store-admission, and a
+recursive re-acquisition is forbidden; that leaves no way for an internal
+admission to hold the removable lock too. A removable command can moreover move
+`Acquiring → Spawning` under only its own admission lock (`store.rs:1803-1814`)
+after an internal snapshot said `Clear`, so **an unlocked cross-pool read can
+never be a victim premise**.
+
+**The protocol, executable and symmetric-safe:** the `evictable` predicate uses
+**only facts of the pool that owns the slot**, all of them guarded by that pool's
+admission lock — which the front-door admission holds across the whole library
+call — plus one non-blocking probe of the member's own record lock:
 
 ```text
-fn checkout_custody_in_custody(
-    this_state: &State,              // already loaded by Store::attempt
-    sibling_state: Option<&State>,   // bounded read of the sibling state file,
-                                     // under the sibling admission lock attempt
-                                     // already holds
+fn member_is_evictable(
+    this_state: &State,        // the owning pool's state, loaded under its
+                               // admission lock by Store::attempt
+    member: &LedgerSlot,       // the pool lock's row for (slot_id, incarnation)
     checkout: &Path,
     own: u64,
-) -> CheckoutCustody
+) -> bool                      // every clause below must hold
 ```
 
-Rules, all inherited from `checkout_custody` so the facts do not diverge:
+- the member's owning record (same pool, same `affinity_dir`) has phase `Idle`,
+  no holder, no `lease_id`, no `pending_recovery`, no `retired`, no `lost`, and
+  `process_group` is `None` (§5.5.1 items 1, 2 and 5);
+- `probe_lock(record_lock, false) == Probe::Free` — non-blocking, so it cannot
+  deadlock and it needs no admission lock (§5.5.1 item 3);
+- **no other record *in this pool* for that checkout is active**
+  (`Acquiring`/`Spawning`/`Running`) and no `Retired` record's
+  `lost.unclosed` is open for this boot session; the caller's own record id is
+  excluded exactly as `checkout_custody`'s `own` argument does. This is the
+  conservative, same-pool form of "the checkout is busy": it protects *all* of
+  this pool's one-use slots for that checkout, and it replaces the removed
+  cross-pool clause;
+- the ledger row is `Idle`, unleased, and matches the pair (§5.5.1 item 6);
+- no donor pin covers the slot and no `oxide clean` for the checkout is recorded
+  (§5.5.1 item 7).
 
-- it takes **no** lock, opens **no** admission file and creates nothing;
-- lock order is the order already held: internal sibling admission → this
-  store's admission. The snapshot is taken once, at the top of the admission,
-  after `recover_settled`, and is not re-read mid-decision;
-- a sibling whose state file is **unreadable** is `Unknown` (never `Clear`), and
-  `Unknown` protects every member;
-- the caller's own record id is exempt only in this store, exactly as
-  `checkout_custody`'s `own` argument does;
-- `Spawning`/`Running` records of that checkout are `Writers`; a `Retired`
-  record's `lost.unclosed` that is not closed by this boot session is `Unknown`;
-- the reader is the *only* place the checklist's item 4 comes from, and a
-  member whose record lives in the sibling pool uses the same function with that
-  pool's snapshot.
+**Cross-pool facts are used for nothing on the victim path.** A one-use slot
+lives in exactly one pool, so only a writer *of that pool* can write the victim's
+tree; a command using the other pool writes the other pool's slot. The checkout
+level fact `checkout_custody` adds is an *output* custody rule (a relink must not
+race a writer), not a slot-deletion premise. If a future one-use decision ever
+needs a cross-pool fact, the design **stops**: it must first acquire that pool's
+admission lock in the shipped internal-first order (never recursively), re-read
+the snapshot under it, and re-validate immediately before the deletion.
 
-**Required regression.** Cases 5 and 7 (internal) and case 8 (removable) each run
-an admission with at least one one-use member and assert that it reaches its
-ordinary decision — admit, evict or refuse — **within the guard's deadline** and
-never blocks on a re-acquired admission lock. A pure regression asserts that
-the in-custody reader takes no lock (no lock file is created, no `flock` is
-attempted) and returns the same verdict as `checkout_custody` for each of the
-`Clear`/`Writers`/`Unknown` fixtures. `Store::checkout_custody` keeps its
-existing signature and its existing callers; nothing about unknown-writer
-protection changes — the reader is a refactor of the same facts, not a weaker
-predicate.
+**Transitions after admission cannot invalidate the decision.** The member's own
+record cannot change between the snapshot and the deletion, because every
+front-door record transition (`mark_spawning` at `store.rs:1803-1825`,
+`mark_running`, `release`, `recover_settled`) takes **that pool's** admission
+lock, which the admission holds for the whole library call; the record's lock
+probe is non-blocking; and the ledger row is re-checked under the pool lock
+immediately before `retire_idle_slot` (§5.5.1 "Revalidation through the
+deletion"). A cross-pool transition is irrelevant by construction, and the
+regression asserts exactly that.
+
+**Required regressions.** Three, all non-vacuous:
+
+1. *Same-pool interleaving.* A one-use member whose owning record moves
+   `Idle → Acquiring → Spawning` while an admission runs is **protected**: the
+   admission refuses (or waits for that progress-capable holder) and the slot's
+   root and ledger row are byte-identical. This is the case the admission lock
+   makes stable, and it is driven by pausing the peer at `bound` (case 19's B2
+   machinery) plus a pure check of the predicate on each phase.
+2. *Cross-pool interleaving is inert.* A **removable** command of the same
+   checkout moves `Acquiring → Spawning` while an **internal** admission with a
+   one-use member runs: the internal admission's decision and result are
+   unchanged (its member is evicted or retained exactly as in the control run
+   with no peer), the removable command's record and slot are untouched, and a
+   pure check asserts the predicate reads no sibling state at all.
+3. *No recursive acquisition.* A pure/regression assertion that the in-custody
+   reader opens no admission file, creates nothing and attempts no `flock`, and
+   that an internal and a removable admission with a member each reach
+   admit/evict/refuse inside the guard's deadline (cases 5, 7 and 8).
+
+`Store::checkout_custody` keeps its signature and its existing callers; the
+external-command relink path is unchanged. Nothing about unknown-writer
+protection weakens: the predicate is the *same facts for the same pool*, with the
+cross-pool clause removed because it was never stable for an internal admission.
 
 The `evictable` set is passed to the library as its **only** allowed victim
 source; membership in `members` alone is never enough. A member that is counted
@@ -899,7 +977,11 @@ record whose group is not positively empty. The library's predicate
 `Idle` (or the lock is not `Free`), so the member is **protected** — counted,
 never a victim, and a one-use admission that needs its bytes refuses (it is not
 a progress-capable holder either, because its custody is uncertain) rather than
-deleting a slot that may still have a writer.
+deleting a slot that may still have a writer. **The same-pool scope is
+deliberate:** the removable sibling's state is read without its lock
+(`store.rs:2509-2525`), so a removable transition cannot be a stable premise for
+an internal eviction; §5.5.2 states why that is sound (slots are per pool) and
+what a future cross-pool decision would have to acquire first.
 
 Two narrower facts must be stated exactly, because they bound what the
 checklist proves:
@@ -1484,12 +1566,21 @@ records.
 {"control_state_version":6,"registration_version":2,"proof_controls":false}
 ```
 
-`proof_controls` is compiled in (`cfg!(feature = "proof-controls")`), so it is
-an artifact property, not an environment claim. The installer
-(`scripts/oxide-install.py`) refuses a candidate whose probe output lacks the
-field, does not parse as a JSON boolean, or reports `true` **before any
-replacement**, and it stages its own build with the feature explicitly
-disabled, recording the artifact evidence in its receipt. Older receipts that
+`proof_controls` is exactly `cfg!(feature = "proof-controls")`, and **the readers
+are `#[cfg(feature = "proof-controls")]`** — the same predicate on both sides, so
+the boolean describes precisely whether the *readers exist in that artifact*.
+`debug_assertions` is not part of the predicate: a debug build without the
+feature has no readers and reports `false`, and a release build with the feature
+has readers and reports `true`. (Every proof that needs a control therefore
+stages with the feature, including any debug fixture; the static edits in §11.2
+name that per role.)
+
+The installer (`scripts/oxide-install.py`) refuses a candidate whose probe output
+lacks the field, does not parse as a JSON boolean, or reports `true` **before any
+replacement**, and it stages its own build with the feature explicitly disabled,
+recording the artifact evidence in its receipt. So **no installed binary ever has
+a reader**, even though a feature-enabled release artifact can exist and report
+`true`. Older receipts that
 lack the field remain valid for the existing replace-ownership match only; a
 receipt without `proof_controls` cannot authorize installing a candidate
 (matching the brief: "older pins lacking that artifact-probe field cannot be
@@ -1629,8 +1720,11 @@ arbitrary file.
 ### 11.1 The feature and its two controls
 
 A new non-default Cargo feature `proof-controls` (default off; no other feature
-enables it) gates exactly two readers, both in the front door and both behind
-the feature so a release build contains no reader at all:
+enables it) gates exactly two readers, both in the front door and both
+`#[cfg(feature = "proof-controls")]`. The guarantee is about the **feature**, not
+the profile: an artifact built without it contains no reader at all, and an
+artifact built with it reports `proof_controls = true` and is refused by the
+installer before any replacement.
 
 | Control | Shape | Rules |
 | --- | --- | --- |
@@ -1756,8 +1850,10 @@ claimed for a statically edited selector.
 
 ### 11.3 Production isolation
 
-- No release build contains a control reader, and no feature-off build reads
-  either variable.
+- No artifact built without `proof-controls` contains a control reader, and no
+  feature-off build reads either variable. A feature-enabled artifact (debug or
+  release) does contain them and reports `true`, which is exactly why the
+  installer refuses `true`, missing and mistyped values before replacement.
 - The feature changes nothing about the production classification, the slice,
   the guard, the state format or the receipt format.
 - Installer refusal of a `proof_controls` artifact is proven **synthetically**
@@ -1987,9 +2083,17 @@ its own validation tier and native activation.
 - The custody premises of case 19: a receipt-bearing binding holds the checkout
   mutex across `bound`, a receipt-absent binding holds none, and a paused peer is
   an active record for the barrier.
+- The victim predicate of §5.5.2 over each record phase, `process_group`,
+  `retired`/`lost`, an active same-pool record for the checkout and each record
+  lock probe state; a counterfactual that hands it a "cross-pool writer" changes
+  nothing (the predicate never consults sibling state), and a stubbed
+  `sibling_state()` asserts it is never called on the victim path.
 - The capability JSON shape and the installer's `proof_controls` acceptance and
   refusal matrix (pure; the synthetic `dogfood:scripts:test` fixture covers the
-  same decisions without an install).
+  same decisions without an install), including a **feature-enabled release**
+  artifact that must report `proof_controls = true` (proving the boolean tracks
+  the feature, not the profile) and be refused by the installer, and a feature-off
+  debug artifact that must report `false`.
 
 ### 16.2 Native cases (one fixed script)
 
@@ -2138,16 +2242,32 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
     frozen skip/seed path once oxide#137's interface exists, its seeded bytes
     enter the next member union, and an unfit headroom skips to a cold build in
     the same slot.
-25. control-uncertain victim custody (§5.5.1): a fixture plants a one-use
-    slot whose ledger row is `Idle` while its control record is still active and
-    its **record lock is held** by a live fixture process (a real "a command may
-    be writing" state: `recover_settled` skips it, `settle` would `Keep`). It is
-    reported as a **protected** member. A one-use admission that needs its bytes
-    refuses (no wait: no progress-capable holder), the slot's root and ledger row
-    are byte-identical afterwards, and a normal admission continues with the
-    protected member counted. Releasing the fixture's lock and letting the next
-    command's `recover_settled` settle the record makes the member evictable, and
-    the following one-use admission reclaims it.
+25. victim custody in both directions (§5.5.1, §5.5.2):
+    - *same pool, ledger-idle / control-uncertain*: a fixture plants a one-use
+      slot whose ledger row is `Idle` while its control record is still active and
+      its **record lock is held** by a live fixture process (a real "a command may
+      be writing" state: `recover_settled` skips it, `settle` would `Keep`). It is
+      reported as a **protected** member; a one-use admission that needs its bytes
+      refuses (no wait: no progress-capable holder), the slot's root and ledger row
+      are byte-identical, and a normal admission continues with it counted.
+      Releasing the lock and letting the next command's `recover_settled` settle
+      the record makes it evictable, and the following one-use admission reclaims
+      it.
+    - *same pool, phase interleaving*: a member whose owning record moves
+      `Idle → Acquiring → Spawning` while the admission runs (the peer is paused at
+      `bound`) is **protected** for every non-idle phase, the admission refuses or
+      waits for that progress-capable holder, and the slot is byte-identical. The
+      same assertions run as a pure check over the predicate for each phase.
+    - *cross-pool interleaving is inert*: a **removable** command of the same
+      checkout moves `Acquiring → Spawning` while an **internal** admission with a
+      one-use member runs. The internal admission's outcome is identical to a
+      control run with no peer (same victim, same bytes, or the same refusal), the
+      removable command's record and slot are untouched, and a pure check asserts
+      the predicate reads **no sibling state** and takes no sibling lock.
+      Together with the pure "no recursive acquisition" check (no admission file
+      opened, nothing created, no `flock` attempted), this is the interleaving
+      regression §5.5.2 requires — the cross-pool fact is excluded because it
+      cannot be stable under an internal admission.
 26. failure-stop and victim substitution: at byte pressure the LRU-selected
     idle one-use victim is made unremovable (an unowned foreign entry planted
     inside it). The admission **stops** with the shipped ownership error, never
@@ -2204,7 +2324,9 @@ retry is authorized by this text.
     it is never a PASS. A source sweep complements it and never replaces it.
 - One fixed script, the whole command of the qualified shared supervisor:
   `bounded-test.py --root-parent /private/tmp --limit 480 --scratch-budget-mib
-  512 -- python3 scripts/test-one-use-workspaces.py`. The explicit internal root
+  512 -- python3 scripts/test-one-use-workspaces.py`. The `--limit 480` wall
+  clock and the 512 MiB monitored scratch budget are **enforced** by the guard
+  (a breach fails the run); the per-phase estimates in §16.4 are observations. The explicit internal root
   is the owner-accepted internal-placement exception (decision `bd357a4c`)
   because a private `directory-budget-v1` pool is a genuine internal pool that
   the product correctly refuses on an external volume; it stays inside one
@@ -2253,8 +2375,15 @@ own (~40 MiB); the 128-slot ceiling pool with one tiny file per slot plus ≤ 24
 medium tiny private slots ≈ 50 MiB; fixtures, logs and the bounded receipt
 ≈ 20 MiB. Total ≈ **298 MiB of 512**.
 
-These are estimates; the qualified guard measures actual owned bytes and time
-and the receipt reports them, and neither figure is an acceptance gate. If the
+**Two of these are enforced gates, not observations.** The supervisor's
+wall-clock limit (`--limit`) and its monitored scratch budget
+(`--scratch-budget-mib 512`) are limits the qualified guard **enforces**: a run
+that exceeds either fails (a deadline breach stops work; a monitored-bytes
+breach is a failure), and that is the brief's and the validation policy's
+time-and-budget gate. The per-phase figures above, the staged-artifact byte
+counts, Cargo-call counts and monitor timings are **observations**, reported by
+the receipt and never acceptance gates. The 480 s total and the ~296 s estimate
+remain UNMEASURED and need the owner's freeze decision before activation. If the
 diagnostic shows the work cannot finish inside 380 s, the owner must revise the
 fixed bound **before** a counted activation — never during one.
 
@@ -2331,11 +2460,14 @@ positive-absence policy are unchanged by either papercut.
     library can never delete a ledger-idle slot whose control record has not
     positively closed, and is "protected, counted, not a wait reason" the right
     treatment?
-16. Is the in-custody custody reader (§5.5.2) the right shape: no lock of its
-    own, internal-then-this-store order already held, the same verdicts as
-    `checkout_custody`, `Unknown` for an unreadable sibling, and a regression
-    that an internal and a removable admission with a member reach a decision
-    without re-acquiring either admission lock?
+16. Is the two-direction custody protocol (§5.5.2) right: the victim predicate
+    uses only the owning pool's admission-guarded facts (phase, holder/lease/
+    recovery/retired/lost, `process_group`, an active same-pool record for the
+    checkout, the non-blocking record-lock probe) and **no** cross-pool fact,
+    because the internal store reads the removable sibling without its lock
+    (`store.rs:2509-2525`, `2652-2654`)? Are the three regressions
+    (same-pool phase protection, cross-pool inertness, no recursive acquisition)
+    sufficient and non-vacuous?
 17. Is the reserve disposition right: the prune branch is unreachable today
     (no reserve is carried; `store.rs:3277-3280` versus `removable.rs:28,298`),
     wiring it would be new deletion behaviour the brief forbids inventing, so the
@@ -2363,7 +2495,7 @@ positive-absence policy are unchanged by either papercut.
   granted; the merge hold and both counted natives remain.
 - The time and disk figures are source-derived arithmetic, not measurements; the
   fit is UNMEASURED until the one activation per side runs, and the declared
-  420 s bound needs the freeze's acceptance before activation.
+  480 s bound needs the freeze's acceptance before activation.
 - The seeding interaction (§8) is a requirement on a frozen but unimplemented
   interface; case 24 is mandatory, so the counted native waits for oxide#137's
   implementation or moves into a scope split.
@@ -2383,6 +2515,11 @@ positive-absence policy are unchanged by either papercut.
   (§10.2, §16.2 case 8). Everything else the brief lists remains in the fixed
   case list. The concurrency case claims custody **exclusion**, never an
   interleaved observation.
+- **Cross-pool custody is deliberately not a victim premise.** The internal store
+  reads the removable sibling's state without its lock, so no internal admission
+  can establish a stable cross-pool fact without acquiring it in the shipped
+  internal-first order; the design therefore protects on same-pool facts only and
+  states the stop condition for any future cross-pool decision (§5.5.2).
 - **The legacy fence needs its own review.** It relaxes one refusal in the
   library's pool-root allowlist (a validated `state.json` fence) and writes a new
   document into the removable pool root; the design specifies strict validation
