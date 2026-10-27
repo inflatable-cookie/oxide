@@ -657,3 +657,45 @@ pub(crate) fn arm_step_open_failure() {
 pub(crate) fn injected_step_open_failure() -> bool {
     STEP_OPEN_FAULT.with(std::cell::Cell::get)
 }
+
+thread_local! {
+    static READDIR_FAULT: Cell<Option<(u64, libc::c_int)>> = const { Cell::new(None) };
+}
+
+/// Arm one injected `readdir` failure that fires once the listing has already
+/// collected `after_entries` names. APFS does not fail a listing on demand, so
+/// this injects the *input* of the seam's end-of-directory classification — the
+/// production null-return-and-`errno` path is what a test then asserts.
+#[must_use = "dropping the guard ends the armed readdir fault"]
+pub(crate) struct ReaddirFaultGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn readdir_fault_after(after_entries: u64, code: libc::c_int) -> ReaddirFaultGuard {
+    READDIR_FAULT.with(|cell| {
+        assert!(cell.get().is_none(), "overlapping readdir faults");
+        cell.set(Some((after_entries, code)));
+    });
+    ReaddirFaultGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for ReaddirFaultGuard {
+    fn drop(&mut self) {
+        READDIR_FAULT.with(|cell| cell.set(None));
+    }
+}
+
+/// The errno code the armed `readdir` fault reports, once the listing has
+/// collected `listed` names, if that fault is still armed.
+pub(crate) fn faulted_readdir(listed: u64) -> Option<libc::c_int> {
+    READDIR_FAULT.with(|cell| {
+        let armed = cell.get()?;
+        if listed < armed.0 {
+            return None;
+        }
+        cell.set(None);
+        Some(armed.1)
+    })
+}

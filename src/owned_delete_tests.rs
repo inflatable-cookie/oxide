@@ -148,6 +148,52 @@ fn finder_metadata_recreated_before_the_removal_is_drained() {
     assert!(!tree.exists(), "the whole directory is gone");
 }
 
+/// An enumeration that stops with an error is never read as an ended
+/// directory (oxide#155). The re-list has already collected a tolerated
+/// metadata entry when the failure is injected, and a foreign entry is still
+/// unread: with the former end-of-directory conflation the partial list would
+/// have been verified and its metadata entry removed. The fixed seam refuses the
+/// whole round before any verify, capture or unlink, so the metadata entry, the
+/// foreign entry and the directory are exactly as the writer left them.
+#[test]
+fn an_incomplete_listing_refuses_before_any_effect() {
+    let fx = Fixture::new("seam-enumeration");
+    let parent = open(fx.path());
+    let tree = fx.dir("slot");
+    let dir = open(&tree);
+    // The tolerated entries are read first in this fixture's directory order;
+    // the assertions below hold whichever order the filesystem returns.
+    fs::write(tree.join(".DS_Store"), vec![b'd'; 6_148]).expect("metadata");
+    fs::write(tree.join("._member"), vec![b'a'; 16]).expect("metadata");
+    fs::write(tree.join("zzz-foreign.txt"), b"foreign").expect("foreign");
+    let _fault = crate::test_fs::readdir_fault_after(1, libc::EIO);
+
+    match rmdir_retrying_finder_metadata(
+        parent.as_fd(),
+        &name("slot"),
+        dir.as_fd(),
+        OsStr::new("slot"),
+        &mut context(),
+        &mut || Ok(()),
+    ) {
+        Rmdir::Failed { error } => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+        other => panic!("an incomplete listing must fail the round: {other:?}"),
+    }
+    assert!(tree.is_dir(), "nothing was removed");
+    assert_eq!(
+        fs::read(tree.join(".DS_Store")).expect("metadata kept"),
+        vec![b'd'; 6_148]
+    );
+    assert_eq!(
+        fs::read(tree.join("._member")).expect("metadata kept"),
+        vec![b'a'; 16]
+    );
+    assert_eq!(
+        fs::read(tree.join("zzz-foreign.txt")).expect("foreign kept"),
+        b"foreign"
+    );
+}
+
 /// A recreated entry that is not tolerated Finder metadata refuses by name and
 /// is left exactly where the writer put it.
 #[test]

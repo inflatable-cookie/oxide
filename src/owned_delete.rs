@@ -1480,6 +1480,66 @@ enum Names {
     TooMany(u64),
 }
 
+/// This thread's `errno` location, where the platform exposes one.
+///
+/// `readdir` reports both the end of a directory and a failure by returning
+/// null, and only `errno` tells them apart. A platform whose `errno` this crate
+/// cannot read cannot prove a listing ended, so it is reported as unprovable
+/// rather than as an empty directory.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: `__errno_location` returns this thread's live errno location.
+    Some(unsafe { libc::__errno_location() })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: `__error` returns this thread's live errno location.
+    Some(unsafe { libc::__error() })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    None
+}
+
+fn set_errno(code: libc::c_int) {
+    if let Some(slot) = errno_slot() {
+        // SAFETY: `slot` is this thread's live errno location.
+        unsafe { *slot = code };
+    }
+}
+
+/// Clear this thread's `errno` before a `readdir` call, so a null return can be
+/// classified by [`enumeration_error`].
+pub fn clear_errno() {
+    set_errno(0);
+}
+
+/// The failure a null `readdir` return reported, or `None` when the directory
+/// really ended. Call it immediately after the null return, with `errno`
+/// cleared beforehand by [`clear_errno`].
+///
+/// A listing this platform cannot classify is an unproven enumeration, never an
+/// end of directory: a partial list is never handed to a caller that would act
+/// on it.
+pub fn enumeration_error() -> Option<io::Error> {
+    if errno_slot().is_none() {
+        return Some(io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(0) => None,
+        Some(_) => Some(error),
+        None => Some(error),
+    }
+}
+
 fn list_names(dir: BorrowedFd<'_>, max: usize) -> io::Result<Names> {
     // A fresh open of the held directory, not `dup`: `dup` shares the
     // descriptor's read offset, so a second listing of the same directory
@@ -1509,9 +1569,33 @@ fn list_names(dir: BorrowedFd<'_>, max: usize) -> io::Result<Names> {
     let mut seen = 0_u64;
     let mut too_many = None;
     loop {
+        // `readdir` reports the end of the directory and a failure with the same
+        // null return, so `errno` is cleared before each call and read after a
+        // null one: a listing that stopped early is an error, never a shorter
+        // directory, and no caller ever acts on a partial list.
+        clear_errno();
+        #[cfg(test)]
+        let entry = match crate::test_fs::faulted_readdir(seen) {
+            // The injected failure takes the same classification path as a real
+            // one: `errno` carries the code and the call reports a null return.
+            Some(code) => {
+                set_errno(code);
+                std::ptr::null_mut()
+            }
+            None => {
+                // SAFETY: `stream` is a live directory stream.
+                unsafe { libc::readdir(stream) }
+            }
+        };
+        #[cfg(not(test))]
         // SAFETY: `stream` is a live directory stream.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
+            if let Some(error) = enumeration_error() {
+                // SAFETY: `stream` is live and closed exactly once.
+                unsafe { libc::closedir(stream) };
+                return Err(error);
+            }
             break;
         }
         // SAFETY: `d_name` is a live NUL-terminated array for this entry.

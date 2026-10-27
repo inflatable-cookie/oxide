@@ -23,9 +23,10 @@ use crate::removable;
 use crate::store::{self, CheckoutCustody, Store};
 use oxide_storage::inventory::{self, InventoryLimits};
 use oxide_storage::owned_delete::{
-    capture_entry, descriptor_identity, observe_entry, only_finder_metadata, open_directory_at,
-    put_back, rmdir_draining_finder_metadata, unlink_captured, verify_captured, Capture,
-    CaptureContext, DrainStop, EntryFacts, Rmdir, FINDER_RACE_ATTEMPTS, FINDER_RACE_PAUSE,
+    capture_entry, clear_errno, descriptor_identity, enumeration_error, observe_entry,
+    only_finder_metadata, open_directory_at, put_back, rmdir_draining_finder_metadata,
+    unlink_captured, verify_captured, Capture, CaptureContext, DrainStop, EntryFacts, Rmdir,
+    FINDER_RACE_ATTEMPTS, FINDER_RACE_PAUSE,
 };
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
@@ -3750,6 +3751,63 @@ mod test_replace_arm {
     }
 }
 
+/// Deterministic directory-enumeration failure for the deletion pass
+/// (oxide#155). Absent from every non-test build: APFS cannot fail a listing on
+/// demand, so a unit test injects the failure once the pass has already
+/// collected a bounded number of names and asserts that no partial list is ever
+/// acted on.
+#[cfg(test)]
+mod test_enumeration_fault {
+    use std::cell::RefCell;
+
+    struct Armed {
+        after: u64,
+        error: std::io::Error,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    /// One armed enumeration failure, ending on drop.
+    #[must_use = "dropping the guard ends the armed enumeration failure"]
+    pub(super) struct Guard {
+        _private: (),
+    }
+
+    pub(super) fn arm(after: u64, code: i32) -> Guard {
+        ARMED.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            assert!(cell.is_none(), "overlapping enumeration faults");
+            *cell = Some(Armed {
+                after,
+                error: std::io::Error::from_raw_os_error(code),
+            });
+        });
+        Guard { _private: () }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|cell| {
+                let _ = cell.borrow_mut().take();
+            });
+        }
+    }
+
+    /// The armed failure, once `listed` names have been collected.
+    pub(super) fn fire(listed: u64) -> Option<std::io::Error> {
+        ARMED.with(|cell| {
+            let armed = cell.borrow_mut().take()?;
+            if listed < armed.after {
+                *cell.borrow_mut() = Some(armed);
+                return None;
+            }
+            Some(armed.error)
+        })
+    }
+}
+
 fn delete_contents(deleter: &mut Deleter, dir: BorrowedFd, top: bool) -> Result<(), Stop> {
     delete_contents_at(deleter, dir, top, 0)
 }
@@ -4025,6 +4083,36 @@ fn delete_contents_at(
 /// Most names one quarantined directory may hold in one bounded pass.
 const MAX_DIRECTORY_NAMES: usize = 200_000;
 
+/// One listed name, with the end of the directory separated from a failure.
+///
+/// `readdir` reports both the end of a directory and a failure with the same
+/// null return, so `errno` is cleared before the call and read after a null
+/// one: a listing that stopped early stops the pass pending instead of letting
+/// it act on the partial list it had collected. A directory whose enumeration
+/// cannot be proven is never read as an empty one.
+fn next_listed_name(stream: *mut libc::DIR, listed: u64) -> Result<Option<String>, Stop> {
+    #[cfg(test)]
+    if let Some(error) = test_enumeration_fault::fire(listed) {
+        return Err(Stop::Pending(format!(
+            "cannot finish reading a quarantined directory ({error}); it is kept"
+        )));
+    }
+    clear_errno();
+    // SAFETY: `stream` is a live directory stream.
+    let entry = unsafe { libc::readdir(stream) };
+    if entry.is_null() {
+        return match enumeration_error() {
+            None => Ok(None),
+            Some(error) => Err(Stop::Pending(format!(
+                "cannot finish reading a quarantined directory ({error}); it is kept"
+            ))),
+        };
+    }
+    // SAFETY: `d_name` is a live NUL-terminated array for this entry.
+    let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+    Ok(Some(name.to_string_lossy().into_owned()))
+}
+
 /// `list_directory` for deletion: the deleter's cadence check runs every
 /// `DELETE_BATCH` names, and more than `MAX_DIRECTORY_NAMES` stops with the
 /// intent pending. One `readdir` call itself is not interrupted.
@@ -4049,14 +4137,11 @@ fn list_directory_checked(dir: BorrowedFd, deleter: &mut Deleter) -> Result<Vec<
     }
     let mut names = Vec::new();
     let outcome = loop {
-        // SAFETY: `stream` is a live directory stream.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break Ok(());
-        }
-        // SAFETY: `d_name` is a live NUL-terminated array for this entry.
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        let name = name.to_string_lossy().into_owned();
+        let name = match next_listed_name(stream, names.len() as u64) {
+            Ok(Some(name)) => name,
+            Ok(None) => break Ok(()),
+            Err(stop) => break Err(stop),
+        };
         if name == "." || name == ".." {
             continue;
         }
@@ -6269,6 +6354,27 @@ mod tests {
         assert!(reason.contains("another device"), "{reason}");
         assert_eq!(fs::read(&file).unwrap(), b"owned");
         assert_eq!(names_in(&root), vec!["owned.txt".to_owned()]);
+    }
+
+    /// An enumeration that stops with an error is never read as an ended
+    /// directory: the pass stops pending before it removes anything, even though
+    /// the partial list it had already collected held a real owned entry.
+    #[test]
+    fn an_incomplete_listing_stops_the_pass_before_any_effect() {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("quarantine");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("owned.txt"), b"owned").unwrap();
+        fs::write(root.join("second.txt"), b"second").unwrap();
+        let _fault = test_enumeration_fault::arm(1, libc::EIO);
+        let (outcome, counts) = delete_fixture(&root);
+        let reason = pass_reason(&outcome);
+        assert!(reason.contains("cannot finish reading"), "{reason}");
+        assert_eq!(
+            names_in(&root),
+            vec!["owned.txt".to_owned(), "second.txt".to_owned()]
+        );
+        assert_eq!(counts.entries, 0);
     }
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
