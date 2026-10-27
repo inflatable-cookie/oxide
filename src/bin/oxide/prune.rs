@@ -7420,7 +7420,8 @@ mod tests {
         let fixture = Fixture::new();
         let one = legacy_snapshot_row(&fixture, &"a".repeat(64));
         let two = legacy_snapshot_row(&fixture, &"b".repeat(64));
-        let three = legacy_snapshot_row(&fixture, &"c".repeat(64));
+        let mut three = legacy_snapshot_row(&fixture, &"c".repeat(64));
+        three.member = "debug".to_owned();
         let control = ready_control(
             &fixture,
             vec![one.clone(), two.clone(), three.clone()],
