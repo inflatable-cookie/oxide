@@ -10,6 +10,29 @@ independent exact-head design review and the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 mechanical merge hold are separate and unchanged.
 
+**Revision 8** answers the CHANGES REQUIRED design review of `b130728`
+(comment `6453630462`, 2026-10-27) with two corrections. **The normal `Prefer`
+fallback now names its eligibility explicitly**: `evict_one_idle`
+(`pool.rs:1786`) sees only ledger-idle, unleased rows and cannot see
+control-record facts, so `Prefer` is redefined as (1) an eligible **evictable**
+member, then (2) the ordinary #118 order with **every verified one-use pair
+removed** — evictable, protected or unverified — leaving normal slots and idle
+class-unknown orphans eligible exactly as before, and failing on the shipped
+error when that set is empty instead of ever falling through to a member. The
+protected pairs reach the library as an explicit exclusion set, and case 7 gains
+the non-vacuous variants (protected member ranked first survives; the orphan is
+chosen under #118; an empty fallback set refuses). **The version-5 serialization
+is now defined safely for ordinary normal records**: `#[serde(default)]` alone
+would emit `class: normal` into a version-5 document that an installed v5
+reader's preflight cannot see and whose strict parser then rejects after output
+effects, so both new fields use
+`skip_serializing_if = "class_is_normal"` / `is_none` — a normal record written
+by a v6 binary omits them and stays at version 5, a `one_use` record always
+carries them with the durable fence at version 6, `validate_state` refuses a
+sub-6 document that carries either field, and a pure serializer regression plus a
+native legacy-read control with the identified older artifact (`489eecc`) prove
+it. The candidate 480 s / 512 MiB bound and the returned reserve requirement are
+unchanged owner decisions.
 **Revision 7** answers the CHANGES REQUIRED design review of `f6276a4`
 (comment `6453458971`, 2026-10-27) with three corrections. **Cross-pool eviction
 custody is dropped from the victim predicate**, because the two directions are
@@ -721,32 +744,60 @@ one.
 
 ## 5. Slot class in Oxide state
 
-### 5.1 The record field and its fence
+### 5.1 The record field, its exact on-disk form and its fence
 
-`Record` (`store.rs:155`) gains:
-
-```text
-class: WorkspaceClass      // serde enum: "normal" | "one_use"
-class_reason: Option<String>  // bounded diagnostic, <= MAX_DIAGNOSTIC_BYTES
-```
-
-`class` is `#[serde(default)]` so a legacy document parses; an **unknown
-variant refuses** through serde (`deny_unknown_fields` plus an unknown enum
-variant both refuse), and `validate_state` additionally refuses a class value it
-does not know, a reason over its bound, and a `one_use` record whose reason or
-facts are not bounded text.
-
-The class is durable before it is trusted: `State` gains a forward-only fence
+`Record` (`store.rs:155`, `#[serde(deny_unknown_fields)]`) gains two fields with
+an **explicit omission rule**, because a v5 reader's `Record` denies unknown
+fields and its preflight only compares numeric versions:
 
 ```text
-one_use_workspaces: Option<String>   // "oxide.one-use/1"
+#[serde(default, skip_serializing_if = "class_is_normal")]
+class: WorkspaceClass                       // "normal" | "one_use"
+#[serde(default, skip_serializing_if = "Option::is_none")]
+class_reason: Option<String>                // bounded, <= MAX_DIAGNOSTIC_BYTES
 ```
 
-which is written **before** the first class-bearing record, exactly as
-`recorded_accounting` (`oxide.accounting/1`) precedes the library's
-policy-2 write. `save()` (`store.rs:3776-3804`) advances the numeric version to
-**`STATE_VERSION = 6`** when that fence is present; version 5 remains the
-predecessor for a pool that never meets one-use (§10.1).
+`#[serde(default)]` alone is **not** enough: it makes legacy documents parse but
+still serialises the field, so an ordinary **normal** record rewritten by a v6
+binary would emit `"class":"normal"` into a **version-5** document that an
+installed v5 reader cannot see coming (its preflight sees 5, not newer) and that
+its strict parser then rejects after output effects. The representation is
+therefore:
+
+| Record | On-disk bytes | State version |
+| --- | --- | --- |
+| legacy normal (no class) | **neither field present** | 5 or below |
+| normal, written by a v6 binary | **neither field present** (`class_is_normal` and `is_none` both skip) | 5 or below, unchanged |
+| `one_use` | `"class":"one_use"`, plus `"class_reason"` when a reason exists | **6**, fence present |
+
+So a document containing either field **always** has the durable
+`one_use_workspaces: "oxide.one-use/1"` fence and numeric version 6, and a
+document without the fence contains neither field. Ordering, for **every** state
+save in the front door:
+
+1. the one-use fence is written durably (its own atomic save) **before** the
+   first state document that carries a class-bearing record;
+2. `save()` advances the numeric version to **`STATE_VERSION = 6`** when that
+   fence is present (`store.rs:3776-3804`'s named-fence rule), and leaves a
+   normal-only pool at its existing version (5 or below);
+3. a version-5-or-below document never contains `class`/`class_reason`, so a
+   v5 reader's ordinary rewrite stays readable by a v5 binary.
+
+Reading is defensive in both directions: `#[serde(default)]` makes a legacy
+document read as `normal`; an **unknown class variant refuses** through serde;
+`validate_state` additionally refuses an unknown class value, a reason over its
+bound, a `one_use` record without bounded facts, and — as defence in depth — a
+document **below** version 6 that contains either field (a state that skipped its
+fence).
+
+**Proof of the legacy serializer.** A pure regression serialises (a) a freshly
+created normal record and (b) a rewritten normal-only state and asserts the bytes
+contain neither `"class"` nor `"class_reason"`, and that a round trip through the
+v5-shaped `Record` succeeds. A native control (case 14) has the **identified
+older artifact** (`489eecc`, state 5) read and rewrite a state written by the
+candidate's ordinary normal creation: it must succeed as a legacy read with no
+hand-off, while the same artifact refuses a v6 one-use state before any output
+effect.
 
 ### 5.2 Class is fixed; a class change is a different record
 
@@ -952,8 +1003,11 @@ external-command relink path is unchanged. Nothing about unknown-writer
 protection weakens: the predicate is the *same facts for the same pool*, with the
 cross-pool clause removed because it was never stable for an internal admission.
 
-The `evictable` set is passed to the library as its **only** allowed victim
-source; membership in `members` alone is never enough. A member that is counted
+The `evictable` set is passed to the library as its **only** allowed one-use
+victim source; membership in `members` alone is never enough. The **protected**
+pairs are passed too, as an explicit *exclusion* set for every normal `Prefer`
+fallback (§6.7), so the ledger-only predicate can never reach a member the
+checklist protects. A member that is counted
 but protected is reported in the bounded observation (`protected: n`) and never
 silently turned into free quota.
 
@@ -1045,16 +1099,20 @@ must adapt deliberately (`store.rs:3255-3280` is the product one):
 ```text
 class: AdmissionClass,          // Normal | OneUse  (from §3)
 victims: VictimPolicy,          // Any (default, today's behaviour)
-                                // Prefer(&MemberSet)  -- one-use first, then Any
-                                // Only(&MemberSet)    -- one-use only
+                                // Prefer { preferred, excluded }
+                                //   -- evictable members first, then the
+                                //      ordinary order with `excluded` removed
+                                // Only(&MemberSet)    -- evictable members only
 slice: Option<OneUseSlice>,     // Some for every new-slot admission and every
                                 // OneUse admission; None where the brief
                                 // forbids a measurement (normal warm reuse)
 
 pub struct MemberSet(/* at most MAX_SLOTS (slot_id, incarnation) pairs */);
 // Two sets, never interchangeable: `accounting` counts bytes and slots,
-// `evictable` is the only victim source and is derived by the front door's
-// control-record custody checklist (§5.5.1). `evictable ⊆ accounting`.
+// `evictable` is the only *one-use* victim source and is derived by the front
+// door's control-record custody checklist (§5.5.1); `excluded` is every
+// verified one-use pair and is subtracted from the normal Prefer fallback
+// (§6.7). `evictable ⊆ excluded ⊆ accounting`.
 pub struct OneUseSlice {
     pub max_slots: usize,       // 16 verified members
     pub max_bytes: u64,         // min(admission_budget / 10, 32 GiB), at least 1
@@ -1120,10 +1178,14 @@ Under the pool lock, before any victim decision:
    not try: it trusts only the `evictable` subset, and it re-checks that subset
    against the ledger under the pool lock.
 
-The mapping is stable because the front door holds its control-state admission
-lock (`store.attempt`, `store.rs:2978`) across the whole library call, so no
-other Oxide command can create, release or evict a slot of this pool while the
-membership is being used. The library itself reads no Oxide record and cannot
+The front door passes the library **both** sets: the `evictable` pairs as the
+only one-use victim source, and **every** verified one-use pair (evictable,
+protected and unverified) as the exclusion set that the normal `Prefer` fallback
+subtracts before ranking anything (§6.7). The mapping is stable because the front
+door holds its control-state admission lock (`store.attempt`, `store.rs:2978`)
+across the whole library call, so no other Oxide command can create, release or
+evict a slot of this pool while the membership is being used, and the exclusion
+set cannot go stale behind the call. The library itself reads no Oxide record and cannot
 verify a record lock; that is the caller's custody, stated here so no reader
 assumes the library proves it.
 
@@ -1221,7 +1283,7 @@ while a build writes. No "Fresh", savings or free-space guarantee is implied.
 | Admission | Restore | Slot chosen | Notes |
 | --- | --- | --- | --- |
 | normal, warm reuse | **none** | shipped #110 target-only walk | never measures members; never reports slice bytes it did not observe |
-| normal, new slot | yes (`Prefer`) | shipped order, class-aware victims | may reclaim idle one-use slots first; continues with a reported overage/lower bound when it must |
+| normal, new slot | yes (`Prefer`) | preferred **evictable** member first, then the fallback set with **every one-use pair removed** (normal slots and idle class-unknown orphans only) | may reclaim idle one-use slots first; continues with a reported overage/lower bound when it must; refuses on its ordinary reasons when the fallback set is empty |
 | one-use, warm reuse | yes (`Only`, candidate excluded) | the verified member slot only | admissible at 16 members while bytes fit and `unknown == 0`; a non-member idle slot is refused, never relabelled |
 | one-use, new slot | yes (`Only`) | new slot, `member_count <= 15`, union within the slice, `unknown == 0` | refuses or waits per §6.9 |
 
@@ -1230,10 +1292,38 @@ proof control is the "normal" rows; the local-output guard is unaffected (§3.6)
 
 ### 6.7 Every pressure path, named
 
-`Prefer` = "an eligible verified one-use idle member first (oldest rank first),
-then today's Any order". `Only` = "an eligible verified one-use idle member
-only; if there is none, this path fails exactly as it fails today when no victim
-is eligible".
+**The three victim sets, exactly.** They are disjoint by construction and the
+library selects from exactly one of them per admission class:
+
+- **`Prefer` (normal admission).** Step 1: an eligible **evictable** one-use
+  member, oldest `(rank, slot_id)` first (§6.2). Step 2 — the fallback — the
+  ordinary #118 `(rank, slot_id)` order over ledger-idle, unleased rows with
+  **every verified one-use pair removed**, whether evictable, protected or
+  unverified. So the fallback may pick a **normal** slot or a positively idle
+  **class-unknown orphan** exactly as today, and it can **never** pick a one-use
+  member. `evict_one_idle` (`pool.rs:1786`) cannot see control-record facts, so
+  this exclusion is applied by the class-scoped selector the library uses for
+  every pressure path — not by the ledger-only predicate. If no row survives the
+  exclusion, the path fails with its shipped error (`Full`,
+  `LedgerExhausted`, `Busy`, `unknown_accounting`) and **never** falls through to
+  a one-use member.
+- **`Only` (one-use admission).** An eligible **evictable** one-use member only,
+  oldest first; if there is none, the path fails exactly as it fails today when
+  no victim is eligible. A normal slot, a class-unknown orphan, a protected
+  member and an unverified pair are all outside this set.
+- **`Any` (the default for a library caller that passes no policy).** Today's
+  behaviour, unchanged, for callers outside this feature; Oxide always passes
+  `Prefer` or `Only` (§6.1), so `Any` never reaches a one-use pool through the
+  front door.
+
+**Why the explicit exclusion is load-bearing.** `evict_one_idle` filters on
+ledger-idle and unleased rows only; it cannot see a member's record phase, lock,
+holder, pin or `process_group`. Without step 2's exclusion, a `Prefer` fallback
+would select exactly the ledger-idle one-use member the checklist calls
+*protected* — a member whose record lock is held, or whose custody is uncertain —
+whenever no preferred member is eligible. The selector therefore computes the
+protected pairs once (§6.2) and subtracts them from the fallback candidate set
+before it ranks anything.
 
 | Path (current source) | Normal admission | One-use admission |
 | --- | --- | --- |
@@ -1241,14 +1331,19 @@ is eligible".
 | byte budget `evict_idle_until_under_cap` (`pool.rs:1759`) | `Prefer` | `Only` |
 | project-cap replacement `replace_idle_slot_for_admission` (`pool.rs:1399`) | named victim from the **normal-only** front-door list, re-verified as a non-member | not reachable (one-use is not subject to the project cap) |
 | removable reserve route `admit_unknown_removable` (`pool.rs:1455`) | `Prefer` | `Only`. The route's prune branch is **unreachable today** (no reserve is carried, §10.2); the policy is specified so a scoped wiring could not pick a normal victim for one-use, and this design changes no behaviour |
-| post-eviction pressure re-read (`allocate`, `pool.rs:1088-1115`) | unchanged; a `Full` that remains is today's `Full` | unchanged; a `Full` that remains is a safety refusal, never a normal victim |
+| post-eviction pressure re-read (`allocate`, `pool.rs:1088-1115`) | `Prefer`: preferred member, then the fallback set (normal slots and idle class-unknown orphans, **all one-use pairs removed**) | `Only`; a `Full` that remains is a safety refusal, never a normal victim |
 | retry after a victim refusal | stops with the shipped error (`Busy`/`unknown_accounting`) | stops; never falls through to a normal victim |
 | unknown accounting (`recorded_total`, `pool.rs:1546`) | unchanged refusal (`unknown_accounting`) | unchanged refusal |
 | class-unknown ledger rows (§5.6) | continues with the lower-bound observation; no stall | **refuses** `unknown_accounting` |
 | count replacement with only bound gaps on a removable pool (`pressure_known_or_bounded_removable`) | unchanged | unchanged |
 
-No row ever lets a one-use admission select a normal victim, and no row lets a
-normal admission be *stopped* solely because the one-use slice is over.
+No row ever lets a one-use admission select a normal victim; no row ever lets a
+normal admission's fallback select a one-use member — protected, unverified or
+evictable — because every one-use pair is removed from that set; and no row
+stops a normal admission *solely* because the one-use slice is over (it continues
+with a measured overage or a lower-bound note and reaches its ordinary decision).
+A normal admission may still be **refused** for its own ordinary reasons, or stop
+on a safety failure of its selected victim, exactly as today.
 
 ### 6.8 Normal admission continues
 
@@ -1529,10 +1624,12 @@ group closes, ordinary release applies.
 | Version rule | `save()` advances only with a named fence | the one-use fence advances to 6; a state with neither fence stays below 6 |
 | Unknown class/version | — | **refuses safely**: an unknown class variant, an unknown fence value, a missing fence at version 6, or a version above 6 all refuse before use |
 
-Per-record migration is the serde default: a record with no `class` reads
-`normal`, which is the protected class (§5.7). The fence, not the per-record
-default, is what tells a *newer* binary that this state may contain one-use
-records.
+Per-record migration is the omission rule of §5.1: a record with no `class` reads
+`normal`, which is the protected class (§5.7), and a **normal** record written by
+a v6 binary omits both new fields so a v5 reader's ordinary rewrite stays
+readable. The fence, not the per-record default, is what tells a *newer* binary
+that this state may contain one-use records, and any document carrying either
+field always carries the fence at version 6.
 
 ### 10.2 Ledger, receipts and registration unchanged
 
@@ -1963,6 +2060,8 @@ claimed for a statically edited selector.
 | automatic adoption on a guarded workspace | **skipped**, no receipt write, no notice |
 | normal warm reuse | unchanged, no slice measurement |
 | normal new slot with slice overage or class-unknown rows | restoration + `Prefer`, then continue with a measured overage or a lower-bound note |
+| normal `Prefer` fallback with a protected/unverified one-use pair ranked first | the pair is **excluded** from the fallback set; an eligible normal slot or idle class-unknown orphan is selected, or the ordinary refusal fires |
+| version-5-or-below state carrying `class`/`class_reason` | **refuses** (a document that skipped its fence) |
 | removable unknown-figure admission (no reserve is carried today) | refuses with the shipped incomplete scan and evicts nothing; the reserve-path protection requirement is returned to the owner (§10.2, §19) |
 | any admission whose retry needs byte pressure on a removable pool | the effective cap is the **recorded registration cap**; `OXIDE_POOL_CAP` does not override an existing removable pool |
 | retried admission after a failure-stop | full class-scoped reselection; never the next candidate, never a normal victim |
@@ -2054,7 +2153,17 @@ its own validation tier and native activation.
   guarded `clean` refusal.
 - The state shape: a version-5 document reads as normal; a version-6 document
   without the fence refuses; an unknown class variant refuses; a class fence
-  with version 5 refuses; bounded reason and membership sizes.
+  with version 5 refuses; a version-5-or-below document carrying `class` or
+  `class_reason` refuses; bounded reason and membership sizes.
+- The serializer omission rule of §5.1: a fresh normal record and a rewritten
+  normal-only state serialise with **neither** `class` nor `class_reason`, a
+  `one_use` record carries both the class and the v6 fence, and a round trip
+  through the v5-shaped `Record` succeeds for the normal bytes.
+- The fallback exclusion of §6.7: with a protected (or unverified) one-use pair
+  ranked before an eligible normal slot, an idle class-unknown orphan and a
+  second evictable member, `Prefer` never returns the protected pair; the
+  orphan and the normal slot remain eligible; an empty fallback set yields the
+  shipped refusal.
 - The request/policy shapes: `Any` is the default, a member set is bounded, a
   policy with an empty set is a no-op, `Only` with no eligible victim fails,
   and the two slice thresholds (new slot needs a free place; warm reuse at the
@@ -2131,10 +2240,25 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
    one-use members, the replacement deletes exactly one idle **normal** slot
    while the one-use members survive (the front-door list has no one-use
    candidate).
-7. normal byte-pressure protection: one-use members present, a normal new slot
-   under byte pressure reclaims one-use first, then a normal victim if still
-   over — and with every one-use member protected it continues with a measured
-   overage and no stall.
+7. normal **fallback-set** protection, byte pressure: one-use members present, a
+   normal new slot under byte pressure reclaims an evictable one-use member
+   first. Three non-vacuous variants:
+   - a **protected** member (ledger-idle, record lock held by a live fixture
+     process) ranked **before** an eligible one-use member and before an eligible
+     normal slot: the protected member survives byte-identically, and the
+     admission either reclaims the next evictable member or, with none left,
+     selects the **safe fallback** (the normal slot) — never the protected
+     member. This is the case the bare `evict_one_idle` predicate would get
+     wrong.
+   - with no evictable member left and an idle **class-unknown orphan** ranked
+     before a normal slot, the fallback selects the **orphan** under the shipped
+     #118 eligibility (the orphan is not a one-use pair, so it is not excluded).
+   - with the fallback set empty (a protected member and a held normal slot), the
+     admission **refuses on its ordinary reason** and the protected member is
+     byte-identical; it never falls through.
+   With every one-use member held (no fallback candidate), a normal admission
+   still continues into the ordinary decision and reports a measured overage
+   rather than stalling on the slice.
 8. removable unknown-figure admission, **today's behaviour asserted**: on the
    owned image's registered and **selected** removable pool (positive
    selected-removable control) with one idle normal slot and one idle one-use
@@ -2165,9 +2289,16 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
 13. crash and recovery: kill while `Acquiring` and while `Spawning`; the
     recovered one-use record keeps its class, the untrusted generation is evicted
     whole, and a normal record's recovery is unchanged.
-14. state class/version: a version-5 fixture state reads as normal; a version-6
-    document without the fence refuses; an unknown class refuses; the capability
-    probe reports state version 6.
+14. state class/version and the legacy serializer: a version-5 fixture state
+    reads as normal; a version-6 document without the fence refuses; a
+    version-5-or-below document that carries `class`/`class_reason` refuses; an
+    unknown class refuses; the capability probe reports state version 6. **Legacy
+    read control with the identified older artifact** (`489eecc`, state 5): the
+    candidate performs an ordinary **normal** creation and rewrite, the old
+    artifact reads and rewrites that state successfully **with no hand-off** (the
+    document contains neither new field, proven by the pure serializer check),
+    while the same artifact refuses a v6 one-use state before any output effect
+    (case 15's positive control).
 15. pre-effect hand-off on the **real** paths, with an identified older
     artifact: pre-feature `489eecc` (state 5) staged by role, no feature. Internal
     positive control: a v6 internal state and no matching installed receipt →
@@ -2336,9 +2467,11 @@ retry is authorized by this text.
   and — new in revision 5 — the **third staging**: the fixed older artifact
   (`489eecc`, state 5) the hand-off case needs, built from its own source and
   flags with no shared target. §16.4 gives the arithmetic and the 430 s work
-  cutoff. This is a declared fixed higher bound under the brief's rule, put to
-  the freeze for acceptance before any activation — never a silent extension, and
-  300 s is not claimed to fit. If the freeze prefers to keep 420 s, the
+  cutoff. This is a **candidate fixed bound for the Supervisor's decision**
+  under the brief's rule, not evidence of fit: it is source-derived and
+  unmeasured, the separately activated diagnostic measures actual fit, and
+  activation waits for that decision — never a silent extension. 300 s is not
+  claimed to fit. If the freeze prefers to keep 420 s, the
   older-artifact case moves to its own scoped proof (§18 Q12).
 - Cumulative author bound **180 min** from actual activation, including
   authoring, admission/waits, coverings, diagnostic, native, cleanup and report;
@@ -2437,9 +2570,11 @@ positive-absence policy are unchanged by either papercut.
    now that membership and unknown rows are both derived under the admission
    lock, and is the stop condition precise enough?
 9. Are `Prefer`/`Only` complete for the count, project-cap, byte, reserve,
-   unknown-accounting and retry paths, with no row able to select a normal
-   victim for one-use admission, and are the reserve/retry fixtures of §16.2
-   cases 8, 26 and 27 feasible, safe and non-vacuous as written?
+   unknown-accounting and retry paths: does the normal `Prefer` fallback now
+   remove **every** verified one-use pair (protected, unverified and evictable)
+   while keeping normal slots and idle class-unknown orphans eligible under
+   #118, with the shipped refusal when that set is empty? Are cases 5, 7 and 8's
+   fixtures feasible, safe and non-vacuous as written?
 10. Is N+1 = 6 with a durable one-use fence the right numeric fence, and is the
     installer's `proof_controls` refusal correct for older receipts?
 11. Is the staging inventory (§11.2) complete now that helper-mediated stagers
@@ -2505,7 +2640,10 @@ positive-absence policy are unchanged by either papercut.
   or narrowed, those cases return to the owner for a scoped ruling rather than
   being dropped or reported unexecuted.
 - **Returned to the owner (not a design claim):** the brief requires the fixed
-  native to cover normal-slot protection under the **reserve** path. That path's
+  native to cover normal-slot protection under the **reserve** path. Nothing in
+  this design substitutes for it: neither the shipped-refusal case 8 nor the pure
+  policy check satisfies that requirement, and only an owner ruling or a revised
+  brief can change how it is discharged. That path's
   prune branch is unreachable in the current source because a removable
   admission carries no reserve (`store.rs:3277-3280` versus
   `removable.rs:28,298`), and reaching it would add a new deletion behaviour that
