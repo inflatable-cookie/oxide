@@ -9,7 +9,22 @@ exact-head design review, then stop for the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 merge hold are separate and unchanged.
 
-**Revision 7** answers the CHANGES REQUIRED review of `6c3d5a07` (review
+**Revision 8** answers the CHANGES REQUIRED review of `88e9a2c` (review
+comment `6450792089`, 2026-10-27): the adapter now freezes **two name
+identities** — the fingerprint package directory uses the **literal** lock
+package name (`.fingerprint/cfg-if-<hash>/`,
+`compilation_files.rs:231-245,278-281`) while the unit suffix, `dep-` entry and
+artifact stem use the **normalized** target name (`lib-cfg_if`,
+`deps/libcfg_if-<hex>.rmeta`, `targets.rs:135-168`). Normalization stays the
+uniqueness/collision rule across all source kinds, the literal name selects the
+directory prefix, and the association is restricted to the named role/layout
+cases (unit-grouped build directories, custom `--out-dir`, custom
+extra-filename and other layouts skip). A pure grammar regression pins
+`cfg-if-<hash>/lib-cfg_if` beside the `foo-bar`/`foo_bar` collision, and cases
+2 and 16 are reconciled with that grammar. The time arithmetic is corrected:
+the upper estimates sum to **265 s of the 300 s**, leaving 35 s; the diagnostic
+is still required and fit stays UNMEASURED.
+**Revision 7** answered the CHANGES REQUIRED review of `6c3d5a07` (review
 comment `6450625847`, 2026-10-27): the supported target name is the **normalized**
 package name (`-` → `_`), matching pinned Cargo's inferred lib naming and its
 rejection of a hyphenated explicit name, so `cfg-if`/`cfg_if` is supported and
@@ -26,7 +41,7 @@ inferred from an unpinned catalog or the recipient allowlist (§4.2, §4.4,
 comment `6450400975`, 2026-10-27): the artifact join now parses **all** rules of
 rustc's dep-info and looks in the unit's own output directory — the `.d`'s own
 rule is first in the ordinary pinned shape, `.rmeta` and `.rlib` emits both
-join, and a build-script `.d` lives under `build/<pkg>-<hex>/` (§4.2, §5.1);
+join, and a build-script `.d` lives under `build/<literal package>-<hex>/` (§4.2, §5.1);
 the join is **established at producing time and recorded in the catalog**, so
 selection reads catalog data only and never touches the donor payload, with
 every artifact, `.d` and fingerprint file re-read and re-verified under the
@@ -36,7 +51,7 @@ ambiguous-name count that binding `bb151a59` requires (§9.2).
 **Revision 5** answered the CHANGES REQUIRED review of `916cc851` (review
 comment `6450220961`, 2026-10-27): the package-wide fingerprint uniqueness rule
 is replaced by **per-unit classification** — a package may legitimately have
-several `<pkg>-<hex>` directories (library, build script, feature variants),
+several `<literal package>-<hex>` directories (library, build script, feature variants),
 each is either one complete unit or an excluded run-only directory, and
 artifacts join to their verified source root through rustc's own `.d` — so the
 required `seedctl` build-script case is achievable (§4.2); the contradictory
@@ -145,7 +160,7 @@ Checked against the design input. "Read" means this design reads the fact;
 | Control-state numeric fences | `store.rs:65-83` (`STATE_VERSION = 5`), `store.rs:116-117`, `store.rs:79-80` | **Not bumped** in this design (§9.4), with an explicit stop condition if a field turns out to be required. |
 | Slot origin (checkout, content, anchor, uncertain paths) and `Built` | `store.rs:251-259`; `src/bin/oxide/freshness.rs:168-200`; `store.rs:3577-3591` (`trusted_origin` needs a matching `mark`) | Read, never widened. It remains the only trust record for reuse. |
 | Cargo identity | `freshness.rs:75-84` (`VERIFIED_CARGO`), `freshness.rs:419-445` (`verified_cargo`) — probed per command, **not persisted** | Recorded explicitly in the new donor catalog; legacy slots have no such fact and are not donors. |
-| Encoded dep-info in the fingerprint directory | Cargo's `.fingerprint/<pkg>-<hash>/dep-<kind>-<target>`, marker `01 00 00 00 ff`, version 1; the repository's own bounded reader documents the format (`src/dep_info.rs:1-30`) and the version-matrix proof decodes every `dep-*` file (`workflow.md#cargo-version-matrix`) | Part of every offered unit's manifest (§4.2, §5.1); a unit without it is not offered. |
+| Encoded dep-info in the fingerprint directory | Cargo's `.fingerprint/<literal package>-<hash>/dep-<kind>-<normalized target>`, marker `01 00 00 00 ff`, version 1; the repository's own bounded reader documents the format (`src/dep_info.rs:1-30`) and the version-matrix proof decodes every `dep-*` file (`workflow.md#cargo-version-matrix`) | Part of every offered unit's manifest (§4.2, §5.1); a unit without it is not offered. |
 | Cargo configuration and environment that Cargo does not fully fingerprint | `workflow.md#cargo-version-matrix` names `build.rustc`, `CARGO_BUILD_RUSTC`, `RUSTC_WORKSPACE_WRAPPER` and a kept wrapper as outside the slot key; Cargo merges `.cargo/config*` from the command's working directory to the filesystem root, then the Cargo home (`cargo-1.97.1/c980f4866` `doc/src/reference/config.md`) | A bounded context digest over the named environment variables and config tables, looked up from the command's working directory with Cargo's precedence, must be equal on both sides; anything unsupported skips (§3.1). |
 | Ambient inputs a proc macro can read while compiling a dependency | not in the consuming crate's dep-info; Cargo fingerprints only a small part of the environment (`cargo-1.97.1/c980f4866` `core/compiler/fingerprint/mod.rs`) | Eligibility is restricted to lock entries with no dependency edges, so no proc macro can be invoked (§3.2); the narrowing is returned to the Supervisor. |
 | Git verification process | `src/bin/oxide/freshness.rs:453-500` (`freshness::Git`): `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `submodule.recurse=0`, `core.fsmonitor=false`, bounded calls/time/output and a settle window | Reused verbatim for every seed-side git call, with cleared `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`; unknown closure refuses (§4.3). |
@@ -343,7 +358,7 @@ Consequences, stated rather than hidden:
 
 | `6449965447` finding (revision 4) | Amendment |
 | --- | --- |
-| 1. The artifact whitelist did not prove which package produced a file | §4.2 classifies each `<pkg>-<hex>` directory **per unit** and joins each artifact set through rustc's own `.d` whose first rule names the artifact and whose inputs all lie inside the package's verified source root; a same-target workspace/path package resolves to its own root and is rejected, a duplicate `.d` claim on one stem makes the package ineligible, and a role whose join cannot be proven is not offered. (Revision 5 replaced the earlier one-directory rule, which wrongly rejected legitimate per-unit variants and the build-script case.) |
+| 1. The artifact whitelist did not prove which package produced a file | §4.2 classifies each `<literal package>-<hex>` directory **per unit** and joins each artifact set through rustc's own `.d` whose first rule names the artifact and whose inputs all lie inside the package's verified source root; a same-target workspace/path package resolves to its own root and is rejected, a duplicate `.d` claim on one stem makes the package ineligible, and a role whose join cannot be proven is not offered. (Revision 5 replaced the earlier one-directory rule, which wrongly rejected legitimate per-unit variants and the build-script case.) |
 | 2. The lock protocol did not retain the admission barrier | §6.3 and §7 define one `Store::seed` lock lifetime — recipient record → removable sibling barrier → store admission → donor record (non-blocking) → pool lock — held from candidate read through the final donor revalidation and released in reverse; the pure Cargo planner runs under those locks and never takes one; the post-return donor re-read is gone; a competing clean/admission/donor transition is fenced by locks 2–4. The `status --measure` claim is corrected to lock-free, and the pool-lock hold is stated as bounded in work, not wall time. |
 | 3. The SQLite oracle was vacuous for offered-run exclusion | §16.2 keeps the required SQLite case at its real scope and adds case 3: an eligible dependency-free git package with a build script whose compile unit must be offered, whose run payload and fingerprint must be absent from the plan, and whose runtime `OUT_DIR` must be the recipient's after donor removal, with a debug-only counterfactual that admits the run and must then print the donor's path. |
 | 4. The disk allocation omitted the recipient's rebuild | §16.4 now uses explicit phases with lifetimes: staging; SQLite donor **and** the recipient's own SQLite rebuild coexisting; then deletion of the proof's own private pool before the image phase. Phase B peak is corrected to about 290-445 MiB, and the time schedule is about 155-290 s, with a stop-and-report gate and a Supervisor bound return. |
@@ -351,13 +366,13 @@ Consequences, stated rather than hidden:
 
 | `6450220961` finding (revision 5) | Amendment |
 | --- | --- |
-| 1. The one-directory rule excluded legitimate per-unit variants | §4.2 replaces package-wide uniqueness with per-unit classification: several `<pkg>-<hex>` directories are legitimate (library, build script, feature variants); each must be one complete unit or an excluded run-only directory; artifacts are joined through the `.d` whose first rule names them and whose inputs are inside the verified source root; a mixed/unclassifiable directory is unusable and a duplicate `.d` claim makes the package ineligible. The `seedctl` build-script case is therefore achievable, and its native control asserts a two-directory package is offered. |
+| 1. The one-directory rule excluded legitimate per-unit variants | §4.2 replaces package-wide uniqueness with per-unit classification: several `<literal package>-<hex>` directories are legitimate (library, build script, feature variants); each must be one complete unit or an excluded run-only directory; artifacts are joined through the `.d` whose first rule names them and whose inputs are inside the verified source root; a mixed/unclassifiable directory is unusable and a duplicate `.d` claim makes the package ineligible. The `seedctl` build-script case is therefore achievable, and its native control asserts a two-directory package is offered. |
 | 2. The donor lock order was contradictory | §6.3/§7 now give one executable sequence: one admission lifetime (recipient record → sibling barrier → admission) spanning call 1 (`seed_candidates`, pool lock alone, read-only), the effect-free selection/reserve gate/markers, and call 2 (`seed`, donor record non-blocking → pool lock, held through the final check, released pool then donor). The catalog is re-read in call 2 and rejected if its generation, lease id or bytes changed. |
 | 3. The reserve gate depended on a plan that did not yet exist | Selection (step 4) produces the plan from call 1's catalogs before the gate; step 5 samples the gate only with a non-empty plan and only then writes `intent` and the untrusted origin. A command with no plan samples nothing and keeps today's behaviour; a positive plan with a below-trigger reading refuses before any child. |
 
 | `6450400975` finding (revision 6) | Amendment |
 | --- | --- |
-| 1. The `.d` join rejected ordinary pinned units | §4.2/§5.1 parse **every** rule (rustc writes the `.d`'s own rule first), accept `.rmeta` and `.rlib` emits and proc-macro `.dylib`/`.so`, and locate a build-script `.d` under `build/<pkg>-<hex>/`; the join is recorded at producing time and re-verified under the pin. Pure and native controls cover the ordinary shapes, so the `cfg-if` positive and the `seedctl` offered build-script unit are achievable. |
+| 1. The `.d` join rejected ordinary pinned units | §4.2/§5.1 parse **every** rule (rustc writes the `.d`'s own rule first), accept `.rmeta` and `.rlib` emits and proc-macro `.dylib`/`.so`, and locate a build-script `.d` under `build/<literal package>-<hex>/`; the join is recorded at producing time and re-verified under the pin. Pure and native controls cover the ordinary shapes, so the `cfg-if` positive and the `seedctl` offered build-script unit are achievable. |
 | 2. Selection read donor payload before the pin | §6.3 step 4 uses catalog data only (the recorded join), reads no donor payload, and the donation source re-verification reads the shared Cargo home; §6.3 step 6 performs every donor payload read under the donor record lock and pool lock, hashing each file and re-checking the `.d` rules against the recorded join. §7 states that call 1 reads control state only, and a native competing-`managed::lease` case proves an acquire/eviction between calls 1 and 2 aborts without reading or cloning. |
 | 3. Ambiguous-name visibility was missing from status | §9.2 adds bounded skip-count buckets to the summary, `last.json` and the recorded `oxide status` line (up to eight fixed tokens, `u32` counts), including a mixed successful-plus-ambiguous seed and a zero-skip control; no walk or reconciliation is added. |
 
@@ -365,6 +380,11 @@ Consequences, stated rather than hidden:
 | --- | --- |
 | 1. The package/target equality rule excluded the required positive | §4.2 now uses the normalized target name (`package_name.replace("-", "_")`), matching pinned Cargo's inferred lib naming and its rejection of a hyphenated explicit `[lib] name`; a genuinely renamed target stays ineligible, and uniqueness/collisions are evaluated after normalization across all source kinds. The `cfg-if` positive and the removable case are supported, and case 21 uses the valid `[lib] name = "cfg_if"` collision fixture. |
 | 2. The ambiguous-name unit count had no source | §4.2/§4.4 add a bounded generation-bound **rejection record** written while the producing lease is held: per excluded normalized name, its reason and the number of candidate compile units classifiable at producing time, or `units_unknown`. §9.2 reports those donor-side unit counts (never package counts, never from an unpinned catalog or the recipient allowlist) in the summary, `last.json` and the recorded status line, with an explicit unknown bucket; case 23 covers a mixed success-plus-ambiguous donor and the zero and unknown controls. |
+
+| `6450792089` finding (revision 8) | Amendment |
+| --- | --- |
+| 1. The fingerprint directory prefix used the normalized target name | §4.2/§5.1 and §10 now separate the **literal package-directory identity** (`.fingerprint/<literal package>-<hex>/`, `build/<literal package>-<hex>/`) from the **normalized target identity** (unit suffix `lib-<target>`, `dep-lib-<target>`, artifact stems `lib<target>-<hex>`), with the opaque `<16hex>` never predicted, normalization still the uniqueness/collision rule across all source kinds, and association restricted to the named role/layout cases. Pure grammar regression: `cfg-if-<hash>/lib-cfg_if` plus `foo-bar`/`foo_bar`; native cases 2 and 16 reconciled with that grammar. |
+| 2. Time arithmetic corrected | §16.4 now states the upper estimates sum to 265 s of the 300 s (lower about 133 s), leaving 35 s; the uncounted diagnostic remains required and fit remains UNMEASURED, with no counted-native implication. |
 
 ## 4. Unit provenance: the producing epoch and the donor catalog
 
@@ -419,10 +439,13 @@ measure in the separately scoped real-project comparison, not a claim here.
 The association rule for one package, applied on both sides independently:
 
 - its **normalized name** maps to exactly one lock entry across **all** source
-  kinds. Cargo normalizes an inferred library target as
-  `package_name.replace("-", "_")` (`cargo-1.97.1/c980f4866`
-  `src/cargo/util/toml/targets.rs:135-170`) and rejects an explicit `[lib]`
-  name containing a hyphen (`targets.rs:1055-1060`), so the design's name is
+  kinds; the literal package name of that entry supplies the fingerprint
+  directory prefix, while the normalized name supplies the unit suffix and
+  artifact stem (the two identities above). Cargo normalizes an inferred
+  library target as `package_name.replace("-", "_")`
+  (`cargo-1.97.1/c980f4866` `src/cargo/util/toml/targets.rs:135-170`) and
+  rejects an explicit `[lib]` name containing a hyphen
+  (`targets.rs:1055-1060`), so the design's name is
   `package_name.replace("-", "_")`, not the literal package name: `cfg-if`
   has target `cfg_if` and is supported. Uniqueness is applied after
   normalization, so `foo-bar` and `foo_bar` collide and both become
@@ -444,27 +467,48 @@ The association rule for one package, applied on both sides independently:
 - the donor and recipient lock entries agree on version and on
   source-plus-checksum (registry) or source-plus-full-revision (git).
 
-**Unit and file association (per-unit classification and the `.d` join).** Two
-facts must not be guessed: which package produced an artifact, and which
-fingerprint directory belongs to which unit. A file name alone proves
-neither — another package, including a workspace/path package, may declare a
-library target with the same name, and Cargo's output and fingerprint
-directory names are built from unit metadata with conditional fallbacks
-(pinned `cargo-1.97.1/c980f4866` `build_runner/compilation_files.rs`). The
-`<pkg>-<16hex>` fingerprint directory is **per unit**, not per package: a
-dependency with its own library and build script legitimately has several such
-directories, and so do ordinary feature/profile variants. The design
-classifies **per unit**, derives the artifact association from rustc's own
-dep-info *at producing time*, records it in the catalog, and lets Cargo's own
-component comparison decide freshness rather than predicting any hash.
+**Unit and file association (two identities, per-unit classification, `.d`
+join).** Three facts must not be guessed: which package produced an artifact,
+which fingerprint directory belongs to which unit, and which name form each
+Cargo path uses. A file name alone proves none of them — another package,
+including a workspace/path package, may declare a library target with the same
+name, and Cargo's output and fingerprint names are built from unit metadata
+with conditional fallbacks. Pinned `cargo-1.97.1/c980f4866` uses **two distinct
+identities**:
+
+- the **package-directory identity is the literal lock package name**, dashes
+  preserved: `compilation_files.rs:231-245,278-281` builds
+  `.fingerprint/<package>-<16hex>/` (so `cfg-if-<hash>` for `cfg-if`);
+- the **target identity is the normalized name** (`package_name.replace("-",
+  "_")`, `targets.rs:135-168`), used for the fingerprint unit suffix
+  (`lib-cfg_if`), the encoded `dep-lib-cfg_if` entry and the artifact stem
+  (`deps/libcfg_if-<hex>.rmeta`, `deps/cfg_if-<hex>.d`). An explicit `[lib]
+  name` must equal that normalized name; Cargo rejects a hyphen there.
+
+The `<16hex>` is Cargo's opaque unit metadata hash and is never predicted. The
+fingerprint directory is **per unit**, not per package: a dependency with its
+own library and build script legitimately has several such directories, and so
+do ordinary feature/profile variants. Normalization is used for **uniqueness
+and collisions** across all lock source kinds; when a normalized name resolves
+to exactly one package, that package's literal name is the only directory
+prefix accepted. The design classifies **per unit**, derives the artifact
+association from rustc's own dep-info *at producing time*, records it in the
+catalog, and lets Cargo's own component comparison decide freshness.
+
+**Supported role/layout restriction.** Cargo exposes unit-id and
+extra-filename choices separately, so the adapter accepts only the layouts it
+names: fingerprint directories directly under `<profile>/.fingerprint/`,
+artifacts under `<profile>/deps/`, and build-script units under
+`<profile>/build/<package>-<hex>/`. A unit-grouped build directory, a custom
+`--out-dir`, a custom extra-filename or any other layout skips the package —
+the grammar is not generalised.
 
 The rules, applied inside the slot's `<profile>/` when the producing lease is
 held:
 
-1. **Classify every `<pkg>-<16hex>` fingerprint directory by unit.** For the
-   eligible normalized name `<pkg>`, each candidate directory must be exactly
-   one
-   of:
+1. **Classify every `<package>-<16hex>` fingerprint directory by unit.** For
+   the eligible package's **literal** name `<package>`, each candidate
+   directory must be exactly one of:
    - **one complete unit** — the triple for a whitelisted role
      (`lib-<target>`, `.json`, `dep-lib-<target>` for a library or proc macro;
      `build-script-build`, `.json`, `dep-build-script-build` for a
@@ -489,15 +533,17 @@ held:
    `rustc_session/src/config.rs` and `rustc_interface/src/passes.rs`). The join
    therefore never looks at rule order. The dep-info file lives under the
    unit's own output directory: `deps/` for a library or proc-macro unit and
-   `build/<pkg>-<hex>/` for a build-script compile unit (Cargo's custom-build
-   units take that directory as `output_dir`). Its file name is rustc's
-   `<crate-or-target-stem>-<hex>.d` (for a build script, the target stem is
-   `build-script-build`). The rules:
+   `build/<package>-<hex>/` for a build-script compile unit (Cargo's
+   custom-build units take that directory as `output_dir`). Its file name is
+   rustc's `<target-stem>-<hex>.d` with the **normalized** target stem (for a
+   build script, the literal target stem `build-script-build`). The rules:
    - the set of rule **targets** must include exactly the `.d` file itself and
      at least one role artifact in the whitelist — `deps/lib<stem>-<hex>.rmeta`
      (the ordinary `metadata` emit), `deps/lib<stem>-<hex>.rlib`,
      `deps/lib<stem>-<hex>.{dylib,so}` for a proc macro, or
-     `build/<pkg>-<hex>/build-script-build` — and no target outside the slot;
+     `build/<package>-<hex>/build-script-build` — and no target outside the
+     slot; the stem is the normalized target identity, while the build-script
+     directory keeps the literal package name;
    - the union of rule **prerequisites** must be non-empty and **entirely**
      inside the package's verified source root (§4.3); a same-target
      workspace/path package resolves to its own checkout root and is rejected;
@@ -521,9 +567,11 @@ excluded lock entry (ambiguous normalized name, non-leaf, unsupported source,
 join unprovable, run-only, or beyond a cap) never becomes an offered unit, so
 selection cannot count it later from an unpinned catalog. The producing epoch
 therefore writes a bounded rejection record into the catalog, per excluded
-normalized name: the reason token and the number of **candidate compile units**
-it can classify for that name at producing time (the `<pkg>-<hex>` directories
-that hold a complete whitelisted-role triple). A package whose unit count
+package: its normalized name (for reporting), its literal name (for the
+directory grammar), the reason token and the number of **candidate compile
+units** it can classify for that package at producing time (the
+`<literal-package>-<16hex>` directories that hold a complete whitelisted-role
+triple). A package whose unit count
 cannot be classified is recorded with `units_unknown: true` rather than a
 zero, so an unknown is never reported as a count of zero. The counts are
 donor-side facts about this catalog; a recipient-side allowlist exclusion is a
@@ -648,7 +696,9 @@ Written while the producing lease is still held and before release, into
   value, target, recipe key, backend, adapter id, the §3.1 context digest and
   its absolute config-file list in precedence order, the flag digests, Cargo
   home, command family and command class;
-- per package: normalized name, version, source string, checksum or full
+- per package: literal lock name (the directory prefix) and normalized target
+  name (the unit suffix and artifact stem), version, source string, checksum
+  or full
   revision, uniqueness evidence for the donor lock (after normalization), the
   **leaf evidence** (the lock entry has no dependency edges, §3.2), source-root
   kind, and the **canonical source tree digest** verified at both ends of the
@@ -708,14 +758,18 @@ slot is evicted. Nothing reads a catalog of a generation it does not match.
 
 ### 5.1 Roles in v1
 
-The fingerprint directory is `<slot>/build/<profile>/.fingerprint/<pkg>-<16hex>/`
-and the artifacts live under `<slot>/build/<profile>/`. `<target_underscored>`
-is the target name with `-` replaced by `_`; `<hex>` is Cargo's opaque unit
-metadata hash, copied verbatim and never predicted.
+The fingerprint directory is
+`<slot>/build/<profile>/.fingerprint/<literal package>-<16hex>/` (dashes
+preserved, e.g. `cfg-if-<hash>`) and the artifacts live under
+`<slot>/build/<profile>/`. The unit suffix and artifact stem use the **normalized** target name
+(`cfg_if`), never the literal package name. `<target_underscored>` is that
+normalized target name; `<hex>` is Cargo's opaque unit metadata hash, copied
+verbatim and never predicted.
 
 Every offered unit requires its **join file**: rustc's dep-info in the unit's
 own output directory — `deps/<stem>-<hex>.d` for a library or proc macro and
-`build/<pkg>-<hex>/build-script-build.d` for a build-script compile unit. All
+`build/<literal package>-<hex>/build-script-build.d` for a build-script
+compile unit. All
 of its rules are parsed; rule order is irrelevant because rustc writes the
 `.d`'s own rule first (§4.2). The `.d` is required, not optional; a unit
 without a proven join is not offered.
@@ -724,8 +778,8 @@ without a proven join is not offered.
 | --- | --- | --- |
 | registry/git dependency library | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{rmeta,rlib}`, joined by `deps/<target_underscored>-<hex>.d` |
 | proc macro | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{dylib,so}`, joined by `deps/<target_underscored>-<hex>.d`. A `.dSYM` bundle is **excluded** |
-| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | `build/<pkg>-<hex>/build-script-build`, joined by `build/<pkg>-<hex>/build-script-build.d`; if that join cannot be proven the role is simply not offered (its run is excluded anyway) |
-| build-script **run** unit and its output | **excluded entirely** | `run-build-script-build-script-build*`, `dep-run-build-script-build-script-build`, `build/<pkg>-<hex>/{output,root-output,stderr}`, `build/<pkg>-<hex>/out/**`, `invoked.timestamp` |
+| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | `build/<literal package>-<hex>/build-script-build`, joined by `build/<literal package>-<hex>/build-script-build.d`; if that join cannot be proven the role is simply not offered (its run is excluded anyway) |
+| build-script **run** unit and its output | **excluded entirely** | `run-build-script-build-script-build*`, `dep-run-build-script-build-script-build`, `build/<literal package>-<hex>/{output,root-output,stderr}`, `build/<literal package>-<hex>/out/**`, `invoked.timestamp` |
 | workspace/path package units | **excluded** | never classified |
 | final outputs, uplifted binaries, test/bench executables | **excluded** | live in the checkout `target/` or are final uplifts |
 | `incremental/**` | **excluded** | |
@@ -1251,9 +1305,12 @@ verifies (`workflow.md#cargo-version-matrix`):
 - adapter id `cargo-1.97.1/c980f4866/build-dir-v1`;
 - assumptions, all pinned-source or fixture-checked: `CARGO_BUILD_BUILD_DIR`
   is the slot's `build/`, Cargo creates `<profile>/` beneath it, fingerprints
-  live in `<profile>/.fingerprint/<pkg>-<hex>/` with the three-entry unit
-  manifest of §5.1, artifacts in `<profile>/deps/`, build scripts in
-  `<profile>/build/<pkg>-<hex>/`, the profile directory name is Cargo's, and
+  live in `<profile>/.fingerprint/<literal package>-<hex>/` with the
+  three-entry unit manifest of §5.1 whose suffix and artifact stem use the
+  **normalized** target name, and only the §4.2 role/layout cases are
+  accepted, artifacts in `<profile>/deps/`, build scripts in
+  `<profile>/build/<literal package>-<hex>/`, the profile directory name is
+  Cargo's, and
   uplift copies finals to `CARGO_TARGET_DIR`;
 - **manifest qualification is a precondition, not an assumption.** Before any
   seeding is enabled, the implementation must confirm, against a real 1.97.1
@@ -1495,14 +1552,15 @@ triple (hash, `.json`, `dep-…`) with every negative (missing `dep-…`, an ext
 archive-reader source-verification-cache identity controls (unchanged
 identity hits without re-reading, a changed size/mtime/inode/device forces a
 re-derivation, and an untrackable identity skips);
-**per-unit classification**: several `<pkg>-<hex>` directories for one package
+**per-unit classification**: several `<literal package>-<hex>` directories for one package
 (role variants) are all offered; a run-only directory is classified, never
 copied, and does not block the package; a mixed-unit directory or an
 unclassifiable entry makes that directory unusable; **artifact join, all rules
 parsed**: a `.d` whose first rule is the `.d` itself (the ordinary rustc shape)
 still joins through its later artifact rule; `--emit=dep-info,metadata`
 (`.rmeta`) and `link` (`.rlib`) both join; a proc-macro `.dylib`; a
-build-script `.d` under `build/<pkg>-<hex>/`; conflicts — two `.d` files
+build-script `.d` under `build/<literal package>-<hex>/`; conflicts — two `.d`
+files
 claiming one artifact, prerequisites outside the verified source root or empty,
 a target outside the slot, a `.d` whose recorded join record no longer matches;
 a workspace/path package with a renamed equal-named lib target and a
@@ -1518,8 +1576,11 @@ submodule, unreadable) and the **exact argv/environment** of every git call
 `core.fsmonitor=false`, `-C` only, cleared `GIT_DIR`/`GIT_WORK_TREE`/
 `GIT_INDEX_FILE`/`GIT_CONFIG_*`) plus a fake-git control that would run a
 configured fsmonitor hook and a bounded-budget exhaustion refusal;
-**normalization and rejections**: a hyphenated package (`cfg-if`) infers target
-`cfg_if` and is offered; an explicit hyphenated `[lib] name` is unsupported;
+**name grammar**: a hyphenated package is offered from
+`.fingerprint/cfg-if-<hash>/lib-cfg_if` while the artifact stem is `libcfg_if`
+and the dep-info is `cfg_if-<hash>.d` (literal directory, normalized target);
+a package whose literal name carries an underscore is unaffected; a
+literal-name directory with a normalized-name suffix mismatch is not joined; an explicit hyphenated `[lib] name` is unsupported;
 `foo-bar` and `foo_bar` collide after normalization and both become ineligible;
 a genuinely renamed lib target is ineligible; the rejection record's
 candidate-unit counts and `units_unknown`; the §3.1 context digest with a
@@ -1566,8 +1627,10 @@ the selected-volume rule.
    exclusion of an offered run unit; the proof receipt says so, and case 3
    supplies the non-vacuous exclusion oracle;
 2. **leaf registry positive and complete manifest.** A small registry leaf
-   (`cfg-if`, no dependency edges, normalized target `cfg_if`) is offered with
-   its full triple
+   (`cfg-if`, no dependency edges) is offered from its **literal-name**
+   directory `.fingerprint/cfg-if-<hash>/` with the **normalized** unit suffix
+   and artifacts (`lib-cfg_if`, `dep-lib-cfg_if`, `deps/libcfg_if-<hex>.rmeta`
+   or `.rlib`, `deps/cfg_if-<hex>.d`), i.e. its full triple
    (hash/`.json`/`dep-…`) plus artifacts; two checkouts share one lock and
    Cargo home, the second leases a new slot that is seeded, and Cargo reports
    the offered dependency unit fresh (`--message-format` is caller-supplied by
@@ -1579,7 +1642,7 @@ the selected-volume rule.
    into `OUT_DIR` and emits `cargo:rustc-env=SEEDCTL_OUT_DIR=<OUT_DIR>`, where
    the generated source embeds that same absolute path. This case also exercises
    the ordinary rustc dep-info shape (the `.d`'s own rule first, the artifact
-   rule later) and the build-script `.d` under `build/<pkg>-<hex>/`. The receipt
+   rule later) and the build-script `.d` under `build/<literal package>-<hex>/`. The receipt
    must list the package's **build-script compile** unit as offered while the
    plan contains no `output`, `root-output`, `out/**` or run fingerprint; the
    recipient's run unit reruns, the crate recompiles, and the program prints
@@ -1627,7 +1690,8 @@ the selected-volume rule.
     control bytes are identical before and after a seed, and its rank, use mark
     and recorded figure are unchanged;
 16. removable path: one owned 128 MiB APFS image (`hdiutil attach -owners on`)
-    registered as a removable pool seeds a tiny `cfg-if` workspace across two
+    registered as a removable pool seeds a tiny `cfg-if` workspace (literal
+    directory `cfg-if-<hash>`, normalized unit `lib-cfg_if`) across two
     of its slots and detaches ordinarily, proving the same-volume predicate and
     that the recipient's bytes are on the image;
 17. registry tamper controls: the cached `.crate` replaced with a different
@@ -1767,12 +1831,13 @@ names the measured analogue or the work performed):
 | 23 ambiguous-name visibility | 2-4 s | one tiny build plus summary/status rendering |
 | cleanup, receipts and the phase table inside the guard | 5-10 s | bounded writes and one detach |
 
-The total is about 130-255 s, with a worst case near 260 s when every case runs
-at its upper estimate. That is inside the 300 s bound with a margin of about
-40 s, so
-the design states it as a plausible accounting, not a demonstrated fit: the
-script prints the phase and case tables, and if the first diagnostic's
-projection or measurement exceeds 275 s it **stops and reports**. If the
+The upper estimates sum to **265 s of the 300 s bound** (the lower estimates to
+about 133 s), leaving 35 s at the top of the range. That is the arithmetic of a
+plausible accounting, **not** a demonstrated fit: the script prints the phase
+and case tables, and if the first required uncounted **diagnostic** run's
+projection or measurement exceeds 275 s it **stops and reports**. The
+diagnostic remains mandatory and fit remains UNMEASURED; no counted native is
+implied. If the
 required SQLite and offered-run cases cannot fit even so, the conflict returns
 to the Supervisor for a scoped bound amendment before freeze; this design does
 not substitute a cheaper fixture and does not treat the separate real-project
@@ -1785,14 +1850,14 @@ comparison as the proof.
    narrowed — or does the Supervisor want the broader dependency graph, which
    would need the deferred artifact-JSON/unit-graph capture plus a reviewed
    proc-macro input-tracking mechanism?
-2. Is the §4.2 normalized-name rule accepted — supported target is
-   `package_name.replace("-", "_")`, an explicit hyphenated `[lib] name` is
-   unsupported, a genuine rename is ineligible, and uniqueness/collisions are
-   evaluated after normalization across all source kinds — and does the
-   origin-side **rejection record** (candidate-unit counts or `units_unknown`)
-   satisfy binding `bb151a59`'s ambiguous-name reporting as donor-side units
-   rather than package counts?
-3. Is the §4.2 per-unit association accepted — each `<pkg>-<hex>` directory
+2. Is the §4.2 **two-identity** rule accepted — the fingerprint package
+   directory uses the literal lock name (`.fingerprint/cfg-if-<hash>/`) while
+   the unit suffix and artifact stem use the normalized target
+   (`lib-cfg_if`), normalization is the uniqueness/collision rule across all
+   source kinds, the association is restricted to the named role/layout
+   cases, and the rejection record reports donor-side candidate-unit counts
+   (or `units_unknown`) rather than package counts?
+3. Is the §4.2 per-unit association accepted — each `<literal package>-<hex>` directory
    classified as one unit or a run-only directory (variants offered, run
    payload never copied); each artifact set joined by parsing **all** rules of
    the unit's dep-info in its own output directory (the `.d`'s own rule first,
@@ -1828,9 +1893,10 @@ comparison as the proof.
 10. Is the §9.2 bounded skip-count reporting accepted as satisfying binding
    `bb151a59`'s ambiguous-name visibility for both the summary and `oxide
    status`, without adding a walk or reconciliation?
-11. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, time
-   about 130-260 s of 300 s, with the required SQLite and offered-run cases
-   retained) make the bound plausible, or should the conflict go to the
+11. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, and
+   upper time estimates summing to 265 s of the 300 s with the required SQLite
+   and offered-run cases retained) leave enough room for an unmeasured fit
+   whose diagnostic is still mandatory, or should the conflict go to the
    Supervisor before freeze?
 12. Is the D-4 interface in §11 the intended reading — seeding cannot help
     while the only donor is the session's held slot — or should a scoped
@@ -1852,7 +1918,9 @@ comparison as the proof.
   cost of an adapter mistake is an inert donor, never a wrong clone.
 - Supported target names are Cargo's normalized inferred names only; a package
   that genuinely renames its lib target is ineligible in v1 rather than mapped
-  by a second grammar.
+  by a second grammar. The literal package name and the normalized target are
+  separate identities (§4.2); the adapter does not assume every hash suffix
+  corresponds to both.
 - Skip counts are donor-side catalog facts. They describe what the producing
   epoch rejected while it held the lease; they are not a recipient-side
   allowlist measurement and they never imply donor reach.
