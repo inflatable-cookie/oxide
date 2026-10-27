@@ -21,6 +21,12 @@ pub mod owned_delete;
 #[cfg(debug_assertions)]
 pub mod proof;
 
+/// Bounded source verification for cold-slot seeding: the registry archive
+/// reader, the canonical tree digest, the verification cache and the git
+/// adapter (oxide#166, slice 1).
+#[cfg(unix)]
+pub mod seed_source;
+
 /// Bounded decoder for Cargo's encoded dep-info, kept as input for the
 /// cross-checkout freshness gate.
 pub mod dep_info;

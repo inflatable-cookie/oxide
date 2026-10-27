@@ -7,11 +7,20 @@ publish = false
 
 [dependencies]
 basic-toml = "=0.1.10"
+# Cold-slot seeding source verification (oxide#166): a pinned archive reader
+# for registry `.crate` files. `flate2` uses its pure-Rust backend and `tar` is
+# used only for decompression and entry iteration; neither is fetched, run as
+# a process, or configured at runtime. The lock adds exactly these registry
+# packages, which the shared bounded offline seeder derives from `Cargo.lock`
+# in the one supported crates.io sparse namespace: flate2, miniz_oxide,
+# adler2, simd-adler32, crc32fast, tar and filetime (cfg-if and libc already).
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 libc = "=0.2.190"
 longhorn-storage-layout = { git = "https://github.com/inflatable-cookie/longhorn.git", tag = "v0.4.1" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
+tar = { version = "=0.4.46", default-features = false }
 
 [[bin]]
 name = "oxide-storage-inventory"
