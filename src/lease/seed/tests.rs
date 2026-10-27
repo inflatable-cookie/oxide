@@ -6,8 +6,8 @@
 //! temp and removes it.
 
 use super::super::pool::{
-    create_injected, lease_injected, mark_evicting_for_test, release_injected, slot_state_injected,
-    tamper_idle_generations_injected,
+    create_injected, lease_injected, mark_evicting_for_test, release_injected,
+    rewrite_removable_backend_injected, slot_state_injected, tamper_idle_generations_injected,
 };
 use super::super::{
     LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, BUDGET_BACKEND_DIRECTORY_V1,
@@ -1033,15 +1033,83 @@ fn seed_skips_a_catalog_whose_record_is_not_the_donor_slots_affinity() {
 #[test]
 fn this_slice_never_writes_a_removable_payload() {
     reset_hooks();
-    // The gate is the pool's recorded backend. A removable pool cannot be
-    // opened in a fixture without a real mounted volume, so the live branch is
-    // checked through the same predicate the seeding calls read.
     assert!(internal_backend(BUDGET_BACKEND_DIRECTORY_V1));
     assert!(!internal_backend(VOLUME_BACKEND_APFS_V1));
     assert_eq!(
         SeedSkipReason::RemovablePoolUnsupported.as_str(),
         "seeding not yet supported on a removable pool"
     );
+}
+
+#[test]
+fn a_removable_pool_is_skipped_before_any_payload_access() {
+    reset_hooks();
+    let rig = Rig::new("removable-gate");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    // A second producing lease, still held, so the internal sidecar write can
+    // also be exercised on the same pool.
+    let record_id = rig.next_record_id();
+    let held = rig.lease_at("donor-b", "donor", rig.affinity_dir(record_id));
+    let files = default_files();
+    write_files(&held.env.cargo_build_build_dir, &files);
+    let held_catalog = catalog_for(&held, record_id, &files);
+
+    // Record the pool as a removable volume whose mount point does not exist:
+    // any attempt to open or probe its payload would fail here.
+    let absent_mount = rig.fx.path.join("absent-volume");
+    rewrite_removable_backend_injected(&rig.pool, &absent_mount).expect("rewrite backend");
+
+    // Call 1 answers from the ledger alone: no candidate, no volume access.
+    assert!(candidates(&rig, &recipient).candidates.is_empty());
+    // Call 2 is the fail-closed skip with the reported reason; the normal cold
+    // build follows.
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::RemovablePoolUnsupported
+        })
+    );
+    // The catalog sidecar is internal, so publishing still works with no
+    // volume present.
+    publish_seed_catalog(&rig.pool, &held_catalog).expect("publish catalog");
+    assert!(!absent_mount.exists(), "no mount point was created");
+    // Nothing was cloned anywhere.
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+}
+
+#[test]
+fn seed_refuses_an_unestablishable_donor_path_instead_of_skipping() {
+    reset_hooks();
+    let rig = Rig::new("donor-path-symlink");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    // Replace the donor artifact with a symlink: the path no longer names an
+    // owned regular file, which is a refusal, never a cold skip.
+    let artifact = donor.grant.env.cargo_build_build_dir.join(ARTIFACT);
+    fs::remove_file(&artifact).expect("remove donor artifact");
+    symlink(donor.grant.env.cargo_build_build_dir.join(DEP), &artifact).expect("symlink artifact");
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+
+    // A missing donor file stays the payload-change skip.
+    let donor = make_donor(&rig, "b");
+    let (grant, recipient) = lease_recipient(&rig, "b");
+    fs::remove_file(donor.grant.env.cargo_build_build_dir.join(ARTIFACT))
+        .expect("remove donor artifact");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert_eq!(
+        outcome,
+        SeedOutcome::Skipped(SeedSkip {
+            reason: SeedSkipReason::FileChanged
+        })
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
 }
 
 #[test]

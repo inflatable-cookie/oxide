@@ -27,7 +27,9 @@
 //!   overlap, a cap, a changed catalog or file, a directory-creation fault, a
 //!   first clone that fails to be created or the cooperative deadline is a
 //!   **skip**: no clone exists, the attempt is abandoned and the caller builds
-//!   cold in the same slot. (`SeedSkip`.)
+//!   cold in the same slot. (`SeedSkip`.) A donor path that is not an owned
+//!   no-follow entry on the pool's device is not a skip: unknown ownership,
+//!   a device mismatch or a link where a real entry belongs **refuses**.
 //! - **After it, a failed recipient walk** abandons seeding only: nothing is
 //!   published, the clone is retained untrusted, and the caller releases the
 //!   slot and cold-builds under ordinary admission. (`SeedAbandon`.)
@@ -46,8 +48,11 @@
 //! Supervisor ruling at PR #159 head `394c0c6`), so until then [`seed`] skips
 //! such a pool with the reason "seeding not yet supported on a removable pool"
 //! and [`seed_candidates`] offers no candidate from one. The command takes the
-//! normal cold build and no removable payload is read or written on these
-//! paths. The frozen eventual behaviour is unchanged by that reassignment.
+//! normal cold build. The custody seam describes a removable pool from its
+//! config and ledger alone and opens no payload for it, so the gate runs
+//! **before any payload or volume access**: no removable payload is read or
+//! written on these paths. The frozen eventual behaviour is unchanged by that
+//! reassignment.
 //!
 //! The donor predicate of §7 has two halves and both are checked here. The
 //! ledger half is state `Idle`, no lease, the catalog's lease as
@@ -90,7 +95,7 @@ pub use catalog::{
 pub use join::{JoinRefusal, ParsedJoin};
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
-use super::pool::{Pool, SeedPoolView, SeedSlotView};
+use super::pool::{open_seed, SeedPoolView, SeedSlotView};
 use super::{
     current_uid, ensure_private_dir, io_error, random_hex, LeaseError, MANAGED_NAME,
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
@@ -333,8 +338,8 @@ pub fn seed_candidates(
     max_candidates: usize,
 ) -> Result<SeedCandidates, LeaseError> {
     validate_recipient(recipient)?;
-    let opened = Pool::open_seed(pool)?;
-    let view = opened.seed_view();
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
     let held = view
         .slot(&recipient.slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
@@ -428,13 +433,17 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     };
     // The non-reconciling open: a recorded `Evicting` slot is never finished,
     // deleted or mutated by a seed.
-    let opened = Pool::open_seed(pool)?;
-    let view = opened.seed_view();
-    // No removable-media write in this slice: an `apfs-volume-v1` payload is
-    // the Elevated path and needs its own tier and native evidence.
+    // The seam opens no removable payload: the backend alone decides the gate,
+    // before any payload or volume access.
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
     if !internal_backend(&view.backend) {
         return Ok(skip(SeedSkipReason::RemovablePoolUnsupported));
     }
+    let payload_root = view
+        .payload_root
+        .as_deref()
+        .ok_or(LeaseError::BackingMismatch)?;
     let recipient = view
         .slot(&request.recipient.slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
@@ -482,20 +491,13 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         DonorControl::Busy => return Ok(skip(SeedSkipReason::DonorBusy)),
         DonorControl::Unknown => return Ok(skip(SeedSkipReason::DonorCustodyUnknown)),
     }
-    // The volume binding is re-verified before any payload read and again
-    // before the final publication decision: a lost or re-mounted volume is
-    // unknown custody, which refuses rather than cold-builds.
-    opened.seed_verify_backing()?;
-    let payload_device = fs::symlink_metadata(&view.payload_root)
-        .map_err(io_error)?
-        .dev();
+    let payload_device = fs::symlink_metadata(payload_root).map_err(io_error)?.dev();
     // Every slot directory is opened one no-follow step at a time beneath the
     // verified payload root, so a project folder (or the slots root) replaced
     // by a symlink is refused rather than followed to another directory.
     // The returned path is for messages; the descriptor is the custody.
-    let (donor_fd, _donor_slot_path) = open_slot_dirs(&view.payload_root, payload_device, donor)?;
-    let (recipient_fd, recipient_slot) =
-        open_slot_dirs(&view.payload_root, payload_device, recipient)?;
+    let (donor_fd, _donor_slot_path) = open_slot_dirs(payload_root, payload_device, donor)?;
+    let (recipient_fd, recipient_slot) = open_slot_dirs(payload_root, payload_device, recipient)?;
     // The recipient is this command's fresh slot: its `build/` is absent or
     // an empty owned directory. Anything else is refused, never cleaned.
     let recipient_build = open_recipient_build(recipient_fd.as_fd(), payload_device)?;
@@ -527,6 +529,10 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         let opened_file = match open_relative_file(donor_build.as_fd(), &file.path, payload_device)
         {
             Ok(opened_file) => opened_file,
+            // Unknown ownership, a device mismatch or a link where a real
+            // entry belongs is a safety fault: refuse, never a cold fallback
+            // (§13). A missing or unreadable entry stays a payload change.
+            Err(error @ LeaseError::UnsafePath(_)) => return Err(error),
             Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
         };
         if opened_file.metadata.st_size.max(0) as u64 != file.size {
@@ -704,11 +710,10 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     // Final donor recheck: the ledger still names the planned generation for
     // both the donor and the recipient.
     test_point(TestPoint::BeforeFinalDonorCheck { pool });
-    opened.seed_verify_backing()?;
-    if !opened.seed_donor_unchanged(donor)? {
+    if !opened.donor_unchanged(donor)? {
         return Err(LeaseError::UnknownAccounting);
     }
-    if !opened.seed_recipient_held(recipient)? {
+    if !opened.recipient_held(recipient)? {
         return Err(LeaseError::UnknownAccounting);
     }
     // The post-clone recipient walk, before any caller proceeds (§6.3 step 7).
@@ -756,8 +761,8 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
 /// catalog is not written.
 pub fn publish_seed_catalog(pool: &Path, catalog: &SeedCatalog) -> Result<(), LeaseError> {
     let bytes = catalog.to_bytes().map_err(LeaseError::InvalidInput)?;
-    let opened = Pool::open_seed(pool)?;
-    let view = opened.seed_view();
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
     let slot = view
         .slot(&catalog.slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
@@ -777,7 +782,7 @@ pub fn publish_seed_catalog(pool: &Path, catalog: &SeedCatalog) -> Result<(), Le
     ensure_private_dir(&managed)?;
     let dir = managed.join(SEEDS_DIR);
     ensure_private_dir(&dir)?;
-    remove_orphan_sidecars(&dir, &view)?;
+    remove_orphan_sidecars(&dir, view)?;
     enforce_family_bytes(&dir, bytes.len() as u64, &catalog.slot_id)?;
     write_sidecar(
         &dir.join(format!("{}{CATALOG_SUFFIX}", catalog.slot_id)),
@@ -1441,7 +1446,7 @@ fn open_relative_file(
             Some(fd) => fd.as_fd(),
             None => root,
         };
-        let next = open_directory_at(parent_fd, &cstring(component)?).map_err(io_error)?;
+        let next = open_directory_at(parent_fd, &cstring(component)?).map_err(donor_path_error)?;
         deepest = Some(require_owned_directory(next, device)?);
     }
     let directory = match deepest.as_ref() {
@@ -1449,7 +1454,7 @@ fn open_relative_file(
         None => root,
     };
     let name = cstring(name)?;
-    let fd = walk::open_regular(&directory, &name).map_err(io_error)?;
+    let fd = walk::open_regular(&directory, &name).map_err(donor_path_error)?;
     let metadata = fstat(fd.as_fd()).map_err(io_error)?;
     if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
         || metadata.st_uid != current_uid()
@@ -1460,6 +1465,18 @@ fn open_relative_file(
         ));
     }
     Ok(OpenedFile { fd, metadata })
+}
+
+/// A donor path that cannot be established as an owned, no-follow entry is a
+/// refusal (unknown ownership is not a cold fallback); a missing or unreadable
+/// entry stays a payload change the caller may skip before the first write.
+fn donor_path_error(error: std::io::Error) -> LeaseError {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => LeaseError::UnsafePath(
+            "a donor path is not an owned no-follow entry on the pool's device",
+        ),
+        _ => io_error(error),
+    }
 }
 
 fn split_relative(relative: &str) -> (Vec<&str>, &str) {
