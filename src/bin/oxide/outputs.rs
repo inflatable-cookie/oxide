@@ -7487,14 +7487,34 @@ fn read_receipt_with(
     checkout: &Path,
     checkout_id: &str,
 ) -> Result<Option<Receipt>, String> {
+    read_receipt_with_budget(legacy, control, checkout, checkout_id, None)
+}
+
+/// Charge actual receipt bytes to a caller's aggregate snapshot budget.
+/// A one-byte probe detects the per-file limit only when it fits inside the
+/// aggregate allowance. Exhausting that allowance never yields authority.
+fn read_receipt_with_budget(
+    legacy: LegacyReceiptReading,
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    mut budget: Option<&mut u64>,
+) -> Result<Option<Receipt>, String> {
     let path = receipt_path(control, checkout_id);
     let Some(file) = store::private_file(&path, false)? else {
         return Ok(None);
     };
+    let allowance = budget.as_deref().copied().unwrap_or(u64::MAX);
+    let read_limit = (MAX_RECEIPT_BYTES + 1).min(allowance);
     let mut bytes = Vec::new();
-    file.take(MAX_RECEIPT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let read = file.take(read_limit).read_to_end(&mut bytes);
+    if let Some(remaining) = budget.as_deref_mut() {
+        *remaining = remaining.saturating_sub(bytes.len() as u64);
+    }
+    read.map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if allowance <= MAX_RECEIPT_BYTES && bytes.len() as u64 == allowance {
+        return Err("the snapshot exceeded its byte budget".to_owned());
+    }
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_RECEIPT_BYTES}-byte limit",
@@ -7574,6 +7594,22 @@ pub(crate) fn read_receipt_for_prune(
     checkout_id: &str,
 ) -> Result<Option<Receipt>, String> {
     read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)
+}
+
+/// Read a prune receipt within the aggregate authority snapshot budget.
+pub(crate) fn read_receipt_for_prune_budgeted(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    budget: &mut u64,
+) -> Result<Option<Receipt>, String> {
+    read_receipt_with_budget(
+        LegacyReceiptReading::Read,
+        control,
+        checkout,
+        checkout_id,
+        Some(budget),
+    )
 }
 
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.

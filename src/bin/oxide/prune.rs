@@ -2104,7 +2104,9 @@ fn evaluate(
     let mut snapshot_error: Option<String> = None;
     for row in rows {
         let entry = receipts.entry(row.checkout_id.clone()).or_insert_with(|| {
-            match outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id) {
+            match outputs::read_receipt_for_prune_budgeted(
+                control, &row.checkout, &row.checkout_id, &mut budget,
+            ) {
                 Ok(Some(receipt)) => Ok(receipt),
                 Ok(None) => Err(format!(
                     "the receipt {} is missing",
@@ -2163,7 +2165,6 @@ fn evaluate(
                 if facts.legacy {
                     out.legacy = true;
                 }
-                let (logical, allocated, complete) = account_root(&row.root);
                 out.candidate = Some(Candidate {
                     checkout_id: row.checkout_id.clone(),
                     checkout: row.checkout.clone(),
@@ -2178,9 +2179,9 @@ fn evaluate(
                     dev: facts.dev,
                     ino: facts.ino,
                     marker_digest: facts.marker_digest,
-                    logical_bytes: logical,
-                    allocated_bytes: allocated,
-                    accounting_complete: complete,
+                    logical_bytes: 0,
+                    allocated_bytes: 0,
+                    accounting_complete: false,
                     receiptless: false,
                 });
             }
@@ -2209,6 +2210,30 @@ fn evaluate(
             evaluated.push(entry);
         }
     }
+    if Instant::now() > deadline {
+        snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
+    }
+    // A representative row is not the transaction authority. Verify every
+    // group's selected references against the already-read checkout receipt.
+    for entry in &evaluated {
+        if let Some(candidate) = &entry.candidate {
+            if candidate.receiptless {
+                continue;
+            }
+            let verified = verified_group(registry, candidate).and_then(|group| {
+                let receipt = receipts.get(&candidate.checkout_id)
+                    .and_then(|result| result.as_ref().ok())
+                    .ok_or_else(|| "the checkout receipt is unavailable".to_owned())?;
+                verify_group_against_receipt(receipt, &candidate.root, &group)
+            });
+            if let Err(reason) = verified {
+                snapshot_error.get_or_insert(reason);
+            }
+        }
+    }
+    if Instant::now() > deadline {
+        snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
+    }
     if let Some(reason) = snapshot_error {
         for entry in &mut evaluated {
             entry.candidate = None;
@@ -2235,6 +2260,7 @@ fn evaluate(
             entry.candidate = None;
         }
     }
+    account_candidates(&mut evaluated);
     Ok(evaluated)
 }
 
@@ -2975,20 +3001,28 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
     }))
 }
 
-fn account_root(root: &Path) -> (u64, u64, bool) {
-    let limits = InventoryLimits {
-        max_entries: OBSERVATION_ENTRIES,
-        max_depth: 64,
-        max_output_bytes: 4096,
-        max_elapsed_ms: OBSERVATION_MS,
-    };
-    match inventory::inventory_directory(root, limits) {
-        Ok(report) => (
-            report.total.logical_bytes_by_name,
-            report.total.allocated_bytes,
-            report.coverage.complete,
-        ),
-        Err(_) => (0, 0, false),
+fn account_candidates(evaluated: &mut [Evaluated]) {
+    let deadline = Instant::now() + Duration::from_millis(OBSERVATION_MS);
+    let mut remaining = OBSERVATION_ENTRIES;
+    for candidate in evaluated.iter_mut().filter_map(|entry| entry.candidate.as_mut()) {
+        let now = Instant::now();
+        if remaining == 0 || now >= deadline {
+            break;
+        }
+        let limits = InventoryLimits {
+            max_entries: remaining,
+            max_depth: 64,
+            max_output_bytes: 4096,
+            max_elapsed_ms: deadline.duration_since(now).as_millis().try_into().unwrap_or(u64::MAX),
+        };
+        let Ok(report) = inventory::inventory_directory(&candidate.root, limits) else {
+            // Consumption is unknown on error, so no further walk is safe.
+            break;
+        };
+        remaining = remaining.saturating_sub(report.entries_visited);
+        candidate.logical_bytes = report.total.logical_bytes_by_name;
+        candidate.allocated_bytes = report.total.allocated_bytes;
+        candidate.accounting_complete = report.coverage.complete && Instant::now() <= deadline;
     }
 }
 
@@ -4545,6 +4579,14 @@ fn verify_group_receipt(
 ) -> Result<(), String> {
     let receipt = outputs::read_receipt_for_prune(control, checkout, checkout_id)?
         .ok_or_else(|| "the checkout's receipt disappeared".to_owned())?;
+    verify_group_against_receipt(&receipt, root, group)
+}
+
+fn verify_group_against_receipt(
+    receipt: &Receipt,
+    root: &Path,
+    group: &[GroupRow],
+) -> Result<(), String> {
     if receipt.prepared_ref().is_some() {
         return Err("the checkout receipt has a pending transition".to_owned());
     }
@@ -5507,7 +5549,6 @@ fn receiptless_candidate(
         RootState::Absent => return Err("the listed root is already absent".to_owned()),
         RootState::Unknown(reason) => return Err(reason),
     };
-    let (logical, allocated, complete) = account_root(root);
     Ok(Candidate {
         checkout_id: row.checkout_id.clone(),
         checkout: row.checkout.clone(),
@@ -5522,9 +5563,9 @@ fn receiptless_candidate(
         dev: facts.dev,
         ino: facts.ino,
         marker_digest: facts.marker_digest,
-        logical_bytes: logical,
-        allocated_bytes: allocated,
-        accounting_complete: complete,
+        logical_bytes: 0,
+        allocated_bytes: 0,
+        accounting_complete: false,
         receiptless: true,
     })
 }
