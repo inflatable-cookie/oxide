@@ -1690,9 +1690,9 @@ impl<'a> IntoIterator for &'a Evaluation {
 
 /// `oxide outputs prune --dry-run`
 fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
+    let authority = AuthorityScope::begin()?;
     let store = paired_store()?;
     let control = store.owner_control().to_path_buf();
-    let authority = AuthorityScope::begin()?;
     let list = match operator_list {
         Some(path) => Some(read_operator_list(path)?),
         None => None,
@@ -1844,34 +1844,34 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             "oxide: prune rolled back {rolled_back} journaled intent(s) that had no filesystem effect; their roots are re-evaluated"
         );
     }
-    if !completed_roots.is_empty() || rolled_back > 0 {
-        registry = match ready_registry(&control) {
-            Ok(registry) => registry,
-            Err(reason) => {
-                return Ok(unsettled(
-                    &control,
-                    &format!(
-                        "a replayed intent settled but the registry became unreadable afterwards ({reason})"
-                    ),
-                ))
-            }
-        };
-    }
     // Start one fresh authority window after any exact intent replay. The
     // registry and optional list are re-read inside that window.
     let authority = AuthorityScope::begin()?;
+    let fresh_store = paired_store()?;
+    if fresh_store.owner_control() != control {
+        return Ok(refused("the internal pool changed during revalidation"));
+    }
+    let store = fresh_store;
     registry = match ready_registry(&control) {
         Ok(registry) => registry,
         Err(reason) if !completed_roots.is_empty() => {
             return Ok(partial(&completed_roots, &format!("the fresh registry failed ({reason})")));
         }
+        Err(reason) if rolled_back > 0 => {
+            return Ok(unsettled(&control, &format!("a replayed intent settled but the registry became unreadable afterwards ({reason})")));
+        }
         Err(reason) => return Ok(refused(&reason)),
     };
     let fresh_list = match operator_list {
         Some(path) => {
-            let fresh = read_operator_list(path)?;
+            let fresh = match read_operator_list(path) {
+                Ok(fresh) => fresh,
+                Err(reason) if !completed_roots.is_empty() => return Ok(partial(&completed_roots, &reason)),
+                Err(reason) => return Ok(refused(&reason)),
+            };
             if list.as_ref().map(|old| &old.sha256) != Some(&fresh.sha256) {
-                return Ok(refused("the operator list changed during revalidation"));
+                let reason = "the operator list changed during revalidation";
+                return Ok(if completed_roots.is_empty() { refused(reason) } else { partial(&completed_roots, reason) });
             }
             Some(fresh)
         }
@@ -2354,13 +2354,50 @@ fn evaluate(
     if !authority.complete() {
         snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
     }
+    // Every current receipt reference must be represented exactly once in
+    // the registry; checking only groups discovered there misses omissions.
+    for (checkout_id, result) in &receipts {
+        let Ok(receipt) = result else { continue };
+        if receipt.prepared_ref().is_some() {
+            continue;
+        }
+        for placement in receipt.links() {
+            let Some(selected) = placement.selected_ref() else { continue };
+            let matches: Vec<&Row> = registry.rows.iter().filter(|row| {
+                row.checkout_id == *checkout_id && row.selected
+                    && row.member == placement.member() && row.root == selected.root()
+            }).collect();
+            if matches.len() != 1 || matches[0].generation != selected.generation()
+                || matches[0].nonce.as_deref() != selected.nonce()
+            {
+                snapshot_error.get_or_insert_with(|| "a receipt reference is missing or contradictory in the registry".to_owned());
+            }
+        }
+    }
     // Verify selected receipt references for every complete group, including
     // ordinary kept roots. A representative is not full transaction authority.
     for entry in &evaluated {
         if entry.row.checkout_id.is_empty() || entry.candidate.as_ref().is_some_and(|c| c.receiptless) {
             continue;
         }
-        let group: Vec<GroupRow> = group_rows(registry, &entry.row.checkout_id, &entry.row.root)
+        let members = group_rows(registry, &entry.row.checkout_id, &entry.row.root);
+        let mut names = std::collections::HashSet::new();
+        if members.iter().any(|row| row.checkout != entry.row.checkout
+            || row.receipt != entry.row.receipt || !names.insert(&row.member))
+        {
+            snapshot_error.get_or_insert_with(|| "a root group has duplicate or contradictory references".to_owned());
+        }
+        let selected: Vec<&Row> = members.iter().copied().filter(|row| row.selected).collect();
+        if let Some(first) = selected.first() {
+            if selected.iter().any(|row| row.nonce != first.nonce
+                || row.generation != first.generation || row.root_dev != first.root_dev
+                || row.root_ino != first.root_ino || row.marker_digest != first.marker_digest
+                || row.root_kind != first.root_kind || row.volume_uuid != first.volume_uuid)
+            {
+                snapshot_error.get_or_insert_with(|| "selected group references disagree about root identity".to_owned());
+            }
+        }
+        let group: Vec<GroupRow> = members
             .iter().map(|row| GroupRow {
                 member: row.member.clone(), generation: row.generation, nonce: row.nonce.clone(),
                 root_dev: row.root_dev, root_ino: row.root_ino,
@@ -2542,6 +2579,9 @@ fn eligibility(
             return Ok(Some(reason));
         }
         return Ok(None);
+    }
+    if prune_fixture_fault(control, "OXIDE_TEST_PRUNE_UNKNOWN_CUSTODY", &row.checkout, "prune-unknown-custody-fired") {
+        return Err("writer custody is unknown (injected fixture)".to_owned());
     }
     match store.checkout_custody(&row.checkout, 0)? {
         CheckoutCustody::Clear => {}
@@ -3180,28 +3220,32 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
     }
 }
 
+#[cfg(debug_assertions)]
+fn prune_fixture_fault(control: &Path, variable: &str, target: &Path, marker: &str) -> bool {
+    let Some(evidence) = proof_evidence() else { return false };
+    let Some(scratch) = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+        .and_then(|path| fs::canonicalize(path).ok()) else { return false };
+    let Ok(canonical_control) = fs::canonicalize(control) else { return false };
+    if canonical_control != control || canonical_control == scratch
+        || !canonical_control.starts_with(&scratch)
+        || !matches!(store::open_control_directory(control), Ok(Some(_)))
+        || std::env::var_os(variable).as_deref() != Some(target.as_os_str())
+    {
+        return false;
+    }
+    OpenOptions::new().create_new(true).write(true).mode(0o600)
+        .open(evidence.join(marker))
+        .and_then(|mut file| writeln!(file, "{}", target.display())).is_ok()
+}
+
+#[cfg(not(debug_assertions))]
+fn prune_fixture_fault(_control: &Path, _variable: &str, _target: &Path, _marker: &str) -> bool { false }
+
 /// This test-only delay is armed only for a private control directory inside
 /// the supervisor's scratch. It never relaxes inventory's mutation-hook rules.
 #[cfg(debug_assertions)]
 fn diagnostic_delay(control: &Path, root: &Path) {
-    let Some(evidence) = proof_evidence() else { return };
-    let Some(scratch) = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
-        .and_then(|path| fs::canonicalize(path).ok()) else { return };
-    let Ok(canonical_control) = fs::canonicalize(control) else { return };
-    if canonical_control != control || canonical_control == scratch
-        || !canonical_control.starts_with(&scratch)
-        || !matches!(store::open_control_directory(control), Ok(Some(_)))
-    {
-        return;
-    }
-    let Some(target) = std::env::var_os("OXIDE_TEST_PRUNE_DIAGNOSTIC_DELAY") else { return };
-    if Path::new(&target) != root {
-        return;
-    }
-    let recorded = OpenOptions::new().create_new(true).write(true).mode(0o600)
-        .open(evidence.join("prune-diagnostic-delay-fired"))
-        .and_then(|mut file| writeln!(file, "{}", root.display()));
-    if recorded.is_ok() {
+    if prune_fixture_fault(control, "OXIDE_TEST_PRUNE_DIAGNOSTIC_DELAY", root, "prune-diagnostic-delay-fired") {
         std::thread::sleep(Duration::from_secs(11));
     }
 }
@@ -4583,6 +4627,10 @@ fn recheck_candidate(
     candidate: &Candidate,
     list: Option<&OperatorList>,
 ) -> Result<u64, String> {
+    if prune_fixture_fault(control, "OXIDE_TEST_PRUNE_LOCKED_REFUSE", &candidate.root, "prune-locked-refuse-fired") {
+        return Err("the locked fixture recheck refused".to_owned());
+    }
+    let authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
     registry.validate()?;
     if !registry.complete {
@@ -4624,6 +4672,9 @@ fn recheck_candidate(
         RootState::Present(_) => return Err("the root's identity changed".to_owned()),
         RootState::Absent => return Err("the root is already absent".to_owned()),
         RootState::Unknown(reason) => return Err(reason),
+    }
+    if !authority.complete() {
+        return Err("the locked authority recheck exceeded its input or time budget".to_owned());
     }
     Ok(registry.revision)
 }
@@ -5761,6 +5812,7 @@ fn recheck_receiptless(
     control: &Path,
     candidate: &Candidate,
 ) -> Result<u64, String> {
+    let authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
     registry.validate()?;
     let entry = evaluate_receiptless(store, control, &registry, &candidate.root, true);
@@ -5771,6 +5823,9 @@ fn recheck_receiptless(
     };
     if !same_candidates(&[candidate], &[&current]) {
         return Err("the listed root's identity changed".to_owned());
+    }
+    if !authority.complete() {
+        return Err("the locked authority recheck exceeded its input or time budget".to_owned());
     }
     Ok(registry.revision)
 }
@@ -7164,7 +7219,7 @@ mod tests {
         let mut row = row_for(&fixture.root);
         row.checkout_id = checkout_id.to_owned();
         row.checkout = fixture.root.join("gone").join(checkout_id);
-        row.receipt = fixture.root.join("unused.json");
+        row.receipt = outputs::receipt_path_public(&fixture.root.join("control"), checkout_id);
         row.root = PathBuf::from(format!("/Volumes/OxV1/oxide-outputs/{checkout_id}"));
         row.root_kind = RootKind::External;
         row.volume_uuid = Some("11111111-2222-3333-4444-555555555555".to_owned());

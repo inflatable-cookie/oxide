@@ -273,7 +273,7 @@ def toolchain_channel() -> str:
     return text[start : text.index('"', start)]
 
 
-def seed_and_stage(proof: Proof) -> tuple[Path, dict]:
+def seed_and_stage(proof: Proof, jobs: int | None = None) -> tuple[Path, dict]:
     """Seed HEAD's lock into a private Cargo home, then build this HEAD's oxide."""
     seed_root = proof.root / "stage"
     seed_root.mkdir(parents=True, exist_ok=True)
@@ -324,8 +324,14 @@ def seed_and_stage(proof: Proof) -> tuple[Path, dict]:
     print(f"wrapper-bypass setup: {versions}")
     if versions != BUILDER_VERSIONS:
         fail(f"builder is not {BUILDER}: {versions}")
+    command = [proof.tools["cargo"], "build", "--locked", "--offline", "--bin", "oxide"]
+    if jobs is not None:
+        if jobs < 1:
+            fail("staging parallelism must be positive")
+        env["CARGO_BUILD_JOBS"] = str(jobs)
+        command.extend(["--jobs", str(jobs)])
     code, _, stderr = proof.run(
-        [proof.tools["cargo"], "build", "--locked", "--offline", "--bin", "oxide"],
+        command,
         cwd=REPO,
         env=env,
         label="stage-build",
