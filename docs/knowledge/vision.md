@@ -243,9 +243,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   build scripts whose outputs record absolute paths rerun.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
+  The concrete protocol, its partial-association limit and its unproven
+  status are in the [proposed cold-slot seeding design](contracts/cold-slot-seeding.md).
 - **Approved, not built:**
   - cold-slot seeding from matching units, conservative first, with
-    one-use temp workspaces handled as seeded, first-evicted slots;
+    one-use temp workspaces handled as seeded, first-evicted slots
+    ([proposed design](contracts/cold-slot-seeding.md), unimplemented and not
+    frozen);
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
 

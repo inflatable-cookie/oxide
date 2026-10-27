@@ -18,6 +18,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Rust toolchain and quality](knowledge/rust-toolchain-and-quality.md)
 - [Opt-in stable Cargo profiles](knowledge/contracts/stable-cargo-profiles.md)
 - [`oxide exec` output-member inference (proposed design)](knowledge/contracts/exec-output-inference.md)
+- [Cold-slot seeding from matching dependency units (proposed design, unimplemented)](knowledge/contracts/cold-slot-seeding.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
 - [Release contract](knowledge/contracts/release.md)
