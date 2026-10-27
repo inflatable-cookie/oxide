@@ -640,6 +640,55 @@ fn a_truncated_or_unparseable_archive_refuses() {
 }
 
 #[test]
+fn nothing_non_padding_may_follow_the_tar_end_marker() {
+    // A valid entry, then the end-of-archive marker, then bytes the pinned
+    // iterator never yields. Zero writer padding stays accepted; a hidden
+    // entry, a hidden header or a single non-zero padding byte refuses.
+    let entry = raw_block(b"cfg-if-1.0.0/Cargo.toml", b'0', b"[package]\n");
+    let valid = |tail: Vec<u8>| {
+        let mut tar = entry.clone();
+        tar.extend([0_u8; 1024]);
+        tar.extend(tail);
+        gzip(&tar)
+    };
+
+    // Pure zero padding (as every tar writer emits) is accepted.
+    let padded = valid(vec![0_u8; 8192]);
+    derive(
+        Cursor::new(padded),
+        TARBALL,
+        &SourceLimits::default(),
+        Instant::now(),
+    )
+    .expect("zero padding after the end marker");
+
+    // A whole hidden entry after the marker is refused.
+    let hidden = raw_block(b"cfg-if-1.0.0/hidden.rs", b'0', b"pub fn hidden() {}\n");
+    assert_eq!(
+        archive_error(valid(hidden.clone()), TARBALL),
+        Some(Refusal::ArchiveGrammar("trailing")),
+        "a hidden entry after the end marker"
+    );
+    // A single non-zero byte in the padding is refused.
+    assert_eq!(
+        archive_error(
+            valid(vec![0_u8; 600].into_iter().chain([1]).collect()),
+            TARBALL
+        ),
+        Some(Refusal::ArchiveGrammar("trailing")),
+        "a non-zero padding byte"
+    );
+    // A hidden payload that begins on a block boundary is still refused.
+    let mut block_aligned = vec![0_u8; 512];
+    block_aligned.extend_from_slice(&hidden);
+    assert_eq!(
+        archive_error(valid(block_aligned), TARBALL),
+        Some(Refusal::ArchiveGrammar("trailing")),
+        "a block-aligned hidden payload"
+    );
+}
+
+#[test]
 fn gnu_and_pax_long_names_are_accepted_and_an_escaping_pax_path_refuses() {
     let long = format!("{TARBALL}/{}", "a".repeat(140));
     let gnu = build_archive(&[(

@@ -9,9 +9,11 @@
 //! names are accepted by the `tar` reader. Symlinks, hard links, device nodes,
 //! FIFOs, sparse entries, duplicate paths, absolute paths, `.`/`..` components,
 //! a wrong top-level archive prefix and any unparseable or truncated entry
-//! refuse. Entry count, archive bytes and derived content are bounded and the
-//! deadline is checked between entries, so a hostile archive cannot make the
-//! verifier do unbounded work.
+//! refuse. After the tar end-of-archive marker only zero padding is accepted,
+//! so an entry or payload hidden past that marker cannot bypass the grammar.
+//! Entry count, archive bytes and derived content are bounded and the deadline
+//! is checked between entries, so a hostile archive cannot make the verifier do
+//! unbounded work.
 
 use super::digest::{ContentHash, EntryKind, SourceTree};
 use super::{Refusal, SourceLimits};
@@ -266,8 +268,12 @@ pub(super) fn derive<R: Read>(
             .map_err(Refusal::ArchiveGrammar)?;
         }
     }
-    // The archive's checksum covers the whole file, so the rest of the gzip
-    // stream and any trailing bytes must be consumed under their own bounds.
+    // The pinned iterator stops at the first zero header, so everything after
+    // the end-of-archive marker is checked here: only zero writer padding is
+    // accepted, and a non-zero byte or an over-long tail refuses, so an entry
+    // or payload hidden past the marker cannot bypass the entry grammar. The
+    // archive's checksum covers the whole file, so the rest of the gzip stream
+    // and any trailing bytes are still consumed for the hash.
     let mut decoder = archive.into_inner();
     let mut trailing: u64 = 0;
     let mut buffer = [0_u8; CHUNK];
@@ -279,9 +285,12 @@ pub(super) fn derive<R: Read>(
         if read == 0 {
             break;
         }
+        if buffer[..read].iter().any(|byte| *byte != 0) {
+            return Err(Refusal::ArchiveGrammar("trailing"));
+        }
         trailing = trailing.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         if trailing > MAX_TRAILING_BYTES {
-            return Err(Refusal::ArchiveGrammar("trailing"));
+            return Err(Refusal::ArchiveBudget);
         }
     }
     let inner = decoder.into_inner().into_inner();
