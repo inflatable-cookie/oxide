@@ -28,6 +28,80 @@ use tar::EntryType;
 const MAX_TRAILING_BYTES: u64 = 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
 
+/// Decompressed tar-stream bytes the reader consumes: 512-byte headers, block
+/// padding and, critically, the PAX/GNU extension payloads the `tar` reader
+/// decodes internally before it yields an entry. The `tar` reader preallocates
+/// at most 128 KiB for an extension but grows the buffer as it reads, so this
+/// wrapper is what makes extension decoding finite and deadline-checked.
+struct TarStream<R> {
+    inner: R,
+    bytes: u64,
+    cap: u64,
+    deadline: Instant,
+    reason: Rc<Cell<Option<Refusal>>>,
+}
+
+impl<R: Read> TarStream<R> {
+    fn new(inner: R, cap: u64, deadline: Instant) -> (Self, Rc<Cell<Option<Refusal>>>) {
+        let reason = Rc::new(Cell::new(None));
+        (
+            Self {
+                inner,
+                bytes: 0,
+                cap,
+                deadline,
+                reason: Rc::clone(&reason),
+            },
+            reason,
+        )
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for TarStream<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.reason.get().is_some() {
+            return Err(io::Error::other("the tar stream stopped"));
+        }
+        if Instant::now() > self.deadline {
+            self.reason.set(Some(Refusal::Deadline));
+            return Err(io::Error::other("the source deadline expired"));
+        }
+        let read = self.inner.read(buffer)?;
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if self.bytes > self.cap {
+            self.reason.set(Some(Refusal::ArchiveBudget));
+            return Err(io::Error::other("the tar stream exceeded its byte bound"));
+        }
+        Ok(read)
+    }
+}
+
+/// Why a read through the bounded readers stopped: the tar stream's own bound
+/// or deadline first, then the compressed-archive bound, else corruption.
+struct Signals {
+    compressed_overflow: Rc<Cell<bool>>,
+    stream: Rc<Cell<Option<Refusal>>>,
+}
+
+impl Signals {
+    fn refusal(&self) -> Refusal {
+        if let Some(reason) = self.stream.get() {
+            return reason;
+        }
+        if self.compressed_overflow.get() {
+            Refusal::ArchiveBudget
+        } else {
+            Refusal::ArchiveCorrupt
+        }
+    }
+}
+
 /// One archive derivation: the expected extracted tree, the SHA-256 of the
 /// archive bytes and the charged content.
 pub(super) struct DerivedArchive {
@@ -95,20 +169,26 @@ pub(super) fn derive<R: Read>(
     limits: &SourceLimits,
     started: Instant,
 ) -> Result<DerivedArchive, Refusal> {
-    let (mut hashing, overflow) = HashingReader::new(source, limits.max_archive_bytes);
+    let (mut hashing, compressed_overflow) = HashingReader::new(source, limits.max_archive_bytes);
+    let deadline = started + limits.deadline;
+    let (stream, stream_reason) =
+        TarStream::new(GzDecoder::new(&mut hashing), limits.max_tar_bytes, deadline);
+    let signals = Signals {
+        compressed_overflow,
+        stream: stream_reason,
+    };
     let mut tree = SourceTree::new();
     let mut content_bytes: u64 = 0;
     let mut entries: u64 = 0;
     let mut root_seen = false;
-    let deadline = started + limits.deadline;
-    let mut archive = tar::Archive::new(GzDecoder::new(&mut hashing));
+    let mut archive = tar::Archive::new(stream);
     {
-        let reader = archive.entries().map_err(|_| archive_error(&overflow))?;
+        let reader = archive.entries().map_err(|_| signals.refusal())?;
         for entry in reader {
             if Instant::now() > deadline {
                 return Err(Refusal::Deadline);
             }
-            let mut entry = entry.map_err(|_| archive_error(&overflow))?;
+            let mut entry = entry.map_err(|_| signals.refusal())?;
             entries = entries.saturating_add(1);
             if entries > limits.max_entries {
                 return Err(Refusal::ArchiveBudget);
@@ -169,7 +249,7 @@ pub(super) fn derive<R: Read>(
             if charged > limits.max_derived_bytes {
                 return Err(Refusal::ArchiveBudget);
             }
-            let (size, hash) = hash_entry(&mut entry, declared, deadline, &overflow)?;
+            let (size, hash) = hash_entry(&mut entry, declared, deadline, &signals)?;
             if size != declared {
                 return Err(Refusal::ArchiveCorrupt);
             }
@@ -187,7 +267,7 @@ pub(super) fn derive<R: Read>(
         }
     }
     // The archive's checksum covers the whole file, so the rest of the gzip
-    // stream and any trailing bytes must be consumed under the byte bound.
+    // stream and any trailing bytes must be consumed under their own bounds.
     let mut decoder = archive.into_inner();
     let mut trailing: u64 = 0;
     let mut buffer = [0_u8; CHUNK];
@@ -195,9 +275,7 @@ pub(super) fn derive<R: Read>(
         if Instant::now() > deadline {
             return Err(Refusal::Deadline);
         }
-        let read = decoder
-            .read(&mut buffer)
-            .map_err(|_| archive_error(&overflow))?;
+        let read = decoder.read(&mut buffer).map_err(|_| signals.refusal())?;
         if read == 0 {
             break;
         }
@@ -206,14 +284,12 @@ pub(super) fn derive<R: Read>(
             return Err(Refusal::ArchiveGrammar("trailing"));
         }
     }
-    let inner = decoder.into_inner();
+    let inner = decoder.into_inner().into_inner();
     loop {
         if Instant::now() > deadline {
             return Err(Refusal::Deadline);
         }
-        let read = inner
-            .read(&mut buffer)
-            .map_err(|_| archive_error(&overflow))?;
+        let read = inner.read(&mut buffer).map_err(|_| signals.refusal())?;
         if read == 0 {
             break;
         }
@@ -224,17 +300,6 @@ pub(super) fn derive<R: Read>(
         sha256,
         content_bytes,
     })
-}
-
-/// Map a reader error to the archive refusal it stands for. A bound breach is
-/// remembered in a flag shared with the hashing reader, so a generic I/O error
-/// after it is not reported as corruption.
-fn archive_error(overflow: &Cell<bool>) -> Refusal {
-    if overflow.get() {
-        Refusal::ArchiveBudget
-    } else {
-        Refusal::ArchiveCorrupt
-    }
 }
 
 fn strip_prefix<'a>(path: &'a str, tarball_name: &str) -> Option<&'a str> {
@@ -251,7 +316,7 @@ fn hash_entry<R: Read>(
     entry: &mut R,
     declared: u64,
     deadline: Instant,
-    overflow: &Cell<bool>,
+    signals: &Signals,
 ) -> Result<(u64, [u8; 32]), Refusal> {
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
@@ -260,9 +325,7 @@ fn hash_entry<R: Read>(
         if Instant::now() > deadline {
             return Err(Refusal::Deadline);
         }
-        let read = entry
-            .read(&mut buffer)
-            .map_err(|_| archive_error(overflow))?;
+        let read = entry.read(&mut buffer).map_err(|_| signals.refusal())?;
         if read == 0 {
             break;
         }

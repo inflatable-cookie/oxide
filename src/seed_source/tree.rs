@@ -10,7 +10,6 @@
 use super::digest::{ContentHash, EntryKind, SourceTree};
 use super::{Refusal, SourceLimits};
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -129,21 +128,20 @@ pub(super) fn walk_extracted_tree(
         depth: 0,
     }];
     while let Some(pending) = stack.pop() {
-        let mut names: Vec<OsString> = fs::read_dir(&pending.path)
-            .map_err(|_| Refusal::TreeUnreadable)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| Refusal::TreeUnreadable)?;
-        names.sort();
-        for name in names {
+        // Enumerate one entry at a time and charge it before touching it, so a
+        // directory with more entries than the bound refuses without listing or
+        // allocating the whole directory.
+        for entry in fs::read_dir(&pending.path).map_err(|_| Refusal::TreeUnreadable)? {
             if Instant::now() > deadline {
                 return Err(Refusal::Deadline);
             }
+            let entry = entry.map_err(|_| Refusal::TreeUnreadable)?;
             entries = entries.saturating_add(1);
             if entries > limits.max_entries {
                 return Err(Refusal::TreeBudget);
             }
-            let name = name
+            let name = entry
+                .file_name()
                 .to_str()
                 .ok_or(Refusal::TreeGrammar("non-utf8"))?
                 .to_owned();

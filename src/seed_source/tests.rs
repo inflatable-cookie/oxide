@@ -9,7 +9,7 @@
 
 use super::archive::derive;
 use super::cache::{CacheRecord, SourceCache, MAX_CACHE_BYTES, MAX_CACHE_RECORDS};
-use super::digest::{DigestScheme, SourceTree, TreeDigest};
+use super::digest::{DigestScheme, SourceTree, TreeDigest, MAX_PATH_BYTES};
 use super::git::{
     clears, git_command, GitRefusal, GitVerifier, GIT_CALL_TIME, GIT_SETTLE_TIME, GIT_TOTAL_TIME,
     MAX_GIT_CALLS, MAX_GIT_STDOUT_BYTES,
@@ -161,13 +161,25 @@ fn build_archive(entries: &[(String, Spec<'_>)]) -> Vec<u8> {
 /// One raw ustar block, so a fixture can carry a path the writer refuses to
 /// construct (absolute, `..`, non-UTF-8, or a pax description).
 fn raw_block(name: &[u8], type_flag: u8, data: &[u8]) -> Vec<u8> {
+    raw_block_sized(
+        name,
+        type_flag,
+        u64::try_from(data.len()).expect("fixture size"),
+        data,
+    )
+}
+
+/// One raw ustar block whose declared size is independent of the bytes that
+/// follow, so a fixture can present an extension header that claims far more
+/// payload than it carries.
+fn raw_block_sized(name: &[u8], type_flag: u8, declared: u64, data: &[u8]) -> Vec<u8> {
     assert!(name.len() <= 100, "fixture header name");
     let mut header = [0_u8; 512];
     header[..name.len()].copy_from_slice(name);
     header[100..108].copy_from_slice(b"0000644\0");
     header[108..116].copy_from_slice(b"0000000\0");
     header[116..124].copy_from_slice(b"0000000\0");
-    header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    header[124..136].copy_from_slice(format!("{declared:011o}\0").as_bytes());
     header[136..148].copy_from_slice(b"00000000000\0");
     header[148..156].copy_from_slice(b"        ");
     header[156] = type_flag;
@@ -534,6 +546,17 @@ fn the_archive_entry_grammar_is_strict() {
             )]),
             Refusal::ArchiveGrammar("prefix"),
         ),
+        (
+            "too-long",
+            build_archive(&[(
+                format!("{TARBALL}/{}", "a".repeat(MAX_PATH_BYTES + 1)),
+                Spec::File {
+                    data: b"x",
+                    mode: 0o644,
+                },
+            )]),
+            Refusal::ArchiveGrammar("too-long"),
+        ),
     ];
     for (label, bytes, expected) in cases {
         assert_eq!(archive_error(bytes, TARBALL), Some(expected), "{label}");
@@ -847,6 +870,80 @@ fn the_cache_document_is_owner_only_bounded_and_ignored_when_invalid() {
             &format!("registry/cache/i/{MAX_CACHE_RECORDS}.crate")
         )
         .is_some());
+}
+
+#[test]
+fn an_oversized_extension_payload_is_bounded_by_the_stream_cap() {
+    // A GNU long-name and a PAX extension header each declare 1 GiB but carry
+    // 64 KiB. The `tar` reader decodes extension payloads internally before it
+    // yields an entry, so the bounded tar stream is what makes that work
+    // finite: the low cap refuses at the bound instead of reading the claimed
+    // size. With the design's default bound the same archive is refused as
+    // unparseable, never read without limit.
+    for (name, type_flag) in [
+        (b"././@LongLink".as_slice(), b'L'),
+        (b"PaxHeaders/x".as_slice(), b'x'),
+    ] {
+        let mut tar = raw_block_sized(name, type_flag, 1 << 30, &vec![b'a'; 64 * 1024]);
+        tar.extend([0_u8; 1024]);
+        let bytes = gzip(&tar);
+        let low = SourceLimits {
+            max_tar_bytes: 4096,
+            ..SourceLimits::default()
+        };
+        assert_eq!(
+            derive(Cursor::new(bytes.clone()), TARBALL, &low, Instant::now()).err(),
+            Some(Refusal::ArchiveBudget),
+            "extension type {}",
+            char::from(type_flag)
+        );
+        assert!(
+            derive(
+                Cursor::new(bytes),
+                TARBALL,
+                &SourceLimits::default(),
+                Instant::now()
+            )
+            .is_err(),
+            "the default bound refuses the truncated extension"
+        );
+    }
+}
+
+#[test]
+fn the_tree_walk_charges_entries_before_listing_them() {
+    let fixture = PackageFixture::create("tree-enumeration", &simple_files());
+    let mut cache = fixture.cache();
+    // The archive has four entries, so this bound passes the archive
+    // derivation; the extracted tree has six entries (four files and two
+    // directories) and the walk refuses at the bound instead of listing it.
+    let limits = SourceLimits {
+        max_entries: 5,
+        ..SourceLimits::default()
+    };
+    assert_eq!(
+        fixture
+            .locate()
+            .verify(&fixture.checksum, &limits, &mut cache, 1)
+            .err(),
+        Some(Refusal::TreeBudget)
+    );
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn an_unbounded_registry_listing_refuses() {
+    let temp = TempDir::new("index-limit");
+    let cargo_home = temp.path().join("cargo-home");
+    let cache = cargo_home.join("registry").join("cache");
+    fs::create_dir_all(&cache).expect("cache root");
+    for index in 0..=super::MAX_REGISTRY_INDEX_ENTRIES {
+        fs::create_dir(cache.join(format!("index-{index}"))).expect("index directory");
+    }
+    assert_eq!(
+        RegistrySource::locate(&cargo_home, TARBALL).err(),
+        Some(Refusal::RegistryIndexLimit)
+    );
 }
 
 struct GitFixture {
@@ -1379,9 +1476,19 @@ fn git_budget_exhaustion_and_unconfirmed_closure_refuse() {
         Some(GitRefusal::Unconfirmed)
     );
 
-    // A retained pipe held by a process the child started.
+    // A retained pipe held by a process the child started. The fixture
+    // records that process so this test leaves nothing behind.
     let holder = temp.path().join("holder-git");
-    write_file(&holder, b"#!/bin/sh\nsleep 2 &\nexit 0\n", 0o755);
+    let holder_pid = temp.path().join("holder.pid");
+    write_file(
+        &holder,
+        format!(
+            "#!/bin/sh\nsleep 2 &\necho $! > '{}'\nexit 0\n",
+            holder_pid.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
     let mut retained = GitVerifier::for_test(
         holder,
         0,
@@ -1394,6 +1501,17 @@ fn git_budget_exhaustion_and_unconfirmed_closure_refuse() {
         retained.verify(&root, &object, &limits).err(),
         Some(GitRefusal::Unconfirmed)
     );
+    if let Ok(pid) = fs::read_to_string(&holder_pid)
+        .unwrap_or_default()
+        .trim()
+        .parse::<i32>()
+    {
+        // SAFETY: the fixture wrote the PID of the `sleep` it started; a
+        // failed kill means the process already ended.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
 
     // A missing program and a failing program are unreadable, not a cold skip.
     let mut missing = GitVerifier::for_test(

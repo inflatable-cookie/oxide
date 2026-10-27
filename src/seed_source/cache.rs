@@ -292,7 +292,9 @@ fn validate_record(record: &CacheRecord) -> Result<(), Refusal> {
         return Err(Refusal::CacheInvalid);
     }
     record.digest().ok_or(Refusal::CacheInvalid)?;
-    if record.archive_mtime_nanos.abs() >= NANOS_PER_SECOND {
+    if record.archive_mtime_nanos <= -NANOS_PER_SECOND
+        || record.archive_mtime_nanos >= NANOS_PER_SECOND
+    {
         return Err(Refusal::CacheInvalid);
     }
     Ok(())

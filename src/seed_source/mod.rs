@@ -46,6 +46,10 @@ const MIB: u64 = 1024 * 1024;
 const MAX_TARBALL_BYTES: usize = 128;
 /// Longest accepted absolute Cargo home in the cache.
 const MAX_HOME_BYTES: usize = 4096;
+/// Registry index directories examined while locating one package. The listing
+/// is incremental and stops at the second match, so no directory can make the
+/// lookup list or allocate without bound.
+const MAX_REGISTRY_INDEX_ENTRIES: u64 = 1024;
 
 /// Every finite bound one source verification draws on. The defaults are the
 /// design's §8.1 figures; a caller sharing one producing-build budget lowers
@@ -59,6 +63,11 @@ pub struct SourceLimits {
     /// Compressed archive bytes read from one `.crate` file. The design's
     /// derived-content cap bounds decompression; this bounds the disk read.
     pub max_archive_bytes: u64,
+    /// Decompressed tar-stream bytes consumed: 512-byte headers, block padding
+    /// and the PAX/GNU extension payloads the `tar` reader decodes internally
+    /// before it yields an entry. The derived-content cap bounds file content;
+    /// this bounds the stream that carries it, including long names.
+    pub max_tar_bytes: u64,
     /// Archive-derived content bytes for one package.
     pub max_derived_bytes: u64,
     /// Longest accepted relative path.
@@ -75,6 +84,7 @@ impl Default for SourceLimits {
             max_entries: 100_000,
             max_content_bytes: 128 * MIB,
             max_archive_bytes: 64 * MIB,
+            max_tar_bytes: 256 * MIB,
             max_derived_bytes: 64 * MIB,
             max_path_bytes: MAX_PATH_BYTES,
             max_depth: 64,
@@ -93,6 +103,8 @@ pub enum Refusal {
     AmbiguousRegistryIndex,
     /// The archive exists but cannot be opened as a regular file.
     ArchiveUnreadable,
+    /// More registry index directories were examined than the bound allows.
+    RegistryIndexLimit,
     /// An archive entry violates the strict entry grammar.
     ArchiveGrammar(&'static str),
     /// The archive is unparseable or truncated.
@@ -129,6 +141,9 @@ impl fmt::Display for Refusal {
                 formatter.write_str("the cached archive matches more than one registry index")
             }
             Self::ArchiveUnreadable => formatter.write_str("the cached archive cannot be read"),
+            Self::RegistryIndexLimit => {
+                formatter.write_str("the registry index listing exceeded its bound")
+            }
             Self::ArchiveGrammar(reason) => write!(formatter, "archive entry refused: {reason}"),
             Self::ArchiveCorrupt => {
                 formatter.write_str("the archive is not a readable tar archive")
@@ -189,15 +204,36 @@ impl RegistrySource {
         }
         let cache_root = cargo_home.join("registry").join("cache");
         let src_root = cargo_home.join("registry").join("src");
-        let indexes = list_directories(&cache_root).map_err(|error| {
+        // Enumerate one index at a time, stopping at the second match: the
+        // lookup is bounded in examined entries and never lists the directory
+        // whole.
+        let mut matches: Vec<(String, PathBuf)> = Vec::new();
+        let reader = fs::read_dir(&cache_root).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Refusal::MissingArchive
             } else {
                 Refusal::ArchiveUnreadable
             }
         })?;
-        let mut matches = Vec::new();
-        for index in indexes {
+        let mut examined: u64 = 0;
+        for entry in reader {
+            examined = examined.saturating_add(1);
+            if examined > MAX_REGISTRY_INDEX_ENTRIES {
+                return Err(Refusal::RegistryIndexLimit);
+            }
+            let entry = entry.map_err(|_| Refusal::ArchiveUnreadable)?;
+            if !entry
+                .file_type()
+                .map_err(|_| Refusal::ArchiveUnreadable)?
+                .is_dir()
+            {
+                continue;
+            }
+            let index = entry
+                .file_name()
+                .to_str()
+                .ok_or(Refusal::Unsupported)?
+                .to_owned();
             let candidate = cache_root
                 .join(&index)
                 .join(format!("{tarball_name}.crate"));
@@ -207,15 +243,17 @@ impl RegistrySource {
                         return Err(Refusal::ArchiveUnreadable);
                     }
                     matches.push((index, candidate));
+                    if matches.len() > 1 {
+                        return Err(Refusal::AmbiguousRegistryIndex);
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(Refusal::ArchiveUnreadable),
             }
         }
-        let (index, archive) = match matches.len() {
-            0 => return Err(Refusal::MissingArchive),
-            1 => matches.pop().ok_or(Refusal::AmbiguousRegistryIndex)?,
-            _ => return Err(Refusal::AmbiguousRegistryIndex),
+        let (index, archive) = match matches.pop() {
+            Some(found) => found,
+            None => return Err(Refusal::MissingArchive),
         };
         let tree = src_root.join(&index).join(tarball_name);
         let metadata = fs::symlink_metadata(&tree).map_err(|error| {
@@ -402,23 +440,6 @@ pub struct VerifiedRegistrySource {
     pub archive_sha256: String,
     /// Whether the cache supplied the archive digest without re-reading it.
     pub cache_hit: bool,
-}
-
-fn list_directories(root: &Path) -> std::io::Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let name = entry
-                .file_name()
-                .to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| std::io::Error::other("non-UTF-8 registry index"))?;
-            names.push(name);
-        }
-    }
-    names.sort();
-    Ok(names)
 }
 
 fn valid_tarball_name(name: &str) -> bool {
