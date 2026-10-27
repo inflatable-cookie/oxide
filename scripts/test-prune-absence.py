@@ -42,10 +42,12 @@ Cases, in execution order (counted fail-fast; the diagnostic records each one):
   1 data-missing-chains   a registered profile group and an operator-listed
                           receiptless legacy root, each with MULTIPLE missing
                           ancestors on the boot Data volume, are candidates; the
-                          receiptless root needs the exact list; one real private
-                          run completes both through the journal, terminal
-                          receipts and tombstones with no intent left, while a
-                          live checkout stays kept with unchanged bytes.
+                          same chain is KEPT when the marker records a different
+                          checkout volume (a recorded volume is never waived);
+                          the receiptless root needs the exact list; one real
+                          private run completes both through the journal,
+                          terminal receipts and tombstones with no intent left,
+                          while a live checkout stays kept with unchanged bytes.
   2 mount-boundaries      a registered checkout inside the attached image whose
                           ancestor below the mount is missing stays KEEP naming
                           the leaf-only rule, and a missing chain under an absent
@@ -56,7 +58,10 @@ Cases, in execution order (counted fail-fast; the diagnostic records each one):
                           checkout refuses, and replacing an existing ancestor by
                           a DIFFERENT empty directory while the checkout stays
                           absent refuses with the witness comparison, which a
-                          fresh absence proof alone would not notice.
+                          fresh absence proof alone would not notice. The seam's
+                          exclusively created marker is reset and bound to each
+                          race's own root, so neither race can be satisfied by a
+                          stale firing.
   5 eacces                the debug-only scoped EACCES injection fires and keeps
                           the root, with the uninjected counterpart proving the
                           same chain absent.
@@ -164,6 +169,7 @@ CUSTODY_VAR, CUSTODY_MARKER = (
 PRESENT_KEEP = "the checkout is present, so its root is kept"
 LEAF_ONLY_REFUSAL = "an ancestor of the checkout below its mount is missing"
 NO_RECORDED_VOLUME = "a /Volumes checkout has no recorded volume UUID"
+RECORDED_VOLUME_CONFLICT = "is not on the checkout's recorded volume"
 NOT_A_DIRECTORY = "an ancestor of the checkout is not a directory"
 WITNESS_REFUSAL = "the checkout's ancestry changed after the real run's snapshot"
 UNKNOWN_CUSTODY = "writer custody is unknown (injected fixture)"
@@ -262,19 +268,32 @@ def chain_checkout(world, path: Path) -> str:
     return os.path.realpath(path)
 
 
-def listed_legacy_root(world, marker_template: dict, checkout: str, label: str) -> tuple:
-    """One operator-listed receiptless legacy root (root/1, no nonce, no
-    recorded checkout volume) whose marker names `checkout`. Only one leaf is
-    created: the container is the product's own owner-only oxide-outputs
+def listed_legacy_root(
+    world,
+    marker_template: dict,
+    checkout: str,
+    label: str,
+    recorded_checkout_volume: str | None = None,
+) -> tuple:
+    """One operator-listed receiptless root whose marker names `checkout`.
+
+    Without `recorded_checkout_volume` it is the genuine legacy shape (root/1,
+    no nonce, no recorded checkout volume). With one, it keeps the current
+    marker shape and nonce and records that volume, which the product must
+    honour: the proof's conflicting control is exactly this case. Only one leaf
+    is created: the container is the product's own owner-only oxide-outputs
     directory."""
     checkout_id = hashlib.sha256(checkout.encode()).hexdigest()
     root = os.path.join(world.mount, "oxide-outputs", f"{label}-{checkout_id[:8]}")
     os.mkdir(root, 0o700)
     document = dict(marker_template)
-    document.pop("nonce", None)
-    document.pop("checkout_volume_uuid", None)
+    if recorded_checkout_volume is None:
+        document.pop("nonce", None)
+        document.pop("checkout_volume_uuid", None)
+        document["version"] = "oxide.outputs.root/1"
+    else:
+        document["checkout_volume_uuid"] = recorded_checkout_volume
     document.update(
-        version="oxide.outputs.root/1",
         checkout=checkout,
         checkout_id=checkout_id,
         generation=1,
@@ -318,16 +337,26 @@ def armed_real_run(world, plan: str, sha: str, extra: dict):
     return permanent.start_child(world.proof, argv, world.root, env)
 
 
-def await_firing(world, marker: Path, child, label: str) -> None:
-    """Wait, bounded by the supervisor's own deadline, for the fixture seam to
-    fire. An early exit is reported with its custody, never silently skipped."""
+def await_firing(world, marker: Path, expected: str, child, label: str) -> None:
+    """Wait, bounded by the supervisor's own deadline, for THIS run's firing.
+
+    The seam's marker is created exclusively, so a marker that already exists is
+    a previous case's firing and can never satisfy this wait: the loop requires
+    the recorded path to be `expected`. An early exit is reported with its
+    custody, never silently skipped."""
     deadline = time.monotonic() + min(30.0, permanent.work_left())
-    while not marker.exists():
+    while True:
+        if marker.exists():
+            recorded = marker.read_text(errors="replace").strip().splitlines()
+            if recorded and recorded[-1] == expected:
+                return
         if child.poll() is not None:
             code, out, err = world.finish(child, label)
-            raise RuntimeError(f"{label} ended before {marker.name} fired (exit {code}): {out}{err}")
+            raise RuntimeError(
+                f"{label} ended before {marker.name} fired for {expected} (exit {code}): {out}{err}"
+            )
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"{label} never reached {marker.name}")
+            raise RuntimeError(f"{label} never fired {marker.name} for {expected}")
         time.sleep(0.05)
 
 
@@ -464,6 +493,19 @@ def run_cases(proof, custody, diagnostic, cases):
     image = {"checkout": world.checkout("image-chain", base=world.mount)}
     world.adopt(image["checkout"])
     marker_template = prior.marker(world.selected(group["checkout"])["root"])
+    # A receiptless root whose marker RECORDS the image's checkout volume while
+    # its surviving ancestors are on the boot Data volume: the record must be
+    # honoured, so this chain is kept even though the Data proof holds.
+    conflicting_checkout = os.path.join(
+        adapter.root, "chains", secrets.token_hex(4), "x", "checkout"
+    )
+    conflicting_root, _ = listed_legacy_root(
+        world,
+        marker_template,
+        conflicting_checkout,
+        "conflict",
+        recorded_checkout_volume=permanent.real_uuid(world.pool),
+    )
     # A receiptless legacy root whose checkout has TWO missing ancestors plus
     # the missing leaf, and which never existed as a checkout at all.
     legacy_checkout = os.path.join(
@@ -542,6 +584,14 @@ def run_cases(proof, custody, diagnostic, cases):
                 raise
 
     def data_missing_chains():
+        # A recorded checkout volume is never waived: the same Data missing
+        # chain is KEPT when the marker records a different volume, and the
+        # root's bytes are untouched.
+        untouched = prior.tree_snapshot(conflicting_root)
+        listed = operator_list(world, [conflicting_root], "conflict")
+        _, out, _ = world.dry_run("recorded volume conflict", boot, listed)
+        require_batch_refusal(json.loads(out), RECORDED_VOLUME_CONFLICT)
+        require(prior.tree_snapshot(conflicting_root) == untouched, "the conflicting root changed")
         # The checkout is present first: the same root is then kept for the
         # ordinary reason, which is this case's non-vacuous control.
         _, out, _ = world.dry_run("present group", boot)
@@ -647,13 +697,25 @@ def run_cases(proof, custody, diagnostic, cases):
         before = prior.tree_snapshot(roots["recreate_race"])
         child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["recreate_race"]})
         try:
-            await_firing(world, proof.evidence / DELAY_MARKER, child, "recreate race")
+            await_firing(
+                world,
+                proof.evidence / DELAY_MARKER,
+                roots["recreate_race"],
+                child,
+                "recreate race",
+            )
             os.makedirs(recreate_race["checkout"], exist_ok=True)
             code, out, err = world.finish(child, "recreate race")
         finally:
             finish_armed(world, child, proof, "recreate race")
         require(code != 0, f"a recreated checkout was pruned: {out}{err}")
         require(PRESENT_KEEP in err, f"the recreated checkout was not refused as present: {err}")
+        # The product creates this seam's marker exclusively, so the second race
+        # needs its own firing: removing this case's marker is what makes the
+        # next wait prove the SECOND root's delay rather than a stale file.
+        marker = proof.evidence / DELAY_MARKER
+        fired(marker, roots["recreate_race"])
+        marker.unlink()
         require(prior.tree_snapshot(roots["recreate_race"]) == before, "the refused root changed")
         require(not world.intents() and not world.quarantines(), "the recreate race left an intent")
         # (b) An EXISTING ancestor replaced by a DIFFERENT empty directory while
@@ -669,7 +731,13 @@ def run_cases(proof, custody, diagnostic, cases):
         ancestor = str(replace_race["path"].parent.parent)
         child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["replace_race"]})
         try:
-            await_firing(world, proof.evidence / DELAY_MARKER, child, "replace race")
+            await_firing(
+                world,
+                proof.evidence / DELAY_MARKER,
+                roots["replace_race"],
+                child,
+                "replace race",
+            )
             os.rename(ancestor, ancestor + "-away")
             os.mkdir(ancestor, 0o700)
             code, out, err = world.finish(child, "replace race")
@@ -758,7 +826,13 @@ def self_check() -> int:
     require(all(seconds > 0 for _, seconds in ALLOCATION_SECONDS), "a phase has no time")
     # A different incomplete-authority reason never satisfies an oracle, even
     # though it also keeps the whole batch.
-    for expected in (LEAF_ONLY_REFUSAL, NO_RECORDED_VOLUME, NOT_A_DIRECTORY, UNKNOWN_CUSTODY):
+    for expected in (
+        LEAF_ONLY_REFUSAL,
+        NO_RECORDED_VOLUME,
+        RECORDED_VOLUME_CONFLICT,
+        NOT_A_DIRECTORY,
+        UNKNOWN_CUSTODY,
+    ):
         doc = {
             "coverage": {"complete": False},
             "candidates": [],

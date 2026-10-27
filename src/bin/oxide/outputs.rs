@@ -1423,6 +1423,13 @@ impl Marker {
         self.volume_uuid.as_deref()
     }
 
+    /// The checkout's volume UUID recorded when the root was created, if the
+    /// marker carries one (shared `oxide.outputs.root/2`). A version-1 marker
+    /// has no such field and reports `None`; a recorded value is never waived.
+    pub(crate) fn checkout_volume_uuid(&self) -> Option<&str> {
+        self.checkout_volume_uuid.as_deref()
+    }
+
     pub(crate) fn nonce(&self) -> Option<&str> {
         self.nonce.as_deref()
     }
