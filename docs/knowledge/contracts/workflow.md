@@ -5045,6 +5045,9 @@ The stable, read-only interface other tools use to find the registered Builds dr
   The fixture now restores exact bytes with exclusive creation and the original
   owner-only mode; its self-check exercises that restoration under the host
   umask in a private temporary directory. This spent start is not proof credit.
+  Each authority-refusal oracle also requires every kept reason to name its
+  planted missing, corrupt or oversized receipt, sticky registry, or injected
+  unknown custody; the pure check rejects an unrelated incomplete snapshot.
   The corrected proof verifies a common canonical real cache root before and
   after strict seeding into its private Cargo home; its pure counterfactual
   is `effigy proof:prune-authority:test`. No counted native has run.

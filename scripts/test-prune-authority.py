@@ -78,6 +78,13 @@ def require(value, message):
         raise RuntimeError(message)
 
 
+def require_batch_refusal(doc, expected):
+    """Every kept root must identify the planted batch fault."""
+    require(not doc["coverage"]["complete"] and not doc["candidates"], "batch was not kept")
+    require(bool(doc["kept"]) and all(expected in item["reason"] for item in doc["kept"]),
+            f"batch refusal did not identify {expected!r}: {doc['kept']}")
+
+
 def canonical_layout(registry: Path, git: Path) -> Path:
     """Only the same canonical parent with the seeder's exact names qualifies."""
     if registry.name != "registry" or git.name != "git" or registry.parent != git.parent:
@@ -139,6 +146,22 @@ def self_check() -> int:
     from types import SimpleNamespace
     from unittest.mock import patch
     import tempfile
+
+    # A different incomplete-authority reason cannot satisfy any planted
+    # fault oracle, even though it also keeps the whole batch.
+    for expected in ("the receipt /fixture is missing", "/fixture is invalid:",
+                     "/fixture exceeds its 65536-byte limit", "the registry is sticky-incomplete",
+                     "writer custody is unknown (injected fixture)"):
+        doc = {"coverage": {"complete": False}, "candidates": [],
+               "kept": [{"reason": "the registry snapshot is incomplete (unrelated fault); the whole batch is kept"}]}
+        try:
+            require_batch_refusal(doc, expected)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"unrelated fault satisfied {expected}")
+        doc["kept"][0]["reason"] = f"the registry snapshot is incomplete ({expected}); the whole batch is kept"
+        require_batch_refusal(doc, expected)
 
     # Exercise the actual host Python API, without creating a fixture: this
     # script exists and a child below the script file cannot exist.
@@ -351,7 +374,11 @@ def run_cases(proof, custody, diagnostic, cases):
                 else: path.write_bytes(content)
                 code, out, _ = world.dry_run(label, boot)
                 doc = json.loads(out)
-                require(code == 0 and not doc["coverage"]["complete"] and not doc["candidates"], label)
+                require(code == 0, label)
+                expected = {"missing": f"the receipt {path} is missing",
+                            "corrupt": f"{path} is invalid:",
+                            "oversized": f"{path} exceeds its 65536-byte limit"}[label]
+                require_batch_refusal(doc, expected)
             finally:
                 if content is None:
                     restore_missing_receipt(path, original, original_mode)
@@ -366,14 +393,16 @@ def run_cases(proof, custody, diagnostic, cases):
             registry.write_text(json.dumps(doc))
             code, out, _ = world.dry_run("sticky", boot)
             doc = json.loads(out)
-            require(code == 0 and not doc["coverage"]["complete"] and not doc["candidates"], "sticky")
+            require(code == 0, "sticky")
+            require_batch_refusal(doc, "the registry is sticky-incomplete")
         finally:
             registry.write_bytes(original)
         fired = proof.evidence / "prune-unknown-custody-fired"
         code, out, _ = world.dry_run("unknown custody", boot,
             extra={"OXIDE_TEST_PRUNE_UNKNOWN_CUSTODY": checkouts[first]})
         doc = json.loads(out)
-        require(code == 0 and not doc["coverage"]["complete"] and not doc["candidates"] and fired.read_text().strip() == checkouts[first], "unknown custody")
+        require(code == 0 and fired.read_text().strip() == checkouts[first], "unknown custody")
+        require_batch_refusal(doc, "writer custody is unknown (injected fixture)")
         require(prior.tree_snapshot(roots[2]) == keep_before and (os.lstat(roots[2]).st_dev, os.lstat(roots[2]).st_ino) == keep_identity, "kept root changed")
     case("authority-refusals", refusals)
 
