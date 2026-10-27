@@ -320,6 +320,23 @@ def closure_unknown(code, killed: bool, reaped: bool, unclosed) -> str | None:
     return None
 
 
+def custody_abort_reason(proof, unclosed) -> str | None:
+    """Why this run must not continue or detach, or `None` when it may.
+
+    It joins the proof's own latch, the shared child helper's unconfirmed
+    closure and the session's un-reaped pids, so an abnormal child or group is
+    classified identically before diagnostic continuation and before detach.
+    """
+    latched = getattr(proof, "custody_unknown", None)
+    if latched is not None:
+        return latched
+    if not proof.closure_known:
+        return "the shared child helper reported unconfirmed closure"
+    if unclosed:
+        return f"{len(unclosed)} proof child(ren) were never reaped"
+    return None
+
+
 def latch_unknown(proof, reason: str) -> None:
     """Record the FIRST custody reason, BEFORE any fallible cleanup."""
     fresh = getattr(proof, "custody_unknown", None) is None
@@ -330,17 +347,25 @@ def latch_unknown(proof, reason: str) -> None:
         print(f"custody latched unknown: {reason}", file=sys.stderr, flush=True)
 
 
-def settle_child(world, child, proof, label: str, unclosed):
-    """Finish one armed child and decide its custody BEFORE cleaning up.
+def settle_child(world, child, proof, label: str, unclosed, wait: float = 120.0):
+    """Wait for one armed child, then decide its custody BEFORE cleaning up.
 
-    The kill (if any) happens after the latch, so a killed leader's surviving
-    group can never be read as closed; the returned reason is the latched one.
+    A child that is still RUNNING is expected: the product is inside its own
+    11-second fixture delay while the proof mutates the fixture. Only a child
+    that outlives this bounded wait is killed, and the latch is recorded BEFORE
+    the kill, so a killed leader's surviving group can never be read as closed.
     """
     killed = False
-    if child.poll() is None:
-        killed = True
-        latch_unknown(proof, f"{label}: the child outlived its work window and was killed")
-        child.kill()
+    deadline = time.monotonic() + min(wait, permanent.work_left())
+    while child.poll() is None:
+        if time.monotonic() >= deadline:
+            killed = True
+            latch_unknown(
+                proof, f"{label}: the child outlived its {wait:.0f}-second wait and was killed"
+            )
+            child.kill()
+            break
+        time.sleep(0.02)
     try:
         code, out, err = world.finish(child, label)
     except BaseException as error:
@@ -764,9 +789,14 @@ def run_cases(proof, custody, diagnostic, cases):
                 raise
             print(f"---- {name} failed (diagnostic continues): {error!r}", flush=True)
         # An unclassifiable custody or deadline outcome aborts the collection:
-        # no later case may run beside an unknown writer group.
-        if getattr(proof, "custody_unknown", None) is not None:
-            raise prior.Aborted(f"custody unknown; collection aborted after {name}")
+        # no later case may run beside an unknown writer group. The SAME
+        # decision gates the ordinary detach in `main`.
+        custody_reason = custody_abort_reason(proof, proof.unclosed)
+        if custody_reason is not None:
+            raise prior.Aborted(
+                f"custody is not positively closed ({custody_reason}); "
+                f"collection aborted after {name}"
+            )
         if permanent.work_left() < 10:
             raise prior.Aborted(f"the work window is exhausted after {name}")
 
@@ -888,23 +918,34 @@ def run_cases(proof, custody, diagnostic, cases):
     case("eacces", eacces)
 
     def custody_and_group():
-        vanished(world, str(custody_case["token"]))
-        authority = world.authority(kept_group["checkout"])
-        payload = prior.tree_snapshot(roots["kept_group"])
-        _, out, _ = world.dry_run(
-            "unknown custody", boot, None, {CUSTODY_VAR: custody_case["checkout"]}
-        )
-        # Unknown writer custody is incomplete AUTHORITY, not path
-        # ineligibility: the whole batch refuses.
-        require_batch_refusal(json.loads(out), UNKNOWN_CUSTODY)
-        fired(proof.evidence / CUSTODY_MARKER, custody_case["checkout"])
-        require(not world.intents() and not world.quarantines(), "a custody refusal left an intent")
-        require(prior.tree_snapshot(roots["kept_group"]) == payload, "the kept group root changed")
-        require(
-            world.authority(kept_group["checkout"]) == authority,
-            "the kept group's receipt or registry changed",
-        )
-        require(os.path.isdir(roots["custody"]), "the custody fixture root vanished")
+        away = vanished(world, str(custody_case["token"]))
+        try:
+            authority = world.authority(kept_group["checkout"])
+            payload = prior.tree_snapshot(roots["kept_group"])
+            _, out, _ = world.dry_run(
+                "unknown custody", boot, None, {CUSTODY_VAR: custody_case["checkout"]}
+            )
+            # Unknown writer custody is incomplete AUTHORITY, not path
+            # ineligibility: the whole batch refuses.
+            require_batch_refusal(json.loads(out), UNKNOWN_CUSTODY)
+            fired(proof.evidence / CUSTODY_MARKER, custody_case["checkout"])
+            require(
+                not world.intents() and not world.quarantines(),
+                "a custody refusal left an intent",
+            )
+            require(
+                prior.tree_snapshot(roots["kept_group"]) == payload,
+                "the kept group root changed",
+            )
+            require(
+                world.authority(kept_group["checkout"]) == authority,
+                "the kept group's receipt or registry changed",
+            )
+            require(os.path.isdir(roots["custody"]), "the custody fixture root vanished")
+        finally:
+            # Put this case's own chain back: a later batch must see exactly its
+            # own candidate, never a leftover from this one.
+            os.rename(away, str(custody_case["token"]))
         group = [
             row
             for row in world.registry_doc()["rows"]
@@ -922,71 +963,109 @@ def run_cases(proof, custody, diagnostic, cases):
 
     case("custody-and-group", custody_and_group)
 
+    def race_plan(label: str, expected_root: str):
+        """One race plan whose ONLY candidate is the race's own root.
+
+        A leftover absent chain from another case would make the product prune a
+        second root after the delay, so an uncontrolled candidate set aborts the
+        collection instead of being read as this case's failure.
+        """
+        plan, sha, doc = world.plan_file(label, boot)
+        if world.candidates(doc) != {expected_root}:
+            raise prior.Aborted(
+                f"{label}: the fixture does not control the candidate set "
+                f"({sorted(world.candidates(doc))}); no race may run"
+            )
+        return plan, sha
+
     def witness_races():
         # (a) The checkout recreated after the real run's own snapshot. A fresh
         # absence proof already sees it present, so this proves the lock-time
-        # revalidation rather than the witness comparison.
-        vanished(world, str(recreate_race["token"]))
-        plan, sha, doc = world.plan_file("recreate plan", boot)
-        require(
-            world.candidates(doc) == {roots["recreate_race"]},
-            f"the recreate race fixture is not one candidate: {doc['candidates']}",
-        )
-        before = prior.tree_snapshot(roots["recreate_race"])
-        child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["recreate_race"]})
+        # revalidation rather than the witness comparison. The product is inside
+        # its own 11-second fixture delay while the fixture mutates, so the child
+        # is expected to be RUNNING here: settle_child waits for it.
+        away = vanished(world, str(recreate_race["token"]))
         try:
-            await_firing(
-                proof.evidence / DELAY_MARKER,
-                roots["recreate_race"],
-                child,
-                "recreate race",
+            plan, sha = race_plan("recreate plan", roots["recreate_race"])
+            before = prior.tree_snapshot(roots["recreate_race"])
+            child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["recreate_race"]})
+            try:
+                await_firing(
+                    proof.evidence / DELAY_MARKER,
+                    roots["recreate_race"],
+                    child,
+                    "recreate race",
+                )
+                os.makedirs(recreate_race["checkout"], exist_ok=True)
+            finally:
+                code, out, err, reason = settle_child(
+                    world, child, proof, "recreate race", adapter.unclosed
+                )
+            require(reason is None, f"the recreate race left custody unknown: {reason}")
+            require(code != 0, f"a recreated checkout was pruned: {out}{err}")
+            require(
+                PRESENT_KEEP in err, f"the recreated checkout was not refused as present: {err}"
             )
-            os.makedirs(recreate_race["checkout"], exist_ok=True)
+            require(prior.tree_snapshot(roots["recreate_race"]) == before, "the refused root changed")
+            require(
+                not world.intents() and not world.quarantines(),
+                "the recreate race left an intent",
+            )
+            # The product creates this seam's marker exclusively, so the second
+            # race needs its own firing: removing this case's marker is what
+            # makes the next wait prove the SECOND root's delay.
+            marker = proof.evidence / DELAY_MARKER
+            fired(marker, roots["recreate_race"])
+            marker.unlink()
         finally:
-            code, out, err, reason = settle_child(
-                world, child, proof, "recreate race", adapter.unclosed
-            )
-        require(reason is None, f"the recreate race left custody unknown: {reason}")
-        require(code != 0, f"a recreated checkout was pruned: {out}{err}")
-        require(PRESENT_KEEP in err, f"the recreated checkout was not refused as present: {err}")
-        require(prior.tree_snapshot(roots["recreate_race"]) == before, "the refused root changed")
-        require(not world.intents() and not world.quarantines(), "the recreate race left an intent")
-        # The product creates this seam's marker exclusively, so the second race
-        # needs its own firing: removing this case's marker is what makes the
-        # next wait prove the SECOND root's delay rather than a stale file.
-        marker = proof.evidence / DELAY_MARKER
-        fired(marker, roots["recreate_race"])
-        marker.unlink()
+            # The race mutation made an empty checkout directory where the chain
+            # was; remove exactly that and put the original chain back.
+            if os.path.lexists(recreate_race["checkout"]):
+                require(
+                    not os.listdir(recreate_race["checkout"]),
+                    "the recreated checkout is not empty; the fixture state is unknown",
+                )
+                os.rmdir(recreate_race["checkout"])
+            os.rename(away, str(recreate_race["token"]))
         # (b) An EXISTING ancestor replaced by a DIFFERENT empty directory while
         # the checkout stays absent. A fresh absence proof still succeeds, so
         # only the real run's own witness comparison can refuse this.
-        vanished(world, str(replace_race["path"].parent))
-        plan, sha, doc = world.plan_file("replace plan", boot)
-        require(
-            world.candidates(doc) == {roots["replace_race"]},
-            f"the replace race fixture is not one candidate: {doc['candidates']}",
-        )
-        before = prior.tree_snapshot(roots["replace_race"])
+        child_away = vanished(world, str(replace_race["path"].parent))
         ancestor = str(replace_race["path"].parent.parent)
-        child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["replace_race"]})
         try:
-            await_firing(
-                proof.evidence / DELAY_MARKER,
-                roots["replace_race"],
-                child,
-                "replace race",
+            plan, sha = race_plan("replace plan", roots["replace_race"])
+            before = prior.tree_snapshot(roots["replace_race"])
+            child = armed_real_run(world, plan, sha, {DELAY_VAR: roots["replace_race"]})
+            try:
+                await_firing(
+                    proof.evidence / DELAY_MARKER,
+                    roots["replace_race"],
+                    child,
+                    "replace race",
+                )
+                os.rename(ancestor, ancestor + "-away")
+                os.mkdir(ancestor, 0o700)
+            finally:
+                code, out, err, reason = settle_child(
+                    world, child, proof, "replace race", adapter.unclosed
+                )
+            require(reason is None, f"the replace race left custody unknown: {reason}")
+            require(code != 0, f"a replaced ancestor was pruned: {out}{err}")
+            require(WITNESS_REFUSAL in err, f"the witness comparison did not refuse: {err}")
+            require(prior.tree_snapshot(roots["replace_race"]) == before, "the refused root changed")
+            require(
+                not world.intents() and not world.quarantines(),
+                "the replace race left an intent",
             )
-            os.rename(ancestor, ancestor + "-away")
-            os.mkdir(ancestor, 0o700)
         finally:
-            code, out, err, reason = settle_child(
-                world, child, proof, "replace race", adapter.unclosed
-            )
-        require(reason is None, f"the replace race left custody unknown: {reason}")
-        require(code != 0, f"a replaced ancestor was pruned: {out}{err}")
-        require(WITNESS_REFUSAL in err, f"the witness comparison did not refuse: {err}")
-        require(prior.tree_snapshot(roots["replace_race"]) == before, "the refused root changed")
-        require(not world.intents() and not world.quarantines(), "the replace race left an intent")
+            # Undo the replacement and the vanished child exactly, so no later
+            # batch inherits an unprovable path from this case. The replacement
+            # only exists when the mutation ran.
+            if os.path.lexists(ancestor + "-away"):
+                os.rmdir(ancestor)
+                os.rename(ancestor + "-away", ancestor)
+            require(os.path.isdir(ancestor), "the replaced ancestor was not restored")
+            os.rename(child_away, str(replace_race["path"].parent))
 
     case("witness-races", witness_races)
 
@@ -1031,7 +1110,7 @@ def run_cases(proof, custody, diagnostic, cases):
             for row in world.registry_doc()["rows"]
             if row["root"] == roots["owned_chain"] and row["member"] == "debug"
         )
-        competitor, competitor_receipt, _ = write_competitor(
+        competitor, competitor_receipt = write_competitor(
             world, world.control, candidate_row, roots["owned_chain"]
         )
         try:
@@ -1098,6 +1177,51 @@ def run_cases(proof, custody, diagnostic, cases):
     return cases
 
 
+def source_structure_problems(source: str) -> list:
+    """Static problems in THIS script's own source, checked without an effect.
+
+    The reviewed defects must not be able to come back silently: every
+    `case(...)` dispatch must match the published case table exactly and in
+    order, and every helper whose value is unpacked must be unpacked into the
+    number of values it returns. It parses its own source and writes nothing.
+    """
+    import ast as _ast
+
+    problems = []
+    tree = _ast.parse(source)
+    dispatched = []
+    for node in _ast.walk(tree):
+        if (
+            isinstance(node, _ast.Call)
+            and isinstance(node.func, _ast.Name)
+            and node.func.id == "case"
+            and node.args
+            and isinstance(node.args[0], _ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            dispatched.append(node.args[0].value)
+        if (
+            isinstance(node, _ast.Assign)
+            and isinstance(node.value, _ast.Call)
+            and isinstance(node.value.func, _ast.Name)
+        ):
+            arity = {"write_competitor": 2, "settle_child": 4}.get(node.value.func.id)
+            if arity is None:
+                continue
+            targets = node.targets
+            if (
+                len(targets) != 1
+                or not isinstance(targets[0], _ast.Tuple)
+                or len(targets[0].elts) != arity
+            ):
+                problems.append(
+                    f"{node.value.func.id} is not unpacked into its {arity} values"
+                )
+    if dispatched != list(CASE_NAMES):
+        problems.append(f"the dispatcher does not match the case table: {dispatched}")
+    return problems
+
+
 def self_check() -> int:
     """Pure apparatus check: no child, no scratch, no pool, no image.
 
@@ -1119,6 +1243,9 @@ def self_check() -> int:
     require(all(seconds > 0 for _, seconds in ALLOCATION_SECONDS), "a phase has no time")
     require(all(mib > 0 for _, mib in ALLOCATION_MIB), "a phase has no scratch")
     require(set(CASE_NEEDS) == set(CASE_NAMES), "a case has no dependency entry")
+    # This file's own structure: the case table and every unpacked helper.
+    structure = source_structure_problems(Path(__file__).read_text())
+    require(not structure, f"the proof's own structure is inconsistent: {structure}")
     # A different incomplete-authority reason never satisfies an oracle, even
     # though it also keeps the whole batch.
     for expected in (
@@ -1234,9 +1361,24 @@ def self_check() -> int:
         custody_unknown = None
 
     fake = FakeProof()
+    require(custody_abort_reason(fake, set()) is None, "a clean proof could not continue")
     latch_unknown(fake, "first")
     latch_unknown(fake, "second")
     require(fake.custody_unknown == "first" and fake.closure_known is False, "the latch moved")
+    require(custody_abort_reason(fake, set()) == "first", "the latch did not gate continuation")
+    # The shared child helper's own unconfirmed closure is classified the same
+    # way, with no latch of its own.
+    unconfirmed = FakeProof()
+    unconfirmed.closure_known = False
+    require(
+        custody_abort_reason(unconfirmed, set()) is not None,
+        "unconfirmed helper closure could neither continue nor refuse the detach",
+    )
+    # A normal, reaped child whose session still holds a pid is not closed.
+    require(
+        custody_abort_reason(FakeProof(), {11}) is not None,
+        "an un-reaped session was read as closed",
+    )
     # Both /Volumes spellings are mounts, including an absent mount name; the
     # mount root itself and every non-normal spelling are invalid, and a plain
     # path is not a mount.
@@ -1288,15 +1430,12 @@ def main():
         error = exc
         traceback.print_exc()
     finally:
-        # The detach needs POSITIVE closure: the proof's own latch, an empty
-        # session and the guard's closure. A killed or unreaped child, or any
-        # recorded custody fault, refuses the detach and keeps the backing.
-        closed = (
-            proof.closure_known
-            and getattr(proof, "custody_unknown", None) is None
-            and not proof.unclosed
-        )
-        disposition = custody.detach_once(sessions_closed=closed)
+        # The detach needs POSITIVE closure: one decision shared with the
+        # diagnostic's continuation check, so a killed or unreaped child, an
+        # unconfirmed helper closure or any recorded fault is classified the
+        # same way before both. Nothing is detached on the direct child alone.
+        custody_reason = custody_abort_reason(proof, proof.unclosed)
+        disposition = custody.detach_once(sessions_closed=custody_reason is None)
     recorded = {item["case"] for item in cases}
     cases.extend(
         {"case": name, "state": "unexecuted"} for name in CASE_NAMES if name not in recorded
@@ -1305,7 +1444,7 @@ def main():
         "qualified": False if diagnostic else None,
         "cases": cases,
         "failed": sorted(item["case"] for item in cases if item["state"] == "failed"),
-        "custody_unknown": getattr(proof, "custody_unknown", None),
+        "custody_unknown": custody_reason,
         "error": None if error is None else f"{type(error).__name__}: {error}",
         "custody": custody.state,
         "detach": disposition,

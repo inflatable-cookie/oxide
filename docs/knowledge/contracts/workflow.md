@@ -5093,11 +5093,21 @@ The stable, read-only interface other tools use to find the registered Builds dr
   case asserts the exact source sentence that refused it and unchanged root
   bytes, and no case claims arbitrary-creator exclusion.
   Child custody is latched before any fallible cleanup: a killed, signalled or
-  unreaped child, a non-empty session, or any recorded custody fault marks the
-  run's closure unknown and refuses the ordinary detach (the backing is kept).
-  The uncounted diagnostic records each case and genuinely continues into cases
-  that do not depend on a failure, and aborts on an unclassifiable custody,
-  infrastructure or deadline outcome.
+  unreaped child, an unconfirmed helper closure, a non-empty session, or any
+  recorded custody fault marks the run's closure unknown, and ONE shared decision
+  then refuses the ordinary detach (the backing is kept) and stops diagnostic
+  continuation. A child that is still running is waited for, never mistaken for a
+  stuck one: the armed races mutate the fixture while the product is inside its
+  own 11-second delay. Each state-mutating case puts its own fixture back
+  (checkout chain, replaced ancestor, vanished child, registry and receipt bytes)
+  so a later batch sees exactly its own candidate, and an uncontrolled candidate
+  set aborts the collection instead of being read as a case result. The
+  uncounted diagnostic records each case and genuinely continues into cases that
+  do not depend on a failure, and aborts on an unclassifiable custody,
+  infrastructure or deadline outcome. The pure check also parses this script's
+  own source: the dispatcher must match the published case table in order, and
+  every helper whose value is unpacked must be unpacked into the number of values
+  it returns.
   `effigy rust:prune-absence:diagnostic` is the same guard, root, image and
   limits with `--diagnostic`: an uncounted keep-going collection with a bounded
   `qualified: false` receipt in the evidence directory, never a counted PASS.
