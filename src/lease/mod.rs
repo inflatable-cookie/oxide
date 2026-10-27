@@ -857,6 +857,11 @@ impl Drop for WidenedMode<'_> {
     }
 }
 
+/// One captured entry's private name, as the journal records it.
+fn capture_private(capture: &Capture) -> String {
+    String::from_utf8_lossy(capture.private.as_bytes()).into_owned()
+}
+
 /// The durable record of one capture inside the tree, built from the verified
 /// observation and the captured private name.
 fn capture_record(
@@ -866,7 +871,7 @@ fn capture_record(
 ) -> crate::owned_delete::CaptureRecord {
     crate::owned_delete::CaptureRecord {
         path: context.chain.clone(),
-        private: String::from_utf8_lossy(capture.private.as_bytes()).into_owned(),
+        private: capture_private(capture),
         original: String::from_utf8_lossy(capture.original.as_bytes()).into_owned(),
         device: observed.device,
         inode: observed.inode,
@@ -1075,16 +1080,21 @@ fn remove_tree_owned_at(
     }
     drop(repaired);
     // The record keeps the owner's original mode and is durable before the mode
-    // ever changes, so a crash can always restore exactly the owner's mode.
-    let record = capture_record(context, &capture, &observed);
-    if let Err(reason) = context.record_captured(&record) {
-        return Err(abort_capture(
-            parent,
-            &capture,
-            LeaseError::Io(format!(
-                "a captured directory could not be recorded ({reason})"
-            )),
-        ));
+    // ever changes, so a crash can always restore exactly the owner's mode. The
+    // **root** is recorded by its plan, not as a nested capture: a nested record
+    // is located by the chain of captured private names *below* the root, and
+    // the root's own private name is not inside itself.
+    let record = (!root_level).then(|| capture_record(context, &capture, &observed));
+    if let Some(record) = &record {
+        if let Err(reason) = context.record_captured(record) {
+            return Err(abort_capture(
+                parent,
+                &capture,
+                LeaseError::Io(format!(
+                    "a captured directory could not be recorded ({reason})"
+                )),
+            ));
+        }
     }
     let original_mode = observed.mode_bits();
     let widened = original_mode & 0o700 != 0o700;
@@ -1115,11 +1125,17 @@ fn remove_tree_owned_at(
             unsafe { libc::fchmod(child.as_raw_fd(), original_mode) };
         }
     };
-    context.chain.push(record.private.clone());
+    // The chain names captured parents *below* the root: the root is the
+    // base the journal's replay opens, so its own private name is not in it.
+    if !root_level {
+        context.chain.push(capture_private(&capture));
+    }
     let names = match names_of(child.as_fd()) {
         Ok(names) => names,
         Err(error) => {
-            context.chain.pop();
+            if !root_level {
+                context.chain.pop();
+            }
             restore(child.as_fd());
             return Err(abort_capture(parent, &capture, io_error(error)));
         }
@@ -1155,7 +1171,9 @@ fn remove_tree_owned_at(
         context,
         &mut || Ok::<(), crate::owned_delete::DrainStop>(()),
     );
-    context.chain.pop();
+    if !root_level {
+        context.chain.pop();
+    }
     // Anything but a positive removal restores the recorded name, so a refused
     // or pending slot is never left under a capture name the ledger cannot
     // name.
@@ -1176,7 +1194,11 @@ fn remove_tree_owned_at(
             // The directory's own removal is durable before it counts, and the
             // root's `removed` phase is what lets a replay conclude instead of
             // guessing from two absent names.
-            if let Err(reason) = context.record_removed(&record) {
+            let released = match &record {
+                Some(record) => context.record_removed(record),
+                None => Ok(()),
+            };
+            if let Err(reason) = released {
                 return Err(LeaseError::Io(format!(
                     "a captured directory's removal could not be recorded ({reason})"
                 )));

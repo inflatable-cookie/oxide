@@ -643,6 +643,43 @@ pub fn describe_entry(facts: &EntryFacts) -> String {
     )
 }
 
+/// Give one captured directory back read access for one replay step, through a
+/// search-only, no-follow descriptor of that very entry and after revalidating
+/// its identity. The recorded mode is restored again by the same path once the
+/// step is done, so this never outlives the replay work it enables.
+pub fn widen_captured_mode(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    device: u64,
+    inode: u64,
+    mode: u32,
+) -> Result<(), String> {
+    let held = open_directory_for_repair(parent, name)
+        .map_err(|error| format!("the captured directory cannot be opened ({error})"))?;
+    match descriptor_identity(held.as_fd()) {
+        Ok(identity) if identity == (device, inode) => {}
+        Ok(_) => {
+            return Err(
+                "the captured directory was replaced before its mode was widened".to_owned(),
+            )
+        }
+        Err(error) => {
+            return Err(format!(
+                "the captured directory's identity cannot be read ({error})"
+            ))
+        }
+    }
+    let bits = ((mode & 0o7777) | 0o700) as libc::mode_t;
+    // SAFETY: `held` is a live descriptor for the verified directory.
+    if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
+        return Err(format!(
+            "the captured directory cannot be widened for replay ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// Restore one captured directory's exact recorded mode through a search-only,
 /// no-follow descriptor of that very entry, after revalidating its identity.
 pub fn restore_captured_mode(

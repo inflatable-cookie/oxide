@@ -16,8 +16,8 @@ use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
 use crate::owned_delete::{
     descriptor_identity, open_directory_at, put_back, reconcile_root_capture,
-    restore_captured_mode, restore_root_capture, Capture, CaptureRecord, ForeignCapture,
-    RootCaptureJournal, RootCapturePhase, RootCapturePlan, RootCaptureState,
+    restore_captured_mode, restore_root_capture, widen_captured_mode, Capture, CaptureRecord,
+    ForeignCapture, RootCaptureJournal, RootCapturePhase, RootCapturePlan, RootCaptureState,
 };
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
@@ -2368,20 +2368,51 @@ fn rollback_captures(
     root_name: &std::ffi::CStr,
     journal: &DeletionJournal,
 ) -> Result<(), String> {
-    let root = open_directory_at(parent, root_name)
-        .map_err(|error| format!("the held tree root cannot be opened ({error})"))?;
-    let identity = descriptor_identity(root.as_fd())
-        .map_err(|error| format!("the held tree root's identity cannot be read ({error})"))?;
-    if identity != (journal.root.device, journal.root.inode) {
-        return Err("the held tree root is not the recorded root".to_owned());
-    }
-    restore_captures_in(root.as_fd(), &[], &journal.captures)
+    // The captured root may carry the owner's search-only mode, so the replay
+    // gives it read access through its own verified descriptor first, exactly
+    // as the product's repair does, and restores the recorded mode afterwards.
+    widen_captured_mode(
+        parent,
+        root_name,
+        journal.root.device,
+        journal.root.inode,
+        journal.root.mode,
+    )?;
+    let outcome = (|| {
+        let root = open_directory_at(parent, root_name)
+            .map_err(|error| format!("the held tree root cannot be opened ({error})"))?;
+        let identity = descriptor_identity(root.as_fd())
+            .map_err(|error| format!("the held tree root's identity cannot be read ({error})"))?;
+        if identity != (journal.root.device, journal.root.inode) {
+            return Err("the held tree root is not the recorded root".to_owned());
+        }
+        let mut resolved = 0;
+        restore_captures_in(root.as_fd(), &[], &journal.captures, &mut resolved)?;
+        if resolved != journal.captures.len() {
+            // A record the walk could not locate is a representation this replay
+            // cannot resolve: fail closed rather than completing past it.
+            return Err(format!(
+                "the journal records {} captures but the rollback resolved {resolved}",
+                journal.captures.len()
+            ));
+        }
+        Ok(())
+    })();
+    let restored = restore_captured_mode(
+        parent,
+        root_name,
+        journal.root.device,
+        journal.root.inode,
+        journal.root.mode,
+    );
+    outcome.and(restored)
 }
 
 fn restore_captures_in(
     base: BorrowedFd<'_>,
     chain: &[String],
     records: &[CaptureRecord],
+    resolved: &mut usize,
 ) -> Result<(), String> {
     let here: Vec<&CaptureRecord> = records
         .iter()
@@ -2389,24 +2420,56 @@ fn restore_captures_in(
         .collect();
     for record in here.iter().filter(|record| record.is_directory()) {
         let private = recorded_name(&record.private)?;
+        if crate::owned_delete::observe_entry(base, &private).is_err() {
+            // Already put back before the crash: nothing is inside it to
+            // resolve, and the observed name must hold exactly the record.
+            restore_recorded(base, record)?;
+            *resolved += 1;
+            continue;
+        }
         verify_recorded(base, &private, record)?;
+        // The same search-only case as the root: read access for this replay
+        // step, restored to the recorded mode before the put-back below.
+        widen_captured_mode(base, &private, record.device, record.inode, record.mode)?;
         let child = open_directory_at(base, &private)
             .map_err(|error| format!("a recorded captured directory cannot be opened ({error})"))?;
         let mut inner = chain.to_vec();
         inner.push(record.private.clone());
-        restore_captures_in(child.as_fd(), &inner, records)?;
+        restore_captures_in(child.as_fd(), &inner, records, resolved)?;
         restore_recorded(base, record)?;
+        *resolved += 1;
     }
     for record in here.iter().filter(|record| !record.is_directory()) {
         restore_recorded(base, record)?;
+        *resolved += 1;
     }
     Ok(())
 }
 
 /// Put one recorded capture back under its observed name, restoring a captured
 /// directory's recorded mode first. Nothing is ever unlinked here.
+///
+/// A capture whose private name is already gone but whose **observed** name
+/// holds exactly the recorded object was put back before the crash
+/// (`abort_capture` does that whenever a later step refuses): that is released,
+/// not treated as uncertainty. Any other absence is uncertain.
 fn restore_recorded(base: BorrowedFd<'_>, record: &CaptureRecord) -> Result<(), String> {
     let private = recorded_name(&record.private)?;
+    if crate::owned_delete::observe_entry(base, &private).is_err() {
+        let original = recorded_name(&record.original)?;
+        return match crate::owned_delete::observe_entry(base, &original) {
+            Ok(facts)
+                if facts.device == record.device
+                    && facts.inode == record.inode
+                    && facts.file_type() == recorded_type(record) =>
+            {
+                Ok(())
+            }
+            _ => {
+                Err("a recorded capture is neither under its private name nor put back".to_owned())
+            }
+        };
+    }
     verify_recorded(base, &private, record)?;
     if record.is_directory() {
         restore_captured_mode(base, &private, record.device, record.inode, record.mode)?;
