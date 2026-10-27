@@ -1524,19 +1524,18 @@ pub fn status_lines(control: &Path) -> Vec<String> {
         }
     ));
     for root in observation.roots.iter().take(8) {
+        let accounting = if root.accounting_complete {
+            format!("{} logical / {} allocated bytes", root.logical_bytes, root.allocated_bytes)
+        } else {
+            "unknown/incomplete accounting".to_owned()
+        };
         lines.push(format!(
-            "  {} {} {} ({}, {} logical / {} allocated bytes{})",
+            "  {} {} {} ({}, {})",
             root.outcome,
             root.checkout_id,
             root.root.display(),
             root.intent.as_deref().unwrap_or("no intent"),
-            root.logical_bytes,
-            root.allocated_bytes,
-            if root.accounting_complete {
-                ""
-            } else {
-                ", partial accounting"
-            }
+            accounting,
         ));
     }
     if observation.roots.len() > 8 {
@@ -1597,6 +1596,30 @@ struct Evaluated {
     legacy: bool,
 }
 
+/// The authority result is distinct from per-root eligibility. A partial
+/// authority view never supplies candidates or diagnostic observations.
+struct Evaluation {
+    entries: Vec<Evaluated>,
+    complete: bool,
+}
+
+impl std::ops::Deref for Evaluation {
+    type Target = [Evaluated];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl<'a> IntoIterator for &'a Evaluation {
+    type Item = &'a Evaluated;
+    type IntoIter = std::slice::Iter<'a, Evaluated>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 /// `oxide outputs prune --dry-run`
 fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
     let store = paired_store()?;
@@ -1622,7 +1645,7 @@ fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
         ));
     }
     let evaluated = evaluate(&store, &control, &registry, list.as_ref())?;
-    let preview = build_preview(&registry, &evaluated, list.as_ref());
+    let preview = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete);
     preview.validate()?;
     let bytes = serde_json::to_vec(&preview).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_PLAN_BYTES {
@@ -1776,7 +1799,15 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         }
         Err(reason) => return Err(reason),
     };
-    let fresh = build_preview(&registry, &evaluated, list.as_ref());
+    let fresh = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete);
+    if !fresh.coverage.complete {
+        let reason = "the fresh authority snapshot is incomplete, so every remaining root is kept";
+        return Ok(if completed_roots.is_empty() {
+            refused(reason)
+        } else {
+            partial(&completed_roots, reason)
+        });
+    }
     let plan_set: Vec<&Candidate> = preview
         .candidates
         .iter()
@@ -2046,7 +2077,7 @@ fn evaluate(
     control: &Path,
     registry: &Registry,
     list: Option<&OperatorList>,
-) -> Result<Vec<Evaluated>, String> {
+) -> Result<Evaluation, String> {
     let deadline = Instant::now() + SNAPSHOT_TIME;
     let mut budget = SNAPSHOT_MAX_BYTES;
     let mut receipts: std::collections::HashMap<String, Result<Receipt, String>> =
@@ -2088,7 +2119,7 @@ fn evaluate(
     let rows = grouped;
     if rows.len() > SNAPSHOT_MAX_RECEIPTS {
         // A cap is not permission to consider part of the registry.
-        return Ok(rows
+        return Ok(Evaluation { entries: rows
             .into_iter()
             .map(|row| Evaluated {
                 row,
@@ -2099,9 +2130,13 @@ fn evaluate(
                 ),
                 legacy: false,
             })
-            .collect());
+            .collect(), complete: false });
     }
-    let mut snapshot_error: Option<String> = None;
+    let mut snapshot_error: Option<String> = if registry.complete {
+        None
+    } else {
+        Some("the registry is sticky-incomplete".to_owned())
+    };
     for row in rows {
         let entry = receipts.entry(row.checkout_id.clone()).or_insert_with(|| {
             match outputs::read_receipt_for_prune_budgeted(
@@ -2157,6 +2192,7 @@ fn evaluate(
                         continue;
                     }
                     Ok(RootState::Unknown(reason)) | Err(reason) => {
+                        snapshot_error.get_or_insert_with(|| reason.clone());
                         out.kept = Some(reason);
                         evaluated.push(out);
                         continue;
@@ -2185,7 +2221,11 @@ fn evaluate(
                     receiptless: false,
                 });
             }
-            Ok(Some(reason)) | Err(reason) => out.kept = Some(reason),
+            Ok(Some(reason)) => out.kept = Some(reason),
+            Err(reason) => {
+                snapshot_error.get_or_insert_with(|| reason.clone());
+                out.kept = Some(reason);
+            }
         }
         evaluated.push(out);
     }
@@ -2241,7 +2281,7 @@ fn evaluate(
                 "the registry snapshot is incomplete ({reason}); the whole batch is kept"
             ));
         }
-        return Ok(evaluated);
+        return Ok(Evaluation { entries: evaluated, complete: false });
     }
     // One root may not be selected by two live references.
     let mut counts: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
@@ -2261,7 +2301,7 @@ fn evaluate(
         }
     }
     account_candidates(&mut evaluated);
-    Ok(evaluated)
+    Ok(Evaluation { entries: evaluated, complete: true })
 }
 
 /// The eligibility predicates for one row. `Ok(None)` means every predicate
@@ -2332,15 +2372,11 @@ fn eligibility(
                 || selected.generation() != row.generation
                 || selected.kind() != row.root_kind
             {
-                return Ok(Some(
-                    "the registry row does not match the checkout's committed receipt".to_owned(),
-                ));
+                return Err("the registry row does not match the checkout's committed receipt".to_owned());
             }
         }
         _ if row.selected => {
-            return Ok(Some(
-                "the registry selects this root but the checkout's receipt does not".to_owned(),
-            ))
+            return Err("the registry selects this root but the checkout's receipt does not".to_owned())
         }
         _ => {}
     }
@@ -2375,7 +2411,7 @@ fn eligibility(
             ))
         }
         Ok(Absence::Unknown(reason)) | Err(reason) => {
-            return Ok(Some(format!("checkout absence is unknown ({reason})")))
+            return Err(format!("checkout absence is unknown ({reason})"))
         }
     }
     // Writer custody across both pools, and library ledger holders. A
@@ -2397,7 +2433,7 @@ fn eligibility(
             ))
         }
         CheckoutCustody::Unknown(reason) => {
-            return Ok(Some(format!("writer custody is unknown ({reason})")))
+            return Err(format!("writer custody is unknown ({reason})"))
         }
     }
     for holder in store::active_holders(control, &row.checkout)? {
@@ -2416,9 +2452,9 @@ fn eligibility(
             }
         }
         Err(reason) => {
-            return Ok(Some(format!(
+            return Err(format!(
                 "the removable pool's writer records are unreadable ({reason})"
-            )))
+            ))
         }
     }
     if *budget > 0 {
@@ -3030,6 +3066,7 @@ fn build_preview(
     registry: &Registry,
     evaluated: &[Evaluated],
     list: Option<&OperatorList>,
+    authority_complete: bool,
 ) -> Preview {
     let candidates: Vec<Candidate> = evaluated
         .iter()
@@ -3056,7 +3093,7 @@ fn build_preview(
             registry_roots: registry.rows.len() as u64,
             candidate_roots: candidates.len() as u64,
             kept_roots: kept.len() as u64,
-            complete: registry.complete,
+            complete: authority_complete,
             source: "internal output registry".to_owned(),
             observed_ms: process::now_ms(),
         },
@@ -6641,7 +6678,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
         };
-        let preview = build_preview(&registry, &[], None);
+        let preview = build_preview(&registry, &[], None, registry.complete);
         let first = serde_json::to_vec(&preview).unwrap();
         let second = serde_json::to_vec(&preview).unwrap();
         assert_eq!(first, second);
@@ -6950,6 +6987,8 @@ mod tests {
         write_registry(&control, &registry).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
         let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        assert!(!evaluated.complete);
+        assert!(!build_preview(&registry, &evaluated, None, evaluated.complete).coverage.complete);
         assert!(evaluated.iter().all(|entry| entry.candidate.is_none()));
         assert!(evaluated.iter().all(|entry| entry
             .kept
