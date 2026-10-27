@@ -5914,6 +5914,67 @@ mod tests {
         outcome
     }
 
+    #[test]
+    fn seed_with_no_catalog_does_not_verify_sources_or_write_sidecars() {
+        use std::ffi::{CStr, CString, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+        let template = std::env::temp_dir().join("oxide-seed-front.XXXXXX");
+        let mut name = CString::new(template.as_os_str().as_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        // SAFETY: name is writable, NUL-terminated and ends in XXXXXX.
+        assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+        let name = CStr::from_bytes_until_nul(&name).unwrap();
+        let root = fs::canonicalize(PathBuf::from(OsStr::from_bytes(name.to_bytes()))).unwrap();
+        let pool = root.join("pool");
+        init_budget_pool(&pool, 1 << 30).unwrap();
+        let store = Store {
+            control: pool.join(MANAGED_NAME),
+            payload: pool.join("payload"),
+            pool: pool.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: Some(1 << 30),
+            recorded_budget: 1 << 30,
+            max_active: 16,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "identity".into(),
+            compatibility: "quick-key".into(),
+        };
+        let held = lease(&store, &key, None).expect("fresh lease");
+        let lock = format!("version = 4\n[[package]]\nname = 'leaf'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let producer = oxide_storage::lease::managed::SeedProducer {
+            cargo_version: "cargo".into(),
+            rustc_digest: "digest".into(),
+            rustc: "rustc".into(),
+            target: "target".into(),
+            recipe: "quick".into(),
+            backend: "backend".into(),
+            adapter: "adapter".into(),
+            context_digest: "context".into(),
+            config_files: vec![],
+            flags_digest: "flags".into(),
+            cargo_home: "/cargo".into(),
+            command_family: "check".into(),
+            command_class: "check".into(),
+        };
+        let before = fs::read(store.control.join("state.json")).unwrap();
+        let result = store.seed(&held, &producer, &lock, |_| {
+            panic!("source verification ran")
+        });
+        assert!(matches!(result, Ok(SeedRun::Skipped("no eligible donor"))));
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        assert!(!store.control.join("seeds").exists());
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// Second-slot rule: a busy slot of this checkout's key sends a further
     /// command to another idle compatible slot or a new one; a slot whose
     /// holder died while its group lives is never reused; with no safely

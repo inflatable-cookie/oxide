@@ -148,7 +148,99 @@ pub(crate) struct Production {
     started_ms: u64,
 }
 
+pub(crate) enum PreparationError {
+    Skip(&'static str),
+    Refuse(String),
+}
+
 impl Production {
+    /// Prepare from the same working directory and environment Cargo will
+    /// inherit. This is called only after the qualification gate is open.
+    pub fn prepare(
+        invocation: &crate::cli::Invocation,
+        checkout: &Path,
+        held: &crate::store::Lease,
+        store: &crate::store::Store,
+    ) -> Result<Self, PreparationError> {
+        use crate::seed_context::{collect, producer, ProducerFacts};
+        if held.reused || !matches!(held.prior, crate::freshness::Prior::Fresh) {
+            return Err(PreparationError::Skip("recipient not fresh"));
+        }
+        if store.backend != crate::store::Backend::DirectoryBudget {
+            return Err(PreparationError::Skip(
+                "seeding not yet supported on a removable pool",
+            ));
+        }
+        if !invocation.tool.is_empty()
+            || invocation.targets.len() > 1
+            || invocation.cargo_args.iter().any(|arg| {
+                use std::os::unix::ffi::OsStrExt;
+                arg.as_os_str().as_bytes().starts_with(b"-Z")
+            })
+        {
+            return Err(PreparationError::Skip("unsupported command"));
+        }
+        let lock =
+            crate::seed_lock::read(&checkout.join("Cargo.lock")).map_err(PreparationError::Skip)?;
+        if lock.eligible.is_empty() {
+            return Err(PreparationError::Skip("no eligible locked packages"));
+        }
+        let cwd = std::env::current_dir()
+            .map_err(|_| PreparationError::Skip("working directory unavailable"))?;
+        let cargo_home = crate::cargo_home::resolve()
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .ok_or(PreparationError::Skip("Cargo home unavailable"))?;
+        let environment: Vec<_> = std::env::vars_os().collect();
+        let context = collect(&cwd, &cargo_home, &invocation.cargo_args, &environment)
+            .map_err(PreparationError::Skip)?;
+        let cargo = crate::freshness::verified_cargo()
+            .map_err(|_| PreparationError::Skip("unsupported Cargo"))?;
+        let rustc = crate::identity::rustc_version(None)
+            .map_err(|_| PreparationError::Skip("compiler unavailable"))?;
+        let target = invocation
+            .target
+            .clone()
+            .or_else(|| {
+                std::env::var("CARGO_BUILD_TARGET")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                rustc
+                    .lines()
+                    .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+            })
+            .ok_or(PreparationError::Skip("target unavailable"))?;
+        let compiler = std::env::var_os("RUSTC");
+        let producer = producer(
+            ProducerFacts {
+                cargo_version: &cargo,
+                rustc_version: &rustc,
+                rustc: compiler.as_deref(),
+                target: &target,
+                recipe: invocation.profile.recipe_key(),
+                backend: store.backend.tag(),
+                cargo_home: &cargo_home,
+                command: &invocation.command,
+            },
+            context,
+        )
+        .map_err(PreparationError::Skip)?;
+        let cache_path = store
+            .pool
+            .join(oxide_storage::lease::MANAGED_NAME)
+            .join("seeds/sources.json");
+        let cache = SourceCache::read(&cache_path, &held.store_id);
+        Self::begin(producer, lock, cargo_home, cache).map_err(|reason| {
+            if reason == "git source verification closure unknown" {
+                PreparationError::Refuse(reason.to_owned())
+            } else {
+                PreparationError::Skip(reason)
+            }
+        })
+    }
+
     pub fn begin(
         producer: oxide_storage::lease::managed::SeedProducer,
         lock: crate::seed_lock::Analysis,

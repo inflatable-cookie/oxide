@@ -518,7 +518,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let mut grants = LeaseGrants::new();
     let resolution = cli::resolution(&invocation.cargo_args);
     let label = exec_label(&invocation.tool);
-    let (mut held, gate) = match lease_with_gate(
+    let (mut held, mut gate) = match lease_with_gate(
         &store,
         &key,
         invocation.profile,
@@ -550,7 +550,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // for every other cooperative command in the checkout to close and blocks
     // new ones until the link is published. It binds exactly the destination
     // the slot was keyed for, or refuses.
-    let binding = match outputs::bind_for_command(
+    let mut binding = match outputs::bind_for_command(
         &store,
         &key.checkout,
         held.record_id(),
@@ -578,6 +578,78 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         let origin = held.prior.unchanged();
         store.release(held, origin)?;
         return Ok(stop_for_admission());
+    }
+    // The seed point is after the output binding and before any recipient
+    // scratch or writer. The qualification gate is false in this slice.
+    let mut production = None;
+    if cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref()) {
+        match seed_sources::Production::prepare(&invocation, &key.checkout, &held, &store) {
+            Ok(mut prepared) => match prepared.seed(&store, &held) {
+                Ok(store::SeedRun::Skipped(reason)) => {
+                    eprintln!("oxide: seeding skipped: {reason}");
+                    production = Some(prepared);
+                }
+                Ok(store::SeedRun::Seeded(_, last)) => {
+                    eprintln!("{}", seed_summary::summary(&last));
+                    production = Some(prepared);
+                }
+                Ok(store::SeedRun::Abandoned) => {
+                    drop(binding);
+                    store.release(held, None)?;
+                    grants.share = false;
+                    (held, gate) = match lease_with_gate(
+                        &store,
+                        &key,
+                        invocation.profile,
+                        &resolution,
+                        label.as_deref(),
+                        &mut waits,
+                        &mut grants,
+                    )? {
+                        Ok(leased) => leased,
+                        Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
+                        Err(Stop::Cargo(code)) => return Ok(code),
+                        Err(Stop::Admission) => return Ok(stop_for_admission()),
+                    };
+                    binding = match outputs::bind_for_command(
+                        &store,
+                        &key.checkout,
+                        held.record_id(),
+                        planned.as_ref(),
+                        pool_fallback.as_deref(),
+                        derives_from_receipt,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(reason) => {
+                            let origin = held.prior.unchanged();
+                            store.release(held, origin)?;
+                            if budget::admission_expired() {
+                                return Ok(stop_for_admission());
+                            }
+                            return Err(reason);
+                        }
+                    };
+                    eprintln!("oxide: seeding skipped: recipient walk incomplete");
+                }
+                Err(reason) => {
+                    drop(binding);
+                    store.release(held, None)?;
+                    if budget::admission_expired() {
+                        return Ok(stop_for_admission());
+                    }
+                    return Err(reason);
+                }
+            },
+            Err(seed_sources::PreparationError::Skip(reason)) => {
+                eprintln!("oxide: seeding skipped: {reason}");
+            }
+            Err(seed_sources::PreparationError::Refuse(reason)) => {
+                drop(binding);
+                let origin = held.prior.unchanged();
+                store.release(held, origin)?;
+                return Err(reason);
+            }
+        }
     }
     for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
@@ -818,6 +890,13 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let note = notes.join(", ");
     let note = (!note.is_empty()).then_some(note);
     let origin = gate.finish(&key.checkout);
+    let seed_profile = if invocation.profile == Profile::Release
+        || (invocation.command == "bench" && !invocation.explicit_profile)
+    {
+        "release"
+    } else {
+        "debug"
+    };
     // A converted checkout's `run` keeps its lease through the program: the
     // program runs as this command's own process group from the real root
     // it bound, under the same custody (a relink waits, a clean waits),
@@ -872,6 +951,8 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             execution_started,
             &mut budget_stop,
             &chosen_temp,
+            production,
+            seed_profile,
         );
     }
     // An unconverted `run` program is an Oxide-launched child too, and when
@@ -912,7 +993,22 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             execution_started,
             &mut budget_stop,
             &chosen_temp,
+            production,
+            seed_profile,
         );
+    }
+    if let Some(producing) = production {
+        let successful = outcome
+            .as_ref()
+            .is_ok_and(|(status, _, _)| status.is_some_and(|status| status.success()))
+            && stopped.is_none()
+            && budget::origin().is_none();
+        if let Err(reason) =
+            producing.publish(&store, &held, successful, origin.as_ref(), seed_profile)
+        {
+            store.release(held, None)?;
+            return Err(reason);
+        }
     }
     store.release(held, origin)?;
     let (status, executable, drained) = outcome?;
@@ -1024,6 +1120,8 @@ fn run_owned_program(
     execution_started: Option<Instant>,
     budget_stop: &mut process::Stop,
     child_temp: &child_temp::Chosen,
+    production: Option<seed_sources::Production>,
+    seed_profile: &str,
 ) -> Result<u8, String> {
     let mut command = Command::new(program);
     command.args(args).env("CARGO_MANIFEST_DIR", manifest_dir);
@@ -1101,6 +1199,17 @@ fn run_owned_program(
             &format!("run program group {} did not close after KILL", group.id),
         )?;
         return Ok(1);
+    }
+    if let Some(producing) = production {
+        let successful = status.is_some_and(|status| status.success())
+            && stopped.is_none()
+            && budget::origin().is_none();
+        if let Err(reason) =
+            producing.publish(store, &held, successful, origin.as_ref(), seed_profile)
+        {
+            store.release(held, None)?;
+            return Err(reason);
+        }
     }
     store.release(held, origin)?;
     if let Some(origin) = budget::origin() {
