@@ -1183,38 +1183,43 @@ untrusted generation. No reference to the donor remains — no hard link, no
 symlink, no shared extent bookkeeping (APFS may share extents, which Oxide
 neither measures nor claims, §8).
 
-### 6.5 Failure: abandon before the first clone, otherwise retain and refuse
+### 6.5 Failure: abandon before the first clone or on a failed recipient walk; refuse every other post-clone fault
 
 Seeding never renames or deletes inside the recipient, because the library's
 journaled deletion is `Evicting`-only with no lease (`src/lease/pool.rs:1963-1981`),
 an unrecorded `.oxide-capture-*` name is refused (`src/lease/mod.rs:913-928`),
 and owned deletion needs caller-owned durable intent while unjournaled residue
 is never consumed (`src/owned_delete.rs:37-48,580-585`). There is therefore no
-in-slot "reset" path at all; the design has exactly three outcome classes:
+in-slot "reset" path at all. The outcome classes are:
 
 - **Abandon before the first clone.** A skip (no donor, no overlap, an
   ineligible package, a cap, the seed's own cooperative deadline) or a
   selection/plan/source failure writes nothing to the recipient: the attempt
   record becomes `skipped` and the command builds cold in the same empty slot.
   A reserve or ownership fault instead refuses before any child (§8.3, §13).
-- **First-clone boundary (the distinction inside those classes).** The first
-  `clonefile` is the point of no return: before it, abandoning is free and the
-  command still builds cold; after it, the recipient is untrusted and the
-  command refuses.
-- **After the first clone, a failed recipient walk abandons seeding only.** A
-  bound-limited, ownership, device, boundary, read or otherwise incomplete or
-  failed post-clone walk (§6.3 step 7) is not a command failure: the seed is
-  abandoned, the cloned recipient is marked untrusted and retained (never
-  reused), and the command continues as an ordinary cold build under normal
-  admission — the normal wait, capacity and reserve behaviour and the ordinary
-  nine-grant loop, with no reserved or failure-specific grant. If normal
-  admission refuses, the command refuses at that point.
-- **After the first clone, any other fault refuses and retains.** A clone, digest or
-  file-type error, a donor transition, a reserve breach, an unreadable path, an
-  incomplete or unclean post-clone walk, or an admission that cannot be proved
-  from it all stop the seed, record the attempt as `reset` (meaning abandoned,
-  not repaired), release the recipient lease with no trusted origin, and the
-  command **refuses** with a non-zero exit. There is no second lease, no extra
+- **First-clone boundary.** The first `clonefile` is the point of no return for
+  *trust*: before it, abandoning is free and the command still builds cold; after
+  it, the recipient is untrusted. What happens next depends on the fault: a
+  failed recipient walk abandons the seed and cold-builds (§ below), while every
+  other post-clone fault refuses.
+- **After the first clone, a failed recipient walk abandons seeding and
+  cold-builds.** A bound-limited, ownership, device, boundary, read or otherwise
+  incomplete or failed post-clone walk (§6.3 step 7) is not a command failure:
+  the seed is abandoned, nothing is published, and the cloned recipient is
+  marked untrusted with no trusted origin. It is **released first through the
+  ordinary release path** — including the removable flush-before-idle, which
+  retires the slot instead of marking it idle if the flush fails — and is never
+  reused and never built in. The command then continues as an **ordinary cold
+  build in a normally admitted slot**: the normal wait, host-limit, capacity and
+  reserve start-gate behaviour and the ordinary nine-grant loop apply, with no
+  extra, reserved or failure-specific grant. If normal admission waits or
+  refuses, the command follows that outcome.
+- **After the first clone, every other fault refuses and retains.** A clone,
+  digest or file-type error, a donor transition, a reserve breach or an
+  unreadable path stops the seed, records the attempt as `reset` (meaning
+  abandoned, not repaired), releases the recipient lease with no trusted
+  origin, and the command **refuses** with a non-zero exit. (The failed-walk
+  case above is the one post-clone outcome that does not refuse.) There is no second lease, no extra
   grant, no rebind and no fresh-slot cold build on this path. It does not start Cargo over the
   partially seeded slot and it does not delete anything in it: the untrusted
   origin and the `reset` attempt record keep the generation from being reused
@@ -1223,14 +1228,15 @@ in-slot "reset" path at all; the design has exactly three outcome classes:
   deletion machinery this design uses. Retention until that eviction is the
   documented cost of a post-clone fault; no new capture format, journal, replay
   boundary or downgrade fence is introduced.
-- **Crash during the clone or the release.** Same as above: the durable
-  untrusted origin and the `intent`/`reset` attempt record survive, no trusted
-  origin is written, and the next command evicts the generation whole. A crash
-  during the **reset-record write** itself leaves the previous state (`intent`)
-  or the origin, both non-trusted and non-publishable.
+- **Crash during the clone or the release.** The refusal path's outcome: the
+  durable untrusted origin and the `intent`/`reset` attempt record survive, no
+  trusted origin is written, no Cargo runs in the slot, and the next command
+  evicts the generation whole. A crash during the **reset-record write** itself
+  leaves the previous state (`intent`) or the origin, both non-trusted and
+  non-publishable.
 
-**Refuse-path boundaries (release, flush, rebind, accounting).** Because there is
-no second lease on this path, each boundary is named once:
+**Refuse-path boundaries (release, flush, rebind, accounting).** Because the
+refusal path takes no second lease, each boundary is named once:
 
 - **Release.** `Store::release` runs the ordinary path with no trusted origin:
   the owned child temp is discarded if present (it is not, since the seed
@@ -1253,6 +1259,16 @@ no second lease on this path, each boundary is named once:
   its bytes and its capture residue under the #155 rules. The post-clone
   `observed-while-held` fact stays a bounded observation of that generation and
   dies with it.
+
+**Failed-walk boundaries (the one post-clone path that cold-builds).** Release,
+flush, retention and admission are named once: the untrusted recipient is
+released through `Store::release` with no trusted origin (removable
+flush-before-idle; a failed flush retires it), so no child is ever started in
+it; the release also drops the output binding, and the cold build is an
+ordinary fresh lease from the normal loop (normal waits, capacity, reserve gate
+and grant bound). The abandoned slot is idle-but-untrusted and is evicted
+before any reuse; its next admission figure is a walk or the journaled
+deletion, never a zero.
 
 ### 6.6 Crash matrix
 
@@ -1745,7 +1761,7 @@ missing lock, and any package/unit outside the whitelist.
 | removable volume lost after the first clone | the existing removal/quarantine path runs; the untrusted generation is retained, never a generic cold build |
 | donor became held/evicting/retired before the first clone, or volume mismatch | **skip** (`donor busy`), cold build; seeding never blocks the build |
 | donor custody unknown before the first clone (a competing acquire, eviction or release) | **skip**, cold build with the custody reason; no donor payload read, no clone |
-| post-clone walk incomplete, unknown or failed (bound, ownership, device, boundary or read) | **abandon seeding only**: publish nothing, mark the cloned recipient untrusted and retain it (never reused), then continue as an ordinary cold build under normal admission; no extra grant |
+| post-clone walk incomplete, unknown or failed (bound, ownership, device, boundary or read) | **abandon seeding only**: publish nothing, release the untrusted recipient through the ordinary release (removable flush-before-idle; retire on failed flush), never reuse or build in it, then cold-build in a normally admitted slot; no extra grant |
 | the ordinary cold build's normal admission waits or refuses | the normal wait/refusal outcome applies; the abandoned recipient is still retained and untrusted |
 | a clone, digest or file-type check fails after the first clone | abandon, retain the untrusted generation, **refuse**; no Cargo runs in the slot |
 | donor path or volume identity cannot be established | **refuse** (unknown ownership is not a cold fallback) |
@@ -2084,11 +2100,12 @@ the selected-volume rule.
     boundary, an entry-limit truncation (bound) and a walk that fails outright —
     must prove the same four things: **no publication** (no `seeded` claim, no
     last-seed sidecar, no summary "seeded" line and the reported
-    `seeding skipped`/abandon reason), the cloned recipient **marked untrusted
-    and retained** (never reused by a later command, removed only by the
-    ordinary journaled `Prior::Unknown` eviction), and the command completing as
-    an **ordinary cold build under normal admission** with the ordinary grant
-    bound and no extra or reserved grant. The controls are non-vacuous: the same
+    `seeding skipped`/abandon reason), the cloned recipient **marked untrusted,
+    released through the ordinary release path and retained** (never reused,
+    never built in, removed only by the ordinary journaled `Prior::Unknown`
+    eviction), and the command completing as an **ordinary cold build in a
+    normally admitted slot** with the ordinary grant bound and no extra or
+    reserved grant. The controls are non-vacuous: the same
     fixture with no injection publishes normally.
 
 ### 16.3 Runner, bounds, clocks and activation
@@ -2177,7 +2194,7 @@ names the measured analogue or the work performed):
 | 17 registry tamper controls, 21 artifact collisions | 2-4 s each, 10-20 s | archive/tree/plan mutations, no or one tiny Cargo call |
 | 22 competing acquire between selection and the pin (skip, cold build) | 3-6 s | a debug pause plus one competing `oxide` command and a tiny cold build |
 | 23 ambiguous-name visibility | 2-4 s | one tiny build plus summary/status rendering |
-| 24 post-clone walk and admission recheck (three controls) | 2-6 s | a tiny walked slot, two refusals and the retained generations |
+| 24 post-clone walk (two controls) | 2-6 s | a tiny walked slot and the retained generations after a failed walk |
 | cleanup, receipts and the phase table inside the guard | 5-10 s | bounded writes and one detach |
 
 The upper estimates sum to **271 s of the 300 s bound** (the lower estimates to
@@ -2203,9 +2220,11 @@ comparison as the proof.
    recipient and continues as an ordinary cold build under normal admission
    with no extra grant) and the §7 rule that a leased/evicting/unknown donor is
    a `donor busy` skip rather than a block?
-2. Is the §6.5 abandon/retention policy accepted in place of an in-slot reset,
-   with post-first-clone faults refusing and leaving the untrusted generation to
-   the existing journaled eviction?
+2. Is the §6.5 policy accepted in place of an in-slot reset — a failed
+   recipient walk abandons the seed, releases the untrusted recipient and
+   cold-builds in a normally admitted slot, while every other post-first-clone
+   fault refuses and leaves the untrusted generation to the existing journaled
+   eviction?
 3. Is the §4.2 dep-info grammar accepted — output rules distinguished from
    rustc's empty phony source rules, phony targets matched to accepted
    prerequisites inside the verified source root, and the fingerprint /
