@@ -2083,7 +2083,11 @@ fn adopt_at(
     if guarded_workspace(context.control(), &context.workspace).is_some() {
         return Err(guarded_adopt_refusal(context));
     }
-    let internal = pool()?;
+    // Otherwise the shipped order is kept **exactly**, including its error
+    // precedence: drive mode, then the control directory, then the pool. The
+    // pool provider is therefore called last, so a dormant build reports the
+    // same refusal a pre-S1 build reported when more than one precondition is
+    // unmet.
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
         return Err(format!(
@@ -2097,6 +2101,7 @@ fn adopt_at(
                 .to_owned(),
         );
     };
+    let internal = pool()?;
     let Some(internal) = internal else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
@@ -16938,6 +16943,96 @@ mod tests {
         // one and the guarded answer is the guard's, on the same bytes.
         assert_ne!(refused, active.0);
         assert!(!crate::one_use::is_active());
+    }
+
+    /// A guarded refusal must not create the pool's admission lock: every lock
+    /// a guarded verb touches before it decides is the checkout binding mutex
+    /// (design §4.1 step 4). The admission lock is created only when the verb
+    /// proceeds.
+    #[test]
+    fn a_guarded_refusal_creates_no_admission_lock() {
+        let fixture = GuardFixture::new("no-admission-lock");
+        fixture.write(&fixture.committed());
+        let admission = fixture.control().join("admission.lock");
+        let _ = fs::remove_file(&admission);
+        assert!(!admission.exists(), "the fixture starts without the lock");
+        crate::store::dead_record_for_tests(&fixture.store, &fixture.checkout, 7);
+        let refused = crate::one_use::with_active(|| {
+            detach_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+            .unwrap_err()
+        });
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(
+            !admission.exists(),
+            "a dead-custody refusal created the admission lock"
+        );
+
+        // Unknown custody the same way.
+        let fixture = GuardFixture::new("no-admission-lock-unknown");
+        fixture.write(&fixture.committed());
+        let admission = fixture.control().join("admission.lock");
+        let _ = fs::remove_file(&admission);
+        crate::store::save_default_state_for_tests(&fixture.store);
+        fs::write(fixture.control().join("state.json"), b"{not json").unwrap();
+        let refused = crate::one_use::with_active(|| {
+            cancel_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+            .unwrap_err()
+        });
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(
+            !admission.exists(),
+            "an unknown-custody refusal created the admission lock"
+        );
+
+        // Non-vacuity: a clear checkout takes the barrier, so the lock is
+        // created there — the creation belongs to the proceeding path only.
+        let fixture = GuardFixture::new("no-admission-lock-proceed");
+        fixture.write(&fixture.committed());
+        let admission = fixture.control().join("admission.lock");
+        let _ = fs::remove_file(&admission);
+        let _ = crate::one_use::with_active(|| {
+            detach_at(&fixture.context(), || {
+                Ok(Some(fixture.store.handle_for_tests()))
+            })
+        });
+        assert!(
+            admission.exists(),
+            "the proceeding path acquires the admission lock"
+        );
+    }
+
+    /// The shipped (dormant) `adopt` keeps its **error precedence**: drive mode
+    /// first, then the control directory, then the pool. A dormant build must
+    /// report the pre-S1 refusal even when the pool provider also fails, while
+    /// the guarded build refuses before any of them.
+    #[test]
+    fn a_dormant_adopt_keeps_the_shipped_error_precedence() {
+        let fixture = GuardFixture::new("dormant-adopt-precedence");
+        let failing = || -> Result<Option<Store>, String> {
+            Err("the removable registration is unreadable".to_owned())
+        };
+        assert!(!crate::one_use::is_active());
+        let refused = adopt_at(&fixture.context(), failing).unwrap_err();
+        assert!(
+            refused.starts_with("outputs adopt needs permanent drive mode (mode is unregistered)"),
+            "the shipped drive-mode refusal wins: {refused}"
+        );
+        // With the switch on the guarded refusal comes first, whatever the
+        // registry or pool says.
+        let refused = crate::one_use::with_active(|| {
+            adopt_at(&fixture.context(), || -> Result<Option<Store>, String> {
+                Err("the removable registration is unreadable".to_owned())
+            })
+            .unwrap_err()
+        });
+        assert!(
+            refused.contains("one-use (temporary) workspace"),
+            "{refused}"
+        );
     }
 
     /// The guarded verbs decide **before** the pool is opened or coordinated:

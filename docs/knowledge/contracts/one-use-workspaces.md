@@ -62,6 +62,19 @@ implementation review corrected:
   unconditionally, so a malformed or mismatched document selects the general
   guarded refusal and only a `Prepared` transition selects the §4.4
   diagnostic.
+- **A guarded refusal creates no lock file.** The admission locks are only
+  *probed* (never created) before the busy decision: `AdmissionProbe::Absent`
+  means no other command has ever entered a critical section on that pool, so
+  the decision is safe without the lock and a dead or unknown refusal leaves the
+  pool exactly as it found it. The lock is created only on the proceeding path,
+  under which the decision is taken again. The removables' sibling state is read
+  through a checked reader that keeps absence (`Ok(None)`) apart from any other
+  failure — a symlinked *or dangling* document, an inaccessible ancestor, an
+  invalid document — which refuses as unknown custody.
+- **The dormant `adopt` keeps the shipped error precedence.** Drive mode, then
+  the control directory, then the pool: the lazy pool provider is called last,
+  so a dormant build reports the pre-S1 refusal when several preconditions are
+  unmet, while the guarded build refuses before any of them.
 - **The activation switch is thread-local and panic-safe.** A test-only guard
   sets the flag on its own thread and restores the previous value on drop, so a
   parallel dormant test never observes an active feature and a panicking body
