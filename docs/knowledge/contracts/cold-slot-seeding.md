@@ -1235,6 +1235,12 @@ in-slot "reset" path at all. The outcome classes are:
   leaves the previous state (`intent`) or the origin, both non-trusted and
   non-publishable.
 
+> **Implementation note (freeze amendment `eccede9f`).** Slice 2 takes the
+> point of no return to be the first write of any kind into the recipient,
+> including directory creation: before it a fault skips; from it onward a
+> fault refuses and retains, while a failed recipient walk still abandons and
+> cold-builds in a newly admitted slot.
+
 **Refuse-path boundaries (release, flush, rebind, accounting).** Because the
 refusal path takes no second lease, each boundary is named once:
 
@@ -1845,13 +1851,14 @@ This design mints none of that.
 
 > **Implementation note (Oxide Supervisor ruling, PR #159 head `394c0c6`).**
 > Slice 2 is implemented for the internal `directory-budget-v1` pool under the
-> Standard tier. Its removable `apfs-volume-v1` custody is reassigned to a new
-> **Elevated slice 4**, which carries the removable-media native case that
-> validates it; the existing proof-apparatus and knowledge slices follow it.
-> The frozen eventual behaviour of §§6–8 is unchanged: this is a slice and
-> validation reassignment, not a contract change. Slice 2 reports an
-> `apfs-volume-v1` pool as the skip "seeding not yet supported on a removable
-> pool" and takes the normal cold build until slice 4 lands.
+> Standard tier. Its removable `apfs-volume-v1` custody is reassigned to one
+> **Elevated slice 4** that lands the removable support code together with the
+> fixed proof script and its removable-media native case in the same slice —
+> not as a separate support slice followed by a proof slice. The knowledge
+> slice follows it. The frozen eventual behaviour of §§6–8 is unchanged: this
+> is a slice and validation reassignment, not a contract change. Slice 2
+> reports an `apfs-volume-v1` pool as the skip "seeding not yet supported on a
+> removable pool" and takes the normal cold build until slice 4 lands.
 
 ## 16. Proof plan
 
