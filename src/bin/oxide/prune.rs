@@ -7483,10 +7483,12 @@ mod tests {
         };
         let evaluated = evaluate_test(&store, &control, &registry, Some(&list)).unwrap();
         assert_eq!(evaluated.len(), 3);
+        assert!(!evaluated.complete);
         for entry in &evaluated {
             let reason = entry.kept.clone().unwrap_or_default();
             assert!(reason.contains("checkout absence is unknown"), "{reason}");
-            assert!(reason.contains("no recorded volume UUID"), "{reason}");
+            assert!(reason.contains("whole batch"), "{reason}");
+            assert!(entry.candidate.is_none());
         }
     }
 
