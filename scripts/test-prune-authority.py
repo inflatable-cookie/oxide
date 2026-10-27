@@ -122,11 +122,23 @@ def verified_seed_source(home: Path) -> dict:
     return {"root": str(root), "home": str(home), "identity": identity}
 
 
+def restore_missing_receipt(path: Path, original: bytes, mode: int) -> None:
+    if mode != 0o600:
+        raise RuntimeError("fixture receipt did not have mode 0600")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "wb") as stream:
+        os.fchmod(stream.fileno(), mode)
+        stream.write(original)
+    if stat.S_IMODE(os.lstat(path).st_mode) != mode or path.read_bytes() != original:
+        raise RuntimeError("receipt restoration changed mode or bytes")
+
+
 def self_check() -> int:
     """Pure counterfactual: exercise the real no-follow seam with fake fds."""
     import errno
     from types import SimpleNamespace
     from unittest.mock import patch
+    import tempfile
 
     # Exercise the actual host Python API, without creating a fixture: this
     # script exists and a child below the script file cannot exist.
@@ -138,6 +150,27 @@ def self_check() -> int:
         pass
     else:
         raise AssertionError("strict resolution accepted a missing path")
+
+    # A private temporary fixture exercises the actual host umask and the same
+    # exclusive restoration used after the missing-receipt case.
+    with tempfile.TemporaryDirectory(prefix="prune-receipt-") as directory_path:
+        receipt = Path(directory_path) / "receipt"
+        original = b"receipt bytes\n"
+        fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(original)
+        mode = stat.S_IMODE(os.lstat(receipt).st_mode)
+        receipt.unlink()
+        restore_missing_receipt(receipt, original, mode)
+        require(receipt.read_bytes() == original and stat.S_IMODE(os.lstat(receipt).st_mode) == mode, "receipt restore")
+        try:
+            restore_missing_receipt(receipt, b"replacement", mode)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("restoration replaced an existing receipt")
+        require(receipt.read_bytes() == original, "existing receipt changed")
 
     seed = wrapper.offline_seed
     directory = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=7, st_ino=11)
@@ -310,6 +343,8 @@ def run_cases(proof, custody, diagnostic, cases):
     def refusals():
         path = Path(permanent.receipt_path(world.pool, checkouts[second]))
         original = path.read_bytes()
+        original_mode = stat.S_IMODE(os.lstat(path).st_mode)
+        require(original_mode == 0o600, "fixture receipt must be owner-only")
         for label, content in (("missing", None), ("corrupt", b"{"), ("oversized", b"x" * 65537)):
             try:
                 if content is None: path.unlink()
@@ -318,7 +353,10 @@ def run_cases(proof, custody, diagnostic, cases):
                 doc = json.loads(out)
                 require(code == 0 and not doc["coverage"]["complete"] and not doc["candidates"], label)
             finally:
-                path.write_bytes(original)
+                if content is None:
+                    restore_missing_receipt(path, original, original_mode)
+                else:
+                    path.write_bytes(original)
         registry = Path(world.registry)
         original = registry.read_bytes()
         try:

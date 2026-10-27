@@ -5032,6 +5032,19 @@ The stable, read-only interface other tools use to find the registered Builds dr
   `8473f38a4bd563dfae3358650ca2023ef29648a14621b319e9ac52e3e12c0098`.
   The proof now uses Python 3.9-compatible strict path resolution, exercised
   by the pure check on an existing file and a missing path.
+  A third activated diagnostic at `ca67322` completed accounting and authority
+  refusals but failed revalidation: the missing-receipt fixture restored the
+  file with a mode the product refused, making its subsequent authority view
+  incomplete. The positive case was skipped; the guard closed with status 1
+  and a certain empty census, and ordinary image detach completed. Its
+  preserved diagnostic receipt is
+  `/private/tmp/oxide-proof.ld5zqdhh/evidence/prune134-diagnostic.json`
+  (SHA-256 `1c06244bb706622c59a814242a7436bde606ff77e8d83df30f0f1d1e227661d0`);
+  the guard receipt SHA-256 is
+  `e83f21273e3e0fa232e0b3cfb8f9d232909521304c2942f454774cd43e20bc14`.
+  The fixture now restores exact bytes with exclusive creation and the original
+  owner-only mode; its self-check exercises that restoration under the host
+  umask in a private temporary directory. This spent start is not proof credit.
   The corrected proof verifies a common canonical real cache root before and
   after strict seeding into its private Cargo home; its pure counterfactual
   is `effigy proof:prune-authority:test`. No counted native has run.
