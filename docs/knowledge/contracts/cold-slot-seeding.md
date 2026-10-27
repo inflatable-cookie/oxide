@@ -9,6 +9,25 @@ exact-head design review, then stop for the Supervisor's delegated freeze.
 Implementation, the author and independent-reviewer native sessions, and the
 merge hold are separate and unchanged.
 
+**Revision 10** answers the CHANGES REQUIRED review of `767f3f6` (review
+comment `6451189343`, 2026-10-27): the build-script compile role now has its
+exact pinned manifest — the hashed rustc output
+`deps/build-script-build-<hex>` with `deps/build-script-build-<hex>.d`, plus
+Cargo's unhashed uplift `build/<literal package>-<hex>/build-script-build`
+inside the same hashed directory — with both files recorded and re-verified,
+and the pure fixture plus native oracle corrected (§4.2, §5.1, §16.1, §16.2);
+the held-recipient reset story is replaced by a policy that never deletes
+inside a `Held` slot: abandon before the first clone is a cold skip, and every
+post-first-clone fault (including a reserve breach or a crash) records `reset`
+as *abandoned*, retains the untrusted generation and **refuses**, leaving the
+whole slot to the existing journaled `Prior::Unknown` eviction, with no new
+capture format, replay journal or downgrade fence, and the `Spawning` crash row
+corrected to explicit recovery (§6.5, §6.6, §13); and §8.2 now states the
+actual oxide#146 policy — independently measured per-slot records, the inode
+union only within one slot's walk, accepted cross-slot hard-link overcount, no
+seed-created hard links, no extent-sharing or free-space claim, and the
+post-seed membership/byte recheck against that policy with an incomplete walk
+reported as unknown rather than zero.
 **Revision 9** answers the CHANGES REQUIRED review of `b4f374b` (review
 comment `6451045780`, 2026-10-27): the dep-info grammar now distinguishes
 **output rules** (the `.d` itself plus the whitelisted role artifacts) from
@@ -106,7 +125,7 @@ revalidated at donation (§4.4, §6.3); a durable unseeded condition so a seeded
 recipient can never publish a catalog (§4.1); a bounded producer-context digest
 covering the compiler, wrapper, flag, profile, config and environment inputs
 Cargo does not fully vouch for (§3); a reserve start gate plus monitored stop
-during clone and reset, with the removable path separated (§8.3); and the real
+during clone and abandon, with the removable path separated (§8.3); and the real
 SQLite/`cc`/`OUT_DIR` proof retained with a source-derived time and disk
 allocation (§16). Each finding is dispositioned in §3.3.
 
@@ -148,8 +167,9 @@ cleanup, output placement and closure rules are untouched.
   `--message-format` or other output-format injection.
 - No eager preparation, full-target copy or whole-slot clone: only the
   classified dependency files of the plan.
-- No byte-copy fallback. If a clone cannot complete, the seed is abandoned and
-  the recipient is reset or the command refuses (§6.5).
+- No byte-copy fallback. If a clone cannot complete, the seed is abandoned
+  before the first clone, or the command refuses and retains the untrusted
+  generation (§6.5).
 - No seeding of workspace/path dependency units, final binaries, test/bench
   executables, uplifted final outputs, incremental directories, or any
   build-script *run* unit or its output (§5).
@@ -348,7 +368,7 @@ Consequences, stated rather than hidden:
 | 2. Freeze an authoritative unit catalog | Bounded `SeedCatalog` sidecar with per-package locked identity, verified source digest and a relative file manifest (§4.4); no reconstruction from prefixes or fingerprint JSON alone. |
 | 3. Git identity needs producing-build evidence | Pre/post content verification plus the producing-window mtime rule and donation re-verification (§4.3); the mtime-preserving adversarial residual is named, not hidden. |
 | 4. Run exclusion can be simpler and less beneficial | Adopted as the frozen rule: the whole run unit and its output are excluded unconditionally, and the reach statement replaces the spike's expectation (§5.2, §12). |
-| 5. One recipient transaction, never import donor trust | Durable untrusted origin, clone-then-verify, reset-or-refuse, no staging protocol (§6). |
+| 5. One recipient transaction, never import donor trust | Durable untrusted origin, clone-then-verify, abandon-or-refuse, no staging protocol (§6). |
 | 6. Freeze custody at the integration point | Seed point after the nine-grant lease and output binding, before `mark_spawning`; library-scoped donor pin and pool lock (§6.1, §7). |
 | 7. Bounded facts and a deliberate older-binary fence | Separate generation-bound sidecars, strict caps, no control/ledger field and an explicit stop condition if one is needed (§9). |
 | 8. Bounds and executable feasibility | Finite bounds table, honest per-inode accounting and a source-derived (UNMEASURED) proof allocation (§8, §16.4). |
@@ -360,7 +380,7 @@ Consequences, stated rather than hidden:
 | 3. The catalog did not prove the current donor artifacts are the produced ones | §4.4 records a SHA-256 for every offered file, computed from the closed producing epoch, and §6.3 revalidates every offered donor file against those hashes under the donor pin and then verifies the clone against the same authenticated manifest. A changed file is an unknown donor: the whole seed is abandoned, not partially offered. |
 | 4. A seeded recipient could publish a wrong catalog | §4.1 makes the unseeded condition a durable fact: a per-generation seed-attempt record, written before candidate reads and before the first clone, and no catalog is published unless that record is absent or terminal `skipped`/`reset`. A command that seeded anything publishes nothing, and a native regression proves a successfully seeded recipient never donates. |
 | 5. Compatibility omitted effective producer inputs | §3 and §3.1 add the compiler selection, wrapper context, full flag set, profile/target overrides and a bounded Cargo configuration digest, with every unreadable, unsupported or unrepresentable fact skipping. |
-| 6. Reserve handling turned an unsafe start into a cold build | §8.3 now gives the seed its own start gate at the existing 22 GiB watchdog trigger (`HOST_RESERVE_BYTES` + `MARGIN_BYTES`) and monitors at the watchdog's own cadence during clone and reset; a below-trigger, unknown or lost reading aborts the seed and **refuses the command before any child**, never a cold build. The removable path keeps its own removal-only watchdog and registration reserve instead of the internal space trigger. |
+| 6. Reserve handling turned an unsafe start into a cold build | §8.3 now gives the seed its own start gate at the existing 22 GiB watchdog trigger (`HOST_RESERVE_BYTES` + `MARGIN_BYTES`) and monitors at the watchdog's own cadence during clone; a below-trigger, unknown or lost reading aborts the seed and **refuses the command before any child**, never a cold build. The removable path keeps its own removal-only watchdog and registration reserve instead of the internal space trigger. |
 | 7. The plan replaced the required SQLite fixture | §16.2 keeps the real `libsqlite3-sys`-with-`bundled`-SQLite case and §16.4 supplies a source-derived time and disk allocation, including staging, seeded Cargo home, two coexisting slots, the owned image, fixtures and cleanup, with a fit gate that stops and reports instead of trimming a case. |
 
 | `6449728021` finding (revision 3) | Amendment |
@@ -406,6 +426,12 @@ Consequences, stated rather than hidden:
 | 2. Hash relationship was implicit | §4.2/§10 state that for every supported role the fingerprint-directory `<hex>` and the artifact/`.d` `<hex>` are the same 16-hex `unit_id` rendering; a differing pair, a non-16-hex value or a shape with either optional choice absent skips cold, and neither hash is predicted. |
 | 3. No representative dep-info positive | §16.1 carries a complete pinned 1.97.1 dep-info fixture including the trailing phony source rules as a required positive beside the `cfg-if` and build-script fixtures, with counterfactuals (phony handling removed, an unmatched phony target, an out-of-root phony target) that must fail, and the positive native oracle retained. |
 | 4. Budget arithmetic restated | §16.4 states the upper estimates sum to 265 s and the lower to about 133 s of the 300 s bound, leaving 35 s; both are marked UNMEASURED and the uncounted diagnostic remains mandatory, with no counted-native implication. |
+
+| `6451189343` finding (revision 10) | Amendment |
+| --- | --- |
+| 1. The build-script role could not satisfy its own join | §4.2/§5.1/§10 now name the exact pinned manifest: the hashed rustc output `deps/build-script-build-<hex>` and `deps/build-script-build-<hex>.d` (same `<hex>` as the fingerprint directory) plus Cargo's unhashed uplift `build/<literal package>-<hex>/build-script-build`, which is a recorded role file and never a `.d` rule target. The pure fixture gains a build-script dep-info positive and uplift negatives, and case 3 asserts both files in the offered unit; unsupported shapes skip. |
+| 2. The held-recipient reset had no crash-replay journal | §6.5/§6.6/§13 delete the in-slot reset entirely: the design never renames or deletes inside a `Held` slot. Pre-clone failures are `skipped` cold builds; every post-first-clone fault (clone, digest, file type, donor transition, reserve breach, crash) records `reset` as *abandoned*, retains the untrusted generation and refuses, leaving deletion to the existing journaled `Prior::Unknown` eviction. No new capture name, intent format, replay boundary or downgrade fence is added, and a crash in `Spawning` before the group is recorded stays held for explicit recovery. |
+| 3. The accounting statement contradicted the current policy | §8.2 now states oxide#146: per-slot independently measured records, the inode union only within one slot's walk, accepted cross-slot hard-link overcount, no seed-created hard links, no extent-sharing or free-space discount, and the post-seed membership/byte recheck against that figure with an incomplete walk reported as unknown rather than zero. |
 
 ## 4. Unit provenance: the producing epoch and the donor catalog
 
@@ -590,17 +616,27 @@ held:
      ineligible. Exactly one `.d` in the directory may claim the artifact
      path; a second claim makes the package ineligible.
 
-   **Hash relationship per role.** For the supported roles (dependency
-   library, proc macro, build-script compile unit) Cargo derives both the
-   fingerprint directory's `<hex>` and the artifact/dep-info `<hex>` from the
-   same `unit_id`, and only when both optional choices are enabled
-   (`compilation_files.rs` unit-id and extra-filename paths). The adapter
-   therefore requires the fingerprint directory suffix and the artifact and
-   `.d` stem hash to be **equal** for every supported unit, and rejects a
-   shape where they differ, where either optional choice is absent, or where
-   either hash is not 16 lowercase hex digits. Neither hash is predicted; the
-   equality is a checked property of the producing slot, and every other
-   shape skips cold.
+   **Hash relationship per role.** For a dependency library or proc-macro
+   unit Cargo derives the fingerprint directory's `<hex>`, the rustc output
+   stem and the `.d` stem from the same `unit_id`, and only when both optional
+   choices are enabled (`compilation_files.rs` unit-id and extra-filename
+   paths). The adapter requires those three to be the same 16 lowercase hex
+   value, and rejects a shape where they differ, where either optional choice
+   is absent, or where any is not 16 hex digits.
+
+   A build-script **compile** unit is the one role whose file names differ:
+   `c_extra_filename` applies to the rustc output, so the compiled executable
+   and its dep-info are `deps/build-script-build-<hex>` and
+   `deps/build-script-build-<hex>.d` with the same `unit_id` `<hex>` as the
+   fingerprint directory suffix, while Cargo then **uplifts** that executable
+   to the unhashed `build/<literal package>-<hex>/build-script-build`
+   (`compilation_files.rs:426-474,592-628`). Both files are role files and
+   both are recorded in the catalog: the join is proven by the `.d` rules on
+   the hashed rustc output, and the uplift is accepted only as a regular file
+   inside the directory whose suffix is that same `<hex>`. An uplift missing,
+   outside that directory, or under a different hash skips the role cold.
+   Neither hash is predicted; the equality is a checked property of the
+   producing slot, and every other shape skips cold.
 
    This binds the source root, the artifact and the unit's dep-info together.
    The catalog records the `.d`'s relative path, the artifact paths and the
@@ -609,7 +645,10 @@ held:
    selection can decide association without reading the donor payload (§6.3).
    The join record keeps the phony targets separate from artifacts, so a later
    re-verification can prove the phony set still matches the prerequisite set
-   without treating a source file as an output.
+   without treating a source file as an output. For a build-script compile
+   role it also records the uplifted
+   `build/<literal package>-<hex>/build-script-build` as a role file with its
+   own digest; the uplift is never a `.d` rule target.
 3. **Re-verify under the pin.** Every artifact, `.d` and fingerprint file the
    plan names is re-read under the donor pin and donor record lock (§6.3 step
    6), hashed against the catalog, and its `.d` rules re-checked against the
@@ -822,9 +861,11 @@ normalized target name; `<hex>` is Cargo's opaque unit metadata hash, copied
 verbatim and never predicted.
 
 Every offered unit requires its **join file**: rustc's dep-info in the unit's
-own output directory — `deps/<stem>-<hex>.d` for a library or proc macro and
-`build/<literal package>-<hex>/build-script-build.d` for a build-script
-compile unit. All of its rules are parsed; rule order is irrelevant because
+own output directory — `deps/<target_underscored>-<hex>.d` for a library or
+proc macro, and `deps/build-script-build-<hex>.d` for a build-script compile
+unit (its rustc output is the hashed `deps/build-script-build-<hex>`, which
+Cargo uplifts to the unhashed `build/<literal package>-<hex>/build-script-build`,
+§4.2). All of its rules are parsed; rule order is irrelevant because
 rustc writes the `.d`'s own rule first, and the empty phony rule rustc writes
 for each input file is matched against the accepted prerequisite set rather
 than rejected as an output (§4.2). The `.d` is required, not optional; a unit
@@ -834,7 +875,7 @@ without a proven join is not offered.
 | --- | --- | --- |
 | registry/git dependency library | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{rmeta,rlib}`, joined by `deps/<target_underscored>-<hex>.d` |
 | proc macro | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{dylib,so}`, joined by `deps/<target_underscored>-<hex>.d`. A `.dSYM` bundle is **excluded** |
-| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | `build/<literal package>-<hex>/build-script-build`, joined by `build/<literal package>-<hex>/build-script-build.d`; if that join cannot be proven the role is simply not offered (its run is excluded anyway) |
+| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | hashed rustc output `deps/build-script-build-<hex>` joined by `deps/build-script-build-<hex>.d`, plus Cargo's uplift `build/<literal package>-<hex>/build-script-build`; if either the join or the uplift cannot be proven the role is not offered (its run is excluded anyway) |
 | build-script **run** unit and its output | **excluded entirely** | `run-build-script-build-script-build*`, `dep-run-build-script-build-script-build`, `build/<literal package>-<hex>/{output,root-output,stderr}`, `build/<literal package>-<hex>/out/**`, `invoked.timestamp` |
 | workspace/path package units | **excluded** | never classified |
 | final outputs, uplifted binaries, test/bench executables | **excluded** | live in the checkout `target/` or are final uplifts |
@@ -1047,32 +1088,41 @@ untrusted generation. No reference to the donor remains — no hard link, no
 symlink, no shared extent bookkeeping (APFS may share extents, which Oxide
 neither measures nor claims, §8).
 
-### 6.5 Failure: reset the owned recipient, or refuse
+### 6.5 Failure: abandon before the first clone, otherwise retain and refuse
 
-- **Skip** (no donor, no overlap, an ineligible package, a cap or the seed's
-  own cooperative deadline): nothing was written to the recipient; the attempt
-  record becomes `skipped`; build cold.
-- **Fault after a partial clone** (any clone, digest or verify error): the
-  library resets exactly the recipient it owns — the plan's relative names
-  deepest-first plus the directories the plan created, keeping the
-  library-created `build/` directory itself — using the existing
-  owned-deletion traversal, then verifies `<slot>/build` has no entries. If the
-  reset verifies, the attempt record becomes `reset` and the command builds
-  cold in the same slot: no tenth grant, no new record, and the recipient
-  never carries partial state into Cargo. A crash *during* the reset leaves the
-  untrusted generation in place, so the next command's `Prior::Unknown`
-  whole-slot eviction (with oxide#155's capture-and-verify deletion) finishes
-  it; the seed never deletes outside its own plan.
-- **Reserve breach or unknown reading during the seed** (§8.3): the seed is
-  abandoned, the recipient is reset as above, and the command **refuses**
-  before any child. A reserve fault is never converted into a cold build.
-- **Unknown ownership or an incomplete reset** (a foreign entry appeared, the
-  device or volume identity changed, a path refused, a digest mismatch left
-  the state unclassifiable): the command **refuses**, prints the reason and
-  exits non-zero. It does not run Cargo over a half-seeded slot and does not
-  delete what it cannot prove it owns; the untrusted origin and the
-  `intent`/`seeded` attempt record keep the generation from being reused or
-  published later.
+Seeding never renames or deletes inside the recipient, because the library's
+journaled deletion is `Evicting`-only with no lease (`src/lease/pool.rs:1963-1981`),
+an unrecorded `.oxide-capture-*` name is refused (`src/lease/mod.rs:913-928`),
+and owned deletion needs caller-owned durable intent while unjournaled residue
+is never consumed (`src/owned_delete.rs:37-48,580-585`). There is therefore no
+in-slot "reset" path at all; the design has exactly three outcome classes:
+
+- **Abandon before the first clone.** A skip (no donor, no overlap, an
+  ineligible package, a cap, the seed's own cooperative deadline) or a
+  selection/plan/source failure writes nothing to the recipient: the attempt
+  record becomes `skipped` and the command builds cold in the same empty slot.
+  A reserve or ownership fault instead refuses before any child (§8.3, §13).
+- **First-clone boundary (the distinction inside those classes).** The first
+  `clonefile` is the point of no return: before it, abandoning is free and the
+  command still builds cold; after it, the recipient is untrusted and the
+  command refuses.
+- **After the first clone, any fault refuses and retains.** A clone, digest or
+  file-type error, a donor transition, a reserve breach or an unreadable path
+  stops the seed, records the attempt as `reset` (meaning abandoned, not
+  repaired), releases the recipient lease with no trusted origin, and the
+  command **refuses** with a non-zero exit. It does not start Cargo over the
+  partially seeded slot and it does not delete anything in it: the untrusted
+  origin and the `reset` attempt record keep the generation from being reused
+  or published, and the next command's ordinary `Prior::Unknown` path evicts
+  the whole slot through the existing journaled deletion, which is the only
+  deletion machinery this design uses. Retention until that eviction is the
+  documented cost of a post-clone fault; no new capture format, journal, replay
+  boundary or downgrade fence is introduced.
+- **Crash during the clone or the release.** Same as above: the durable
+  untrusted origin and the `intent`/`reset` attempt record survive, no trusted
+  origin is written, and the next command evicts the generation whole. A crash
+  during the **reset-record write** itself leaves the previous state (`intent`)
+  or the origin, both non-trusted and non-publishable.
 
 ### 6.6 Crash matrix
 
@@ -1082,12 +1132,14 @@ neither measures nor claims, §8).
 | after the untrusted origin, before the first clone | untrusted origin, empty build | same as above (nothing to clean) |
 | during cloning | untrusted origin plus partial `build/` | same as above: the generation is never reused, the whole slot is evicted |
 | after a complete seed, before `mark_spawning` | untrusted origin, complete seed | whole slot evicted; no partial trust, no Cargo |
-| after `mark_spawning`, during Cargo | untrusted/stale origin, Cargo may have run | existing recovery; `Prior::Unknown` eviction |
+| after `mark_spawning`, before the process group is recorded | untrusted/stale origin, `Spawning` record | **stays held for explicit recovery** (`workflow.md#crash-recovery`); automatic eviction is not guaranteed |
+| during Cargo, group recorded | untrusted/stale origin, Cargo may have run | existing recovery by group emptiness; then `Prior::Unknown` eviction |
 | after Cargo, during catalog write/release | previous (untrusted) origin | eviction; a catalog is never made eligible by a generation the ledger does not confirm |
 
 The poison is the persisted untrusted origin plus the generation binding, not a
-new recovery engine. The design adds no new crash-recovery decision and keeps
-the existing writer-closure and quarantine rules.
+new recovery engine. The design adds no new crash-recovery decision, no new
+deletion intent format and no new capture name, and keeps the existing
+writer-closure, quarantine and explicit-recovery rules.
 
 ## 7. Donor closure and lock order
 
@@ -1154,9 +1206,10 @@ mutation does.
 
 If any check fails while the transaction runs (the donor changed phase, the
 volume vanished, a digest mismatched), the seed is abandoned inside the same
-lock lifetime: the recipient is reset as in §6.5, the attempt state becomes
-`reset`, and the command either builds cold (pure seed fault) or refuses
-(reserve, ownership, device or custody fault, §13).
+lock lifetime: a pre-clone failure is a `skipped` cold build, and any
+post-first-clone failure abandons the seed as in §6.5 — the attempt state
+becomes `reset`, the untrusted generation is retained, and the command
+refuses (reserve, ownership, device, custody or clone fault, §13).
 
 ## 8. Bounds, accounting, budget and watchdog
 
@@ -1183,19 +1236,34 @@ lock lifetime: the recipient is reset as in §6.5, the attempt state becomes
 | seed work (clone + digest verify) | 5 s cooperative deadline, checked between filesystem calls | a blocked syscall cannot be pre-empted; not a hard lock bound |
 | hashed bytes at donation | 2 × cloned bytes (donor + recipient copy) | the donor copy is compared with the producing-epoch digest; the clone with the same digest |
 | seed sidecars total (`catalog`, `attempt`, `last`, `sources`) | 24 MiB | write refuses, or the oldest catalog is dropped, when exceeded |
-| diagnostics | 2 KiB sidecar, one summary line ≤ 240 bytes | generated from post-reset state only |
+| diagnostics | 2 KiB sidecar, one summary line ≤ 240 bytes | generated from post-abandon state only |
 
-### 8.2 Accounting is honest
+### 8.2 Accounting follows the recorded per-slot policy
 
-Cloned files are new inodes with full logical and allocated bytes. The pool's
-recorded per-slot figure gains them at the recipient's next closed record
-(written by the release walk, `local-lease.md` §"Recorded per-slot
-accounting"); nothing fabricates an early record. The donor's record is
-untouched, so its figure keeps describing the donor's own bytes. APFS may share
-extents between the two slots; Oxide does not measure extent sharing, does not
-deduct it, and makes **no free-space or write-savings claim**. A cross-slot
-hard-link pair would be counted once by the `(device, inode)` union, but
-seeding never creates hard links.
+Cloned files are new inodes with full logical and allocated bytes. Seeding
+never creates a hard link, so it introduces no inode sharing at all.
+
+The current admission figure is the **sum of independently measured per-slot
+records** (oxide#146, `local-lease.md#recorded-per-slot-accounting-oxide146-implemented-native-held`):
+each slot is measured and recorded on its own, the `(device, inode)` union
+applies **within one slot's own walk**, and cross-slot hard-link overcount is
+deliberately accepted by that policy. Seeding therefore needs no cross-slot
+union and claims none. The recipient's cloned bytes enter its own next closed
+record, written by the release walk; nothing fabricates an early record, and
+the donor's record is untouched, so its figure keeps describing the donor's
+own bytes. APFS may share extents between the two slots; Oxide does not measure
+extent sharing, does not deduct it, and makes **no free-space or write-savings
+claim**.
+
+The brief-required post-seed recheck is against that same policy, not against a
+pool-wide inode union: after a successful seed the command re-reads the
+recipient's ledger membership (same store, slot id, incarnation and lease
+generation, `Held`) and its recorded observation state, and the next release
+walk publishes the slot's own closed record. If that walk is incomplete, the
+record is **unknown** rather than zero, the slot stays unrecorded until a later
+bounded walk, and the admission figure is a stated lower bound — never a
+silently reduced total. No pool size, extent-sharing or free-space saving is
+inferred from the seed.
 
 ### 8.3 Reserve: a start gate, a monitored stop, and two backends
 
@@ -1216,15 +1284,16 @@ build:
   child** with the reserve-stop diagnostic, and no attempt record is written.
   A command with nothing to seed never samples this gate, so its behaviour is
   exactly today's. While cloning and
-  resetting, the seed samples at the watchdog's interval (about 1 s, and at
+  abandoning, the seed samples at the watchdog's interval (about 1 s, and at
   least between every 64 copied files) with the same trigger; a breach or
-  lost reading aborts the seed, resets the recipient and refuses the command.
+  lost reading aborts the seed, retains the untrusted generation and refuses
+  the command.
   The sampled minimum and the crossing are reported like a watchdog stop.
 - **removable `apfs-volume-v1` pool.** Its watchdog is a removal detector and
   has no space trigger (`store.rs:1716-1726`), and the volume's own capacity
   is its hard limit. The seed therefore requires the verified mount/volume-UID
   binding and the registration's reserve reading (the existing admission
-  rule), monitors the binding at the same cadence, and aborts and resets on
+  rule), monitors the binding at the same cadence, and aborts and abandons on
   any binding or removal failure; the command then follows the existing
   lost-volume path rather than a generic cold build.
 - **Deliberate asymmetry, stated for the Supervisor.** This gate is the
@@ -1235,7 +1304,7 @@ build:
 The pool budget stays soft: a started command's seed may pass the cap exactly
 as its Cargo may, and the seed's bytes are visible to the next admission. The
 command's admission budget is never extended: an expiry before the clone means
-no seed; an expiry during it abandons and resets the seed and releases the
+no seed; an expiry during it abandons the seed and releases the
 slot exactly as the existing expired-admission path does (no child, exit 124).
 That release records no trusted origin, so the seeded generation is evicted by
 the next command: the seed is never treated as a trusted build.
@@ -1256,7 +1325,8 @@ directory (mode `0700`, atomic temp + rename + `sync`, never in the payload):
   (§4.4), at most one per ledger slot id;
 - `<pool>/oxide-managed/seeds/<slot-id>.attempt.json` — the per-generation seed
   attempt (§4.1, §6.3): generation envelope plus a terminal state
-  (`intent`, `seeded`, `skipped`, `reset`) and, when `seeded`, the donor slot,
+  (`intent`, `seeded`, `skipped`, `reset` — `reset` means *abandoned, not
+  repaired*, §6.5) and, when `seeded`, the donor slot,
   unit/file/byte counts and the catalog digest. Never deleted for its
   generation, so a later command cannot claim an unseeded epoch;
 - `<pool>/oxide-managed/seeds/last.json` — the last completed seed
@@ -1366,10 +1436,11 @@ verifies (`workflow.md#cargo-version-matrix`):
   **normalized** target name, whose fingerprint-directory and
   artifact/dep-info hashes are the same 16-hex `unit_id` rendering, and whose
   dep-info carries rustc's empty phony source rules, and only the §4.2
-  role/layout cases are accepted, artifacts in `<profile>/deps/`, build scripts in
-  `<profile>/build/<literal package>-<hex>/`, the profile directory name is
-  Cargo's, and
-  uplift copies finals to `CARGO_TARGET_DIR`;
+  role/layout cases are accepted, library and proc-macro artifacts in
+  `<profile>/deps/`, a build-script rustc output as the hashed
+  `<profile>/deps/build-script-build-<hex>` with Cargo's uplift
+  `<profile>/build/<literal package>-<hex>/build-script-build`, the profile
+  directory name is Cargo's, and uplift copies finals to `CARGO_TARGET_DIR`;
 - **manifest qualification is a precondition, not an assumption.** Before any
   seeding is enabled, the implementation must confirm, against a real 1.97.1
   build of a tiny fixture, that every offered unit's complete triple is
@@ -1402,7 +1473,7 @@ missing lock, and any package/unit outside the whitelist.
 - **oxide#136 child temporary files.** The seed's only payload writes are under
   `<slot>/build/**`, before the owned temp directory exists; `scratch/` custody, its marker, its
   accounting, its release removal after positive closure and the crash
-  leftover rules are untouched. A seed reset never touches `scratch/`.
+  leftover rules are untouched. Abandoning a seed never touches `scratch/`.
 - **oxide#140 command budgets.** The seed is inside the admission window,
   never extends it, and an expiry behaves exactly as today (no child, exit
   124). The seed's own cooperative deadline is a skip reason, not a new budget
@@ -1515,13 +1586,15 @@ missing lock, and any package/unit outside the whitelist.
 | unsupported Cargo, adapter, command family, `exec`/external tool | skip, cold build |
 | recipient lock missing, empty allowlist, malformed or oversized | skip, cold build (Cargo may create the lock itself) |
 | unsupported producer context (compiler, wrapper, flags, profile, config, source replacement, patch) | skip, cold build |
-| cap or the seed's own cooperative deadline exceeded | skip (abandon and reset if cloning started) |
+| cap or the seed's own cooperative deadline exceeded before the first clone | skip, cold build |
 | a competing mount could not be fenced, or the admission/donor locks could not be taken in order | **refuse** (unknown custody) |
-| donor archive or git tree fails verification; catalog digest mismatch | skip the package, or abandon and reset when an offered file/mode changed |
-| **internal pool host reserve unknown or below the 22 GiB trigger, before or during the seed** | **refuse**; the seed is abandoned and reset, and no child starts |
-| removable volume binding or registration reserve fails, or the mount is lost | abandon and reset; the existing removal/quarantine path runs, never a generic cold build |
-| donor became held/evicting/retired during the transaction, volume mismatch | abandon, reset recipient, cold build |
-| a clone, digest, file-type or reset check fails | reset; if the reset verifies, cold build; otherwise **refuse** |
+| donor archive or git tree fails verification; catalog digest mismatch before the first clone | skip the package, cold build |
+| **internal pool host reserve unknown or below the 22 GiB trigger, before the first clone** | **refuse**; no marker and no clone is written |
+| **reserve breach or unknown reading after the first clone** | abandon the seed, retain the untrusted generation and **refuse**; the ordinary journaled eviction removes it later |
+| removable volume binding or registration reserve fails before the first clone | refuse; the existing removal/quarantine path runs |
+| removable volume lost after the first clone | the existing removal/quarantine path runs; the untrusted generation is retained, never a generic cold build |
+| donor became held/evicting/retired before the first clone, or volume mismatch | skip, cold build |
+| a clone, digest or file-type check fails after the first clone | abandon, retain the untrusted generation, **refuse**; no Cargo runs in the slot |
 | donor path or volume identity cannot be established | **refuse** (unknown ownership is not a cold fallback) |
 | recipient `build/` is not empty or not an owned directory | **refuse** |
 
@@ -1551,8 +1624,9 @@ anything it cannot prove it owns and never starts Cargo on unverified state.
 - **Seed a held donor (the D-4 shortcut).** No closure evidence, an `exec` may
   itself run Cargo, and it would let a seed read a slot a running program may
   still be using; rejected.
-- **Reacquire and rebuild on seed failure.** Spends a tenth grant; resetting
-  the owned recipient in place is bounded and cheaper.
+- **Reacquire and rebuild on seed failure.** Spends a tenth grant; refusing
+  and retaining the untrusted generation for the ordinary journaled eviction
+  needs no new deletion machinery.
 - **A staging directory plus a publication protocol.** More crash states for no
   benefit: a new slot with an untrusted origin is already safe to abandon.
 - **Byte-copy fallback, hard-link fallback, `ditto`/`cp -c` shells.** Only
@@ -1573,7 +1647,7 @@ anything it cannot prove it owns and never starts Cargo on unverified state.
    record lock then pool lock, held to the end) plus
    `managed::publish_seed_catalog`: catalog generation recheck, path and device
    validation, per-file digest revalidation, clonefile-only copy, final donor
-   recheck and reset-or-refuse, with the bounded caps. Unit regressions on tiny
+   recheck and abandon-or-refuse, with the bounded caps. Unit regressions on tiny
    owned fixtures, no Cargo.
 3. **Front door.** `Store::seed` with the one admission lifetime of §6.3/§7
    (recipient record → sibling barrier → admission across both calls), lock
@@ -1593,8 +1667,9 @@ This design mints none of that.
 
 ## 16. Proof plan
 
-Tier: **HIGH** authoring complexity, **ELEVATED** (the recipient reset deletes
-storage, and one case writes removable media). Author and independent reviewer
+Tier: **HIGH** authoring complexity, **ELEVATED** (a post-clone abandon keeps
+an untrusted generation that the ordinary journaled eviction later deletes,
+and one case writes removable media). Author and independent reviewer
 natives are separately owner-activated; before the first counted native the
 author runs one separately activated, uncounted `--diagnostic` of the same
 fixed script, and a source sweep never replaces it.
@@ -1617,7 +1692,9 @@ unclassifiable entry makes that directory unusable; **artifact join, all rules
 parsed**: a `.d` whose first rule is the `.d` itself (the ordinary rustc shape)
 still joins through its later artifact rule; `--emit=dep-info,metadata`
 (`.rmeta`) and `link` (`.rlib`) both join; a proc-macro `.dylib`; a
-build-script `.d` under `build/<literal package>-<hex>/`; rustc's **empty
+build-script hash/uplift pair (`deps/build-script-build-<hex>` +
+`deps/build-script-build-<hex>.d` plus the uplift
+`build/<literal package>-<hex>/build-script-build`); rustc's **empty
 phony source rules** are matched against the accepted prerequisite set and
 contribute no artifact, while a phony rule whose target was never a
 prerequisite, is out of root or is nonempty is rejected; the
@@ -1655,7 +1732,8 @@ both `config`/`config.toml` in one directory, unsupported `--config`,
 non-UTF-8 config; catalog schema, leaf and source evidence, per-file digest
 records, caps and generation binding; the durable attempt record's states and
 the unseeded publication rule; producing-window mtime rule; plan intersection
-and determinism; reset list derivation; reserve gate and monitored-stop
+and determinism; the abandon/retention decision; reserve gate and
+monitored-stop
 decision points against a fake reader; **lock-lifetime seams**: the planner
 never takes a lock and never reads donor payload; call 1 takes only the pool
 lock and reads catalogs only; call 2 takes the donor record then the pool lock
@@ -1667,25 +1745,34 @@ unsupported-version skip; donor predicate matrix (held, retired, evicting,
 pending recovery, rank/lease mismatch, volume mismatch, missing lock, `seeded`
 attempt); and the fail-closed matrix of §13.
 
-**Representative pinned 1.97.1 dep-info (positive fixture, non-vacuous).** The
-pure suite parses this complete shape, with the output rules followed by
+**Representative pinned 1.97.1 dep-info (positive fixtures, non-vacuous).** The
+pure suite parses these complete shapes, with the output rules followed by
 rustc's empty phony source rules, and requires a *successful* join for a
 `cfg-if` leaf (literal `cfg-if-<hash>` directory, `lib-cfg_if` unit,
-`libcfg_if-<hex>.rmeta` artifact) and for a build-script compile unit:
+`libcfg_if-<hex>.rmeta` artifact) and for a build-script compile unit
+(hashed rustc output `deps/build-script-build-<hex>` plus Cargo's unhashed
+uplift `build/seedctl-<hex>/build-script-build`):
 
 ```make
 deps/libcfg_if-<hex>.rmeta: /root/.cargo/registry/src/index.crates.io-<idx>/cfg-if-1.0.0/src/lib.rs
 /root/.cargo/registry/src/index.crates.io-<idx>/cfg-if-1.0.0/src/lib.rs:
+
+deps/build-script-build-<hex>: /root/.cargo/registry/src/index.crates.io-<idx>/seedctl-0.1.0/build.rs
+/root/.cargo/registry/src/index.crates.io-<idx>/seedctl-0.1.0/build.rs:
 ```
 
-(The real file writes the `.d`'s own output rule first and one empty phony rule
-per input; the fixture covers both the `.d` rule and the phony rules.) The
-counterfactual runs the same fixture with phony-target handling removed and
-must **fail** with an unexpected-target rejection, so the regression is
-non-vacuous. A second fixture adds a phony target that is not a prerequisite
-and must fail, and a third carries an out-of-root phony target and must fail.
-The positive native oracle of cases 2 and 3 remains the end-to-end
-counterpart.
+(The real files write the `.d`'s own output rule first and one empty phony rule
+per input; the fixtures cover both the `.d` rule and the phony rules, and the
+build-script fixture's `deps/` output stem carries the same `<hex>` as the
+fingerprint directory while the uplift is only accepted inside
+`build/<literal package>-<hex>/`.) The counterfactual runs the same fixtures
+with phony-target handling removed and must **fail** with an unexpected-target
+rejection, so the regression is non-vacuous. Further fixtures add a phony
+target that is not a prerequisite (must fail), an out-of-root phony target
+(must fail), a build-script uplift outside its hashed directory or with a
+different hash (must fail), and a build-script `.d` that names the uplift
+instead of the hashed rustc output (must fail). The positive native oracle of
+cases 2 and 3 remains the end-to-end counterpart.
 
 ### 16.2 Native cases (one fixed script)
 
@@ -1725,9 +1812,13 @@ the selected-volume rule.
    into `OUT_DIR` and emits `cargo:rustc-env=SEEDCTL_OUT_DIR=<OUT_DIR>`, where
    the generated source embeds that same absolute path. This case also exercises
    the ordinary rustc dep-info shape (the `.d`'s own rule first, the artifact
-   rule later) and the build-script `.d` under `build/<literal package>-<hex>/`. The receipt
-   must list the package's **build-script compile** unit as offered while the
-   plan contains no `output`, `root-output`, `out/**` or run fingerprint; the
+   rule later) and the build-script role manifest: the hashed rustc output
+   `deps/build-script-build-<hex>` with its `deps/build-script-build-<hex>.d`,
+   plus Cargo's unhashed uplift
+   `build/<literal package>-<hex>/build-script-build` inside the hashed
+   directory. The receipt must list the package's **build-script compile** unit
+   as offered with **both** files in the plan while the plan contains no
+   `output`, `root-output`, `out/**` or run fingerprint; the
    recipient's run unit reruns, the crate recompiles, and the program prints
    the **recipient's** `OUT_DIR` and the donor's path is absent from the
    output. The counterfactual is a debug-only plan override that admits the
@@ -1774,7 +1865,8 @@ the selected-volume rule.
     and recorded figure are unchanged;
 16. removable path: one owned 128 MiB APFS image (`hdiutil attach -owners on`)
     registered as a removable pool seeds a tiny `cfg-if` workspace (literal
-    directory `cfg-if-<hash>`, normalized unit `lib-cfg_if`) across two
+    directory `cfg-if-<hash>`, normalized unit `lib-cfg_if`, artifact
+    `deps/libcfg_if-<hex>.rmeta`) across two
     of its slots and detaches ordinarily, proving the same-volume predicate and
     that the recipient's bytes are on the image;
 17. registry tamper controls: the cached `.crate` replaced with a different
@@ -1787,7 +1879,8 @@ the selected-volume rule.
     succeeded;
 19. reserve gate: an injected below-trigger reading (the existing debug-only
     free-space seam) makes a command whose only available donor would seed
-    **refuse before any child**; a mid-seed breach aborts, resets and refuses;
+    **refuse before any child**; a mid-seed breach aborts, retains the
+    untrusted generation and refuses;
     the non-seeding control still runs Cargo as today;
 20. partial-trust negative: a fault-injected partial recipient is never reused
     as warm by a later command.
@@ -1810,7 +1903,8 @@ the selected-volume rule.
     real `oxide` command that leases or evicts the selected donor (or a direct
     library `managed::lease` on it). The seeded command must abort: no donor
     payload may be read while unpinned, no clone may be published, the recipient
-    is reset, and the command either builds cold or refuses per §13. The
+    is abandoned and retained, and the command refuses per §13 with no Cargo
+    in the slot. The
     adversary's own slot state is unchanged. Without the interleaving the same
     fixture seeds normally, so the control is non-vacuous.
 23. **ambiguous-name visibility.** The donor workspace compiles one eligible
@@ -1928,24 +2022,30 @@ comparison as the proof.
 
 ## 17. Independent review questions
 
-1. Is the §4.2 dep-info grammar accepted — output rules distinguished from
+1. Is the §4.2 build-script role manifest accepted — the hashed rustc output
+   `deps/build-script-build-<hex>` with its `.d`, plus Cargo's unhashed uplift
+   `build/<literal package>-<hex>/build-script-build` recorded as a role file
+   and never a `.d` target — and the §6.5 abandon/retention policy accepted in
+   place of an in-slot reset, with post-first-clone faults refusing and leaving
+   the untrusted generation to the existing journaled eviction?
+2. Is the §4.2 dep-info grammar accepted — output rules distinguished from
    rustc's empty phony source rules, phony targets matched to accepted
    prerequisites inside the verified source root, and the fingerprint /
    artifact `unit_id` hash equality required for every supported role — with
    the representative pinned fixture as the non-vacuous pure positive?
-2. Is the §3.2 leaf boundary accepted as the positive ambient-input boundary,
+3. Is the §3.2 leaf boundary accepted as the positive ambient-input boundary,
    with proc-macro reach returned to the Supervisor rather than silently
    narrowed — or does the Supervisor want the broader dependency graph, which
    would need the deferred artifact-JSON/unit-graph capture plus a reviewed
    proc-macro input-tracking mechanism?
-3. Is the §4.2 **two-identity** rule accepted — the fingerprint package
+4. Is the §4.2 **two-identity** rule accepted — the fingerprint package
    directory uses the literal lock name (`.fingerprint/cfg-if-<hash>/`) while
    the unit suffix and artifact stem use the normalized target
    (`lib-cfg_if`), normalization is the uniqueness/collision rule across all
    source kinds, the association is restricted to the named role/layout
    cases, and the rejection record reports donor-side candidate-unit counts
    (or `units_unknown`) rather than package counts?
-4. Is the §4.2 per-unit association accepted — each `<literal package>-<hex>` directory
+5. Is the §4.2 per-unit association accepted — each `<literal package>-<hex>` directory
    classified as one unit or a run-only directory (variants offered, run
    payload never copied); each artifact set joined by parsing **all** rules of
    the unit's dep-info in its own output directory (the `.d`'s own rule first,
@@ -1953,7 +2053,7 @@ comparison as the proof.
    target and sources entirely inside the verified source root; the join
    recorded at producing time and re-verified under the pin; and no offering
    when the join is unprovable?
-5. Is the §6.3/§7 sequencing accepted as the brief's admission barrier: one
+6. Is the §6.3/§7 sequencing accepted as the brief's admission barrier: one
    admission lifetime (recipient record → sibling barrier → admission) across
    call 1 (pool lock alone, **catalog bytes only, no donor payload**), the
    effect-free selection from the recorded join and the reserve gate, then call
@@ -1961,32 +2061,32 @@ comparison as the proof.
    and hashed** and held through the final donor revalidation, with a competing
    `managed::lease` acquire/eviction between the calls aborting the seed and
    the pool hold bounded in work rather than wall time?
-6. Is the §4.3 archive-to-tree rule sound — cached `.crate` bytes against the
+7. Is the §4.3 archive-to-tree rule sound — cached `.crate` bytes against the
    lock checksum, a canonical derivation with strict entry grammar, a cache hit
    bound to the archive's recorded device/inode/size/mtime identity — and is the
    pinned `flate2` + `tar` reader acceptable as a new locked dependency?
-7. Is the complete per-role manifest in §5.1, including the required `.d` join,
+8. Is the complete per-role manifest in §5.1, including the required `.d` join,
    accepted as the completeness and association boundary?
-8. Is recording per-file producing-epoch SHA-256 digests (§4.4) with a
+9. Is recording per-file producing-epoch SHA-256 digests (§4.4) with a
    256 MiB / 4 s cap the right stale-content evidence, and is abandoning the
    whole seed on one mismatch the intended fail-closed behaviour?
-9. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
+10. Is the durable per-generation seed-attempt record (§4.1, §9.1) accepted as
    the unseeded fact, including an older binary reusing a slot?
-10. Is the §8.3 reserve treatment accepted: the gate sampled only after the
+11. Is the §8.3 reserve treatment accepted: the gate sampled only after the
    effect-free selection produced a non-empty plan and before the durable
    markers, a 22 GiB start gate and monitored stop that refuses rather than
    cold-builds, the removable volume on its own removal-only watchdog and
    registration reserve, and a no-plan command keeping today's behaviour (no
    sample, no marker)?
-11. Is the §9.2 bounded skip-count reporting accepted as satisfying binding
+12. Is the §9.2 bounded skip-count reporting accepted as satisfying binding
    `bb151a59`'s ambiguous-name visibility for both the summary and `oxide
    status`, without adding a walk or reconciliation?
-12. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, and
+13. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, and
    upper time estimates summing to 265 s of the 300 s with the required SQLite
    and offered-run cases retained) leave enough room for an unmeasured fit
    whose diagnostic is still mandatory, or should the conflict go to the
    Supervisor before freeze?
-13. Is the D-4 interface in §11 the intended reading — seeding cannot help
+14. Is the D-4 interface in §11 the intended reading — seeding cannot help
     while the only donor is the session's held slot — or should a scoped
     follow-up consider a read-only held-slot donor under stricter closure?
 
