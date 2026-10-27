@@ -8074,8 +8074,7 @@ mod tests {
         // Make the checkout's ancestor deliberately unprovable on both the
         // internal test volume and a /Volumes-backed validation directory.
         fs::create_dir(fixture.root.join("real")).unwrap();
-        std::os::unix::fs::symlink(fixture.root.join("real"), fixture.root.join("gone"))
-            .unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("real"), fixture.root.join("gone")).unwrap();
         let one = legacy_snapshot_row(&fixture, &"a".repeat(64));
         let two = legacy_snapshot_row(&fixture, &"b".repeat(64));
         let mut three = legacy_snapshot_row(&fixture, &"c".repeat(64));
@@ -8160,8 +8159,7 @@ mod tests {
     fn a_version_one_receipt_keeps_every_existing_predicate() {
         let fixture = Fixture::new();
         fs::create_dir(fixture.root.join("real")).unwrap();
-        std::os::unix::fs::symlink(fixture.root.join("real"), fixture.root.join("gone"))
-            .unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("real"), fixture.root.join("gone")).unwrap();
         let row = legacy_snapshot_row(&fixture, &"a".repeat(64));
         let control = ready_control(&fixture, vec![row.clone()], Vec::new());
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
