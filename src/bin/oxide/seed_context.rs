@@ -4,7 +4,6 @@
 //! names, enter the digest; the file list is retained as review evidence.
 
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -38,7 +37,7 @@ pub(crate) struct Context {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    oxide_storage::lease::seed::catalog_digest(bytes)
 }
 
 fn merge(low: &mut Value, high: Value) {

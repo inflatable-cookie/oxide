@@ -155,7 +155,11 @@ impl Producer {
                 path: relative.to_owned(),
                 size: count,
                 mtime_ms,
-                digest: format!("{:x}", hasher.finalize()),
+                digest: hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
                 kind,
             },
             bytes,
