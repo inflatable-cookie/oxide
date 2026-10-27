@@ -2606,3 +2606,31 @@ fn catalog_publication_requires_matching_unseeded_attempt() {
     publish_seed_catalog(&rig.pool, &catalog).expect("unseeded terminal generation");
     assert!(write_seed_attempt(&rig.pool, &attempt).is_err());
 }
+
+#[test]
+fn last_seed_read_requires_current_ledger_generation() {
+    reset_hooks();
+    let rig = Rig::new("last-generation");
+    let (grant, _) = lease_recipient(&rig, "last");
+    let last = SeedLast {
+        schema: "oxide.cold-seed/1".into(),
+        store_id: grant.store_id.clone(),
+        slot_id: grant.slot_id.clone(),
+        incarnation: grant.incarnation.clone(),
+        lease_id: grant.lease_id.clone(),
+        donor_slot: "2".into(),
+        units: 1,
+        files: 1,
+        logical_bytes: 1,
+        elapsed_ms: 1,
+        when_ms: 1,
+        buckets: vec![],
+        unknown: 0,
+    };
+    write_seed_last(&rig.pool, &last).expect("write held generation");
+    assert_eq!(read_seed_last(&rig.pool), Some(last.clone()));
+    release_injected(&rig.pool, &grant.lease_id).expect("release");
+    assert_eq!(read_seed_last(&rig.pool), Some(last));
+    tamper_idle_generations_injected(&rig.pool).expect("change generation");
+    assert_eq!(read_seed_last(&rig.pool), None);
+}

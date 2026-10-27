@@ -3,7 +3,9 @@
 //! is joined through its own rustc dep-info to a verified source root.
 
 use crate::seed_plan::VerifiedSource;
-use oxide_storage::lease::managed::{SeedFile, SeedFileKind, SeedJoin, SeedRole, SeedUnit};
+use oxide_storage::lease::managed::{
+    SeedFile, SeedFileKind, SeedJoin, SeedRejectReason, SeedRejection, SeedRole, SeedUnit,
+};
 use oxide_storage::lease::seed::{parse_seed_join, seed_output_rule_proven};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -164,6 +166,115 @@ impl Producer {
             },
             bytes,
         ))
+    }
+
+    /// Record donor-side candidate unit counts for lock-side rejections.
+    /// Ambiguous lock entries sharing one normalized name are grouped so one
+    /// fingerprint directory is never counted twice.
+    pub fn rejections(
+        &mut self,
+        profile: &str,
+        rejected: &[crate::seed_lock::RejectedPackage],
+    ) -> Vec<SeedRejection> {
+        let root = format!("{profile}/.fingerprint");
+        let names = self.names(Path::new(&root));
+        let mut grouped: std::collections::BTreeMap<(String, SeedRejectReason), BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for item in rejected {
+            let name = item.package.name.replace('-', "_");
+            let key = if name.len() <= 64 {
+                name
+            } else {
+                "unknown".to_owned()
+            };
+            grouped
+                .entry((key, item.reason))
+                .or_default()
+                .insert(item.package.name.clone());
+        }
+        let mut result = Vec::new();
+        let mut total = 0u64;
+        for ((name, reason), literals) in grouped {
+            if result.len() == 255 {
+                result.push(SeedRejection {
+                    name: "unknown".into(),
+                    reason: SeedRejectReason::Cap,
+                    units: None,
+                });
+                break;
+            }
+            let mut count = Some(0u32);
+            if let Some(names) = &names {
+                for entry in names {
+                    let matches = literals.iter().any(|literal| {
+                        entry
+                            .strip_prefix(&format!("{literal}-"))
+                            .is_some_and(|hash| {
+                                hash.len() == 16
+                                    && hash.bytes().all(|byte| {
+                                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                    })
+                            })
+                    });
+                    if !matches {
+                        continue;
+                    }
+                    let entries = self.names(Path::new(&format!("{root}/{entry}")));
+                    let Some(entries) = entries else {
+                        count = None;
+                        break;
+                    };
+                    let lib = format!("lib-{name}");
+                    let candidates = [lib.as_str(), "build-script-build"];
+                    let roles: Vec<&str> = candidates
+                        .into_iter()
+                        .filter(|stem| entries.iter().any(|entry| entry == stem))
+                        .collect();
+                    if roles.len() == 1 {
+                        let stem = roles[0];
+                        let triple = [
+                            stem.to_owned(),
+                            format!("{stem}.json"),
+                            format!("dep-{stem}"),
+                        ];
+                        let complete = triple.iter().all(|part| entries.contains(part))
+                            && entries
+                                .iter()
+                                .all(|part| triple.contains(part) || part == "invoked.timestamp");
+                        if !complete {
+                            count = None;
+                            break;
+                        }
+                        count = count.and_then(|value| value.checked_add(1));
+                    } else if roles.is_empty()
+                        && entries.iter().all(|part| {
+                            part == "invoked.timestamp"
+                                || part.starts_with("run-build-script-build-script-build")
+                                || part == "dep-run-build-script-build-script-build"
+                        })
+                    {
+                        // A classified run-only directory is not a compile unit.
+                    } else {
+                        count = None;
+                        break;
+                    }
+                }
+            } else {
+                count = None;
+            }
+            if let Some(value) = count {
+                total = total.saturating_add(u64::from(value));
+                if total > 4096 {
+                    count = None;
+                }
+            }
+            result.push(SeedRejection {
+                name,
+                reason,
+                units: count,
+            });
+        }
+        result
     }
 
     /// Classify each fingerprint directory independently. Unknown entries make
@@ -448,5 +559,31 @@ mod tests {
             .units("debug", &source)
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn ambiguous_name_counts_classifiable_units_and_marks_unknown() {
+        let fixture = Fixture::new();
+        let lock = "version = 4\n[[package]]\nname = 'foo-bar'\nversion = '1'\n[[package]]\nname = 'foo_bar'\nversion = '1'\n";
+        let analysis = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let first = "build/debug/.fingerprint/foo-bar-aaaaaaaaaaaaaaaa";
+        for name in ["lib-foo_bar", "lib-foo_bar.json", "dep-lib-foo_bar"] {
+            fixture.write(&format!("{first}/{name}"), "x");
+        }
+        let second = "build/debug/.fingerprint/foo_bar-bbbbbbbbbbbbbbbb";
+        for name in ["lib-foo_bar", "lib-foo_bar.json", "dep-lib-foo_bar"] {
+            fixture.write(&format!("{second}/{name}"), "x");
+        }
+        let root = fixture.0.join("build");
+        let records = Producer::new(&root)
+            .unwrap()
+            .rejections("debug", &analysis.rejected);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, SeedRejectReason::AmbiguousName);
+        assert_eq!(records[0].units, Some(2));
+        fixture.write(&format!("{second}/unclassified"), "x");
+        let records = Producer::new(&root)
+            .unwrap()
+            .rejections("debug", &analysis.rejected);
+        assert_eq!(records[0].units, None);
     }
 }

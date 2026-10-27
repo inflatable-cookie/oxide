@@ -3,6 +3,7 @@
 //! This is only the first filter: source verification and the manifest/dep-info
 //! join must still establish that an eligible lock entry produced a unit.
 
+use oxide_storage::lease::managed::SeedRejectReason;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -60,9 +61,26 @@ pub(crate) fn read(path: &Path) -> Result<Vec<Package>, &'static str> {
     eligible(&bytes)
 }
 
+/// A lock-side rejection; the producing epoch must classify its candidate
+/// units before placing a count in a catalog.
+#[derive(Clone, Debug)]
+pub(crate) struct RejectedPackage {
+    pub package: Package,
+    pub reason: SeedRejectReason,
+}
+
+pub(crate) struct Analysis {
+    pub eligible: Vec<Package>,
+    pub rejected: Vec<RejectedPackage>,
+}
+
 /// Filter by normalized-name uniqueness across *all* lock entries, leafness,
 /// and supported immutable source identity. The order remains lock order.
 pub(crate) fn eligible(bytes: &[u8]) -> Result<Vec<Package>, &'static str> {
+    Ok(analyze(bytes)?.eligible)
+}
+
+pub(crate) fn analyze(bytes: &[u8]) -> Result<Analysis, &'static str> {
     if bytes.len() > MAX_LOCK_BYTES {
         return Err("lock too large");
     }
@@ -89,14 +107,15 @@ pub(crate) fn eligible(bytes: &[u8]) -> Result<Vec<Package>, &'static str> {
             .entry(package.name.replace('-', "_"))
             .or_insert(0usize) += 1;
     }
-    Ok(lock
-        .package
-        .into_iter()
-        .filter(|package| {
-            if names[&package.name.replace('-', "_")] != 1 || !package.dependencies.is_empty() {
-                return false;
-            }
-            match package.source.as_deref() {
+    let mut eligible = Vec::new();
+    let mut rejected = Vec::new();
+    for package in lock.package {
+        let reason = if names[&package.name.replace('-', "_")] != 1 {
+            Some(SeedRejectReason::AmbiguousName)
+        } else if !package.dependencies.is_empty() {
+            Some(SeedRejectReason::NonLeaf)
+        } else {
+            let supported = match package.source.as_deref() {
                 Some(CRATES_IO) => package
                     .checksum
                     .as_deref()
@@ -105,9 +124,16 @@ pub(crate) fn eligible(bytes: &[u8]) -> Result<Vec<Package>, &'static str> {
                     .rsplit_once('#')
                     .is_some_and(|(_, revision)| hex(revision, 40)),
                 _ => false,
-            }
-        })
-        .collect())
+            };
+            (!supported).then_some(SeedRejectReason::UnsupportedSource)
+        };
+        if let Some(reason) = reason {
+            rejected.push(RejectedPackage { package, reason });
+        } else {
+            eligible.push(package);
+        }
+    }
+    Ok(Analysis { eligible, rejected })
 }
 
 #[cfg(test)]
@@ -142,9 +168,13 @@ dependencies = ["cfg-if"]
             "b".repeat(64),
             "c".repeat(64)
         );
-        let packages = eligible(input.as_bytes()).unwrap();
-        assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0].name, "cfg-if");
+        let result = analyze(input.as_bytes()).unwrap();
+        assert_eq!(result.eligible.len(), 1);
+        assert_eq!(result.eligible[0].name, "cfg-if");
+        assert_eq!(result.rejected.len(), 3);
+        assert_eq!(result.rejected[0].reason, SeedRejectReason::AmbiguousName);
+        assert_eq!(result.rejected[1].reason, SeedRejectReason::AmbiguousName);
+        assert_eq!(result.rejected[2].reason, SeedRejectReason::NonLeaf);
     }
 
     #[test]

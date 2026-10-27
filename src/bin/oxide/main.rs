@@ -35,6 +35,8 @@ mod seed_lock;
 mod seed_plan;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_sources;
+#[allow(dead_code)] // Enabled after the cold-seeding qualification.
+mod seed_summary;
 mod store;
 mod version;
 mod watchdog;
@@ -1432,6 +1434,11 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         [flag] if flag == "--launch-check" => return launch::run_check(),
         _ => return Err("status takes no arguments except --measure or --launch-check".to_owned()),
     };
+    if let Some(reason) =
+        cold_seed_qualification_notice(std::env::var_os("OXIDE_COLD_SEED").as_deref())
+    {
+        println!("seeding skipped: {reason}");
+    }
     let settings = store::settings()?;
     print_settings(&settings);
     println!(

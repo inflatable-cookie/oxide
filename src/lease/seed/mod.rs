@@ -467,6 +467,38 @@ fn read_attempt_at(pool: &Path, slot: &str) -> AttemptRead {
     }
 }
 
+/// The current held generation's durable attempt state, with corrupt or
+/// inaccessible sidecars treated as unknown rather than an unseeded fact.
+pub fn held_seed_attempt(
+    pool: &Path,
+    recipient: &SeedRecipient,
+) -> Result<SeedAttemptState, LeaseError> {
+    validate_recipient(recipient)?;
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
+    let slot = view
+        .slot(&recipient.slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if !slot.held
+        || slot.incarnation.to_string() != recipient.incarnation
+        || slot.lease_id.as_deref() != Some(recipient.lease_id.as_str())
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    match read_attempt_at(&view.pool_root, &recipient.slot_id) {
+        AttemptRead::Absent => Ok(SeedAttemptState::None),
+        AttemptRead::Invalid => Err(LeaseError::UnknownAccounting),
+        AttemptRead::Present(record)
+            if record.store_id == view.store_id
+                && record.incarnation == recipient.incarnation
+                && record.lease_id == recipient.lease_id =>
+        {
+            Ok(record.state)
+        }
+        AttemptRead::Present(_) => Ok(SeedAttemptState::None),
+    }
+}
+
 fn catalog_unseeded(pool: &Path, catalog: &SeedCatalog) -> bool {
     match read_attempt_at(pool, &catalog.slot_id) {
         AttemptRead::Absent => catalog.attempt == SeedAttemptState::None,
@@ -615,7 +647,15 @@ pub fn read_seed_last(pool: &Path) -> Option<SeedLast> {
         return None;
     }
     let record: SeedLast = serde_json::from_slice(&bytes).ok()?;
-    record.valid().then_some(record)
+    (record.valid()
+        && super::pool::seed_record_matches(
+            pool,
+            &record.store_id,
+            &record.slot_id,
+            &record.incarnation,
+            &record.lease_id,
+        ))
+    .then_some(record)
 }
 
 /// Publish the last summary only for the caller's still-held generation.

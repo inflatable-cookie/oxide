@@ -507,13 +507,13 @@ pub mod managed {
     use std::time::Duration;
 
     pub use super::super::seed::{
-        publish_seed_catalog, read_seed_last, seed, seed_candidates, seed_monitored,
-        write_seed_attempt, write_seed_last, SeedAbandon, SeedAttempt, SeedAttemptState,
-        SeedBucket, SeedCandidate, SeedCandidates, SeedCatalog, SeedDonor, SeedFile, SeedFileKind,
-        SeedJoin, SeedLast, SeedObservation, SeedOutcome, SeedPackage, SeedProducer, SeedReceipt,
-        SeedRecipient, SeedRejectReason, SeedRejection, SeedRequest, SeedRole, SeedSkip,
-        SeedSkipReason, SeedSourceKind, SeedSourceRoot, SeedUnit, SeedUnitRef, SeedWalkGap,
-        SeedWalkLimits, ATTEMPT_SCHEMA,
+        held_seed_attempt, publish_seed_catalog, read_seed_last, seed, seed_candidates,
+        seed_monitored, write_seed_attempt, write_seed_last, SeedAbandon, SeedAttempt,
+        SeedAttemptState, SeedBucket, SeedCandidate, SeedCandidates, SeedCatalog, SeedDonor,
+        SeedFile, SeedFileKind, SeedJoin, SeedLast, SeedObservation, SeedOutcome, SeedPackage,
+        SeedProducer, SeedReceipt, SeedRecipient, SeedRejectReason, SeedRejection, SeedRequest,
+        SeedRole, SeedSkip, SeedSkipReason, SeedSourceKind, SeedSourceRoot, SeedUnit, SeedUnitRef,
+        SeedWalkGap, SeedWalkLimits, ATTEMPT_SCHEMA,
     };
 
     /// Create an `apfs-volume-v1` pool: config, ledger and lock in `pool`
@@ -2289,6 +2289,32 @@ impl Pool {
 /// pair. Each file is replaced atomically, so one read may straddle a
 /// concurrent replacement: a mismatched pair is re-read once and a second
 /// mismatch refuses as unknown instead of being repaired or waited for.
+/// Passive generation check for a seed status sidecar. No pool lock,
+/// recovery or filesystem walk is performed.
+pub(super) fn seed_record_matches(
+    root: &Path,
+    store_id: &str,
+    slot_id: &str,
+    incarnation: &str,
+    lease_id: &str,
+) -> bool {
+    let Ok(root) = canonical_existing_dir(root, true) else {
+        return false;
+    };
+    let Ok((config, ledger)) = read_consistent_pair(&root) else {
+        return false;
+    };
+    config.store_id == store_id
+        && ledger.slots.iter().any(|slot| {
+            slot.id.to_string() == slot_id
+                && slot.incarnation.to_string() == incarnation
+                && slot.last_lease_id == lease_id
+                && matches!(slot.state, SlotPersistState::Idle | SlotPersistState::Held)
+                && (slot.state != SlotPersistState::Held
+                    || slot.lease_id.as_deref() == Some(lease_id))
+        })
+}
+
 fn read_consistent_pair(root: &Path) -> Result<(PoolConfig, Ledger), LeaseError> {
     for _ in 0..2 {
         let config = read_config(root)?;

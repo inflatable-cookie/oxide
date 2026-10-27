@@ -1505,6 +1505,123 @@ pub(crate) enum SeedRun {
 }
 
 impl Store {
+    /// Build and publish a catalog for a successful, still-held producing
+    /// generation. The caller verifies source trees on both sides of Cargo and
+    /// supplies the producing start; all catalog work is bounded and the
+    /// library rechecks the generation before its atomic sidecar write.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub(crate) fn publish_seed_catalog(
+        &self,
+        held: &Lease,
+        producer: oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
+        before: &[crate::seed_plan::VerifiedSource],
+        after: &[crate::seed_plan::VerifiedSource],
+        started: SystemTime,
+        started_ms: u64,
+        successful: bool,
+        origin: Option<&Built>,
+        profile: &str,
+    ) -> Result<(), String> {
+        use oxide_storage::lease::managed::{
+            held_seed_attempt, publish_seed_catalog, SeedAttemptState, SeedCatalog, SeedPackage,
+            SeedRecipient, SeedSourceRoot,
+        };
+        if !successful
+            || origin.is_none()
+            || held.reused
+            || !matches!(held.prior, Prior::Fresh)
+            || self.backend != Backend::DirectoryBudget
+        {
+            return Ok(());
+        }
+        let recipient = SeedRecipient {
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+        };
+        let _sibling = self.sibling_admission()?;
+        let _admission = self.admission()?;
+        let state = self.load()?;
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == held.record)
+            .filter(|record| record.lease_id.as_deref() == Some(held.lease_id.as_str()))
+            .ok_or("the producing record is no longer held")?;
+        let attempt = held_seed_attempt(&self.pool, &recipient)
+            .map_err(|error| lease_error("cannot read seed attempt", &error))?;
+        if !matches!(attempt, SeedAttemptState::None | SeedAttemptState::Skipped) {
+            return Ok(());
+        }
+        let Some(mut classifier) = crate::seed_catalog::Producer::new(&held.build_dir) else {
+            return Ok(());
+        };
+        let rejected = classifier.rejections(profile, &lock.rejected);
+        let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(4));
+        let mut packages = Vec::new();
+        for source in before {
+            if !lock.eligible.iter().any(|entry| entry == &source.package) {
+                continue;
+            }
+            let Some(post) = after.iter().find(|post| {
+                post.package == source.package
+                    && post.kind == source.kind
+                    && post.root == source.root
+                    && post.tree_digest == source.tree_digest
+                    && post.proc_macro == source.proc_macro
+            }) else {
+                continue;
+            };
+            if !pass.unchanged_since(&post.root, post.kind, started) {
+                continue;
+            }
+            let Some(units) = classifier.units(profile, post) else {
+                return Ok(());
+            };
+            if units.is_empty() {
+                continue;
+            }
+            let Some(source_name) = post.package.source.clone() else {
+                continue;
+            };
+            packages.push(SeedPackage {
+                name: post.package.name.clone(),
+                target: post.package.name.replace('-', "_"),
+                version: post.package.version.clone(),
+                source: source_name,
+                checksum: post.package.checksum.clone(),
+                unique: true,
+                leaf: true,
+                source_root: SeedSourceRoot {
+                    kind: post.kind,
+                    digest: post.tree_digest.clone(),
+                },
+                units,
+            });
+        }
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let catalog = SeedCatalog {
+            schema: oxide_storage::lease::seed::SEED_CATALOG_SCHEMA.into(),
+            store_id: held.store_id.clone(),
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+            record_id: held.record,
+            mark: record.last_used,
+            started_at_ms: started_ms,
+            finished_at_ms: process::now_ms(),
+            attempt,
+            producer,
+            packages,
+            rejected,
+        };
+        publish_seed_catalog(&self.pool, &catalog)
+            .map_err(|error| lease_error("cannot publish seed catalog", &error))
+    }
+
     /// One admission lifetime spans the catalog read, effect-free plan,
     /// reserve gate, durable intent and pinned library transaction. `held`
     /// already owns the outermost recipient record lock.
