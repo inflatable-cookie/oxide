@@ -67,21 +67,6 @@ pub(super) fn open_regular(path: &Path) -> Result<OpenedFile, Refusal> {
     })
 }
 
-/// The identity of one regular file at `path`, without following a symlink.
-pub(super) fn archive_identity(path: &Path) -> Result<FileIdentity, Refusal> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Refusal::MissingArchive
-        } else {
-            Refusal::ArchiveUnreadable
-        }
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(Refusal::ArchiveUnreadable);
-    }
-    Ok(FileIdentity::of(&metadata))
-}
-
 /// The identity of the extracted tree's root directory, never following a
 /// symlink.
 pub(super) fn tree_identity(path: &Path) -> Result<FileIdentity, Refusal> {

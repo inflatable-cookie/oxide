@@ -391,7 +391,12 @@ impl RegistrySource {
         if record.archive_sha256 != checksum {
             return None;
         }
-        let identity = tree::archive_identity(&self.archive).ok()?;
+        // §4.3 lists a missing or unreadable archive among the identity changes
+        // that force a full re-derivation or a skip, so a hit must open the
+        // archive (no follow) and take the descriptor's identity. This
+        // establishes readability and identity only; no content byte is read,
+        // so the hit still does not re-read or re-hash the archive.
+        let identity = tree::open_regular(&self.archive).ok()?.identity;
         if identity.device != record.archive_device
             || identity.inode != record.archive_inode
             || identity.size != record.archive_size

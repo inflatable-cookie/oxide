@@ -798,24 +798,66 @@ fn the_cache_document_is_owner_only_bounded_and_ignored_when_invalid() {
     );
     assert_eq!(SourceCache::read(&path, "store-2").len(), 0);
 
-    // An unknown field, a wrong schema, malformed JSON, a noncanonical digest
-    // and an impossible nanosecond field each make the whole document ignored.
+    // An unknown field, a wrong schema, a noncanonical digest, an impossible
+    // nanosecond field (including both i64 extremes, where `abs` overflowed)
+    // and malformed JSON each make the whole document ignored. Every forged
+    // document must differ from the valid one, so a substitution that stops
+    // matching its target cannot silently turn this regression vacuous.
     let text = fs::read_to_string(&path).expect("sidecar text");
-    for forged in [
-        text.replace("\"records\"", "\"extra\":1,\"records\""),
-        text.replace("oxide.seed-sources/1", "oxide.seed-sources/2"),
-        text.replace(
-            &sample_digest().to_hex(),
-            &sample_digest().to_hex().to_uppercase(),
+    let nanosecond = "\"archive_mtime_nanos\":5";
+    let forgeries = [
+        (
+            "unknown field",
+            text.replace("\"records\"", "\"extra\":1,\"records\""),
         ),
-        text.replace(
-            "\"archive_mtime_nanos\":5",
-            "\"archive_mtime_nanos\":1000000000",
+        (
+            "wrong schema",
+            text.replace("oxide.seed-sources/1", "oxide.seed-sources/2"),
         ),
-        "{".to_owned(),
-    ] {
+        (
+            "noncanonical digest",
+            text.replace(
+                &sample_digest().to_hex(),
+                &sample_digest().to_hex().to_uppercase(),
+            ),
+        ),
+        (
+            "nanos at one second",
+            text.replace(nanosecond, "\"archive_mtime_nanos\":1000000000"),
+        ),
+        (
+            "nanos at minus one second",
+            text.replace(nanosecond, "\"archive_mtime_nanos\":-1000000000"),
+        ),
+        (
+            "nanos at i64::MIN",
+            text.replace(nanosecond, "\"archive_mtime_nanos\":-9223372036854775808"),
+        ),
+        (
+            "nanos at i64::MAX",
+            text.replace(nanosecond, "\"archive_mtime_nanos\":9223372036854775807"),
+        ),
+        ("malformed json", "{".to_owned()),
+    ];
+    for (label, forged) in forgeries {
+        if label != "malformed json" {
+            assert_ne!(forged, text, "{label} did not change the document");
+        }
         fs::write(&path, &forged).expect("forge sidecar");
-        assert_eq!(SourceCache::read(&path, "store-1").len(), 0, "{forged}");
+        assert_eq!(
+            SourceCache::read(&path, "store-1").len(),
+            0,
+            "{label}: {forged}"
+        );
+    }
+
+    // The same extremes are refused on insert, without a sidecar round trip.
+    for nanos in [i64::MIN, i64::MAX, -1_000_000_000, 1_000_000_000] {
+        let mut record = sample_record("registry/cache/i/extreme.crate", 1);
+        record.archive_mtime_nanos = nanos;
+        let mut probe = SourceCache::new("store-1").expect("cache");
+        assert_eq!(probe.insert(record), Err(Refusal::CacheInvalid), "{nanos}");
+        assert!(probe.is_empty());
     }
 
     // A symlinked sidecar is not read.
