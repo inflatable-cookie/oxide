@@ -237,7 +237,17 @@ CUSTODY_VAR, CUSTODY_MARKER = (
 )
 # The product's own words for each refusal this proof expects: exact source
 # sentences, never loose keywords.
+# The DRY RUN's per-root eligibility keep (a live checkout keeps its own root),
+# which is a different question from whether a real run refused a race.
 PRESENT_KEEP = "the checkout is present, so its root is kept"
+# The real run's own refusals. `confirm_absence` (under publication custody) says
+# the checkout reappeared; the batch summary says nothing was changed. Neither is
+# the dry-run eligibility sentence, and the race oracle must use exactly these.
+REAPPEARED_REFUSAL = "the checkout reappeared before the prune"
+NO_EFFECT_REFUSAL = (
+    "every candidate root was kept by a fresh check before its intent; "
+    "no output root was changed"
+)
 LEAF_ONLY_REFUSAL = "an ancestor of the checkout below its mount is missing"
 NO_RECORDED_VOLUME = "a /Volumes checkout has no recorded volume UUID"
 RECORDED_VOLUME_CONFLICT = "is not on the checkout's recorded volume"
@@ -254,6 +264,27 @@ UNKNOWN_CUSTODY = "writer custody is unknown (injected fixture)"
 def require(value, message):
     if not value:
         raise RuntimeError(message)
+
+
+def race_refusal_ok(stderr: str) -> bool:
+    """The witness race's OWN refusal branch, as one pure predicate.
+
+    The real run refuses under publication custody ("the checkout reappeared
+    before the prune") and the batch states that nothing was changed. A dry-run
+    eligibility keep ("the checkout is present, so its root is kept") is a
+    different question and must never satisfy this oracle — demanding it is what
+    aborted the spent diagnostic at fe3228b.
+    """
+    return (
+        REAPPEARED_REFUSAL in stderr
+        and NO_EFFECT_REFUSAL in stderr
+        and PRESENT_KEEP not in stderr
+    )
+
+
+def dry_run_live_keep(reason: str) -> bool:
+    """A LIVE checkout's dry-run keep: the eligibility sentence, not a refusal."""
+    return reason == PRESENT_KEEP
 
 
 def require_batch_refusal(doc, expected):
@@ -965,7 +996,7 @@ def run_cases(proof, custody, diagnostic, cases):
         require_root_kept(doc, conflicting_root, RECORDED_VOLUME_CONFLICT)
         require_root_kept(doc, symlink_root, NOT_A_DIRECTORY)
         require(
-            world.kept(doc, roots["live"]) == PRESENT_KEEP,
+            dry_run_live_keep(world.kept(doc, roots["live"])),
             f"the live checkout was not kept: {doc['kept']}",
         )
         code, out, err = world.real_run("positive prune", boot, plan, sha, listed)
@@ -1148,8 +1179,12 @@ def run_cases(proof, custody, diagnostic, cases):
             if reason is not None:
                 raise prior.Aborted(f"the recreate race left custody unknown: {reason}")
             require(code != 0, f"a recreated checkout was pruned: {out}{err}")
+            # This is the REAL RUN's branch, not the dry-run eligibility keep:
+            # confirm_absence refused under publication custody and the batch
+            # summary states that nothing was changed.
             require(
-                PRESENT_KEEP in err, f"the recreated checkout was not refused as present: {err}"
+                race_refusal_ok(err),
+                f"the recreated checkout was not refused by the locked recheck: {err}",
             )
             require(prior.tree_snapshot(roots["recreate_race"]) == before, "the refused root changed")
             require(
@@ -1782,6 +1817,36 @@ def self_check() -> int:
     # This file's own structure: the case table and every unpacked helper.
     structure = source_structure_problems(Path(__file__).read_text())
     require(not structure, f"the proof's own structure is inconsistent: {structure}")
+    # The witness race's expected branch: the exact sentences the SPENT
+    # diagnostic at fe3228b recorded, and NOT the dry-run eligibility keep that
+    # the first version demanded (that mismatch aborted that run).
+    spent_race = (
+        "oxide: prune kept /Volumes/Ox1354c23f3e5/oxide-outputs/checkout-f69601a5: "
+        + REAPPEARED_REFUSAL
+        + "\noxide: prune refused: "
+        + NO_EFFECT_REFUSAL
+        + "\n"
+    )
+    require(race_refusal_ok(spent_race), "the race oracle rejects its own recorded refusal")
+    eligibility_keep = "oxide: prune kept /x: " + PRESENT_KEEP + "\n"
+    require(
+        not race_refusal_ok(eligibility_keep),
+        "the race oracle accepts a dry-run eligibility keep",
+    )
+    require(
+        not race_refusal_ok(spent_race.replace(NO_EFFECT_REFUSAL, "some other refusal")),
+        "the race oracle accepts a refusal that states no zero-effect outcome",
+    )
+    # The ordinary live-checkout oracle is the other branch and stays distinct.
+    require(dry_run_live_keep(PRESENT_KEEP), "the live-checkout oracle rejects its sentence")
+    require(
+        not dry_run_live_keep(spent_race.strip()),
+        "the live-checkout oracle accepts a race refusal",
+    )
+    require(
+        PRESENT_KEEP not in spent_race and REAPPEARED_REFUSAL not in PRESENT_KEEP,
+        "the two oracles' sentences must stay distinguishable",
+    )
     # The pre-detach protocol's counterfactuals (injectable effects only).
     detach_counterfactuals()
     attach_call_shape()

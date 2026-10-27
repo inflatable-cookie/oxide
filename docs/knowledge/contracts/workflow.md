@@ -5190,6 +5190,37 @@ The stable, read-only interface other tools use to find the registered Builds dr
   host install, mode, settings or consumer change is authorized by this
   implementation.
 
+  **Spent native start (preserved, not credit).** Under an explicit ROOT
+  activation the ONE uncounted diagnostic ran once at `fe3228b` and stopped with
+  exit 1: guard receipt `44ec0dab…` (run_id `b1907e58753d75b6c0b91a61f7803349`,
+  closure closed, status 1, **no deadline**, 48.37 s of 300 s, reserve minimum
+  2221.2 GiB over 191 samples, owned peak 279.2 MiB of 512 MiB, post-leader census
+  certain with zero members and zero uncertain) and proof receipt `40037b5c…`
+  under `/private/tmp/oxide-proof.l82e88u0/evidence`, both kept untouched. Five
+  cases completed and produced the first native evidence of the protocol: the one
+  real private prune deleted two roots whose checkout was positively absent (a
+  registered Data missing-chain profile group and a receiptless legacy Data
+  missing-chain root; `0` by exact intent replay) while the SAME complete batch
+  kept six live checkouts plus a recorded-volume conflict
+  (`…not on the checkout's recorded volume`) and a symlinked ancestor
+  (`…not a directory`); the image-custody record `e3bbb547…` shows the full
+  pre-detach protocol completed end to end (original identity rebind, clean
+  pre/post session censuses, ordinary device detach, positive absence, backing
+  removed only then, no stale volume, image or process). `witness-races` then
+  failed on a FIXTURE ORACLE, not on the product: the recreate race's real run
+  correctly refused under publication custody with "the checkout reappeared
+  before the prune" and "every candidate root was kept by a fresh check before
+  its intent; no output root was changed" (root unchanged, no intent, exit 2),
+  while the oracle demanded the dry-run eligibility sentence "the checkout is
+  present, so its root is kept". The oracle is now the pure `race_refusal_ok`
+  predicate (both real-run sentences required, the eligibility keep explicitly
+  rejected) with a pure counterfactual built from the spent run's own recorded
+  text, and the live-checkout keep keeps its separate `dry_run_live_keep`
+  oracle. That start is SPENT: it is not a counted PASS and grants no credit. The
+  author's counted native, the distinct counted reviewer native and any fresh
+  diagnostic each still need their own ROOT activation after an independent
+  exact-head source-fit review.
+
 - **Receiptless legacy roots.** An operator-listed root that no registry row names is a candidate only when it sits directly inside the registered volume's `oxide-outputs`, carries a well-formed owner marker for that volume, its checkout has no receipt, journal or live reference, the checkout's actual leaf is absent and every writer is closed. Before its intent, the writer helper exclusively creates a `pruning` receipt bound to the intent (no adoption history is reconstructed); every bind, adopt, automatic adoption, detach, clean and replay refuses that state. The intent adds a temporary pruning row within the live caps. If the intent is not published, the receipt is discarded with no output effect; an intent-phase rollback removes both. Completion ends the receipt in `pruned`.
 - **Tombstones.** After a positive completion (both the registry terminal state and the receipt's terminal state committed), the completed row and the settled intent leave the live registry in one revision, and a diagnostic entry is appended best effort to `outputs/tombstones.json` (`oxide.outputs.tombstones/1`, at most 16,384 entries and 4 MiB, oldest compacted first). The ring is never a safety journal or a live cap; unfinished intents and reservations stay in the registry and are never compacted. A recreated root always gets a fresh nonce.
 - **Replay detail.** An `intent`-phase journal with its original root still present and unchanged is rolled back exactly on replay; that is not a completion, and the root is re-evaluated in the same run against the plan. An `intent`-phase journal whose root is instead found under its own quarantine leaf with the recorded device, inode and marker (a crash between the rename and its journal phase) resumes deletion. Any other unfinished phase is resumed only from its exact recorded identity, otherwise it stays pending. A symbolic link inside a quarantine stops the deletion and leaves the intent pending.
