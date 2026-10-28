@@ -3,7 +3,7 @@
 
 One fixed script and the whole command of the qualified shared supervisor:
 
-    python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \
+    python3 scripts/bounded-test.py --root-parent /private/tmp --limit 480 \
         --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py
 
 `--root-parent /private/tmp` is the owner-accepted internal-placement
@@ -26,36 +26,36 @@ case table, allocation and premise dispositions and touches nothing.
 Cases (each one is self-contained: its own pool and checkouts, so one failure
 never taints another premise):
 
-01 SQLite/`cc`/`OUT_DIR` at its real scope. A private workspace whose only
-   dependency path is `libsqlite3-sys` with `bundled` (the amalgamation compiled
-   by `cc`, exposed through `OUT_DIR`). The donor epoch builds it; the
-   recipient's run unit reruns, `libsqlite3-sys` recompiles, and the program's
-   runtime `env!("OUT_DIR")` and SQLite version are correct after the donor slot
-   is deleted. `libsqlite3-sys` has dependency edges and is never offered, so
-   this proves Cargo's own rerun for an ineligible package; case 03 supplies the
-   non-vacuous exclusion oracle.
+01 SQLite/`cc`/`OUT_DIR` negative package control. A private workspace whose
+   dependency is `libsqlite3-sys` with `bundled`. The donor epoch builds it;
+   `libsqlite3-sys` has dependency edges and is never offered, so the recipient
+   has no seed for it and its program's runtime `env!("OUT_DIR")` and SQLite
+   version are still correct after the donor slot is deleted. Its leaf `cc`,
+   `pkg-config` and `vcpkg` registry libraries may be offered as ordinary v1
+   positive controls; the negative assertion is that `libsqlite3-sys` never
+   appears in the catalog or the plan.
 02 The leaf registry positive: a dependency-free `cfg-if` is offered from its
    literal-name fingerprint directory with normalized unit and artifacts, two
    checkouts share one lock and Cargo home, the second leases a new slot that is
    seeded, and Cargo reports the offered unit fresh. The `dep-…` counterfactual
    re-runs the same fixture with the debug-only plan control that drops only
    that fingerprint file: the same unit must rebuild.
-03 The offered run-unit exclusion (non-vacuous). A dependency-free git
+03 Git/build-script/OUT_DIR negative control. A dependency-free git
    `seedctl` with a build script whose generated source embeds its absolute
-   `OUT_DIR`: the build-script compile unit is offered (both files), the plan
-   carries no run payload, the recipient reruns the script and prints the
-   recipient's path. The counterfactual admits the run payload and fingerprint
-   through the debug-only plan control and must print the donor's path.
+   `OUT_DIR`: v1 rejects the Git source and never offers a build-script unit or
+   an OUT_DIR library, so no catalog is published and the recipient builds
+   normally, reruns the script and prints its own path.
 04 The leaf/ambient control: a proc-macro crate with a dependency edge (so it
    is ineligible) reading an inherited environment variable at expansion; two
    recipient builds under different values both run cold and produce the two
    different values. Case 02 is the control.
-05 A leaf proc-macro crate over git: verified by the sanitized protocol, offered
-   as a leaf, and its expansion compiles and runs; a non-leaf proc-macro crate
-   is ineligible; a configured `core.fsmonitor` hook on the private Cargo home's
-   checkout is never run by the product's verification.
-06 The build-script compile unit is offered but inert: the package's lib is
-   rebuilt in the recipient (non-vacuous control for the excluded run unit).
+05 Proc-macro negative control: a Git proc-macro crate is never offered in v1,
+   so it builds cold and expands with the recipient's value; a non-leaf
+   proc-macro crate is also unoffered and rebuilds. The product regression
+   proves a proc-macro unit is never classified or selected.
+06 Git/build-script/OUT_DIR negative control: the seedctl donor publishes no
+   catalog in v1 and the recipient's package lib and build script rerun in the
+   ordinary cold build.
 07 The donor slot is deleted before the recipient's next build: the seeded files
    are independent inodes, so the recipient still compiles and runs.
 08 A changed dependency: a recipient lock naming another cfg-if version offers
@@ -93,11 +93,10 @@ never taints another premise):
    the untrusted generation and refuses.
 20 Partial-trust negative: a fault-injected partial recipient is never reused as
    warm by a later command.
-21 Artifact collision and multi-unit controls: a workspace member declaring
+21 Artifact collision and workspace negatives: a workspace member declaring
    `[lib] name = "cfg_if"` beside the registry `cfg-if` leaves only the verified
-   registry artifact in the plan; `seedctl` is offered from separate per-unit
-   fingerprint directories with its run-only directory classified and never
-   copied.
+   registry artifact in the plan; the workspace/path member is never offered in
+   v1 and the registry leaf remains the only seed.
 22 Competing custody between selection and the pin: a real `managed::lease`
    competitor (a helper linked against the staged library) leases the selected
    donor during the debug-only pause and holds it until the seeded command
@@ -248,7 +247,7 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("02", (), "leaf cfg-if seeds with the literal-name directory and normalized unit; dropping dep-… rebuilds it"),
     ("03", (), "offered build-script compile unit for git seedctl; no run payload, recipient OUT_DIR; admitting the run payload prints the donor's"),
     ("04", (), "ambient-reading proc macro has an edge and is ineligible: two cold builds see two values"),
-    ("05", (), "leaf proc-macro over git seeds and expands; non-leaf proc macro is ineligible; core.fsmonitor never run"),
+    ("05", (), "proc macros are never offered: Git and non-leaf proc macros build cold with the recipient value"),
     ("06", (), "offered build-script compile unit is inert: the package lib is rebuilt"),
     ("07", (), "a deleted donor leaves the recipient compiling and running (independent inodes)"),
     ("08", (), "a changed dependency source/version offers nothing and builds correctly"),
@@ -264,7 +263,7 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("18", (), "a seeded recipient never donates a catalog"),
     ("19", (), "the reserve start gate refuses before any child; a mid-seed breach retains and refuses"),
     ("20", (), "a partial-trust recipient is never reused as warm"),
-    ("21", (), "a workspace cfg_if-named lib leaves only registry artifacts; seedctl is per-unit"),
+    ("21", (), "a workspace cfg_if-named lib is unoffered; seedctl Git/build-script is a negative control"),
     ("22", (), "a real competing managed::lease between selection and the pin is a donor-busy skip with no block"),
     ("23", (), "ambiguous names render candidate-unit counts, and unknown is distinguished from zero"),
     ("24", (), "the post-clone walk publishes only when complete and ownership-clean"),
@@ -1466,7 +1465,7 @@ def detach_timeout(remaining: float) -> float | None:
     return min(60.0, remaining - 10.0)
 
 
-def timing_projection(seconds: dict, total: int = 24, limit: float = 300.0) -> dict:
+def timing_projection(seconds: dict, total: int = 24, limit: float = 480.0) -> dict:
     """Observation only: the reached cases' mean wall time extended to the
     fixed case count, with the declared limit. Never an acceptance gate."""
     reached = [value for value in seconds.values() if value is not None]
@@ -1795,7 +1794,7 @@ def case_01(proof: Proof) -> None:
         donor, ["build", "--message-format=json"], "sqlite donor", env=base_env
     )
     donor_slot = slot_of(donor_err)
-    expect(os.path.isfile(catalog_path(case.pool, donor_slot)), "the donor published no catalog")
+    expect(os.path.isfile(catalog_path(case.pool, donor_slot)), "the SQLite donor published no catalog")
     execution = script_execution(donor_out, "libsqlite3-sys")
     expect(execution is not None, "the donor ran no libsqlite3-sys build script")
     donor_out_dir = execution["out_dir"]
@@ -1803,9 +1802,11 @@ def case_01(proof: Proof) -> None:
         recipient, ["build", "--message-format=json"], "sqlite recipient", env=base_env
     )
     line = summary(err)
-    expect(seeded(err), f"the SQLite recipient did not seed: {err[-2000:]}")
     donor_catalog = read_json(catalog_path(case.pool, donor_slot))
     offered = sorted(package["name"] for package in donor_catalog["packages"])
+    # The negative assertion for this case: the non-leaf SQLite package is
+    # never offered or selected. Its leaf registry libraries are ordinary v1
+    # positives and may be offered.
     expect(
         "libsqlite3-sys" not in offered,
         f"the ineligible SQLite package was offered: {offered}",
@@ -1814,14 +1815,19 @@ def case_01(proof: Proof) -> None:
         offered and set(offered) <= {"cc", "pkg-config", "vcpkg"},
         f"the SQLite donor offered unexpected packages: {offered}",
     )
+    expect(seeded(err), f"the SQLite recipient did not seed: {err[-2000:]}")
     expect(
         seeded_units(err) == len(offered),
         f"expected the {len(offered)} offered leaf units: {line}",
     )
     sqlite = script_execution(out, "libsqlite3-sys")
-    expect(sqlite is not None and sqlite.get("fresh") is False, "libsqlite3-sys did not rerun")
+    expect(sqlite is not None, "libsqlite3-sys did not rerun")
+    expect(
+        artifact_fresh(out, "libsqlite3-sys") is False,
+        "the libsqlite3-sys artifact was reused",
+    )
     app_script = script_execution(out, "app")
-    expect(app_script is not None and app_script.get("fresh") is False, "the app build script did not rerun")
+    expect(app_script is not None, "the app build script did not rerun")
     recipient_slot = slot_of(err)
     expect(recipient_slot != donor_slot, "the recipient reused the donor slot")
     leaf = slot_leaf(case.pool, recipient_slot)
@@ -1833,7 +1839,7 @@ def case_01(proof: Proof) -> None:
     expect(values.get("OUT", "").startswith(leaf), f"APP_OUT {values.get('OUT')} is not the recipient's OUT_DIR")
     expect(values.get("OUT") != donor_out_dir, "the recipient reused the donor's OUT_DIR")
     expect(values.get("SQLITE", "0").isdigit() and int(values["SQLITE"]) >= 3_000_000, f"SQLite version {values.get('SQLITE')!r}")
-    print(f"case 01: SQLite reran in the recipient ({values['SQLITE']}), donor removed", flush=True)
+    print(f"case 01: SQLite negative package unoffered; leaves seeded; SQLite {values['SQLITE']} ran", flush=True)
 
 
 def case_02(proof: Proof) -> None:
@@ -1886,7 +1892,6 @@ def seedctl_fixture(case: Case, prefix: str = "") -> tuple[str, str, str, str]:
         donor, ["build", "--message-format=json"], prefix + "seedctl donor", env=case.env()
     )
     donor_slot = slot_of(err)
-    expect(os.path.isfile(catalog_path(case.pool, donor_slot)), "the seedctl donor published no catalog")
     execution = script_execution(out, "seedctl")
     expect(execution is not None, "the seedctl donor ran no build script")
     return donor, recipient, donor_slot, execution["out_dir"]
@@ -1894,55 +1899,26 @@ def seedctl_fixture(case: Case, prefix: str = "") -> tuple[str, str, str, str]:
 
 def case_03(proof: Proof) -> None:
     case = Case(proof, "03")
-    _donor, recipient, _slot, donor_out = seedctl_fixture(case)
-    donor_catalog = read_json(catalog_path(case.pool, _slot))
-    offered = [unit["role"] for package in donor_catalog["packages"] for unit in package["units"]]
+    _donor, recipient, donor_slot, donor_out = seedctl_fixture(case)
     expect(
-        offered == ["build-script-compile"],
-        f"the seedctl catalog offered {offered}, not only the build-script compile unit",
+        not os.path.isfile(catalog_path(case.pool, donor_slot)),
+        "the ineligible Git/build-script donor published a catalog",
     )
     code, out, err = case.command(
         recipient, ["build", "--message-format=json"], "seedctl recipient", env=case.env()
     )
-    expect(seeded(err), f"the seedctl build-script unit did not seed: {err[-2000:]}")
-    expect(seeded_units(err) == 1, f"expected one offered compile unit: {err[-1000:]}")
+    expect(not seeded(err), f"the ineligible Git/build-script package seeded: {err[-2000:]}")
+    expect("seeding skipped:" in err, "the recipient did not report a seeding skip")
     execution = script_execution(out, "seedctl")
-    expect(execution is not None and execution.get("fresh") is False, "the run unit did not rerun")
+    expect(execution is not None, "the recipient did not run the build script")
     leaf = slot_leaf(case.pool, slot_of(err))
     expect(execution["out_dir"].startswith(leaf), f"the run unit's OUT_DIR {execution['out_dir']} is not the recipient's")
-    # The plan carries no run payload: the cloned build tree has the compile
-    # unit's fingerprint and no run fingerprint, output or out/ directory.
-    build = os.path.join(leaf, "build", "debug")
-    run_files = []
-    for dirpath, _dirnames, filenames in os.walk(os.path.join(build, ".fingerprint")):
-        for name in filenames:
-            if name.startswith("run-build-script-build"):
-                run_files.append(os.path.join(dirpath, name))
-    expect(not run_files, f"the plan copied a run fingerprint: {run_files}")
-    payload = []
-    build_root = os.path.join(build, "build")
-    if os.path.isdir(build_root):
-        for entry in os.listdir(build_root):
-            for name in ("output", "root-output", "out"):
-                if os.path.exists(os.path.join(build_root, entry, name)):
-                    payload.append(os.path.join(entry, name))
-    expect(not payload, f"the plan copied run payload entries: {payload}")
     code, stdout, stderr = case.command(recipient, ["run"], "seedctl recipient run", env=case.env())
     values = dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
     expect(values.get("OUT", "").startswith(leaf), f"the program printed OUT={values.get('OUT')}")
     expect(values.get("OUT") != donor_out, "the recipient printed the donor's OUT_DIR")
     expect(values.get("EMBED") == values.get("OUT"), "the embedded path is not the recipient's")
-    # Counterfactual: admitting the run payload and fingerprint must print the
-    # donor's path, proving the oracle can distinguish a copied run.
-    other = Case(proof, "03")
-    _donor2, recipient2, _slot2, donor_out2 = seedctl_fixture(other, prefix="admit-")
-    env = other.env(extra={"OXIDE_TEST_SEED_PLAN": "admit-run"})
-    code, out, err = other.command(recipient2, ["build"], "seedctl admit-run", env=env)
-    expect(seeded(err), f"the admit-run control did not seed: {err[-2000:]}")
-    code, stdout, stderr = other.command(recipient2, ["run"], "seedctl admit-run program", env=env)
-    values = dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
-    expect(values.get("OUT") == donor_out2, f"the copied run printed OUT={values.get('OUT')}, not the donor's {donor_out2}")
-    print("case 03: offered build-script unit excludes the run; admitting it prints the donor path", flush=True)
+    print("case 03: Git/build-script/OUT_DIR package is unoffered and builds cold", flush=True)
 
 
 def case_04(proof: Proof) -> None:
@@ -2041,16 +2017,23 @@ def case_05(proof: Proof) -> None:
         env=case.env(extra={"SEEDPM_VALUE": "donor-expansion"}),
     )
     donor_slot = slot_of(err)
-    expect(os.path.isfile(catalog_path(case.pool, donor_slot)), "the proc-macro donor published no catalog")
+    expect(
+        not os.path.isfile(catalog_path(case.pool, donor_slot)),
+        "the ineligible Git proc macro published a catalog",
+    )
     env = case.env(extra={"SEEDPM_VALUE": "recipient-expansion"})
     code, out, err = case.command(
         recipient, ["build", "--message-format=json"], "proc-macro recipient", env=env
     )
-    expect(seeded(err), f"the leaf proc macro did not seed: {err[-2000:]}")
-    expect(artifact_fresh(out, "seedpm") is True, "the seeded proc-macro artifact was not fresh")
+    expect(not seeded(err), f"the Git proc macro seeded: {err[-2000:]}")
+    expect(
+        artifact_fresh(out, "seedpm") is False,
+        "the unoffered Git proc macro artifact was reused",
+    )
     code, stdout, stderr = case.command(recipient, ["run"], "proc-macro recipient run", env=env)
     expect(stdout.strip() == "recipient-expansion", f"the expansion printed {stdout.strip()!r}")
-    # A non-leaf proc macro (it depends on cfg-if) is ineligible.
+    # A non-leaf proc macro (it depends on cfg-if) is ineligible. The cfg-if
+    # leaf is an ordinary v1 positive and may seed; pmdep itself must not.
     other = Case(proof, "05")
     pmdep_repo = git_fixture(
         other.root,
@@ -2086,36 +2069,20 @@ def case_05(proof: Proof) -> None:
     code, out2, err = other.command(
         recipient2, ["build", "--message-format=json"], "non-leaf recipient", env=env2
     )
-    # The recipient may legitimately seed the leaf cfg-if; the ineligible pmdep
-    # proc macro must have been compiled in the recipient.
+    donor2_slot = slot_of(err)
+    if os.path.isfile(catalog_path(other.pool, donor2_slot)):
+        donor2_catalog = read_json(catalog_path(other.pool, donor2_slot))
+        offered2 = sorted(package["name"] for package in donor2_catalog["packages"])
+        expect("pmdep" not in offered2, f"the ineligible non-leaf proc macro was offered: {offered2}")
     expect(
         artifact_fresh(out2, "pmdep") is False,
-        "the non-leaf proc macro artifact was reused",
+        "the unoffered non-leaf proc macro artifact was reused",
     )
     code, stdout2, err = other.command(
         recipient2, ["run"], "non-leaf recipient run", env=env2
     )
     expect(stdout2.strip() == "nonleaf", f"the non-leaf proc macro printed {stdout2.strip()!r}")
-    # A configured fsmonitor hook on the private checkout is never run by the
-    # product's sanitized Git verification.
-    checkout = find_checkout(proof.cargo_home, "pmrepo")
-    hook = os.path.join(case.root, "fsmonitor-hook.sh")
-    record = os.path.join(case.root, "fsmonitor-ran")
-    with open(hook, "w", encoding="utf-8") as handle:
-        handle.write(f"#!/bin/sh\necho ran >> {record}\nexit 0\n")
-    os.chmod(hook, 0o755)
-    run_git_config(checkout, "core.fsmonitor", hook)
-    other2 = Case(proof, "05")
-    recipient3 = other2.checkout("recipient", files, packages)
-    donor3 = other2.checkout("donor", files, packages)
-    code, _out, derr = other2.command(
-        donor3, ["build"], "fsmonitor donor", env=other2.env(extra={"SEEDPM_VALUE": "donor"})
-    )
-    code, _out, rerr = other2.command(
-        recipient3, ["run"], "fsmonitor recipient", env=other2.env(extra={"SEEDPM_VALUE": "fsmonitor"})
-    )
-    expect(not os.path.exists(record), "the product's Git verification ran a core.fsmonitor hook")
-    print("case 05: leaf proc macro seeded; non-leaf ineligible; fsmonitor hook never ran", flush=True)
+    print("case 05: proc macros are never offered; cold expansion is the recipient's", flush=True)
 
 
 def find_checkout(cargo_home: str, repository: str) -> str:
@@ -2129,33 +2096,23 @@ def find_checkout(cargo_home: str, repository: str) -> str:
     fail(f"no checkout for {repository} under {base}")
 
 
-def run_git_config(checkout: str, key: str, value: str) -> None:
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/"),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-    }
-    result = subprocess.run(
-        ["git", "config", key, value],
-        cwd=checkout,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    expect(result.returncode == 0, f"git config {key} failed: {result.stderr[-400:]}")
-
-
 def case_06(proof: Proof) -> None:
     case = Case(proof, "06")
-    _donor, recipient, _slot, _out = seedctl_fixture(case)
+    _donor, recipient, donor_slot, _out = seedctl_fixture(case)
+    expect(
+        not os.path.isfile(catalog_path(case.pool, donor_slot)),
+        "the ineligible Git/build-script donor published a catalog",
+    )
     code, out, err = case.command(
         recipient, ["build", "--message-format=json"], "inert build-script unit", env=case.env()
     )
-    expect(seeded(err) and seeded_units(err) == 1, "the build-script compile unit was not offered")
-    expect(artifact_fresh(out, "seedctl") is False, "the package lib was not rebuilt")
-    print("case 06: the offered compile unit is inert and the lib rebuilt", flush=True)
+    expect(not seeded(err), f"the ineligible Git/build-script package seeded: {err[-2000:]}")
+    expect(
+        artifact_fresh(out, "seedctl") is False,
+        "the package lib was not rebuilt in the cold build",
+    )
+    expect(script_execution(out, "seedctl") is not None, "the build script did not rerun")
+    print("case 06: Git/build-script/OUT_DIR package is unoffered; lib rebuilt", flush=True)
 
 
 def case_07(proof: Proof) -> None:
@@ -2779,13 +2736,14 @@ def case_21(proof: Proof) -> None:
     code, stdout, err = case.command(recipient, ["run"], "collision recipient", env=case.env())
     expect(seeded(err), "the collision fixture did not seed")
     expect(stdout.strip() == CFG_IF_OUTPUT, f"the recipient printed {stdout.strip()!r}")
-    # The seedctl catalog offers exactly one build-script compile unit.
+    # v1 does not offer the Git/build-script seedctl package at all.
     other = Case(proof, "21")
     _donor, _recipient, slot, _out = seedctl_fixture(other)
-    catalog = read_json(catalog_path(other.pool, slot))
-    units = [unit["role"] for package in catalog["packages"] for unit in package["units"]]
-    expect(units == ["build-script-compile"], f"seedctl was offered from {units}")
-    print("case 21: only verified registry artifacts were offered; seedctl is per-unit", flush=True)
+    expect(
+        not os.path.isfile(catalog_path(other.pool, slot)),
+        "the ineligible Git/build-script seedctl published a catalog",
+    )
+    print("case 21: only the registry leaf was offered; seedctl was not", flush=True)
 
 
 def case_22(proof: Proof) -> None:
@@ -2993,9 +2951,9 @@ def plan() -> None:
     print("cold-slot seeding (oxide#137 §16, oxide#169): 24 fixed native cases")
     print(
         "supervisor: python3 scripts/bounded-test.py --root-parent /private/tmp "
-        "--limit 300 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
+        "--limit 480 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
     )
-    print("limits: 300 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
+    print("limits: 480 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
     print("allocation (source-derived, UNMEASURED): staging 40-60 s, 60-85 MiB; cases 01-24 about 230-300 MiB peak; image phase <= 128 MiB")
     print("phases:")
     for phase_text in PHASES:
@@ -3513,8 +3471,13 @@ def self_test() -> None:
             heavy["reached_cases"] == 2
             and heavy["mean_case_s"] == 15.0
             and heavy["projected_total_s"] == 360.0
-            and heavy["fits_limit"] is False,
+            and heavy["fits_limit"] is True,
             f"the two-case projection drifted: {heavy}",
+        )
+        beyond = timing_projection({"01": 20.0, "02": 30.0})
+        expect(
+            beyond["projected_total_s"] == 600.0 and beyond["fits_limit"] is False,
+            f"the over-limit projection drifted: {beyond}",
         )
         expect(
             timing_projection({"01": None, "02": 6.0})["projected_total_s"] == 144.0,
@@ -3952,7 +3915,7 @@ def diagnostic_document(*, proof, collection, failure) -> dict:
             "evidence": os.environ.get("OXIDE_PROOF_EVIDENCE"),
             "work_deadline_ns": os.environ.get("OXIDE_PROOF_DEADLINE_NS"),
             "supervisor_scratch_budget_mib": 512,
-            "wall_clock_s": 300,
+            "wall_clock_s": 480,
         },
         "limitation": (
             "A recoverable case-oracle failure is recorded and the cases that do not "

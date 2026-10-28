@@ -1,7 +1,7 @@
 # Cold-slot seeding from matching dependency units (proposed design)
 
 Status: **design frozen; implemented in the unpublished `oxide` by oxide#167,
-oxide#168 and oxide#169.** This document was the design deliverable of
+oxide#168 and oxide#169, with the v1 offer set narrowed by Revision 15.** This document was the design deliverable of
 oxide#137 under the ROOT design-first rebind (standing decision `8ddaa98d`).
 The frozen protocol is implemented: the library custody calls, the front door
 transaction, the debug-only proof controls and the 24-case proof script exist
@@ -34,6 +34,32 @@ control. The proof's case 3 oracle, the pure build-script fixture and the
 catalog/product regressions follow these names; the per-case elapsed timing is
 recorded in the uncounted diagnostic receipt for a measured bound projection.
 
+**Revision 15** applies Tom's operator decision `e3540b1c` (2026-10-28),
+recorded by the Oxide Supervisor: v1 offers **only plain registry library
+compile units**. A unit is offered only when its lock entry is a crates.io
+registry package with a recorded checksum, its normalized name is unique, it
+has **no dependency edges**, its verified manifest declares a plain (not
+proc-macro) library, its fingerprint triple is the library triple, its
+artifacts are the `.rmeta`/`.rlib` pair, and every `.d` input is inside the
+verified source root. Git/Git-revision sources, build-script compile and run
+units, proc-macro units, and any unit whose `.d` names an `OUT_DIR` or other
+outside-root input are **not offered**; each skip is named and the command
+continues as an ordinary cold build. The case 05 proc-macro reuse defect is
+fixed by never classifying or selecting a proc-macro unit, with product
+regressions on both the catalog producer and plan selection. Cases 01
+(non-leaf SQLite package), 03 and 06 (Git/build-script/`OUT_DIR` seedctl) and
+05 (proc macro) are negative controls that assert the package is unoffered,
+no catalog is published and the ordinary build is correct; positives use
+plain registry libraries. Case 11's post-crash `FileNotFoundError` is
+root-caused from its new location evidence and corrected at its source, not
+caught or masked. The selector bound is **480 s** for
+`rust:cold-slot-seeding` and `:diagnostic` only (decision `e3540b1c`), with
+the 30 s script margin, 512 MiB monitored scratch, heavy admission, host
+reserve, custody and ordinary detach unchanged; any bound above 480 s needs
+another operator ruling. Revision 15 supersedes the build-script,
+proc-macro and Git offers of revisions 11–14 for v1; their text is retained
+as history. The default-on flip remains isolated behind this task's merge
+hold.
 **Revision 13** applies Supervisor A2′ at head `c022dc6` (review comment
 `6451786564`, 2026-10-27): the limit-gap/donor-figure publication exception is
 deleted everywhere (§6.3 step 7, §8.1, §8.2, §13, case 24 and the revision
@@ -417,24 +443,24 @@ other compile-time inputs (`env!`, `option_env!`, `include_str!`,
 script) are exactly the inputs Cargo fingerprints, and a same-package build
 script's run unit is already excluded so its library rebuilds.
 
-Consequences, stated rather than hidden:
+Consequences, stated rather than hidden (Revision 15):
 
-- the eligible set is the **leaf** dependency set. Most proc-macro crates
-  depend on `syn`/`quote`/`proc-macro2` and are therefore ineligible, as are
-  most libraries with dependencies. Proc-macro scope is preserved
-  structurally — a git or registry proc-macro crate with no dependency edges
-  is eligible, and seeded proc-macro dylibs are only ever *used* to compile
-  units that are themselves ineligible and rebuilt — but its practical reach
-  is small;
-- this narrows the approved scope, which names proc macros and dependency
-  libraries generally. The design therefore **returns that narrowing to the
-  Supervisor** rather than deciding it: the alternatives are the deferred
-  artifact-JSON/unit-graph capture plus a reviewed proc-macro input-tracking
-  mechanism, or accepting the leaf boundary for v1;
-- the leaf rule is applied on both sides (donor and recipient lock entries),
-  recorded as evidence in the catalog, and a non-vacuous native control proves
-  that a non-leaf dependency whose proc macro reads an environment variable is
-  ineligible and rebuilds with the recipient's own environment.
+- the v1 eligible set is **plain registry library compile units only**: the
+  lock entry is a crates.io registry package with a checksum, has no
+  dependency edges, and the verified manifest declares a plain library.
+  Proc-macro, build-script compile, Git/Git-revision, path/workspace and any
+  outside-root `.d` unit are **not offered at all**, so a proc macro can never
+  be seeded or reused from a donor and a build-script compile unit never
+  enters a plan;
+- the leaf rule is still applied on both sides (the entry has no dependency
+  edges), and the registry-only rule is applied on both sides; a non-leaf
+  package and a registry leaf's proc-macro or build-script sibling remain
+  ineligible with a named skip;
+- the positive controls are plain registry leaf libraries (for example
+  `cfg-if`); the non-leaf SQLite package and the Git/build-script/`OUT_DIR`
+  seedctl package are negative controls. Broader seeding (build scripts,
+  proc macros, Git, outside-root inputs) needs a later design and task, not a
+  silent widening here.
 
 ### 3.3 Prior review findings, resolved or dispositioned
 
@@ -606,19 +632,21 @@ The association rule for one package, applied on both sides independently:
 - its lock entry has **no dependency edges at all** (§3.2), so its compilation
   cannot invoke a proc macro; a package with any dependency edge is ineligible
   on both sides;
-- its lock source is a supported immutable kind: crates.io-style registry with
-  a recorded `checksum`, or git with a full 40-hex revision;
+- its lock source is a **crates.io-style registry with a recorded
+  `checksum`**. Git/Git-revision, path, workspace, vendored and replaced
+  sources are ineligible in v1 (Revision 15);
 - path/workspace/vendored/source-replaced and `[[patch]]`-replaced entries are
   ineligible; a lock entry without a `source` is ineligible;
 - its manifest (read from the verified source root) declares exactly one
-  library or proc-macro target whose name is the normalized package name, and
+  plain library target (not a proc macro) whose name is the normalized
+  package name, and
   an explicit `[lib] name`, when present, must equal that same normalized
   name (so a hyphenated explicit name is unsupported by Cargo itself). A
   package that declares a different lib target name — a genuine rename — is
   ineligible in v1: the pinned adapter proves the inferred normalization, not
   an arbitrary rename, and two packages can expose the same target name;
 - the donor and recipient lock entries agree on version and on
-  source-plus-checksum (registry) or source-plus-full-revision (git).
+  source-plus-checksum (registry only in v1).
 
 **Unit and file association (two identities, per-unit classification, `.d`
 join).** Three facts must not be guessed: which package produced an artifact,
@@ -648,13 +676,16 @@ prefix accepted. The design classifies **per unit**, derives the artifact
 association from rustc's own dep-info *at producing time*, records it in the
 catalog, and lets Cargo's own component comparison decide freshness.
 
-**Supported role/layout restriction.** Cargo exposes unit-id and
-extra-filename choices separately, so the adapter accepts only the layouts it
-names: fingerprint directories directly under `<profile>/.fingerprint/`,
-artifacts under `<profile>/deps/`, and build-script units under
-`<profile>/build/<package>-<hex>/`. A unit-grouped build directory, a custom
-`--out-dir`, a custom extra-filename or any other layout skips the package —
-the grammar is not generalised.
+**Supported role/layout restriction (Revision 15).** Cargo exposes unit-id
+and extra-filename choices separately, so the adapter accepts only the layout
+it names for v1: fingerprint directories directly under
+`<profile>/.fingerprint/` and plain registry library artifacts under
+`<profile>/deps/`. A build-script directory under
+`<profile>/build/<package>-<hex>/`, a proc-macro artifact, a unit-grouped build
+directory, a custom `--out-dir`, a custom extra-filename or any other layout
+skips the package — the grammar is not generalised. The build-script
+paragraphs below are historical revision 11–14 text and are not offered in
+v1.
 
 The rules, applied inside the slot's `<profile>/` when the producing lease is
 held:
@@ -984,39 +1015,31 @@ for each input file is matched against the accepted prerequisite set rather
 than rejected as an output (§4.2). The `.d` is required, not optional; a unit
 without a proven join is not offered.
 
-| Role | Complete fingerprint triple (inside the package directory) | Artifacts (with the required `.d`) |
+| Role in v1 | Complete fingerprint triple (inside the package directory) | Artifacts (with the required `.d`) |
 | --- | --- | --- |
-| registry/git dependency library | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{rmeta,rlib}`, joined by `deps/<target_underscored>-<hex>.d` |
-| proc macro | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{dylib,so}`, joined by `deps/<target_underscored>-<hex>.d`. A `.dSYM` bundle is **excluded** |
-| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | hashed rustc output `build/<literal package>-<hex>/build_script_build-<hex>` joined by `build/<literal package>-<hex>/build_script_build-<hex>.d`, plus Cargo's unhashed uplift `build/<literal package>-<hex>/build-script-build` in that same directory (byte-identical to the hashed output); if either the join or the uplift cannot be proven the role is not offered (its run is excluded anyway) |
-| build-script **run** unit and its output | **excluded entirely** | `run-build-script-build-script-build*`, `dep-run-build-script-build-script-build`, `build/<literal package>-<hex>/{output,root-output,stderr}`, `build/<literal package>-<hex>/out/**`, `invoked.timestamp` |
-| workspace/path package units | **excluded** | never classified |
-| final outputs, uplifted binaries, test/bench executables | **excluded** | live in the checkout `target/` or are final uplifts |
-| `incremental/**` | **excluded** | |
+| plain registry dependency library | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{rmeta,rlib}`, joined by `deps/<target_underscored>-<hex>.d` |
+| proc-macro, build-script compile/run, Git/Git-revision, workspace/path, outside-root `.d` units | **excluded entirely** | never classified or offered in v1; each skip is named and the command builds normally |
+| final outputs, uplifted binaries, test/bench executables, incremental | **excluded** | live in the checkout `target/` or are final uplifts |
 
-A library or proc-macro unit whose `.d` names a generated `OUT_DIR` input (a
-build script's generated source, for example) remains **unoffered** in v1: the
-join's prerequisites must sit inside the verified source root, and a generated
-input does not. The package is then represented only by its build-script
-compile unit, if that unit joins; case 3's seedctl package is the native
-negative control and its library is never offered.
-
-Every role below additionally requires the §3.2 leaf boundary: a package with
-any dependency edge is not offered, so a proc-macro dylib can be seeded only
-from a dependency-free proc-macro package, and it can only ever be *used* to
-compile units that are themselves ineligible and rebuilt.
+A library whose `.d` names a generated `OUT_DIR` input (a build script's
+generated source, for example) remains **unoffered** in v1: the join's
+prerequisites must sit inside the verified source root, and a generated input
+does not. The package is not rescued by any other role: v1 never offers its
+build-script compile or run unit, and never offers a proc macro. Case 3's
+seedctl package is a negative control, not a build-script positive.
 
 The three fingerprint entries are the unit's complete Cargo-visible state and
 are all required: the hash file, the encoded components, and the encoded
 dep-info whose absence Cargo 1.97.1 already treats as stale. These names are
 the adapter's, and §10 requires them to be confirmed against a real 1.97.1
 build before any seeding is enabled. A unit with any of them missing is not
-offered. Artifacts are matched by the `<hex>` variants of the allowlisted stems
-**and** by the `.d` join of §4.2; unlisted stems, unknown suffixes, symlinks,
-directories, Finder metadata and `.dSYM` bundles are never copied, and a
-fingerprint-directory entry that classifies as none of the rows above makes
-that directory unusable — a package with no usable directory is not offered
-(§4.2).
+offered. Artifacts are matched by the `<hex>` variants of the allowlisted
+library stems **and** by the `.d` join of §4.2; unlisted stems, unknown
+suffixes, symlinks, directories, Finder metadata and `.dSYM` bundles are never
+copied, and a fingerprint-directory entry that classifies as none of the
+rows above makes that directory unusable — a package with no usable directory
+is not offered (§4.2). A build-script-only directory and a proc-macro library
+directory are skipped by name; they never become a `SeedRole` offer.
 
 ### 5.2 Run units are excluded unconditionally in v1
 
@@ -1663,12 +1686,11 @@ verifies (`workflow.md#cargo-version-matrix`):
   **normalized** target name, whose fingerprint-directory and
   artifact/dep-info hashes are the same 16-hex `unit_id` rendering, and whose
   dep-info carries rustc's empty phony source rules, and only the §4.2
-  role/layout cases are accepted, library and proc-macro artifacts in
-  `<profile>/deps/`, a build-script rustc output as the hashed
-  `<profile>/build/<literal package>-<hex>/build_script_build-<hex>` with
-  Cargo's unhashed uplift `<profile>/build/<literal package>-<hex>/build-script-build`
-  in the same directory, the profile directory name is Cargo's, and uplift
-  copies finals to `CARGO_TARGET_DIR`;
+  v1 role/layout is accepted: a plain registry library's `.rmeta`/`.rlib`
+  pair in `<profile>/deps/` joined by its `<profile>/deps/<target>-<hex>.d`.
+  Proc-macro artifacts, build-script outputs and uplifts, Git/Git-revision
+  sources and any outside-root `.d` input are not accepted; the profile
+  directory name is Cargo's, and uplift copies finals to `CARGO_TARGET_DIR`;
 - **manifest qualification is a precondition, not an assumption.** Before any
   seeding is enabled, the implementation must confirm, against a real 1.97.1
   build of a tiny fixture, that every offered unit's complete triple is
@@ -1917,6 +1939,11 @@ fixed script, and a source sweep never replaces it.
 
 ### 16.1 Pure checks (no child, no Cargo, no pool)
 
+**Revision 15:** only plain registry library positives remain. Every build-script,
+proc-macro, Git and outside-root `OUT_DIR` item below is a **negative** check,
+not an offered positive; the producer and plan-selection regressions prove that
+none of those units is ever offered or selected.
+
 Lock parsing, the uniqueness rule, the **leaf rule** (a lock entry with any
 dependency edge is ineligible on either side, including build and dev edges
 the lock records) and the manifest target-name rule; the complete per-role
@@ -1932,11 +1959,9 @@ copied, and does not block the package; a mixed-unit directory or an
 unclassifiable entry makes that directory unusable; **artifact join, all rules
 parsed**: a `.d` whose first rule is the `.d` itself (the ordinary rustc shape)
 still joins through its later artifact rule; `--emit=dep-info,metadata`
-(`.rmeta`) and `link` (`.rlib`) both join; a proc-macro `.dylib`; a
-build-script hash/uplift pair (`build/<literal package>-<hex>/build_script_build-<hex>`
-plus `build/<literal package>-<hex>/build_script_build-<hex>.d`, and the
-unhashed uplift `build/<literal package>-<hex>/build-script-build`); the
-hyphenated hashed name is a negative fixture; a library `.d` naming a generated
+(`.rmeta`) and `link` (`.rlib`) both join; a proc-macro `.dylib` is never offered; a
+build-script hash/uplift pair is never offered; the hyphenated hashed name is a
+negative fixture; a library `.d` naming a generated
 `OUT_DIR` input is not offered (positive package without generated inputs plus
 that negative); a source first observed only post-Cargo is accepted, while a
 pre-Cargo entry that changed identity is skipped; rustc's **empty
@@ -2032,17 +2057,16 @@ one fresh internal root for the genuine internal pool, and `TMPDIR`, `TMP` and
 `TEMP` point at a separate fresh directory so ordinary test temp still follows
 the selected-volume rule.
 
-1. **SQLite/`cc`/`OUT_DIR` (required by the brief, retained), reported at its
-   real scope.** A private workspace whose only dependency path is
-   `libsqlite3-sys` with the `bundled` feature (the SQLite amalgamation
-   compiled by `cc`, exposed through `OUT_DIR` and the link-search replay).
-   The donor epoch builds it; the recipient's run must show the run unit
-   rerunning, SQLite recompiling or its consumer rebuilding, and the program's
-   runtime `env!("OUT_DIR")` value and SQLite version correct after the donor
-   slot is deleted. SQLite has dependency edges and is **never offered**, so
-   this case proves Cargo's own rerun for an ineligible package, not the
-   exclusion of an offered run unit; the proof receipt says so, and case 3
-   supplies the non-vacuous exclusion oracle;
+1. **SQLite negative package control (retained).** A private workspace whose
+   dependency is `libsqlite3-sys` with the `bundled` feature (the SQLite
+   amalgamation compiled by `cc`, exposed through `OUT_DIR` and the link-search
+   replay). The donor epoch builds it; `libsqlite3-sys` has dependency edges
+   and is **never offered**, so no catalog entry or plan names it. Its leaf
+   `cc`/`pkg-config`/`vcpkg` registry libraries are ordinary v1 positives and
+   may seed. The recipient's `libsqlite3-sys` build script reruns, the program's
+   runtime `env!("OUT_DIR")` value and SQLite version are correct after the
+   donor slot is deleted, and the oracle asserts the negative package is
+   unoffered rather than requiring a global no-seed;
 2. **leaf registry positive and complete manifest.** A small registry leaf
    (`cfg-if`, no dependency edges) is offered from its **literal-name**
    directory `.fingerprint/cfg-if-<hash>/` with the **normalized** unit suffix
@@ -2054,41 +2078,31 @@ the selected-volume rule.
    the proof, never injected). A debug-only proof control that drops only the
    `dep-…` entry from the plan must make the same unit rebuild, proving the
    manifest is the complete one;
-3. **run exclusion for an OFFERED unit (non-vacuous oracle).** A dependency-free
-   git dependency `seedctl` with a build script that writes a generated file
-   into `OUT_DIR` and emits `cargo:rustc-env=SEEDCTL_OUT_DIR=<OUT_DIR>`, where
-   the generated source embeds that same absolute path. This case also exercises
-   the ordinary rustc dep-info shape (the `.d`'s own rule first, the artifact
-   rule later) and the build-script role manifest: the hashed rustc output
-   `build/<literal package>-<hex>/build_script_build-<hex>` with its
-   `build/<literal package>-<hex>/build_script_build-<hex>.d`, plus Cargo's
-   unhashed uplift `build/<literal package>-<hex>/build-script-build` in the
-   same directory. The receipt must list the package's
-   **build-script compile** unit as offered with **both** hashed files (the
-   underscored rustc output and its `.d`) plus the byte-identical uplift in the
-   plan, while the package's **library** unit is not offered (its `.d` names
-   the generated `OUT_DIR` source) and the plan contains no
-   `output`, `root-output`, `out/**` or run fingerprint; the
-   recipient's run unit reruns, the crate recompiles, and the program prints
-   the **recipient's** `OUT_DIR` and the donor's path is absent from the
-   output. The counterfactual is a debug-only plan override that admits the
-   run payload and fingerprint: the same program must then print the
-   **donor's** `OUT_DIR`, which fails the recipient-path assertion — proving
-   the oracle can distinguish a copied run from a rerun. Donor deletion before
-   the recipient build is part of the case;
+3. **Git/build-script/`OUT_DIR` negative control.** A dependency-free git
+   `seedctl` with a build script that writes a generated file into `OUT_DIR`
+   and embeds that absolute path. v1 rejects the Git source and never offers a
+   build-script compile/run unit or the `OUT_DIR` library, so the donor
+   publishes **no catalog**, the recipient prints a named seeding skip, and
+   the ordinary build reruns the script and prints the recipient's own
+   `OUT_DIR`; the donor's path is absent. There is no `admit-run` positive
+   counterfactual in v1;
 4. **ambient-input control (leaf boundary, non-vacuous).** A dependency with
    an edge whose proc macro reads an inherited environment variable is
    **ineligible**; two recipient builds under different values of that
    variable both run cold and produce the two different values, proving the
    leaf rule prevents the donor's expansion-time ambient input from leaking
    into the recipient's code. Its control is the leaf case 2;
-5. **leaf proc macro over git.** An owned scratch git repository holds a
-   dependency-free proc-macro crate; it is verified by the sanitized git
-   protocol, offered as a leaf, and the recipient's expansion compiles and
-   runs. A non-leaf proc-macro crate is ineligible (its `syn`/`quote` edges),
-   and a configured `core.fsmonitor` hook in that repository is never run;
-6. build-script **compile** unit: offered, but the excluded run unit makes it
-   inert — the package's lib is rebuilt (the non-vacuous control);
+5. **Proc-macro negative control.** An owned scratch git repository holds a
+   proc-macro crate; v1 never verifies it as a seed source, offers it, or
+   selects its unit. The recipient builds it cold and expands with the
+   recipient's own value; a non-leaf proc-macro fixture is likewise
+   unoffered, and its artifact must not be reused. The product regression
+   proves a proc-macro unit is never classified or selected; a configured
+   `core.fsmonitor` hook is outside the v1 path because Git sources are
+   ineligible;
+6. **Git/build-script/`OUT_DIR` negative control (cold lib).** The same
+   ineligible seedctl package publishes no catalog; the recipient's package
+   library is rebuilt and its build script reruns in the ordinary cold build;
 7. donor deleted before the recipient builds: the recipient still compiles and
    runs, with no link to the donor;
 8. changed dependency: a recipient lock with a different version or source does
@@ -2135,19 +2149,14 @@ the selected-volume rule.
 20. partial-trust negative: a fault-injected partial recipient is never reused
     as warm by a later command.
 
-21. **artifact collision and multi-unit controls.** A workspace/path package
-    that declares `[lib] name = "cfg_if"` (a valid explicit name, and the
-    normalization of the registry `cfg-if`) beside a genuine registry
-    `cfg-if`,
-    and a same-target dependency from a second source, must leave the plan
-    containing only the verified registry artifacts: the proof asserts the
-    workspace artifact's path is absent from the plan and that the recipient
-    still builds and runs correctly. A dependency with both a library and a
-    build script (the case 3 `seedctl` package) must be offered from its
-    **separate per-unit fingerprint directories**, with its run-only directory
-    classified and never copied — the regression the earlier package-wide
-    uniqueness rule would have failed.
-
+21. **artifact collision and workspace negative control.** A workspace/path
+    package that declares `[lib] name = "cfg_if"` (a valid explicit name, and
+    the normalization of the registry `cfg-if`) beside a genuine registry
+    `cfg-if` must leave the plan containing only the verified registry
+    artifact: the workspace/path package is ineligible in v1, the proof
+    asserts its artifact path is absent from the plan and that the recipient
+    still builds and runs correctly. The Git/build-script seedctl package is a
+    second negative control (no catalog, no seed), not a per-unit positive.
 22. **competing library acquire between selection and the pin (no seed, no
     block).** With a debug-only pause ordered between call 1 and call 2, a
     second process runs a real `oxide` command that leases or evicts the
@@ -2192,11 +2201,11 @@ the selected-volume rule.
 - Selector (created by oxide#169):
   `effigy rust:cold-slot-seeding` = one fixed script and the whole command of
   the qualified shared supervisor,
-  `python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py`.
+  `python3 scripts/bounded-test.py --root-parent /private/tmp --limit 480 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py`.
   The private pool is a genuine internal `directory-budget-v1` pool, so the
   recipe declares the owner-accepted internal-placement exception (decision
   `bd357a4c`) inside the same monitored owned root; the supervisor bytes are
-  the `bc24b238…` pin above, with `--limit 300` and a 512 MiB monitored
+  the `bc24b238…` pin above, with `--limit 480` (Tom's decision `e3540b1c`, this selector and its diagnostic twin only; any higher bound needs another operator ruling) and a 512 MiB monitored
   scratch budget including cleanup and the one owned image.
 - `effigy rust:cold-slot-seeding:diagnostic` appends the script's
   `--diagnostic`: the uncounted keep-going collection required before a counted
@@ -2257,7 +2266,7 @@ Coexisting: staging (60-85), Cargo home (50-70), image backing (≤ 128), tiny
 fixtures (≤ 8) — about **120-290 MiB**. Ordinary detach, backing removed only
 after a completed detach.
 
-Time, per required case, against the 300 s wall clock (estimates; the basis
+Time, per required case, against the 480 s wall clock (estimates; the basis
 names the measured analogue or the work performed):
 
 | Case | Estimate | Basis |
@@ -2277,7 +2286,7 @@ names the measured analogue or the work performed):
 | 24 post-clone walk (two controls) | 2-6 s | a tiny walked slot and the retained generations after a failed walk |
 | cleanup, receipts and the phase table inside the guard | 5-10 s | bounded writes and one detach |
 
-The upper estimates sum to **271 s of the 300 s bound** (the lower estimates to
+Revision 15 raises only these selectors from 300 s to **480 s**; the earlier 271 s arithmetic is historical. The upper estimates sum to **271 s of the earlier 300 s bound** (the lower estimates to
 about 135 s), leaving 29 s at the top of the range. That is the arithmetic of a
 plausible accounting, **not** a demonstrated fit: the script prints the phase
 and case tables, and if the first required uncounted **diagnostic** run's
@@ -2359,7 +2368,7 @@ comparison as the proof.
    `bb151a59`'s ambiguous-name visibility for both the summary and `oxide
    status`, without adding a walk or reconciliation?
 14. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, and
-   upper time estimates summing to 271 s of the 300 s with the required SQLite
+   upper time estimates summing to 271 s of the earlier 300 s (v1 is 480 s) with the required SQLite
    and offered-run cases retained) leave enough room for an unmeasured fit
    whose diagnostic is still mandatory, or should the conflict go to the
    Supervisor before freeze?

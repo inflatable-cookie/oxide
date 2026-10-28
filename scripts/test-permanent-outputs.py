@@ -2962,7 +2962,10 @@ def collect_cases(
                 # case-oracle failure, so it aborts like the custody seam below.
                 if not diagnostic:
                     raise
-                result = {"result": "aborted", "fault": f"unexpected {fault!r}"[:600]}
+                result = {
+                    "result": "aborted",
+                    "fault": f"unexpected {fault!r} at {where_of(fault)}"[:600],
+                }
             # Custody and the run's own resource samples are checked after the
             # case, whatever its own oracle did.
             if after_case is not None and result["result"] != "aborted":

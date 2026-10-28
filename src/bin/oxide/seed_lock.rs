@@ -91,6 +91,20 @@ pub(crate) fn skip_reason(reason: &str, analysis: &Analysis) -> String {
     format!("{reason}; {name}: {detail}")
 }
 
+/// A Git package for the dormant v1 Git-hint verifier's own unit tests.
+/// Product eligibility rejects Git before this point; the constructor keeps
+/// that dormant machinery testable without widening v1.
+#[cfg(test)]
+pub(crate) fn test_git_package(name: &str, version: &str, url: &str, rev: &str) -> Package {
+    Package {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        source: Some(format!("git+{url}#{rev}")),
+        checksum: None,
+        dependencies: Vec::new(),
+    }
+}
+
 /// Filter by normalized-name uniqueness across *all* lock entries, leafness,
 /// and supported immutable source identity. The order remains lock order.
 pub(crate) fn eligible(bytes: &[u8]) -> Result<Vec<Package>, &'static str> {
@@ -132,16 +146,14 @@ pub(crate) fn analyze(bytes: &[u8]) -> Result<Analysis, &'static str> {
         } else if !package.dependencies.is_empty() {
             Some(SeedRejectReason::NonLeaf)
         } else {
-            let supported = match package.source.as_deref() {
-                Some(CRATES_IO) => package
+            // v1 offers only plain registry library compile units. Git,
+            // path, workspace and every other source is ineligible at the
+            // first filter, even when it is otherwise pinned.
+            let supported = package.source.as_deref() == Some(CRATES_IO)
+                && package
                     .checksum
                     .as_deref()
-                    .is_some_and(|value| hex(value, 64)),
-                Some(source) if source.starts_with("git+") => source
-                    .rsplit_once('#')
-                    .is_some_and(|(_, revision)| hex(revision, 40)),
-                _ => false,
-            };
+                    .is_some_and(|value| hex(value, 64));
             (!supported).then_some(SeedRejectReason::UnsupportedSource)
         };
         if let Some(reason) = reason {

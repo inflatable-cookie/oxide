@@ -4,7 +4,8 @@
 
 use crate::seed_plan::VerifiedSource;
 use oxide_storage::lease::managed::{
-    SeedFile, SeedFileKind, SeedJoin, SeedRejectReason, SeedRejection, SeedRole, SeedUnit,
+    SeedFile, SeedFileKind, SeedJoin, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind,
+    SeedUnit,
 };
 use oxide_storage::lease::seed::{parse_seed_join, seed_output_rule_proven};
 use sha2::{Digest, Sha256};
@@ -293,6 +294,14 @@ impl Producer {
         if profile != "debug" && profile != "release" {
             return None;
         }
+        // v1 offers only plain registry library compile units. A Git source
+        // is already rejected by the lock filter; this guard is defense in
+        // depth. Proc-macro and build-script packages are never offered, so
+        // a proc macro cannot be reused from a donor and a build-script unit
+        // never enters a plan.
+        if source.kind != SeedSourceKind::Registry || source.proc_macro {
+            return Some(Vec::new());
+        }
         let fingerprint_root = format!("{profile}/.fingerprint");
         let names = self.names(Path::new(&fingerprint_root))?;
         let prefix = format!("{}-", source.package.name);
@@ -314,13 +323,12 @@ impl Producer {
             };
             let target = source.package.name.replace('-', "_");
             let lib = format!("lib-{target}");
-            let build = "build-script-build";
-            let has_lib = entries.iter().any(|name| name == &lib);
-            let has_build = entries.iter().any(|name| name == build);
-            if has_lib == has_build {
+            // A build-script compile directory has no `lib-<target>` entry;
+            // v1 never classifies it. Only a library unit is considered.
+            if !entries.iter().any(|name| name == &lib) {
                 continue;
             }
-            let stem = if has_lib { lib.as_str() } else { build };
+            let stem = lib.as_str();
             let expected: BTreeSet<String> = [
                 stem.to_owned(),
                 format!("{stem}.json"),
@@ -337,42 +345,14 @@ impl Producer {
             {
                 continue;
             }
-            let role = if has_build {
-                SeedRole::BuildScriptCompile
-            } else if source.proc_macro {
-                SeedRole::ProcMacro
-            } else {
-                SeedRole::Lib
-            };
-            let output_dir = if has_build {
-                format!("{profile}/build/{name}")
-            } else {
-                format!("{profile}/deps")
-            };
-            let dep_stem = if has_build {
-                // Cargo 1.97.1's hashed rustc output and dep-info use the
-                // underscored rustc stem inside build/<literal>-<hex>/; the
-                // hyphenated `build-script-build` in the same directory is the
-                // separate uplift checked below.
-                "build_script_build"
-            } else {
-                target.as_str()
-            };
-            let dep = format!("{output_dir}/{dep_stem}-{hash}.d");
+            let role = SeedRole::Lib;
+            let output_dir = format!("{profile}/deps");
+            let dep = format!("{output_dir}/{target}-{hash}.d");
             let mut artifacts = Vec::new();
-            if has_build {
-                artifacts.push(format!("{output_dir}/build_script_build-{hash}"));
-            } else {
-                let extensions: &[&str] = if source.proc_macro {
-                    &["dylib", "so"]
-                } else {
-                    &["rmeta", "rlib"]
-                };
-                for extension in extensions {
-                    let path = format!("{output_dir}/lib{target}-{hash}.{extension}");
-                    if self.safe_path(Path::new(&path)).is_some() {
-                        artifacts.push(path);
-                    }
+            for extension in ["rmeta", "rlib"] {
+                let path = format!("{output_dir}/lib{target}-{hash}.{extension}");
+                if self.safe_path(Path::new(&path)).is_some() {
+                    artifacts.push(path);
                 }
             }
             if artifacts.is_empty() {
@@ -450,22 +430,6 @@ impl Producer {
             }
             if incomplete {
                 continue;
-            }
-            if has_build {
-                let uplift = format!("{output_dir}/build-script-build");
-                let Some((file, _)) = self.read_file(&uplift, SeedFileKind::Uplift, false) else {
-                    continue;
-                };
-                let Some(hashed) = files
-                    .iter()
-                    .find(|item| item.kind == SeedFileKind::Artifact)
-                else {
-                    continue;
-                };
-                if file.digest != hashed.digest || file.size != hashed.size {
-                    continue;
-                }
-                files.push(file);
             }
             let digest = dep_file.digest.clone();
             files.push(dep_file);
@@ -577,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn build_script_compile_unit_uses_the_underscored_hashed_output_and_uplift() {
+    fn build_script_and_proc_macro_units_are_never_offered() {
         let fixture = Fixture::new();
         let lock = format!("version = 4\n[[package]]\nname = 'seedctl'\nversion = '0.1.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
         let package = crate::seed_lock::eligible(lock.as_bytes())
@@ -585,14 +549,6 @@ mod tests {
             .remove(0);
         let source_root = fixture.0.join("source");
         fixture.write("source/src/lib.rs", "source");
-        let source = VerifiedSource {
-            package,
-            tree_digest: "b".repeat(64),
-            kind: SeedSourceKind::Registry,
-            root: source_root.clone(),
-            verification_root: source_root.clone(),
-            proc_macro: false,
-        };
         let hash = "aaaaaaaaaaaaaaaa";
         let dir = format!("build/debug/.fingerprint/seedctl-{hash}");
         for name in [
@@ -602,52 +558,54 @@ mod tests {
         ] {
             fixture.write(&format!("{dir}/{name}"), "fingerprint");
         }
-        let output = format!("debug/build/seedctl-{hash}");
-        let hashed = format!("{output}/build_script_build-{hash}");
-        let dep = format!("{hashed}.d");
-        let uplift = format!("{output}/build-script-build");
-        fixture.write(&format!("build/{hashed}"), "build-script-output");
-        fixture.write(&format!("build/{uplift}"), "build-script-output");
         let build = fixture.0.join("build");
-        let input = source_root.join("src/lib.rs");
-        fixture.write(
-            &format!("build/{dep}"),
-            &format!(
-                "{}: {}\n{}: {}\n{}:\n",
-                build.join(&dep).display(),
-                input.display(),
-                build.join(&hashed).display(),
-                input.display(),
-                input.display()
-            ),
-        );
-        let units = Producer::new(&build)
-            .unwrap()
-            .units("debug", &source)
-            .unwrap();
-        assert_eq!(units.len(), 1);
-        assert_eq!(
-            units[0].role,
-            oxide_storage::lease::managed::SeedRole::BuildScriptCompile
-        );
-        assert_eq!(units[0].files.len(), 6);
-        // A non-identical uplift is fail-closed.
-        fixture.write(&format!("build/{uplift}"), "different-bytes");
+        let build_source = VerifiedSource {
+            package: package.clone(),
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root.clone(),
+            proc_macro: false,
+        };
         assert!(Producer::new(&build)
             .unwrap()
-            .units("debug", &source)
+            .units("debug", &build_source)
             .unwrap()
             .is_empty());
-        fixture.write(&format!("build/{uplift}"), "build-script-output");
-        // The hyphenated hashed name is not what Cargo 1.97.1 produces.
+        // A complete proc-macro library fingerprint is still never offered.
+        let pm_dir = format!("build/debug/.fingerprint/seedpm-{hash}");
+        for name in ["lib-seedpm", "lib-seedpm.json", "dep-lib-seedpm"] {
+            fixture.write(&format!("{pm_dir}/{name}"), "fingerprint");
+        }
+        fixture.write(&format!("build/debug/deps/libseedpm-{hash}.dylib"), "dylib");
         fixture.write(
-            &format!("build/{output}/build-script-build-{hash}"),
-            "build-script-output",
+            &format!("build/debug/deps/seedpm-{hash}.d"),
+            &format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                build.join(format!("debug/deps/seedpm-{hash}.d")).display(),
+                source_root.join("src/lib.rs").display(),
+                build
+                    .join(format!("debug/deps/libseedpm-{hash}.dylib"))
+                    .display(),
+                source_root.join("src/lib.rs").display(),
+                source_root.join("src/lib.rs").display()
+            ),
         );
-        std::fs::remove_file(build.join(&hashed)).unwrap();
+        let pm_source = VerifiedSource {
+            package: crate::seed_lock::eligible(
+                b"version = 4\n[[package]]\nname = 'seedpm'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n",
+            )
+            .unwrap()
+            .remove(0),
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root,
+            proc_macro: true,
+        };
         assert!(Producer::new(&build)
             .unwrap()
-            .units("debug", &source)
+            .units("debug", &pm_source)
             .unwrap()
             .is_empty());
     }

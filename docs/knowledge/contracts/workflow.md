@@ -25,9 +25,11 @@ before any child exists, by cloning matching dependency units from an idle
 donor slot on the same pool under the existing journaled custody: the donor
 record lock and pool lock are held, every artifact, `.d` and fingerprint file
 is re-hashed against the generation-bound catalog, and the recipient publishes
-only after a complete ownership-clean post-clone walk. Nothing is offered for a
-non-leaf package, an unprovable `.d` join, a differing producer context, a
-build-script run payload or a run-only fingerprint. A failure before the first
+only after a complete ownership-clean post-clone walk. v1 offers **only plain
+registry library compile units**: nothing is offered for a non-leaf package, a
+proc macro, a build-script compile/run unit, an outside-root/`OUT_DIR` `.d`
+input, a Git/Git-revision or path source, an unprovable `.d` join, a differing
+producer context or a run-only fingerprint. A failure before the first
 recipient write skips to the normal cold build; every later clone, digest or
 custody fault refuses, releases the slot with no trusted origin and leaves the
 untrusted generation to the ordinary journaled whole-slot eviction. A failed
@@ -48,10 +50,13 @@ The qualification apparatus is one fixed 24-case script,
 `scripts/test-cold-slot-seeding.py`:
 `effigy rust:cold-slot-seeding` and `:diagnostic` run it under the qualified
 shared supervisor with the internal-placement exception
-(`bd357a4c`), 300 s, 512 MiB monitored scratch and one owned 128 MiB image;
+(`bd357a4c`), **480 s** (Tom's decision `e3540b1c`, this selector and its
+diagnostic twin only), 512 MiB monitored scratch and one owned 128 MiB image;
 `effigy proof:cold-slot-seeding:test` runs only its pure apparatus. The
 uncounted diagnostic, one counted author native and one separately activated
-independent reviewer native are owner-activated at the exact head, and the
+independent reviewer native are owner-activated at the exact head; cases 01
+(non-leaf SQLite), 03/06 (Git/build-script/`OUT_DIR` seedctl) and 05 (proc
+macro) are negative controls, and positives are plain registry libraries. The
 [tier is ELEVATED](../vision.md#validation-policy) because a post-clone
 abandon retains an untrusted generation that the ordinary journaled eviction
 later deletes and one case writes removable media. The merge stays held until

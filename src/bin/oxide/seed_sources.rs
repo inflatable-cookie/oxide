@@ -670,9 +670,12 @@ mod tests {
     #[test]
     fn git_hints_must_be_unique_canonical_cargo_checkouts() {
         let fixture = Fixture::new();
-        let package = crate::seed_lock::eligible(
-            format!("version = 4\n[[package]]\nname = 'sample'\nversion = '1'\nsource = 'git+https://example.invalid/r#{}'\n", "a".repeat(40)).as_bytes(),
-        ).unwrap().remove(0);
+        let package = crate::seed_lock::test_git_package(
+            "sample",
+            "1",
+            "https://example.invalid/r",
+            &"a".repeat(40),
+        );
         let root = fixture.0.join("git/checkouts/repo/revision");
         std::fs::create_dir_all(&root).unwrap();
         let hint = || GitHint {
@@ -704,9 +707,12 @@ mod tests {
     #[test]
     fn discovery_finds_nested_packages_and_ignores_symlinked_checkouts() {
         let fixture = Fixture::new();
-        let package = crate::seed_lock::eligible(
-            format!("version = 4\n[[package]]\nname = 'sample'\nversion = '1'\nsource = 'git+https://example.invalid/r#{}'\n", "a".repeat(40)).as_bytes(),
-        ).unwrap().remove(0);
+        let package = crate::seed_lock::test_git_package(
+            "sample",
+            "1",
+            "https://example.invalid/r",
+            &"a".repeat(40),
+        );
         let checkout = fixture.0.join("git/checkouts/repo/revision");
         let root = checkout.join("member");
         std::fs::create_dir_all(root.join("src")).unwrap();

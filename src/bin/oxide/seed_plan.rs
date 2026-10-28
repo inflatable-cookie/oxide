@@ -101,9 +101,14 @@ pub(crate) fn select(
             let Some(source) = matching_source else {
                 continue;
             };
+            // v1 offers only plain registry library compile units. A
+            // proc-macro or build-script unit in a catalog is never selected,
+            // even if a producer wrote one; Git is rejected by the lock.
             for unit in &package.units {
-                if matches!(unit.role, SeedRole::Lib) && source.proc_macro
-                    || matches!(unit.role, SeedRole::ProcMacro) && !source.proc_macro
+                if package.source_root.kind != SeedSourceKind::Registry
+                    || source.kind != SeedSourceKind::Registry
+                    || source.proc_macro
+                    || unit.role != SeedRole::Lib
                 {
                     continue;
                 }
@@ -319,5 +324,42 @@ mod tests {
         let selected = select(&recipient, &producer(), &allowed, &[source], &candidates).unwrap();
         assert_eq!(selected.donor.slot_id, "new");
         assert_eq!(selected.units.len(), 1);
+    }
+
+    #[test]
+    fn v1_never_selects_a_proc_macro_or_build_script_unit() {
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = VerifiedSource {
+            package: package.clone(),
+            tree_digest: "tree".into(),
+            kind: SeedSourceKind::Registry,
+            root: "/fixture".into(),
+            verification_root: "/fixture".into(),
+            proc_macro: false,
+        };
+        let recipient = SeedRecipient {
+            slot_id: "recipient".into(),
+            incarnation: "i".into(),
+            lease_id: "l".into(),
+        };
+        let allowed = [package];
+        for role in [SeedRole::ProcMacro, SeedRole::BuildScriptCompile] {
+            let mut candidate = candidate("id", 1, "tree");
+            candidate.catalog.packages[0].units[0].role = role;
+            assert!(
+                select(
+                    &recipient,
+                    &producer(),
+                    &allowed,
+                    &[source.clone()],
+                    &[candidate],
+                )
+                .is_none(),
+                "v1 selected a {role:?} unit"
+            );
+        }
     }
 }
