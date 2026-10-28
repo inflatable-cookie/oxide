@@ -396,6 +396,9 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     legacy["slots"] = [dict(slot) for slot in ledger["slots"]]
     for record in legacy["slots"]:
         record["rank"] = 0
+        # A legacy representation has no capacity fence, so it cannot carry a
+        # closed observation either: the product refuses that combination.
+        record.pop("recorded", None)
     write_json(ledger_path, legacy)
     before = open(ledger_path, "rb").read()
     run(proof, ["status"], "legacy-status", app, env)
@@ -491,7 +494,18 @@ def prove_raised_fence(proof: Proof, pool: str, env: dict, workdir: str) -> None
         after.get("capacity_policy") == 3,
         f"crossing the legacy 128-slot ceiling did not raise the ledger fence: {after.get('capacity_policy')}",
     )
-    RESULTS.append({"case": "raised-fence-at-129-slots", "policy_before": 2, "policy_after": 3, "slots": 129})
+    state = read_json(os.path.join(pool, "oxide-managed", "state.json"))
+    expect(
+        state["version"] == 7 and state.get("slot_ceiling") == "oxide.slots/256",
+        f"the 129th slot did not make the raised-ceiling control fence durable: {state}",
+    )
+    RESULTS.append({
+        "case": "raised-fence-at-129-slots",
+        "policy_before": 2,
+        "policy_after": 3,
+        "state_version": state["version"],
+        "slots": 129,
+    })
 
 
 def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
@@ -545,6 +559,14 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     # which is what an older binary refuses.
     ledger["capacity_policy"] = 3
     write_json(ledger_path, ledger)
+    # The product makes the matching control fence durable before it first
+    # records the 129th slot (proved by the raised-fence case), so the fixture
+    # models the same consistent pair instead of a state no writer produces.
+    state_path = os.path.join(pool, "oxide-managed", "state.json")
+    state = read_json(state_path)
+    state["version"] = 7
+    state["slot_ceiling"] = "oxide.slots/256"
+    write_json(state_path, state)
 
     # Default status at the 256-slot ceiling is recorded-only: it walks
     # nothing.
@@ -600,6 +622,11 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     expect(all(record["id"] != 1 for record in after["slots"]), "the evicted record remains")
     expect(any(record["id"] == 257 for record in after["slots"]), "the 257th slot was not allocated")
     expect(after.get("capacity_policy") == 3, "the 257th slot did not raise the ledger fence")
+    state = read_json(state_path)
+    expect(
+        state["version"] == 7 and state.get("slot_ceiling") == "oxide.slots/256",
+        f"an ordinary release dropped the raised-ceiling control fence: {state}",
+    )
     RESULTS.append({
         "case": "pool-ceiling-257th-replaces-rank-lru",
         "slots": 256,
@@ -719,14 +746,26 @@ def prove_byte_pressure(proof: Proof, pool: str, env: dict, workdir: str) -> Non
     third = write_tree(os.path.join(workdir, "byte-app-c"), FIXTURE)
     limited = dict(env)
     limited["OXIDE_TEST_BUDGET_BYTES"] = str(3 * MIB)
-    run(proof, ["exec", "--", sys.executable, "-c", "pass"], "byte-first", first, limited)
+    # Each leased command writes its own slot (through the build directory the
+    # lease hands it), so the release's complete walk records those bytes. An
+    # idle slot is never edited after release: that would leave the recorded
+    # figure this case relies on stale.
+    def writer(letter: str, count: int) -> str:
+        return (
+            "import os, pathlib\n"
+            f"pathlib.Path(os.environ['CARGO_BUILD_BUILD_DIR'], 'blob').write_bytes(b'{letter}' * ({count}))\n"
+        )
+
+    run(proof, ["exec", "--", sys.executable, "-c", writer("a", 2 * MIB)], "byte-first", first, limited)
     aged = slot_dir(pool, "1")
-    with open(os.path.join(aged, "build", "blob"), "wb") as handle:
-        handle.write(b"a" * (2 * MIB))
-    run(proof, ["exec", "--profile", "debug", "--", sys.executable, "-c", "pass"], "byte-second", first, limited)
+    run(
+        proof,
+        ["exec", "--profile", "debug", "--", sys.executable, "-c", writer("b", 1 * MIB)],
+        "byte-second",
+        first,
+        limited,
+    )
     newer = slot_dir(pool, "2")
-    with open(os.path.join(newer, "build", "blob"), "wb") as handle:
-        handle.write(b"b" * (1 * MIB))
     held = start(proof, ["exec"], "byte-held", third, limited, hold=True)
     wait_started(held)
     held_marker = os.path.join(ROOT, "markers", "byte-held.started")

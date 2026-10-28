@@ -590,12 +590,15 @@ written forward-only, in the same atomic replacement that first records the
 a `3` ledger with `unknown_accounting` (exit 3) before any mutation; a ledger
 above 128 slots without the fence is a state no writer produces and refuses
 too. A pool that stays at or below 128 slots never carries `3`, so its ledger
-stays readable by an older binary, and the control-state hand-off version is
-unchanged: refusing, not handing off, is the required mixed-version behaviour
-for a slot table an older binary cannot represent, while the existing
-version-5 fence keeps the [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122)
-working exactly as documented. A completed legacy `Evicting` reconciliation
-may still finish in the legacy representation. Before a revised write, every
+stays readable by an older binary. The ledger alone cannot order that switch
+against the [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122),
+which reads control state rather than the ledger, so the same admission that
+can first add the 129th slot also makes a forward-only **version-7** control
+fence durable first (`oxide.slots/256`): an older binary with version ≤ 6 then
+hands off to a receipt-matching successor instead of refusing a ledger this
+one is about to fence, and a pool below the ceiling keeps version 5, which an
+older binary still reads directly. A completed legacy `Evicting`
+reconciliation may still finish in the legacy representation. Before a revised write, every
 stored field is validated against the raised caps; an oversized legacy field
 refuses with the original file, ownership and quarantine bytes untouched,
 never truncated or dropped.
@@ -668,8 +671,9 @@ at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The worst-valid
 ledger/control serialization, escaped round-trip and oversized-field refusals
 are unit tests in `effigy test rust`, as is a fixed 50 ms ceiling on a
-128-slot and a 256-slot ledger's bounded read, ranked ordering and atomic
-write. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
+whole 128-slot and 256-slot recorded-ledger round trip (bounded read, ranked
+ordering and validated write bytes; the durable `fsync` is host I/O and lies
+outside the gate), reporting both measured figures. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
 limits with `--diagnostic`: an uncounted keep-going collection that records
 reached/completed/failed/skipped phases and the latched first fault in a
 bounded `qualified: false` receipt, continues only into phases whose declared
@@ -692,10 +696,12 @@ trust of a recorded idle slot until its generation changes.
 
 **What shipped.** `SlotRecord.recorded` carries one closed observation, the
 `capacity_policy` fence is now **2** (version 1 stays readable and is upgraded
-by the next revised write), and the front door's control `STATE_VERSION` is
-**5** with the `oxide.accounting/1` fence written durably by the first
-mutating command's admission gate, before any library write can fence the
-ledger. `Pool::recorded_total()` replaces the whole-payload admission walk
+by the next revised write; oxide#177 adds the raised-ceiling policy 3 above
+128 slots), and the front door's control `STATE_VERSION` is **5** with the
+`oxide.accounting/1` fence written durably by the first mutating command's
+admission gate, before any library write can fence the ledger (oxide#177 adds
+the version-7 `oxide.slots/256` fence for a pool that reaches the legacy
+ceiling). `Pool::recorded_total()` replaces the whole-payload admission walk
 with `pool_scope()` (a new `inventory::scope_directory` entry point with a
 ledger-membership hard stop, observed on its own debug-only
 `OXIDE_TEST_SCOPE_LOG`) plus one figure per slot, and `Pool::pressure()` is
@@ -1033,16 +1039,21 @@ front door's hand-off trigger reads control `state.json` /
 peeked numeric version **greater than the running binary's**, so the value is
 the version this gate writes, **5** (`RECORDED_ACCOUNTING_STATE_VERSION`,
 `store.rs:74`; 4 is the oxide#133 owned-outputs fence an installed binary
-already writes). The [one-use workspaces](one-use-workspaces.md) fence moved
-`STATE_VERSION` to **6**, written only when that feature first writes a
-class-bearing record, so a recorded-accounting-only pool stays at 5. The 3 an earlier
+already writes). The [one-use workspaces](one-use-workspaces.md) fence made
+version **6** the one-use version, written only when that feature first writes
+a class-bearing record, so a recorded-accounting-only pool stays at 5. The 3 an earlier
 revision of this section proposed was a *downgrade* from that shipped 4 and
 would leave an installed version-4 binary exposed to `deny_unknown_fields` on
 `recorded`. The fence is installed by the front door's mutating-command
 admission gate, so it is durable before any library write can fence the
 ledger; an owned-outputs-only save still derives version 4. Phase B therefore writes control `version: 5` **before** the first
 recorded ledger write, so an installed version-4 binary hands off to a
-receipt-matching successor instead of refusing the pool it was just handed. A
+receipt-matching successor instead of refusing the pool it was just handed.
+The raised-ceiling fence (oxide#177) repeats that ordering for `capacity_policy:
+3`: the version-7 `oxide.slots/256` control fence is made durable by the
+admission that holds this pool's lock at the legacy 128-slot membership, before
+that same admission can record the 129th slot, and a later ordinary save keeps
+version 7 because the fence is part of the document. A
 crash between the two writes leaves control 5 with a v1 ledger, which is a
 normal state for the new binary and a hand-off for the older one; the reverse
 order would strand it. The old binary's own refusal remains the honest
@@ -1075,7 +1086,7 @@ reply as a size.
 | Front-door release order | `store.rs` `release` (`:1622`), `unshare` (`:1640`), `discard_scratch` (`:1674`), `flush_before_idle` (`:1689`) |
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
-| Control state fence | `store.rs` `STATE_VERSION` (`:74`, 6 is the [one-use workspaces](one-use-workspaces.md) fence); the recorded-accounting gate writes `RECORDED_ACCOUNTING_STATE_VERSION` 5, and an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, hand-off trigger in `handoff.rs`) |
+| Control state fence | `store.rs` `STATE_VERSION` (`:89`, 7 is the raised-ceiling fence, 6 the [one-use workspaces](one-use-workspaces.md) fence); the recorded-accounting gate writes `RECORDED_ACCOUNTING_STATE_VERSION` 5, and an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, `SLOT_CEILING_FENCE`, hand-off trigger in `handoff.rs`) |
 | Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
@@ -1114,12 +1125,15 @@ decision mocks where a real path exists:
    zero stays a measured zero; an incomplete walk refuses with its gap kinds.
 7. **Serialization.** Worst-valid 256-slot ledger round-trips under
    `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
-8. **Compatibility.** `capacity_policy: 1`, legacy (no fence) and `2` ledgers;
-   held IDs preserved; the control fence is `STATE_VERSION` 5 written by the
-   admission gate before the ledger fence, an owned-outputs-only state derives
-   version 4 (proved on `save` directly, not through a path that takes
-   admission), a v4 control still hands off, and a v5 document without the
-   fence or with an unknown fence value refuses; old-binary refusal is
+8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2` and `3`
+   ledgers; held IDs preserved; the recorded-accounting control fence is
+   version 5 written by the admission gate before the ledger fence, and a pool
+   at the legacy 128-slot membership additionally writes the version-7
+   `oxide.slots/256` fence before its admission can record the 129th slot; an
+   owned-outputs-only state derives version 4 (proved on `save` directly, not
+   through a path that takes admission), a v4 control still hands off, a v5
+   document without the recorded fence or with an unknown fence value refuses,
+   and version 7 requires the raised-ceiling fence; old-binary refusal is
    exercised as a ledger parse/validation refusal, not a mutation.
 9. **Removable combination.** The cap uses pool bytes only, so a volume whose
    unrelated used bytes exceed the cap still admits with no eviction while the

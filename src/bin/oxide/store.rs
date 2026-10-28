@@ -68,6 +68,12 @@ pub(crate) const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 /// permanent version-2 fence is actually written.
 const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Permanent control-state fence for revised Store mutations (oxide#118).
+/// Version 7 carries the raised-ceiling fence (oxide#177): the library
+/// ledger's `capacity_policy: 3` refuses an older binary, so this control
+/// fence must be durable **before** the first ledger write that can record
+/// more than the legacy 128 slots. It is written only for a pool whose own
+/// ledger already holds the legacy ceiling, so a smaller pool stays at 5 and
+/// an older binary keeps reading it.
 /// Version 6 carries the one-use fence (design §5.1, §10.1): a record may
 /// carry a workspace class only under this version and its durable
 /// `oxide.one-use/1` fence, so an older strict parser can never meet a class
@@ -80,9 +86,13 @@ const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Version 4 (the profile-member owned-outputs fence, oxide#133), version 3
 /// (the whole-target registry transaction, oxide#129) and version 2
 /// (oxide#128) remain readable until a forward fence upgrades them.
-pub(crate) const STATE_VERSION: u32 = 6;
+pub(crate) const STATE_VERSION: u32 = 7;
+/// Version 6 is the one-use fence. A version-7 document may also carry it,
+/// so presence requires at least this version and version 7 does not require
+/// the fence itself.
+const ONE_USE_STATE_VERSION: u32 = 6;
 /// Version 5 is the recorded-accounting fence (oxide#146), still written for
-/// a pool that has not opted into one-use workspaces.
+/// a pool that has not opted into one-use workspaces or the raised ceiling.
 const RECORDED_ACCOUNTING_STATE_VERSION: u32 = 5;
 /// Version 4 is the owned-outputs fence this version supersedes.
 const PREVIOUS_STATE_VERSION: u32 = 4;
@@ -96,9 +106,13 @@ const LEGACY_STATE_VERSION: u32 = 1;
 /// The recorded-accounting fence value; see [`State::recorded_accounting`].
 pub(crate) const RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 /// The one-use fence value; see [`State::one_use_workspaces`]. A document
-/// carrying it is always at [`STATE_VERSION`], and a document with either
-/// `class` or `class_reason` in any record always carries it.
+/// carrying it is at least at [`ONE_USE_STATE_VERSION`], and a document with
+/// either `class` or `class_reason` in any record always carries it.
 pub(crate) const ONE_USE_FENCE: &str = "oxide.one-use/1";
+/// The raised-ceiling fence value (oxide#177); see
+/// [`State::slot_ceiling`]. A document carrying it is always at
+/// [`STATE_VERSION`], and a version-7 document always carries it.
+pub(crate) const SLOT_CEILING_FENCE: &str = "oxide.slots/256";
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
 const MAX_IDENTITY_BYTES: usize = 64;
@@ -426,6 +440,15 @@ struct State {
     /// never sets it, so its numeric version does not advance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     one_use_workspaces: Option<String>,
+    /// Forward-only raised-ceiling fence (oxide#177), set durably by the
+    /// admission gate **before** the first library write that can record more
+    /// than the legacy 128 slots and never cleared. The library ledger's
+    /// `capacity_policy: 3` is unreadable to an older binary, so an older
+    /// binary hands off to a receipt-matching successor instead of refusing a
+    /// pool this one just raised. A pool below the legacy ceiling never sets
+    /// it, so its version stays 5 and older binaries keep reading it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slot_ceiling: Option<String>,
 }
 
 /// The durable initialization record shared by both pools of a pair.
@@ -468,6 +491,7 @@ impl Default for State {
             outputs_init: None,
             recorded_accounting: None,
             one_use_workspaces: None,
+            slot_ceiling: None,
         }
     }
 }
@@ -4252,6 +4276,10 @@ impl Store {
         }
 
         let view = self.ledger()?;
+        // The admission lock is held, so this membership is stable: a pool at
+        // the legacy ceiling fences its control state before the admission
+        // below can record the 129th slot (oxide#177).
+        self.fence_raised_slot_ceiling(view.slots.len())?;
         let has_slot = |record: &Record| {
             let project = self.affinity_dir(record.id);
             view.slots.iter().any(|slot| slot.project == project)
@@ -5068,14 +5096,36 @@ impl Store {
     /// ledger's `capacity_policy: 2` is unreadable to it. The write is one-time
     /// per pool; a read-only command never takes this gate and so never writes.
     /// The one-use fence is a second, later step taken only when a
-    /// class-bearing record is written.
+    /// class-bearing record is written, and the raised-ceiling fence is the
+    /// per-admission step in `attempt` once the ledger can hold 129 slots.
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
         self.fence_recorded_accounting()?;
         Ok(lock)
     }
 
-    /// Make the version-6 recorded-accounting fence durable. Nothing is
+    /// Make the version-7 raised-ceiling fence durable (oxide#177) before any
+    /// admission that can write the library ledger's `capacity_policy: 3`.
+    ///
+    /// Called under this pool's admission lock with that lock's own membership
+    /// snapshot, so a command that adds the 129th slot cannot race a peer that
+    /// read the count one slot lower. Nothing is written below the legacy
+    /// 128-slot ceiling: a smaller pool keeps version 5, which an older binary
+    /// still reads. The fence is forward-only, so its version survives every
+    /// later `save`.
+    fn fence_raised_slot_ceiling(&self, slots: usize) -> Result<(), String> {
+        if slots < oxide_storage::lease::LEGACY_MAX_SLOTS {
+            return Ok(());
+        }
+        let mut state = self.load()?;
+        if state.slot_ceiling.as_deref() == Some(SLOT_CEILING_FENCE) {
+            return Ok(());
+        }
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        self.save(&state)
+    }
+
+    /// Make the version-5 recorded-accounting fence durable. Nothing is
     /// written when it is already set.
     fn fence_recorded_accounting(&self) -> Result<(), String> {
         let mut state = self.load()?;
@@ -5127,6 +5177,7 @@ impl Store {
             | OLDER_STATE_VERSION
             | PREVIOUS_STATE_VERSION
             | RECORDED_ACCOUNTING_STATE_VERSION
+            | ONE_USE_STATE_VERSION
             | STATE_VERSION => false,
             _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
         };
@@ -5157,13 +5208,18 @@ impl Store {
         // advances nothing.
         let recorded = fenced.recorded_accounting.is_some();
         let one_use = fenced.one_use_workspaces.is_some();
+        let slot_ceiling = fenced.slot_ceiling.is_some();
         let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
-        fenced.version = if one_use {
+        fenced.version = if slot_ceiling {
+            // Version 7 is the raised-ceiling fence (oxide#177) and the
+            // hand-off trigger that must precede the ledger's policy-3 write.
+            STATE_VERSION
+        } else if one_use {
             // Version 6 is the one-use fence and the version a class-bearing
             // record always travels under.
-            STATE_VERSION
+            ONE_USE_STATE_VERSION
         } else if recorded {
             // Version 5 is the recorded-accounting fence (oxide#146) and the
             // hand-off trigger that must precede the ledger's policy-2 write.
@@ -5204,9 +5260,10 @@ impl Store {
 ///
 /// `#[serde(default)]` makes an explicit `"class":"normal"` indistinguishable
 /// from an absent field in the typed parse, so the presence of either field
-/// needs its own pass: a document below [`STATE_VERSION`] that names `class` or
-/// `class_reason` in **any** record object is refused here. At or above the
-/// one-use version presence is expected and [`validate_state`] decides.
+/// needs its own pass: a document below [`ONE_USE_STATE_VERSION`] that names
+/// `class` or `class_reason` in **any** record object is refused here. At or
+/// above the one-use version presence is expected and [`validate_state`]
+/// decides.
 ///
 /// A document this pass cannot read is left to the typed parse, which reports
 /// the same malformed input with its own diagnostic. Field presence is read
@@ -5246,7 +5303,7 @@ fn reject_class_fields_before_six(bytes: &[u8]) -> Result<(), String> {
     let Some(version) = document.version else {
         return Ok(());
     };
-    if version >= u64::from(STATE_VERSION) {
+    if version >= u64::from(ONE_USE_STATE_VERSION) {
         return Ok(());
     }
     if document.records.is_some_and(|records| {
@@ -5273,6 +5330,7 @@ fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
             | OLDER_STATE_VERSION
             | PREVIOUS_STATE_VERSION
             | RECORDED_ACCOUNTING_STATE_VERSION
+            | ONE_USE_STATE_VERSION
             | STATE_VERSION
     ) {
         return Err("Oxide state has an unsupported version".to_owned());
@@ -5291,14 +5349,16 @@ fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
         }
     }
-    // The one-use fence and the numeric version are equivalent (design §5.1,
-    // §10.1): a class-bearing record always travels under both, a fenced
-    // document is always at the one-use version, and an unknown fence value
-    // refuses instead of being guessed at. Presence itself is decided by
-    // `reject_class_fields_before_six`, which the typed parse cannot do.
+    // The one-use fence and the one-use numeric version are equivalent at
+    // version 6 (design §5.1, §10.1): a class-bearing record always travels
+    // under both, and an unknown fence value refuses instead of being guessed
+    // at. Version 7 carries the raised-ceiling fence and may carry this one
+    // too, so presence requires at least version 6 and version 6 requires the
+    // fence. Presence itself is decided by `reject_class_fields_before_six`,
+    // which the typed parse cannot do.
     match state.one_use_workspaces.as_deref() {
         None => {
-            if state.version >= STATE_VERSION {
+            if state.version == ONE_USE_STATE_VERSION {
                 return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
             }
             if state
@@ -5312,7 +5372,25 @@ fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
             }
         }
         Some(fence) if fence == ONE_USE_FENCE => {
-            if state.version != STATE_VERSION {
+            if state.version < ONE_USE_STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
+        Some(_) => {
+            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
+        }
+    }
+    // The raised-ceiling fence and version 7 are equivalent (oxide#177): a
+    // version-7 document always carries it, and a smaller pool never does. An
+    // unknown fence value refuses rather than being guessed at.
+    match state.slot_ceiling.as_deref() {
+        None => {
+            if state.version >= STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
+        Some(fence) if fence == SLOT_CEILING_FENCE => {
+            if state.version < STATE_VERSION {
                 return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
             }
         }
@@ -9868,7 +9946,7 @@ pub(crate) mod tests {
         write(document(6, true, ",\"class\":\"one_use\""));
         let fenced = accept("v6 with the fence and a class");
         assert_eq!(fenced.records[0].class, WorkspaceClass::OneUse);
-        assert_eq!(fenced.version, STATE_VERSION);
+        assert_eq!(fenced.version, ONE_USE_STATE_VERSION);
 
         write(document(6, false, ""));
         refuse("v6 without the fence");
@@ -9884,6 +9962,94 @@ pub(crate) mod tests {
         write(document(5, false, ""));
         accept("the control document without either field");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// oxide#177: a pool at the legacy 128-slot ceiling makes the
+    /// raised-ceiling control fence durable before the admission that can
+    /// record the 129th slot, so an older binary hands off instead of refusing
+    /// a ledger this one is about to fence. Below the ceiling nothing is
+    /// written, so a small pool keeps version 5 and an older binary keeps
+    /// reading it. The fence is forward-only: an ordinary later save keeps it.
+    #[test]
+    fn the_raised_slot_ceiling_fence_is_written_only_at_the_legacy_ceiling() {
+        let (root, store, _key) = class_fixture("raised-ceiling-gate");
+        store.fence_recorded_accounting().unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.version, RECORDED_ACCOUNTING_STATE_VERSION);
+        assert!(state.slot_ceiling.is_none());
+
+        let below = oxide_storage::lease::LEGACY_MAX_SLOTS - 1;
+        store.fence_raised_slot_ceiling(below).unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(
+            state.version, RECORDED_ACCOUNTING_STATE_VERSION,
+            "a pool below the legacy ceiling advanced its control version"
+        );
+        assert!(state.slot_ceiling.is_none());
+
+        store
+            .fence_raised_slot_ceiling(oxide_storage::lease::LEGACY_MAX_SLOTS)
+            .unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+
+        // Forward-only: the next ordinary save keeps the fenced version.
+        store.save(&state).unwrap();
+        let stored = store.load().unwrap();
+        assert_eq!(stored.version, STATE_VERSION);
+        assert_eq!(stored.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A version-7 document always carries the raised-ceiling fence and a
+    /// smaller document never does; an unknown fence value and a version-7
+    /// document without the fence are states no writer produces. Version 7 may
+    /// also carry the one-use fence, so a one-use pool that reached the
+    /// ceiling keeps both.
+    #[test]
+    fn the_raised_slot_ceiling_fence_and_version_are_equivalent() {
+        let mut state = State::default();
+        state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+
+        state.version = STATE_VERSION;
+        assert!(
+            validate_state(&state, false).is_err(),
+            "version 7 without the raised fence was accepted"
+        );
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        assert!(validate_state(&state, false).is_ok());
+
+        state.version = ONE_USE_STATE_VERSION;
+        assert!(
+            validate_state(&state, false).is_err(),
+            "the raised fence at version 6 was accepted"
+        );
+        state.slot_ceiling = None;
+        assert!(
+            validate_state(&state, false).is_err(),
+            "version 6 without the one-use fence was accepted"
+        );
+        state.one_use_workspaces = Some(ONE_USE_FENCE.to_owned());
+        assert!(
+            validate_state(&state, false).is_ok(),
+            "the one-use version must stay readable without the raised fence"
+        );
+        state.one_use_workspaces = None;
+
+        state.version = STATE_VERSION;
+        state.slot_ceiling = Some("oxide.slots/128".to_owned());
+        assert!(
+            validate_state(&state, false).is_err(),
+            "an unknown raised-ceiling fence was accepted"
+        );
+
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        state.one_use_workspaces = Some(ONE_USE_FENCE.to_owned());
+        assert!(
+            validate_state(&state, false).is_ok(),
+            "a one-use pool at the raised ceiling must keep both fences"
+        );
     }
 
     /// The serializer omission rule of §5.1. A fresh normal record and a
@@ -9942,7 +10108,7 @@ pub(crate) mod tests {
         let slot = held.slot_id.clone();
         store.release(held, None).unwrap();
         let state = store.load().unwrap();
-        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.version, ONE_USE_STATE_VERSION);
         assert_eq!(state.one_use_workspaces.as_deref(), Some(ONE_USE_FENCE));
         let record = state
             .records
@@ -9989,7 +10155,7 @@ pub(crate) mod tests {
         let mut state = store.load().unwrap();
         store.fence_one_use_workspaces(&mut state).unwrap();
         let fenced = store.load().unwrap();
-        assert_eq!(fenced.version, STATE_VERSION);
+        assert_eq!(fenced.version, ONE_USE_STATE_VERSION);
         assert_eq!(fenced.one_use_workspaces.as_deref(), Some(ONE_USE_FENCE));
         assert!(
             fenced

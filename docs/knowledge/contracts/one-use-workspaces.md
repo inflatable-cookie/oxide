@@ -1876,7 +1876,7 @@ hint for *which* slots to expect bytes in, never for the slice figure.
 
 | Bound | Value | Why |
 | --- | --- | --- |
-| One-use members per pool | **16** | hard count ceiling, independent of `MAX_SLOTS` (128) and the normal eight-slot project cap |
+| One-use members per pool | **16** | hard count ceiling, independent of `MAX_SLOTS` (256) and the normal twelve-slot project cap |
 | New one-use slot needs | `member_count <= 15` after restore | the new slot must have a free place; reaching 16 by eviction and then refusing is not allowed |
 | Warm reuse needs | a **verified member** candidate, `member_count <= 16` | it adds no slot; 16 members with a protected candidate is admissible if the bytes fit |
 | Slice bytes | **min(admission_budget / 10, 32 GiB)**, at least 1 | a tenth of this admission's effective soft budget, capped so a large pool cannot reserve an unbounded disposable region |
@@ -2930,7 +2930,7 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
    matching record); a normal admission at the ceiling reclaims the one-use
    member first, and a one-use admission at the ceiling reclaims only a one-use
    member or refuses.
-6. normal project-cap protection: at the eight-slot **normal** cap with eligible
+6. normal project-cap protection: at the twelve-slot **normal** cap with eligible
    one-use members, the replacement deletes exactly one idle **normal** slot
    while the one-use members survive (the front-door list has no one-use
    candidate).

@@ -1510,7 +1510,11 @@ necessary.
   the removable pool's `removable/state.json` and `removable.json`. Each is
   parsed as a bounded `serde_json::Value`, and only a numeric `u32` `version`
   above this binary's `STATE_VERSION` or `REGISTRATION_VERSION` triggers,
-  whatever other fields the document carries. A missing pool or file, an IO or
+  whatever other fields the document carries. (A pool whose ledger first
+  crosses the legacy 128-slot ceiling advances its control state to version 7,
+  the raised-ceiling fence, exactly so that an older binary hands off rather
+  than meeting a `capacity_policy: 3` ledger; a pool below that ceiling stays
+  at version 5.) A missing pool or file, an IO or
   permission error, an oversized document, a non-object, and a missing, non-numeric,
   negative or wider-than-`u32` version are not proof of a newer format: those
   keep the existing errors and never execute anything. Plain passthrough
@@ -3876,9 +3880,11 @@ Rules:
   complete pool figure or a removable pool's bound-only unknown; and
   **recorded byte** pressure, when the attributable pool sum — never the
   shared volume's total — is at or above the budget. A ledger whose slot
-  table exceeds 128 carries the forward-only `capacity_policy: 3` fence, so
-  an older binary refuses it at ledger read before any mutation; a pool at or
-  below 128 slots keeps the fence an older binary still reads. It remeasures
+  table exceeds 128 carries the forward-only `capacity_policy: 3` fence, and
+  the admission that can first record the 129th slot makes the matching
+  version-7 `oxide.slots/256` control fence durable first, so an older binary
+  hands off instead of reading a policy-3 ledger; a pool at or below 128 slots
+  keeps version 5 and an older binary still reads it directly. It remeasures
   after each deletion and refuses `Full` when only held slots remain. A
   removable pool whose own size is unknown takes the reserve/floor route
   instead of a byte-cap comparison. Held, uncertain, foreign and unmeasurable
@@ -3921,7 +3927,8 @@ Rules:
   oxide#177's accounting-cost gate: a new-slot admission at 256 walks no
   inventory, the evicted slot is never walked, a release walks only its own
   slot, and default `status` at 256 walks nothing; it also crosses the legacy
-  128-slot ceiling natively and requires `capacity_policy: 3`. Worst-valid
+  128-slot ceiling natively and requires `capacity_policy: 3` plus the
+  version-7 `oxide.slots/256` control fence in the same admission. Worst-valid
   ledger/control serialization, round-trip and oversized-field refusals are
   unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
   and limits with `--diagnostic` (uncounted, keep-going, a bounded

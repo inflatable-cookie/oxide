@@ -70,7 +70,10 @@ pub const CAPACITY_POLICY_VERSION: u32 = 2;
 /// written forward-only, in the same atomic replacement that first takes the
 /// slot count above 128, and an older binary's policy check refuses it before
 /// any mutation. A pool that stays at or below 128 slots never carries it, so
-/// its ledger stays readable by an older binary.
+/// its ledger stays readable by an older binary. The front door's version-7
+/// `oxide.slots/256` control fence is durable before that first policy-3
+/// write, so an older installed binary hands off before it opens such a
+/// ledger instead of meeting the refusal.
 pub const RAISED_CAPACITY_POLICY_VERSION: u32 = 3;
 /// The version-1 fence (oxide#118) stays readable and is upgraded by the next
 /// revised write; a version-1 ledger never carries a record.
