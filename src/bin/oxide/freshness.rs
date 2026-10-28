@@ -1881,7 +1881,11 @@ mod tests {
         assert_eq!(step(&["test", "-Zunstable-options"], true), "refuse");
     }
 
-    /// CSI colour on a piped `error:` line. Cargo 1.97.1 still emits it.
+    /// Strip CSI. Recipe env `CLICOLOR_FORCE=1` makes Cargo 1.97.1 colour
+    /// piped stderr (`\x1b[1m\x1b[91merror\x1b[0m:`), so production
+    /// `cargo_accepts` (`starts_with("error:")`) sees `first_error=None`.
+    /// A bare ESC not followed by `[` drops the next character; Cargo CSI
+    /// always uses `[`.
     fn strip_ansi(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut chars = text.chars();
@@ -1904,16 +1908,17 @@ mod tests {
     /// Cargo parsed the subcommand, then refused -Z. Stable 1.97.1 wording:
     /// the -Z flag is only accepted on the nightly channel (exit 101).
     /// Nightly unknown-flag wording also contains the `-Z` flag token.
-    /// Argument errors exit 1 and never mention -Z.
+    /// Argument errors exit 1 and never mention -Z. CSI is stripped because
+    /// the recipe env colours the piped `error:` prefix.
     fn refused_z_flag(code: Option<i32>, stderr: &str) -> bool {
         code == Some(101) && strip_ansi(stderr).contains("`-Z` flag")
     }
 
     /// Real offline Cargo in an empty scratch directory: accepted arguments
     /// reach Cargo's `-Z` refusal after it has accepted the subcommand.
-    /// A check placed after `--` is not a Cargo argument. Colour on the
-    /// `error:` prefix is not the signal. Production `cargo_accepts` is
-    /// unchanged.
+    /// A check placed after `--` is not a Cargo argument. Production
+    /// `cargo_accepts` is unchanged and fails under `CLICOLOR_FORCE=1`; this
+    /// test-only oracle hides that product defect.
     #[test]
     fn parse_check_asks_cargo_without_effects() {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
