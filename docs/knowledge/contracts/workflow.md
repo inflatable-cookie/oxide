@@ -3871,7 +3871,7 @@ Rules:
   device refuses.
 - **Admission.** The ledger's rules with this command's soft budget
   (`LeaseRequest.budget_bytes`, else the recorded one) as the cap, and the
-  raised `MAX_SLOTS` 256 / 4 MiB ledger representation (oxide#177;
+  raised `MAX_SLOTS` 256 / 8 MiB ledger representation (oxide#177;
   [local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
   A compatible idle slot is reused first and kept warm; the half-budget
   recycling rule is retired. A new slot replaces the least-recently-used
@@ -3929,8 +3929,8 @@ Rules:
   slot, and default `status` at 256 walks nothing; it also crosses the legacy
   128-slot ceiling natively and requires `capacity_policy: 3` plus the
   version-7 `oxide.slots/256` control fence in the same admission. Worst-valid
-  ledger/control serialization, round-trip and oversized-field refusals are
-  unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
+  ledger/control serialization — including the reachable two-journal
+  `Evicting` state — round-trip and oversized-field refusals are unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
   and limits with `--diagnostic` (uncounted, keep-going, a bounded
   `qualified: false` receipt, aborting on an unknown outcome or unclosed
   proof child), and `effigy proof:slot-headroom:test` is its pure

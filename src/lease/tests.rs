@@ -2497,6 +2497,201 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     }
 }
 
+/// A maximal valid deletion journal (oxide#155): one root plan plus the most
+/// capture and foreign records the validator allows, each with the longest
+/// chain of the longest capture names and the longest observed original name a
+/// writer can produce, so a byte bound measured with it covers everything a
+/// recorded deletion can durably hold.
+fn maximal_journal_json(tag: u64) -> serde_json::Value {
+    let name = |value: u64| {
+        format!(
+            "{}{:032x}",
+            crate::owned_delete::CAPTURE_PREFIX,
+            tag * 10_000 + value
+        )
+    };
+    let chain: Vec<String> = (0..64).map(&name).collect();
+    assert!(chain.iter().all(|item| item.len() <= 47));
+    // A 255-byte name is the filesystem's NAME_MAX; control bytes are valid
+    // UTF-8 and compact JSON escapes each as six characters.
+    let original = "\u{1}".repeat(255);
+    let captures: Vec<serde_json::Value> = (0..96)
+        .map(|index| {
+            serde_json::json!({
+                "path": chain,
+                "private": name(1_000 + index),
+                "original": original,
+                "device": u64::MAX,
+                "inode": u64::MAX,
+                "mode": 0o100644,
+            })
+        })
+        .collect();
+    let foreign: Vec<serde_json::Value> = (0..32)
+        .map(|index| {
+            serde_json::json!({
+                "path": chain,
+                "private": name(2_000 + index),
+                "original": original,
+                "expected_device": u64::MAX,
+                "expected_inode": u64::MAX,
+                "expected_mode": 0o100644,
+                // `describe_entry`'s fixed form, the longest writer text here.
+                "found": "regular file device 18446744073709551615 inode 18446744073709551615 mode 100644 owner 501",
+                "restored": false,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "root": {
+            "private": name(0),
+            "phase": "planned",
+            "device": u64::MAX,
+            "inode": u64::MAX,
+            "parent_device": u64::MAX,
+            "parent_inode": u64::MAX,
+            "mode": 0o040700,
+        },
+        "captures": captures,
+        "foreign": foreign,
+    })
+}
+
+/// The reachable worst valid ledger (oxide#177): the raised-ceiling
+/// representation at 256 slots with every field at its cap, where the two
+/// slots a pool can durably leave `Evicting` carry maximal deletion journals.
+/// Its measured bytes are what `MAX_LEDGER_BYTES` is derived from.
+#[test]
+fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
+    let fx = Fixture::new("worst-journal-ledger");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("config.json")).expect("config")).expect("json");
+    let path = format!("/{}", "\u{1}".repeat(1023));
+    let holder = "\u{1}".repeat(MAX_HOLDER_BYTES);
+    let lease_id = "\u{1}".repeat(MAX_LEASE_ID_BYTES);
+    let mut slots = Vec::new();
+    for index in 0..super::MAX_SLOTS as u64 {
+        let id = u64::MAX - 1 - index;
+        let rank = u64::MAX - 1 - index;
+        let id_text = id.to_string();
+        let leaf = format!("{}-{id_text}", "b".repeat(80 - id_text.len() - 1));
+        let mut slot = serde_json::json!({
+            "id": id,
+            "incarnation": u64::MAX,
+            "state": "idle",
+            "project": path,
+            "workspace": path,
+            "profile": "full-debug",
+            "holder": holder,
+            "lease_id": null,
+            "last_lease_id": lease_id,
+            "dir": format!("{}/{leaf}", "a".repeat(80)),
+            "rank": rank,
+            "recorded": {
+                "for_lease": lease_id,
+                "unique_bytes": u64::MAX,
+                "logical_bytes": u64::MAX,
+                "entries": u64::MAX,
+                "at_ms": u64::MAX,
+            },
+        });
+        if index < 2 {
+            // A recorded deletion holds no size observation and may carry the
+            // journal; two is the reachable worst (see `MAX_LEDGER_BYTES`).
+            slot["state"] = serde_json::json!("evicting");
+            slot.as_object_mut().expect("object").remove("recorded");
+            slot["capture"] = maximal_journal_json(index);
+        }
+        slots.push(slot);
+    }
+    let ledger = serde_json::json!({
+        "version": 1,
+        "store_id": config["store_id"],
+        "cap_bytes": 64 * 1024 * 1024,
+        "next_slot": u64::MAX,
+        "next_lease": u64::MAX,
+        "capacity_policy": RAISED_CAPACITY_POLICY_VERSION,
+        "next_rank": u64::MAX,
+        "slots": slots,
+    });
+    let input = serde_json::to_vec(&ledger).expect("worst valid journaled ledger");
+    let stored = super::pool::write_ledger_bytes_injected(&pool, &input)
+        .expect("the worst valid journaled ledger is accepted");
+    assert!(
+        stored.len() as u64 <= MAX_LEDGER_BYTES,
+        "worst valid journaled ledger {} exceeds {MAX_LEDGER_BYTES}",
+        stored.len()
+    );
+    assert!(
+        stored.len() > 4_500_000,
+        "the journaled fixture did not reach the journal's cost: {}",
+        stored.len()
+    );
+    // The two journals really round-tripped, not just their slot rows.
+    for id in [u64::MAX - 1, u64::MAX - 2] {
+        let journal = super::pool::capture_record_injected(&pool, id)
+            .unwrap_or_else(|| panic!("the journal of slot {id} did not survive"));
+        assert_eq!(journal.captures.len(), 96);
+        assert_eq!(journal.foreign.len(), 32);
+        assert_eq!(journal.captures[0].path.len(), 64);
+        assert_eq!(journal.captures[0].original.chars().count(), 255);
+    }
+    println!(
+        "worst valid 256-slot journaled ledger: {} bytes of the {MAX_LEDGER_BYTES}-byte cap",
+        stored.len()
+    );
+    // A passive snapshot reads the journals without reconciling them.
+    let snapshot = super::pool::snapshot_injected(&pool).expect("the journaled ledger reads");
+    assert_eq!(snapshot.slots.len(), super::MAX_SLOTS);
+    assert_eq!(snapshot.evicting_slot_ids.len(), 2);
+}
+
+/// A journaled deletion that cannot be classified keeps the pool blocked:
+/// every new lease is refused with `unknown_accounting`, so no second eviction
+/// (and no second journal) can be started while one is outstanding. That is the
+/// invariant `MAX_LEDGER_BYTES`'s journal bound relies on.
+#[test]
+fn a_blocked_journaled_deletion_refuses_every_new_lease() {
+    let fixture = Fixture::new("blocked-journal");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-journal");
+    super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    let plan = crate::owned_delete::RootCapturePlan {
+        private: format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, 0),
+        phase: crate::owned_delete::RootCapturePhase::Planned,
+        device: 1,
+        inode: 2,
+        parent_device: 1,
+        parent_inode: 3,
+        mode: 0o040700,
+    };
+    // The recorded root is gone and neither its original nor its planned
+    // private name holds it, so replay must keep the deletion pending.
+    fs::remove_dir_all(&slot_path).expect("the recorded root is absent");
+    super::pool::write_capture_record_injected(
+        &pool,
+        slot_id,
+        super::pool::DeletionJournal {
+            root: plan,
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("journal");
+    let workspace = fixture.dir("workspace");
+    assert!(
+        matches!(
+            lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")),
+            Err(LeaseError::UnknownAccounting)
+        ),
+        "a blocked journaled deletion admitted a new lease"
+    );
+    // The journaled record is retained: no second deletion was started.
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(snapshot.evicting_slot_ids.len(), 1);
+}
+
 /// oxide#177's accounting-cost gate as one fixed measurement: one whole round
 /// trip of the real recorded representation — the bounded ledger read, the
 /// ranked ordering admission uses, and the actual atomic ledger write that
@@ -2504,17 +2699,19 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
 /// 256-slot ceiling. Both figures are printed and each whole round trip must
 /// stay under one generous fixed test ceiling.
 ///
-/// The round trip includes the atomic replacement's durable `fsync`, which is
-/// host I/O and dominates the figure on a loaded machine, so the ceiling is
-/// 500 ms: a fixed sanity bound on the requested write round trip, not on the
-/// representation work alone. It still catches a whole-payload walk or a
-/// per-slot quadratic regression, which is what the gate is for. This is not a
-/// benchmark or a claim about a large live pool.
+/// The round trip includes the atomic replacement's durable `fsync` of a
+/// ledger that now reaches the journaled worst-valid size, which is host I/O
+/// and dominates the figure on a loaded machine (195.7 ms was observed for the
+/// 256-slot round trip there), so the ceiling is 1000 ms: a fixed sanity bound
+/// on the requested write round trip, not on the representation work alone. It
+/// still catches a whole-payload walk or a per-slot quadratic regression,
+/// which is what the gate is for. This is not a benchmark or a claim about a
+/// large live pool.
 #[test]
 fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
     use std::time::{Duration, Instant};
 
-    const CEILING: Duration = Duration::from_millis(500);
+    const CEILING: Duration = Duration::from_millis(1_000);
     let fx = Fixture::new("ledger-cost");
     let pool = fx.dir("pool");
     create_injected(&pool, 64 * 1024 * 1024).expect("init");
@@ -2549,6 +2746,11 @@ fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
                 },
             }));
         }
+        // One recorded deletion carries a maximal journal, so the measured
+        // read, rank and write also cover journal parsing and serialization.
+        rows[0]["state"] = serde_json::json!("evicting");
+        rows[0].as_object_mut().expect("object").remove("recorded");
+        rows[0]["capture"] = maximal_journal_json(0);
         let policy = if slots > super::LEGACY_MAX_SLOTS {
             RAISED_CAPACITY_POLICY_VERSION
         } else {
@@ -2578,9 +2780,11 @@ fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
         let mut best = Duration::MAX;
         for _ in 0..3 {
             let started = Instant::now();
-            let view = managed::ledger_view(&pool).expect("recorded read");
+            // The passive snapshot reads and validates the ledger (including
+            // the journal) without reconciling the recorded deletion.
+            let view = super::pool::snapshot_injected(&pool).expect("recorded read");
             assert_eq!(view.slots.len(), slots);
-            assert!(view.slots.iter().all(|slot| slot.recorded.is_some()));
+            assert_eq!(view.evicting_slot_ids.len(), 1);
             let mut order: Vec<(u64, u64)> = view
                 .slots
                 .iter()

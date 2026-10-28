@@ -54,11 +54,27 @@ pub const MAX_SLOTS: usize = 256;
 /// older binary refuses it at ledger read instead of reading a slot table it
 /// cannot represent (oxide#177).
 pub const LEGACY_MAX_SLOTS: usize = 128;
-/// Finite ledger file size including the atomic temp. The worst valid
-/// 256-slot ledger with every bounded field at its ceiling, escaped by
-/// compact JSON, fits this cap with no truncation (oxide#177; the unit proof
-/// reports the exact figure).
-pub const MAX_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
+/// Finite ledger file size including the atomic temp. The worst valid ledger
+/// is the raised-ceiling representation at `MAX_SLOTS` with every bounded
+/// field at its ceiling and every numeric field at its full 20-digit width,
+/// plus the deletion journals an `Evicting` record can durably hold. One
+/// maximal journal is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture
+/// records and `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a
+/// chain of at most `MAX_CAPTURE_DEPTH` (64) capture names of at most
+/// `CAPTURE_PREFIX + 2*CAPTURE_TAG_BYTES` (47) bytes and an observed original
+/// name of at most `NAME_MAX` (255) bytes, escaped sixfold by compact JSON.
+/// At most two journals can be reachable: an eviction is one
+/// `retire_idle_slot` inside one admission and a failed deletion aborts that
+/// admission's eviction loop, every open reconciles all `Evicting` records
+/// before admitting anything (a journal that cannot finish sets
+/// `reconciliation_blocked` and every lease is refused until it does, and one
+/// that can finish is removed), and a removable pool's single lost-slot
+/// eviction before its loop aborts can add at most one more. The 8 MiB cap is
+/// derived from the measured two-journal worst valid ledger (the unit proof
+/// reports both exact figures) and still covers six maximal journals, so even
+/// an unexpected co-occurrence is representable; a hand-crafted ledger beyond
+/// the cap refuses rather than truncating.
+pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 /// Permanent capacity-policy fence in the library ledger (oxide#118). Its
 /// presence tells an older binary that this ledger uses ranked idle
 /// replacement; the fence is never removed. Version 2 (oxide#146) adds the

@@ -272,7 +272,7 @@ the recorded one) and the [storage inventory](storage-inventory.md)
 unique-allocated figure for owned slots, a `(device, inode)` union so a hard
 link counts once; filesystem metadata directories remain outside that slot
 accounting. Control/ledger headroom stays outside the payload and is bounded
-(`MAX_LEDGER_BYTES` 4 MiB, `MAX_SLOTS` 256). Eviction happens only at lease
+(`MAX_LEDGER_BYTES` 8 MiB, `MAX_SLOTS` 256). Eviction happens only at lease
 time and only for known owned idle whole slots, in the pool's recorded
 least-recently-used order (oxide#118, [below](#slot-headroom-and-ranked-idle-replacement-oxide118)). Held occupancy, foreign
 entries, symlinked pool/payload/slots/slot roots, unknown accounting and
@@ -559,13 +559,27 @@ only: `MAX_SLOTS` is 256 and Oxide's project cap is twelve; neither build
 concurrency nor `max_active` changed, there is no new configuration, and the
 soft byte budget and the 95 GB registered reserve are unchanged.
 
-**Representation.** `MAX_LEDGER_BYTES` is 4 MiB. Every bounded field keeps its
+**Representation.** `MAX_LEDGER_BYTES` is 8 MiB. Every bounded field keeps its
 cap: paths 1024 bytes, holder 128, lease ID 160, slot directory component 80.
-A compact JSON ledger with every field at its ceiling, escaped sixfold and
-with 20-digit integers, is proven by a unit test to fit the cap and round-trip;
-at the 256-slot ceiling the measured worst-valid ledger is 3,968,466 bytes
-(every numeric field at its full 20-digit width and every string at its cap).
-Control state is bounded
+A compact JSON ledger with every field at its ceiling, escaped sixfold and with
+20-digit integers, is proven by unit tests to fit the cap and round-trip. The
+all-idle worst-valid 256-slot ledger (every numeric field at its full 20-digit
+width and every string at its cap) measures 3,968,466 bytes. The bound also
+covers the deletion journal (oxide#155), which is the other durable state a
+slot record can hold: an `Evicting` slot may carry a `DeletionJournal` with up
+to 96 outstanding capture records and 32 mismatched captures, each with a chain
+of up to 64 capture names (47 bytes each) and an observed original name of up
+to `NAME_MAX` 255 bytes, escaped sixfold. At most two such journals are
+reachable: an eviction is one `retire_idle_slot` inside one admission and a
+failed deletion aborts that admission's eviction loop; every open reconciles
+all `Evicting` records before admitting anything, so a journal that cannot
+finish sets `reconciliation_blocked` and every lease is refused until it does
+(one that can finish is removed); and a removable pool's single lost-slot
+eviction before its loop aborts can add at most one more. The measured
+two-journal worst-valid ledger is 5,227,058 bytes, and the 8 MiB cap still
+covers six maximal journals, so even an unexpected co-occurrence is
+representable; a hand-crafted ledger beyond the cap refuses rather than
+truncating. Control state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
 tickets, 128 clean marks, 16 recoveries, 16 flushes, per-object compact
 ceilings (record 40 KiB, recovery 9 KiB, holder 5 KiB, lost 8 KiB, flush
@@ -671,12 +685,13 @@ its own, so the runner owns closure on any fault. With every slot's record
 current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The worst-valid
-ledger/control serialization, escaped round-trip and oversized-field refusals
-are unit tests in `effigy test rust`, as is a fixed 500 ms ceiling on a
-whole 128-slot and 256-slot recorded-ledger round trip (bounded read, ranked
-ordering, the actual atomic write and its read-back; the ceiling is generous
-for the included `fsync`, which is host I/O), reporting both measured
-figures. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
+ledger/control serialization — including the reachable two-journal
+`Evicting` state, 5,227,058 bytes against the 8 MiB cap — escaped round-trip
+and oversized-field refusals are unit tests in `effigy test rust`, as is a
+fixed 500 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
+trip with a journal (bounded read via the passive snapshot, ranked ordering,
+the actual atomic write and its read-back; the ceiling is generous for the
+included `fsync`, which is host I/O), reporting both measured figures. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
 limits with `--diagnostic`: an uncounted keep-going collection that records
 reached/completed/failed/skipped phases and the latched first fault in a
 bounded `qualified: false` receipt, continues only into phases whose declared
@@ -774,9 +789,9 @@ never written for a `Held` slot and never adopted across incarnations.
 Size. At the 128-slot ceiling `MAX_LEDGER_BYTES` stayed 2 MiB and the record
 cost at most `128 × (``"recorded":{…}`` ≈ 960 escaped lease bytes + 4 × 20-digit
 integers)`, about 131 KiB at every bounded field's ceiling; oxide#177 later
-raised the cap to 4 MiB with the 256-slot ceiling (see the slot-headroom
-representation above), and the worst-valid-ledger unit proof carries the
-record there. If a future proof cannot fit the cap, a **fit blocker is
+raised the cap to 8 MiB with the 256-slot ceiling (see the slot-headroom
+representation above), and the worst-valid-ledger unit proofs carry both the
+record and the reachable deletion-journal state there. If a future proof cannot fit the cap, a **fit blocker is
 reported** and the bound is not silently raised.
 
 #### Validity: what makes a record current
