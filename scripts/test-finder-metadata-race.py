@@ -757,6 +757,23 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
         other = run([oxide, "check"], cwd=checkout, env=roomy)
         if other.returncode or not os.path.isdir(private_root):
             fail(f"{case}: unrelated admission did not keep the blocked capture: {other.stderr[-1500:]}")
+        with open(os.path.join(env["OXIDE_POOL"], "ledger.json"), encoding="utf-8") as handle:
+            after = json.load(handle)
+        pending = [row for row in after.get("slots", []) if row.get("id") == slots[0]["id"]]
+        if len(pending) != 1 or pending[0].get("state") != "evicting":
+            fail(f"{case}: the blocked slot was reused or removed")
+        recorded = pending[0].get("recorded") or {}
+        if recorded.get("unique_bytes", 0) <= 0:
+            fail(f"{case}: the blocked slot has no positive recorded charge")
+        tight = dict(env)
+        tight["OXIDE_TEST_BUDGET_BYTES"] = "1"
+        refused = run([oxide, "check"], cwd=workspace(env, base, "d"), env=tight)
+        if refused.returncode == 0 or "unknown_accounting" in refused.stderr:
+            fail(f"{case}: exhausted budget did not refuse on capacity: {refused.stderr[-1500:]}")
+        if "pool cap cannot admit a new slot" not in refused.stderr:
+            fail(f"{case}: the capacity refusal was not reported: {refused.stderr[-1500:]}")
+        if not os.path.isdir(private_root) or not os.path.isdir(victim):
+            fail(f"{case}: budget pressure removed a blocked slot or replacement")
         os.rmdir(victim)
         replay = run([oxide, "check"], cwd=checkout, env=roomy)
         if replay.returncode:

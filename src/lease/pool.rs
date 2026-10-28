@@ -2177,6 +2177,28 @@ impl Pool {
         scan: &AccountingScan,
         plan: &VictimPlan,
     ) -> Result<(), LeaseError> {
+        // A bounded scan may fall back to the removable volume's reserve,
+        // but a pending eviction still consumes its conservative charge. If
+        // that charge alone exhausts the budget, unknown other bytes cannot
+        // make room for an admission.
+        if bound_gaps_only(scan) {
+            let pending = self
+                .ledger
+                .slots
+                .iter()
+                .filter(|slot| slot.state == SlotPersistState::Evicting)
+                .fold(0_u64, |total, slot| {
+                    let charge = slot
+                        .recorded
+                        .as_ref()
+                        .filter(|record| record.for_lease == slot.last_lease_id)
+                        .map_or(self.budget, |record| record.unique_bytes);
+                    total.saturating_add(charge)
+                });
+            if pending >= self.budget {
+                return Err(LeaseError::Full);
+            }
+        }
         let mut idle_available = true;
         loop {
             let available = self.volume_available_bytes()?;
@@ -4835,6 +4857,31 @@ mod removable_pool_path_tests {
             "a newer idle slot was evicted first"
         );
         assert!(pool.slot(4).is_some(), "a held slot was evicted");
+    }
+
+    #[test]
+    fn the_unknown_route_still_charges_a_pending_eviction() {
+        let fixture = Fixture::new("pending-reserve-charge");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let path = idle_dir(&mut pool, 1, 1);
+        let slot = pool.slot_mut(1).expect("slot");
+        slot.state = SlotPersistState::Evicting;
+        slot.recorded.as_mut().expect("record").unique_bytes = CAP;
+        verified_facts::with(facts(RESERVE + GIB), || {
+            assert!(matches!(
+                pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any()),
+                Err(LeaseError::Full)
+            ));
+        });
+        assert!(path.exists());
+        pool.slot_mut(1).expect("slot").recorded = None;
+        verified_facts::with(facts(RESERVE + GIB), || {
+            assert!(matches!(
+                pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any()),
+                Err(LeaseError::Full)
+            ));
+        });
+        assert!(path.exists());
     }
 
     #[test]

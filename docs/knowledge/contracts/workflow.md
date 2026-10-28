@@ -3871,7 +3871,9 @@ Rules:
   A deletion that cannot reconcile stays `Evicting` and is excluded from
   reuse and victim choice. Admission charges its last closed size; historical
   records without one consume the whole admission budget, a conservative
-  decision bound rather than a claim about actual bytes. The scope walk stops
+  decision bound rather than a claim about actual bytes. On the removable
+  pool's bounded-scan reserve route, pending charges that alone reach the
+  budget still refuse admission. The scope walk stops
   at the journaled private root only when its recorded identity verifies.
   Status names pending slot IDs, and the read-only drive description names them
   in its pending-reconciliation detail. Other independently owned bytes still
