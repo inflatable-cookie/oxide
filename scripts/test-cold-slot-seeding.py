@@ -220,20 +220,20 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("06", (), "offered build-script compile unit is inert: the package lib is rebuilt"),
     ("07", (), "a deleted donor leaves the recipient compiling and running (independent inodes)"),
     ("08", (), "a changed dependency version offers nothing and builds correctly"),
-    ("09", (), "a held donor is a donor-busy skip with the donor tree unchanged"),
+    ("09", (), "a held donor is not offered, the recipient builds cold, and the released donor publishes its catalog"),
     ("10", (), "a differing RUSTFLAGS producer context is ineligible and builds cold"),
     ("11", (), "a crash after the first clone leaves an untrusted generation the next command evicts"),
     ("12", (), "the units, files and bytes caps and the seed work deadline skip without donor mutation"),
-    ("13", (), "dirty and differently-revisioned git checkouts and a same-name collision are ineligible"),
+    ("13", (), "dirty, differently-revisioned and submodule git checkouts and a same-name registry/Git collision are ineligible"),
     ("14", (), "an unsupported Cargo identity skips seeding while Cargo still runs"),
     ("15", (), "a seed writes nothing to the donor: tree, catalog, ledger, control, rank and use mark"),
     ("16", (), "the removable apfs-volume-v1 path seeds across two slots on one owned image and detaches"),
-    ("17", (), "registry tamper controls never produce a seeded copy"),
+    ("17", (), "wrong, extra, symlinked, altered and missing registry-tree controls never produce a seeded copy"),
     ("18", (), "a seeded recipient never donates a catalog"),
     ("19", (), "the reserve start gate refuses before any child; a mid-seed breach retains and refuses"),
     ("20", (), "a partial-trust recipient is never reused as warm"),
     ("21", (), "a workspace cfg_if-named lib leaves only registry artifacts; seedctl is per-unit"),
-    ("22", (), "a competing custody holder between selection and the pin is a donor-busy skip with no block"),
+    ("22", (), "a real competing managed::lease between selection and the pin is a donor-busy skip with no block"),
     ("23", (), "ambiguous names render candidate-unit counts, and unknown is distinguished from zero"),
     ("24", (), "the post-clone walk publishes only when complete and ownership-clean"),
 ]
@@ -742,13 +742,45 @@ fn main() {
 '''
 
 
+def staged_library(stage_root: str) -> tuple[str, str]:
+    """The staged `liboxide_storage` rlib and the dependency directory that
+    holds it.
+
+    `layout.stage_at` sets `CARGO_BUILD_BUILD_DIR=<stage-root>/build`, so the
+    library's intermediates live under `build/debug/deps`; a plain target
+    directory without a build dir would put them under `target/debug/deps`.
+    Exactly one of those roots may carry the library, and it must carry exactly
+    one rlib: zero or ambiguous matches refuse rather than linking a wrong or
+    partial artifact.
+    """
+    roots = [
+        os.path.join(stage_root, "build", "debug", "deps"),
+        os.path.join(stage_root, "target", "debug", "deps"),
+    ]
+    found = []
+    for deps in roots:
+        if not os.path.isdir(deps):
+            continue
+        rlibs = sorted(glob.glob(os.path.join(deps, "liboxide_storage-*.rlib")))
+        if rlibs:
+            found.append((deps, rlibs))
+    expect(
+        len(found) == 1,
+        f"expected exactly one staged oxide_storage deps root, got {[deps for deps, _ in found]}",
+    )
+    deps, rlibs = found[0]
+    expect(
+        len(rlibs) == 1,
+        f"expected exactly one staged oxide_storage rlib under {deps}, got {rlibs}",
+    )
+    return deps, rlibs[0]
+
+
 def build_lease_helper(proof: Proof) -> str:
     """One tiny helper linked against the staged library: a real
     `managed::lease` competitor, not a forged lock or ledger state."""
-    debug = os.path.dirname(os.path.dirname(proof.binary))
-    deps = os.path.join(debug, "deps")
-    rlibs = sorted(glob.glob(os.path.join(deps, "liboxide_storage-*.rlib")))
-    expect(len(rlibs) == 1, f"expected one staged oxide_storage rlib, got {rlibs}")
+    stage_root = os.path.join(proof.root, "stage-candidate")
+    deps, rlib = staged_library(stage_root)
     root = os.path.join(proof.root, "lease-helper")
     os.makedirs(root)
     source = os.path.join(root, "main.rs")
@@ -770,7 +802,7 @@ def build_lease_helper(proof: Proof) -> str:
             "-L",
             f"dependency={deps}",
             "--extern",
-            f"oxide_storage={rlibs[0]}",
+            f"oxide_storage={rlib}",
             "-o",
             binary,
             source,
@@ -2349,6 +2381,53 @@ def self_test() -> None:
         flags = {"CARGO_ENCODED_RUSTFLAGS": "x"}
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
+
+        # The staged-library locator: both supported layouts, and zero or
+        # ambiguous matches refuse. Synthetic stage roots only.
+        def rlib(deps: str, name: str = "liboxide_storage-abc.rlib") -> None:
+            os.makedirs(deps, exist_ok=True)
+            with open(os.path.join(deps, name), "wb") as handle:
+                handle.write(b"synthetic rlib\n")
+
+        build_layout = os.path.join(base, "stage-build")
+        rlib(os.path.join(build_layout, "build", "debug", "deps"))
+        expect(
+            staged_library(build_layout)[0].endswith(os.path.join("build", "debug", "deps")),
+            "the build-dir layout was not found",
+        )
+        target_layout = os.path.join(base, "stage-target")
+        rlib(os.path.join(target_layout, "target", "debug", "deps"))
+        expect(
+            staged_library(target_layout)[0].endswith(os.path.join("target", "debug", "deps")),
+            "the plain target layout was not found",
+        )
+        empty_layout = os.path.join(base, "stage-empty")
+        os.makedirs(os.path.join(empty_layout, "build", "debug", "deps"))
+        try:
+            staged_library(empty_layout)
+        except RuntimeError:
+            pass
+        else:
+            fail("an empty stage root did not refuse")
+        ambiguous = os.path.join(base, "stage-ambiguous")
+        rlib(os.path.join(ambiguous, "build", "debug", "deps"))
+        rlib(os.path.join(ambiguous, "target", "debug", "deps"))
+        try:
+            staged_library(ambiguous)
+        except RuntimeError:
+            pass
+        else:
+            fail("two staged library roots did not refuse")
+        duplicated = os.path.join(base, "stage-duplicated")
+        deps = os.path.join(duplicated, "build", "debug", "deps")
+        rlib(deps)
+        rlib(deps, "liboxide_storage-def.rlib")
+        try:
+            staged_library(duplicated)
+        except RuntimeError:
+            pass
+        else:
+            fail("two staged rlibs in one root did not refuse")
 
         # The receipt builder, on a fake collection.
         collection = perm.Collection()
