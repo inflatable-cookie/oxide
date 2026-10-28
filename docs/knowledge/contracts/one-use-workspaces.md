@@ -87,6 +87,17 @@ implementation review corrected:
   lock is an error the barrier reports as unknown custody, never as "no lock".
   Both classes of error are wrapped in the bounded guarded text, so no raw
   filesystem error escapes a guarded refusal.
+- **A command that names no member is still inspected.** `oxide exec` without
+  `--output` and an external subcommand declare no profile member, so the
+  guard's inspection set is the two Cargo profile outputs a Cargo-driven tool
+  can write — `debug` and `release` — plus the triple forms of any `--target`
+  the command declares (bounded by the layout's member cap; a pathological
+  `--target` cannot extend it). That is what §4.2 row 2 needs: a link planted
+  at `target/debug` or `target/release` in a one-use workspace with **no**
+  receipt refuses, both at the fast precheck and under the binding mutex. An
+  explicit `--output` still narrows the set to exactly what was declared, and a
+  layout this build cannot model (a JSON target specification) gets the same
+  conservative set instead of an empty one.
 - **The prune-intent check follows the shipped definition.** `unsettled_for`
   answers `Ok(None)` only when there is no registry document at all (a pool
   that never published output authority cannot hold a published intent); every

@@ -5503,7 +5503,14 @@ pub fn guarded_declaration(
     let command = invocation.command.as_str();
     if command == "exec" || crate::cli::derives_from_receipt(command, &invocation.declared_outputs)
     {
-        return crate::layout::declared(&invocation.declared_outputs);
+        let declared = crate::layout::declared(&invocation.declared_outputs)?;
+        if declared.is_empty() {
+            // An opaque tool names no member, but §4.2 row 2 still has to
+            // refuse a link planted at the Cargo profile outputs a tool writes
+            // through, so the guard inspects them.
+            return Ok(opaque_guarded_members(invocation));
+        }
+        return Ok(declared);
     }
     Ok(
         match crate::layout::classify(
@@ -5513,9 +5520,50 @@ pub fn guarded_declaration(
             &invocation.targets,
         ) {
             crate::layout::Layout::Declared(declaration) => declaration,
-            crate::layout::Layout::Unknown(_) => crate::layout::Declaration::empty(),
+            // A layout this build cannot model (a JSON target specification)
+            // names no member either, so it gets the same conservative
+            // inspection set instead of an empty one.
+            crate::layout::Layout::Unknown(_) => opaque_guarded_members(invocation),
         },
     )
+}
+
+/// The inspection set of a guarded command that names no profile member:
+/// `oxide exec` without `--output` and an external subcommand (design §4.2
+/// row 2, §4.3). The two Cargo profile outputs any Cargo-driven tool can write
+/// are always inspected — a planted `target/debug` or `target/release` link must
+/// refuse even when the command itself declared nothing — plus the triple forms
+/// of any `--target` this command declares. Bounded by the layout's member cap;
+/// a pathological `--target` cannot extend it, so the two profile members still
+/// apply.
+fn opaque_guarded_members(invocation: &crate::cli::Invocation) -> crate::layout::Declaration {
+    let mut names: Vec<String> = vec!["debug".to_owned(), "release".to_owned()];
+    for triple in &invocation.targets {
+        for profile in ["debug", "release"] {
+            if names.len() >= crate::layout::MAX_MEMBERS {
+                break;
+            }
+            let name = format!("{triple}/{profile}");
+            if crate::layout::Member::parse(&name).is_ok() {
+                names.push(name);
+            }
+        }
+    }
+    let parsed = names
+        .iter()
+        .filter_map(|name| crate::layout::Member::parse(name).ok());
+    match crate::layout::Declaration::new(parsed) {
+        Ok(declaration) => declaration,
+        // Two plain profile members are always a valid set, so this fallback
+        // cannot lose the profile inspection; only an overlapping `--target`
+        // spelling is dropped.
+        Err(_) => crate::layout::Declaration::new(
+            ["debug", "release"]
+                .iter()
+                .filter_map(|name| crate::layout::Member::parse(name).ok()),
+        )
+        .unwrap_or_else(|_| crate::layout::Declaration::empty()),
+    }
 }
 
 /// The profile member set `oxide exec` derives when the caller declares none
@@ -17267,7 +17315,127 @@ mod tests {
         assert_eq!(durable_digest(&fixture), before);
     }
 
-    /// The guarded prune-intent check follows the **shipped** definition, and
+    /// A guarded command that names no profile member still has the Cargo
+    /// profile outputs inspected (design §4.2 row 2, §4.3): `oxide exec`
+    /// without `--output` and an external subcommand get `debug` and `release`,
+    /// an explicit `--output` narrows the set to exactly what was declared, and
+    /// a declared `--target` adds its triple forms.
+    #[test]
+    fn an_opaque_guarded_command_inspects_the_cargo_profile_members() {
+        let names = |invocation: &crate::cli::Invocation| -> Vec<String> {
+            guarded_declaration(invocation)
+                .unwrap()
+                .members()
+                .iter()
+                .map(|member| member.name().to_owned())
+                .collect()
+        };
+        let arg = |text: &str| std::ffi::OsString::from(text);
+
+        // exec without --output: both Cargo profile outputs.
+        let exec = crate::cli::parse_exec(&[arg("--"), arg("cargo"), arg("nextest")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(names(&exec), vec!["debug", "release"]);
+
+        // An explicit --output is the whole set.
+        let declared = crate::cli::parse_exec(&[
+            arg("--output"),
+            arg("release"),
+            arg("--"),
+            arg("cargo"),
+            arg("nextest"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(names(&declared), vec!["release"]);
+
+        // An external subcommand derives no member, so the same set applies.
+        let external =
+            crate::cli::parse_leased("nextest", &[arg("--target"), arg("aarch64-apple-darwin")])
+                .unwrap();
+        let derived: Vec<String> = names(&external);
+        assert!(
+            derived.contains(&"debug".to_owned()) && derived.contains(&"release".to_owned()),
+            "{derived:?}"
+        );
+        // A declared target adds its triple members beside the plain ones.
+        assert!(
+            derived.contains(&"aarch64-apple-darwin/debug".to_owned())
+                && derived.contains(&"aarch64-apple-darwin/release".to_owned()),
+            "{derived:?}"
+        );
+    }
+
+    /// The §4.2 row-2 regression the review asked for: a one-use workspace with
+    /// **no receipt** and a link planted at `target/debug` or `target/release`
+    /// refuses a guarded `exec` / external subcommand, both at the fast
+    /// precheck and under the binding mutex.
+    #[test]
+    fn an_opaque_guarded_command_refuses_a_planted_profile_link() {
+        let arg = |text: &str| std::ffi::OsString::from(text);
+        let exec = crate::cli::parse_exec(&[arg("--"), arg("cargo"), arg("nextest")])
+            .unwrap()
+            .unwrap();
+        let external = crate::cli::parse_leased("nextest", &[]).unwrap();
+        for (label, invocation) in [("exec", &exec), ("external", &external)] {
+            for member in ["debug", "release"] {
+                let fixture = GuardFixture::new(&format!("opaque-{label}-{member}"));
+                fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+                let elsewhere = fixture.root.join("elsewhere");
+                fs::create_dir_all(&elsewhere).unwrap();
+                let link = fixture.checkout.join("target").join(member);
+                std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+                let declaration = guarded_declaration(invocation).unwrap();
+                let members: Vec<String> = declaration
+                    .members()
+                    .iter()
+                    .map(|member| member.name().to_owned())
+                    .collect();
+                let refused = crate::one_use::with_active(|| {
+                    guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members)
+                        .unwrap_err()
+                });
+                assert!(refused.contains(member), "{label}/{member}: {refused}");
+                assert!(refused.contains("symbolic link"), "{refused}");
+                assert!(refused.contains("nothing was changed"), "{refused}");
+                // The authoritative revalidation refuses it too, under the
+                // checkout binding mutex.
+                let refused = crate::one_use::with_active(|| {
+                    match bind_for_command(
+                        &fixture.store,
+                        &fixture.checkout,
+                        0,
+                        None,
+                        None,
+                        false,
+                        Some(&LocalOutputs {
+                            members: &members,
+                            reason: "one-use",
+                        }),
+                    ) {
+                        Err(reason) => reason,
+                        Ok(_) => panic!("{label}/{member}: the guarded binding refuses"),
+                    }
+                });
+                assert!(refused.contains(member), "{label}/{member}: {refused}");
+                assert!(link.is_symlink(), "the planted link is untouched");
+                // A real (even nonempty) profile directory is local and runs.
+                fs::remove_file(&link).unwrap();
+                fs::create_dir(&link).unwrap();
+                fs::write(link.join("binary"), b"x").unwrap();
+                crate::one_use::with_active(|| {
+                    assert!(
+                        guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members)
+                            .is_ok(),
+                        "{label}/{member}: a real directory stays local"
+                    );
+                });
+            }
+        }
+    }
+
+    /// The guarded prune-intent check follows the **shipped** definition, and    /// The guarded prune-intent check follows the **shipped** definition, and
     /// every failure of the registry read is a refusal:
     ///
     /// - no registry document at all -> clear (a pool that has never published
