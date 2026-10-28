@@ -4975,6 +4975,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
     "mode": "ephemeral",
     "reserve_bytes": 21474836480,
     "available": true,
+    "pending_reconciliation_slots": 0,
     "unavailable_reason": null,
     "payload": "/Volumes/Builds/oxide-pool",
     "suggested_scratch_root": "/Volumes/Builds/scratch"
@@ -4992,8 +4993,9 @@ The stable, read-only interface other tools use to find the registered Builds dr
   - the payload directory exists;
   - the removable pool's config and ledger read cleanly, and the config matches the registration (volume, UUID, payload directory and budget).
 
-  Every `diskutil` or `plutil` call is bounded: 5 s each and a 4 MiB output cap. A timeout, oversize output or parse failure counts as unknown. An `Evicting` record in the ledger makes the drive unavailable, because a build's open would reconcile it; `describe` reconciles nothing and reports it.
-- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as the mount parent, read-only, a role or the boot container), `below_reserve`, `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), `payload_missing`, or `pending_reconciliation`. Consumers branch on `available`, not on reason strings.
+  Every `diskutil` or `plutil` call is bounded: 5 s each and a 4 MiB output cap. A timeout, oversize output or parse failure counts as unknown. An `Evicting` record in the ledger does not make the drive unavailable: a build's open reconciles it and selects the drive anyway, the same as `oxide`'s selection (`Store::open_removable`, which never refuses on it). `describe` reconciles nothing and reports the count in `pending_reconciliation_slots` instead (oxide#174; before that it was `available: false` with reason `pending_reconciliation`, which blocked consumers at the 128-slot ceiling).
+- **`pending_reconciliation_slots`** is the number of ledger records in `Evicting` (deletions a build's open reconciles), added in schema 1 by oxide#174. It is advisory and never changes `available`: `0` when none is pending, and `null` when the config and ledger were not read (an unreadable registration, or an earlier check refused). A drive with pending records and every other check passing reports `available: true` with a count of `n`.
+- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as the mount parent, read-only, a role or the boot container), `below_reserve`, `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), or `payload_missing`. `pending_reconciliation` was a reason value before oxide#174 and is no longer emitted; consumers that handled it still see only the values above. Consumers branch on `available`, not on reason strings.
 - **`unavailable_detail`** is a human-readable explanation, added in schema 1. Its text is not stable.
 - **`reserve_bytes`** is the registered reserve in bytes, added in schema 1, and `null` when the registration cannot be read. `available` is only a snapshot of free space above it. A writer rechecks the mount, the volume UUID and free space against this value at use time.
 - **`selected`** is the passive preference: `"removable"` when `available` is true, otherwise `"internal"`. It is not a promise of the next build's selection, which stays authoritative inside the build and may differ, for example after its own reconciliation.

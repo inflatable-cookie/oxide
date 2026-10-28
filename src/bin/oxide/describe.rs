@@ -54,6 +54,10 @@ struct Removable {
     /// time: `available` is only a snapshot.
     reserve_bytes: Option<u64>,
     available: bool,
+    /// Ledger records in `Evicting`: deletions a build's open reconciles. A
+    /// count, never a refusal, so `available` is unaffected. `null` when the
+    /// config and ledger were not read.
+    pending_reconciliation_slots: Option<usize>,
     unavailable_reason: Option<&'static str>,
     unavailable_detail: Option<String>,
     payload: Option<String>,
@@ -79,9 +83,6 @@ pub enum Reason {
     /// The internal control directory, config or ledger is absent.
     ControlMissing,
     PayloadMissing,
-    /// A ledger record awaits deletion reconciliation at the next open. The
-    /// description does not perform it.
-    PendingReconciliation,
 }
 
 impl Reason {
@@ -94,7 +95,6 @@ impl Reason {
             Self::MetadataUnknown => "metadata_unknown",
             Self::ControlMissing => "control_missing",
             Self::PayloadMissing => "payload_missing",
-            Self::PendingReconciliation => "pending_reconciliation",
         }
     }
 }
@@ -159,6 +159,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 mode: DriveMode::Ephemeral,
                 reserve_bytes: None,
                 available: false,
+                pending_reconciliation_slots: None,
                 unavailable_reason: Some(Reason::MetadataUnknown.tag()),
                 unavailable_detail: Some(detail),
                 payload: None,
@@ -170,9 +171,9 @@ fn describe(configured: &Path) -> Result<Description, String> {
             let control = control.ok_or("the registered control directory is missing")?;
             let outcome = availability(&registration, &control);
             let available = outcome.is_ok();
-            let (reason, detail) = match outcome {
-                Ok(()) => (None, None),
-                Err(Unavailable { reason, detail }) => (Some(reason.tag()), Some(detail)),
+            let (pending, reason, detail) = match outcome {
+                Ok(pending) => (Some(pending), None, None),
+                Err(Unavailable { reason, detail }) => (None, Some(reason.tag()), Some(detail)),
             };
             let removable = Removable {
                 mount_point: Some(lossy(&registration.mount_point)),
@@ -180,6 +181,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 mode: registration.mode,
                 reserve_bytes: Some(registration.reserve_bytes),
                 available,
+                pending_reconciliation_slots: pending,
                 unavailable_reason: reason,
                 unavailable_detail: detail,
                 payload: Some(lossy(
@@ -204,12 +206,14 @@ fn describe(configured: &Path) -> Result<Description, String> {
 
 /// Passive eligibility: every check a build's selection makes, probed
 /// read-only, plus the pool's config and ledger. Opening for a build can
-/// still differ, so this is a snapshot, not a promise.
-fn availability(registration: &Registration, control: &Path) -> Result<(), Unavailable> {
+/// still differ, so this is a snapshot, not a promise. On success it returns
+/// the pending reconciliation count: a build's open reconciles those records
+/// and selects the drive anyway, so they never refuse.
+fn availability(registration: &Registration, control: &Path) -> Result<usize, Unavailable> {
     let binding = probe_volume(registration)?;
     let description = probe_control(control, registration)?;
     probe_payload(&binding)?;
-    pending(&description)
+    Ok(pending(&description))
 }
 
 /// The mount rules, read-only: the registered volume is mounted at its
@@ -323,17 +327,10 @@ fn probe_payload(binding: &Binding) -> Result<(), Unavailable> {
     }
 }
 
-fn pending(description: &VolumeDescription) -> Result<(), Unavailable> {
-    if description.evicting_slots == 0 {
-        return Ok(());
-    }
-    Err(unavailable(
-        Reason::PendingReconciliation,
-        format!(
-            "{} recorded slot deletion(s) await reconciliation at the next build",
-            description.evicting_slots
-        ),
-    ))
+/// Recorded slot deletions awaiting reconciliation at the next build's open.
+/// Reported beside `available`, never a reason to refuse.
+fn pending(description: &VolumeDescription) -> usize {
+    description.evicting_slots
 }
 
 /// `diskutil <args>` as JSON through `plutil`, each process bounded by
@@ -484,6 +481,7 @@ mod tests {
             mode: DriveMode::Ephemeral,
             reserve_bytes: None,
             available: false,
+            pending_reconciliation_slots: None,
             unavailable_reason: Some(Reason::MetadataUnknown.tag()),
             unavailable_detail: Some("bad \"json\"\\\n".to_owned()),
             payload: None,
@@ -627,6 +625,7 @@ mod tests {
             mode: DriveMode::Ephemeral,
             reserve_bytes: Some(20 * 1024 * 1024 * 1024),
             available: false,
+            pending_reconciliation_slots: None,
             unavailable_reason: Some(Reason::Absent.tag()),
             unavailable_detail: None,
             payload: Some("/Volumes/Builds/oxide-pool".to_owned()),
@@ -646,7 +645,6 @@ mod tests {
             Reason::MetadataUnknown,
             Reason::ControlMissing,
             Reason::PayloadMissing,
-            Reason::PendingReconciliation,
         ]
         .into_iter()
         .map(Reason::tag)
@@ -661,13 +659,12 @@ mod tests {
                 "metadata_unknown",
                 "control_missing",
                 "payload_missing",
-                "pending_reconciliation",
             ]
         );
     }
 
     #[test]
-    fn pending_records_make_the_drive_unavailable() {
+    fn pending_records_are_counted_not_refused() {
         let mut description = VolumeDescription {
             store_id: "id".to_owned(),
             cap_bytes: 1,
@@ -676,10 +673,36 @@ mod tests {
             payload_dir: removable::PAYLOAD_DIR.to_owned(),
             evicting_slots: 0,
         };
-        assert!(pending(&description).is_ok());
+        assert_eq!(pending(&description), 0);
         description.evicting_slots = 2;
-        let refused = pending(&description).unwrap_err();
-        assert_eq!(refused.reason, Reason::PendingReconciliation);
+        assert_eq!(pending(&description), 2);
+    }
+
+    /// The JSON reports the count as a number, `0` when no record is pending.
+    #[test]
+    fn pending_count_is_a_number_beside_available() {
+        let removable = Removable {
+            mount_point: Some("/Volumes/Builds".to_owned()),
+            volume_uuid: Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned()),
+            mode: DriveMode::Permanent,
+            reserve_bytes: Some(20 * 1024 * 1024 * 1024),
+            available: true,
+            pending_reconciliation_slots: Some(3),
+            unavailable_reason: None,
+            unavailable_detail: None,
+            payload: Some("/Volumes/Builds/oxide-pool".to_owned()),
+            suggested_scratch_root: Some("/Volumes/Builds/scratch".to_owned()),
+        };
+        let json: serde_json::Value = serde_json::to_value(&removable).unwrap();
+        assert_eq!(json["available"], true);
+        assert_eq!(json["pending_reconciliation_slots"], 3);
+        assert!(json["unavailable_reason"].is_null());
+        let none = Removable {
+            pending_reconciliation_slots: Some(0),
+            ..removable
+        };
+        let json: serde_json::Value = serde_json::to_value(&none).unwrap();
+        assert_eq!(json["pending_reconciliation_slots"], 0);
     }
 
     #[test]
