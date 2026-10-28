@@ -55,8 +55,11 @@ post-crash `FileNotFoundError` was a proof-path error: the helper read
 `pool/oxide-managed/ledger.json`, while the product's `LEDGER_NAME` is
 `pool/ledger.json`; the helper and its synthetic mutation now use the root
 path, and the shared collector records a bounded innermost function/line
-without masking the original exception. No product defect was involved. The
-selector bound is **480 s** for
+without masking the original exception. No product defect was involved.
+A donor path that is absent (evicted or its slot directory vanished) before the
+first recipient write is `DonorPayloadMissing` and skips cold; an existing
+foreign-owned, linked, wrong-type or wrong-device donor path remains an
+`UnsafePath` refusal. The selector bound is **480 s** for
 `rust:cold-slot-seeding` and `:diagnostic` only (decision `e3540b1c`), with
 the 30 s script margin, 512 MiB monitored scratch, heavy admission, host
 reserve, custody and ordinary detach unchanged; any bound above 480 s needs
@@ -2122,8 +2125,10 @@ the selected-volume rule.
     the existing `OXIDE_TEST_*` hooks) crashes after the first clone; the next
     command must evict the untrusted generation, run no Cargo over partial
     state, and build cold;
-12. caps each skip without donor mutation: logical bytes, units, files and the
-    seed's own deadline;
+12. caps each skip without donor mutation: logical bytes, units and files.
+    The work-deadline control is injected after the first clone and must
+    **refuse**, retaining the untrusted recipient and its ledger/attempt
+    evidence, not perform the A2′ incomplete-walk abandon;
 13. git identity negatives: a dirty, submodule or differently-revisioned
     checkout is ineligible; a same-name registry/git collision is ineligible;
 14. unsupported layout: a fake `cargo` that reports an unverified version
@@ -2217,6 +2222,10 @@ the selected-volume rule.
   the latched first fault in a bounded `qualified: false` receipt, continues
   only into dependency-independent cases, aborts on unknown custody, device,
   accounting, deadline or receipt outcomes).
+- The cold script derives its own work clock from the supervisor deadline with
+  the 30 s shutdown margin (the imported finder helper's 300 s constant is
+  overridden only in this selectors' process), so the 480 s bound applies to
+  both the guard and the script.
 - `effigy proof:cold-slot-seeding:test` runs only the script's pure
   `--self-check`/`--self-test` with synthetic seams: no child, pool, image or
   Cargo.

@@ -1806,6 +1806,81 @@ fn a_missing_walk_root_is_an_unreadable_gap() {
 }
 
 #[test]
+fn seed_skips_a_vanished_donor_slot_before_any_recipient_write() {
+    reset_hooks();
+    let rig = Rig::new("donor-vanished");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let donor_slot = donor
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .expect("donor slot dir")
+        .to_path_buf();
+    fs::remove_dir_all(&donor_slot).expect("evict donor slot");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("cold skip");
+    assert!(
+        matches!(
+            outcome,
+            SeedOutcome::Skipped(SeedSkip {
+                reason: SeedSkipReason::DonorPayloadMissing
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+    release_injected(&rig.pool, &grant.lease_id).expect("release recipient");
+}
+
+#[test]
+fn seed_skips_a_missing_donor_slot_folder_before_any_recipient_write() {
+    reset_hooks();
+    let rig = Rig::new("donor-folder-missing");
+    let donor = make_donor_in_folder(&rig, "a", "donor-folder");
+    let (grant, recipient) = lease_recipient_in_folder(&rig, "a", "recipient-folder");
+    let folder = rig.pool.join("payload").join("slots").join("donor-folder");
+    fs::remove_dir_all(&folder).expect("remove donor folder");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("cold skip");
+    assert!(
+        matches!(
+            outcome,
+            SeedOutcome::Skipped(SeedSkip {
+                reason: SeedSkipReason::DonorPayloadMissing
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+    release_injected(&rig.pool, &grant.lease_id).expect("release recipient");
+}
+
+#[test]
+fn seed_refuses_an_existing_foreign_donor_slot_path() {
+    reset_hooks();
+    let rig = Rig::new("donor-existing-foreign");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let donor_slot = donor
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .expect("donor slot dir")
+        .to_path_buf();
+    let outside = rig.fx.dir("outside-donor");
+    fs::remove_dir_all(&donor_slot).expect("remove donor slot");
+    symlink(&outside, &donor_slot).expect("foreign donor link");
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+    release_injected(&rig.pool, &grant.lease_id).expect("release recipient");
+}
+
+#[test]
 fn seed_refuses_a_slot_folder_symlink_on_either_side() {
     reset_hooks();
     let rig = Rig::new("slot-folder-symlink");

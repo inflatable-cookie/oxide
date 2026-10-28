@@ -245,7 +245,7 @@ CC_1079 = "50d30906286121d95be3d479533b458f87493b30a4b5f79a607db8f5d11aa91f"
 CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("01", (), "SQLite/cc/OUT_DIR at real scope: the run unit reruns, libsqlite3-sys recompiles, OUT_DIR and SQLite version are the recipient's"),
     ("02", (), "leaf cfg-if seeds with the literal-name directory and normalized unit; dropping dep-… rebuilds it"),
-    ("03", (), "offered build-script compile unit for git seedctl; no run payload, recipient OUT_DIR; admitting the run payload prints the donor's"),
+    ("03", (), "Git/build-script/OUT_DIR seedctl is a negative control: no catalog, no seed, recipient OUT_DIR"),
     ("04", (), "ambient-reading proc macro has an edge and is ineligible: two cold builds see two values"),
     ("05", (), "proc macros are never offered: Git and non-leaf proc macros build cold with the recipient value"),
     ("06", (), "offered build-script compile unit is inert: the package lib is rebuilt"),
@@ -254,7 +254,7 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("09", (), "a held donor is not offered, the recipient builds cold, and the released donor publishes its catalog"),
     ("10", (), "a differing RUSTFLAGS producer context is ineligible and builds cold"),
     ("11", (), "a crash after the first clone leaves an untrusted generation the next command evicts"),
-    ("12", (), "the units, files and bytes caps and the seed work deadline skip without donor mutation"),
+    ("12", (), "the units/files/bytes caps skip; the post-write work deadline refuses and retains without donor mutation"),
     ("13", (), "dirty, differently-revisioned and submodule git checkouts and a same-name registry/Git collision are ineligible"),
     ("14", (), "an unsupported Cargo identity skips seeding while Cargo still runs"),
     ("15", (), "a seed writes nothing to the donor: tree, catalog, ledger, control, rank and use mark"),
@@ -489,6 +489,13 @@ def skip_line(stderr: str) -> str:
     lines = [line for line in stderr.splitlines() if "seeding skipped:" in line]
     expect(len(lines) >= 1, f"no seeding skip line: {stderr[-2000:]}")
     return lines[-1]
+
+
+def no_seed_skip(stderr: str) -> bool:
+    """The stable v1 no-donor reasons: no eligible donor, or a lock whose only
+    sources are ineligible (Git/proc-macro/build-script/OUT_DIR)."""
+    line = skip_line(stderr)
+    return "no eligible donor" in line or "no eligible locked packages" in line
 
 
 def seeds_dir(pool: str) -> str:
@@ -1371,6 +1378,24 @@ def script_execution(stdout: str, package: str) -> dict | None:
 GIB = 1024 * 1024 * 1024
 
 
+def configure_proof_clock() -> None:
+    """Use the supervisor's 480 s deadline for this selector, leaving the 30 s
+    shutdown margin, instead of the imported finder proof's 300 s constant.
+    The shared helper is untouched for its own selectors; this proof patches
+    only the globals its `Proof` methods read."""
+    if "OXIDE_PROOF_DEADLINE_NS" not in os.environ:
+        return
+    Proof.run.__globals__["PROOF_SECONDS"] = 450.0
+
+    def remaining() -> float:
+        left = supervisor_remaining() - SHUTDOWN_MARGIN_S
+        if left <= 5:
+            fail("proof would exceed 480 s")
+        return left
+
+    Proof.run.__globals__["remaining"] = remaining
+
+
 def supervisor_remaining() -> float:
     """Seconds until the shared supervisor's exported hard deadline. Cleanup
     uses this, never the script's finer WORK deadline, so a late failure can
@@ -2156,11 +2181,7 @@ def case_08(proof: Proof) -> None:
     recipient = case.checkout("changed", files, packages)
     code, stdout, err = case.command(recipient, ["run"], "changed dependency", env=case.env())
     expect(not seeded(err), "a different source was offered")
-    reason = skip_line(err)
-    expect(
-        "no eligible donor" in reason or "no eligible locked packages" in reason,
-        f"unexpected skip: {reason}",
-    )
+    expect(no_seed_skip(err), f"unexpected skip: {skip_line(err)}")
     expect(stdout.strip() == "5", f"the changed dependency printed {stdout.strip()!r}")
     print("case 08: a changed source offered nothing and built correctly", flush=True)
 
@@ -2336,10 +2357,28 @@ def case_12(proof: Proof) -> None:
     donor_slot = slot_of(err)
     before = record_donor_figure(case.pool, donor_slot)
     env = case.env(extra={"OXIDE_TEST_SEED_LIMIT": "deadline"})
-    code, _out, err = case.command(recipient, ["build"], "deadline recipient", env=env)
-    expect(not seeded(err) and "seeding skipped: deadline" in err, f"the work deadline did not skip: {err[-1000:]}")
+    # The work deadline is injected after the first clone. §6.5 makes that a
+    # post-write refusal with the untrusted generation retained, not the A2′
+    # incomplete-walk abandon (which publishes nothing and cold-builds).
+    code, _out, err = case.command(
+        recipient, ["build"], "deadline recipient", env=env, expect_code=1
+    )
+    expect(
+        "cold-seed work deadline expired after the first clone" in err,
+        f"the work deadline was not a post-write refusal: {err[-1200:]}",
+    )
+    expect(not seeded(err), "the deadline recipient seeded")
     expect_no_seed_mutation(case.pool, donor_slot, before)
-    print("case 12: each cap and the work deadline skipped without donor mutation", flush=True)
+    rows = json.loads(ledger_bytes(case.pool).decode())["slots"]
+    retained = [row for row in rows if str(row["id"]) != donor_slot]
+    expect(len(retained) == 1, f"expected one retained recipient slot: {rows}")
+    retained_slot = str(retained[0]["id"])
+    expect(leaf_exists(case.pool, retained_slot), "the deadline refusal did not retain a leaf")
+    expect(
+        attempt_state(case.pool, retained_slot) == "reset",
+        "the deadline refusal did not record reset/retained evidence",
+    )
+    print("case 12: caps skipped; the post-write deadline refused and retained", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2376,7 +2415,7 @@ def case_13(proof: Proof) -> None:
         dirty = case.checkout("dirty", files, packages)
         code, _out, err = case.command(dirty, ["build"], "dirty git checkout", env=case.env())
         expect(not seeded(err), "a dirty checkout was seeded")
-        expect("no eligible donor" in skip_line(err), f"unexpected skip: {skip_line(err)}")
+        expect(no_seed_skip(err), f"unexpected skip: {skip_line(err)}")
     finally:
         os.remove(stray)
     files2 = seedctl_app(repository, rev2)
@@ -2384,7 +2423,7 @@ def case_13(proof: Proof) -> None:
     revision = case.checkout("revision", files2, packages2)
     code, _out, err = case.command(revision, ["build"], "differently-revisioned checkout", env=case.env())
     expect(not seeded(err), "a differently-revisioned checkout was seeded")
-    expect("no eligible donor" in skip_line(err), f"unexpected skip: {skip_line(err)}")
+    expect(no_seed_skip(err), f"unexpected skip: {skip_line(err)}")
     # A submodule (a gitlink in the checkout) is ineligible: the producing
     # epoch records no package, so no catalog exists to donate and the
     # recipient builds cold.
@@ -2448,7 +2487,7 @@ def case_14(proof: Proof) -> None:
     with open(script, "w", encoding="utf-8") as handle:
         handle.write(
             "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
+            'if [ "$1" = "--version" ] || [ "$1" = "-V" ]; then\n'
             '  echo "cargo 1.90.0 (000000000 2020-01-01)"\n'
             "  exit 0\n"
             "fi\n"
@@ -4061,6 +4100,7 @@ def main(argv: list[str]) -> int:
         os.path.isdir(os.environ.get("OXIDE_PROOF_EVIDENCE", "")) and "OXIDE_PROOF_DEADLINE_NS" in os.environ,
         "not under the qualified shared supervisor",
     )
+    configure_proof_clock()
     repo = os.path.dirname(HERE)
     assert_no_owned_image()
     root = fixture_dir(scratch, "cold-seed.")

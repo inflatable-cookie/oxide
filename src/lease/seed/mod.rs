@@ -885,7 +885,16 @@ pub fn seed_monitored(
     // verified payload root, so a project folder (or the slots root) replaced
     // by a symlink is refused rather than followed to another directory.
     // The returned path is for messages; the descriptor is the custody.
-    let (donor_fd, donor_slot_path) = open_slot_dirs(payload_root, payload_device, donor)?;
+    let Some((donor_fd, donor_slot_path)) =
+        open_donor_slot_dirs(payload_root, payload_device, donor)?
+    else {
+        // A donor that was evicted or whose leaf vanished before this call is
+        // simply unavailable. No recipient write has happened yet, so this is
+        // a cold skip, never an unsafe-path refusal for a path that no longer
+        // exists. An existing foreign, linked or wrong-device entry still
+        // refuses in the helper below.
+        return Ok(skip(SeedSkipReason::DonorPayloadMissing));
+    };
     let (recipient_fd, recipient_slot) = open_slot_dirs(payload_root, payload_device, recipient)?;
     // The recipient is this command's fresh slot: its `build/` is absent or
     // an empty owned directory. Anything else is refused, never cleaned.
@@ -2009,6 +2018,63 @@ fn slot_custody_error() -> LeaseError {
 
 fn missing_directory() -> LeaseError {
     LeaseError::Io("a created seed directory is missing".to_owned())
+}
+
+/// Open the donor's slot path, distinguishing a vanished path from an unsafe
+/// one. A missing payload root, `slots`, project folder or leaf means the donor
+/// is unavailable before any recipient write, so the caller skips cold. An
+/// existing path that is foreign-owned, linked, the wrong type or on another
+/// device still refuses through the same custody checks as the recipient.
+fn open_donor_slot_dirs(
+    payload_root: &Path,
+    device: u64,
+    slot: &SeedSlotView,
+) -> Result<Option<(OwnedFd, PathBuf)>, LeaseError> {
+    let payload = match open_path_directory(payload_root) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(slot_custody_error()),
+    };
+    let payload = require_owned_directory(payload, device)?;
+    let Some(slots) = open_slot_component_optional(payload.as_fd(), c"slots", device)? else {
+        return Ok(None);
+    };
+    let root = payload_root.join("slots");
+    match slot.dir.as_deref() {
+        None => {
+            let name = cstring(&slot.id.to_string())?;
+            let Some(fd) = open_slot_component_optional(slots.as_fd(), &name, device)? else {
+                return Ok(None);
+            };
+            Ok(Some((fd, root.join(slot.id.to_string()))))
+        }
+        Some(dir) => {
+            let (folder, leaf) = dir.split_once('/').ok_or_else(slot_custody_error)?;
+            let Some(folder_fd) =
+                open_slot_component_optional(slots.as_fd(), &cstring(folder)?, device)?
+            else {
+                return Ok(None);
+            };
+            let Some(leaf_fd) =
+                open_slot_component_optional(folder_fd.as_fd(), &cstring(leaf)?, device)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((leaf_fd, root.join(dir))))
+        }
+    }
+}
+
+fn open_slot_component_optional(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    device: u64,
+) -> Result<Option<OwnedFd>, LeaseError> {
+    match open_directory_at(parent, name) {
+        Ok(fd) => Ok(Some(require_owned_directory(fd, device)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(slot_custody_error()),
+    }
 }
 
 /// Open one recorded slot beneath the payload's own descriptors, one
