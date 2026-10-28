@@ -300,7 +300,7 @@ struct SlotRecord {
     rank: u64,
     /// The closed size observation of the generation that last went idle
     /// (oxide#146). Written only by the atomic `Held -> Idle` replacement and
-    /// cleared by every transition out of `Idle`.
+    /// cleared when held again, and retained while eviction is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recorded: Option<RecordedSize>,
     /// The journaled captures of this recorded deletion (oxide#155): the root
@@ -1019,8 +1019,6 @@ pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), Le
         return Err(LeaseError::UnknownAccounting);
     }
     slot.state = SlotPersistState::Evicting;
-    // The product clears a record in the same write that records `Evicting`.
-    slot.recorded = None;
     slot.capture = None;
     opened.persist()
 }
@@ -1229,9 +1227,6 @@ impl Pool {
     }
 
     fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
-        if self.reconciliation_blocked {
-            return Err(LeaseError::UnknownAccounting);
-        }
         if let Some(budget) = request.budget_bytes {
             if budget == 0 {
                 return Err(LeaseError::InvalidInput("budget must be positive"));
@@ -2265,22 +2260,11 @@ impl Pool {
     /// stays unmeasured keeps today's refusal: its figure is never zero and
     /// never free space.
     fn recorded_total(&mut self) -> Result<u64, LeaseError> {
-        if self.reconciliation_blocked
-            || self
-                .ledger
-                .slots
-                .iter()
-                .any(|slot| slot.state == SlotPersistState::Evicting)
-        {
-            return Err(LeaseError::UnknownAccounting);
-        }
         let mut total = self.pool_scope().require_complete()?;
         let mut pending: Vec<(u64, RecordedSize)> = Vec::new();
         for index in 0..self.ledger.slots.len() {
             let figure = self.slot_figure(index, &mut pending)?;
-            total = total
-                .checked_add(figure)
-                .ok_or(LeaseError::UnknownAccounting)?;
+            total = total.saturating_add(figure);
         }
         if !pending.is_empty() {
             for (id, record) in pending {
@@ -2307,7 +2291,11 @@ impl Pool {
             return Err(LeaseError::UnknownAccounting);
         };
         if slot.state == SlotPersistState::Evicting {
-            return Err(LeaseError::UnknownAccounting);
+            // An unknown historical size consumes the entire admission budget:
+            // this is a decision bound, not a claim about its actual bytes.
+            return Ok(slot.recorded.as_ref()
+                .filter(|record| record.for_lease == slot.last_lease_id)
+                .map_or(self.budget, |record| record.unique_bytes));
         }
         let id = slot.id;
         let last_lease_id = slot.last_lease_id.clone();
@@ -2387,8 +2375,27 @@ impl Pool {
     fn scope_stops(&self) -> Result<Vec<PathBuf>, LeaseError> {
         let mut stops = Vec::with_capacity(self.ledger.slots.len());
         for slot in &self.ledger.slots {
+            let relative = self.slot_relative(slot)?;
             if self.recorded_slot_root(slot.id)?.is_some() {
-                stops.push(self.slot_relative(slot)?);
+                stops.push(relative.clone());
+            }
+            // Only stop at a private root whose journaled identity still
+            // matches. Other names remain in the scope walk.
+            if slot.state == SlotPersistState::Evicting {
+                if let Some(journal) = &slot.capture {
+                    let mut private = relative;
+                    private.set_file_name(&journal.root.private);
+                    let absolute = self.backing.payload_root().join(&private);
+                    if let Ok(meta) = fs::symlink_metadata(absolute) {
+                        if meta.is_dir() && !meta.file_type().is_symlink()
+                            && meta.dev() == journal.root.device
+                            && meta.ino() == journal.root.inode
+                            && meta.uid() == current_uid()
+                        {
+                            stops.push(private);
+                        }
+                    }
+                }
             }
         }
         Ok(stops)
@@ -2558,10 +2565,8 @@ impl Pool {
         {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
             slot.state = SlotPersistState::Evicting;
-            // A pending deletion holds no size observation: the record is
-            // cleared in the same atomic write that records `Evicting`, so no
-            // reader can pair a figure with a slot being deleted.
-            slot.recorded = None;
+            // Keep the last closed observation to charge a blocked eviction.
+
         }
         self.persist_revised()?;
         self.remove_owned_slot(id, &path)?;
@@ -4120,7 +4125,7 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         if let Some(dir) = &slot.dir {
             split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
         }
-        if slot.recorded.is_some() && slot.state != SlotPersistState::Idle {
+        if slot.recorded.is_some() && slot.state == SlotPersistState::Held {
             return Err(LeaseError::UnknownAccounting);
         }
         // A capture record belongs to a recorded deletion and nowhere else,

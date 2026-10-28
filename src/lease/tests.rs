@@ -4269,6 +4269,26 @@ fn a_nested_put_back_collision_keeps_both_names_and_the_record() {
     fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
 }
 
+/// A blocked deletion keeps its own slot and its closed size, while a
+/// different project can obtain a fresh slot under the remaining budget.
+#[test]
+fn blocked_eviction_is_charged_but_does_not_block_other_admissions() {
+    let fixture = Fixture::new("blocked-isolation");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-isolation");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(&slot_path).expect("collision");
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "other"))
+        .expect("unrelated admission");
+    assert_ne!(granted.slot_id, slot_id.to_string());
+    assert!(captured.is_dir());
+    assert!(slot_path.is_dir());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
 /// A panic after the product widened the captured root's mode restores the
 /// owner's exact mode through the scope guard, and the recorded recovery then
 /// puts the root back.
