@@ -129,17 +129,26 @@ records for the scratch subtree. No behaviour is built on ownership enforcement.
 ## Volume identity binding
 
 A scratch pool is bound at creation and re-verified on every open through **two**
-records, because one of them must remain readable when the volume is gone:
+records, because one of them must remain readable when the volume is gone.
+
+**Identity is the volume UUID; mount facts are not.** The recorded equality set
+is `volume_uuid`, `mount_point`, `scratch_root` and `pool`. `st_dev` is a
+per-mount number that changes when the same volume remounts, so it is never
+stored as identity and never compared: the same UUID remounted at the same mount
+point is warm reuse. (The parent-device inequality inside `Binding::open` is a
+contemporaneous mount-root test — the mount root's device differs from its
+parent's at that moment — not a stored value.) Owner is checked as "the record
+file belongs to this user", not as a stored field, and `created_ms` is
+provenance.
 
 - **On-volume binding.** On first use the creating command makes the pool leaf
   exclusively (0700), then writes `<pool>/oxide-managed/scratch.json` atomically
   (0600, private temp plus one replace) **before** the library initialises the
   pool payload. Schema `oxide.scratch-pool/1`, strict (`deny_unknown_fields`),
   16 KiB bound, containing exactly: `schema`, `volume_uuid`, `mount_point`
-  (canonical), `scratch_root` (canonical), `pool` (canonical), `device`
-  (`st_dev`), `owner` (uid) and `created_ms`. It proves the volume's own bytes
-  agree with the placement; the frozen pool `config.json`, ledger and control
-  files are untouched.
+  (canonical), `scratch_root` (canonical), `pool` (canonical) and `created_ms`.
+  It proves the volume's own bytes agree with the placement; the frozen pool
+  `config.json`, ledger and control files are untouched.
 - **Host identity record.** The same command then writes
   `<account state root>/scratch-pools/<sha256 of the normalised pool path>.json`
   (state directory 0700, file 0600, atomic replace, 4 KiB bound, strict schema
@@ -225,7 +234,7 @@ a class.
 | 12 | Mount name not one component under `/Volumes`, or `/Volumes` unsafe | `scratch-volume-unverified` |
 | 13 | Existing pool at a scratch path without `scratch.json` | `scratch-binding-missing` |
 | 14 | Binding unreadable, symlinked, foreign-owned, oversized, malformed, unknown schema, wrong key | `scratch-binding-invalid` |
-| 15 | Binding UUID, mount point, root, device or owner differs from the observed facts | `scratch-binding-mismatch` |
+| 15 | Binding UUID, mount point, root or pool differs from the observed facts (never `st_dev`) | `scratch-binding-mismatch` |
 | 16 | Host record unreadable, symlinked, foreign-owned, oversized, malformed, unknown schema, wrong pool key | `scratch-record-invalid` |
 | 17 | Host record disagrees with the on-volume binding or the observed facts | `scratch-record-mismatch` |
 | 18 | Host record cannot be written at creation | `scratch-record-unwritable` (removes only the leaf this invocation just created) |
@@ -234,7 +243,7 @@ a class.
 | 21 | Scratch path with the built-in budget default | `scratch-budget-required` |
 | 22 | `OXIDE_SCRATCH_ROOT` empty, relative, with `..`, or unreadable | `scratch-root-unsafe` |
 | 23 | Leased command on an existing scratch pool without the declaration | unchanged `external-volume` refusal (#3); the mode never persists; read-only `status`/`--measure` identifies it from the host record instead |
-| 24 | `status` of a recorded scratch pool whose volume is absent | `unavailable (scratch volume <uuid> absent)` from the host record, no walk, no write, exit unchanged |
+| 24 | `status` of a recorded scratch pool whose volume is absent, or whose binding does not verify | `unavailable (<class>)` from the host record, no walk, no write, exit unchanged (see "Read-only status") |
 
 Rows 1–3 and 23 keep today's exact messages; row 5 refuses the declaration
 rather than the path. Row 24 is a report, not a new status failure: `status`
@@ -269,19 +278,28 @@ already reads known pools and registrations read-only.
    per-invocation, cannot be inherited from a config file, is announced on
    creation and in `status`, and cannot touch the default pool.
 
-## Status, selection and diagnostics
+## Read-only status
 
-`oxide status` gains one bounded text label and no new walk, derived from the
-host identity record only, so it works with the volume absent and never writes:
-a scratch pool prints `pool: <path> (scratch pool, volume <uuid>)`; a recorded
-scratch pool whose volume is absent prints `pool: <path> unavailable
-(scratch volume <uuid> absent)` and still walks nothing; `status --measure`
-keeps its existing walk rules and still writes nothing. With **no** host record
-`status` has no scratch fact and reports exactly as today (the ordinary
-external refusal for a known pool), and it never invents one: a leased open
-repairs a missing record. No JSON schema changes: `--json` and
-`pool describe --json` keep their current keys and add no scratch object.
-`remember_pool` and the known-pools list keep their current rule (an
+`status` gains no walk and never writes. It consults the host identity record
+first, keyed by the normalised pool path, and **only an existing record makes a
+pool a scratch fact**; there is no other source, so `status` never guesses from
+the on-volume binding it has not opened.
+
+| Record | Volume and binding | Status line |
+| --- | --- | --- |
+| none | any | no scratch fact: the path takes the ordinary path rules exactly as today |
+| present | present, binding verifies | `pool: <path> (scratch pool, volume <uuid>)` |
+| present | present, binding missing, invalid or mismatched | `pool: <path> unavailable (<class>)`, no walk |
+| present | absent | `pool: <path> unavailable (scratch volume <uuid> absent)`, no walk |
+
+A status line that comes from the record needs no `OXIDE_SCRATCH_ROOT`, leases
+nothing and creates nothing, and the two middle rows read only documents and
+metadata; `--measure` keeps its existing walk rules and still writes nothing. A
+missing record is repaired only by the next **leased** open (row 23), never by
+`status`, so until that open the pool has no scratch line at all — the honest
+degradation also recorded in "Limits of this design". No JSON schema changes:
+`--json` and `pool describe --json` keep their current keys and add no scratch
+object. `remember_pool` and the known-pools list keep their current rule (an
 `OXIDE_POOL` pool is still not listed); the scratch host record above is a
 separate identity document, not that list. Refusals print the class in words,
 never a raw path dump, bounded and escaped as today.
@@ -347,9 +365,11 @@ root in `<mount>/scratch/oxide` of the selected volume, and falls back to
 4. Each migrated proof states in its own text that a fallback run to
    `/private/tmp` exercises the internal path where the declaration is inert;
    that is not scratch-pool coverage and is reported as such.
-5. Already-passed evidence stays bound to its activated recipe. A migrated
-   selector needs a short independent recipe review, not a re-run of a previously
-   passed native; every HELD proof keeps its own separate owner activation.
+5. A migrated script's source changes, and the knowledge exception that keeps
+   previously-passed evidence for a selector-only migration is explicitly
+   limited to migrations whose source does not change. So a migrated proof's
+   evidence is re-established at the new head (S4), never carried over, and
+   every HELD proof keeps its own separate owner activation.
 6. `AGENTS.md` and [workflow](workflow.md#temporary-scratch-placement) are
    amended in the same slice: the exception paragraph is scoped to the keep
    list, and the mirrored selector text loses its exception note as each proof
@@ -438,10 +458,32 @@ nothing. Each case reports its own oracle; the diagnostic records
 reached/completed/failed/skipped and the latched first fault in a bounded
 `qualified: false` receipt.
 
-**S4 — recipe migration. STANDARD.** The ten drops and three keeps above, the
-per-script `OXIDE_SCRATCH_ROOT` wiring, the pure self-check pins, and the
-`AGENTS.md` / `workflow.md` amendments. Each selector keeps **its own** wall
-clock and scratch budget; there is no uniform figure:
+**S4 — recipe migration, one brief per proof. HIGH (proof authoring).** This is
+**not** a recipe-only edit. Every migrated script must name
+`OXIDE_SCRATCH_ROOT` (no script names it today, and no supervisor default can
+supply it: the supervisor's bytes are qualification-bound, so adding one would
+force its own full re-qualification), and the knowledge rule that lets a
+selector migration keep previously-passed evidence applies only when the source
+does not change. So each migration is a proof-authoring change:
+
+- `[premise checklist](workflow.md#proof-authoring-premise-checklist)` recorded
+  for the changed fixture environment (private `HOME`/`CARGO_HOME`, the
+  `OXIDE_`/`XDG_`/`CARGO_*`/`GIT_` scrub, the declaration and cap, `mktemp`-only
+  fixture roots, the image custody where one exists);
+- the required **uncounted keep-going diagnostic** (`:diagnostic` twin, all ten
+  have one) before any counted native, as an uncounted collection that never
+  becomes a PASS;
+- the **counted author native at the migrated head**, then one distinct
+  **independent reviewer native at that exact head**, because every migrated
+  child now writes a pool on removable media (the ELEVATED trigger), in
+  addition to the reviewer's exact-head source review;
+- its own owner activation, its own wall clock and its own scratch budget.
+  Nothing in S4 grants an activation or carries an old native receipt forward;
+  the new head's receipts are the evidence.
+
+The ten sub-slices and the three keeps are listed in "Migration list". Each
+selector keeps **its own** wall clock and scratch budget; there is no uniform
+figure:
 
 | Selector | Limit / scratch | Pure check available |
 | --- | --- | --- |
@@ -456,15 +498,20 @@ clock and scratch budget; there is no uniform figure:
 | `rust:finder-metadata-race` (+ diag) | 420 s / 512 MiB | `rust:finder-metadata-race:test` |
 | `rust:command-budgets` (+ diag) | 300 s / 512 MiB | `proof:command-budgets:test` |
 
-Where a pure check exists, the slice runs it and pins the new environment
-contract there. Where none exists (`installed-handoff`, `profile-outputs`,
-`auto-adopt-ineligible`) the slice does **not** invent one and does **not**
-re-run a native: it relies on that proof's effect-free `--plan` (or the dogfood
-selector test, for `installed-handoff`, which is updated in the same commit),
-plus the short independent recipe review. Selectors: `effigy docs:check`, the
-pure checks in the table, `effigy dogfood:scripts:test`, and the recipe review.
-No new activation, and no re-run of a previously passed native. 300 s, no
-scratch (pure and plan checks only).
+Each sub-slice's effect-free checks are `effigy docs:check`, that proof's pure
+check from the table (which pins the new environment contract), and
+`effigy dogfood:scripts:test` (its `HandoffSelectorTests` pins
+`rust:installed-handoff`'s root, limits and body, so it changes in the same
+commit). Where no pure check exists (`installed-handoff`, `profile-outputs`,
+`auto-adopt-ineligible`) the sub-slice adds no new selector and does not invent
+one: that proof's effect-free `--plan` is the only pre-native check, and the
+diagnostic plus the two natives are unchanged in requirement.
+
+Cost, stated rather than hidden: ten diagnostics and twenty natives (author and
+reviewer), each at its own budget, sequenced by the owner; the migration is not
+a mechanical selector edit and no previously-passed native is recounted as if it
+were. A proof whose counted native has never passed simply takes its first run
+under the new recipe with the same requirements.
 
 **S5 — record the retirement (optional, docs-only). STANDARD.** Amend the
 `bd357a4c` paragraph to the keep list and, if the owner retires the exception
@@ -483,6 +530,9 @@ itself, add the `retired.toml` entry in the same change. `effigy docs:check`.
   is macOS-only, so the scratch branch refuses there instead of admitting
   anything. That is a unit-tested refusal, not a portability claim, and the
   internal-root recipes stay the only Linux story.
+- The migration cost is ten re-established proofs (diagnostic, author native and
+  independent reviewer native each), not ten selector edits; the design sets no
+  schedule and grants no activation.
 - The host identity record belongs to the invoking account state root. A
   different state root (a private-`HOME` fixture, a moved state directory) sees
   no record: a present volume is still admitted from the on-volume binding and
@@ -502,6 +552,6 @@ itself, add the `retired.toml` entry in the same change. `effigy docs:check`.
 - `migration_list_and_internal_premise_cases` — "Migration list" and
   "Recipe changes".
 - `finite_slices_and_validation_plan` — "Implementation slices" (per-slice
-  tiers, selectors, wall and scratch budgets, the S4 per-selector table, and
-  S3's covering product checks plus the independent elevated reviewer native)
-  and "Limits of this design".
+  tiers including S4's HIGH proof-authoring requirement, selectors, wall and
+  scratch budgets, the S4 per-selector table, and the independent elevated
+  reviewer native for both S3 and S4) and "Limits of this design".
