@@ -47,12 +47,14 @@ outside-root input are **not offered**; each skip is named and the command
 continues as an ordinary cold build. The case 05 proc-macro reuse defect is
 fixed by never classifying or selecting a proc-macro unit, with product
 regressions on both the catalog producer and plan selection. Cases 01
-(non-leaf SQLite package), 03 and 06 (Git/build-script/`OUT_DIR` seedctl) and
-05 (proc macro) are negative controls that assert the package is unoffered,
-no catalog is published and the ordinary build is correct; positives use
-plain registry libraries. Case 11's post-crash `FileNotFoundError` is
-root-caused from its new location evidence and corrected at its source, not
-caught or masked. The selector bound is **480 s** for
+(non-leaf SQLite package; its registry leaf libraries may seed), 03 and 06
+(Git/build-script/`OUT_DIR` seedctl; no catalog), and 05 (proc macro) are
+negative controls that assert the target package is unoffered and the
+ordinary build is correct; positives use plain registry libraries. Case 11's
+post-crash `FileNotFoundError` now records its innermost function and line in
+the diagnostic receipt; the author round stops for Supervisor disposition
+because no native may locate it and no catch/mask was added. The selector
+bound is **480 s** for
 `rust:cold-slot-seeding` and `:diagnostic` only (decision `e3540b1c`), with
 the 30 s script margin, 512 MiB monitored scratch, heavy admission, host
 reserve, custody and ordinary detach unchanged; any bound above 480 s needs
