@@ -120,7 +120,8 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
    every child gets it with `RUSTUP_TOOLCHAIN=1.97.1` and
    `RUSTUP_AUTO_INSTALL=0`. Fixture locks are written before any `--locked`
    call (`lock_text`), and the registry input is seeded by the shared bounded
-   seeder (`scripts/offline_seed.py`) from one union lock.
+   seeder (`scripts/offline_seed.py`) into two private homes, each with one
+   unique-registry-name lock (fixture and helper).
 2. Account-home control: `perm.proof_env` sets `OXIDE_TEST_HOME_FROM_ENV=1`.
 3. Environment isolation: `perm.proof_env` scrubs `OXIDE_*`, `XDG_*`,
    `CARGO_BUILD_*`, `CARGO_TARGET_*`, `GIT_*`; `case_env` re-adds only the
@@ -182,6 +183,7 @@ import tempfile
 import textwrap
 import time
 import types
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location(
@@ -221,7 +223,7 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("05", (), "leaf proc-macro over git seeds and expands; non-leaf proc macro is ineligible; core.fsmonitor never run"),
     ("06", (), "offered build-script compile unit is inert: the package lib is rebuilt"),
     ("07", (), "a deleted donor leaves the recipient compiling and running (independent inodes)"),
-    ("08", (), "a changed dependency version offers nothing and builds correctly"),
+    ("08", (), "a changed dependency source/version offers nothing and builds correctly"),
     ("09", (), "a held donor is not offered, the recipient builds cold, and the released donor publishes its catalog"),
     ("10", (), "a differing RUSTFLAGS producer context is ineligible and builds cold"),
     ("11", (), "a crash after the first clone leaves an untrusted generation the next command evicts"),
@@ -580,6 +582,26 @@ SQLITE_APP_MAIN = '''fn main() {
     println!("SQLITE={}", libsqlite3_sys::SQLITE_VERSION_NUMBER);
 }
 '''
+def submodule_url(path: str) -> str:
+    """A valid `file://` URL for an owned local repository.
+
+    Git records whatever argument `git submodule add` receives in
+    `.gitmodules`. A bare absolute path is not a URL, and Cargo's Git source
+    refuses it (`invalid url`), so every owned submodule is recorded with the
+    `file://` scheme. Relative inputs and control characters refuse: this
+    fixture never lets an accident point at a host path. The product's own
+    verification is unchanged; it still refuses a declared submodule.
+    """
+    if path.startswith("file://"):
+        return path
+    expect(os.path.isabs(path), f"a submodule must be an absolute owned path, got {path!r}")
+    expect(
+        "\n" not in path and "\0" not in path and "://" not in path,
+        f"a submodule path carries an unusable shape: {path!r}",
+    )
+    return "file://" + path
+
+
 def git_fixture(
     root: str,
     name: str,
@@ -619,7 +641,15 @@ def git_fixture(
     git("init", "-q", "-b", "main")
     if submodule is not None:
         added = subprocess.run(
-            ["git", "-c", "protocol.file.allow=always", "submodule", "add", submodule, "inner"],
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule_url(submodule),
+                "inner",
+            ],
             cwd=repo,
             env=env,
             capture_output=True,
@@ -2541,6 +2571,29 @@ def self_test() -> None:
         flags = {"CARGO_ENCODED_RUSTFLAGS": "x"}
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
+
+        # The owned-submodule URL: Cargo accepts only a URL shape, so an
+        # absolute owned path becomes file:///, an existing file URL is kept,
+        # and a relative or control-character path refuses.
+        owned = os.path.join(base, "owned-inner")
+        expect(submodule_url(owned) == "file://" + owned, "an absolute path did not become a file URL")
+        parsed = urllib.parse.urlsplit(submodule_url(owned))
+        expect(
+            parsed.scheme == "file" and parsed.path == owned and parsed.netloc == "",
+            f"the owned submodule URL is not a canonical file URL: {submodule_url(owned)}",
+        )
+        expect(submodule_url("file://" + owned) == "file://" + owned, "an existing file URL was rewritten")
+        for label, bad in (
+            ("relative", "owned-inner"),
+            ("newline", owned + "\n"),
+            ("scheme inside path", owned + "://x"),
+        ):
+            try:
+                submodule_url(bad)
+            except RuntimeError:
+                pass
+            else:
+                fail(f"a {label} submodule path did not refuse")
 
         # Per-home seed locks: unique registry names are a hard precondition
         # (the seeder copies one index file per crate name).
