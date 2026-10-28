@@ -998,8 +998,11 @@ The one-way switch needs ordering the ledger alone cannot provide, because the
 front door's hand-off trigger reads control `state.json` /
 `removable.json`, not the library ledger (oxide#122). Hand-off requires a
 peeked numeric version **greater than the running binary's**, so the value is
-this tree's `STATE_VERSION`, **5** (`store.rs:74`; 4 is the oxide#133
-owned-outputs fence an installed binary already writes). The 3 an earlier
+the version this gate writes, **5** (`RECORDED_ACCOUNTING_STATE_VERSION`,
+`store.rs:74`; 4 is the oxide#133 owned-outputs fence an installed binary
+already writes). The [one-use workspaces](one-use-workspaces.md) fence moved
+`STATE_VERSION` to **6**, written only when that feature first writes a
+class-bearing record, so a recorded-accounting-only pool stays at 5. The 3 an earlier
 revision of this section proposed was a *downgrade* from that shipped 4 and
 would leave an installed version-4 binary exposed to `deny_unknown_fields` on
 `recorded`. The fence is installed by the front door's mutating-command
@@ -1039,7 +1042,7 @@ reply as a size.
 | Front-door release order | `store.rs` `release` (`:1622`), `unshare` (`:1640`), `discard_scratch` (`:1674`), `flush_before_idle` (`:1689`) |
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
-| Control state fence | `store.rs` `STATE_VERSION` (`:74`, 5 writes the recorded-accounting fence; an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4), `RECORDED_ACCOUNTING_FENCE`, hand-off trigger in `handoff.rs` |
+| Control state fence | `store.rs` `STATE_VERSION` (`:74`, 6 is the [one-use workspaces](one-use-workspaces.md) fence); the recorded-accounting gate writes `RECORDED_ACCOUNTING_STATE_VERSION` 5, and an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, hand-off trigger in `handoff.rs`) |
 | Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
