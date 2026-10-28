@@ -2735,7 +2735,8 @@ impl Pool {
     }
 
     /// An uncertain or partially inventoried pending root is isolated before
-    /// reconciliation can change a mode, create a journal or delete anything.
+    /// a new capture or deletion. Existing journaled modes may be restored
+    /// through the verified descriptors used for the preflight.
     fn pending_root_ready(&self, id: u64, path: &Path) -> Option<OwnedFd> {
         let slot = self.slot(id)?;
         if self.checked_slot_scope(path).is_err() {
@@ -2743,13 +2744,17 @@ impl Pool {
         }
         let parent = super::open_verified_directory(path.parent()?).ok()?;
         let original = std::ffi::CString::new(path.file_name()?.as_bytes()).ok()?;
-        let mut candidates = vec![original];
-        if let Some(journal) = &slot.capture {
-            let Ok(private) = std::ffi::CString::new(journal.root.private.as_bytes()) else {
-                return None;
-            };
-            candidates.push(private);
-        }
+        let candidates = if let Some(journal) = &slot.capture {
+            match reconcile_root_capture(parent.as_fd(), &original, &journal.root) {
+                RootCaptureState::Original => vec![original],
+                RootCaptureState::Private => {
+                    vec![std::ffi::CString::new(journal.root.private.as_bytes()).ok()?]
+                }
+                _ => return None,
+            }
+        } else {
+            vec![original]
+        };
         candidates.into_iter().find_map(|candidate| {
             let facts = crate::owned_delete::observe_entry(parent.as_fd(), &candidate).ok()?;
             if !facts.is_directory() || facts.uid != current_uid() || facts.mode_bits() & 0o077 != 0
@@ -2761,7 +2766,19 @@ impl Pool {
                     return None;
                 }
             }
-            let root = open_directory_at(parent.as_fd(), &candidate).ok()?;
+            let (root, mut mode_guard) = if let Some(journal) = &slot.capture {
+                let (root, guard) = crate::owned_delete::open_verified_step(
+                    parent.as_fd(),
+                    &candidate,
+                    journal.root.device,
+                    journal.root.inode,
+                    journal.root.mode,
+                )
+                .ok()?;
+                (root, Some(guard))
+            } else {
+                (open_directory_at(parent.as_fd(), &candidate).ok()?, None)
+            };
             if descriptor_identity(root.as_fd()).ok() != Some((facts.device, facts.inode)) {
                 return None;
             }
@@ -2775,8 +2792,13 @@ impl Pool {
                 limits.max_depth,
                 &mut remaining,
                 deadline,
+                slot.capture.as_ref(),
+                &[],
             ) {
                 return None;
+            }
+            if let Some(guard) = mode_guard.as_mut() {
+                guard.restore().ok()?;
             }
             crate::owned_delete::observe_entry(parent.as_fd(), &candidate)
                 .ok()
@@ -3758,8 +3780,9 @@ fn folder_occupied(folder: &Path) -> Result<bool, LeaseError> {
     Ok(false)
 }
 
-/// Read-only, descriptor-relative completeness preflight. A failed or capped
-/// listing never supplies a partial list to reconciliation.
+/// Descriptor-relative completeness preflight. Existing journaled directory
+/// modes are restored through verified guards; no partial list is acted on.
+#[allow(clippy::too_many_arguments)]
 fn pending_tree_complete(
     dir: BorrowedFd<'_>,
     device: u64,
@@ -3767,6 +3790,8 @@ fn pending_tree_complete(
     max_depth: usize,
     remaining: &mut u64,
     deadline: Instant,
+    journal: Option<&DeletionJournal>,
+    chain: &[String],
 ) -> bool {
     if Instant::now() >= deadline || depth > max_depth {
         return false;
@@ -3790,8 +3815,35 @@ fn pending_tree_complete(
             return false;
         }
         if facts.is_directory() {
-            let Ok(child) = open_directory_at(dir, &name) else {
-                return false;
+            let record = journal.and_then(|journal| {
+                journal.captures.iter().find(|record| {
+                    record.is_directory()
+                        && record.path == chain
+                        && (record.private.as_bytes() == name.to_bytes()
+                            || record.original.as_bytes() == name.to_bytes())
+                })
+            });
+            let mut next_chain = chain.to_vec();
+            let (child, mut mode_guard) = if let Some(record) = record {
+                if facts.device != record.device || facts.inode != record.inode {
+                    return false;
+                }
+                next_chain.push(record.private.clone());
+                let Ok((child, guard)) = crate::owned_delete::open_verified_step(
+                    dir,
+                    &name,
+                    record.device,
+                    record.inode,
+                    record.mode,
+                ) else {
+                    return false;
+                };
+                (child, Some(guard))
+            } else {
+                let Ok(child) = open_directory_at(dir, &name) else {
+                    return false;
+                };
+                (child, None)
             };
             if descriptor_identity(child.as_fd()).ok() != Some((facts.device, facts.inode))
                 || !pending_tree_complete(
@@ -3801,7 +3853,15 @@ fn pending_tree_complete(
                     max_depth,
                     remaining,
                     deadline,
+                    if record.is_some() { journal } else { None },
+                    &next_chain,
                 )
+            {
+                return false;
+            }
+            if mode_guard
+                .as_mut()
+                .is_some_and(|guard| guard.restore().is_err())
             {
                 return false;
             }

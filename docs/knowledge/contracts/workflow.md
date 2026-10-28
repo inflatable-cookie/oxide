@@ -3871,9 +3871,10 @@ Rules:
   A deletion that cannot reconcile stays `Evicting` and is excluded from
   reuse and victim choice. Admission charges the maximum of its recorded size
   and the largest recorded slot: these pools have no per-slot byte ceiling and
-  no descriptor-relative observed-byte inventory is available. A pending root whose identity or complete
-  walk cannot be established remains isolated before reconciliation may change
-  it. The soft-budget and replacement limitation is described in
+  no descriptor-relative observed-byte inventory is available. A journaled
+  root's recorded modes are restored through verified descriptors before its
+  completeness preflight. If identity or completeness cannot be established,
+  the root remains isolated and no deletion occurs. The soft-budget and replacement limitation is described in
   [local lease](local-lease.md#capacity-and-eviction). Independent incomplete
   scope remains an accounting error.
   Status names pending slot IDs, and the read-only drive description names them

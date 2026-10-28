@@ -283,7 +283,11 @@ Deletion never touches project or workspace paths. A deletion restores owner rea
 reconciled only for the recorded evicting slot path.
 
 An incomplete or unverifiable pending eviction remains isolated from reuse,
-adoption and deletion. Its admission charge is the maximum of its recorded
+adoption and deletion. For an existing journal, recorded directory modes are
+restored through identity-verified descriptors around the completeness
+preflight; a failed preflight retains the journal and deletes nothing. An
+unjournaled root receives no mode change or capture before a complete
+preflight. Its admission charge is the maximum of its recorded
 size and the largest recorded slot (these budget-only pools have no per-slot
 byte ceiling). No observed-byte term is used: pathname inventory does not hold
 a no-follow root for a descriptor-relative walk. Arbitrary replacement of

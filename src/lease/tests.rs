@@ -4504,6 +4504,50 @@ fn a_private_pending_tree_over_the_entry_bound_is_not_journaled() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
+#[test]
+fn a_journaled_search_only_root_over_the_bound_restores_mode_and_stays_pending() {
+    let fixture = Fixture::new("journaled-search-only-bound");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+    let parent = slot_path.parent().unwrap().to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    for index in 0..40 {
+        fs::write(captured.join(format!("entry-{index}")), b"unchanged").unwrap();
+    }
+    fs::set_permissions(&captured, fs::Permissions::from_mode(0o100)).unwrap();
+    write_journal(
+        &pool,
+        slot_id,
+        crate::owned_delete::RootCapturePlan {
+            mode: u32::from(plan.mode & u32::from(libc::S_IFMT)) | 0o100,
+            ..plan
+        },
+        true,
+        Vec::new(),
+        Vec::new(),
+    );
+    let before = fs::read(pool.join("ledger.json")).unwrap();
+    let widened = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&widened);
+    let hook = crate::test_fs::after_step_chmod(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+    });
+    let status = with_accounting_limits(20, 64, 60_000, || status_injected(&pool)).unwrap();
+    drop(hook);
+    assert_eq!(
+        widened.load(Ordering::Relaxed),
+        1,
+        "root was widened for preflight"
+    );
+    assert_eq!(status.slots.len(), 1);
+    assert_eq!(mode_of(&captured), 0o100);
+    assert!(!slot_path.exists());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+    assert_eq!(before, fs::read(pool.join("ledger.json")).unwrap());
+    fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(fs::read(captured.join("entry-39")).unwrap(), b"unchanged");
+}
+
 /// A replacement at the recorded name stays untouched while the recorded
 /// pending root remains isolated; replacement sizing is outside this charge.
 #[test]
