@@ -1,6 +1,6 @@
 # One-use workspaces beside normal slots (design of record)
 
-Status: **design frozen (decision `dd090b31`), slice S1 implemented and
+Status: **design frozen (decision `dd090b31`), slices S1 and S2 implemented and
 DORMANT, everything else unimplemented.** The frozen design authorizes no
 proof script, selector, native execution, live-pool read, installation,
 consumer change or host setting by itself; each slice still needs its own
@@ -479,6 +479,87 @@ shipped interface (§8). Tom approved the one-use handling via Supervisor
 `66fa8331` bind the shape, and the localized source-review amendments A1–A5
 (`5eda747c`) and the wording review `7718ec1f` are applied. Neither committee
 review nor this document is native qualification.
+
+**S2 implementation record (oxide#171).** Slice S2 of §15 landed dormant under
+its own approved brief. What the tree now holds:
+
+- **The record field and its omission rule (§5.1).** `store::Record` gained
+  `class` (`normal` | `one_use`, `#[serde(default, skip_serializing_if =
+  "class_is_normal")]`) and `class_reason`
+  (`Option<String>`, `skip_serializing_if = "Option::is_none"`), both appended
+  last so an ordinary record's bytes are unchanged. `store::State` gained the
+  durable `one_use_workspaces: Option<String>` fence, also appended last.
+  `STATE_VERSION` is now **6** and `RECORDED_ACCOUNTING_STATE_VERSION` is the
+  **5** the recorded-accounting gate still writes, so `save()` advances to 6
+  only when the one-use fence is present (then 5, 4, 3, 2 in the old order).
+  `fence_one_use_workspaces` writes the fence as its **own atomic save before**
+  the first document carrying a class-bearing record; it is called only where a
+  `one_use` record is created. A future format that needs another fence takes
+  the next number: the idle-exec design's proposed "6" is now taken.
+- **The bounded presence-aware decode (§5.1).** `load` runs
+  `reject_class_fields_before_six` over the **same** bytes before the typed
+  parse: `serde_json` maps `null` to `None`, so the pass reads a small raw
+  schema whose two class fields use a present-but-any-value marker (an
+  `IgnoredAny` consumer that reports whether the key existed). A document below
+  version 6 that names `class` or `class_reason` in **any** record object is
+  refused; at version 6 presence is expected and `validate_state` decides. A
+  document the pass cannot read is left to the typed parse. `validate_state`
+  keeps the structural rules and adds the two version/fence directions (fence
+  without version 6 refuses, version 6 without the fence refuses, an unknown
+  fence value refuses, a class-bearing record without the fence refuses) plus
+  the bounded reason and the "a reason belongs to a `one_use` record alone"
+  rule. A reason longer than `MAX_DIAGNOSTIC_BYTES` is truncated on a character
+  boundary when it is stored, so a pathological path is a bounded diagnostic
+  and never a state error.
+- **Classification feeds the record, and nothing else does.**
+  `store::WorkspaceAdmission` (`class` plus the bounded reason) is threaded from
+  the command's already-computed classification through `Store::acquire` into
+  `attempt`. The classification is only computed while the one-use switch is
+  active, so **every production command in this slice admits `Normal`**, writes
+  neither field and leaves the numeric version where it found it.
+- **Record identity, the project cap and sharing (§5.2-§5.4).** Second-slot
+  matching, the stale-record sweep and `shared_candidate` all compare class, so
+  an existing record of the other class is never reused, relabelled, evicted,
+  shared or released by this command. The eight-slot project cap counts
+  **normal** records and its replacement candidate list holds only normal
+  records; only a **normal** admission enters the cap path, which is the reading
+  in which a temporary clone of the repository does not compete with its normal
+  checkouts for that cap, while deleting a one-use slot can never relieve it.
+  The wait justification next to that path is class-scoped for the same reason:
+  a held record of another class can never become reusable here.
+- **Membership and class-unknown derivation (§5.5, §5.6).** `Store::
+  class_membership` derives the two bounded sets from the state and ledger rows
+  a caller already holds: `members` (the row of every `one_use` record, as its
+  `(slot_id, incarnation)` pair) and `unknown` (every row no record owns). They
+  are disjoint and account for every one-use-or-unknown row once, and both are
+  bounded by the ledger's own `MAX_SLOTS`. The `evictable` split, the
+  in-custody reader and the slice accounting belong to S3 and are **not** here;
+  §5.5's checklist therefore has no victim predicate in this slice.
+- **Legacy records (§5.7).** A record with no class reads as `normal`, which is
+  the protected class, and a normal record written by this binary omits both
+  fields, so the bytes a superseded reader sees are unchanged. A one-use command
+  in a temporary workspace takes a **distinct** record; the legacy record keeps
+  its class and its slot.
+- **Status and summary visibility (§10.5).** A slot whose owning record is
+  `one_use` carries the bounded `(one_use)` label after its state and its stored
+  reason on a continuation line; a normal or unowned slot adds nothing. A pool
+  that holds a one-use member prints the sanctioned
+  `one-use slots: unmeasured (<reason>)` line, with the member count and — when
+  any ledger row is class-unknown — an explicit "lower bound" note. It claims no
+  bytes and no free quota, and it is absent for every pool a dormant build can
+  produce.
+- **Dormancy is unchanged in kind.** The switch is still
+  `one_use::is_active`, `false` in every production binary and settable only by
+  unit tests; S2 adds no environment variable and no persisted activation. The
+  regressions drive the seam directly (`WorkspaceAdmission::one_use`) and prove
+  the omission rule byte for byte: a normal rewrite and a normal lease cycle
+  round-trip through a version-5-shaped `deny_unknown_fields` schema and come
+  back **identical**, with no `class` text and version 5 on disk.
+- **One known follow-on.** `src/lease/seed/mod.rs` reads a donor's control
+  record and classifies only `CONTROL_STATE_VERSION = 5`, so a version-6
+  (one-use-fenced) pool's donors read as `Unknown` and seeding skips them. That
+  is the conservative direction and §8.5 already requires the seeding interface
+  to be re-checked at dispatch, so this slice changes no library code.
 
 ## 1. Outcome and non-goals
 
@@ -2588,11 +2669,14 @@ claimed for a statically edited selector.
   point (returned for scoped review). Activation, the native cases and the
   command-level oracle belong to the Elevated proof slice (S4) and to the
   separately activated implementation proof brief.
-- **S2 record class and front-door scoping.** `Record.class`/`class_reason` with
-  the omission rule (§5.1), the bounded **presence-aware decode** in
-  `Store::load` that refuses a sub-6 document carrying either field, the fence,
-  project-cap and sharing class filters, membership and class-unknown derivation,
-  status/summary visibility.
+- **S2 record class and front-door scoping — implemented, dormant (oxide#171).**
+  `Record.class`/`class_reason` with the omission rule (§5.1), the bounded
+  **presence-aware decode** in `Store::load` that refuses a sub-6 document
+  carrying either field, the one-use fence and version 6 (written only with the
+  first class-bearing record), the project-cap and sharing class filters,
+  membership and class-unknown derivation, and status visibility; see the S2
+  implementation record above. The `evictable` split and the in-custody reader
+  (§5.5.1, §5.5.2) stay with S3.
 - **S3 library admission protocol.** `LeaseRequest` additions, the `MemberSet`
   and `evictable` split with the in-custody custody reader (§5.5.2), `restore`
   with its two thresholds and reuse-candidate exclusion, the union walk, the

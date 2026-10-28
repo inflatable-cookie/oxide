@@ -64,6 +64,11 @@ pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 /// permanent version-2 fence is actually written.
 const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Permanent control-state fence for revised Store mutations (oxide#118).
+/// Version 6 carries the one-use fence (design §5.1, §10.1): a record may
+/// carry a workspace class only under this version and its durable
+/// `oxide.one-use/1` fence, so an older strict parser can never meet a class
+/// field it does not know. It is written **only** when a class-bearing record
+/// is first written, so a normal-only pool stays at version 5 or below.
 /// Version 5 carries the recorded per-slot accounting fence (oxide#146): the
 /// library ledger's `capacity_policy: 2` refuses an older binary's strict
 /// parse, so this control fence must be durable *before* the first recorded
@@ -71,7 +76,10 @@ const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Version 4 (the profile-member owned-outputs fence, oxide#133), version 3
 /// (the whole-target registry transaction, oxide#129) and version 2
 /// (oxide#128) remain readable until a forward fence upgrades them.
-pub(crate) const STATE_VERSION: u32 = 5;
+pub(crate) const STATE_VERSION: u32 = 6;
+/// Version 5 is the recorded-accounting fence (oxide#146), still written for
+/// a pool that has not opted into one-use workspaces.
+const RECORDED_ACCOUNTING_STATE_VERSION: u32 = 5;
 /// Version 4 is the owned-outputs fence this version supersedes.
 const PREVIOUS_STATE_VERSION: u32 = 4;
 /// Version 3 is the unfenced-shape successor of version 2: a pool with the
@@ -83,6 +91,10 @@ const LEGACY_FIELDS_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 /// The recorded-accounting fence value; see [`State::recorded_accounting`].
 pub(crate) const RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
+/// The one-use fence value; see [`State::one_use_workspaces`]. A document
+/// carrying it is always at [`STATE_VERSION`], and a document with either
+/// `class` or `class_reason` in any record always carries it.
+pub(crate) const ONE_USE_FENCE: &str = "oxide.one-use/1";
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
 const MAX_IDENTITY_BYTES: usize = 64;
@@ -185,6 +197,73 @@ struct Record {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_used_ms: Option<u64>,
+    /// This record's workspace class (design §5.1). Class is written once,
+    /// when the record is created, and never relabelled (§5.2).
+    ///
+    /// A **normal** record omits both new fields, so the bytes a version-6
+    /// binary writes for an ordinary slot are exactly the bytes a version-5
+    /// binary wrote and reads (`Record` denies unknown fields, and its
+    /// preflight compares only numeric versions). A `one_use` record is
+    /// therefore always accompanied by the durable fence, which is what tells
+    /// an older reader that this document is beyond it.
+    #[serde(default, skip_serializing_if = "class_is_normal")]
+    class: WorkspaceClass,
+    /// Bounded reason this workspace classified one-use (§5.1, §10.5). Only a
+    /// `one_use` record may carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    class_reason: Option<String>,
+}
+
+/// A slot record's workspace class (design §5.1).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceClass {
+    /// The protected class (§5.7): every pre-feature record reads as this, and
+    /// a normal slot keeps the project-cap and eviction rules it always had.
+    #[default]
+    Normal,
+    /// A temporary workspace's slot: never counted against the project cap
+    /// (§5.3), never shared with a normal command (§5.4).
+    OneUse,
+}
+
+/// The serializer omission rule of design §5.1: a normal record prints
+/// neither class field, so a superseded reader's strict parse still accepts
+/// the document.
+fn class_is_normal(class: &WorkspaceClass) -> bool {
+    *class == WorkspaceClass::Normal
+}
+
+/// The class one front-door command gives the record it creates or reuses
+/// (design §3.6, §5.1).
+///
+/// It is `Normal` for every production command in this slice: the one-use
+/// feature is dormant, so classification is never computed and no command can
+/// ask for `OneUse`. A [`WorkspaceAdmission::one_use`] admission is reachable
+/// from unit tests only, and it is the seam the proof slice's activation uses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkspaceAdmission<'a> {
+    pub class: WorkspaceClass,
+    /// The bounded classification reason, recorded only for a `one_use`
+    /// record (§5.1).
+    pub reason: Option<&'a str>,
+}
+
+impl<'a> WorkspaceAdmission<'a> {
+    /// The pre-feature admission: a normal record, with neither class field on
+    /// disk.
+    pub const NORMAL: Self = Self {
+        class: WorkspaceClass::Normal,
+        reason: None,
+    };
+
+    /// A one-use admission with the bounded reason the record keeps.
+    pub(crate) fn one_use(reason: &'a str) -> Self {
+        Self {
+            class: WorkspaceClass::OneUse,
+            reason: Some(reason),
+        }
+    }
 }
 
 impl Record {
@@ -337,6 +416,12 @@ struct State {
     /// off to a receipt-matching successor instead of refusing the pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recorded_accounting: Option<String>,
+    /// Forward-only one-use fence (design §5.1, §10.1), written durably
+    /// **before** the first state document that carries a class-bearing
+    /// record and never cleared. A normal-only pool written by this binary
+    /// never sets it, so its numeric version does not advance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    one_use_workspaces: Option<String>,
 }
 
 /// The durable initialization record shared by both pools of a pair.
@@ -375,6 +460,7 @@ impl Default for State {
             owned_outputs: None,
             outputs_init: None,
             recorded_accounting: None,
+            one_use_workspaces: None,
         }
     }
 }
@@ -1223,6 +1309,36 @@ pub struct Report {
     /// Idle slots with no current ledger record: they make `recorded_total` a
     /// stated lower bound.
     pub unrecorded_slots: usize,
+    /// The bounded class facts of this pool's ledger (design §5.5, §5.6).
+    pub class: ClassMembership,
+}
+
+/// One bounded ledger row of a one-use member or an unattributed row, carried
+/// as the `(slot_id, incarnation)` pair design §5.5 encodes so the library can
+/// verify it against the ledger before any use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // The pairs are consumed by the S3 admission protocol.
+pub struct ClassMember {
+    pub slot_id: String,
+    pub incarnation: String,
+}
+
+/// The bounded class-scoped view of one pool's ledger (design §5.5, §5.6).
+///
+/// `members` and `unknown` are disjoint, and together with the verified normal
+/// slots they account for every ledger row exactly once: a row is a member when
+/// its owning record is `one_use`, normal when that record is `normal`, and
+/// **unknown** when no record owns it. An unknown row is never a member, never
+/// an eviction candidate and never free quota; a pool holding one can only ever
+/// report its slice as a lower bound.
+///
+/// This view is an observation, never an authorisation: nothing here is a
+/// writer-closure proof, and a dormant build writes no one-use record at all,
+/// so `status` sees an empty view for every pool that exists today.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClassMembership {
+    pub members: Vec<ClassMember>,
+    pub unknown: Vec<ClassMember>,
 }
 
 /// An existing lease-ticket record shown by `oxide status`.
@@ -1412,6 +1528,11 @@ pub struct SlotView {
     /// This slot's size for this view: a live walk, a recorded observation
     /// or an honest not-measured phrase.
     pub size: SlotSize,
+    /// The owning record's workspace class (design §5.1, §10.5); `None` when
+    /// no record owns this row, which is a class-unknown slot (§5.6).
+    pub class: Option<WorkspaceClass>,
+    /// The bounded reason the owning record was classified one-use.
+    pub class_reason: Option<String>,
 }
 
 pub struct Interrupted {
@@ -2219,10 +2340,13 @@ impl Store {
     /// cancels without touching any slot.
     /// `share` allows taking another checkout's idle compatible slot.
     /// `label` names the holder in `oxide status` (`exec <program>`).
+    /// `admission` is this command's workspace class (design §5.1): `Normal`
+    /// for every production command in this slice.
     pub fn acquire(
         &self,
         key: &SlotKey,
         profile: Profile,
+        admission: WorkspaceAdmission<'_>,
         share: bool,
         label: Option<&str>,
         waits: &mut WaitAccounting,
@@ -2240,7 +2364,7 @@ impl Store {
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::Interrupted(signal));
             }
-            let attempt = self.attempt(ticket.0, key, profile, max_active, share, label);
+            let attempt = self.attempt(ticket.0, key, profile, max_active, admission, share, label);
             match attempt {
                 Err(error) => {
                     waits.stop(Instant::now());
@@ -2993,6 +3117,8 @@ impl Store {
             retired: Some(lost.describe(false)),
             lost: Some(lost),
             last_used_ms: Some(1),
+            class: WorkspaceClass::Normal,
+            class_reason: None,
         });
         self.save(&state).unwrap();
     }
@@ -3706,6 +3832,10 @@ impl Store {
         };
         let now = process::now_ms();
         let boot = boot_session();
+        // The class view is derived from the state and ledger rows this
+        // report already read (design §5.5, §5.6); it reads nothing else and
+        // writes nothing.
+        let class = self.class_membership(&state, snapshot.slots.as_slice());
         let slots = snapshot
             .slots
             .iter()
@@ -3722,6 +3852,8 @@ impl Store {
                         record.and_then(|record| record.checkout.as_deref()),
                     ),
                     state: slot.state,
+                    class: record.map(|record| record.class),
+                    class_reason: record.and_then(|record| record.class_reason.clone()),
                     profile: record.map(|record| record.profile.clone()),
                     checkout: record.and_then(|record| record.checkout.clone()),
                     managed: record.is_some(),
@@ -3833,7 +3965,50 @@ impl Store {
             recorded_total: snapshot.recorded_total,
             recorded_slots: snapshot.recorded_slots,
             unrecorded_slots: snapshot.unrecorded_slots,
+            class,
         })
+    }
+
+    /// The bounded class-scoped view of one pool's ledger (design §5.5, §5.6),
+    /// derived from control state and ledger rows the caller already read.
+    ///
+    /// `members` is the ledger row of every `one_use` record and `unknown` every
+    /// row no record owns; that is what makes a slice figure honest: it is
+    /// either the verified member union with no unknown row, or the same union
+    /// labelled a lower bound beside the unattributed count. Both sets are
+    /// bounded by the ledger's own ceiling: a record owns at most one row (its
+    /// affinity directory is unique) and the library refuses a ledger above
+    /// `MAX_SLOTS` rows, so nothing here is truncated.
+    fn class_membership(&self, state: &State, slots: &[LedgerSlot]) -> ClassMembership {
+        let pair = |slot: &LedgerSlot| ClassMember {
+            slot_id: slot.slot_id.clone(),
+            incarnation: slot.incarnation.clone(),
+        };
+        let mut members = Vec::new();
+        for record in state
+            .records
+            .iter()
+            .filter(|record| record.class == WorkspaceClass::OneUse)
+        {
+            let project = self.affinity_dir(record.id);
+            members.extend(
+                slots
+                    .iter()
+                    .filter(|slot| slot.project == project)
+                    .map(pair),
+            );
+        }
+        let unknown = slots
+            .iter()
+            .filter(|slot| {
+                !state
+                    .records
+                    .iter()
+                    .any(|record| slot.project == self.affinity_dir(record.id))
+            })
+            .map(pair)
+            .collect();
+        ClassMembership { members, unknown }
     }
 
     fn attempt(
@@ -3842,6 +4017,7 @@ impl Store {
         key: &SlotKey,
         profile: Profile,
         max_active: usize,
+        admission: WorkspaceAdmission<'_>,
         share: bool,
         label: Option<&str>,
     ) -> Result<Result<Lease, Wait>, String> {
@@ -3892,6 +4068,9 @@ impl Store {
             record.phase != Phase::Retired
                 && record.checkout.as_deref() == Some(key.checkout.as_path())
                 && record.compatibility == key.compatibility
+                // Class is part of record identity (design §5.2): an existing
+                // record of the other class is never reused or relabelled.
+                && record.class == admission.class
         };
         let stale: Vec<u64> = state
             .records
@@ -3940,7 +4119,7 @@ impl Store {
         // admission below; choosing it never deletes anything itself.
         let mut replace: Option<(u64, String)> = None;
         let shared = if share && !existing.is_some_and(|index| has_slot(&state.records[index])) {
-            self.shared_candidate(&state, key, &view)?
+            self.shared_candidate(&state, key, admission.class, &view)?
         } else {
             None
         };
@@ -3964,11 +4143,15 @@ impl Store {
             // or uncertain (a live or unattributable lock) is never a
             // candidate; foreign and unmeasurable slots fail the library's
             // own ownership and accounting checks.
+            // The eight-slot project cap counts **normal** slots only (design
+            // §5.3): a one-use slot never consumes one of a repository's eight
+            // normal slots, and deleting one can never relieve that cap.
             let mut candidates: Vec<(u64, u64, u64, String)> = state
                 .records
                 .iter()
                 .filter(|record| {
-                    record.phase == Phase::Idle
+                    record.class == WorkspaceClass::Normal
+                        && record.phase == Phase::Idle
                         && record.identity == key.identity
                         && has_slot(record)
                 })
@@ -3990,20 +4173,34 @@ impl Store {
             let project_slots = state
                 .records
                 .iter()
-                .filter(|record| record.identity == key.identity && has_slot(record))
+                .filter(|record| {
+                    record.class == WorkspaceClass::Normal
+                        && record.identity == key.identity
+                        && has_slot(record)
+                })
                 .count();
             // A specific held compatible slot of any checkout of this
             // repository can become reusable under the existing identity and
-            // freshness rules; only such a slot justifies waiting.
+            // freshness rules; only such a slot justifies waiting. It must be
+            // of this command's class too, because neither the second-slot rule
+            // nor sharing takes a record across classes (§5.2, §5.4).
             let compatible_busy = state.records.iter().any(|record| {
-                record.identity == key.identity
+                record.class == admission.class
+                    && record.identity == key.identity
                     && record.compatibility == key.compatibility
                     && matches!(
                         record.phase,
                         Phase::Acquiring | Phase::Spawning | Phase::Running
                     )
             });
-            if project_slots >= PROJECT_SLOT_CAP {
+            // The cap is a **normal**-slot cap and only a normal admission
+            // enters it (§5.3): a one-use slot never consumes one of a
+            // repository's eight normal slots, deleting one can never relieve
+            // that cap (the candidate list below holds no one-use record), and
+            // a temporary clone of the same repository therefore no longer
+            // competes with its normal checkouts for it. A one-use admission's
+            // slot count is bounded by the slice (slice S3) and by `MAX_SLOTS`.
+            if admission.class == WorkspaceClass::Normal && project_slots >= PROJECT_SLOT_CAP {
                 let chosen = existing.map(|index| state.records[index].id);
                 candidates.sort();
                 for (_, _, id, slot_id) in candidates {
@@ -4047,6 +4244,13 @@ impl Store {
                     return Err("a new Oxide record lock is unexpectedly held".to_owned());
                 };
                 lock = Some(file);
+                // The one-use fence is durable before the first document that
+                // carries a class-bearing record (design §5.1 step 1). A
+                // normal admission writes neither, so a dormant build leaves
+                // the pool's numeric version exactly as it found it.
+                if admission.class == WorkspaceClass::OneUse {
+                    self.fence_one_use_workspaces(&mut state)?;
+                }
                 state.records.push(Record {
                     id,
                     identity: key.identity.clone(),
@@ -4062,6 +4266,8 @@ impl Store {
                     retired: None,
                     lost: None,
                     last_used_ms: None,
+                    class: admission.class,
+                    class_reason: admission.reason.map(bounded_class_reason),
                 });
                 state.records.len() - 1
             }
@@ -4391,17 +4597,23 @@ impl Store {
     /// The most recently used idle slot of the same repository and key whose
     /// last checkout is another live affinity and whose origin is trusted.
     /// Detached records (after `oxide clean`) are never shared.
+    ///
+    /// Sharing is class-matched (design §5.4): a normal command never borrows a
+    /// one-use slot, whose build may be about to be deleted, and a one-use
+    /// command never borrows or relabels a normal slot.
     fn shared_candidate(
         &self,
         state: &State,
         key: &SlotKey,
+        class: WorkspaceClass,
         view: &LedgerView,
     ) -> Result<Option<(u64, File, Built)>, String> {
         let mut candidates: Vec<&Record> = state
             .records
             .iter()
             .filter(|record| {
-                record.phase == Phase::Idle
+                record.class == class
+                    && record.phase == Phase::Idle
                     && record.identity == key.identity
                     && record.compatibility == key.compatibility
                     && record
@@ -4591,7 +4803,7 @@ impl Store {
         Ok(lock)
     }
 
-    /// Make the version-5 recorded-accounting fence durable. Nothing is
+    /// Make the version-6 recorded-accounting fence durable. Nothing is
     /// written when it is already set.
     fn fence_recorded_accounting(&self) -> Result<(), String> {
         let mut state = self.load()?;
@@ -4600,6 +4812,26 @@ impl Store {
         }
         state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
         self.save(&state)
+    }
+
+    /// Make the one-use fence durable **before** the first document that
+    /// carries a class-bearing record (design §5.1 step 1, §10.1).
+    ///
+    /// `state` is the caller's already-loaded state under this pool's
+    /// admission lock. The fence is written as its own atomic save first, so a
+    /// crash between the two leaves a fenced pool with no class-bearing record
+    /// — readable by this binary and refused by an older one, which is the
+    /// safe direction. Nothing is written for a normal-only pool, so a dormant
+    /// build never advances an existing pool's numeric version.
+    fn fence_one_use_workspaces(&self, state: &mut State) -> Result<(), String> {
+        if state.one_use_workspaces.as_deref() == Some(ONE_USE_FENCE) {
+            return Ok(());
+        }
+        let mut fenced = state.clone();
+        fenced.one_use_workspaces = Some(ONE_USE_FENCE.to_owned());
+        self.save(&fenced)?;
+        state.one_use_workspaces = Some(ONE_USE_FENCE.to_owned());
+        Ok(())
     }
 
     fn load(&self) -> Result<State, String> {
@@ -4612,6 +4844,9 @@ impl Store {
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("Oxide state exceeds its byte limit".to_owned());
         }
+        // The bounded presence-aware decode runs over these same bytes, once,
+        // before the typed parse (design §5.1).
+        reject_class_fields_before_six(&bytes)?;
         let state: State = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Oxide state is invalid: {error}"))?;
         let legacy = match state.version {
@@ -4619,6 +4854,7 @@ impl Store {
             LEGACY_FIELDS_STATE_VERSION
             | OLDER_STATE_VERSION
             | PREVIOUS_STATE_VERSION
+            | RECORDED_ACCOUNTING_STATE_VERSION
             | STATE_VERSION => false,
             _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
         };
@@ -4648,13 +4884,18 @@ impl Store {
         // binary still runs a pool it understands, and the released `/1` fence
         // advances nothing.
         let recorded = fenced.recorded_accounting.is_some();
+        let one_use = fenced.one_use_workspaces.is_some();
         let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
-        fenced.version = if recorded {
+        fenced.version = if one_use {
+            // Version 6 is the one-use fence and the version a class-bearing
+            // record always travels under.
+            STATE_VERSION
+        } else if recorded {
             // Version 5 is the recorded-accounting fence (oxide#146) and the
             // hand-off trigger that must precede the ledger's policy-2 write.
-            STATE_VERSION
+            RECORDED_ACCOUNTING_STATE_VERSION
         } else if successor {
             PREVIOUS_STATE_VERSION
         } else if previous {
@@ -4686,6 +4927,68 @@ impl Store {
     }
 }
 
+/// The bounded presence-aware decode of design §5.1, over the **same** bytes
+/// `load` already read (one parse, no re-serialisation, no payload walk).
+///
+/// `#[serde(default)]` makes an explicit `"class":"normal"` indistinguishable
+/// from an absent field in the typed parse, so the presence of either field
+/// needs its own pass: a document below [`STATE_VERSION`] that names `class` or
+/// `class_reason` in **any** record object is refused here. At or above the
+/// one-use version presence is expected and [`validate_state`] decides.
+///
+/// A document this pass cannot read is left to the typed parse, which reports
+/// the same malformed input with its own diagnostic. Field presence is read
+/// through a small raw schema rather than `serde_json::Value`, so the pass
+/// allocates only the two fields per record it is looking for.
+fn reject_class_fields_before_six(bytes: &[u8]) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct RawDocument {
+        version: Option<u64>,
+        records: Option<Vec<RawRecord>>,
+    }
+    // `Option<_>` cannot tell an absent key from an explicit `null` (serde
+    // maps `null` to `None`), and both are present fields, so the marker
+    // accepts and discards any value while reporting whether the key existed.
+    #[derive(Default)]
+    struct Present(bool);
+
+    impl<'de> Deserialize<'de> for Present {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            serde::de::IgnoredAny::deserialize(deserializer).map(|_| Self(true))
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct RawRecord {
+        #[serde(default)]
+        class: Present,
+        #[serde(default)]
+        class_reason: Present,
+    }
+    let Ok(document) = serde_json::from_slice::<RawDocument>(bytes) else {
+        return Ok(());
+    };
+    let Some(version) = document.version else {
+        return Ok(());
+    };
+    if version >= u64::from(STATE_VERSION) {
+        return Ok(());
+    }
+    if document.records.is_some_and(|records| {
+        records
+            .iter()
+            .any(|record| record.class.0 || record.class_reason.0)
+    }) {
+        return Err(format!(
+            "Oxide state is invalid: a version-{version} record carries a one-use class field"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate one control-state document. A legacy version-1 document keeps
 /// the legacy read limits (its byte cap is checked by `load`); a version-2
 /// document must satisfy every field cap and compact-object ceiling, so the
@@ -4697,6 +5000,7 @@ fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
             | LEGACY_FIELDS_STATE_VERSION
             | OLDER_STATE_VERSION
             | PREVIOUS_STATE_VERSION
+            | RECORDED_ACCOUNTING_STATE_VERSION
             | STATE_VERSION
     ) {
         return Err("Oxide state has an unsupported version".to_owned());
@@ -4706,11 +5010,40 @@ fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
     // guessed at.
     match state.recorded_accounting.as_deref() {
         None => {
-            if state.version >= STATE_VERSION {
+            if state.version >= RECORDED_ACCOUNTING_STATE_VERSION {
                 return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
             }
         }
         Some(fence) if fence == RECORDED_ACCOUNTING_FENCE => {}
+        Some(_) => {
+            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
+        }
+    }
+    // The one-use fence and the numeric version are equivalent (design §5.1,
+    // §10.1): a class-bearing record always travels under both, a fenced
+    // document is always at the one-use version, and an unknown fence value
+    // refuses instead of being guessed at. Presence itself is decided by
+    // `reject_class_fields_before_six`, which the typed parse cannot do.
+    match state.one_use_workspaces.as_deref() {
+        None => {
+            if state.version >= STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+            if state
+                .records
+                .iter()
+                .any(|record| record.class != WorkspaceClass::Normal)
+            {
+                return Err(
+                    "Oxide state has a class-bearing record without the one-use fence".to_owned(),
+                );
+            }
+        }
+        Some(fence) if fence == ONE_USE_FENCE => {
+            if state.version != STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
         Some(_) => {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
         }
@@ -4778,6 +5111,24 @@ fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
         {
             return Err("Oxide record exceeds its field bounds".to_owned());
         }
+        // A class reason belongs to a one-use record alone, and is bounded like
+        // every other diagnostic (design §5.1).
+        match record.class {
+            WorkspaceClass::Normal => {
+                if record.class_reason.is_some() {
+                    return Err("Oxide record has an invalid workspace class".to_owned());
+                }
+            }
+            WorkspaceClass::OneUse => {
+                if record
+                    .class_reason
+                    .as_deref()
+                    .is_some_and(|value| !bounded_text(value, MAX_DIAGNOSTIC_BYTES))
+                {
+                    return Err("Oxide record has an invalid workspace class".to_owned());
+                }
+            }
+        }
         if let Some(holder) = &record.holder {
             if !bounded_text(&holder.lease_holder, MAX_LEASE_HOLDER_BYTES)
                 || holder
@@ -4837,6 +5188,21 @@ fn validate_recovery(recovery: &Recovery) -> Result<(), String> {
 
 fn bounded_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max
+}
+
+/// Keep a stored class reason inside the state's diagnostic bound, on a
+/// character boundary. Classification reasons embed a path, and a pathological
+/// one must not turn a lease into a state error: the reason is a bounded
+/// diagnostic, so it is truncated rather than invented or refused.
+fn bounded_class_reason(reason: &str) -> String {
+    if reason.len() <= MAX_DIAGNOSTIC_BYTES {
+        return reason.to_owned();
+    }
+    let mut end = MAX_DIAGNOSTIC_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
 }
 
 fn path_text(path: &Path) -> bool {
@@ -5264,6 +5630,8 @@ pub fn hold_record_for_tests(store: &Store, checkout: &Path, id: u64) -> File {
         retired: None,
         lost: None,
         last_used_ms: None,
+        class: WorkspaceClass::Normal,
+        class_reason: None,
     };
     entry.phase = Phase::Running;
     state.records.push(entry);
@@ -5795,6 +6163,8 @@ pub(crate) mod tests {
             retired: lost.as_ref().map(|lost| lost.describe(false)),
             lost,
             last_used_ms: Some(1),
+            class: WorkspaceClass::Normal,
+            class_reason: None,
         }
     }
 
@@ -7138,7 +7508,15 @@ pub(crate) mod tests {
         internal.save(&active).unwrap();
         let (ticket, _file) = removable.register_ticket().unwrap();
         assert!(matches!(
-            removable.attempt(ticket, &key, Profile::Quick, 2, false, None),
+            removable.attempt(
+                ticket,
+                &key,
+                Profile::Quick,
+                2,
+                WorkspaceAdmission::NORMAL,
+                false,
+                None
+            ),
             Ok(Err(Wait::HostLimit(2)))
         ));
         removable.remove_ticket(ticket).unwrap();
@@ -7148,7 +7526,15 @@ pub(crate) mod tests {
         removable.save(&active).unwrap();
         let (ticket, _file) = internal.register_ticket().unwrap();
         assert!(matches!(
-            internal.attempt(ticket, &key, Profile::Quick, 2, false, None),
+            internal.attempt(
+                ticket,
+                &key,
+                Profile::Quick,
+                2,
+                WorkspaceAdmission::NORMAL,
+                false,
+                None
+            ),
             Ok(Err(Wait::HostLimit(2)))
         ));
         internal.remove_ticket(ticket).unwrap();
@@ -7158,7 +7544,15 @@ pub(crate) mod tests {
     fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result<Lease, Wait> {
         let (ticket, _file) = store.register_ticket().unwrap();
         let outcome = store
-            .attempt(ticket, key, Profile::Quick, 16, false, label)
+            .attempt(
+                ticket,
+                key,
+                Profile::Quick,
+                16,
+                WorkspaceAdmission::NORMAL,
+                false,
+                label,
+            )
             .unwrap();
         store.remove_ticket(ticket).unwrap();
         outcome
@@ -7985,6 +8379,8 @@ pub(crate) mod tests {
             retired: None,
             lost: None,
             last_used_ms: None,
+            class: WorkspaceClass::Normal,
+            class_reason: None,
         }
     }
 
@@ -8373,6 +8769,8 @@ pub(crate) mod tests {
                 unclosed: Some("u".repeat(MAX_DIAGNOSTIC_BYTES)),
             }),
             last_used_ms: Some(u64::MAX),
+            class: WorkspaceClass::Normal,
+            class_reason: None,
         }
     }
 
@@ -8418,6 +8816,8 @@ pub(crate) mod tests {
                 unclosed: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
             }),
             last_used_ms: Some(u64::MAX),
+            class: WorkspaceClass::Normal,
+            class_reason: None,
         }
     }
 
@@ -8970,6 +9370,637 @@ pub(crate) mod tests {
             "{} > {}",
             bytes.len(),
             MAX_OBSERVATIONS_BYTES
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // One-use workspaces, slice S2 (design §5.1, §5.3, §5.4, §5.6, §5.7).
+    //
+    // Everything here is reachable from unit tests only: the feature is
+    // dormant, so no production command can classify a workspace one-use and
+    // no production path writes a class-bearing record. These regressions
+    // therefore drive the seam directly (`WorkspaceAdmission::one_use`) and
+    // assert both the class behaviour and the dormant byte identity.
+    // ---------------------------------------------------------------------
+
+    /// The pre-feature record shape, written exactly as a version-5 reader
+    /// sees it: `deny_unknown_fields`, field for field, with neither class
+    /// field. A normal document must round-trip through this and come back
+    /// byte-identical, which is what makes the omission rule of §5.1 provable.
+    mod v5 {
+        use std::path::PathBuf;
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub(super) struct Record {
+            pub id: u64,
+            pub identity: String,
+            pub compatibility: String,
+            pub profile: String,
+            pub checkout: Option<PathBuf>,
+            pub phase: String,
+            pub process_group: Option<i32>,
+            pub last_used: u64,
+            #[serde(default)]
+            pub holder: Option<serde_json::Value>,
+            #[serde(default)]
+            pub lease_id: Option<String>,
+            #[serde(default)]
+            pub pending_recovery: Option<serde_json::Value>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub retired: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub lost: Option<serde_json::Value>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub last_used_ms: Option<u64>,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub(super) struct State {
+            pub version: u32,
+            pub next_id: u64,
+            pub next_use: u64,
+            pub tickets: Vec<serde_json::Value>,
+            pub cleans: Vec<serde_json::Value>,
+            pub records: Vec<Record>,
+            pub recoveries: Vec<serde_json::Value>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            pub flushes: Vec<serde_json::Value>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub owned_outputs: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub outputs_init: Option<serde_json::Value>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub recorded_accounting: Option<String>,
+        }
+
+        /// Parse the document as a version-5 reader would, then re-serialize
+        /// it; an absent class field survives exactly.
+        pub(super) fn roundtrip(bytes: &[u8]) -> Vec<u8> {
+            let state: State = serde_json::from_slice(bytes).expect("a v5 reader accepts it");
+            serde_json::to_vec(&state).expect("serialize")
+        }
+    }
+
+    /// Write a raw control document the way the store does: owner-only, so
+    /// the private-file checks in `load` are exercised rather than bypassed.
+    fn write_raw_state(store: &Store, bytes: &[u8]) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = store.control.join("state.json");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    fn class_fixture(label: &str) -> (PathBuf, Store, SlotKey) {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-class-{label}-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let pool = root.join("pool");
+        init_budget_pool(&pool, 1 << 30).unwrap();
+        let store = Store {
+            control: pool.join(MANAGED_NAME),
+            payload: pool.join("payload"),
+            pool: pool.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: Some(1 << 30),
+            recorded_budget: 1 << 30,
+            max_active: 16,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "identity".to_owned(),
+            compatibility: "quick-key".to_owned(),
+        };
+        (root, store, key)
+    }
+
+    fn lease_as(
+        store: &Store,
+        key: &SlotKey,
+        admission: WorkspaceAdmission<'_>,
+        share: bool,
+    ) -> Result<Lease, Wait> {
+        let (ticket, _file) = store.register_ticket().unwrap();
+        let outcome = store
+            .attempt(ticket, key, Profile::Quick, 16, admission, share, None)
+            .unwrap();
+        store.remove_ticket(ticket).unwrap();
+        outcome
+    }
+
+    fn class_state_bytes(store: &Store) -> Vec<u8> {
+        fs::read(store.control.join("state.json")).unwrap()
+    }
+
+    /// The presence-aware decode of §5.1 over the six inputs §16.1 names, plus
+    /// both explicit default values. `#[serde(default)]` alone cannot tell
+    /// `"class":"normal"` from an absent field, so this pass is what refuses a
+    /// sub-6 document that carries either key with **any** value.
+    #[test]
+    fn a_sub_six_document_carrying_a_class_field_is_refused() {
+        let (root, store, _key) = class_fixture("presence");
+        let document = |version: u32, fence: bool, record_fields: &str| {
+            let fence = if fence {
+                ",\"one_use_workspaces\":\"oxide.one-use/1\""
+            } else {
+                ""
+            };
+            format!(
+                "{{\"version\":{version},\"next_id\":1,\"next_use\":1,\"tickets\":[],\"cleans\":[],\"records\":[{{\"id\":1,\"identity\":\"identity\",\"compatibility\":\"quick-key\",\"profile\":\"quick\",\"checkout\":\"/checkout\",\"phase\":\"idle\",\"process_group\":null,\"last_used\":1,\"holder\":null,\"lease_id\":null,\"pending_recovery\":null,\"last_used_ms\":1{record_fields}}}],\"recoveries\":[],\"recorded_accounting\":\"oxide.accounting/1\"{fence}}}"
+            )
+        };
+        let write = |bytes: String| write_raw_state(&store, bytes.as_bytes());
+        let accept = |label: &str| match store.load() {
+            Ok(state) => {
+                assert_eq!(state.records.len(), 1, "{label}");
+                state
+            }
+            Err(error) => panic!("{label}: {error}"),
+        };
+        let refuse = |label: &str| {
+            let error = store
+                .load()
+                .err()
+                .unwrap_or_else(|| panic!("{label}: accepted"));
+            assert!(
+                error.contains("class field") || error.contains("unsupported version"),
+                "{label}: {error}"
+            );
+        };
+
+        write(document(5, false, ""));
+        let absent = accept("v5 absent");
+        assert_eq!(absent.version, RECORDED_ACCOUNTING_STATE_VERSION);
+        assert_eq!(absent.records[0].class, WorkspaceClass::Normal);
+
+        write(document(5, false, ",\"class\":\"normal\""));
+        refuse("v5 with an explicit normal class");
+        write(document(5, false, ",\"class_reason\":null"));
+        refuse("v5 with an explicit null reason");
+        write(document(5, false, ",\"class\":\"one_use\""));
+        refuse("v5 with a one-use class");
+
+        write(document(6, true, ",\"class\":\"one_use\""));
+        let fenced = accept("v6 with the fence and a class");
+        assert_eq!(fenced.records[0].class, WorkspaceClass::OneUse);
+        assert_eq!(fenced.version, STATE_VERSION);
+
+        write(document(6, false, ""));
+        refuse("v6 without the fence");
+        // Both version/fence directions the design names: a fence below the
+        // one-use version refuses, and an unknown fence value refuses.
+        write(document(5, true, ""));
+        refuse("the one-use fence at version 5");
+        write(document(6, true, "").replace("oxide.one-use/1", "oxide.one-use/9"));
+        refuse("an unknown one-use fence value");
+
+        // Non-vacuity of the pass: the same document with the class key
+        // removed loads, so the refusal above is the field, not the shape.
+        write(document(5, false, ""));
+        accept("the control document without either field");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The serializer omission rule of §5.1. A fresh normal record and a
+    /// rewritten normal-only state print **neither** class field, a version-5
+    /// reader's strict parse accepts the bytes and re-serializes them
+    /// identically, and a `one_use` record always carries both the class and
+    /// the durable fence at version 6.
+    #[test]
+    fn a_normal_record_writes_neither_class_field_and_a_one_use_record_always_fences() {
+        let (root, store, key) = class_fixture("omission");
+        // A rewritten normal-only state.
+        store.save(&State::default()).unwrap();
+        let bytes = class_state_bytes(&store);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains("\"class\""), "{text}");
+        assert!(!text.contains("class_reason"), "{text}");
+        assert_eq!(
+            v5::roundtrip(&bytes),
+            bytes,
+            "a v5 reader changed the bytes"
+        );
+
+        // A freshly created normal record, written by a full lease cycle: the
+        // pool's numeric version stays the recorded-accounting predecessor and
+        // no class field appears anywhere.
+        let held = lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("lease");
+        store.release(held, None).unwrap();
+        let bytes = class_state_bytes(&store);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains("\"class\""), "{text}");
+        assert!(!text.contains("class_reason"), "{text}");
+        assert!(
+            text.contains("\"version\":5"),
+            "a normal admission advanced the numeric version: {text}"
+        );
+        assert_eq!(
+            store.load().unwrap().one_use_workspaces,
+            None,
+            "a normal admission wrote the one-use fence"
+        );
+        assert_eq!(
+            v5::roundtrip(&bytes),
+            bytes,
+            "a v5 reader changed the bytes"
+        );
+
+        // A one-use record carries the class, its reason and the fence, and
+        // the numeric version advanced to the one-use version.
+        let held = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let slot = held.slot_id.clone();
+        store.release(held, None).unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.one_use_workspaces.as_deref(), Some(ONE_USE_FENCE));
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.class == WorkspaceClass::OneUse)
+            .expect("the one-use record");
+        assert_eq!(
+            record.class_reason.as_deref(),
+            Some("a temporary workspace")
+        );
+        assert!(
+            serde_json::from_slice::<v5::State>(&class_state_bytes(&store)).is_err(),
+            "a version-5 reader accepted a class-bearing record"
+        );
+        let report = store.report(Accounting::Recorded, 1).unwrap();
+        let view = report
+            .slots
+            .iter()
+            .find(|view| view.slot_id == slot)
+            .expect("the one-use slot");
+        assert_eq!(view.class, Some(WorkspaceClass::OneUse));
+        assert_eq!(view.class_reason.as_deref(), Some("a temporary workspace"));
+
+        // A reason longer than the diagnostic bound is truncated, never a
+        // state error and never invented text.
+        let long = "r".repeat(MAX_DIAGNOSTIC_BYTES * 2);
+        assert_eq!(bounded_class_reason(&long).len(), MAX_DIAGNOSTIC_BYTES);
+        assert_eq!(bounded_class_reason("short"), "short");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The fence is written only when a class-bearing record is written, and
+    /// it is durable on its own first: a crash between the two saves leaves a
+    /// fenced pool with no class-bearing record, which every reader accepts.
+    #[test]
+    fn the_one_use_fence_is_written_only_with_a_class_bearing_record() {
+        let (root, store, key) = class_fixture("fence-order");
+        // Every real mutating command takes the admission gate first, which
+        // makes the recorded-accounting fence durable; a version-6 document
+        // carries both fences, so the fixture starts from the same state.
+        let mut state = State::default();
+        state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+        store.save(&state).unwrap();
+        let mut state = store.load().unwrap();
+        store.fence_one_use_workspaces(&mut state).unwrap();
+        let fenced = store.load().unwrap();
+        assert_eq!(fenced.version, STATE_VERSION);
+        assert_eq!(fenced.one_use_workspaces.as_deref(), Some(ONE_USE_FENCE));
+        assert!(
+            fenced
+                .records
+                .iter()
+                .all(|record| record.class == WorkspaceClass::Normal),
+            "the fence-only document carries no class-bearing record"
+        );
+        // Idempotent, and it never writes a second time.
+        store.fence_one_use_workspaces(&mut state).unwrap();
+        let again = store.load().unwrap();
+        assert_eq!(again.version, fenced.version);
+        assert_eq!(again.one_use_workspaces, fenced.one_use_workspaces);
+        assert_eq!(again.records.len(), fenced.records.len());
+
+        // A class-bearing record without the fence is refused, so the ordering
+        // above is load-bearing rather than decorative.
+        let mut unfenced = State::default();
+        unfenced.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+        unfenced.records.push(Record {
+            class: WorkspaceClass::OneUse,
+            class_reason: Some("reason".to_owned()),
+            ..record(Phase::Idle, None, None)
+        });
+        let error = store.save(&unfenced).unwrap_err();
+        assert!(error.contains("without the one-use fence"), "{error}");
+        let _ = key;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The eight-slot project cap counts **normal** slots only (§5.3): a
+    /// one-use admission is never blocked by it, and a one-use slot never
+    /// relieves it — the cap path can only evict a normal slot, and it refuses
+    /// honestly when none is safe.
+    #[test]
+    fn the_project_cap_counts_normal_slots_only() {
+        let (root, store, key) = class_fixture("cap");
+        let mut normal = Vec::new();
+        while normal.len() < PROJECT_SLOT_CAP {
+            normal.push(lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("normal"));
+        }
+        let state = store.load().unwrap();
+        assert_eq!(
+            state
+                .records
+                .iter()
+                .filter(|record| record.class == WorkspaceClass::Normal)
+                .count(),
+            PROJECT_SLOT_CAP
+        );
+        // A normal command is at the cap: it waits for a held compatible slot.
+        assert!(matches!(
+            lease_as(&store, &key, WorkspaceAdmission::NORMAL, false),
+            Err(Wait::Checkout)
+        ));
+        // A one-use command is not blocked by eight normal slots of this
+        // repository; it takes its own record and its own slot.
+        let one_use = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("a one-use admission is not capped by normal slots");
+        let one_use_slot = one_use.slot_id.clone();
+        let state = store.load().unwrap();
+        assert_eq!(
+            state
+                .records
+                .iter()
+                .filter(|record| record.class == WorkspaceClass::OneUse)
+                .count(),
+            1
+        );
+        // A one-use slot never relieves the normal cap: releasing it leaves a
+        // normal admission at the cap, and the one-use slot stays untouched.
+        store.release(one_use, None).unwrap();
+        assert!(matches!(
+            lease_as(&store, &key, WorkspaceAdmission::NORMAL, false),
+            Err(Wait::Checkout)
+        ));
+        let view = store.ledger().unwrap();
+        assert!(
+            view.slots.iter().any(|slot| slot.slot_id == one_use_slot),
+            "a normal admission evicted the one-use slot"
+        );
+        for held in normal {
+            drop(held);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Sharing is class-matched (§5.4): another checkout's idle compatible slot
+    /// is taken only when the class matches. A normal command never borrows a
+    /// one-use slot, a one-use command never borrows or relabels a normal slot,
+    /// and same-class sharing between two one-use checkouts keeps today's gate,
+    /// origin and custodian rules.
+    #[test]
+    fn sharing_is_class_matched() {
+        let (root, store, key) = class_fixture("sharing");
+        let other_checkout = key
+            .checkout
+            .parent()
+            .expect("fixture root")
+            .join("other-checkout");
+        fs::create_dir(&other_checkout).unwrap();
+        let other = SlotKey {
+            checkout: other_checkout,
+            identity: key.identity.clone(),
+            compatibility: key.compatibility.clone(),
+        };
+        // The same trusted content origin for both records: only the class can
+        // decide the share, so the case is never vacuous.
+        let origin = Built::Content(crate::freshness::Origin {
+            checkout: key.checkout.clone(),
+            content: crate::freshness::Content::default(),
+            content_version: 0,
+            anchor_ns: 1,
+            uncertain: std::collections::BTreeSet::new(),
+        });
+        let settle = |store: &Store, held: Lease| {
+            let record = held.record_id();
+            store.release(held, Some(origin.clone())).unwrap();
+            record
+        };
+
+        // A one-use slot of the first checkout, idle with a trusted origin.
+        let one_use = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let one_use_slot = one_use.slot_id.clone();
+        let one_use_record = settle(&store, one_use);
+
+        // A normal command of the other checkout does not take it: the idle
+        // compatible slot, its origin and its lock are all eligible, so only
+        // the class can refuse the share. It takes its own normal slot.
+        let normal =
+            lease_as(&store, &other, WorkspaceAdmission::NORMAL, true).expect("normal admission");
+        assert!(
+            normal.shared_from.is_none(),
+            "a normal command borrowed a one-use slot"
+        );
+        assert_ne!(normal.slot_id, one_use_slot);
+        let normal_record = settle(&store, normal);
+
+        let state = store.load().unwrap();
+        let class_of = |id: u64| {
+            state
+                .records
+                .iter()
+                .find(|record| record.id == id)
+                .map(|record| record.class)
+        };
+        assert_eq!(class_of(one_use_record), Some(WorkspaceClass::OneUse));
+        assert_eq!(class_of(normal_record), Some(WorkspaceClass::Normal));
+        let pair_of = |slot: &str| {
+            store
+                .ledger()
+                .unwrap()
+                .slots
+                .iter()
+                .find(|row| row.slot_id == slot)
+                .map(|row| row.incarnation.clone())
+        };
+        let one_use_pair = pair_of(&one_use_slot).expect("the one-use row");
+
+        // Same-class sharing between two one-use checkouts is allowed and
+        // relabels nothing: the record keeps its class, the ledger row keeps
+        // its pair, and only the checkout affinity moves, as it always has.
+        let shared = lease_as(
+            &store,
+            &other,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            true,
+        )
+        .expect("one-use sharing");
+        assert_eq!(shared.slot_id, one_use_slot, "a one-use slot is shareable");
+        assert_eq!(shared.shared_from.as_deref(), Some(key.checkout.as_path()));
+        store.release(shared, None).unwrap();
+        assert_eq!(pair_of(&one_use_slot), Some(one_use_pair));
+
+        let state = store.load().unwrap();
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == one_use_record)
+            .expect("the one-use record");
+        assert_eq!(record.class, WorkspaceClass::OneUse);
+        let membership = store.class_membership(&state, &store.ledger().unwrap().slots);
+        assert!(membership
+            .members
+            .iter()
+            .any(|member| member.slot_id == one_use_slot));
+        assert!(membership.unknown.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Legacy records (§5.7): a record written before this feature has no
+    /// class and reads as **protected normal**. Its next one-use command in a
+    /// temporary workspace classifies `one_use`, which differs from the
+    /// record's class, so it takes a distinct record and the legacy record
+    /// keeps its class and its slot under today's rules.
+    #[test]
+    fn a_legacy_record_reads_as_protected_normal() {
+        let (root, store, key) = class_fixture("legacy");
+        // A document written the way every pre-feature binary wrote it.
+        let legacy = format!(
+            concat!(
+                "{{\"version\":5,\"next_id\":2,\"next_use\":2,\"tickets\":[],\"cleans\":[],",
+                "\"records\":[{{\"id\":1,\"identity\":\"identity\",",
+                "\"compatibility\":\"quick-key\",\"profile\":\"quick\",",
+                "\"checkout\":\"{}\",\"phase\":\"idle\",\"process_group\":null,",
+                "\"last_used\":1,\"holder\":null,\"lease_id\":null,",
+                "\"pending_recovery\":null,\"last_used_ms\":1}}],\"recoveries\":[],",
+                "\"recorded_accounting\":\"oxide.accounting/1\"}}"
+            ),
+            key.checkout.display()
+        );
+        write_raw_state(&store, legacy.as_bytes());
+        // A real pre-feature record always owned its affinity directory; the
+        // hand-written document keeps that fact so the record is reusable.
+        fs::create_dir(store.affinity_dir(1)).unwrap();
+        fs::set_permissions(
+            store.affinity_dir(1),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.records[0].class, WorkspaceClass::Normal);
+        assert_eq!(state.records[0].class_reason, None);
+        assert_eq!(state.one_use_workspaces, None);
+
+        // A legacy record that owns a real slot keeps it: the one-use command
+        // takes a distinct record and never relabels, reuses or deletes the
+        // normal one.
+        let normal = lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("normal");
+        let normal_slot = normal.slot_id.clone();
+        store.release(normal, None).unwrap();
+        let one_use = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        assert_ne!(one_use.slot_id, normal_slot);
+        store.release(one_use, None).unwrap();
+        let state = store.load().unwrap();
+        let legacy = state
+            .records
+            .iter()
+            .find(|record| record.id == 1)
+            .expect("the legacy record");
+        assert_eq!(legacy.class, WorkspaceClass::Normal);
+        assert_eq!(legacy.class_reason, None);
+        let one_use = state
+            .records
+            .iter()
+            .find(|record| record.class == WorkspaceClass::OneUse)
+            .expect("the one-use record");
+        assert_ne!(one_use.id, 1, "the legacy record was relabelled");
+        assert_eq!(
+            one_use.class_reason.as_deref(),
+            Some("a temporary workspace")
+        );
+        let slots = store.ledger().unwrap().slots;
+        assert!(
+            slots.iter().any(|slot| slot.slot_id == normal_slot),
+            "the legacy record lost its slot"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Membership and class-unknown derivation (§5.5, §5.6): member rows come
+    /// from one-use records, an unowned ledger row is **unknown** and never a
+    /// member, and the two sets account for every one-use-or-unknown row once.
+    #[test]
+    fn class_membership_separates_one_use_rows_from_class_unknown_rows() {
+        let (root, store, key) = class_fixture("membership");
+        let normal = lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("normal");
+        let normal_record = normal.record_id();
+        store.release(normal, None).unwrap();
+        let one_use = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let one_use_slot = one_use.slot_id.clone();
+        store.release(one_use, None).unwrap();
+
+        let state = store.load().unwrap();
+        let slots = store.ledger().unwrap().slots;
+        let membership = store.class_membership(&state, &slots);
+        assert_eq!(membership.members.len(), 1);
+        assert_eq!(membership.members[0].slot_id, one_use_slot);
+        assert!(membership.unknown.is_empty());
+
+        // Forgetting the normal record leaves its ledger row with no owning
+        // record: that row is class-unknown, never a member and never quota.
+        let mut state = store.load().unwrap();
+        store.forget_record(&mut state, normal_record);
+        let slots = store.ledger().unwrap().slots;
+        let membership = store.class_membership(&state, &slots);
+        assert_eq!(membership.members.len(), 1);
+        assert_eq!(membership.unknown.len(), 1);
+        assert_ne!(membership.unknown[0].slot_id, one_use_slot);
+        // Together they account for every ledger row exactly once.
+        assert_eq!(
+            membership.members.len() + membership.unknown.len(),
+            slots.len()
         );
         fs::remove_dir_all(root).unwrap();
     }
