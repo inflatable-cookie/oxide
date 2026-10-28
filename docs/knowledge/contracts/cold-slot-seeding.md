@@ -6,9 +6,11 @@ oxide#137 under the ROOT design-first rebind (standing decision `8ddaa98d`).
 The frozen protocol is implemented: the library custody calls, the front door
 transaction, the debug-only proof controls and the 24-case proof script exist
 at the heads built by those tasks. The default-on flip (`COLD_SEED_QUALIFIED`)
-is the slice's last commit; the merge is held until the owner-activated
-uncounted diagnostic, one counted author native and one separately activated
-independent reviewer native pass at the exact merge head. No live pool, installation, consumer adoption or real-drive
+is the isolated one-line product commit `bd61f7f`; later proof-script-only
+corrections do not change it, so it stays in the merge head and is verified by
+the reviewer there. The merge is held until the owner-activated uncounted
+diagnostic, one counted author native and one separately activated independent
+reviewer native pass at the exact merge head. No live pool, installation, consumer adoption or real-drive
 qualification is authorized by this record.
 
 **Revision 13** applies Supervisor A2′ at head `c022dc6` (review comment
@@ -1859,7 +1861,8 @@ This design mints none of that.
 > apparatus and its removable-media native case, as one slice. This knowledge
 > record is folded into that slice. The frozen behaviour of §§6–8 is unchanged.
 > The product now implements slices 1–4; slice 5 is this record and the
-> workflow/vision truth, with the default flip as the final commit.
+> workflow/vision truth, with the default flip as the isolated one-line product
+> commit `bd61f7f` (not necessarily the last proof-script commit).
 
 ## 16. Proof plan
 
