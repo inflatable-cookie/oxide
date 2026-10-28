@@ -563,7 +563,9 @@ soft byte budget and the 95 GB registered reserve are unchanged.
 cap: paths 1024 bytes, holder 128, lease ID 160, slot directory component 80.
 A compact JSON ledger with every field at its ceiling, escaped sixfold and
 with 20-digit integers, is proven by a unit test to fit the cap and round-trip;
-at the 256-slot ceiling it is about 3.9 MB. Control state is bounded
+at the 256-slot ceiling the measured worst-valid ledger is 3,968,466 bytes
+(every numeric field at its full 20-digit width and every string at its cap).
+Control state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
 tickets, 128 clean marks, 16 recoveries, 16 flushes, per-object compact
 ceilings (record 40 KiB, recovery 9 KiB, holder 5 KiB, lost 8 KiB, flush
@@ -670,10 +672,11 @@ current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The worst-valid
 ledger/control serialization, escaped round-trip and oversized-field refusals
-are unit tests in `effigy test rust`, as is a fixed 50 ms ceiling on a
+are unit tests in `effigy test rust`, as is a fixed 500 ms ceiling on a
 whole 128-slot and 256-slot recorded-ledger round trip (bounded read, ranked
-ordering and validated write bytes; the durable `fsync` is host I/O and lies
-outside the gate), reporting both measured figures. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
+ordering, the actual atomic write and its read-back; the ceiling is generous
+for the included `fsync`, which is host I/O), reporting both measured
+figures. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
 limits with `--diagnostic`: an uncounted keep-going collection that records
 reached/completed/failed/skipped phases and the latched first fault in a
 bounded `qualified: false` receipt, continues only into phases whose declared

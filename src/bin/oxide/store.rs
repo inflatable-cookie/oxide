@@ -4278,8 +4278,10 @@ impl Store {
         let view = self.ledger()?;
         // The admission lock is held, so this membership is stable: a pool at
         // the legacy ceiling fences its control state before the admission
-        // below can record the 129th slot (oxide#177).
-        self.fence_raised_slot_ceiling(view.slots.len())?;
+        // below can record the 129th slot (oxide#177). The fence is set on
+        // this attempt's in-memory state, so every later save in this
+        // admission carries it instead of overwriting it with a stale copy.
+        self.fence_raised_slot_ceiling(&mut state, view.slots.len())?;
         let has_slot = |record: &Record| {
             let project = self.affinity_dir(record.id);
             view.slots.iter().any(|slot| slot.project == project)
@@ -5109,20 +5111,21 @@ impl Store {
     ///
     /// Called under this pool's admission lock with that lock's own membership
     /// snapshot, so a command that adds the 129th slot cannot race a peer that
-    /// read the count one slot lower. Nothing is written below the legacy
-    /// 128-slot ceiling: a smaller pool keeps version 5, which an older binary
-    /// still reads. The fence is forward-only, so its version survives every
-    /// later `save`.
-    fn fence_raised_slot_ceiling(&self, slots: usize) -> Result<(), String> {
-        if slots < oxide_storage::lease::LEGACY_MAX_SLOTS {
-            return Ok(());
-        }
-        let mut state = self.load()?;
-        if state.slot_ceiling.as_deref() == Some(SLOT_CEILING_FENCE) {
+    /// read the count one slot lower. The fence is set on the caller's
+    /// in-memory state as well as persisted, because the caller keeps mutating
+    /// and saving that same state before the library write; a separately saved
+    /// fence would be overwritten by the caller's stale copy. Nothing is
+    /// written below the legacy 128-slot ceiling: a smaller pool keeps version
+    /// 5, which an older binary still reads. The fence is forward-only, so its
+    /// version survives every later `save`.
+    fn fence_raised_slot_ceiling(&self, state: &mut State, slots: usize) -> Result<(), String> {
+        if slots < oxide_storage::lease::LEGACY_MAX_SLOTS
+            || state.slot_ceiling.as_deref() == Some(SLOT_CEILING_FENCE)
+        {
             return Ok(());
         }
         state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
-        self.save(&state)
+        self.save(state)
     }
 
     /// Make the version-5 recorded-accounting fence durable. Nothing is
@@ -9979,7 +9982,8 @@ pub(crate) mod tests {
         assert!(state.slot_ceiling.is_none());
 
         let below = oxide_storage::lease::LEGACY_MAX_SLOTS - 1;
-        store.fence_raised_slot_ceiling(below).unwrap();
+        let mut state = store.load().unwrap();
+        store.fence_raised_slot_ceiling(&mut state, below).unwrap();
         let state = store.load().unwrap();
         assert_eq!(
             state.version, RECORDED_ACCOUNTING_STATE_VERSION,
@@ -9987,18 +9991,24 @@ pub(crate) mod tests {
         );
         assert!(state.slot_ceiling.is_none());
 
+        // The fence is set on the caller's own state: `attempt` keeps mutating
+        // and saving that state before the library write, so a later save of it
+        // must carry the fence rather than overwriting it with a stale copy.
+        let mut state = store.load().unwrap();
         store
-            .fence_raised_slot_ceiling(oxide_storage::lease::LEGACY_MAX_SLOTS)
+            .fence_raised_slot_ceiling(&mut state, oxide_storage::lease::LEGACY_MAX_SLOTS)
             .unwrap();
-        let state = store.load().unwrap();
-        assert_eq!(state.version, STATE_VERSION);
         assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
-
-        // Forward-only: the next ordinary save keeps the fenced version.
         store.save(&state).unwrap();
         let stored = store.load().unwrap();
         assert_eq!(stored.version, STATE_VERSION);
         assert_eq!(stored.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+
+        // Forward-only: another ordinary save keeps the fenced version too.
+        store.save(&stored).unwrap();
+        let again = store.load().unwrap();
+        assert_eq!(again.version, STATE_VERSION);
+        assert_eq!(again.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
         fs::remove_dir_all(root).unwrap();
     }
 

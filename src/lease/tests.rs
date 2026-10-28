@@ -2361,14 +2361,20 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let lease_id = "\u{1}".repeat(MAX_LEASE_ID_BYTES);
     // The worst valid ledger is the raised-ceiling representation (oxide#177):
     // every slot idle with a closed observation whose generation fence is at
-    // its own cap, so the bound covers the record (oxide#146).
+    // its own cap, so the bound covers the record (oxide#146). Every numeric
+    // field is at its widest too: 20-digit ids, incarnations and ranks and the
+    // maximum `u64` in every recorded figure, so the measured maximum is the
+    // real worst-valid serialization rather than a short-number fixture.
     let mut slots = Vec::new();
-    for id in 1..=super::MAX_SLOTS as u64 {
-        let digits = id.to_string().len();
-        let leaf = format!("{}-{id}", "b".repeat(80 - digits - 1));
+    for index in 0..super::MAX_SLOTS as u64 {
+        let id = u64::MAX - 1 - index;
+        let rank = u64::MAX - 1 - index;
+        let id_text = id.to_string();
+        assert_eq!(id_text.len(), 20, "fixture ids must use the full width");
+        let leaf = format!("{}-{id_text}", "b".repeat(80 - id_text.len() - 1));
         slots.push(serde_json::json!({
             "id": id,
-            "incarnation": id,
+            "incarnation": u64::MAX,
             "state": "idle",
             "project": path,
             "workspace": path,
@@ -2377,7 +2383,7 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
             "lease_id": null,
             "last_lease_id": lease_id,
             "dir": format!("{}/{leaf}", "a".repeat(80)),
-            "rank": 0,
+            "rank": rank,
             "recorded": {
                 "for_lease": lease_id,
                 "unique_bytes": u64::MAX,
@@ -2391,10 +2397,10 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         "version": 1,
         "store_id": config["store_id"],
         "cap_bytes": 64 * 1024 * 1024,
-        "next_slot": 257,
-        "next_lease": 1_000_000,
+        "next_slot": u64::MAX,
+        "next_lease": u64::MAX,
         "capacity_policy": RAISED_CAPACITY_POLICY_VERSION,
-        "next_rank": 1,
+        "next_rank": u64::MAX,
         "slots": slots,
     });
     let input = serde_json::to_vec(&ledger).expect("worst valid ledger");
@@ -2425,69 +2431,90 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(status.slots.len(), super::MAX_SLOTS);
 
     // The same shape with one field over its new cap refuses the revised
-    // write and leaves the stored bytes untouched.
-    let before = fs::read(pool.join("ledger.json")).expect("stored ledger");
-    let mut oversized = ledger.clone();
-    let mut slot = ledger["slots"][0].clone();
-    slot["holder"] = serde_json::json!("x".repeat(MAX_HOLDER_BYTES + 1));
-    oversized["slots"] = serde_json::json!([slot]);
-    oversized["next_slot"] = serde_json::json!(2);
-    let bytes = serde_json::to_vec(&oversized).expect("oversized ledger");
-    fs::write(pool.join("ledger.json"), &bytes).expect("legacy oversized field");
+    // write and leaves the stored bytes untouched. The negative fixtures use
+    // ordinary (not maximum-width) numbers so the admission reaches the field
+    // check instead of stopping at exhausted rank headroom.
     let project = fx.dir("project");
     let workspace = fx.dir("workspace");
-    assert!(matches!(
-        lease_injected(request(&pool, &project, &workspace, "holder")),
-        Err(LeaseError::UnknownAccounting)
-    ));
-    assert_eq!(
-        fs::read(pool.join("ledger.json")).expect("untouched"),
-        bytes,
-        "an oversized legacy field was truncated or rewritten"
-    );
-    fs::write(pool.join("ledger.json"), &before).expect("restore");
-
-    // A record whose generation fence is over its cap refuses the revised
-    // write too, with the stored bytes untouched.
-    let before = fs::read(pool.join("ledger.json")).expect("stored ledger");
-    let mut oversized = ledger.clone();
-    let mut slot = ledger["slots"][0].clone();
-    slot["recorded"]["for_lease"] = serde_json::json!("x".repeat(MAX_LEASE_ID_BYTES + 1));
-    oversized["slots"] = serde_json::json!([slot]);
-    oversized["next_slot"] = serde_json::json!(2);
-    let bytes = serde_json::to_vec(&oversized).expect("oversized record ledger");
-    fs::write(pool.join("ledger.json"), &bytes).expect("oversized record field");
-    assert!(matches!(
-        lease_injected(request(&pool, &project, &workspace, "holder")),
-        Err(LeaseError::UnknownAccounting)
-    ));
-    assert_eq!(
-        fs::read(pool.join("ledger.json")).expect("untouched"),
-        bytes,
-        "an oversized record field was truncated or rewritten"
-    );
-    fs::write(pool.join("ledger.json"), &before).expect("restore");
+    let one_slot = |holder: &str, for_lease: &str| {
+        serde_json::json!({
+            "version": 1,
+            "store_id": config["store_id"],
+            "cap_bytes": 64 * 1024 * 1024,
+            "next_slot": 2,
+            "next_lease": 1_000_000,
+            "capacity_policy": super::CAPACITY_POLICY_VERSION,
+            "next_rank": 2,
+            "slots": [{
+                "id": 1,
+                "incarnation": 1,
+                "state": "idle",
+                "project": path,
+                "workspace": path,
+                "profile": "full-debug",
+                "holder": holder,
+                "lease_id": null,
+                "last_lease_id": lease_id,
+                "dir": format!("{}/{}", "a".repeat(80), format!("{}-1", "b".repeat(78))),
+                "rank": 1,
+                // Small figures: an enormous recorded size would trigger
+                // byte-pressure eviction of this very slot before the field
+                // check the case is about.
+                "recorded": {
+                    "for_lease": for_lease,
+                    "unique_bytes": 4_096,
+                    "logical_bytes": 8_192,
+                    "entries": 16,
+                    "at_ms": 1,
+                },
+            }],
+        })
+    };
+    for (label, document) in [
+        (
+            "an oversized holder",
+            one_slot(&"x".repeat(MAX_HOLDER_BYTES + 1), &lease_id),
+        ),
+        (
+            "an oversized record generation fence",
+            one_slot("holder", &"x".repeat(MAX_LEASE_ID_BYTES + 1)),
+        ),
+    ] {
+        let before = fs::read(pool.join("ledger.json")).expect("stored ledger");
+        let bytes = serde_json::to_vec(&document).expect("oversized ledger");
+        fs::write(pool.join("ledger.json"), &bytes).expect("oversized field fixture");
+        let outcome = lease_injected(request(&pool, &project, &workspace, "holder"));
+        assert!(
+            matches!(outcome, Err(LeaseError::UnknownAccounting)),
+            "{label} did not refuse the revised write: {outcome:?}"
+        );
+        assert_eq!(
+            fs::read(pool.join("ledger.json")).expect("untouched"),
+            bytes,
+            "{label} was truncated or rewritten"
+        );
+        fs::write(pool.join("ledger.json"), &before).expect("restore");
+    }
 }
 
-/// oxide#177's accounting-cost gate as one fixed measurement: one complete
-/// round trip of the real recorded representation — the bounded ledger read,
-/// the ranked ordering admission uses, and the exact bytes a revised write
-/// validates and serializes — at the legacy 128-slot ceiling and at the raised
+/// oxide#177's accounting-cost gate as one fixed measurement: one whole round
+/// trip of the real recorded representation — the bounded ledger read, the
+/// ranked ordering admission uses, and the actual atomic ledger write that
+/// reads its result back — at the legacy 128-slot ceiling and at the raised
 /// 256-slot ceiling. Both figures are printed and each whole round trip must
 /// stay under one generous fixed test ceiling.
 ///
-/// The atomic file replacement's durable `fsync` is deliberately outside the
-/// measured window: it is host I/O latency (hundreds of milliseconds on a
-/// loaded machine, while the representation work below stays in single-digit
-/// milliseconds), and gating it would measure the host rather than the code.
-/// The representation work is what a whole-payload walk or a per-slot
-/// quadratic regression would blow up, and the fixed ceiling still catches
-/// that. This is not a benchmark or a claim about a large live pool.
+/// The round trip includes the atomic replacement's durable `fsync`, which is
+/// host I/O and dominates the figure on a loaded machine, so the ceiling is
+/// 500 ms: a fixed sanity bound on the requested write round trip, not on the
+/// representation work alone. It still catches a whole-payload walk or a
+/// per-slot quadratic regression, which is what the gate is for. This is not a
+/// benchmark or a claim about a large live pool.
 #[test]
 fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
     use std::time::{Duration, Instant};
 
-    const CEILING: Duration = Duration::from_millis(50);
+    const CEILING: Duration = Duration::from_millis(500);
     let fx = Fixture::new("ledger-cost");
     let pool = fx.dir("pool");
     create_injected(&pool, 64 * 1024 * 1024).expect("init");
@@ -2541,12 +2568,12 @@ fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
     let mut measured = Vec::new();
     for slots in [super::LEGACY_MAX_SLOTS, super::MAX_SLOTS] {
         let input = serde_json::to_vec(&documented(slots)).expect("ledger");
-        // The real write once, so the on-disk ledger is this fixture's shape.
-        super::pool::write_ledger_bytes_injected(&pool, &input).expect("fixture write");
+        // Warm the code paths once (this write is not measured).
+        super::pool::write_ledger_bytes_injected(&pool, &input).expect("warm write");
         // Whole round trips for this size: read the recorded ledger, rank it
-        // exactly as admission does, then produce the bytes a revised write
-        // validates and serializes. The gate is the whole round trip, not its
-        // parts; the best of three keeps one scheduler stall from turning a
+        // exactly as admission does, then perform the actual atomic ledger
+        // write and read its result back. The gate is the whole round trip, not
+        // its parts; the best of three keeps one scheduler stall from turning a
         // generous fixed ceiling into a flaky assertion.
         let mut best = Duration::MAX;
         for _ in 0..3 {
@@ -2561,12 +2588,11 @@ fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
                 .collect();
             order.sort();
             assert_eq!(order.first(), Some(&(1, 1)));
-            let written = super::pool::ledger_write_bytes_injected(&input).expect("write bytes");
-            assert!(!written.is_empty());
+            super::pool::write_ledger_bytes_injected(&pool, &input).expect("valid write");
             best = best.min(started.elapsed());
         }
         println!(
-            "{slots}-slot ledger round trip, best of 3 (read, rank, validated write bytes): {} us",
+            "{slots}-slot ledger round trip, best of 3 (read, rank, atomic write and read-back): {} us",
             best.as_micros()
         );
         assert!(best < CEILING, "{slots}-slot round trip took {best:?}");

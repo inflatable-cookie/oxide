@@ -165,7 +165,8 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
         if name.startswith(("OXIDE_", "XDG_", "SCCACHE_", "CARGO_BUILD_", "CARGO_TARGET_")):
             env.pop(name, None)
         elif name in ("CARGO", "CARGO_HOME", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
-                      "RUSTUP_TOOLCHAIN", "CARGO_NET_OFFLINE", "CARGO_TERM_COLOR"):
+                      "RUSTUP_TOOLCHAIN", "CARGO_NET_OFFLINE", "CARGO_TERM_COLOR",
+                      "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
             env.pop(name, None)
     env.update(
         {
@@ -180,6 +181,10 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
             "CARGO_BUILD_RUSTC_WRAPPER": "",
+            # One frozen compiler-flag environment for every fixture child: an
+            # inherited RUSTFLAGS or encoded `--config` value would change the
+            # fixtures behind the proof's back.
+            "RUSTFLAGS": "",
             "RUSTUP_HOME": real_rustup,
             "RUSTUP_TOOLCHAIN": fm.BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
@@ -232,7 +237,7 @@ def stage(proof: Proof, repo: str) -> str:
             "CARGO", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR",
             "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
-            "RUSTUP_TOOLCHAIN",
+            "RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
         ):
             env.pop(name, None)
     target = os.path.join(ROOT, "stage-target")
@@ -245,6 +250,9 @@ def stage(proof: Proof, repo: str) -> str:
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
             "CARGO_BUILD_RUSTC_WRAPPER": "",
+            # The premise checklist's frozen compiler flags: staging never
+            # inherits the caller's RUSTFLAGS or an encoded RUSTFLAGS value.
+            "RUSTFLAGS": "",
             "RUSTUP_TOOLCHAIN": fm.BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
             "CARGO_NET_OFFLINE": "true",

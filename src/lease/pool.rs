@@ -4194,18 +4194,6 @@ pub(super) fn write_ledger_bytes_injected(
     serde_json::to_vec(&stored).map_err(|error| LeaseError::Io(error.to_string()))
 }
 
-/// Test-only: the exact bytes a revised write persists, after the same strict
-/// parse and field validation that write performs. Nothing is written, so a
-/// cost measurement can cover the ledger representation's read, rank and write
-/// work without gating the host's durable-fsync latency (oxide#177).
-#[cfg(test)]
-pub(super) fn ledger_write_bytes_injected(bytes: &[u8]) -> Result<Vec<u8>, LeaseError> {
-    let ledger: Ledger =
-        serde_json::from_slice(bytes).map_err(|_| LeaseError::UnknownAccounting)?;
-    validate_ledger_write(&ledger)?;
-    serde_json::to_vec(&ledger).map_err(|error| LeaseError::Io(error.to_string()))
-}
-
 /// Read-only, before the pool lock is created or taken: a pool holding the
 /// retired image or receipt, or whose config records any backend but the
 /// two current ones, refuses untouched. A missing config is left to the
