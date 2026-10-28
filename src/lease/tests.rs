@@ -505,7 +505,10 @@ fn legacy_ledger_reads_without_migrating_and_the_first_revised_write_fences_it()
         .expect("first revised grant");
     let after_grant = fs::read(pool.join("ledger.json")).expect("fenced ledger");
     let stored: serde_json::Value = serde_json::from_slice(&after_grant).expect("json");
-    assert_eq!(stored["capacity_policy"], serde_json::json!(2));
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(super::CAPACITY_POLICY_VERSION)
+    );
     assert_eq!(stored["next_rank"], serde_json::json!(2));
     assert_eq!(stored["slots"][0]["rank"], serde_json::json!(1));
     status_injected(&pool).expect("fenced ledger reads");
@@ -4190,13 +4193,26 @@ fn replay_concludes_an_unlinked_file_in_the_2255_capture_shape() {
     let mut directory = parent.join(&plan.private);
     let mut chain = Vec::new();
     let mut records = Vec::new();
-    for name in ["build", "debug", "deps", "arrow_schema.rcgu.o"] {
+    for name in [
+        "build",
+        "debug",
+        "deps",
+        "arrow_schema-8fafd6ba14ed7d09.arrow_schema.ec65cfc77a09ada8-cgu.13.rcgu.o",
+    ] {
         let leaf = directory.join(name);
         if name.ends_with(".o") {
             fs::write(&leaf, b"fixture").expect("file");
         } else if !leaf.exists() {
             fs::create_dir(&leaf).expect("directory");
         }
+        let mode = if name == "build" {
+            0o700
+        } else if name.ends_with(".o") {
+            0o644
+        } else {
+            0o755
+        };
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(mode)).expect("incident mode");
         let held = File::open(&directory).expect("directory descriptor");
         let original = std::ffi::CString::new(name).expect("name");
         let capture = crate::owned_delete::capture_entry(held.as_fd(), &original).expect("capture");
@@ -4293,10 +4309,34 @@ fn blocked_eviction_is_charged_but_does_not_block_other_admissions() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
 }
 
-/// A competing admission waits for the eviction's lock instead of reading
-/// its in-flight journal as unknown accounting.
+/// A replacement at the recorded name is outside the verified private root;
+/// its bytes remain in the pool-scope walk and cannot be hidden by the charge.
 #[test]
-fn a_competing_admission_waits_for_an_inflight_eviction() {
+fn blocked_capture_collision_is_counted_as_foreign_scope() {
+    let fixture = Fixture::new("blocked-collision-bytes");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-collision-bytes");
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    fs::create_dir(&slot_path).expect("collision");
+    fs::write(slot_path.join("foreign"), vec![1_u8; 9 * 1024 * 1024]).expect("foreign bytes");
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    let result = lease_injected(request(&pool, &project, &workspace, "other"));
+    assert!(
+        matches!(result, Err(LeaseError::Full)),
+        "collision bytes must be charged: {result:?}"
+    );
+    assert!(slot_path.join("foreign").is_file());
+    assert!(slot_path
+        .parent()
+        .expect("parent")
+        .join(plan.private)
+        .is_dir());
+}
+
+/// An eviction held past the second admission's lock deadline returns Busy,
+/// never unknown accounting; once the first finishes, admission succeeds.
+#[test]
+fn a_competing_admission_times_out_on_an_inflight_eviction() {
     use std::sync::mpsc;
     use std::time::Duration;
     let fixture = Fixture::new("concurrent-eviction");
@@ -4327,16 +4367,17 @@ fn a_competing_admission_waits_for_an_inflight_eviction() {
         let result = lease_injected(second_request);
         done_tx.send(result).expect("report result");
     });
-    let waiting = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
+    let second_result = done_rx.recv_timeout(Duration::from_secs(8));
     resume_tx.send(()).expect("resume eviction");
     let first_result = first.join().expect("first worker");
-    let second_result = done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("second worker");
     second.join().expect("second join");
-    assert!(waiting, "second admission must wait for the held lock");
+    assert!(
+        matches!(second_result, Ok(Err(LeaseError::Busy))),
+        "second admission: {second_result:?}"
+    );
     assert!(first_result.is_ok(), "first admission: {first_result:?}");
-    assert!(second_result.is_ok(), "second admission: {second_result:?}");
+    let retry = lease_injected(request(&pool, &second_project, &workspace, "retry"));
+    assert!(retry.is_ok(), "admission after eviction: {retry:?}");
 }
 
 /// A panic after the product widened the captured root's mode restores the

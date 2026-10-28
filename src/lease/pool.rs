@@ -14,7 +14,7 @@ use super::{
     ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH,
     ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CAPACITY_POLICY_VERSION, CONFIG_NAME,
     LEASE_VERSION, LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{
@@ -742,7 +742,7 @@ pub mod managed {
 
     /// [`lease`], with the reuse walk's measurement of the slot it took.
     pub fn lease_measured(request: LeaseRequest) -> Result<Leased, LeaseError> {
-        Pool::open(&request.pool)?.lease(&request)
+        Pool::open_for_lease(&request.pool)?.lease(&request)
     }
 
     pub fn release(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
@@ -1065,10 +1065,22 @@ impl Pool {
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
     pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
+        Self::open_with_lock(root, false)
+    }
+
+    fn open_for_lease(root: &Path) -> Result<Self, LeaseError> {
+        Self::open_with_lock(root, true)
+    }
+
+    fn open_with_lock(root: &Path, bounded: bool) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
-        let lock = lock_pool(&root)?;
+        let lock = if bounded {
+            lock_pool_inner(&root, true, Some(Duration::from_secs(5)))?
+        } else {
+            lock_pool(&root)?
+        };
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
         let backing = match config.backend.as_str() {
@@ -1200,7 +1212,9 @@ impl Pool {
         // revised write, atomically with whatever needed it. The step is
         // one-way: an older binary refuses a version-2 ledger before any
         // mutation, which is why the front door writes its control fence first.
-        if self.ledger.capacity_policy == Some(LEGACY_CAPACITY_POLICY_VERSION) {
+        if self.ledger.capacity_policy == Some(LEGACY_CAPACITY_POLICY_VERSION)
+            || self.ledger.capacity_policy == Some(PREVIOUS_CAPACITY_POLICY_VERSION)
+        {
             self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
         }
         if self.ledger.capacity_policy != Some(CAPACITY_POLICY_VERSION) {
@@ -4068,10 +4082,10 @@ fn refuse_occupied_init_directory(pool: &Path) -> Result<(), LeaseError> {
 }
 
 fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
-    lock_pool_inner(pool, true)
+    lock_pool_inner(pool, true, None)
 }
 
-fn lock_pool_inner(pool: &Path, create: bool) -> Result<File, LeaseError> {
+fn lock_pool_inner(pool: &Path, create: bool, wait: Option<Duration>) -> Result<File, LeaseError> {
     let path = pool.join(LOCK_NAME);
     let existing = match fs::symlink_metadata(&path) {
         Ok(metadata) => {
@@ -4101,6 +4115,25 @@ fn lock_pool_inner(pool: &Path, create: bool) -> Result<File, LeaseError> {
             .is_some_and(|before| before.dev() != metadata.dev() || before.ino() != metadata.ino())
     {
         return Err(LeaseError::UnsafePath("lock file must be private"));
+    }
+    if let Some(wait) = wait {
+        let deadline = Instant::now() + wait;
+        loop {
+            // SAFETY: the live descriptor owns the lock until dropped.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(file);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock
+                && error.kind() != std::io::ErrorKind::Interrupted
+            {
+                return Err(io_error(error));
+            }
+            if Instant::now() >= deadline {
+                return Err(LeaseError::Busy);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     // SAFETY: `file` is open for the pool lock; flock holds until File drop.
     let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -4135,7 +4168,9 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
             }
         }
         (Some(policy), Some(next)) => {
-            if (policy != LEGACY_CAPACITY_POLICY_VERSION && policy != CAPACITY_POLICY_VERSION)
+            if (policy != LEGACY_CAPACITY_POLICY_VERSION
+                && policy != PREVIOUS_CAPACITY_POLICY_VERSION
+                && policy != CAPACITY_POLICY_VERSION)
                 || next == 0
             {
                 return Err(LeaseError::UnknownAccounting);
@@ -4160,7 +4195,11 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         if let Some(dir) = &slot.dir {
             split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
         }
-        if slot.recorded.is_some() && slot.state == SlotPersistState::Held {
+        if slot.recorded.is_some()
+            && (slot.state == SlotPersistState::Held
+                || (slot.state == SlotPersistState::Evicting
+                    && ledger.capacity_policy != Some(CAPACITY_POLICY_VERSION)))
+        {
             return Err(LeaseError::UnknownAccounting);
         }
         // A capture record belongs to a recorded deletion and nowhere else,
@@ -5194,7 +5233,7 @@ mod recorded_ledger_tests {
         .is_ok());
         // An unknown fence value refuses, and a legacy ledger holding a record
         // refuses too.
-        assert!(validate_ledger_read(&ledger(Some(3), 1, SlotPersistState::Idle, false)).is_err());
+        assert!(validate_ledger_read(&ledger(Some(4), 1, SlotPersistState::Idle, false)).is_err());
         assert!(validate_ledger_read(&ledger(None, 0, SlotPersistState::Idle, true)).is_err());
     }
 

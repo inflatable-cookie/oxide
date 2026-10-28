@@ -33,8 +33,9 @@ after the caller's listing, before the removal:
   first project's idle whole slot with no race armed. The slot *leaf* is gone
   and no deletion is pending. Fixture premise.
 - `lease_unlinked_file`: stop immediately after a nested `filler` unlink,
-  verify its journal record remains, then admit an unrelated build and check
-  replay removed the victim.
+  verify its journal record remains, admit an unrelated build while a
+  fixture collision blocks recovery, remove that collision, and check that
+  the next admission removes the victim.
 - `lease_metadata`: the same eviction raced with `.DS_Store`/`._*`. The
   eviction completes and the evidence records the firing.
 - `lease_foreign`: raced with an ordinary file. The admission refuses, the slot
@@ -111,7 +112,9 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_DEADLINE_NS`,
    `OXIDE_PROOF_EVIDENCE` (required for the hook guard) and, per case,
    `OXIDE_TEST_FINDER_RACE`, or the scoped `OXIDE_TEST_CAPTURE_UNLINK_STOP`
-   for the nested-file case.
+   for the nested-file case. That case uses the existing debug-only
+   `OXIDE_TEST_BUDGET_BYTES` to admit below a larger temporary budget while
+   the captured slot is blocked.
 4. automatic adoption: `workspace()` makes a real private Git repository whose
    `.gitignore` covers `target`, so the first conversion is eligible; each
    prune case then asserts the adopted owned root, the checkout's member link
@@ -717,12 +720,25 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
             for entry in slots[0]["capture"].get("captures", [])
         ):
             fail(f"{case}: missing nested file capture in ledger")
-        replay = run([oxide, "check"], cwd=workspace(env, base, "c"), env=env)
+        private_root = os.path.join(os.path.dirname(victim), slots[0]["capture"]["root"]["private"])
+        if not os.path.isdir(private_root) or os.path.exists(victim):
+            fail(f"{case}: private root or absent original is not as recorded")
+        # A fixture-owned collision blocks put-back while the unrelated build
+        # is admitted. Give it enough budget for the recorded blocked charge.
+        os.mkdir(victim)
+        roomy = dict(env)
+        roomy["OXIDE_TEST_BUDGET_BYTES"] = str(64 * MIB)
+        checkout = workspace(env, base, "c")
+        other = run([oxide, "check"], cwd=checkout, env=roomy)
+        if other.returncode or not os.path.isdir(private_root):
+            fail(f"{case}: unrelated admission did not keep the blocked capture: {other.stderr[-1500:]}")
+        os.rmdir(victim)
+        replay = run([oxide, "check"], cwd=checkout, env=roomy)
         if replay.returncode:
-            fail(f"{case}: unrelated replay admission failed: {replay.stderr[-1500:]}")
-        if victim in slot_leaves(env["OXIDE_POOL"]):
+            fail(f"{case}: subsequent replay failed: {replay.stderr[-1500:]}")
+        if os.path.exists(private_root) or victim in slot_leaves(env["OXIDE_POOL"]):
             fail(f"{case}: victim was not removed by replay")
-        return f"{case}: stopped after unlink, unrelated admission replayed the eviction"
+        return f"{case}: admitted unrelated work while blocked; next admission completed eviction"
     after = slot_leaves(env["OXIDE_POOL"])
     status = run([oxide, "status"], cwd=base, env=env)
     pending = "recorded deletion pending reconciliation" in status.stdout

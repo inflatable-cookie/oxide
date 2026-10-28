@@ -814,22 +814,27 @@ pub fn sigpipe_ignored() -> bool {
 // Locking under a deadline
 
 /// Take an exclusive `flock`, honouring the admission window. Unbudgeted
-/// commands keep the existing blocking call; budgeted ones poll the existing
-/// nonblocking primitive so an expired window never waits forever.
+/// commands keep the existing blocking call except at the admission gate,
+/// whose per-attempt wait is bounded even without a user budget.
 pub fn lock(file: &std::fs::File, what: &str) -> Result<(), String> {
-    match admission_deadline() {
-        None => crate::store::flock_blocking(file),
-        Some(_) => loop {
-            if crate::store::flock_nonblocking(file)? {
-                return Ok(());
-            }
-            if admission_expired() {
-                return Err(format!(
-                    "the admission budget expired while waiting for the {what} lock"
-                ));
-            }
-            std::thread::sleep(POLL);
-        },
+    let admission_lock_limit =
+        (what == "admission").then(|| Instant::now() + Duration::from_secs(5));
+    if admission_deadline().is_none() && admission_lock_limit.is_none() {
+        return crate::store::flock_blocking(file);
+    }
+    loop {
+        if crate::store::flock_nonblocking(file)? {
+            return Ok(());
+        }
+        if admission_expired() {
+            return Err(format!(
+                "the admission budget expired while waiting for the {what} lock"
+            ));
+        }
+        if admission_lock_limit.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("the admission lock is busy; retry the command".to_owned());
+        }
+        std::thread::sleep(POLL);
     }
 }
 

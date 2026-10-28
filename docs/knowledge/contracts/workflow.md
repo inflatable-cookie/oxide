@@ -3875,7 +3875,12 @@ Rules:
   at the journaled private root only when its recorded identity verifies.
   Status names pending slot IDs, and the read-only drive description names them
   in its pending-reconciliation detail. Other independently owned bytes still
-  count, and count ceilings still include the pending slot.
+  count, and count ceilings still include the pending slot. The admission
+  lock and the lease library's pool lock each wait at most five seconds per
+  attempt; an occupied lock reports busy instead of unknown accounting.
+  Before writing this new ledger shape, the mutating front door publishes a
+  version-7 control fence; the library uses capacity-policy version 3, so
+  older readers refuse or hand off before interpreting an `Evicting` size.
 - **Watchdog.** Only on a directory pool, only while Oxide supervises a
   leased Cargo group (build and `run` build, `test` execution, building
   passthrough). It samples `statfs` `f_bavail` of the payload directory

@@ -57,8 +57,11 @@ pub const MAX_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
 /// presence tells an older binary that this ledger uses ranked idle
 /// replacement; the fence is never removed. Version 2 (oxide#146) adds the
 /// closed per-slot size record, so a version-2 ledger also refuses an older
-/// binary's `deny_unknown_fields` parse.
-pub const CAPACITY_POLICY_VERSION: u32 = 2;
+/// binary's `deny_unknown_fields` parse. Version 3 retains the closed size
+/// across an eviction so older readers refuse the changed state semantics.
+pub const CAPACITY_POLICY_VERSION: u32 = 3;
+/// Version 2 recorded only idle sizes and remains readable.
+pub const PREVIOUS_CAPACITY_POLICY_VERSION: u32 = 2;
 /// The version-1 fence (oxide#118) stays readable and is upgraded by the next
 /// revised write; a version-1 ledger never carries a record.
 pub const LEGACY_CAPACITY_POLICY_VERSION: u32 = 1;
