@@ -167,11 +167,6 @@ impl Production {
         if held.reused || !matches!(held.prior, crate::freshness::Prior::Fresh) {
             return Err(PreparationError::Skip("recipient not fresh"));
         }
-        if store.backend != crate::store::Backend::DirectoryBudget {
-            return Err(PreparationError::Skip(
-                "seeding not yet supported on a removable pool",
-            ));
-        }
         if !invocation.tool.is_empty()
             || invocation.targets.len() > 1
             || invocation.cargo_args.iter().any(|arg| {

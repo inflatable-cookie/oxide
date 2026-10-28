@@ -1,13 +1,15 @@
 # Cold-slot seeding from matching dependency units (proposed design)
 
-Status: **design only, unimplemented, not frozen.** No product code, test
-proof, selector, native execution, live pool read, installation or consumer
-change is authorized by this document. It is the first deliverable of oxide#137
-under the ROOT design-first rebind of 2026-10-27 (Tom and the Oxide Supervisor,
-standing decision `8ddaa98d`): publish a concrete design, take an independent
-exact-head design review, then stop for the Supervisor's delegated freeze.
-Implementation, the author and independent-reviewer native sessions, and the
-merge hold are separate and unchanged.
+Status: **design frozen; implemented in the unpublished `oxide` by oxide#167,
+oxide#168 and oxide#169.** This document was the design deliverable of
+oxide#137 under the ROOT design-first rebind (standing decision `8ddaa98d`).
+The frozen protocol is implemented: the library custody calls, the front door
+transaction, the debug-only proof controls and the 24-case proof script exist
+at the heads built by those tasks. The default-on flip is the last commit and
+merges only after the owner-activated uncounted diagnostic, one counted author
+native and one separately activated independent reviewer native pass at the
+exact merge head. No live pool, installation, consumer adoption or real-drive
+qualification is authorized by this record.
 
 **Revision 13** applies Supervisor A2′ at head `c022dc6` (review comment
 `6451786564`, 2026-10-27): the limit-gap/donor-figure publication exception is
@@ -1468,13 +1470,14 @@ build:
   separate scoped change, and this design does not make it.
 
 > **Implementation note (Oxide Supervisor ruling, PR #159 head `394c0c6`).**
-> Slice 2 implements the internal `directory-budget-v1` gate and seeding path
-> under the Standard tier. Until **Elevated slice 4** lands with its
-> removable-media native case, an `apfs-volume-v1` pool is a fail-closed
-> seeding skip reported as "seeding not yet supported on a removable pool", and
-> the command takes the normal cold build; no removable payload is read or
-> written on the slice-2 paths. The removable bullet above is unchanged and
-> remains the eventual contract that slice 4 must satisfy.
+> Slice 2 implemented the internal `directory-budget-v1` gate and seeding path
+> under the Standard tier. **Elevated slice 4 (oxide#169)** removed that
+> interim skip: `apfs-volume-v1` seeding now re-verifies the registration's
+> mount/volume-UID binding and reserve before the durable marks, opens the
+> verified volume payload under the pool lock for call 2, and monitors the
+> binding at the watchdog cadence; the removable bullet above is the contract
+> it implements. The interim "seeding not yet supported on a removable pool"
+> reason no longer exists in the product.
 
 The pool budget stays soft: a started command's seed may pass the cap exactly
 as its Cargo may, and the seed's bytes are visible to the next admission. The
@@ -1850,15 +1853,13 @@ Each slice needs its own approved Queue brief, risk tier and covering checks.
 This design mints none of that.
 
 > **Implementation note (Oxide Supervisor ruling, PR #159 head `394c0c6`).**
-> Slice 2 is implemented for the internal `directory-budget-v1` pool under the
-> Standard tier. Its removable `apfs-volume-v1` custody is reassigned to one
-> **Elevated slice 4** that lands the removable support code together with the
-> fixed proof script and its removable-media native case in the same slice —
-> not as a separate support slice followed by a proof slice. The knowledge
-> slice follows it. The frozen eventual behaviour of §§6–8 is unchanged: this
-> is a slice and validation reassignment, not a contract change. Slice 2
-> reports an `apfs-volume-v1` pool as the skip "seeding not yet supported on a
-> removable pool" and takes the normal cold build until slice 4 lands.
+> Slice 2 implemented the internal `directory-budget-v1` pool under the
+> Standard tier, and **Elevated slice 4 (oxide#169)** landed the removable
+> `apfs-volume-v1` support code together with the fixed proof script, its pure
+> apparatus and its removable-media native case, as one slice. This knowledge
+> record is folded into that slice. The frozen behaviour of §§6–8 is unchanged.
+> The product now implements slices 1–4; slice 5 is this record and the
+> workflow/vision truth, with the default flip as the final commit.
 
 ## 16. Proof plan
 
@@ -2136,7 +2137,7 @@ the selected-volume rule.
 
 ### 16.3 Runner, bounds, clocks and activation
 
-- Selector (proposed, created only in the implementation slice):
+- Selector (created by oxide#169):
   `effigy rust:cold-slot-seeding` = one fixed script and the whole command of
   the qualified shared supervisor,
   `python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py`.
@@ -2158,8 +2159,9 @@ the selected-volume rule.
   including admission waits, covering checks, the native and cleanup, with no
   reset and no extension; the independent design review ratifies feasibility
   before promotion.
-- Every receipt states: "Effigy heavy admission unavailable (f6b3b50 retired
-  host-run client; Queue #381 pending); not host-admitted". Counting follows
+- Every receipt states that it ran under the qualified shared supervisor's
+  heavy admission (the retired host-run client `f6b3b50` and Queue #381 are
+  historical; admission has been healthy since 24 Oct 2026). Counting follows
   the standing rule: anything reaching the guard spends the proof; a
   positively pre-admission busy with the guard never started is effect-free and
   at most one per new quiet window, never in a loop.

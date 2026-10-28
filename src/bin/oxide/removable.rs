@@ -774,6 +774,15 @@ pub fn select(internal: Store) -> Result<Selected, String> {
 /// the next build. They probe the volume and run `diskutil`; `oxide status`
 /// runs them only in measured mode.
 fn verified(internal: &Store, registration: &Registration) -> Result<(), String> {
+    let _ = internal;
+    verified_registration(registration)
+}
+
+/// The same volume checks, without an `internal` store: the seed's removable
+/// start gate re-verifies the mount/volume-UID binding and the registration's
+/// reserve inside its admission lifetime (§8.3), so a volume that vanished or
+/// was remounted after selection refuses before any donor payload is read.
+pub(crate) fn verified_registration(registration: &Registration) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
         return Err("the removable backend is macOS-only".to_owned());
     }
@@ -796,7 +805,6 @@ fn verified(internal: &Store, registration: &Registration) -> Result<(), String>
             registration.reserve_bytes / MIB
         ));
     }
-    let _ = internal;
     Ok(())
 }
 

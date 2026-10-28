@@ -68,8 +68,10 @@ pub(crate) fn producer(
         "build" | "test" | "run" | "bench" => "build",
         _ => return Err("unsupported command"),
     };
-    if facts.backend != "directory-budget-v1" {
-        return Err("seeding not yet supported on a removable pool");
+    // Both provided backends seed. The backend is part of the producer
+    // identity, so a donor and a recipient on different backends never match.
+    if facts.backend != "directory-budget-v1" && facts.backend != "apfs-volume-v1" {
+        return Err("unsupported pool backend");
     }
     let rustc = match facts.rustc {
         Some(value) => value.to_str().ok_or("non-UTF-8 compiler")?,
@@ -353,6 +355,12 @@ mod tests {
         assert!(producer(input, test_context()).is_err());
         let mut input = facts();
         input.backend = "apfs-volume-v1";
+        assert_eq!(
+            producer(input, test_context()).unwrap().backend,
+            "apfs-volume-v1"
+        );
+        let mut input = facts();
+        input.backend = "apfs-sparse-image-v1";
         assert!(producer(input, test_context()).is_err());
         let mut input = facts();
         input.target = "/fixture/custom.json";

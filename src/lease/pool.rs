@@ -295,13 +295,12 @@ pub(super) struct SeedSlotView {
 /// The pool and ledger facts call 1 and call 2 may read.
 pub(super) struct SeedPoolView {
     pub(super) store_id: String,
-    /// The recorded backend. The seeding custody calls only write an internal
-    /// directory-budget pool's payload.
+    /// The recorded backend: `directory-budget-v1` or `apfs-volume-v1`.
     pub(super) backend: String,
     pub(super) pool_root: PathBuf,
-    /// The internal payload root. It is `None` for a recorded removable
-    /// `apfs-volume-v1` pool: the seam never opens or probes that volume, so
-    /// the caller's backend gate runs before any removable payload access.
+    /// The payload root. Call 1 and the sidecar writers need no payload, so
+    /// their seam leaves this `None` and opens no volume; call 2 uses
+    /// [`open_seed_payload`] and gets the verified root for both backends.
     pub(super) payload_root: Option<PathBuf>,
     pub(super) slots: Vec<SeedSlotView>,
 }
@@ -315,10 +314,9 @@ impl SeedPoolView {
 /// The seeding custody seam (`oxide#137` §6.3 calls 1 and 2 and
 /// `publish_seed_catalog`): the pool lock held for the whole transaction plus
 /// the immutable facts those calls read. It takes no reconciliation and writes
-/// nothing, and it opens a payload only for the internal directory backend
-/// this slice writes. A removable `apfs-volume-v1` pool is described from its
-/// config and ledger alone, so no removable payload is read or written before
-/// the caller's backend gate.
+/// nothing. [`open_seed`] opens no payload; [`open_seed_payload`] additionally
+/// opens the verified payload call 2 clones from, including a removable
+/// `apfs-volume-v1` volume's mount and volume-UID binding (§7, §8.3).
 pub(super) struct SeedPoolOpen {
     _lock: File,
     pub(super) view: SeedPoolView,
@@ -351,22 +349,23 @@ impl SeedPoolOpen {
     }
 }
 
-/// The recorded backend, read without the pool lock and without touching any
-/// payload, so a seeding call can gate a removable pool before it takes the
-/// donor record lock or opens the seam. The config is replaced atomically, so a
-/// single read is consistent.
-pub(super) fn recorded_backend(root: &Path) -> Result<String, LeaseError> {
-    let root = canonical_existing_dir(root, true)?;
-    refuse_foreign_pool_entries(&root)?;
-    refuse_retired_image_pool(&root)?;
-    Ok(read_config(&root)?.backend)
-}
-
 /// Open the seeding seam: the pool lock alone, no reconciliation, no ledger or
 /// payload mutation. A recorded `Evicting` slot is read as it stands and never
-/// finished here. Only an internal `directory-budget-v1` payload is opened; a
-/// removable pool yields a view with no payload root and no volume access.
+/// finished here. No payload is opened: the sidecar writers and call 1 read
+/// control state only.
 pub(super) fn open_seed(root: &Path) -> Result<SeedPoolOpen, LeaseError> {
+    open_seed_inner(root, false)
+}
+
+/// The same seam, additionally opening the payload call 2 clones from. For a
+/// removable `apfs-volume-v1` pool this verifies the recorded mount and volume
+/// UUID through [`Binding::open`] and the recorded owner-only payload
+/// directory, under the pool lock and before any donor payload is read.
+pub(super) fn open_seed_payload(root: &Path) -> Result<SeedPoolOpen, LeaseError> {
+    open_seed_inner(root, true)
+}
+
+fn open_seed_inner(root: &Path, with_payload: bool) -> Result<SeedPoolOpen, LeaseError> {
     let root = canonical_existing_dir(root, true)?;
     refuse_foreign_pool_entries(&root)?;
     refuse_retired_image_pool(&root)?;
@@ -387,17 +386,22 @@ pub(super) fn open_seed(root: &Path) -> Result<SeedPoolOpen, LeaseError> {
             split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
         }
     }
-    let payload_root = match config.backend.as_str() {
-        BUDGET_BACKEND_DIRECTORY_V1 => {
-            let paths = BackingPaths::under(&root);
-            Some(
-                open_budget_payload(&root, &paths, &config)?
-                    .payload_root()
-                    .to_path_buf(),
-            )
-        }
-        // No volume access: the caller gates the removable path from the
-        // backend alone, so this seam reports no payload root.
+    let paths = BackingPaths::under(&root);
+    let payload_root: Option<PathBuf> = match config.backend.as_str() {
+        BUDGET_BACKEND_DIRECTORY_V1 => Some(
+            open_budget_payload(&root, &paths, &config)?
+                .payload_root()
+                .to_path_buf(),
+        ),
+        // Call 2 requires the verified mount and volume-UID binding (§7): the
+        // payload is opened through the same strict check a mutating pool open
+        // uses, so a removed, remounted or substituted volume refuses before
+        // any donor payload is read. The sidecar seam opens nothing.
+        VOLUME_BACKEND_APFS_V1 if with_payload => Some(
+            open_volume_payload(&paths, &config)?
+                .payload_root()
+                .to_path_buf(),
+        ),
         VOLUME_BACKEND_APFS_V1 => None,
         _ => return Err(LeaseError::BackingMismatch),
     };

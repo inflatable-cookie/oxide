@@ -1007,3 +1007,36 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 [tasks."rust:command-budgets:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py --diagnostic"
+
+# Cold-slot seeding (oxide#137 §16, oxide#169 slice 4): one fixed 24-case
+# script and the whole command of the qualified shared supervisor, with
+# --root-parent /private/tmp (the owner-accepted internal-placement exception,
+# decision bd357a4c) because the proof's own pool is a genuine internal
+# directory-budget pool and one case registers a removable pool from an
+# internal control directory. 300 s, 512 MiB monitored scratch, one owned
+# 128 MiB APFS image attached with `hdiutil -owners on`, ordinary detach. It stages
+# this HEAD's debug `oxide` and seeds one private offline CARGO_HOME from a
+# union lock with the shared bounded seeder (scripts/offline_seed.py), then
+# runs the 24 cases with their debug-only proof controls. Native fit is
+# UNMEASURED: the uncounted diagnostic, the counted author native and the
+# independently activated reviewer native are separately owner-activated.
+[tasks."rust:cold-slot-seeding"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
+
+# Uncounted keep-going collection for oxide#169, run through the same
+# qualified guard, root, bounds and custody. Its receipt is distinctly
+# qualified=false and is never a counted PASS; this declaration activates
+# nothing. Only a recoverable case-oracle failure lets a dependency-independent
+# case continue; an unknown child, writer, mount, custody, resource or deadline
+# outcome aborts and retains the image.
+[tasks."rust:cold-slot-seeding:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py --diagnostic"
+
+# The pure apparatus of the cold-slot seeding proof: the case table, the
+# keep-going/fail-fast collection semantics, the receipt builder, the lock
+# fixture grammar and every seed oracle. It stages nothing, starts no child,
+# creates no pool and touches no image.
+[tasks."proof:cold-slot-seeding:test"]
+run = "python3 scripts/test-cold-slot-seeding.py --self-test"

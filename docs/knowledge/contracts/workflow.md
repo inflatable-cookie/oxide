@@ -15,14 +15,49 @@ qualification, default-pool creation outside tests, installation (binary or
 skill) or consumer-adoption authority. Other sections
 state the target design.
 
-## Cold-slot seeding qualification hold
+## Cold-slot seeding
 
-Cold-slot seeding is off. Setting `OXIDE_COLD_SEED=1` reports that seeding is
-not yet qualified on this Cargo; it does not seed, produce catalogs, or write
-seed sidecars. The separate qualification proof must pass before the opt-in can
-be honoured. With the variable unset, the existing command behaviour is
-unchanged. The [cold-slot seeding contract](cold-slot-seeding.md) owns the
-proposed transaction and qualification requirements.
+Cold-slot seeding is implemented in the unpublished `oxide` (`oxide#167`,
+`oxide#168`, `oxide#169`) and enabled by default once this slice's one-line
+qualification flip lands; `OXIDE_COLD_SEED=0` is the opt-out and the variable
+was never a permanent switch. A fresh slot of a supported command is warmed once,
+before any child exists, by cloning matching dependency units from an idle
+donor slot on the same pool under the existing journaled custody: the donor
+record lock and pool lock are held, every artifact, `.d` and fingerprint file
+is re-hashed against the generation-bound catalog, and the recipient publishes
+only after a complete ownership-clean post-clone walk. Nothing is offered for a
+non-leaf package, an unprovable `.d` join, a differing producer context, a
+build-script run payload or a run-only fingerprint. A failure before the first
+recipient write skips to the normal cold build; every later clone, digest or
+custody fault refuses, releases the slot with no trusted origin and leaves the
+untrusted generation to the ordinary journaled whole-slot eviction. A failed
+post-clone walk publishes nothing and cold-builds in a newly admitted slot.
+This adds no grant, no second lease, no deletion path and no new sidecar
+format beyond the bounded `oxide-managed/seeds/` catalog/attempt/last
+documents, and it never mutates the donor.
+
+Both provided backends seed: an internal `directory-budget-v1` pool's start
+gate is the host reserve (20 GiB + 2 GiB margin, sampled before the durable
+marks and monitored during the clone), and an `apfs-volume-v1` removable pool
+re-verifies its registration's mount/volume-UID binding and reserve before the
+marks and monitors that binding at the watchdog cadence. A missing
+`clonefile`, an unknown source identity or a lost volume follows the existing
+refusal, removal and quarantine rules.
+
+The qualification apparatus is one fixed 24-case script,
+`scripts/test-cold-slot-seeding.py`:
+`effigy rust:cold-slot-seeding` and `:diagnostic` run it under the qualified
+shared supervisor with the internal-placement exception
+(`bd357a4c`), 300 s, 512 MiB monitored scratch and one owned 128 MiB image;
+`effigy proof:cold-slot-seeding:test` runs only its pure apparatus. The
+uncounted diagnostic, one counted author native and one separately activated
+independent reviewer native are owner-activated at the exact head, and the
+[tier is ELEVATED](../vision.md#validation-policy) because a post-clone
+abandon retains an untrusted generation that the ordinary journaled eviction
+later deletes and one case writes removable media. Until those natives pass at
+the merge head the default flip is not merged. The
+[cold-slot seeding contract](cold-slot-seeding.md) owns the transaction, its
+partial-association limit and the proof plan.
 
 ## Shape
 
