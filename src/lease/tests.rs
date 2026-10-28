@@ -924,15 +924,14 @@ fn unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_releas
         held_status.lease_id.as_deref(),
         Some(held.lease_id.as_str())
     );
-    assert!(matches!(
-        lease_injected(request(
-            &pool,
-            &fx.dir("blocked-project"),
-            &workspace,
-            "blocked-holder"
-        )),
-        Err(LeaseError::UnknownAccounting)
-    ));
+    let other = lease_injected(request(
+        &pool,
+        &fx.dir("blocked-project"),
+        &workspace,
+        "blocked-holder",
+    ))
+    .expect("unrelated slot is admitted");
+    assert_ne!(other.slot_id, idle.slot_id);
     release_injected(&pool, &held.lease_id).expect("unrelated held lease closes");
     assert_eq!(
         fs::read(&sentinel).expect("root symlink target is untouched"),
@@ -4151,10 +4150,9 @@ fn a_refused_eviction_after_the_root_capture_recovers_on_the_next_open() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
-/// A vanished captured file stops the live run; replay can conclude its
-/// recorded removal inside the verified private root.
+/// A vanished capture remains uncertain when the live run restored its root.
 #[test]
-fn a_captured_private_file_that_vanishes_completes_on_replay() {
+fn a_vanished_capture_under_a_restored_root_remains_pending() {
     let fixture = Fixture::new("live-vanish");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "live-vanish");
     let parent = slot_path.parent().expect("slot parent").to_path_buf();
@@ -4176,8 +4174,9 @@ fn a_captured_private_file_that_vanishes_completes_on_replay() {
     );
 
     let after = status_injected(&pool).expect("status");
-    assert!(after.slots.is_empty(), "the recorded file is concluded on replay");
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+    assert_eq!(after.slots.len(), 1);
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
 }
 
 /// The incident journal has a root, build/debug/deps captures, and one
@@ -4201,11 +4200,16 @@ fn replay_concludes_an_unlinked_file_in_the_2255_capture_shape() {
         let held = File::open(&directory).expect("directory descriptor");
         let original = std::ffi::CString::new(name).expect("name");
         let capture = crate::owned_delete::capture_entry(held.as_fd(), &original).expect("capture");
-        let facts = crate::owned_delete::observe_entry(held.as_fd(), &capture.private).expect("facts");
+        let facts =
+            crate::owned_delete::observe_entry(held.as_fd(), &capture.private).expect("facts");
         let private = String::from_utf8(capture.private.as_bytes().to_vec()).expect("private name");
         records.push(crate::owned_delete::CaptureRecord {
-            path: chain.clone(), private: private.clone(), original: name.to_owned(),
-            device: facts.device, inode: facts.inode, mode: facts.mode as u32,
+            path: chain.clone(),
+            private: private.clone(),
+            original: name.to_owned(),
+            device: facts.device,
+            inode: facts.inode,
+            mode: facts.mode as u32,
         });
         directory.push(&private);
         chain.push(private);
@@ -4281,12 +4285,58 @@ fn blocked_eviction_is_charged_but_does_not_block_other_admissions() {
     fs::create_dir(&slot_path).expect("collision");
     let project = fixture.dir("other-project");
     let workspace = fixture.dir("other-workspace");
-    let granted = lease_injected(request(&pool, &project, &workspace, "other"))
-        .expect("unrelated admission");
+    let granted =
+        lease_injected(request(&pool, &project, &workspace, "other")).expect("unrelated admission");
     assert_ne!(granted.slot_id, slot_id.to_string());
     assert!(captured.is_dir());
     assert!(slot_path.is_dir());
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
+/// A competing admission waits for the eviction's lock instead of reading
+/// its in-flight journal as unknown accounting.
+#[test]
+fn a_competing_admission_waits_for_an_inflight_eviction() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let fixture = Fixture::new("concurrent-eviction");
+    let (pool, _, _) = idle_slot_for_eviction(&fixture, "concurrent-eviction");
+    let first_project = fixture.dir("first-project");
+    let second_project = fixture.dir("second-project");
+    let workspace = fixture.dir("shared-workspace");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let mut first_request = request(&pool, &first_project, &workspace, "first");
+    first_request.budget_bytes = Some(1);
+    let first = thread::spawn(move || {
+        let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "metadata", false);
+        let _pause = crate::test_fs::before_unlink_at(1, move || {
+            entered_tx.send(()).expect("pause reached");
+            resume_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("pause released");
+        });
+        lease_injected(first_request)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("eviction paused");
+    let second_request = request(&pool, &second_project, &workspace, "second");
+    let (done_tx, done_rx) = mpsc::channel();
+    let second = thread::spawn(move || {
+        let result = lease_injected(second_request);
+        done_tx.send(result).expect("report result");
+    });
+    let waiting = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
+    resume_tx.send(()).expect("resume eviction");
+    let first_result = first.join().expect("first worker");
+    let second_result = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("second worker");
+    second.join().expect("second join");
+    assert!(waiting, "second admission must wait for the held lock");
+    assert!(first_result.is_ok(), "first admission: {first_result:?}");
+    assert!(second_result.is_ok(), "second admission: {second_result:?}");
 }
 
 /// A panic after the product widened the captured root's mode restores the

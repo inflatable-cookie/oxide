@@ -330,8 +330,8 @@ fn pending(description: &VolumeDescription) -> Result<(), Unavailable> {
     Err(unavailable(
         Reason::PendingReconciliation,
         format!(
-            "{} recorded slot deletion(s) await reconciliation at the next build",
-            description.evicting_slots
+            "recorded slot deletions await reconciliation at the next build: {}",
+            description.evicting_slot_ids.join(", ")
         ),
     ))
 }
@@ -675,11 +675,14 @@ mod tests {
             volume_uuid: "uuid".to_owned(),
             payload_dir: removable::PAYLOAD_DIR.to_owned(),
             evicting_slots: 0,
+            evicting_slot_ids: Vec::new(),
         };
         assert!(pending(&description).is_ok());
         description.evicting_slots = 2;
+        description.evicting_slot_ids = vec!["1".into(), "2".into()];
         let refused = pending(&description).unwrap_err();
         assert_eq!(refused.reason, Reason::PendingReconciliation);
+        assert!(refused.detail.contains("1, 2"));
     }
 
     #[test]

@@ -32,6 +32,9 @@ after the caller's listing, before the removal:
 - `lease_control`: two admissions under a 1 MiB budget; the second evicts the
   first project's idle whole slot with no race armed. The slot *leaf* is gone
   and no deletion is pending. Fixture premise.
+- `lease_unlinked_file`: stop immediately after a nested `filler` unlink,
+  verify its journal record remains, then admit an unrelated build and check
+  replay removed the victim.
 - `lease_metadata`: the same eviction raced with `.DS_Store`/`._*`. The
   eviction completes and the evidence records the firing.
 - `lease_foreign`: raced with an ordinary file. The admission refuses, the slot
@@ -107,7 +110,8 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    the fixture's explicit values, then re-adds the supervisor's own
    `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_DEADLINE_NS`,
    `OXIDE_PROOF_EVIDENCE` (required for the hook guard) and, per case,
-   `OXIDE_TEST_FINDER_RACE`.
+   `OXIDE_TEST_FINDER_RACE`, or the scoped `OXIDE_TEST_CAPTURE_UNLINK_STOP`
+   for the nested-file case.
 4. automatic adoption: `workspace()` makes a real private Git repository whose
    `.gitignore` covers `target`, so the first conversion is eligible; each
    prune case then asserts the adopted owned root, the checkout's member link
@@ -247,6 +251,7 @@ CRATE = {
 GITIGNORE = "/target\n"
 CASES = (
     "lease_control",
+    "lease_unlinked_file",
     "lease_metadata",
     "lease_foreign",
     "lease_link",
@@ -263,6 +268,7 @@ CASES = (
 # bound is exercised; `None` is the unraced premise control.
 RACES = {
     "lease_control": None,
+    "lease_unlinked_file": None,
     "lease_metadata": "*:metadata",
     "lease_foreign": "*:foreign",
     "lease_link": "*:link",
@@ -695,7 +701,28 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
             f"{case}: the first admission left {len(before)} slot leaves, expected one: {sorted(before)}"
         )
     victim = next(iter(before))
-    second = run([oxide, "check"], cwd=workspace(env, base, "b"), env=env)
+    second_env = dict(env)
+    if case == "lease_unlinked_file":
+        second_env["OXIDE_TEST_CAPTURE_UNLINK_STOP"] = "filler"
+    second = run([oxide, "check"], cwd=workspace(env, base, "b"), env=second_env)
+    if case == "lease_unlinked_file":
+        marker = os.path.join(evidence_dir(), "capture-unlink-stop")
+        if second.returncode == 0 or not os.path.isfile(marker):
+            fail(f"{case}: nested unlink stop did not fire: {second.stderr[-1500:]}")
+        with open(os.path.join(env["OXIDE_POOL"], "ledger.json"), encoding="utf-8") as handle:
+            ledger = json.load(handle)
+        slots = [slot for slot in ledger.get("slots", []) if slot.get("capture")]
+        if len(slots) != 1 or not any(
+            entry.get("original") == "filler" and entry.get("path")
+            for entry in slots[0]["capture"].get("captures", [])
+        ):
+            fail(f"{case}: missing nested file capture in ledger")
+        replay = run([oxide, "check"], cwd=workspace(env, base, "c"), env=env)
+        if replay.returncode:
+            fail(f"{case}: unrelated replay admission failed: {replay.stderr[-1500:]}")
+        if victim in slot_leaves(env["OXIDE_POOL"]):
+            fail(f"{case}: victim was not removed by replay")
+        return f"{case}: stopped after unlink, unrelated admission replayed the eviction"
     after = slot_leaves(env["OXIDE_POOL"])
     status = run([oxide, "status"], cwd=base, env=env)
     pending = "recorded deletion pending reconciliation" in status.stdout

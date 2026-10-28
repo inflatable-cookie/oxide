@@ -313,6 +313,8 @@ pub struct VolumeDescription {
     pub payload_dir: String,
     /// Recorded slot deletions an open would reconcile. Read, not run.
     pub evicting_slots: usize,
+    /// IDs of the pending deletions, in ledger order.
+    pub evicting_slot_ids: Vec<String>,
 }
 
 /// Status of one slot. No payload or secret content.
@@ -1096,6 +1098,20 @@ fn remove_tree_owned_at(
                 ))
             }
             Err(error) => return Err(io_error(error)),
+        }
+        #[cfg(debug_assertions)]
+        if context.has_journal()
+            && !record.path.is_empty()
+            && std::env::var("OXIDE_TEST_CAPTURE_UNLINK_STOP")
+                .is_ok_and(|value| value == record.original)
+        {
+            if let Some(evidence) = crate::proof::evidence() {
+                std::fs::write(evidence.join("capture-unlink-stop"), &record.original)
+                    .map_err(io_error)?;
+                // Model process loss, not a recoverable error: stack unwinding
+                // would put the captured root back before the next open.
+                std::process::exit(86);
+            }
         }
         if let Err(reason) = context.record_removed(&record) {
             return Err(LeaseError::Io(format!(

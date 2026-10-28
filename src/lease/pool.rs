@@ -862,11 +862,13 @@ pub mod managed {
         {
             return Err(LeaseError::BackingMismatch);
         }
-        let evicting_slots = ledger
+        let evicting_slot_ids: Vec<String> = ledger
             .slots
             .iter()
             .filter(|slot| slot.state == SlotPersistState::Evicting)
-            .count();
+            .map(|slot| slot.id.to_string())
+            .collect();
+        let evicting_slots = evicting_slot_ids.len();
         Ok(VolumeDescription {
             store_id: config.store_id,
             cap_bytes: config.cap_bytes,
@@ -874,6 +876,7 @@ pub mod managed {
             volume_uuid: volume.volume_uuid,
             payload_dir: volume.payload_dir,
             evicting_slots,
+            evicting_slot_ids,
         })
     }
 
@@ -2293,7 +2296,9 @@ impl Pool {
         if slot.state == SlotPersistState::Evicting {
             // An unknown historical size consumes the entire admission budget:
             // this is a decision bound, not a claim about its actual bytes.
-            return Ok(slot.recorded.as_ref()
+            return Ok(slot
+                .recorded
+                .as_ref()
                 .filter(|record| record.for_lease == slot.last_lease_id)
                 .map_or(self.budget, |record| record.unique_bytes));
         }
@@ -2387,7 +2392,8 @@ impl Pool {
                     private.set_file_name(&journal.root.private);
                     let absolute = self.backing.payload_root().join(&private);
                     if let Ok(meta) = fs::symlink_metadata(absolute) {
-                        if meta.is_dir() && !meta.file_type().is_symlink()
+                        if meta.is_dir()
+                            && !meta.file_type().is_symlink()
                             && meta.dev() == journal.root.device
                             && meta.ino() == journal.root.inode
                             && meta.uid() == current_uid()
@@ -2566,7 +2572,6 @@ impl Pool {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
             slot.state = SlotPersistState::Evicting;
             // Keep the last closed observation to charge a blocked eviction.
-
         }
         self.persist_revised()?;
         self.remove_owned_slot(id, &path)?;
@@ -2680,14 +2685,18 @@ impl Pool {
                 let private_root = root_facts.uid == current_uid()
                     && root_facts.mode & 0o077 == 0
                     && journal.root.mode & 0o077 == 0;
-                let concluded = match rollback_captures(parent.as_fd(), &private, &journal, private_root) {
-                    Ok(concluded) => concluded,
-                    Err(_) => return Ok(CaptureDisposition::Blocked),
-                };
+                let concluded =
+                    match rollback_captures(parent.as_fd(), &private, &journal, private_root) {
+                        Ok(concluded) => concluded,
+                        Err(_) => return Ok(CaptureDisposition::Blocked),
+                    };
                 if !concluded.is_empty() {
                     let mut updated = journal.clone();
-                    updated.captures.retain(|record| !concluded.contains(record));
-                    self.record_slot_capture(id, Some(updated)).map_err(LeaseError::Io)?;
+                    updated
+                        .captures
+                        .retain(|record| !concluded.contains(record));
+                    self.record_slot_capture(id, Some(updated))
+                        .map_err(LeaseError::Io)?;
                 }
                 if restore_root_capture(parent.as_fd(), &name, &journal.root).is_err() {
                     return Ok(CaptureDisposition::Blocked);
@@ -3195,7 +3204,14 @@ fn rollback_captures(
             "the held tree root is not the recorded root",
         )?;
         let mut resolved = 0;
-        restore_captures_in(root.as_fd(), &[], &journal.captures, &mut resolved, private_root, &mut concluded)?;
+        restore_captures_in(
+            root.as_fd(),
+            &[],
+            &journal.captures,
+            &mut resolved,
+            private_root,
+            &mut concluded,
+        )?;
         if resolved != journal.captures.len() {
             // A record the walk could not locate is a representation this replay
             // cannot resolve: fail closed rather than completing past it.
@@ -3260,7 +3276,14 @@ fn restore_captures_in(
                 // is read through the held descriptor; a rebind stops the step
                 // without modifying the replacement.
                 verify_recorded(base, &original, record)?;
-                restore_captures_in(step.as_fd(), &inner, records, resolved, private_root, concluded)
+                restore_captures_in(
+                    step.as_fd(),
+                    &inner,
+                    records,
+                    resolved,
+                    private_root,
+                    concluded,
+                )
             })();
             match stepped {
                 Ok(()) => {
@@ -3291,7 +3314,14 @@ fn restore_captures_in(
         let stepped = (|| {
             let mut inner = chain.to_vec();
             inner.push(record.private.clone());
-            restore_captures_in(step.as_fd(), &inner, records, resolved, private_root, concluded)?;
+            restore_captures_in(
+                step.as_fd(),
+                &inner,
+                records,
+                resolved,
+                private_root,
+                concluded,
+            )?;
             restore_recorded(base, record)?;
             Ok(())
         })();
@@ -5135,7 +5165,7 @@ mod recorded_ledger_tests {
             true
         ))
         .is_err());
-        // Version 2 carries records on an idle slot only.
+        // Version 2 carries a closed record on an idle or evicting slot.
         assert!(validate_ledger_read(&ledger(
             Some(CAPACITY_POLICY_VERSION),
             1,
@@ -5156,7 +5186,7 @@ mod recorded_ledger_tests {
             SlotPersistState::Evicting,
             true
         ))
-        .is_err());
+        .is_ok());
         // An unknown fence value refuses, and a legacy ledger holding a record
         // refuses too.
         assert!(validate_ledger_read(&ledger(Some(3), 1, SlotPersistState::Idle, false)).is_err());
