@@ -4361,7 +4361,7 @@ fn blocked_eviction_charge_prevents_over_budget_admission() {
 }
 
 /// A pending root without a capture journal cannot be distinguished from a
-/// replacement when its contents are unreadable. It consumes the budget,
+/// replacement when its contents are unreadable. It is isolated and charged,
 /// while an independent unreadable subtree remains an accounting error.
 #[test]
 fn an_unjournaled_inaccessible_eviction_is_a_conservative_refusal() {
@@ -4403,16 +4403,39 @@ fn an_unjournaled_inaccessible_eviction_is_a_conservative_refusal() {
                 "{result:?}"
             );
         } else {
-            assert!(matches!(result, Err(LeaseError::Full)), "{result:?}");
+            assert!(result.is_ok(), "unrelated admission: {result:?}");
         }
         assert!(slot_path.is_dir(), "pending root was removed");
     }
 }
 
 /// A pending unjournaled root that exhausts the scope walk's entry bound is
-/// conservatively charged without deleting it or creating a new slot.
+/// charged by the largest recorded or observed size without changing it.
 #[test]
-fn an_unjournaled_eviction_over_the_entry_bound_refuses_conservatively() {
+fn an_unjournaled_eviction_over_the_entry_bound_admits_other_work() {
+    fn snapshot(path: &Path, base: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+        let mut children: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        children.sort();
+        for child in children {
+            let metadata = fs::symlink_metadata(&child).unwrap();
+            let content = if metadata.is_file() {
+                fs::read(&child).unwrap()
+            } else {
+                Vec::new()
+            };
+            entries.push((
+                child.strip_prefix(base).unwrap().to_path_buf(),
+                metadata.mode(),
+                content,
+            ));
+            if metadata.is_dir() {
+                snapshot(&child, base, entries);
+            }
+        }
+    }
     let fixture = Fixture::new("pending-entry-bound");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
     mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
@@ -4422,11 +4445,25 @@ fn an_unjournaled_eviction_over_the_entry_bound_refuses_conservatively() {
     }
     let project = fixture.dir("other-project");
     let workspace = fixture.dir("other-workspace");
-    with_accounting_limits(20, 64, 60_000, || {
-        let result = lease_injected(request(&pool, &project, &workspace, "other"));
-        assert!(matches!(result, Err(LeaseError::Full)), "{result:?}");
+    let mut before = Vec::new();
+    let root_mode = fs::symlink_metadata(&slot_path).unwrap().mode();
+    snapshot(&slot_path, &slot_path, &mut before);
+    let mutation = serde_json::json!([{
+        "path": slot_path, "action": "remove_before_file_type"
+    }]);
+    crate::inventory::walk_observer::with_mutations(fixture.path(), mutation.to_string(), || {
+        with_accounting_limits(20, 64, 60_000, || {
+            let (charge, largest, observed) =
+                super::pool::pending_charge_injected(&pool, slot_id).unwrap();
+            assert_eq!(charge, largest.max(observed));
+            let result = lease_injected(request(&pool, &project, &workspace, "other"));
+            assert!(result.is_ok(), "unrelated admission: {result:?}");
+        });
     });
-    assert!(slot_path.join("entry-39").is_file());
+    let mut after = Vec::new();
+    snapshot(&slot_path, &slot_path, &mut after);
+    assert_eq!(before, after);
+    assert_eq!(fs::symlink_metadata(&slot_path).unwrap().mode(), root_mode);
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 

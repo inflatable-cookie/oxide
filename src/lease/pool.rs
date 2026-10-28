@@ -1060,6 +1060,37 @@ pub(super) fn capture_record_injected(pool: &Path, slot_id: u64) -> Option<Delet
         .and_then(|slot| slot.capture.clone())
 }
 
+#[cfg(test)]
+pub(super) fn pending_charge_injected(
+    pool: &Path,
+    slot_id: u64,
+) -> Result<(u64, u64, u64), LeaseError> {
+    let opened = Pool::open(pool)?;
+    let index = opened
+        .ledger
+        .slots
+        .iter()
+        .position(|slot| slot.id == slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    let largest = opened
+        .ledger
+        .slots
+        .iter()
+        .filter_map(|slot| slot.recorded.as_ref())
+        .map(|record| record.unique_bytes)
+        .max()
+        .unwrap_or(0);
+    let path = opened.slot_path(slot_id)?;
+    let observed = inventory_sizes_with(&path, 0, opened.pressure_limits())
+        .unique
+        .unwrap_or(0);
+    Ok((
+        opened.slot_figure(index, &mut Vec::new())?,
+        largest,
+        observed,
+    ))
+}
+
 impl Pool {
     /// Open a budget-only directory or removable-volume pool. Any other
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
@@ -2182,19 +2213,12 @@ impl Pool {
         // that charge alone exhausts the budget, unknown other bytes cannot
         // make room for an admission.
         if bound_gaps_only(scan) {
-            let pending = self
-                .ledger
-                .slots
-                .iter()
-                .filter(|slot| slot.state == SlotPersistState::Evicting)
-                .fold(0_u64, |total, slot| {
-                    let charge = slot
-                        .recorded
-                        .as_ref()
-                        .filter(|record| record.for_lease == slot.last_lease_id)
-                        .map_or(self.budget, |record| record.unique_bytes);
-                    total.saturating_add(charge)
-                });
+            let mut pending = 0_u64;
+            for (index, slot) in self.ledger.slots.iter().enumerate() {
+                if slot.state == SlotPersistState::Evicting {
+                    pending = pending.saturating_add(self.slot_figure(index, &mut Vec::new())?);
+                }
+            }
             if pending >= self.budget {
                 return Err(LeaseError::Full);
             }
@@ -2287,47 +2311,7 @@ impl Pool {
     /// stays unmeasured keeps today's refusal: its figure is never zero and
     /// never free space.
     fn recorded_total(&mut self) -> Result<u64, LeaseError> {
-        let scope = self.pool_scope();
-        let mut total = match scope.require_complete() {
-            Ok(total) => total,
-            Err(original) => {
-                // A journal-less pending root has no recorded identity, so a
-                // failed walk cannot distinguish its old bytes from an
-                // arbitrary replacement. Reserve the entire budget rather
-                // than presenting that uncertainty as global accounting.
-                // This second scope is only a refusal diagnostic: its
-                // unverified stops can never authorize an admission or delete.
-                let pending: Vec<&SlotRecord> = self
-                    .ledger
-                    .slots
-                    .iter()
-                    .filter(|slot| {
-                        slot.state == SlotPersistState::Evicting && slot.capture.is_none()
-                    })
-                    .collect();
-                if !pending.is_empty() {
-                    if pending.iter().any(|slot| self.slot_root(slot.id).is_err()) {
-                        return Err(LeaseError::Full);
-                    }
-                    if let Ok(mut stops) = self.scope_stops() {
-                        for slot in pending {
-                            stops.push(self.slot_relative(slot)?);
-                        }
-                        if scope_sizes_with(
-                            self.backing.payload_root(),
-                            &stops,
-                            self.pressure_limits(),
-                        )
-                        .require_complete()
-                        .is_ok()
-                        {
-                            return Err(LeaseError::Full);
-                        }
-                    }
-                }
-                return Err(original);
-            }
-        };
+        let mut total = self.pool_scope().require_complete()?;
         let mut pending: Vec<(u64, RecordedSize)> = Vec::new();
         for index in 0..self.ledger.slots.len() {
             let figure = self.slot_figure(index, &mut pending)?;
@@ -2358,13 +2342,39 @@ impl Pool {
             return Err(LeaseError::UnknownAccounting);
         };
         if slot.state == SlotPersistState::Evicting {
-            // An unknown historical size consumes the entire admission budget:
-            // this is a decision bound, not a claim about its actual bytes.
-            return Ok(slot
+            // These pools have no per-slot byte ceiling. Use the largest
+            // recorded slot as the fallback floor, and retain any bytes a
+            // bounded walk could observe even if that walk is incomplete.
+            let largest = self
+                .ledger
+                .slots
+                .iter()
+                .filter_map(|slot| slot.recorded.as_ref())
+                .map(|record| record.unique_bytes)
+                .max()
+                .unwrap_or(0);
+            let recorded = slot
                 .recorded
                 .as_ref()
                 .filter(|record| record.for_lease == slot.last_lease_id)
-                .map_or(self.budget, |record| record.unique_bytes));
+                .map_or(0, |record| record.unique_bytes);
+            let mut paths = vec![self.slot_path(slot.id)?];
+            if let Some(journal) = &slot.capture {
+                paths.push(paths[0].with_file_name(&journal.root.private));
+            }
+            let observed = paths
+                .iter()
+                .map(|path| match fs::symlink_metadata(path) {
+                    Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                        inventory_sizes_with(path, 0, self.pressure_limits())
+                            .unique
+                            .unwrap_or(0)
+                    }
+                    _ => 0,
+                })
+                .max()
+                .unwrap_or(0);
+            return Ok(largest.max(recorded).max(observed));
         }
         let id = slot.id;
         let last_lease_id = slot.last_lease_id.clone();
@@ -2433,7 +2443,34 @@ impl Pool {
                 }
             }
         };
-        scope_sizes_with(self.backing.payload_root(), &stops, self.pressure_limits())
+        let mut isolated = Vec::new();
+        for slot in &self.ledger.slots {
+            if slot.state == SlotPersistState::Evicting {
+                let Ok(relative) = self.slot_relative(slot) else {
+                    return Sizes {
+                        logical: None,
+                        unique: None,
+                        scan: root_failure_with(
+                            self.pressure_limits(),
+                            AccountingGapKind::UnsupportedMetadata,
+                            0,
+                        ),
+                    };
+                };
+                isolated.push(relative.clone());
+                if let Some(journal) = &slot.capture {
+                    let mut private = relative;
+                    private.set_file_name(&journal.root.private);
+                    isolated.push(private);
+                }
+            }
+        }
+        scope_sizes_with(
+            self.backing.payload_root(),
+            &stops,
+            &isolated,
+            self.pressure_limits(),
+        )
     }
 
     /// The stop predicate: every recorded slot root that is still a real
@@ -2451,27 +2488,7 @@ impl Pool {
                 }
                 continue;
             }
-            // A collision at the recorded name is not the journaled root:
-            // leave it in the scope walk instead of hiding its bytes behind
-            // the blocked slot's charge. Apply the same identity check to
-            // both possible names of the root.
-            if let Some(journal) = &slot.capture {
-                let mut private = relative.clone();
-                private.set_file_name(&journal.root.private);
-                for candidate in [relative, private] {
-                    let absolute = self.backing.payload_root().join(&candidate);
-                    if let Ok(meta) = fs::symlink_metadata(absolute) {
-                        if meta.is_dir()
-                            && !meta.file_type().is_symlink()
-                            && meta.dev() == journal.root.device
-                            && meta.ino() == journal.root.inode
-                            && meta.uid() == current_uid()
-                        {
-                            stops.push(candidate);
-                        }
-                    }
-                }
-            }
+            // Pending names use the separate isolation list in pool_scope.
         }
         Ok(stops)
     }
@@ -2690,6 +2707,10 @@ impl Pool {
             .collect();
         for id in evicting {
             let path = self.slot_path(id)?;
+            if !self.pending_root_ready(id, &path) {
+                self.reconciliation_blocked = true;
+                continue;
+            }
             // A journaled root capture is reconciled first: the recorded path
             // may be absent because the tree is under its private name, and
             // deleting by the recorded path alone would conclude a deletion
@@ -2714,6 +2735,48 @@ impl Pool {
             self.persist()?;
         }
         Ok(())
+    }
+
+    /// An uncertain or partially inventoried pending root is isolated before
+    /// reconciliation can change a mode, create a journal or delete anything.
+    fn pending_root_ready(&self, id: u64, path: &Path) -> bool {
+        let Some(slot) = self.slot(id) else {
+            return false;
+        };
+        if slot
+            .capture
+            .as_ref()
+            .is_some_and(|journal| journal.root.phase == RootCapturePhase::Removed)
+        {
+            return true;
+        }
+        if self.checked_slot_scope(path).is_err() {
+            return false;
+        }
+        let mut candidates = vec![path.to_path_buf()];
+        if let Some(journal) = &slot.capture {
+            candidates.push(path.with_file_name(&journal.root.private));
+        }
+        candidates.into_iter().any(|candidate| {
+            let Ok(meta) = fs::symlink_metadata(&candidate) else {
+                return false;
+            };
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || meta.uid() != current_uid()
+                || meta.permissions().mode() & 0o077 != 0
+            {
+                return false;
+            }
+            if let Some(journal) = &slot.capture {
+                if meta.dev() != journal.root.device || meta.ino() != journal.root.inode {
+                    return false;
+                }
+            }
+            inventory_sizes_with(&candidate, 0, self.pressure_limits())
+                .require_complete()
+                .is_ok()
+        })
     }
 
     /// Reconcile one recorded deletion's journal, deciding only from the
@@ -3936,9 +3999,14 @@ fn inventory_sizes(path: &Path) -> Sizes {
 /// the same gap mapping, over a walk that hard-stops at the recorded slot
 /// roots it is given. It is a different entry point from the payload walk, so
 /// a scope pass never registers as an inventory walk of the payload.
-fn scope_sizes_with(root: &Path, stops: &[PathBuf], base: InventoryLimits) -> Sizes {
+fn scope_sizes_with(
+    root: &Path,
+    stops: &[PathBuf],
+    isolated: &[PathBuf],
+    base: InventoryLimits,
+) -> Sizes {
     let started = std::time::Instant::now();
-    match crate::inventory::scope_directory(root, stops, base) {
+    match crate::inventory::scope_directory_isolating(root, stops, isolated, base) {
         Ok(report) => {
             let coverage = if report.coverage.complete {
                 AccountingCoverage::Complete
@@ -4916,10 +4984,8 @@ mod removable_pool_path_tests {
         assert!(path.exists());
         pool.slot_mut(1).expect("slot").recorded = None;
         verified_facts::with(facts(RESERVE + GIB), || {
-            assert!(matches!(
-                pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any()),
-                Err(LeaseError::Full)
-            ));
+            pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any())
+                .expect("an unrecorded pending root is not a whole-budget charge");
         });
         assert!(path.exists());
     }

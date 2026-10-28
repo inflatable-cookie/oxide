@@ -282,6 +282,14 @@ entry ownership are verified. The target is never followed or removed.
 Deletion never touches project or workspace paths. A deletion restores owner read, write and search on each owned real directory it removes, so read-only directories a build or test left inside a slot (such as Effigy's `.effigy/state/objects/<hash>` under a slot's child scratch) cannot leave a recorded deletion unfinishable; foreign directories and symlinks still refuse, and a symlink is unlinked as a leaf, never followed. A lost delete is
 reconciled only for the recorded evicting slot path.
 
+An incomplete or unverifiable pending eviction remains isolated from reuse,
+adoption and deletion. Its admission charge is the maximum of its recorded
+size, a bounded walk's observed bytes and the largest recorded slot (these
+budget-only pools have no per-slot byte ceiling). Arbitrary replacement of
+that root is outside this accounting guarantee: the byte budget is soft and
+may overshoot the charge. The existing registered reserve and running-build
+reserve watchdog remain the free-space protection.
+
 **A command's child temporary directory is inside its slot (oxide#136).**
 `<slot>/scratch` is an ordinary owned entry of the slot tree, so the same
 unique-allocated `(device, inode)` union counts it once with the rest of the

@@ -3869,17 +3869,13 @@ Rules:
   enforces the budget while a build writes; a build can pass it, and the next
   new slot evicts.
   A deletion that cannot reconcile stays `Evicting` and is excluded from
-  reuse and victim choice. Admission charges its last closed size; historical
-  records without one consume the whole admission budget, a conservative
-  decision bound rather than a claim about actual bytes. On the removable
-  pool's bounded-scan reserve route, pending charges that alone reach the
-  budget still refuse admission. If an unjournaled pending root cannot be
-  measured, its identity and replacement bytes are unknown: a second read-only
-  scope check may exclude it only to refuse `Full` at the whole-budget bound;
-  it never authorizes allocation or deletion. If the pending root's own metadata
-  cannot be read, the same whole-budget refusal applies; otherwise an independent
-  incomplete scope remains an accounting error. The scope walk stops
-  at the journaled private root only when its recorded identity verifies.
+  reuse and victim choice. Admission charges the maximum of its recorded size,
+  the bytes observed by a bounded walk and the largest recorded slot: these
+  pools have no per-slot byte ceiling. A pending root whose identity or complete
+  walk cannot be established remains isolated before reconciliation may change
+  it. The soft-budget and replacement limitation is described in
+  [local lease](local-lease.md#capacity-and-eviction). Independent incomplete
+  scope remains an accounting error.
   Status names pending slot IDs, and the read-only drive description names them
   in its pending-reconciliation detail. Other independently owned bytes still
   count, and count ceilings still include the pending slot. The admission
