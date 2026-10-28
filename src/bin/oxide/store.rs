@@ -4719,10 +4719,20 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
         if error.kind() == std::io::ErrorKind::NotFound {
             return Ok(None);
         }
-        return Err(format!(
-            "cannot open admission lock in {}: {error}",
-            control.display()
-        ));
+        return Err(if create {
+            // Pre-S1 wording, kept verbatim for the shared dormant path.
+            format!(
+                "cannot open admission lock in {}: the create did not succeed",
+                control.display()
+            )
+        } else {
+            // The guarded probe's precise wording: a symlinked, unreadable or
+            // otherwise unusable lock is not absence.
+            format!(
+                "cannot open admission lock in {}: {error}",
+                control.display()
+            )
+        });
     }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
@@ -4739,8 +4749,22 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
 }
 
 pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
-    let file = open_admission_file(control, true)?
-        .ok_or_else(|| format!("cannot create admission lock in {}", control.display()))?;
+    // The shipped messages are part of the pre-S1 behaviour this slice must
+    // keep byte-identical while it is dormant, so they are produced here
+    // exactly as they were: an absent control directory names itself, and any
+    // other failure to end with an open descriptor says the create did not
+    // succeed. The guarded probe path (create == false) keeps the precise
+    // wording it needs to tell "no lock" from "cannot tell".
+    let Some(file) = open_admission_file(control, true)? else {
+        return if open_control_directory(control)?.is_none() {
+            Err(format!("{} does not exist", control.display()))
+        } else {
+            Err(format!(
+                "cannot open admission lock in {}: the create did not succeed",
+                control.display()
+            ))
+        };
+    };
     crate::budget::lock(&file, "admission")?;
     Ok(file)
 }
@@ -6047,6 +6071,40 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The shared `lock_admission` messages are the pre-S1 texts verbatim, so a
+    /// dormant build reports exactly what it reported before this slice (gate
+    /// `dormant_byte_identity`). The guarded probe keeps its own, precise
+    /// wording; this test pins the shipped pair.
+    #[test]
+    fn the_shipped_admission_messages_are_unchanged() {
+        let (root, internal, _removable) = paired_controls("shipped-admission-text");
+        // An absent control directory names itself, exactly as before.
+        let absent = Path::new("/nonexistent-oxide-control");
+        let refused = lock_admission(absent).unwrap_err();
+        assert_eq!(refused, "/nonexistent-oxide-control does not exist");
+        // Any other failure to reach an open descriptor is reported with the
+        // shipped "create did not succeed" text, not the OS error.
+        let admission = internal.control.join("admission.lock");
+        let elsewhere = root.join("elsewhere.lock");
+        fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &admission).unwrap();
+        let refused = lock_admission(&internal.control).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "cannot open admission lock in {}: the create did not succeed",
+                internal.control.display()
+            )
+        );
+        // The guarded probe on the same path is precise instead, and never
+        // reports absence for an unusable lock.
+        let probed = probe_admission(&internal.control).unwrap_err();
+        assert!(probed.contains("cannot open admission lock in"), "{probed}");
+        assert!(!probed.contains("create did not succeed"), "{probed}");
+        fs::remove_file(&admission).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// The control-state bytes of one pool, for a refusal that must change
     /// nothing (one-use S1: `next_id` included).
     fn state_bytes(store: &Store) -> Vec<u8> {
@@ -6457,7 +6515,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The guarded order (design §4.1 step 3): the caller's revalidation runs    /// The guarded order (design §4.1 step 3): the caller's revalidation runs
+    /// The guarded order (design §4.1 step 3): the caller's revalidation runs
     /// before any mark, and its refusal is returned unchanged with nothing
     /// allocated. The shipped `Recovering` mode never consults it.
     #[test]

@@ -25,10 +25,11 @@ implementation review corrected:
   checkout binding mutex across the revalidation **and** the `Barrier` attempt,
   releasing it only between attempts and before the poll, so no peer command's
   binding can publish a `Prepared` receipt in the gap. To keep that safe it
-  takes **every** lock in the attempt non-blocking
-  (`store::try_lock_admission`), so it can never deadlock with a shipped verb
-  that holds the barrier and then wants the binding mutex. Expiry is the
-  bounded `BARRIER_BUSY` refusal with nothing written.
+  takes **every** lock in the attempt non-blocking (`store::probe_admission`
+  to look, `store::acquire_existing_admission` to take), so it can never
+  deadlock with a shipped verb that holds the barrier and then wants the
+  binding mutex. Expiry is the bounded `BARRIER_BUSY` refusal with nothing
+  written.
 - **A dead busy fact refuses even beside a live one.** A free waiter or record
   lock never clears itself without the shipped recovery, so waiting for a live
   holder could not make progress; the classifier reports the dead fact. A free
@@ -64,13 +65,15 @@ implementation review corrected:
   diagnostic.
 - **A guarded refusal creates no lock file — structurally, not by promise.**
   A guarded verb never creates the pool's `admission.lock` at any point: it
-  *probes* it (never creating it), refuses or retries when it is held, retries
-  when it is absent (a pool that has never had a controller enter its critical
-  section; the verb cannot bootstrap it), and then takes the **existing** lock
+  *probes* it (never creating it), retries when it is held or absent — absence
+  at one probe is only that, an observation the verb answers with a retry, and
+  it never bootstraps the lock itself — and then takes the **existing** lock
   non-blockingly before its second authority decision. There is therefore no
   path on which a dead, live, retry or unknown answer can leave a newly created
   `admission.lock`; the only file a refusal may touch is the checkout binding
-  mutex. The caller's revalidation runs again between the two decisions, so a
+  mutex. Because the verb never creates the lock, a pool that has no admission
+  lock at all can never reach a mark through this path: it retries until its
+  budget is spent and then refuses with `BARRIER_BUSY`. The caller's revalidation runs again between the two decisions, so a
   change that lands in that window is refused before a mark, and only the
   proceeding path writes the mark and its `waiters/` lock.
 - **Unknown custody is never absence, on either side of the pair.** The other

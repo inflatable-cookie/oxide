@@ -17096,7 +17096,7 @@ mod tests {
         });
     }
 
-    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a
+    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a
     /// `Prepared` transition with the exact diagnostic, repeatedly and
     /// byte-identically including `next_id`, and the refusal happens at the
     /// effect-free fast precheck — before the binding mutex is even created
@@ -17326,7 +17326,7 @@ mod tests {
         assert!(refused.contains("unsettled"), "{refused}");
     }
 
-    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally
+    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally
     /// through it (design §4.2's `Pruned` row), writing no receipt or state
     /// byte.
     #[test]
