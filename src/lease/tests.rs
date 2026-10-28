@@ -4389,7 +4389,17 @@ fn blocked_capture_collision_is_counted_as_foreign_scope() {
 #[test]
 fn a_competing_admission_waits_for_an_inflight_eviction() {
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    if let Some(pool) = std::env::var_os("OXIDE_175_CHILD_POOL") {
+        let project = PathBuf::from(std::env::var_os("OXIDE_175_CHILD_PROJECT").expect("project"));
+        let workspace =
+            PathBuf::from(std::env::var_os("OXIDE_175_CHILD_WORKSPACE").expect("workspace"));
+        let ready = PathBuf::from(std::env::var_os("OXIDE_175_CHILD_READY").expect("ready"));
+        fs::write(ready, b"ready").expect("child ready");
+        lease_injected(request(Path::new(&pool), &project, &workspace, "second"))
+            .expect("second process admits after the eviction");
+        return;
+    }
     let fixture = Fixture::new("concurrent-eviction");
     let (pool, _, _) = idle_slot_for_eviction(&fixture, "concurrent-eviction");
     let first_project = fixture.dir("first-project");
@@ -4412,24 +4422,35 @@ fn a_competing_admission_waits_for_an_inflight_eviction() {
     entered_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("eviction paused");
-    let second_request = request(&pool, &second_project, &workspace, "second");
-    let (done_tx, done_rx) = mpsc::channel();
-    let second = thread::spawn(move || {
-        let result = lease_injected(second_request);
-        done_tx.send(result).expect("report result");
-    });
-    let waiting = done_rx.recv_timeout(Duration::from_millis(250));
+    let ready = fixture.path().join("second-ready");
+    let mut second = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "lease::tests::a_competing_admission_waits_for_an_inflight_eviction",
+        ])
+        .env("OXIDE_175_CHILD_POOL", &pool)
+        .env("OXIDE_175_CHILD_PROJECT", &second_project)
+        .env("OXIDE_175_CHILD_WORKSPACE", &workspace)
+        .env("OXIDE_175_CHILD_READY", &ready)
+        .spawn()
+        .expect("start second process");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let started = ready.exists();
+    thread::sleep(Duration::from_millis(250));
+    let waiting = second.try_wait().expect("second process status").is_none();
     resume_tx.send(()).expect("resume eviction");
-    let second_result = done_rx.recv_timeout(Duration::from_secs(10));
     let first_result = first.join().expect("first worker");
-    second.join().expect("second join");
+    let second_result = second.wait().expect("second process exit");
     assert!(
-        matches!(waiting, Err(mpsc::RecvTimeoutError::Timeout)),
-        "second admission did not wait: {waiting:?}"
+        started && waiting,
+        "second process did not wait for the pool lock"
     );
     assert!(
-        matches!(second_result, Ok(Ok(_))),
-        "second admission: {second_result:?}"
+        second_result.success(),
+        "second process exit: {second_result}"
     );
     assert!(first_result.is_ok(), "first admission: {first_result:?}");
 }
