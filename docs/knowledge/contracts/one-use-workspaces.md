@@ -1,6 +1,6 @@
 # One-use workspaces beside normal slots (design of record)
 
-Status: **design frozen (decision `dd090b31`), slices S1 and S2 implemented and
+Status: **design frozen (decision `dd090b31`), slices S1-S3 implemented and
 DORMANT, everything else unimplemented.** The frozen design authorizes no
 proof script, selector, native execution, live-pool read, installation,
 consumer change or host setting by itself; each slice still needs its own
@@ -564,6 +564,97 @@ its own approved brief. What the tree now holds:
   (one-use-fenced) pool's donors read as `Unknown` and seeding skips them. That
   is the conservative direction and §8.5 already requires the seeding interface
   to be re-checked at dispatch, so this slice changes no library code.
+
+**S3 implementation record (oxide#172).** Slice S3 of §15 landed dormant under
+its own approved brief. It is the library admission protocol, and it changes no
+production behaviour while the feature is dormant. What the tree now holds:
+
+- **The request, the observation and the refusal (§6.1, §6.9).**
+  `LeaseRequest` gained `class: AdmissionClass`, `victims: VictimPolicy` and
+  `slice: Option<OneUseSlice>`; `Leased` gained
+  `slice: Option<SliceReport>`; and `LeaseError::OneUseBudget { measured:
+  Option<u64>, limit: u64 }` carries reason `one_use_budget` and exit code 3
+  beside `Full` and `unknown_accounting`, with a display that never says "pool
+  cap". The new types live in `src/lease/slice.rs` and are re-exported from
+  `oxide_storage::lease`. `MemberSet` is bounded by the ledger's `MAX_SLOTS`,
+  removes exact duplicate pairs and **refuses an over-bound set rather than
+  truncating it**; `Any` is the default policy and the default admission class,
+  so a library caller outside this feature keeps today's behaviour.
+- **Where the accounting set lives.** §6.1's abbreviated `OneUseSlice` listing
+  names only the bounds, the kind and the unknown count. The implementation
+  passes the front door's verified member set as `OneUseSlice::members` and the
+  **evictable subset** as `VictimPolicy::preferred`, which is what lets restore
+  count protected members and lets `Prefer` subtract every member from its
+  fallback. The one policy rule the library enforces is set inclusion: a
+  `preferred` pair outside `slice.members` is an `InvalidInput` refusal, so the
+  `evictable ⊆ accounting` invariant cannot be violated by a caller.
+- **Restore (§6.3, §6.4, §6.9).** `Pool::restore` verifies every accounting pair
+  against the ledger under the pool lock (an unverified pair is dropped and
+  reported, never replaced), measures the member union, and reclaims eligible
+  idle members oldest `(rank, slot_id)` first until both thresholds hold, the
+  bytes fit, or no eligible victim is left. The reuse candidate is never a
+  victim; its bytes still count; a new one-use slot is held to
+  `member_count <= max_slots - 1`, a warm reuse is admissible at the ceiling.
+  A class-unknown pool is reported `LowerBound` and **reclaims nothing** — the
+  brief's rule that an unprovable bound must not be spent as if bounded, and
+  the conservative reading of §6.3. An incomplete or unusable union is
+  `Unmeasured`, never zero and never an exact overage. After restore, a
+  still-full `OneUse` admission returns `OneUseBudget` while a normal one
+  returns `Over` and continues into its ordinary decision (§6.8). Restore runs
+  before every new-slot admission and every one-use admission including warm
+  reuse, and never on a normal warm reuse. The front door passes a slice for
+  every admission and the library's own branch decides: a normal warm reuse
+  measures nothing even though it carries the observation, so the rule cannot
+  depend on a caller predicting which branch the ledger will take.
+- **The union walk (§6.4).** `inventory::union_directory` is a mode of the
+  existing walker: one shared `(device, inode)` set, one shared entry budget,
+  one shared depth limit and one absolute cooperative deadline across every
+  root. It refuses an empty, duplicate, non-directory or cross-device root and
+  never follows a link or crosses a mount; partial coverage stays partial with
+  its gaps. `Pool::member_union` walks the verified member roots under
+  `pressure_limits()` (60 s internal / 5 s removable) and treats a missing root
+  as zero, exactly as the shipped recorded total does, while an existing
+  non-directory root is unknown custody and `Unmeasured`.
+- **Class-scoped pressure paths (§6.7).** One `VictimPlan` is resolved per
+  admission (verified preferred pairs plus every verified member pair as the
+  fallback exclusion) and used by the slot-count ceiling, the byte-price path,
+  the post-eviction re-read and the removable reserve route. `Any` keeps the
+  shipped selector; `Only` selects an evictable member alone; `Prefer` selects
+  an evictable member first and otherwise the ordinary order with **every**
+  one-use pair removed. The named project-cap replacement refuses a member
+  outright. The reserve route's own behaviour is untouched: it passes the
+  admission's policy to the same selector and its reserve branch stays
+  unwired, as §10.2 returns that wiring to the owner.
+- **The in-custody reader (§5.5.1, §5.5.2).**
+  `Store::evictable_members` reads only the pool that owns the slot: phase
+  `Idle` with no holder, lease, pending recovery, retirement or loss marker; no
+  recorded process group; a **free and existing** record lock (non-blocking
+  `probe_lock(..., false)`, so `Missing` is not free, and a donor pin — itself
+  that lock — is refused); no other active record of that checkout in this
+  pool and no open unclosed-writer marker for this boot session; a ledger row
+  that is `Idle` and unleased at the exact pair; and no recorded `oxide clean`
+  for the checkout. It never calls `Store::checkout_custody`, never takes a
+  second admission lock, and **reads no sibling-pool state**; the caller's own
+  record id is excluded exactly as `checkout_custody`'s `own` argument does. A
+  member failing any clause is counted and protected. `Store::
+  progress_capable_member` is the separate, same-pool decision §6.9 needs: a
+  live held record lock, an `Acquiring`/`Spawning`/`Running` phase and no open
+  unclosed-writer marker; a full one-use slice waits (`Wait::Uncertain`) only
+  for one of those, and otherwise refuses. A class-unknown one-use pool refuses
+  with the shipped `UnknownAccounting` class plus a message naming the
+  unattributed row count.
+- **Dormant byte identity.** The switch is still `one_use::is_active`, the
+  thread-local S1 seam that is `false` in every production binary (S4 replaces
+  it). No production command classifies a workspace one-use, so
+  `admission.class` is `Normal`, the member set is empty, restore is
+  `NotNeeded` — or `LowerBound` beside a class-unknown row, which reclaims
+  nothing and which the front door prints nothing about when no member exists —
+  with no walk and no write, and the resolved plan names no member and excludes
+  none, leaving every pressure path's order exactly as shipped.
+  The regression copies one freshly created pool twice and admits through the
+  shipped request shape (`Any`, no slice) in the first copy and the new
+  empty-member shape (`Prefer`, `Some(empty)`) in the second: the ledger bytes,
+  the grant and the slot tree are identical.
 
 ## 1. Outcome and non-goals
 
@@ -2681,15 +2772,18 @@ claimed for a statically edited selector.
   membership and class-unknown derivation, and status visibility; see the S2
   implementation record above. The `evictable` split and the in-custody reader
   (§5.5.1, §5.5.2) stay with S3.
-- **S3 library admission protocol.** `LeaseRequest` additions, the `MemberSet`
-  and `evictable` split with the in-custody custody reader (§5.5.2), `restore`
-  with its two thresholds and reuse-candidate exclusion, the union walk, the
-  class-scoped pressure paths, the `one_use_budget` and `unknown_accounting`
-  refusals, and the class-scoped policy applied to the reserve route's victim
-  choice (`admit_unknown_removable` passes the admission's `Prefer`/`Only` to the
-  same selector). The route's own behaviour is **not** changed: its reserve
-  branch is unreachable today and wiring it is returned to the owner (§10.2,
-  §19).
+- **S3 library admission protocol - implemented, dormant (oxide#172).**
+  `LeaseRequest`'s class, victim policy and slice; the bounded `MemberSet`, the
+  `evictable` split with the in-custody reader (§5.5.2); `restore` with its two
+  thresholds and the reuse-candidate exclusion; the union walk; the
+  class-scoped pressure paths; the `one_use_budget` and `unknown_accounting`
+  refusals; and the class-scoped policy passed to `admit_unknown_removable`'s
+  victim choice. The route's own behaviour is **not** changed: its reserve
+  branch is still unreachable and wiring it stays returned to the owner (§10.2,
+  §19). See the S3 implementation record above for the six properties the
+  slice states exactly (where the accounting set lives, `LowerBound` reclaiming
+  nothing, the union's shared bounds, the reader's same-pool scope, the
+  progress-capable wait and the dormant byte identity).
 - **S4 proof controls.** The feature, the two readers, the capability field and
   the installer refusal, the `stage_at` feature parameter and the static edits
   to the exposed scripts.

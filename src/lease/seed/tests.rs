@@ -10,8 +10,8 @@ use super::super::pool::{
     rewrite_removable_backend_injected, slot_state_injected, tamper_idle_generations_injected,
 };
 use super::super::{
-    LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, BUDGET_BACKEND_DIRECTORY_V1,
-    VOLUME_BACKEND_APFS_V1,
+    AdmissionClass, LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, VictimPolicy,
+    BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1,
 };
 use super::*;
 use std::cell::{Cell, RefCell};
@@ -370,6 +370,9 @@ impl Rig {
             reserve_bytes: None,
             layout,
             replace_slot: None,
+            class: AdmissionClass::Normal,
+            victims: VictimPolicy::Any,
+            slice: None,
         })
         .expect("lease")
     }

@@ -31,8 +31,9 @@ use oxide_storage::lease::managed::{
     recover, release, snapshot, status as pool_status,
 };
 use oxide_storage::lease::{
-    AccountingScan, LeaseError, LeaseRequest, LedgerSlot, LedgerView, PoolStatus,
-    Profile as LeaseProfile, ReuseMeasurement, SlotLayout, SlotOccupancy,
+    AccountingScan, AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair,
+    MemberSet, OneUseSlice, PoolStatus, Profile as LeaseProfile, RestoreOutcome, ReuseMeasurement,
+    SliceAdmission, SliceReport, SlotLayout, SlotOccupancy, VictimPolicy,
     BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
 use oxide_storage::volume::Binding;
@@ -711,6 +712,20 @@ fn closed_by_boot(record: &Record, boot_ms: Option<u64>) -> bool {
         .as_ref()
         .is_some_and(|lost| lost.unclosed.is_some())
         && started_before_boot(record, boot_ms)
+}
+
+/// The control-record half of the one-use evictable checklist (design §5.5.1
+/// items 1, 2 and 5): phase exactly `Idle`, no holder, lease, pending recovery,
+/// retirement or loss marker, and no recorded process group. A recorded group
+/// means a writer may still exist, so it is protected.
+fn idle_member_record(record: &Record) -> bool {
+    record.phase == Phase::Idle
+        && record.holder.is_none()
+        && record.lease_id.is_none()
+        && record.pending_recovery.is_none()
+        && record.retired.is_none()
+        && record.lost.is_none()
+        && record.process_group.is_none()
 }
 
 /// The own-command recovery rule. `held` is the held slot on the record's
@@ -4014,6 +4029,176 @@ impl Store {
         ClassMembership { members, unknown }
     }
 
+    /// The member pairs as the library's bounded set.
+    fn member_set(members: &[ClassMember]) -> MemberSet {
+        MemberSet::new(
+            members
+                .iter()
+                .map(|member| MemberPair::new(&member.slot_id, &member.incarnation)),
+        )
+    }
+
+    /// The **evictable** subset of this pool's one-use members (design §5.5.1,
+    /// §5.5.2): the only one-use victim source the library is allowed to use.
+    ///
+    /// Every fact below is read here, from the control state this admission
+    /// already holds under its own admission lock, plus one non-blocking probe
+    /// of the member's own record lock. `Store::checkout_custody` is
+    /// deliberately **not** called: it takes this store's admission lock again,
+    /// and on macOS a second `flock` from the same process blocks rather than
+    /// recursing. Cross-pool facts are used for nothing: a one-use slot lives
+    /// in exactly one pool, so only a writer of that pool can write its tree
+    /// (design §5.5.2).
+    ///
+    /// A member failing any clause is **protected**: still counted by the
+    /// slice, never a victim. A donor pin is a held record lock (the donor is
+    /// pinned by taking its record lock before the pool lock), so the lock probe
+    /// refuses it here without a separate fact.
+    fn evictable_members(
+        &self,
+        state: &State,
+        slots: &[LedgerSlot],
+        members: &[ClassMember],
+        own: u64,
+    ) -> Vec<ClassMember> {
+        let boot = boot_session();
+        let mut evictable = Vec::with_capacity(members.len());
+        for pair in members {
+            let Some(slot) = slots
+                .iter()
+                .find(|slot| slot.slot_id == pair.slot_id && slot.incarnation == pair.incarnation)
+            else {
+                continue;
+            };
+            // A slot's class is a function of exactly one record's immutable
+            // field, matched by its own affinity directory (§5.2).
+            let Some(record) = state.records.iter().find(|record| {
+                record.class == WorkspaceClass::OneUse
+                    && slot.project == self.affinity_dir(record.id)
+            }) else {
+                continue;
+            };
+            if !idle_member_record(record) {
+                continue;
+            }
+            // A free, existing record lock: `Missing` is not free (item 3).
+            match probe_lock(&self.lock_path(record.id), false) {
+                Ok(Probe::Free(_probe)) => {}
+                _ => continue,
+            }
+            if self.other_record_active(state, record, own, boot) {
+                continue;
+            }
+            if slot.state != SlotOccupancy::Idle || slot.lease_id.is_some() {
+                continue;
+            }
+            let Some(checkout) = record.checkout.as_deref() else {
+                continue;
+            };
+            if state.cleans.iter().any(|clean| clean.checkout == checkout) {
+                continue;
+            }
+            evictable.push(pair.clone());
+        }
+        evictable
+    }
+
+    /// No other record **in this pool** for the member's checkout is active,
+    /// and no retired record's unclosed writers are open for this boot session.
+    /// The caller's own record is excluded exactly as `checkout_custody`'s
+    /// `own` argument does.
+    fn other_record_active(
+        &self,
+        state: &State,
+        member: &Record,
+        own: u64,
+        boot: Option<u64>,
+    ) -> bool {
+        let Some(checkout) = member.checkout.as_deref() else {
+            return true;
+        };
+        state
+            .records
+            .iter()
+            .filter(|other| other.id != own)
+            .filter(|other| other.checkout.as_deref() == Some(checkout))
+            .any(|other| {
+                other.active()
+                    || (other.phase == Phase::Retired
+                        && other
+                            .lost
+                            .as_ref()
+                            .is_some_and(|lost| lost.unclosed.is_some())
+                        && !closed_by_boot(other, boot))
+            })
+    }
+
+    /// Whether a full one-use slice has a holder that can finish (design §6.9):
+    /// a record lock held by a live process, an `Acquiring`/`Spawning`/`Running`
+    /// phase, and no open unclosed-writer marker. A control-uncertain member is
+    /// never progress-capable, so it is never a reason to wait.
+    fn progress_capable_member(&self, state: &State, own: u64) -> bool {
+        let boot = boot_session();
+        state
+            .records
+            .iter()
+            .filter(|record| record.class == WorkspaceClass::OneUse && record.id != own)
+            .filter(|record| {
+                matches!(
+                    record.phase,
+                    Phase::Acquiring | Phase::Spawning | Phase::Running
+                )
+            })
+            .filter(|record| {
+                !record
+                    .lost
+                    .as_ref()
+                    .is_some_and(|lost| lost.unclosed.is_some())
+                    || closed_by_boot(record, boot)
+            })
+            .any(|record| {
+                matches!(
+                    probe_lock(&self.lock_path(record.id), false),
+                    Ok(Probe::Held)
+                )
+            })
+    }
+
+    /// The bounded visibility line of §10.5 for one slice observation. A normal
+    /// warm reuse has no observation and prints nothing; a normal new-slot
+    /// admission prints only when a member or a class-unknown row exists, so a
+    /// dormant pool's output stays byte-identical.
+    fn report_slice(class: WorkspaceClass, report: &SliceReport) {
+        if class == WorkspaceClass::Normal && report.members == 0 {
+            return;
+        }
+        match &report.outcome {
+            RestoreOutcome::NotNeeded => {}
+            RestoreOutcome::Within { bytes } => eprintln!(
+                "oxide: one-use slots: {} of {}, {bytes} of {} bytes",
+                report.members, report.max_slots, report.max_bytes
+            ),
+            RestoreOutcome::Over { bytes } => eprintln!(
+                "oxide: one-use slots: over by {} bytes: measured {bytes} of {}, {} protected, {} unmeasured",
+                bytes.saturating_sub(report.max_bytes),
+                report.max_bytes,
+                report.protected,
+                report.unverified
+            ),
+            RestoreOutcome::Full { bytes, held } => eprintln!(
+                "oxide: one-use slots: full: measured {bytes} of {} bytes, {held} protected of {} members",
+                report.max_bytes, report.members
+            ),
+            RestoreOutcome::LowerBound { bytes, unknown } => eprintln!(
+                "oxide: one-use slots: lower bound, {unknown} class-unknown ledger rows: measured {bytes} of {} bytes",
+                report.max_bytes
+            ),
+            RestoreOutcome::Unmeasured { reason } => {
+                eprintln!("oxide: one-use slots: unmeasured ({reason})")
+            }
+        }
+    }
+
     fn attempt(
         &self,
         ticket: u64,
@@ -4340,14 +4525,53 @@ impl Store {
                 })?),
                 None => None,
             };
+        // The workspace class and the bounded slice observation (design §6.1,
+        // §6.3). Production is dormant: `admission.class` is `Normal` for every
+        // command while `one_use::is_active()` is false, so no member set is
+        // ever nonempty in a production pool and no record carries a class.
+        let class = admission.class;
+        let lease_profile = match profile {
+            Profile::Debug => LeaseProfile::FullDebug,
+            Profile::Quick | Profile::Release => LeaseProfile::Dev,
+        };
+        let membership = self.class_membership(&state, &view.slots);
+        let unknown_rows = membership.unknown.len();
+        let evictable = if membership.members.is_empty() {
+            Vec::new()
+        } else {
+            self.evictable_members(&state, &view.slots, &membership.members, record)
+        };
+        let affinity = self.affinity_dir(record);
+        let reuse_candidate = view.slots.iter().any(|slot| {
+            slot.project == affinity
+                && slot.profile == lease_profile
+                && slot.state == SlotOccupancy::Idle
+                && slot.lease_id.is_none()
+        });
+        // Every admission carries the observation. The library performs no
+        // restore on a normal warm reuse (it is the branch, not this
+        // prediction, that decides), so a normal warm reuse still measures
+        // nothing while a new slot — normal or one-use — restores.
+        let slice = Some(OneUseSlice::bounded(
+            Self::member_set(&membership.members),
+            if reuse_candidate {
+                SliceAdmission::WarmReuse
+            } else {
+                SliceAdmission::NewSlot
+            },
+            membership.unknown.len(),
+            self.command_budget(),
+        ));
+        let preferred = Self::member_set(&evictable);
+        let victims = match class {
+            WorkspaceClass::Normal => VictimPolicy::Prefer { preferred },
+            WorkspaceClass::OneUse => VictimPolicy::Only { preferred },
+        };
         let request = LeaseRequest {
             pool: self.pool.clone(),
-            project: self.affinity_dir(record),
+            project: affinity,
             workspace: key.checkout.clone(),
-            profile: match profile {
-                Profile::Debug => LeaseProfile::FullDebug,
-                Profile::Quick | Profile::Release => LeaseProfile::Dev,
-            },
+            profile: lease_profile,
             holder: lease_holder,
             budget_bytes: self.budget,
             // The registered removable volume's free-space reserve, when this
@@ -4363,6 +4587,12 @@ impl Store {
                 profile: profile.label().to_owned(),
             }),
             replace_slot,
+            class: match class {
+                WorkspaceClass::Normal => AdmissionClass::Normal,
+                WorkspaceClass::OneUse => AdmissionClass::OneUse,
+            },
+            victims,
+            slice,
         };
         let outcome = lease_measured(request);
         // The library deletes the requested victim only after complete
@@ -4388,6 +4618,9 @@ impl Store {
                 if let Some(note) = &leased.admission_note {
                     eprintln!("oxide: warning: {note}");
                 }
+                if let Some(report) = &leased.slice {
+                    Self::report_slice(class, report);
+                }
                 (leased.grant, leased.measured)
             }
             Err(error) => {
@@ -4403,6 +4636,25 @@ impl Store {
                     // completion frees a count or byte ceiling.
                     LeaseError::Full | LeaseError::LedgerExhausted if busy => {
                         Ok(Err(Wait::Capacity))
+                    }
+                    // A full one-use slice waits only for a holder that can
+                    // finish (design §6.9); a control-uncertain member is
+                    // protected, never a reason to wait.
+                    LeaseError::OneUseBudget { .. }
+                        if class == WorkspaceClass::OneUse
+                            && self.progress_capable_member(&state, record) =>
+                    {
+                        Ok(Err(Wait::Uncertain))
+                    }
+                    // Class-unknown ledger rows make the slice bound
+                    // unprovable: refuse with the shipped safety class and
+                    // name the unattributed rows (§5.6).
+                    LeaseError::UnknownAccounting
+                        if class == WorkspaceClass::OneUse && unknown_rows > 0 =>
+                    {
+                        Err(format!(
+                            "one-use workspace admission refused: {unknown_rows} of this pool's ledger slots have no owning record, so the one-use slice cannot be bounded; nothing was evicted"
+                        ))
                     }
                     error => Err(lease_error("cannot lease a slot", &error)),
                 };
@@ -9501,6 +9753,10 @@ pub(crate) mod tests {
     }
 
     fn class_fixture(label: &str) -> (PathBuf, Store, SlotKey) {
+        class_fixture_with_budget(label, 1 << 30)
+    }
+
+    fn class_fixture_with_budget(label: &str, budget: u64) -> (PathBuf, Store, SlotKey) {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -9512,14 +9768,14 @@ pub(crate) mod tests {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(&root).unwrap();
         let pool = root.join("pool");
-        init_budget_pool(&pool, 1 << 30).unwrap();
+        init_budget_pool(&pool, budget).unwrap();
         let store = Store {
             control: pool.join(MANAGED_NAME),
             payload: pool.join("payload"),
             pool: pool.clone(),
             backend: Backend::DirectoryBudget,
-            budget: Some(1 << 30),
-            recorded_budget: 1 << 30,
+            budget: Some(budget),
+            recorded_budget: budget,
             max_active: 16,
             sibling: None,
         };
@@ -10100,6 +10356,278 @@ pub(crate) mod tests {
             membership.members.len() + membership.unknown.len(),
             slots.len()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // One-use workspaces, slice S3: the evictable split and its reader
+    // (design §5.5.1, §5.5.2, §6.9). Unit tests only: production is dormant.
+    // ---------------------------------------------------------------------
+
+    /// The evictable checklist protects every doubt: a held record lock, an
+    /// active phase, a recorded group, a clean mark and a missing lock are all
+    /// protected, and only a positively idle, unlocked, clean `Idle` member is
+    /// evictable.
+    #[test]
+    fn the_evictable_split_protects_every_control_uncertainty() {
+        let (root, store, key) = class_fixture("evictable");
+        let held = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let record_id = held.record_id();
+        store.release(held, None).unwrap();
+        let state = store.load().unwrap();
+        let slots = store.ledger().unwrap().slots;
+        let membership = store.class_membership(&state, &slots);
+        assert_eq!(membership.members.len(), 1);
+        let pair = membership.members[0].clone();
+        let evictable = store.evictable_members(&state, &slots, &membership.members, 0);
+        assert_eq!(evictable, vec![pair.clone()], "a closed idle member");
+        // The caller's own record is excluded exactly as `checkout_custody`
+        // does; here the member is that record and it is still idle.
+        assert_eq!(
+            store.evictable_members(&state, &slots, &membership.members, record_id),
+            vec![pair.clone()]
+        );
+
+        // 1/2: an active phase or a recorded holder is protected.
+        for mutate in [
+            |record: &mut Record| record.phase = Phase::Spawning,
+            |record: &mut Record| {
+                record.phase = Phase::Idle;
+                record.holder = Some(Holder {
+                    pid: 41,
+                    started_ms: 7,
+                    lease_holder: "oxide-41-3".to_owned(),
+                    command: None,
+                });
+            },
+        ] {
+            let mut state = store.load().unwrap();
+            let index = state
+                .records
+                .iter()
+                .position(|record| record.id == record_id)
+                .unwrap();
+            mutate(&mut state.records[index]);
+            let evictable = store.evictable_members(&state, &slots, &membership.members, 0);
+            assert!(evictable.is_empty(), "an active member was evictable");
+        }
+
+        // 5: a recorded process group means a writer may still exist.
+        let mut state = store.load().unwrap();
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.id == record_id)
+            .unwrap();
+        state.records[index].process_group = Some(41);
+        assert!(store
+            .evictable_members(&state, &slots, &membership.members, 0)
+            .is_empty());
+
+        // 3: a lock probe that is free is evictable; a held or missing lock is
+        // not. The donor pin is a held record lock, so this covers §8.2.
+        let mut state = store.load().unwrap();
+        state.records[index].process_group = None;
+        store.save(&state).unwrap();
+        let path = store.lock_path(record_id);
+        let held_probe = probe_lock(&path, true).expect("lock");
+        assert!(matches!(&held_probe, Probe::Free(_)));
+        assert!(
+            store
+                .evictable_members(&state, &slots, &membership.members, 0)
+                .is_empty(),
+            "a held record lock was evictable"
+        );
+        drop(held_probe);
+        assert_eq!(
+            store.evictable_members(&state, &slots, &membership.members, 0),
+            vec![pair.clone()]
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(
+            store
+                .evictable_members(&state, &slots, &membership.members, 0)
+                .is_empty(),
+            "a missing record lock is not free"
+        );
+        let _ = probe_lock(&path, true).expect("lock");
+
+        // 7: a recorded clean for the member's checkout is protected.
+        let mut state = store.load().unwrap();
+        state.cleans.push(Clean {
+            id: 1,
+            checkout: key.checkout.clone(),
+            process_group: None,
+        });
+        store.save(&state).unwrap();
+        assert!(
+            store
+                .evictable_members(&state, &slots, &membership.members, 0)
+                .is_empty(),
+            "a clean mark was evictable"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The evictable reader reads no sibling-pool state at all (§5.5.2): with
+    /// an active record in the other pool and a blocking barrier configured,
+    /// the result is identical and no admission file is opened there.
+    #[test]
+    fn the_evictable_reader_ignores_the_other_pool() {
+        let (root, store, key) = class_fixture("evictable-sibling");
+        let held = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        store.release(held, None).unwrap();
+        let state = store.load().unwrap();
+        let slots = store.ledger().unwrap().slots;
+        let membership = store.class_membership(&state, &slots);
+        let expected = store.evictable_members(&state, &slots, &membership.members, 0);
+        assert_eq!(expected.len(), 1, "the fixture member is not evictable");
+
+        // The other pool holds an active record for the same checkout, which a
+        // cross-pool premise would have protected the member against.
+        let sibling = Store::for_tests(&root.join("sibling-pool"));
+        let mut other = State::default();
+        let mut active = record(Phase::Running, Some(42), None);
+        active.checkout = Some(key.checkout.clone());
+        other.records.push(active);
+        sibling.save(&other).unwrap();
+        let sibling_control = sibling.control.clone();
+        let with_sibling = store
+            .handle_for_tests()
+            .with_sibling(&sibling_control, true);
+        let evictable = with_sibling.evictable_members(&state, &slots, &membership.members, 0);
+        assert_eq!(evictable, expected, "the reader read cross-pool state");
+        assert!(
+            !sibling_control.join("admission.lock").exists(),
+            "the evictable reader opened the other pool's admission lock"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Only a live, active, custody-clear member is progress-capable (§6.9);
+    /// an idle record, an unheld active record and unknown custody are not.
+    #[test]
+    fn a_progress_capable_member_is_a_live_active_record() {
+        let (root, store, key) = class_fixture("progress");
+        let held = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let record_id = held.record_id();
+        // The command's own record is excluded; another ID sees the holder.
+        assert!(store.progress_capable_member(&store.load().unwrap(), 0));
+        assert!(
+            !store.progress_capable_member(&store.load().unwrap(), record_id),
+            "the caller's own record was progress-capable"
+        );
+        store.release(held, None).unwrap();
+        assert!(
+            !store.progress_capable_member(&store.load().unwrap(), 0),
+            "an idle record was progress-capable"
+        );
+
+        // An active phase without the live lock is not progress-capable: its
+        // writer custody is unknown, so it is protected and never a reason to
+        // wait.
+        let mut state = store.load().unwrap();
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.id == record_id)
+            .unwrap();
+        state.records[index].phase = Phase::Spawning;
+        store.save(&state).unwrap();
+        assert!(!store.progress_capable_member(&state, 0));
+
+        // A live lock with an active phase is progress-capable, and an open
+        // unclosed-writer marker makes it unknown custody again.
+        let probe = probe_lock(&store.lock_path(record_id), true).expect("lock");
+        assert!(matches!(&probe, Probe::Free(_)));
+        assert!(store.progress_capable_member(&state, 0));
+        drop(probe);
+        let mut state = store.load().unwrap();
+        state.records[index].lost = Some(Lost {
+            slot_id: "1".to_owned(),
+            at_ms: 1,
+            unclosed: Some("a test writer was never confirmed closed".to_owned()),
+        });
+        store.save(&state).unwrap();
+        let _ = probe_lock(&store.lock_path(record_id), true).expect("lock");
+        assert!(!store.progress_capable_member(&state, 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// A full one-use slice waits only for a holder that can finish, and a
+    /// fresh admission succeeds once that holder releases (§6.9). The slice
+    /// byte bound is a tenth of this command's soft budget, so a tiny budget
+    /// and a real payload make the bound non-vacuous.
+    #[test]
+    fn a_full_one_use_slice_waits_for_a_live_holder_then_admits() {
+        let (root, store, key) = class_fixture_with_budget("one-use-wait", 1_000);
+        let held = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let member_slot = held.slot_id.clone();
+        fs::write(held.build_dir.join("payload"), vec![b'x'; 4 * 1024]).expect("payload");
+        // The member is live and cannot be deleted, so a new one-use slot
+        // cannot fit: the command waits for the holder instead of refusing.
+        assert!(matches!(
+            lease_as(
+                &store,
+                &key,
+                WorkspaceAdmission::one_use("a temporary workspace"),
+                false,
+            ),
+            Err(Wait::Uncertain)
+        ));
+        assert!(
+            store
+                .ledger()
+                .unwrap()
+                .slots
+                .iter()
+                .any(|slot| slot.slot_id == member_slot),
+            "a wait deleted the live member"
+        );
+
+        // The holder closes. A fresh record (a different compatibility key)
+        // has no reuse candidate, so restore may reclaim the released member
+        // and the admission succeeds.
+        store.release(held, None).unwrap();
+        let fresh = SlotKey {
+            checkout: key.checkout.clone(),
+            identity: key.identity.clone(),
+            compatibility: "fresh-key".to_owned(),
+        };
+        let admitted = lease_as(
+            &store,
+            &fresh,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("the fresh one-use admission admits");
+        assert_ne!(admitted.slot_id, member_slot);
+        let slots = store.ledger().unwrap().slots;
+        assert_eq!(slots.len(), 1, "the released member was not reclaimed");
+        assert_eq!(slots[0].slot_id, admitted.slot_id);
         fs::remove_dir_all(root).unwrap();
     }
 }
