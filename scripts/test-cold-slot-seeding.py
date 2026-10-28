@@ -133,10 +133,11 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
 5. Cargo external argv: not applicable (no external subcommand fixture).
 6. Owned image: `attach_owned_image()` creates the 128 MiB image and its
    custody record in the supervisor's never-auto-cleaned evidence directory
-   before attach, installs the cleanup handle the moment attach succeeds (or
-   a retained handle when attach fails), and only then parses or looks up
-   mount/device facts, so a late fault cannot leave an attached image without
-   a handle. `perm.owners_honored()` proves the mounted root does not carry
+   before attach and installs a provisional retained cleanup handle before
+   the `hdiutil attach` call itself, so an exception, timeout or signal from
+   that call cannot leave an attached image without a handle. On a successful
+   attach the handle is kept and only then are the plist and device/UUID
+   facts read; a failed attach keeps a retained handle for its backing. `perm.owners_honored()` proves the mounted root does not carry
    `MNT_IGNORE_OWNERSHIP`. `detach_owned_image()` performs one ordinary
    detach (never `-force`, never retried) whose window comes from the
    supervisor deadline; its disposition is clean only when detach exited zero,
@@ -145,9 +146,11 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
    recorded case failure, latched abort or unclosed child retains the backing,
    custody record and mount. Only a clean gate may detach; a retained
    disposition aborts a diagnostic and makes a counted PASS impossible.
-7. Compiler flags: `freeze_compiler_flags` removes `CARGO_ENCODED_RUSTFLAGS`
-   and fixes `RUSTFLAGS` for staging and every fixture child; case 10 changes it
-   only for its donor command.
+7. Compiler flags: `stage_candidate()` runs the shared `layout.stage_at` with
+   the proof's frozen `RUSTFLAGS` and no `CARGO_ENCODED_RUSTFLAGS` (restoring
+   the invoking environment afterwards), and every fixture child and the
+   helper's library build use the same frozen flags; case 10 changes them only
+   for its donor command.
 8. Temporary storage: the child env points every temp variable at the
    supervisor's scratch; the private pool is the reviewed internal-placement
    exception. The image backing and custody record live in the supervisor's
@@ -1155,6 +1158,31 @@ def build_lease_helper(proof: Proof, repo: str) -> str:
     return binary
 
 
+def stage_candidate(proof: Proof, repo: str) -> str:
+    """Stage the candidate with the proof's frozen compiler flags.
+
+    The shared `layout.stage_at` builds its child environment from
+    `os.environ` and does not scrub `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`, so
+    this wrapper freezes them for that one call and restores the invoking
+    values afterwards. Every later fixture child and the helper build use the
+    same frozen flags.
+    """
+    saved = {
+        name: os.environ.get(name)
+        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")
+    }
+    os.environ["RUSTFLAGS"] = FROZEN_RUSTFLAGS
+    os.environ.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    try:
+        return layout.stage_at(proof, repo, "candidate", jobs=4)
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def setup(proof: Proof, repo: str) -> None:
     proof.root = os.path.realpath(proof.root)
     scratch = os.path.realpath(os.environ["OXIDE_TASK_SCRATCH_ROOT"])
@@ -1166,7 +1194,7 @@ def setup(proof: Proof, repo: str) -> None:
     proof.evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
     proof.image = None
     proof.phase("start")
-    proof.binary = layout.stage_at(proof, repo, "candidate", jobs=4)
+    proof.binary = stage_candidate(proof, repo)
     print(f"staged candidate {proof.binary}", flush=True)
     # layout.stage_at deletes its whole stage after copying this binary, so
     # nothing below may rely on a staged artifact; the helper builds its own
@@ -1413,6 +1441,15 @@ def custody_completed(disposition: str) -> bool:
     return disposition == "no owned image was attached" or detach_is_clean(disposition)
 
 
+def cleanup_window(seconds: float) -> float | None:
+    """A cleanup child's timeout, or None when the guard's closure margin is
+    too small to start it. Used for verification children after a detach."""
+    remaining = supervisor_remaining()
+    if remaining < 10.0:
+        return None
+    return min(seconds, remaining - 5.0)
+
+
 def detach_timeout(remaining: float) -> float | None:
     """One ordinary detach's timeout, or None when the guard margin is too
     small to start it. Never -force and never retried."""
@@ -1520,6 +1557,16 @@ def attach_owned_image(proof: Proof) -> dict:
     with open(custody, "w", encoding="utf-8") as handle:
         json.dump(document, handle, indent=2, sort_keys=True)
     os.chmod(custody, 0o600)
+    # A handle exists before the attach call: if the call itself raises
+    # (timeout, signal, OSError), the backing and any possible mount are
+    # retained and never reported as "no image was attached".
+    proof.image = owned_image_handle(
+        name,
+        mount,
+        backing,
+        custody,
+        detached="retained: attach outcome unknown",
+    )
     attached = direct_run(
         ["/usr/bin/hdiutil", "attach", "-owners", "on", "-nobrowse", "-plist", backing],
         bounded_step(120),
@@ -1536,8 +1583,9 @@ def attach_owned_image(proof: Proof) -> dict:
             False,
             f"attach failed; backing retained at {backing}: {attached.stderr!r}",
         )
-    # The handle exists before any parsing or verification below can raise.
-    proof.image = owned_image_handle(name, mount, backing, custody)
+    # The attach succeeded: clear the provisional disposition and record the
+    # mount before any parsing or verification below can raise.
+    proof.image["detached"] = None
     proof.mount = mount
     plist = plistlib.loads(attached.stdout.encode())
     mounts = [
@@ -1582,7 +1630,13 @@ def detach_owned_image(proof: Proof, *, reason: str) -> str:
     try:
         mount = image["mount"]
         if not os.path.ismount(mount):
-            info = direct_run(["/usr/bin/hdiutil", "info"], 30)
+            window = cleanup_window(30)
+            if window is None:
+                image["detached"] = (
+                    f"retained: only {supervisor_remaining():.1f} s before the supervisor deadline ({reason})"
+                )
+                return image["detached"]
+            info = direct_run(["/usr/bin/hdiutil", "info"], window)
             if info.returncode != 0:
                 image["detached"] = f"retained: hdiutil info could not be read ({reason})"
                 return image["detached"]
@@ -1601,7 +1655,13 @@ def detach_owned_image(proof: Proof, *, reason: str) -> str:
             )
             return image["detached"]
         result = direct_run(["/usr/bin/hdiutil", "detach", mount], timeout)
-        info = direct_run(["/usr/bin/hdiutil", "info"], 30)
+        window = cleanup_window(30)
+        if window is None:
+            image["detached"] = (
+                f"retained: only {supervisor_remaining():.1f} s before the supervisor deadline after detach ({reason})"
+            )
+            return image["detached"]
+        info = direct_run(["/usr/bin/hdiutil", "info"], window)
         info_ok = info.returncode == 0
         verdict = detach_verdict(
             result.returncode,
@@ -3150,6 +3210,17 @@ def self_test() -> None:
             for index, line in enumerate(attach_lines)
             if "plistlib.loads" in line or "diskutil" in line
         ]
+        attach_call_lines = [
+            index
+            for index, line in enumerate(attach_lines)
+            if "attached = direct_run" in line
+        ]
+        expect(
+            handle_lines
+            and attach_call_lines
+            and handle_lines[0] < attach_call_lines[0],
+            "the attach cleanup handle is installed after the attach call",
+        )
         expect(
             handle_lines and parse_lines and handle_lines[0] < parse_lines[0],
             "the attach cleanup handle is installed after a parse/lookup step",
@@ -3157,6 +3228,119 @@ def self_test() -> None:
         expect(
             "retained: attach failed" in attach_source,
             "a failed attach does not install a retained handle",
+        )
+
+        # The cleanup window is measured from the supervisor deadline, never
+        # the finer WORK clock; a small margin refuses to start a child.
+        saved_deadline = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
+        now = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+        try:
+            os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(now + 5 * 1_000_000_000)
+            expect(cleanup_window(30) is None, "a near-deadline cleanup child was allowed")
+            os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(now + 30 * 1_000_000_000)
+            window = cleanup_window(30)
+            expect(
+                window is not None and 20.0 < window < 30.0,
+                f"the cleanup window did not follow the deadline: {window}",
+            )
+            expect(cleanup_window(2) == 2.0, f"the cleanup window cap drifted: {cleanup_window(2)}")
+        finally:
+            if saved_deadline is None:
+                os.environ.pop("OXIDE_PROOF_DEADLINE_NS", None)
+            else:
+                os.environ["OXIDE_PROOF_DEADLINE_NS"] = saved_deadline
+
+        # An exception from the attach call itself still leaves an
+        # evidence-backed retained handle. The fakes run no hdiutil.
+        fake_evidence = os.path.join(base, "fake-evidence")
+        os.makedirs(fake_evidence, exist_ok=True)
+        fake_proof = types.SimpleNamespace(image=None, mount=None)
+        saved_run = direct_run
+        saved_step = bounded_step
+        saved_evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+
+        def fake_run(command, timeout):
+            if command[:2] == ["/usr/bin/hdiutil", "attach"]:
+                raise subprocess.TimeoutExpired(command, timeout)
+            if command[:2] == ["/usr/bin/hdiutil", "create"]:
+                with open(command[-1], "wb") as handle:
+                    handle.write(b"synthetic image\n")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        try:
+            globals()["direct_run"] = fake_run
+            globals()["bounded_step"] = lambda seconds: seconds
+            os.environ["OXIDE_PROOF_EVIDENCE"] = fake_evidence
+            try:
+                attach_owned_image(fake_proof)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                fail("a faked attach timeout did not propagate")
+        finally:
+            globals()["direct_run"] = saved_run
+            globals()["bounded_step"] = saved_step
+            if saved_evidence is None:
+                os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+            else:
+                os.environ["OXIDE_PROOF_EVIDENCE"] = saved_evidence
+        expect(fake_proof.image is not None, "a faked attach timeout left no cleanup handle")
+        expect(
+            "retained: attach outcome unknown" in (fake_proof.image.get("detached") or ""),
+            f"a faked attach timeout did not retain: {fake_proof.image}",
+        )
+        expect(
+            os.path.isfile(fake_proof.image["backing"]),
+            "a faked attach timeout did not keep its backing",
+        )
+        expect(
+            detach_is_clean(fake_proof.image["detached"]) is False,
+            "a faked attach timeout reported clean custody",
+        )
+
+        # Staging uses the frozen flags even though layout.stage_at inherits
+        # os.environ; the invoking values are restored afterwards.
+        saved_stage = layout.stage_at
+        saved_flags = os.environ.get("RUSTFLAGS")
+        saved_encoded = os.environ.get("CARGO_ENCODED_RUSTFLAGS")
+        observed = {}
+
+        def fake_stage(fake_proof, source, label, jobs=None):
+            observed["rustflags"] = os.environ.get("RUSTFLAGS")
+            observed["encoded"] = os.environ.get("CARGO_ENCODED_RUSTFLAGS")
+            observed["label"] = label
+            observed["jobs"] = jobs
+            return "/staged/oxide"
+
+        try:
+            layout.stage_at = fake_stage
+            os.environ["RUSTFLAGS"] = "inherited-host-flags"
+            os.environ["CARGO_ENCODED_RUSTFLAGS"] = "inherited-encoded-flags"
+            binary = stage_candidate(types.SimpleNamespace(), "/repo")
+        finally:
+            layout.stage_at = saved_stage
+            for name, value in (
+                ("RUSTFLAGS", saved_flags),
+                ("CARGO_ENCODED_RUSTFLAGS", saved_encoded),
+            ):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        expect(binary == "/staged/oxide", "staged_candidate did not return the stage result")
+        expect(
+            observed.get("rustflags") == FROZEN_RUSTFLAGS
+            and observed.get("encoded") is None,
+            f"staging did not see the frozen flags: {observed}",
+        )
+        expect(
+            observed.get("label") == "candidate" and observed.get("jobs") == 4,
+            f"staging arguments drifted: {observed}",
+        )
+        expect(
+            os.environ.get("RUSTFLAGS") == saved_flags
+            and os.environ.get("CARGO_ENCODED_RUSTFLAGS") == saved_encoded,
+            "the staging wrapper did not restore the invoking flags",
         )
 
         # Detach decisions: only exit zero, a gone mount and no hdiutil naming
