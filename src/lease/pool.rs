@@ -2381,16 +2381,21 @@ impl Pool {
         let mut stops = Vec::with_capacity(self.ledger.slots.len());
         for slot in &self.ledger.slots {
             let relative = self.slot_relative(slot)?;
-            if self.recorded_slot_root(slot.id)?.is_some() {
-                stops.push(relative.clone());
+            if slot.state != SlotPersistState::Evicting {
+                if self.recorded_slot_root(slot.id)?.is_some() {
+                    stops.push(relative);
+                }
+                continue;
             }
-            // Only stop at a private root whose journaled identity still
-            // matches. Other names remain in the scope walk.
-            if slot.state == SlotPersistState::Evicting {
-                if let Some(journal) = &slot.capture {
-                    let mut private = relative;
-                    private.set_file_name(&journal.root.private);
-                    let absolute = self.backing.payload_root().join(&private);
+            // A collision at the recorded name is not the journaled root:
+            // leave it in the scope walk instead of hiding its bytes behind
+            // the blocked slot's charge. Apply the same identity check to
+            // both possible names of the root.
+            if let Some(journal) = &slot.capture {
+                let mut private = relative.clone();
+                private.set_file_name(&journal.root.private);
+                for candidate in [relative, private] {
+                    let absolute = self.backing.payload_root().join(&candidate);
                     if let Ok(meta) = fs::symlink_metadata(absolute) {
                         if meta.is_dir()
                             && !meta.file_type().is_symlink()
@@ -2398,7 +2403,7 @@ impl Pool {
                             && meta.ino() == journal.root.inode
                             && meta.uid() == current_uid()
                         {
-                            stops.push(private);
+                            stops.push(candidate);
                         }
                     }
                 }
