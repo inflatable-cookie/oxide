@@ -4,9 +4,10 @@ use super::pool::{
     recover_injected, release_injected, status_injected, with_accounting_limits,
 };
 use super::{
-    remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, LeaseError,
-    LeaseRequest, Profile, SlotLayout, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
-    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_LEDGER_BYTES,
+    remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass,
+    LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
+    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
+    MAX_LEDGER_BYTES,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -110,6 +111,9 @@ fn request_with_profile(
         reserve_bytes: None,
         layout: None,
         replace_slot: None,
+        class: AdmissionClass::Normal,
+        victims: VictimPolicy::Any,
+        slice: None,
     }
 }
 

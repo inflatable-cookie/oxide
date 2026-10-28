@@ -9,7 +9,9 @@ use super::super::pool::{
     create_injected, lease_injected, mark_evicting_for_test, release_injected,
     rewrite_removable_backend_injected, slot_state_injected, tamper_idle_generations_injected,
 };
-use super::super::{LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout};
+use super::super::{
+    AdmissionClass, LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, VictimPolicy,
+};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, OsString};
@@ -367,6 +369,9 @@ impl Rig {
             reserve_bytes: None,
             layout,
             replace_slot: None,
+            class: AdmissionClass::Normal,
+            victims: VictimPolicy::Any,
+            slice: None,
         })
         .expect("lease")
     }

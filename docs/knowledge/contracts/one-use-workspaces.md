@@ -1,14 +1,151 @@
-# One-use workspaces beside normal slots (proposed design)
+# One-use workspaces beside normal slots (design of record)
 
-Status: **design only, unimplemented, unfrozen.** No product code, proof script,
-selector, native execution, live-pool read, installation, consumer change or
-host setting is authorized by this document. It is the first deliverable of
-oxide#138 under the ROOT design-first rebind of 2026-10-27 (Queue brief v3
-`sha256:f4523cf9…`): publish a concrete design in Oxide's owning knowledge
-tree, run `effigy docs:check`, publish a clean exact head, and stop for an
-independent exact-head design review and the Supervisor's delegated freeze.
-Implementation, the author and independent-reviewer native sessions, and the
-mechanical merge hold are separate and unchanged.
+Status: **design frozen (decision `dd090b31`), slices S1-S3 implemented and
+DORMANT, everything else unimplemented.** The frozen design authorizes no
+proof script, selector, native execution, live-pool read, installation,
+consumer change or host setting by itself; each slice still needs its own
+approved brief, and activation belongs to the Elevated proof slice (§15 S4).
+
+**S1 implementation record (oxide#170).** Slice S1 of §15 landed dormant under
+its own approved brief: `src/bin/oxide/one_use.rs` owns §3's classification,
+the two predicates of §3.6, the bounded dropped-root reasons and the §4.4/§4.5
+diagnostic text; `outputs` owns the §4.2/§4.3 receipt-and-path decision, the
+§4.1 ordering (fast precheck, then the authoritative revalidation under the
+checkout binding mutex before any mark, then a bounded non-blocking
+`Barrier`-mode attempt) and the guarded plan/status/clean wording; `store` owns
+the `begin_clean` **mode** seam (`CleanMode::Recovering` for every existing
+caller, `CleanMode::Barrier` for the guarded verbs, with the §4.1 step-5
+live/dead/unknown busy classifier and the bounded non-progress refusal) through
+`Store::begin_clean_with`.
+
+Five properties of that record are worth stating because they are what the
+implementation review corrected:
+
+- **The binding mutex spans the attempt.** `guarded_barrier` holds the
+  checkout binding mutex across the revalidation **and** the `Barrier` attempt,
+  releasing it only between attempts and before the poll, so no peer command's
+  binding can publish a `Prepared` receipt in the gap. To keep that safe it
+  takes **every** lock in the attempt non-blocking (`store::probe_admission`
+  to look, `store::acquire_existing_admission` to take), so it can never
+  deadlock with a shipped verb that holds the barrier and then wants the
+  binding mutex. Expiry is the bounded `BARRIER_BUSY` refusal with nothing
+  written.
+- **A dead busy fact refuses even beside a live one.** A free waiter or record
+  lock never clears itself without the shipped recovery, so waiting for a live
+  holder could not make progress; the classifier reports the dead fact. A free
+  *record* lock is not dead by itself: §4.1 step 5's dead row also requires no
+  live group, so a record whose recorded process group still exists is a live
+  fact the verb retries. Unknown custody is never collapsed to "clear": the
+  pool's control directory and the sibling pool's state are inspected so that
+  only a genuinely absent document or directory counts as absent, while a
+  symlinked, unreadable or invalid one refuses.
+- **Each guarded output verb has its effect-free fast precheck.** `detach`,
+  `cancel-reservation` (and `adopt`, which never enters custody) read the
+  checkout's authority state **before the pool is opened, before any signal
+  handler, before the binding mutex and before the barrier**, so a `Prepared`
+  transition, a pending migration journal, an unsettled prune intent or a
+  listed root refuses with literally nothing created. The authoritative
+  revalidation still runs later under the binding mutex. The pool is a **lazy
+  provider** passed into the verb's core, so no registration or pool error can
+  pre-empt the refusal; the regression hands in a failing provider to prove it.
+- **The payload root is unsafe-broad, and only a payload root is.** §3.3's pool
+  test drops a candidate that *is* a registered payload root, not only ones
+  inside or around it. The removable **mount point is not a payload**: it is an
+  ancestor of its payload, so the ancestor rule already drops it, while a
+  scratch root on the registered volume but outside the payload is a legitimate
+  one-use root — which is where the AGENTS.md validation scratch lives.
+- **The shipped checkout-authority refusals are kept.** A guarded command keeps
+  the unsettled-prune-intent refusal (fast precheck and under the binding
+  mutex), keeps the `Pruning` refusal, and a `Pruned` receipt selects nothing,
+  so it runs locally through the live-component rows instead of tripping the
+  slot-key mismatch.
+- **Guarded `adopt` never surfaces a malformed receipt.** The verb refuses
+  unconditionally, so a malformed or mismatched document selects the general
+  guarded refusal and only a `Prepared` transition selects the §4.4
+  diagnostic.
+- **A guarded refusal creates no lock file — structurally, not by promise.**
+  A guarded verb never creates the pool's `admission.lock` at any point: it
+  *probes* it (never creating it), retries when it is held or absent — absence
+  at one probe is only that, an observation the verb answers with a retry, and
+  it never bootstraps the lock itself — and then takes the **existing** lock
+  non-blockingly before its second authority decision. There is therefore no
+  path on which a dead, live, retry or unknown answer can leave a newly created
+  `admission.lock`; the only file a refusal may touch is the checkout binding
+  mutex. Because the verb never creates the lock, a pool that has no admission
+  lock at all can never reach a mark through this path: it retries until its
+  budget is spent and then refuses with `BARRIER_BUSY`. The caller's revalidation runs again between the two decisions, so a
+  change that lands in that window is refused before a mark, and only the
+  proceeding path writes the mark and its `waiters/` lock.
+- **Unknown custody is never absence, on either side of the pair.** The other
+  pool's state is read through a checked reader that inspects its **control
+  directory itself** before the document: a genuinely absent directory means no
+  records, while a symlinked, *dangling*, non-directory, foreign or unreadable
+  one refuses as unknown custody — reading `state.json` alone would map a
+  dangling control directory to `ENOENT` and so to "no records". The admission
+  probe is equally precise: only a `NotFound` open is absence
+  (`AdmissionProbe::Absent`); a symlinked, unreadable or otherwise unusable
+  lock is an error the barrier reports as unknown custody, never as "no lock".
+  Both classes of error are wrapped in the bounded guarded text, so no raw
+  filesystem error escapes a guarded refusal.
+- **A command that names no member is still inspected.** `oxide exec` without
+  `--output` and an external subcommand declare no profile member, so the
+  guard's inspection set is the two Cargo profile outputs a Cargo-driven tool
+  can write — `debug` and `release` — plus the triple forms of any `--target`
+  the command declares (bounded by the layout's member cap; a pathological
+  `--target` cannot extend it). That is what §4.2 row 2 needs: a link planted
+  at `target/debug` or `target/release` in a one-use workspace with **no**
+  receipt refuses, both at the fast precheck and under the binding mutex. An
+  explicit `--output` still narrows the set to exactly what was declared, and a
+  layout this build cannot model (a JSON target specification) gets the same
+  conservative set instead of an empty one.
+- **The prune-intent check follows the shipped definition.** `unsettled_for`
+  answers `Ok(None)` only when there is no registry document at all (a pool
+  that never published output authority cannot hold a published intent); every
+  read, parse or validation error propagates and refuses; a present intent whose
+  phase is terminal **and** whose checkout receipt committed is settled and
+  clear, exactly as the shipped verbs treat it; an unfinished intent refuses by
+  ID. **Where** it is checked is per verb, and the distinction matters:
+  `detach` and `cancel-reservation` decide the unsettled intent, the `Pruning`
+  receipt and the `Prepared` transition at the **effect-free precheck**, and
+  revalidate only the `Prepared` transition (receipt and pending migration
+  journal) under the checkout binding mutex before any mark; `adopt` decides
+  everything at its unconditional effect-free refusal; a leased command's
+  binding decides the whole §4.2 table — unsettled intent, `Pruning`,
+  `Prepared` — under the binding mutex in `bind_local_outputs`. The registry
+  read is not taken under the publication lock — the same pre-effect property
+  the shipped `bind_for_command`, `reserve` and `detach` have — and S1 adds no
+  weakening to it.
+- **The dormant `adopt` keeps the shipped error precedence.** Drive mode, then
+  the control directory, then the pool: the lazy pool provider is called last,
+  so a dormant build reports the pre-S1 refusal when several preconditions are
+  unmet, while the guarded build refuses before any of them.
+- **The activation switch is thread-local and panic-safe.** A test-only guard
+  sets the flag on its own thread and restores the previous value on drop, so a
+  parallel dormant test never observes an active feature and a panicking body
+  cannot leak one; the classification counter uses the same scope. That scope is
+  what makes the dormancy comparison meaningful.
+- **The regressions enter the real verbs.** `adopt`, `detach` and
+  `cancel-reservation` are split into a command wrapper and an
+  `…_at(context, pool)` core, so the tests drive the guarded entry points
+  themselves: repeated byte-identical `Prepared` refusals (including `next_id`)
+  with the checkout binding lock absent, and a dead record, a dead clean mark, a
+  live holder (the bounded busy refusal) and unknown custody through `detach`
+  and `cancel-reservation`. The dormancy regression is a command-path
+  comparison: the dormant verbs must answer with the pre-S1 texts and durable
+  effect (one shipped clean mark per verb, the shipped fence, no `class`
+  field), the guarded rollout must answer with the guard's texts instead, and
+  the dormant path must classify nothing at all. **Dormancy is one temporary process-local switch,
+`one_use::is_active`, `false` in every production binary, settable only by
+unit tests** (S4 replaces it with the `proof-controls` readers of §11.1, which
+are the only activation path the frozen design allows). While it is off, no
+workspace is classified, no guard refusal exists, no note is printed, no
+`Record.class` is ever written, and every shipped path is byte-identical to the
+release before this slice. S1 deliberately carries **no** forward fence and
+**no** version-6 state document: both move to S2 with the stored field (§10.1),
+so a dormant pool is still readable by an older binary. The guarded command's
+one note reuses the shipped warning surface (§4.5), so its printed form is
+`oxide: WARNING: one-use workspace: local outputs (<reason>)`; the plan and
+status lines of §4.5 are added only while the switch is on.
 
 **Revision 13** binds the Oxide Supervisor's design-review disposition
 (2026-10-27, Queue brief v4) in three places. **Case 19 E now has one exact,
@@ -342,6 +479,182 @@ shipped interface (§8). Tom approved the one-use handling via Supervisor
 `66fa8331` bind the shape, and the localized source-review amendments A1–A5
 (`5eda747c`) and the wording review `7718ec1f` are applied. Neither committee
 review nor this document is native qualification.
+
+**S2 implementation record (oxide#171).** Slice S2 of §15 landed dormant under
+its own approved brief. What the tree now holds:
+
+- **The record field and its omission rule (§5.1).** `store::Record` gained
+  `class` (`normal` | `one_use`, `#[serde(default, skip_serializing_if =
+  "class_is_normal")]`) and `class_reason`
+  (`Option<String>`, `skip_serializing_if = "Option::is_none"`), both appended
+  last so an ordinary record's bytes are unchanged. `store::State` gained the
+  durable `one_use_workspaces: Option<String>` fence, also appended last.
+  `STATE_VERSION` is now **6** and `RECORDED_ACCOUNTING_STATE_VERSION` is the
+  **5** the recorded-accounting gate still writes, so `save()` advances to 6
+  only when the one-use fence is present (then 5, 4, 3, 2 in the old order).
+  `fence_one_use_workspaces` writes the fence as its **own atomic save before**
+  the first document carrying a class-bearing record; it is called only where a
+  `one_use` record is created. A future format that needs another fence takes
+  the next number: the idle-exec design's proposed "6" is now taken.
+- **The bounded presence-aware decode (§5.1).** `load` runs
+  `reject_class_fields_before_six` over the **same** bytes before the typed
+  parse: `serde_json` maps `null` to `None`, so the pass reads a small raw
+  schema whose two class fields use a present-but-any-value marker (an
+  `IgnoredAny` consumer that reports whether the key existed). A document below
+  version 6 that names `class` or `class_reason` in **any** record object is
+  refused; at version 6 presence is expected and `validate_state` decides. A
+  document the pass cannot read is left to the typed parse. `validate_state`
+  keeps the structural rules and adds the two version/fence directions (fence
+  without version 6 refuses, version 6 without the fence refuses, an unknown
+  fence value refuses, a class-bearing record without the fence refuses) plus
+  the bounded reason and the "a reason belongs to a `one_use` record alone"
+  rule. A reason longer than `MAX_DIAGNOSTIC_BYTES` is truncated on a character
+  boundary when it is stored, so a pathological path is a bounded diagnostic
+  and never a state error.
+- **Classification feeds the record, and nothing else does.**
+  `store::WorkspaceAdmission` (`class` plus the bounded reason) is threaded from
+  the command's already-computed classification through `Store::acquire` into
+  `attempt`. The classification is only computed while the one-use switch is
+  active, so **every production command in this slice admits `Normal`**, writes
+  neither field and leaves the numeric version where it found it.
+- **Record identity, the project cap and sharing (§5.2-§5.4).** Second-slot
+  matching and `shared_candidate` compare class, so an existing record of the
+  other class is never reused, relabelled, evicted, shared or released by this
+  command. The **stale-record sweep stays class-agnostic**: it is scoped by
+  *key* (checkout plus compatibility), so an idle slotless record of the other
+  class is still a live record of this checkout and keeps its place — a
+  one-use admission takes a distinct record rather than deleting the normal or
+  legacy one, which the next normal command then reuses. The eight-slot project
+  cap counts **normal** records and its replacement candidate list holds only
+  normal records; only a **normal** admission enters the cap path, which is the reading
+  in which a temporary clone of the repository does not compete with its normal
+  checkouts for that cap, while deleting a one-use slot can never relieve it.
+  The wait justification next to that path is class-scoped for the same reason:
+  a held record of another class can never become reusable here.
+- **Membership and class-unknown derivation (§5.5, §5.6).** `Store::
+  class_membership` derives the two bounded sets from the state and ledger rows
+  a caller already holds: `members` (the row of every `one_use` record, as its
+  `(slot_id, incarnation)` pair) and `unknown` (every row no record owns). They
+  are disjoint and account for every one-use-or-unknown row once, and both are
+  bounded by the ledger's own `MAX_SLOTS`. The `evictable` split, the
+  in-custody reader and the slice accounting belong to S3 and are **not** here;
+  §5.5's checklist therefore has no victim predicate in this slice.
+- **Legacy records (§5.7).** A record with no class reads as `normal`, which is
+  the protected class, and a normal record written by this binary omits both
+  fields, so the bytes a superseded reader sees are unchanged. A one-use command
+  in a temporary workspace takes a **distinct** record; the legacy record keeps
+  its class and its slot.
+- **Status and summary visibility (§10.5).** A slot whose owning record is
+  `one_use` carries the bounded `(one_use)` label after its state and its stored
+  reason on a continuation line; a normal or unowned slot adds nothing. A pool
+  that holds a one-use member prints the sanctioned
+  `one-use slots: unmeasured (<reason>)` line, with the member count and — when
+  any ledger row is class-unknown — an explicit "lower bound" note. It claims no
+  bytes and no free quota, and it is absent for every pool a dormant build can
+  produce.
+- **Dormancy is unchanged in kind.** The switch is still
+  `one_use::is_active`, `false` in every production binary and settable only by
+  unit tests; S2 adds no environment variable and no persisted activation. The
+  regressions drive the seam directly (`WorkspaceAdmission::one_use`) and prove
+  the omission rule byte for byte: a normal rewrite and a normal lease cycle
+  round-trip through a version-5-shaped `deny_unknown_fields` schema and come
+  back **identical**, with no `class` text and version 5 on disk.
+- **One known follow-on.** `src/lease/seed/mod.rs` reads a donor's control
+  record and classifies only `CONTROL_STATE_VERSION = 5`, so a version-6
+  (one-use-fenced) pool's donors read as `Unknown` and seeding skips them. That
+  is the conservative direction and §8.5 already requires the seeding interface
+  to be re-checked at dispatch, so this slice changes no library code.
+
+**S3 implementation record (oxide#172).** Slice S3 of §15 landed dormant under
+its own approved brief. It is the library admission protocol, and it changes no
+production behaviour while the feature is dormant. What the tree now holds:
+
+- **The request, the observation and the refusal (§6.1, §6.9).**
+  `LeaseRequest` gained `class: AdmissionClass`, `victims: VictimPolicy` and
+  `slice: Option<OneUseSlice>`; `Leased` gained
+  `slice: Option<SliceReport>`; and `LeaseError::OneUseBudget { measured:
+  Option<u64>, limit: u64 }` carries reason `one_use_budget` and exit code 3
+  beside `Full` and `unknown_accounting`, with a display that never says "pool
+  cap". The new types live in `src/lease/slice.rs` and are re-exported from
+  `oxide_storage::lease`. `MemberSet` is bounded by the ledger's `MAX_SLOTS`,
+  removes exact duplicate pairs and **refuses an over-bound set rather than
+  truncating it**; `Any` is the default policy and the default admission class,
+  so a library caller outside this feature keeps today's behaviour.
+- **Where the accounting set lives.** §6.1's abbreviated `OneUseSlice` listing
+  names only the bounds, the kind and the unknown count. The implementation
+  passes the front door's verified member set as `OneUseSlice::members` and the
+  **evictable subset** as `VictimPolicy::preferred`, which is what lets restore
+  count protected members and lets `Prefer` subtract every member from its
+  fallback. The one policy rule the library enforces is set inclusion: a
+  `preferred` pair outside `slice.members` is an `InvalidInput` refusal, so the
+  `evictable ⊆ accounting` invariant cannot be violated by a caller.
+- **Restore (§6.3, §6.4, §6.9).** `Pool::restore` verifies every accounting pair
+  against the ledger under the pool lock (an unverified pair is dropped and
+  reported, never replaced), measures the member union, and reclaims eligible
+  idle members oldest `(rank, slot_id)` first until both thresholds hold, the
+  bytes fit, or no eligible victim is left. The reuse candidate is never a
+  victim; its bytes still count; a new one-use slot is held to
+  `member_count <= max_slots - 1`, a warm reuse is admissible at the ceiling.
+  A class-unknown pool is reported `LowerBound` and **reclaims nothing** — the
+  brief's rule that an unprovable bound must not be spent as if bounded, and
+  the conservative reading of §6.3. An incomplete or unusable union is
+  `Unmeasured`, never zero and never an exact overage. After restore, a
+  still-full `OneUse` admission returns `OneUseBudget` while a normal one
+  returns `Over` and continues into its ordinary decision (§6.8). Restore runs
+  before every new-slot admission and every one-use admission including warm
+  reuse, and never on a normal warm reuse. The front door passes a slice for
+  every admission and the library's own branch decides: a normal warm reuse
+  measures nothing even though it carries the observation, so the rule cannot
+  depend on a caller predicting which branch the ledger will take.
+- **The union walk (§6.4).** `inventory::union_directory` is a mode of the
+  existing walker: one shared `(device, inode)` set, one shared entry budget,
+  one shared depth limit and one absolute cooperative deadline across every
+  root. It refuses an empty, duplicate, non-directory or cross-device root and
+  never follows a link or crosses a mount; partial coverage stays partial with
+  its gaps. `Pool::member_union` walks the verified member roots under
+  `pressure_limits()` (60 s internal / 5 s removable) and treats a missing root
+  as zero, exactly as the shipped recorded total does, while an existing
+  non-directory root is unknown custody and `Unmeasured`.
+- **Class-scoped pressure paths (§6.7).** One `VictimPlan` is resolved per
+  admission (verified preferred pairs plus every verified member pair as the
+  fallback exclusion) and used by the slot-count ceiling, the byte-price path,
+  the post-eviction re-read and the removable reserve route. `Any` keeps the
+  shipped selector; `Only` selects an evictable member alone; `Prefer` selects
+  an evictable member first and otherwise the ordinary order with **every**
+  one-use pair removed. The named project-cap replacement refuses a member
+  outright. The reserve route's own behaviour is untouched: it passes the
+  admission's policy to the same selector and its reserve branch stays
+  unwired, as §10.2 returns that wiring to the owner.
+- **The in-custody reader (§5.5.1, §5.5.2).**
+  `Store::evictable_members` reads only the pool that owns the slot: phase
+  `Idle` with no holder, lease, pending recovery, retirement or loss marker; no
+  recorded process group; a **free and existing** record lock (non-blocking
+  `probe_lock(..., false)`, so `Missing` is not free, and a donor pin — itself
+  that lock — is refused); no other active record of that checkout in this
+  pool and no open unclosed-writer marker for this boot session; a ledger row
+  that is `Idle` and unleased at the exact pair; and no recorded `oxide clean`
+  for the checkout. It never calls `Store::checkout_custody`, never takes a
+  second admission lock, and **reads no sibling-pool state**; the caller's own
+  record id is excluded exactly as `checkout_custody`'s `own` argument does. A
+  member failing any clause is counted and protected. `Store::
+  progress_capable_member` is the separate, same-pool decision §6.9 needs: a
+  live held record lock, an `Acquiring`/`Spawning`/`Running` phase and no open
+  unclosed-writer marker; a full one-use slice waits (`Wait::Uncertain`) only
+  for one of those, and otherwise refuses. A class-unknown one-use pool refuses
+  with the shipped `UnknownAccounting` class plus a message naming the
+  unattributed row count.
+- **Dormant byte identity.** The switch is still `one_use::is_active`, the
+  thread-local S1 seam that is `false` in every production binary (S4 replaces
+  it). No production command classifies a workspace one-use, so
+  `admission.class` is `Normal`, the member set is empty, restore is
+  `NotNeeded` — or `LowerBound` beside a class-unknown row, which reclaims
+  nothing and which the front door prints nothing about when no member exists —
+  with no walk and no write, and the resolved plan names no member and excludes
+  none, leaving every pressure path's order exactly as shipped.
+  The regression copies one freshly created pool twice and admits through the
+  shipped request shape (`Any`, no slice) in the first copy and the new
+  empty-member shape (`Prefer`, `Some(empty)`) in the second: the ledger bytes,
+  the grant and the slot tree are identical.
 
 ## 1. Outcome and non-goals
 
@@ -2428,36 +2741,49 @@ claimed for a statically edited selector.
 
 ## 15. Implementation slices (not authorized by this design)
 
-- **S1 classification and guard.** `classify`, the guarded plan/declaration/
-  binding branch, the local-output refusal table, the exact `Prepared`
-  diagnostic before every effect at all four mutation sites, the guarded
-  `clean` refusal text, plan/status wording, the forward fence and version 6, and
-  the two §4.1 seams: the `begin_clean` **mode** (`Recovering` for every existing
-  caller; `Barrier` for guarded verbs, with its **live/dead/unknown busy
-  classifier and bounded non-progress refusal**) and the **revalidation order**
-  that decides the `Prepared` refusal under the checkout binding mutex *before*
-  any mark, id or `waiters/` file exists, with a bounded non-blocking barrier
-  attempt afterwards. Regressions cover a dead record, a dead clean mark, a live
-  holder, unknown custody, the busy-barrier refusal, and **verb-level**
-  repeated refusals (byte-identical including `next_id`); the command-level case
-  uses a matched-control delta, since a build's ticket/lease lifecycle advances
-  `next_id` independently of the output path, and an exact post-lease baseline
-  would need the proposed `leased:<gate>` pause point (returned for scoped
-  review).
-- **S2 record class and front-door scoping.** `Record.class`/`class_reason` with
-  the omission rule (§5.1), the bounded **presence-aware decode** in
-  `Store::load` that refuses a sub-6 document carrying either field, the fence,
-  project-cap and sharing class filters, membership and class-unknown derivation,
-  status/summary visibility.
-- **S3 library admission protocol.** `LeaseRequest` additions, the `MemberSet`
-  and `evictable` split with the in-custody custody reader (§5.5.2), `restore`
-  with its two thresholds and reuse-candidate exclusion, the union walk, the
-  class-scoped pressure paths, the `one_use_budget` and `unknown_accounting`
-  refusals, and the class-scoped policy applied to the reserve route's victim
-  choice (`admit_unknown_removable` passes the admission's `Prefer`/`Only` to the
-  same selector). The route's own behaviour is **not** changed: its reserve
-  branch is unreachable today and wiring it is returned to the owner (§10.2,
-  §19).
+- **S1 classification and guard — implemented, dormant (oxide#170).** The
+  shipped slice is: `classify`, the guarded plan/declaration/binding branch, the
+  local-output refusal table, the exact `Prepared` diagnostic before every
+  effect at all four mutation sites, the guarded `clean` refusal text,
+  plan/status wording, and the two §4.1 seams: the `begin_clean` **mode**
+  (`Recovering` for every existing caller; `Barrier` for guarded verbs, with its
+  **live/dead/unknown busy classifier and bounded non-progress refusal**) and
+  the **revalidation order** that decides the `Prepared` refusal under the
+  checkout binding mutex *before* any mark, id or `waiters/` file exists, with a
+  bounded non-blocking barrier attempt afterwards. **The forward fence and
+  version 6 are not part of it**: they move to S2, which owns the stored field
+  the fence protects, so a dormant pool stays readable by an older binary. The
+  slice is inactive outside tests: see the status note above for the one
+  temporary switch, which S4 replaces. Regressions cover a dead record, a dead
+  clean mark, a live holder, unknown custody, the busy-barrier refusal, the
+  guarded receipt/path table and hierarchy, plan/status wording, and
+  **verb-level** repeated refusals (byte-identical including `next_id`); the
+  command-level case uses a matched-control delta, since a build's
+  ticket/lease lifecycle advances `next_id` independently of the output path,
+  and an exact post-lease baseline would need the proposed `leased:<gate>` pause
+  point (returned for scoped review). Activation, the native cases and the
+  command-level oracle belong to the Elevated proof slice (S4) and to the
+  separately activated implementation proof brief.
+- **S2 record class and front-door scoping — implemented, dormant (oxide#171).**
+  `Record.class`/`class_reason` with the omission rule (§5.1), the bounded
+  **presence-aware decode** in `Store::load` that refuses a sub-6 document
+  carrying either field, the one-use fence and version 6 (written only with the
+  first class-bearing record), the project-cap and sharing class filters,
+  membership and class-unknown derivation, and status visibility; see the S2
+  implementation record above. The `evictable` split and the in-custody reader
+  (§5.5.1, §5.5.2) stay with S3.
+- **S3 library admission protocol - implemented, dormant (oxide#172).**
+  `LeaseRequest`'s class, victim policy and slice; the bounded `MemberSet`, the
+  `evictable` split with the in-custody reader (§5.5.2); `restore` with its two
+  thresholds and the reuse-candidate exclusion; the union walk; the
+  class-scoped pressure paths; the `one_use_budget` and `unknown_accounting`
+  refusals; and the class-scoped policy passed to `admit_unknown_removable`'s
+  victim choice. The route's own behaviour is **not** changed: its reserve
+  branch is still unreachable and wiring it stays returned to the owner (§10.2,
+  §19). See the S3 implementation record above for the six properties the
+  slice states exactly (where the accounting set lives, `LowerBound` reclaiming
+  nothing, the union's shared bounds, the reader's same-pool scope, the
+  progress-capable wait and the dormant byte identity).
 - **S4 proof controls.** The feature, the two readers, the capability field and
   the installer refusal, the `stage_at` feature parameter and the static edits
   to the exposed scripts.

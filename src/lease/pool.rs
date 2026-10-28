@@ -1,6 +1,10 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
 use super::backing::BackingPaths;
+use super::slice::{
+    AdmissionClass, MemberPair, MemberSet, OneUseSlice, RestoreOutcome, SliceAdmission,
+    SliceReport, VictimPolicy,
+};
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
@@ -13,7 +17,9 @@ use super::{
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
-use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
+use crate::inventory::{
+    inventory_directory, union_directory, GapKind, InventoryError, InventoryLimits,
+};
 use crate::owned_delete::{
     descriptor_identity, open_directory_at, put_back, reconcile_root_capture,
     restore_captured_mode, restore_root_capture, Capture, CaptureRecord, ForeignCapture,
@@ -62,6 +68,19 @@ pub struct LeaseRequest {
     /// recorded rank; the library rechecks its identity, ownership, occupancy
     /// and accounting under the pool lock.
     pub replace_slot: Option<u64>,
+    /// This admission's workspace class (design §6.1). `Normal` for every
+    /// production command while the one-use feature is dormant; a one-use
+    /// admission is reachable from tests and, later, from the activated proof
+    /// slice only.
+    pub class: AdmissionClass,
+    /// Which victims every pressure path of this admission may select
+    /// (design §6.7). [`VictimPolicy::Any`] is the default and leaves a
+    /// library caller's behaviour exactly as shipped.
+    pub victims: VictimPolicy,
+    /// The bounded member observation `restore` runs before admission
+    /// (design §6.3): `Some` for every new-slot admission and every one-use
+    /// admission, `None` where no measurement is allowed (normal warm reuse).
+    pub slice: Option<OneUseSlice>,
 }
 
 /// Presentation path of a new slot: `slots/<folder>/<profile>-<id>`. It is
@@ -137,6 +156,82 @@ fn choose_folder(
         }
     }
     Ok(None)
+}
+
+/// One member pair verified against this pool's ledger under the pool lock
+/// (design §6.2). The pair is kept exactly as the front door named it so set
+/// membership stays a literal comparison with the ledger row.
+#[derive(Clone, Debug)]
+struct VerifiedMember {
+    id: u64,
+    incarnation: u64,
+    pair: MemberPair,
+}
+
+/// Which victim set a pressure path selects (design §6.7).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum VictimPlanKind {
+    #[default]
+    Any,
+    Prefer,
+    Only,
+}
+
+/// The admission's resolved victim plan: the preferred (evictable) members
+/// that verified against the ledger, and the verified member pairs a normal
+/// `Prefer` fallback must never select.
+#[derive(Clone, Debug, Default)]
+struct VictimPlan {
+    kind: VictimPlanKind,
+    preferred: Vec<VerifiedMember>,
+    /// Every verified accounting member pair, used to subtract one-use slots
+    /// from the normal fallback (design §6.7).
+    excluded: Vec<MemberPair>,
+}
+
+impl VictimPlan {
+    /// Today's behaviour, for a library caller that passes no policy and for
+    /// the shipped explicit-idle-deletion paths.
+    fn any() -> Self {
+        Self::default()
+    }
+
+    /// Whether this plan names the ledger row as a preferred victim.
+    fn prefers(&self, slot: &SlotRecord) -> bool {
+        self.prefers_id(slot.id, slot.incarnation)
+    }
+
+    fn prefers_id(&self, id: u64, incarnation: u64) -> bool {
+        self.preferred
+            .iter()
+            .any(|member| member.id == id && member.incarnation == incarnation)
+    }
+
+    /// Whether this slot is a verified one-use member that the normal fallback
+    /// must leave alone.
+    fn excludes(&self, slot: &SlotRecord) -> bool {
+        self.excluded.iter().any(|pair| {
+            pair.slot_id == slot.id.to_string() && pair.incarnation == slot.incarnation.to_string()
+        })
+    }
+}
+
+/// Why a member union could not be measured (design §6.4, §6.8).
+#[derive(Debug)]
+enum UnionGap {
+    /// The bounded union walk stopped partial or timed out; its bytes are not
+    /// an exact figure.
+    Incomplete(AccountingScan),
+    /// A member root is not the real directory the ledger claims, or the walk
+    /// refused before producing a report. Unknown custody, never zero.
+    Unknown(String),
+}
+
+fn union_gap_reason(gap: &UnionGap) -> String {
+    match gap {
+        UnionGap::Incomplete(scan) => scan.to_string(),
+        UnionGap::Unknown(reason) => reason.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1161,6 +1256,7 @@ impl Pool {
                     grant: self.grant_from(existing, true)?,
                     measured: None,
                     admission_note: None,
+                    slice: None,
                 });
             }
             if existing.state == SlotPersistState::Held {
@@ -1182,56 +1278,456 @@ impl Pool {
                 return Err(LeaseError::Busy);
             }
         }
-        if let Some((idle, incarnation)) = self
-            .ledger
+        // The membership and victim policy are resolved against the ledger
+        // under the caller's admission lock, before any restore decision.
+        let plan = self.resolve_victims(request)?;
+        let candidate = self.idle_compatible(&project, request.profile);
+        // A one-use admission always carries its slice (design §6.1) and its
+        // restore runs before either branch (§6.3). The reuse candidate must
+        // be a verified member: a non-member idle slot is refused, never
+        // relabelled (§6.6).
+        if request.class == AdmissionClass::OneUse {
+            let slice = request.slice.as_ref().ok_or(LeaseError::InvalidInput(
+                "a one-use admission requires its bounded slice",
+            ))?;
+            if !slice.members.is_bounded() || slice.max_slots == 0 || slice.max_bytes == 0 {
+                return Err(LeaseError::InvalidInput(
+                    "the one-use slice bounds are not usable",
+                ));
+            }
+            if let Some((idle, incarnation)) = candidate {
+                let pair = MemberPair::new(idle.to_string(), incarnation.to_string());
+                if !slice.members.contains(&pair) {
+                    return Err(LeaseError::UnknownAccounting);
+                }
+            }
+            let report = self.restore(slice, &plan, request.class, candidate)?;
+            match &report.outcome {
+                RestoreOutcome::LowerBound { unknown, .. } if *unknown > 0 => {
+                    return Err(LeaseError::UnknownAccounting)
+                }
+                RestoreOutcome::Unmeasured { .. } => {
+                    return Err(LeaseError::OneUseBudget {
+                        measured: None,
+                        limit: slice.max_bytes,
+                    })
+                }
+                RestoreOutcome::Full { bytes, .. } => {
+                    return Err(LeaseError::OneUseBudget {
+                        measured: Some(*bytes),
+                        limit: slice.max_bytes,
+                    })
+                }
+                _ => {}
+            }
+            if let Some((idle, incarnation)) = candidate {
+                return self
+                    .reuse_idle(idle, incarnation, project, workspace, request)
+                    .map(|leased| Leased {
+                        slice: Some(report),
+                        ..leased
+                    });
+            }
+            self.ensure_capacity_policy()?;
+            self.next_rank()?;
+            let grant = self.allocate(project, workspace, request, &plan)?;
+            return Ok(Leased {
+                grant,
+                measured: None,
+                admission_note: self.admission_note.take(),
+                slice: Some(report),
+            });
+        }
+        if let Some((idle, incarnation)) = candidate {
+            // A normal warm reuse measures nothing (design §6.3): the #110
+            // target-only walk below is its only measurement.
+            return self
+                .reuse_idle(idle, incarnation, project, workspace, request)
+                .map(|leased| Leased {
+                    slice: None,
+                    ..leased
+                });
+        }
+        // Restore runs before every new-slot admission, normal included
+        // (design §6.3). An empty member set costs no walk and no write.
+        let slice_report = match request.slice.as_ref() {
+            Some(slice) => {
+                if !slice.members.is_bounded() || slice.max_slots == 0 || slice.max_bytes == 0 {
+                    return Err(LeaseError::InvalidInput(
+                        "the one-use slice bounds are not usable",
+                    ));
+                }
+                Some(self.restore(slice, &plan, request.class, None)?)
+            }
+            None => None,
+        };
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
+        let grant = self.allocate(project, workspace, request, &plan)?;
+        Ok(Leased {
+            grant,
+            measured: None,
+            admission_note: self.admission_note.take(),
+            slice: slice_report,
+        })
+    }
+
+    /// The idle compatible slot this admission would reuse, if any.
+    fn idle_compatible(&self, project: &Path, profile: Profile) -> Option<(u64, u64)> {
+        self.ledger
             .slots
             .iter()
             .find(|slot| {
                 slot.state == SlotPersistState::Idle
                     && slot.project == project
-                    && slot.profile == request.profile
+                    && slot.profile == profile
             })
             .map(|slot| (slot.id, slot.incarnation))
-        {
-            let slot_path =
-                self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
-            // Compatible reuse needs this slot's own walk complete.
-            let _unique = inventory_sizes(&slot_path).require_complete()?;
-            let dir = self.slot(idle).and_then(|slot| slot.dir.clone());
-            // The idle-rank sequence must have headroom before any grant
-            // transition; exhaustion refuses without changing the pool.
-            self.ensure_capacity_policy()?;
-            self.next_rank()?;
-            let grant = self.take_idle(idle, incarnation, project, workspace, request)?;
-            return Ok(Leased {
-                grant,
-                measured: Some(ReuseMeasurement {
-                    slot_id: idle.to_string(),
-                    incarnation: incarnation.to_string(),
-                    unique_allocated_bytes: _unique,
-                    dir,
-                }),
-                admission_note: None,
-            });
-        }
-        self.ensure_capacity_policy()?;
-        self.next_rank()?;
-        self.allocate_unmeasured(project, workspace, request)
     }
 
-    /// A new slot: nothing measured it.
-    fn allocate_unmeasured(
+    /// Take an idle compatible slot after validating its own scope.
+    fn reuse_idle(
         &mut self,
+        idle: u64,
+        incarnation: u64,
         project: PathBuf,
         workspace: PathBuf,
         request: &LeaseRequest,
     ) -> Result<Leased, LeaseError> {
-        let grant = self.allocate(project, workspace, request)?;
+        let slot_path =
+            self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
+        // Compatible reuse needs this slot's own walk complete.
+        let _unique = inventory_sizes(&slot_path).require_complete()?;
+        let dir = self.slot(idle).and_then(|slot| slot.dir.clone());
+        // The idle-rank sequence must have headroom before any grant
+        // transition; exhaustion refuses without changing the pool.
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
+        let grant = self.take_idle(idle, incarnation, project, workspace, request)?;
         Ok(Leased {
             grant,
-            measured: None,
-            admission_note: self.admission_note.take(),
+            measured: Some(ReuseMeasurement {
+                slot_id: idle.to_string(),
+                incarnation: incarnation.to_string(),
+                unique_allocated_bytes: _unique,
+                dir,
+            }),
+            admission_note: None,
+            slice: None,
         })
+    }
+
+    /// Resolve one admission's victim policy against this pool's ledger
+    /// (design §6.2, §6.7). Every pair is looked up under the pool lock; one
+    /// that does not verify is dropped from the preferred set, never replaced
+    /// by another slot. A preferred pair outside the accounting set is a
+    /// caller error and refuses before any victim decision.
+    fn resolve_victims(&self, request: &LeaseRequest) -> Result<VictimPlan, LeaseError> {
+        let kind = match &request.victims {
+            VictimPolicy::Any => return Ok(VictimPlan::any()),
+            VictimPolicy::Prefer { .. } => VictimPlanKind::Prefer,
+            VictimPolicy::Only { .. } => VictimPlanKind::Only,
+        };
+        let preferred = request.victims.preferred();
+        if !preferred.is_bounded() {
+            return Err(LeaseError::InvalidInput(
+                "the evictable member set exceeds the ledger's slot bound",
+            ));
+        }
+        let excluded: Vec<MemberPair> = match request.slice.as_ref() {
+            Some(slice) => {
+                if !slice.members.is_bounded() {
+                    return Err(LeaseError::InvalidInput(
+                        "the verified member set exceeds the ledger's slot bound",
+                    ));
+                }
+                for pair in preferred.iter() {
+                    if !slice.members.contains(pair) {
+                        return Err(LeaseError::InvalidInput(
+                            "an evictable member is not in the verified member set",
+                        ));
+                    }
+                }
+                slice.members.iter().cloned().collect()
+            }
+            None => {
+                if kind != VictimPlanKind::Any {
+                    return Err(LeaseError::InvalidInput(
+                        "a class-scoped victim policy requires its slice",
+                    ));
+                }
+                Vec::new()
+            }
+        };
+        let preferred = preferred
+            .iter()
+            .filter_map(|pair| self.verify_member(pair))
+            .collect();
+        Ok(VictimPlan {
+            kind,
+            preferred,
+            excluded,
+        })
+    }
+
+    /// Verify one `(slot_id, incarnation)` pair against the ledger (§6.2).
+    fn verify_member(&self, pair: &MemberPair) -> Option<VerifiedMember> {
+        let slot = self.ledger.slots.iter().find(|slot| {
+            slot.id.to_string() == pair.slot_id && slot.incarnation.to_string() == pair.incarnation
+        })?;
+        Some(VerifiedMember {
+            id: slot.id,
+            incarnation: slot.incarnation,
+            pair: pair.clone(),
+        })
+    }
+
+    /// Restore the one-use slice before an admission (design §6.3). Runs
+    /// before every new-slot admission and every one-use admission, and never
+    /// on a normal warm reuse. It reclaims eligible idle members oldest
+    /// `(rank, slot_id)` first until both thresholds hold, the union is within
+    /// its byte bound, or no eligible victim is left. The reuse candidate is
+    /// never a victim; its bytes still count. A deletion always goes through
+    /// [`Pool::retire_idle_slot`], and a safety failure stops the decision —
+    /// it never falls through to a less-checked victim.
+    ///
+    /// A pool with class-unknown rows is reported as a lower bound and
+    /// reclaims nothing: its bound cannot be proven, so no deletion may be
+    /// spent on it (§5.6, §6.9). A partial or unusable union walk is reported
+    /// `Unmeasured`, never as zero and never as an exact overage.
+    fn restore(
+        &mut self,
+        slice: &OneUseSlice,
+        plan: &VictimPlan,
+        class: AdmissionClass,
+        reuse: Option<(u64, u64)>,
+    ) -> Result<SliceReport, LeaseError> {
+        let mut members: Vec<VerifiedMember> = Vec::new();
+        let mut unverified = 0usize;
+        for pair in slice.members.iter() {
+            match self.verify_member(pair) {
+                Some(member) if !members.iter().any(|taken| taken.id == member.id) => {
+                    members.push(member);
+                }
+                _ => unverified += 1,
+            }
+        }
+        if members.is_empty() {
+            let outcome = if slice.unknown > 0 {
+                RestoreOutcome::LowerBound {
+                    bytes: 0,
+                    unknown: slice.unknown,
+                }
+            } else {
+                RestoreOutcome::NotNeeded
+            };
+            return Ok(Self::slice_report(slice, outcome, 0, 0, unverified));
+        }
+        let mut bytes = match self.member_union(&members) {
+            Ok(bytes) => bytes,
+            Err(gap) => {
+                let outcome = RestoreOutcome::Unmeasured {
+                    reason: union_gap_reason(&gap),
+                };
+                let protected = self.protected_members(&members, plan, reuse);
+                return Ok(Self::slice_report(
+                    slice,
+                    outcome,
+                    members.len(),
+                    protected,
+                    unverified,
+                ));
+            }
+        };
+        if slice.unknown > 0 {
+            let outcome = RestoreOutcome::LowerBound {
+                bytes,
+                unknown: slice.unknown,
+            };
+            let protected = self.protected_members(&members, plan, reuse);
+            return Ok(Self::slice_report(
+                slice,
+                outcome,
+                members.len(),
+                protected,
+                unverified,
+            ));
+        }
+        // A new slot needs one free place; a warm reuse adds none. A caller
+        // that declared a new slot is held to the stricter threshold even if
+        // the reuse branch is taken.
+        let new_slot_needed = reuse.is_none() || slice.kind == SliceAdmission::NewSlot;
+        loop {
+            let threshold = members.len() > slice.max_slots
+                || (new_slot_needed && members.len() >= slice.max_slots)
+                || bytes > slice.max_bytes;
+            if !threshold {
+                break;
+            }
+            let Some((id, incarnation)) = self.pick_restore_victim(&members, plan, reuse) else {
+                break;
+            };
+            let Some(index) = self.ledger.slots.iter().position(|slot| {
+                slot.id == id
+                    && slot.incarnation == incarnation
+                    && slot.state == SlotPersistState::Idle
+                    && slot.lease_id.is_none()
+            }) else {
+                break;
+            };
+            let project = self.ledger.slots[index].project.clone();
+            let profile = self.ledger.slots[index].profile;
+            self.retire_idle_slot(id, incarnation, &project, profile)?;
+            members.retain(|member| member.id != id);
+            bytes = match self.member_union(&members) {
+                Ok(bytes) => bytes,
+                Err(gap) => {
+                    let outcome = RestoreOutcome::Unmeasured {
+                        reason: union_gap_reason(&gap),
+                    };
+                    let protected = self.protected_members(&members, plan, reuse);
+                    return Ok(Self::slice_report(
+                        slice,
+                        outcome,
+                        members.len(),
+                        protected,
+                        unverified,
+                    ));
+                }
+            };
+        }
+        let still_over = members.len() > slice.max_slots
+            || (new_slot_needed && members.len() >= slice.max_slots)
+            || bytes > slice.max_bytes;
+        let protected = self.protected_members(&members, plan, reuse);
+        let outcome = if still_over {
+            match class {
+                // A one-use admission refuses with a dedicated bounded error
+                // (§6.9); a normal one continues with its measured overage
+                // (§6.8).
+                AdmissionClass::OneUse => RestoreOutcome::Full {
+                    bytes,
+                    held: protected,
+                },
+                AdmissionClass::Normal => RestoreOutcome::Over { bytes },
+            }
+        } else {
+            RestoreOutcome::Within { bytes }
+        };
+        Ok(Self::slice_report(
+            slice,
+            outcome,
+            members.len(),
+            protected,
+            unverified,
+        ))
+    }
+
+    fn slice_report(
+        slice: &OneUseSlice,
+        outcome: RestoreOutcome,
+        members: usize,
+        protected: usize,
+        unverified: usize,
+    ) -> SliceReport {
+        SliceReport {
+            outcome,
+            members,
+            protected,
+            unverified,
+            max_slots: slice.max_slots,
+            max_bytes: slice.max_bytes,
+        }
+    }
+
+    /// Verified members that cannot be a victim for this admission: not in the
+    /// front door's evictable set, or the reuse candidate itself.
+    fn protected_members(
+        &self,
+        members: &[VerifiedMember],
+        plan: &VictimPlan,
+        reuse: Option<(u64, u64)>,
+    ) -> usize {
+        members
+            .iter()
+            .filter(|member| {
+                !plan.prefers_id(member.id, member.incarnation)
+                    || Some((member.id, member.incarnation)) == reuse
+            })
+            .count()
+    }
+
+    /// The oldest eligible idle member that may be a victim, never the reuse
+    /// candidate (design §6.3).
+    fn pick_restore_victim(
+        &self,
+        members: &[VerifiedMember],
+        plan: &VictimPlan,
+        reuse: Option<(u64, u64)>,
+    ) -> Option<(u64, u64)> {
+        members
+            .iter()
+            .filter(|member| plan.prefers_id(member.id, member.incarnation))
+            .filter(|member| Some((member.id, member.incarnation)) != reuse)
+            .filter_map(|member| {
+                self.slot(member.id)
+                    .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+                    .map(|slot| (slot.rank, slot.id, slot.incarnation))
+            })
+            .min_by_key(|(rank, id, _)| (*rank, *id))
+            .map(|(_, id, incarnation)| (id, incarnation))
+    }
+
+    /// The unique allocated bytes of the member slots as one union (design
+    /// §6.4). One bounded walk over every member root with one shared
+    /// `(device, inode)` set, so a cross-member hard link is counted once.
+    fn member_union(&self, members: &[VerifiedMember]) -> Result<u64, UnionGap> {
+        let mut roots = Vec::with_capacity(members.len());
+        for member in members {
+            match self.slot_root(member.id) {
+                Err(error) => {
+                    return Err(UnionGap::Unknown(format!(
+                        "member slot {} has no readable ledger row: {error}",
+                        member.id
+                    )))
+                }
+                Ok((_, None)) => continue,
+                Ok((path, Some(metadata))) if metadata.file_type().is_dir() => roots.push(path),
+                Ok((_, Some(_))) => {
+                    return Err(UnionGap::Unknown(format!(
+                        "member slot {} root is not a real directory",
+                        member.id
+                    )))
+                }
+            }
+        }
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        let limits = self.pressure_limits();
+        match union_directory(&roots, limits) {
+            Ok(report) if report.coverage.complete => Ok(report.allocated_bytes),
+            Ok(report) => {
+                let gaps = report
+                    .coverage
+                    .gaps
+                    .iter()
+                    .map(|gap| AccountingGap {
+                        kind: gap_kind(gap.kind),
+                        occurrences: gap.occurrences,
+                    })
+                    .collect();
+                Err(UnionGap::Incomplete(scan_with(
+                    limits,
+                    AccountingCoverage::Partial,
+                    gaps,
+                    report.entries_visited,
+                    report.elapsed_ms,
+                    report.vanished,
+                )))
+            }
+            Err(error) => Err(UnionGap::Unknown(error.to_string())),
+        }
     }
 
     fn evict_idle(&mut self, slot_id: &str) -> Result<(), LeaseError> {
@@ -1289,15 +1785,16 @@ impl Pool {
         project: PathBuf,
         workspace: PathBuf,
         request: &LeaseRequest,
+        plan: &VictimPlan,
     ) -> Result<LeaseGrant, LeaseError> {
         if let Some(victim) = request.replace_slot {
-            self.replace_idle_slot_for_admission(victim)?;
+            self.replace_idle_slot_for_admission(victim, plan)?;
         }
         // Slot headroom only: the pool ceiling is replaced, never exceeded.
         // Every allocated entry counts, including held, idle, retired-backed
         // and unresolved Evicting records.
         if self.ledger.slots.len() >= MAX_SLOTS {
-            self.evict_idle_until(MAX_SLOTS - 1)?;
+            self.evict_idle_until(MAX_SLOTS - 1, plan)?;
             if self.ledger.slots.len() >= MAX_SLOTS {
                 return Err(LeaseError::LedgerExhausted);
             }
@@ -1316,14 +1813,14 @@ impl Pool {
         match self.pressure() {
             Ok(used) => {
                 if used >= self.budget {
-                    self.evict_idle_until_under_cap()?;
+                    self.evict_idle_until_under_cap(plan)?;
                     if self.pressure()? >= self.budget {
                         return Err(LeaseError::Full);
                     }
                 }
             }
             Err(LeaseError::AccountingIncomplete(scan)) if self.is_removable() => {
-                self.admit_unknown_removable(&scan)?;
+                self.admit_unknown_removable(&scan, plan)?;
             }
             Err(error) => return Err(error),
         }
@@ -1611,11 +2108,23 @@ impl Pool {
     /// is required before the deletion, and the rank sequence was already
     /// checked before this admission changed anything. A victim that is no
     /// longer idle refuses as busy without touching it.
-    pub(super) fn replace_idle_slot_for_admission(&mut self, id: u64) -> Result<(), LeaseError> {
+    fn replace_idle_slot_for_admission(
+        &mut self,
+        id: u64,
+        plan: &VictimPlan,
+    ) -> Result<(), LeaseError> {
         if id == 0 {
             return Err(LeaseError::InvalidInput(
                 "replacement slot ID must be a positive integer",
             ));
+        }
+        // A named project-cap replacement is a normal-slot decision and must
+        // never reach a verified one-use member (design §6.7).
+        if self
+            .slot(id)
+            .is_some_and(|slot| plan.excludes(slot) || plan.prefers(slot))
+        {
+            return Err(LeaseError::UnknownAccounting);
         }
         // A count replacement is count pressure, not a byte-size decision: it
         // needs a complete pool figure, or a removable pool whose figure is
@@ -1632,7 +2141,7 @@ impl Pool {
         self.retire_idle_slot(id, incarnation, &project, profile)
     }
 
-    pub(super) fn evict_idle_until(&mut self, max_slots: usize) -> Result<(), LeaseError> {
+    fn evict_idle_until(&mut self, max_slots: usize, plan: &VictimPlan) -> Result<(), LeaseError> {
         // Bound admission to the allocated entries it saw when it began, so
         // concurrent-looking state cannot extend the loop.
         let mut remaining = self.ledger.slots.len();
@@ -1642,7 +2151,7 @@ impl Pool {
             // authorises a byte-pressure deletion.
             self.pressure_known_or_bounded_removable()?;
             let before = self.ledger.slots.len();
-            if !self.evict_one_idle()? {
+            if !self.evict_one_idle_with(plan)? {
                 break;
             }
             if self.ledger.slots.len() >= before {
@@ -1667,9 +2176,10 @@ impl Pool {
     /// it refuses with the original incomplete scan. Everything else on the
     /// volume — caches, scratch, another tool's Desktop — is irrelevant here,
     /// which is why the decision takes no "volume used" figure at all.
-    pub(super) fn admit_unknown_removable(
+    fn admit_unknown_removable(
         &mut self,
         scan: &AccountingScan,
+        plan: &VictimPlan,
     ) -> Result<(), LeaseError> {
         let mut idle_available = true;
         loop {
@@ -1689,7 +2199,7 @@ impl Pool {
                     // The reserve is a prune trigger: retire one eligible idle
                     // whole slot and re-read free space. When no eligible slot
                     // is left, the floor decides.
-                    idle_available = self.evict_one_idle()?;
+                    idle_available = self.evict_one_idle_with(plan)?;
                     if !idle_available {
                         continue;
                     }
@@ -1971,7 +2481,7 @@ impl Pool {
         Ok(facts.available_bytes)
     }
 
-    pub(super) fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
+    fn evict_idle_until_under_cap(&mut self, plan: &VictimPlan) -> Result<(), LeaseError> {
         let mut remaining = self.ledger.slots.len();
         loop {
             // Byte pressure remeasures the recorded figure after each deletion
@@ -1984,7 +2494,7 @@ impl Pool {
                 return Ok(());
             }
             let before = self.ledger.slots.len();
-            if !self.evict_one_idle()? {
+            if !self.evict_one_idle_with(plan)? {
                 return Ok(());
             }
             if self.ledger.slots.len() >= before {
@@ -1994,26 +2504,41 @@ impl Pool {
         }
     }
 
-    /// The least-recently-used eligible idle whole slot: ascending
-    /// `(rank, numeric slot id)`. Held, retired-backed and unresolved
-    /// `Evicting` records are never candidates. A safety failure on the
-    /// selected victim stops admission; it never skips to another slot.
-    fn evict_one_idle(&mut self) -> Result<bool, LeaseError> {
-        let Some((id, incarnation, project, profile)) = self
-            .ledger
-            .slots
-            .iter()
-            .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
-            .min_by_key(|slot| (slot.rank, slot.id))
-            .map(|slot| {
-                (
-                    slot.id,
-                    slot.incarnation,
-                    slot.project.clone(),
-                    slot.profile,
-                )
-            })
-        else {
+    /// One eligible idle victim for this admission's policy (design §6.7),
+    /// oldest `(rank, numeric slot id)` first. Held, retired-backed and
+    /// unresolved `Evicting` records are never candidates. A safety failure on
+    /// the selected victim stops admission; it never skips to another slot.
+    ///
+    /// `Any` is today's behaviour. `Only` selects from the evictable member set
+    /// alone, so a normal slot and a class-unknown orphan are impossible
+    /// victims. `Prefer` selects an evictable member first and otherwise the
+    /// ordinary order with **every** verified one-use pair removed.
+    fn evict_one_idle_with(&mut self, plan: &VictimPlan) -> Result<bool, LeaseError> {
+        let eligible =
+            |slot: &SlotRecord| slot.state == SlotPersistState::Idle && slot.lease_id.is_none();
+        let oldest = |predicate: &dyn Fn(&SlotRecord) -> bool| {
+            self.ledger
+                .slots
+                .iter()
+                .filter(|slot| eligible(slot) && predicate(slot))
+                .min_by_key(|slot| (slot.rank, slot.id))
+                .map(|slot| {
+                    (
+                        slot.id,
+                        slot.incarnation,
+                        slot.project.clone(),
+                        slot.profile,
+                    )
+                })
+        };
+        let victim = match plan.kind {
+            VictimPlanKind::Any => oldest(&|_| true),
+            VictimPlanKind::Only => oldest(&|slot| plan.prefers(slot)),
+            VictimPlanKind::Prefer => {
+                oldest(&|slot| plan.prefers(slot)).or_else(|| oldest(&|slot| !plan.excludes(slot)))
+            }
+        };
+        let Some((id, incarnation, project, profile)) = victim else {
             return Ok(false);
         };
         self.retire_idle_slot(id, incarnation, &project, profile)?;
@@ -4133,6 +4658,50 @@ mod removable_pool_path_tests {
         path
     }
 
+    /// The removable reserve route passes the admission's policy to the same
+    /// selector, so a one-use admission can never prune a normal slot and the
+    /// route's own behaviour is unchanged (design §6.7, §10.2).
+    #[test]
+    fn the_reserve_route_selects_only_the_admission_policy() {
+        let fixture = Fixture::new("reserve-policy");
+        let mut pool = fixture.pool(Some(RESERVE));
+        let member_slot = idle_dir(&mut pool, 1, 1);
+        let normal_slot = idle_dir(&mut pool, 2, 2);
+        let member = pool
+            .verify_member(&MemberPair::new("1", "1"))
+            .expect("the member verifies");
+        let only = VictimPlan {
+            kind: VictimPlanKind::Only,
+            preferred: vec![member.clone()],
+            excluded: vec![member.pair],
+        };
+        // Free space at the floor with a reserve above it: the route prunes
+        // while it has an eligible idle slot, then admits at the floor.
+        verified_facts::with(recovering(&[FLOOR, FLOOR, FLOOR]), || {
+            pool.admit_unknown_removable(&bounds_scan(), &only)
+                .expect("admits at the floor");
+        });
+        assert!(!member_slot.exists(), "the evictable member survived");
+        assert_eq!(
+            slot_ids_for_test(&pool),
+            vec![2],
+            "Only selected a normal slot on the reserve route"
+        );
+        assert!(normal_slot.exists());
+
+        // The non-vacuous control: `Any` takes both idle slots, so the survival
+        // above is the policy's doing.
+        let fixture = Fixture::new("reserve-policy-any");
+        let mut pool = fixture.pool(Some(RESERVE));
+        idle_dir(&mut pool, 1, 1);
+        idle_dir(&mut pool, 2, 2);
+        verified_facts::with(recovering(&[FLOOR, FLOOR, FLOOR]), || {
+            pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any())
+                .expect("admits at the floor");
+        });
+        assert!(slot_ids_for_test(&pool).is_empty());
+    }
+
     #[test]
     fn foreign_volume_usage_never_evicts_a_pool_below_its_cap() {
         let fixture = Fixture::new("foreign");
@@ -4146,7 +4715,8 @@ mod removable_pool_path_tests {
             assert!(used < CAP, "pool figure {used} is not below the cap");
             // The frozen rule: the cap comparison never sees the volume total.
             // Restoring `max(recorded, volume_used)` would make this evict.
-            pool.evict_idle_until_under_cap().expect("no pressure");
+            pool.evict_idle_until_under_cap(&VictimPlan::any())
+                .expect("no pressure");
             assert!(
                 pool.slot(1).is_some(),
                 "a pool below its cap evicted an idle slot for foreign volume bytes"
@@ -4176,7 +4746,7 @@ mod removable_pool_path_tests {
             }
         }
         verified_facts::with(facts(10 * GIB), || {
-            pool.evict_idle_until_under_cap()
+            pool.evict_idle_until_under_cap(&VictimPlan::any())
                 .expect("known-byte eviction");
         });
         assert!(!older.exists(), "the rank-LRU idle slot was not evicted");
@@ -4196,7 +4766,7 @@ mod removable_pool_path_tests {
         verified_facts::with(recovering(&[FLOOR - GIB, RESERVE + GIB]), || {
             // Below the floor with an eligible idle slot: prune it, re-read
             // free space, and admit once it is above the reserve.
-            let outcome = pool.admit_unknown_removable(&bounds_scan());
+            let outcome = pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any());
             reads = verified_facts::reads();
             outcome.expect("the recovered admission succeeds");
         });
@@ -4220,7 +4790,7 @@ mod removable_pool_path_tests {
         let mut pool = fixture.pool(Some(RESERVE));
         verified_facts::with(facts(FLOOR - GIB), || {
             let scan = bounds_scan();
-            match pool.admit_unknown_removable(&scan) {
+            match pool.admit_unknown_removable(&scan, &VictimPlan::any()) {
                 Err(LeaseError::AccountingIncomplete(original)) => {
                     assert_eq!(*original, scan, "the original scan was not preserved")
                 }
@@ -4235,7 +4805,7 @@ mod removable_pool_path_tests {
         let mut pool = fixture.pool(Some(RESERVE));
         idle_dir(&mut pool, 1, 1);
         verified_facts::with(facts(FLOOR), || {
-            pool.admit_unknown_removable(&bounds_scan())
+            pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any())
                 .expect("at the floor with nothing left admits");
         });
         let note = pool.admission_note.clone().unwrap_or_default();
@@ -4255,7 +4825,7 @@ mod removable_pool_path_tests {
         // Two victims cannot recover the reserve; the third reading reaches
         // the floor, so the route warns and admits with nothing left.
         verified_facts::with(recovering(&[FLOOR - GIB, FLOOR - GIB, FLOOR]), || {
-            pool.admit_unknown_removable(&bounds_scan())
+            pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any())
                 .expect("at the floor with nothing left admits");
         });
         assert!(!first.exists(), "the first LRU victim was not retired");
@@ -4288,7 +4858,7 @@ mod removable_pool_path_tests {
         };
         verified_facts::with(facts(10 * GIB), || {
             // The pool ceiling path: three slots down to one is count pressure.
-            pool.evict_idle_until(1)
+            pool.evict_idle_until(1, &VictimPlan::any())
                 .expect("bounds-only removable count pressure is allowed");
         });
         assert_eq!(
@@ -4326,6 +4896,9 @@ mod removable_pool_path_tests {
             reserve_bytes: None,
             layout: None,
             replace_slot: None,
+            class: AdmissionClass::Normal,
+            victims: VictimPolicy::Any,
+            slice: None,
         };
         let idle = lease_injected(request.clone()).expect("first slot");
         release_injected(&pool_root, &idle.lease_id).expect("idle slot");
@@ -4368,6 +4941,9 @@ mod removable_pool_path_tests {
             reserve_bytes: Some(RESERVE),
             layout: None,
             replace_slot: None,
+            class: AdmissionClass::Normal,
+            victims: VictimPolicy::Any,
+            slice: None,
         };
         // 1014 GiB of unrelated volume usage against a 64 MiB pool cap.
         verified_facts::with(facts(10 * GIB), || {
@@ -4405,7 +4981,7 @@ mod removable_pool_path_tests {
         let mut broken = recovering(&[FLOOR - GIB, FLOOR - GIB]);
         broken.verify_error_after = Some(1);
         verified_facts::with(broken, || {
-            let outcome = pool.admit_unknown_removable(&bounds_scan());
+            let outcome = pool.admit_unknown_removable(&bounds_scan(), &VictimPlan::any());
             read = verified_facts::reads();
             assert!(
                 matches!(outcome, Err(LeaseError::BackingMismatch)),
@@ -4432,7 +5008,7 @@ mod removable_pool_path_tests {
             verified_facts::with(facts(10 * GIB), || {
                 pool.pressure_known_or_bounded_removable()
                     .expect("bounds-only removable count pressure is allowed");
-                pool.replace_idle_slot_for_admission(1)
+                pool.replace_idle_slot_for_admission(1, &VictimPlan::any())
                     .expect("the count replacement proceeds");
             });
         });
@@ -4444,7 +5020,7 @@ mod removable_pool_path_tests {
         // The same incomplete figure must not authorise a byte-pressure
         // deletion on the known-usage path.
         with_accounting_limits(1, 64, 60_000, || {
-            let outcome = pool.evict_idle_until_under_cap();
+            let outcome = pool.evict_idle_until_under_cap(&VictimPlan::any());
             assert!(
                 matches!(outcome, Err(LeaseError::AccountingIncomplete(_))),
                 "byte pressure on an unknown removable figure must refuse: {outcome:?}"
@@ -4605,5 +5181,566 @@ mod recorded_ledger_tests {
             refused.slots[0].capture = Some(journal(bad));
             assert!(validate_ledger_read(&refused).is_err());
         }
+    }
+}
+
+/// Production-path exercises of the one-use slice protocol
+/// (`one-use-workspaces` §6.2-§6.9). These build a real budget-only pool over
+/// its own tiny fixture payload and drive the same `restore`, selection and
+/// admission methods production uses. The feature is dormant: every one-use
+/// request here comes from a unit test, never from a production command.
+#[cfg(test)]
+mod one_use_slice_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct SliceFixture {
+        root: PathBuf,
+    }
+
+    impl SliceFixture {
+        fn new(label: &str) -> Self {
+            let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let parent = base.join("one-use-slice");
+            fs::create_dir_all(&parent).expect("fixture parent");
+            let root = parent.join(format!("{label}-{:x}-{}", std::process::id(), now_ms()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir(&root).expect("fixture root");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("private fixture root");
+            Self { root }
+        }
+
+        fn pool_root(&self, name: &str) -> PathBuf {
+            let path = self.root.join(name);
+            fs::create_dir(&path).expect("pool root");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("private pool root");
+            path
+        }
+
+        fn pool(&self, name: &str, cap: u64) -> (PathBuf, Pool) {
+            let root = self.pool_root(name);
+            create_injected(&root, cap).expect("budget pool");
+            let pool = Pool::open(&root).expect("open budget pool");
+            (root, pool)
+        }
+
+        fn dir(&self, name: &str) -> PathBuf {
+            let path = self.root.join(name);
+            fs::create_dir(&path).expect("fixture dir");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("private fixture dir");
+            path
+        }
+    }
+
+    impl Drop for SliceFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn idle(pool: &mut Pool, id: u64, rank: u64, files: usize) -> PathBuf {
+        let path = add_idle_slot_for_test(pool, id, rank, 1024, files).expect("idle slot");
+        for directory in [path.clone(), path.join("build")] {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("private slot directory");
+        }
+        path
+    }
+
+    fn pair(id: u64) -> MemberPair {
+        MemberPair::new(id.to_string(), "1")
+    }
+
+    fn members(pool: &Pool, ids: &[u64]) -> Vec<VerifiedMember> {
+        ids.iter()
+            .map(|id| pool.verify_member(&pair(*id)).expect("verified member"))
+            .collect()
+    }
+
+    fn plan(kind: VictimPlanKind, preferred: &[u64], excluded: &[u64]) -> VictimPlan {
+        VictimPlan {
+            kind,
+            preferred: preferred
+                .iter()
+                .map(|id| VerifiedMember {
+                    id: *id,
+                    incarnation: 1,
+                    pair: pair(*id),
+                })
+                .collect(),
+            excluded: excluded.iter().map(|id| pair(*id)).collect(),
+        }
+    }
+
+    fn slice(ids: &[u64], kind: SliceAdmission, max_slots: usize, max_bytes: u64) -> OneUseSlice {
+        OneUseSlice {
+            members: MemberSet::new(ids.iter().map(|id| pair(*id))),
+            max_slots,
+            max_bytes,
+            kind,
+            unknown: 0,
+        }
+    }
+
+    fn ids(pool: &Pool) -> Vec<u64> {
+        slot_ids_for_test(pool)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        pool: &Path,
+        project: &Path,
+        workspace: &Path,
+        holder: &str,
+        class: AdmissionClass,
+        victims: VictimPolicy,
+        slice: Option<OneUseSlice>,
+    ) -> LeaseRequest {
+        LeaseRequest {
+            pool: pool.to_path_buf(),
+            project: project.to_path_buf(),
+            workspace: workspace.to_path_buf(),
+            profile: Profile::Dev,
+            holder: holder.to_owned(),
+            budget_bytes: None,
+            reserve_bytes: None,
+            layout: None,
+            replace_slot: None,
+            class,
+            victims,
+            slice,
+        }
+    }
+
+    fn preferred(ids: &[u64]) -> VictimPolicy {
+        VictimPolicy::Only {
+            preferred: MemberSet::new(ids.iter().map(|id| pair(*id))),
+        }
+    }
+
+    /// A new one-use slot at the member ceiling reclaims the oldest idle
+    /// evictable member and then admits (§6.3, §6.5, §6.9).
+    #[test]
+    fn a_new_one_use_slot_reclaims_the_oldest_member_and_admits() {
+        let fixture = SliceFixture::new("threshold");
+        let (root, mut pool) = fixture.pool("pool", 1 << 30);
+        for id in 1..=16 {
+            idle(&mut pool, id, id, 0);
+        }
+        let project = fixture.dir("project");
+        let workspace = fixture.dir("workspace");
+        let report = pool
+            .restore(
+                &slice(
+                    &(1..=16).collect::<Vec<_>>(),
+                    SliceAdmission::NewSlot,
+                    16,
+                    1 << 30,
+                ),
+                &plan(VictimPlanKind::Only, &(1..=16).collect::<Vec<_>>(), &[]),
+                AdmissionClass::OneUse,
+                None,
+            )
+            .expect("restore");
+        assert_eq!(report.members, 15, "restore did not reclaim one place");
+        assert!(matches!(report.outcome, RestoreOutcome::Within { .. }));
+        assert_eq!(ids(&pool), (2..=16).collect::<Vec<_>>());
+        assert_eq!(report.protected, 0);
+
+        // The same threshold through a real admission: one reclaimed place is
+        // used by the new slot.
+        let leased = pool
+            .lease(&request(
+                &root,
+                &project,
+                &workspace,
+                "slice-new",
+                AdmissionClass::OneUse,
+                preferred(&(2..=16).collect::<Vec<_>>()),
+                Some(slice(
+                    &(2..=16).collect::<Vec<_>>(),
+                    SliceAdmission::NewSlot,
+                    16,
+                    1 << 30,
+                )),
+            ))
+            .expect("the new one-use slot admits");
+        assert!(!leased.grant.reused_slot);
+        let report = leased.slice.expect("a one-use admission always reports");
+        assert_eq!(report.members, 15);
+        assert_eq!(ids(&pool).len(), 16);
+    }
+
+    /// A warm reuse at the ceiling adds no slot, so it admits with all 16
+    /// members while the bytes fit (§6.1, §6.6).
+    #[test]
+    fn a_warm_reuse_at_the_member_ceiling_admits_without_eviction() {
+        let fixture = SliceFixture::new("warm");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        for id in 1..=16 {
+            idle(&mut pool, id, id, 0);
+        }
+        let report = pool
+            .restore(
+                &slice(
+                    &(1..=16).collect::<Vec<_>>(),
+                    SliceAdmission::WarmReuse,
+                    16,
+                    1 << 30,
+                ),
+                &plan(VictimPlanKind::Only, &(1..=16).collect::<Vec<_>>(), &[]),
+                AdmissionClass::OneUse,
+                Some((1, 1)),
+            )
+            .expect("restore");
+        assert_eq!(report.members, 16);
+        assert_eq!(report.protected, 1, "the reuse candidate is not a victim");
+        assert!(matches!(report.outcome, RestoreOutcome::Within { .. }));
+        assert_eq!(ids(&pool), (1..=16).collect::<Vec<_>>());
+    }
+
+    /// A warm reuse whose only remaining eligible victim is the reuse
+    /// candidate itself is full, and the candidate keeps its bytes (§6.3).
+    #[test]
+    fn a_warm_reuse_walled_in_by_its_own_candidate_is_full() {
+        let fixture = SliceFixture::new("reuse-full");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        idle(&mut pool, 1, 1, 1);
+        let report = pool
+            .restore(
+                &slice(&[1], SliceAdmission::WarmReuse, 16, 1),
+                &plan(VictimPlanKind::Only, &[1], &[]),
+                AdmissionClass::OneUse,
+                Some((1, 1)),
+            )
+            .expect("restore");
+        match report.outcome {
+            RestoreOutcome::Full { bytes, held } => {
+                assert!(bytes > 1);
+                assert_eq!(held, 1);
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+        assert_eq!(ids(&pool), vec![1], "the reuse candidate was deleted");
+    }
+
+    /// A protected member is counted and never a victim, even when it is the
+    /// only member left over the bound (§5.5.2, §6.7).
+    #[test]
+    fn a_protected_member_is_counted_and_never_a_victim() {
+        let fixture = SliceFixture::new("protected");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        idle(&mut pool, 1, 1, 1);
+        idle(&mut pool, 2, 2, 1);
+        let report = pool
+            .restore(
+                &slice(&[1, 2], SliceAdmission::NewSlot, 16, 1),
+                &plan(VictimPlanKind::Only, &[2], &[1, 2]),
+                AdmissionClass::OneUse,
+                None,
+            )
+            .expect("restore");
+        match report.outcome {
+            RestoreOutcome::Full { held, .. } => assert_eq!(held, 1),
+            other => panic!("expected Full, got {other:?}"),
+        }
+        assert_eq!(
+            ids(&pool),
+            vec![1],
+            "the evictable member was not reclaimed"
+        );
+    }
+
+    /// The normal `Prefer` fallback subtracts every verified one-use pair, so
+    /// it can never pick a one-use member — protected or not (§6.7).
+    #[test]
+    fn the_normal_fallback_never_selects_a_one_use_member() {
+        let fixture = SliceFixture::new("fallback");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        idle(&mut pool, 1, 1, 0);
+        idle(&mut pool, 2, 2, 0);
+        let prefer = plan(VictimPlanKind::Prefer, &[], &[1]);
+        assert!(pool.evict_one_idle_with(&prefer).expect("victim"));
+        assert_eq!(ids(&pool), vec![1], "the fallback took a one-use member");
+        assert!(
+            !pool.evict_one_idle_with(&prefer).expect("no victim"),
+            "the fallback fell through to a one-use member"
+        );
+    }
+
+    /// `Only` selects an evictable member and never a normal slot (§6.7).
+    #[test]
+    fn only_never_selects_a_normal_slot() {
+        let fixture = SliceFixture::new("only");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        idle(&mut pool, 1, 1, 0);
+        idle(&mut pool, 2, 2, 0);
+        let only = plan(VictimPlanKind::Only, &[1], &[1]);
+        assert!(pool.evict_one_idle_with(&only).expect("victim"));
+        assert_eq!(
+            ids(&pool),
+            vec![2],
+            "Only did not take the evictable member"
+        );
+        assert!(
+            !pool.evict_one_idle_with(&only).expect("no victim"),
+            "Only fell through to a normal slot"
+        );
+    }
+
+    /// A cross-member hard link is counted once by the union walk (§6.4).
+    #[test]
+    fn the_union_counts_a_cross_member_hard_link_once() {
+        let fixture = SliceFixture::new("union");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        let first = idle(&mut pool, 1, 1, 1);
+        let second = idle(&mut pool, 2, 2, 0);
+        fs::hard_link(
+            first.join("build").join("blob-0"),
+            second.join("build").join("linked"),
+        )
+        .expect("hard link");
+        fs::write(second.join("build").join("unique"), vec![b'y'; 32 * 1024]).expect("unique file");
+        let one = pool.member_union(&members(&pool, &[1])).expect("slot 1");
+        let two = pool.member_union(&members(&pool, &[2])).expect("slot 2");
+        let union = pool.member_union(&members(&pool, &[1, 2])).expect("union");
+        assert!(one > 0 && two > 0, "the fixture files are empty");
+        assert_eq!(union, two, "the union is not the second root's total");
+        assert!(
+            one + two > union,
+            "summing independent walks did not overcount the hard link"
+        );
+    }
+
+    /// Class-unknown rows make the slice a lower bound and restore reclaims
+    /// nothing; a one-use admission refuses (§5.6, §6.9).
+    #[test]
+    fn unknown_rows_are_a_lower_bound_and_never_reclaimed() {
+        let fixture = SliceFixture::new("unknown");
+        let (root, mut pool) = fixture.pool("pool", 1 << 30);
+        idle(&mut pool, 1, 1, 1);
+        let mut slice = slice(&[1], SliceAdmission::NewSlot, 16, 1);
+        slice.unknown = 2;
+        let report = pool
+            .restore(
+                &slice,
+                &plan(VictimPlanKind::Only, &[1], &[1]),
+                AdmissionClass::OneUse,
+                None,
+            )
+            .expect("restore");
+        match report.outcome {
+            RestoreOutcome::LowerBound { unknown, .. } => assert_eq!(unknown, 2),
+            other => panic!("expected a lower bound, got {other:?}"),
+        }
+        assert_eq!(ids(&pool), vec![1], "an unprovable bound deleted a member");
+
+        let project = fixture.dir("project");
+        let workspace = fixture.dir("workspace");
+        let refused = pool.lease(&request(
+            &root,
+            &project,
+            &workspace,
+            "slice-unknown",
+            AdmissionClass::OneUse,
+            preferred(&[1]),
+            Some(slice),
+        ));
+        assert!(
+            matches!(refused, Err(LeaseError::UnknownAccounting)),
+            "a one-use admission admitted beside class-unknown rows: {refused:?}"
+        );
+        assert_eq!(ids(&pool), vec![1]);
+    }
+
+    /// An accounting pair that does not verify is dropped and reported, never
+    /// replaced by another slot (§6.2).
+    #[test]
+    fn an_unverified_pair_is_dropped_and_never_replaced() {
+        let fixture = SliceFixture::new("unverified");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        idle(&mut pool, 1, 1, 0);
+        let mut request = slice(&[1], SliceAdmission::NewSlot, 16, 1 << 30);
+        request.members = MemberSet::new([pair(1), MemberPair::new("99", "1")]);
+        let report = pool
+            .restore(
+                &request,
+                &plan(VictimPlanKind::Only, &[1], &[1]),
+                AdmissionClass::Normal,
+                None,
+            )
+            .expect("restore");
+        assert_eq!(report.members, 1);
+        assert_eq!(report.unverified, 1);
+        assert!(matches!(report.outcome, RestoreOutcome::Within { .. }));
+        assert_eq!(ids(&pool), vec![1]);
+    }
+
+    /// A one-use new-slot admission with only protected members refuses with
+    /// the dedicated `one_use_budget` error and deletes nothing (§6.9).
+    #[test]
+    fn a_full_one_use_slice_refuses_with_one_use_budget() {
+        let fixture = SliceFixture::new("one-use-budget");
+        let (root, mut pool) = fixture.pool("pool", 1 << 30);
+        let slot = idle(&mut pool, 1, 1, 1);
+        let project = fixture.dir("project");
+        let workspace = fixture.dir("workspace");
+        let refused = pool.lease(&request(
+            &root,
+            &project,
+            &workspace,
+            "slice-full",
+            AdmissionClass::OneUse,
+            preferred(&[]),
+            Some(slice(&[1], SliceAdmission::NewSlot, 16, 1)),
+        ));
+        match refused {
+            Err(error @ LeaseError::OneUseBudget { measured, limit }) => {
+                assert!(measured.is_some_and(|bytes| bytes > limit));
+                assert_eq!(limit, 1);
+                assert_eq!(error.reason(), "one_use_budget");
+                assert_eq!(error.exit_code(), 3);
+                assert!(!error.to_string().contains("pool cap"), "{error}");
+            }
+            other => panic!("expected one_use_budget, got {other:?}"),
+        }
+        assert!(slot.exists(), "a refusal deleted the protected member");
+        assert_eq!(ids(&pool), vec![1]);
+    }
+
+    /// A one-use warm reuse must land on a verified member: a non-member idle
+    /// slot is refused, never relabelled (§6.6).
+    #[test]
+    fn a_one_use_warm_reuse_of_a_non_member_is_refused() {
+        let fixture = SliceFixture::new("reuse-member");
+        let (root, mut pool) = fixture.pool("pool", 1 << 30);
+        let slot = idle(&mut pool, 1, 1, 0);
+        // The idle slot matches the request's project and profile, so the
+        // library would reuse it; it is deliberately absent from the member
+        // set.
+        let project = fixture.dir("project");
+        if let Some(record) = pool.slot_mut(1) {
+            record.project = project.clone();
+        }
+        let workspace = fixture.dir("workspace");
+        let refused = pool.lease(&request(
+            &root,
+            &project,
+            &workspace,
+            "slice-reuse",
+            AdmissionClass::OneUse,
+            preferred(&[]),
+            Some(slice(&[], SliceAdmission::WarmReuse, 16, 1 << 30)),
+        ));
+        assert!(
+            matches!(refused, Err(LeaseError::UnknownAccounting)),
+            "a non-member warm reuse was not refused: {refused:?}"
+        );
+        assert_eq!(ids(&pool), vec![1]);
+        assert!(slot.exists());
+    }
+
+    /// Dormant byte identity: a normal admission that carries today's request
+    /// shape and one that carries the new empty-member shape produce the same
+    /// ledger bytes, grant and slot tree. The two pools are byte-identical
+    /// copies made before either admission, so the store ID and lease IDs
+    /// match and no field can differ by accident.
+    #[test]
+    fn a_dormant_normal_admission_is_byte_identical_to_the_shipped_shape() {
+        fn copy_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).expect("copy dir");
+            let metadata = fs::symlink_metadata(from).expect("source metadata");
+            fs::set_permissions(to, metadata.permissions()).expect("copy mode");
+            for entry in fs::read_dir(from).expect("read source") {
+                let entry = entry.expect("entry");
+                let target = to.join(entry.file_name());
+                let kind = entry.file_type().expect("entry type");
+                if kind.is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), &target).expect("copy file");
+                }
+            }
+        }
+
+        let fixture = SliceFixture::new("dormant");
+        let source = fixture.pool_root("source");
+        create_injected(&source, 1 << 30).expect("source pool");
+        let shipped = fixture.root.join("shipped");
+        let candidate = fixture.root.join("candidate");
+        copy_tree(&source, &shipped);
+        copy_tree(&source, &candidate);
+        let project = fixture.dir("project");
+        let workspace = fixture.dir("workspace");
+
+        let mut shipped_pool = Pool::open(&shipped).expect("shipped pool");
+        let shipped_grant = shipped_pool
+            .lease(&request(
+                &shipped,
+                &project,
+                &workspace,
+                "dormant",
+                AdmissionClass::Normal,
+                VictimPolicy::Any,
+                None,
+            ))
+            .expect("shipped-shape admission");
+        let mut candidate_pool = Pool::open(&candidate).expect("candidate pool");
+        let candidate_grant = candidate_pool
+            .lease(&request(
+                &candidate,
+                &project,
+                &workspace,
+                "dormant",
+                AdmissionClass::Normal,
+                VictimPolicy::Prefer {
+                    preferred: MemberSet::empty(),
+                },
+                Some(OneUseSlice::bounded(
+                    MemberSet::empty(),
+                    SliceAdmission::NewSlot,
+                    0,
+                    1 << 30,
+                )),
+            ))
+            .expect("empty-member admission");
+        assert_eq!(
+            fs::read(shipped.join(LEDGER_NAME)).expect("shipped ledger"),
+            fs::read(candidate.join(LEDGER_NAME)).expect("candidate ledger"),
+            "the dormant admission changed the ledger bytes"
+        );
+        // The pool root itself differs between the two copies; strip it so the
+        // comparison is about the admission, not the fixture path.
+        let shape = |grant: &LeaseGrant, root: &Path| {
+            (
+                grant.slot_id.clone(),
+                grant.incarnation.clone(),
+                grant.reused_slot,
+                grant
+                    .env
+                    .cargo_build_build_dir
+                    .strip_prefix(root)
+                    .map(Path::to_path_buf),
+                grant.env.cargo_target_dir.clone(),
+            )
+        };
+        assert_eq!(
+            shape(&shipped_grant.grant, &shipped),
+            shape(&candidate_grant.grant, &candidate)
+        );
+        assert!(
+            shipped_grant.slice.is_none(),
+            "a shipped shape has no slice"
+        );
+        assert_eq!(
+            candidate_grant.slice.as_ref().map(|report| &report.outcome),
+            Some(&RestoreOutcome::NotNeeded),
+            "an empty member set must cost no walk and no write"
+        );
     }
 }
