@@ -359,7 +359,10 @@ slot has a recorded origin:
      own arguments with an extra unknown `-Z` before any `--`; it refuses
      that flag before loading the workspace. Unless that refusal is Cargo's
      first error, Cargo would reject the command without resolving, so no
-     lock is written and the slot is refused. External and unknown
+     lock is written and the slot is refused. The parse check sets
+     `CARGO_TERM_COLOR=never` and removes `CLICOLOR_FORCE`, so a forced-colour
+     environment or `term.color = "always"` cannot colour that `error:` prefix
+     and make the gate refuse a command Cargo accepts. External and unknown
      commands (including `clippy`), and commands passing their own `-Z`,
      never get a lock from the gate.
    - `--locked` or `--frozen` with a missing lock, or with `--frozen` or
