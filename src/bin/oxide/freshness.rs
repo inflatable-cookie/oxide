@@ -1454,7 +1454,13 @@ fn lock_step(request: &Resolution, missing: bool) -> LockStep<'_> {
 
 /// Run the parse check (`Resolution::parse_check`): Cargo accepts the
 /// arguments when its first error is the refusal of the unknown `-Z`.
-fn cargo_accepts(command: Command) -> Result<bool, String> {
+/// The call sets `CARGO_TERM_COLOR=never` and removes `CLICOLOR_FORCE`, so
+/// Cargo's first error line stays the uncoloured `error:` the match uses.
+/// An environment value overrides `term.color` in config.
+fn cargo_accepts(mut command: Command) -> Result<bool, String> {
+    command
+        .env("CARGO_TERM_COLOR", "never")
+        .env_remove("CLICOLOR_FORCE");
     let output = run_cargo(command, MAX_METADATA_ERROR_BYTES)?;
     let first_error = output
         .stderr
@@ -1884,6 +1890,8 @@ mod tests {
     /// Real Cargo in an empty scratch directory: accepted arguments reach the
     /// `-Z` refusal; anything else, including a check placed after `--`,
     /// would hit Cargo's argument error or its missing manifest instead.
+    /// Forced colour on the child (`CLICOLOR_FORCE=1`, `CARGO_TERM_COLOR=always`)
+    /// still gets the same answers: `cargo_accepts` forces plain output.
     #[test]
     fn parse_check_asks_cargo_without_effects() {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
@@ -1891,7 +1899,7 @@ mod tests {
             .unwrap_or_else(std::env::temp_dir);
         let dir = base.join(format!("parse-check-{:x}", std::process::id()));
         fs::create_dir(&dir).expect("scratch dir");
-        let accepts = |values: &[&str]| -> Option<bool> {
+        let accepts = |values: &[&str], colour: bool| -> Option<bool> {
             let values: Vec<OsString> = values.iter().map(OsString::from).collect();
             let invocation =
                 crate::cli::parse_leased(values[0].to_str().expect("UTF-8"), &values[1..])
@@ -1899,22 +1907,34 @@ mod tests {
             let check = crate::cli::resolution(&invocation.cargo_args).parse_check?;
             let mut command = Command::new(crate::CARGO);
             command.args(check).current_dir(&dir);
+            if colour {
+                command.env("CLICOLOR_FORCE", "1");
+                command.env("CARGO_TERM_COLOR", "always");
+            }
             Some(cargo_accepts(command).expect("Cargo ran"))
         };
-        assert_eq!(accepts(&["test", "--locked"]), Some(true));
-        assert_eq!(
-            accepts(&["build", "--offline", "--config", "net.offline=false"]),
-            Some(true)
-        );
-        assert_eq!(
-            accepts(&["test", "--message-format=json", "--", "--bogus"]),
-            Some(true)
-        );
-        assert_eq!(accepts(&["test", "--bogus"]), Some(false));
-        assert_eq!(accepts(&["check", "--message-format=bogus"]), Some(false));
-        assert_eq!(accepts(&["build", "--release", "--features"]), Some(false));
-        assert_eq!(accepts(&["nextest", "run"]), None);
-        assert_eq!(accepts(&["test", "-Zunstable-options"]), None);
+        let cases: &[(&[&str], Option<bool>)] = &[
+            (&["test", "--locked"], Some(true)),
+            (
+                &["build", "--offline", "--config", "net.offline=false"],
+                Some(true),
+            ),
+            (
+                &["test", "--message-format=json", "--", "--bogus"],
+                Some(true),
+            ),
+            (&["test", "--bogus"], Some(false)),
+            (&["check", "--message-format=bogus"], Some(false)),
+            (&["build", "--release", "--features"], Some(false)),
+            (&["nextest", "run"], None),
+            (&["test", "-Zunstable-options"], None),
+        ];
+        for (values, expected) in cases {
+            let plain = accepts(values, false);
+            let coloured = accepts(values, true);
+            assert_eq!(plain, *expected, "{values:?}");
+            assert_eq!(coloured, plain, "coloured {values:?}");
+        }
         let left: Vec<_> = fs::read_dir(&dir).expect("scratch").collect();
         fs::remove_dir(&dir).expect("parse check left no files");
         assert!(left.is_empty());
