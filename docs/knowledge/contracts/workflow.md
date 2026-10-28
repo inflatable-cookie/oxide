@@ -3869,9 +3869,9 @@ Rules:
   enforces the budget while a build writes; a build can pass it, and the next
   new slot evicts.
   A deletion that cannot reconcile stays `Evicting` and is excluded from
-  reuse and victim choice. Admission charges the maximum of its recorded size,
-  the bytes observed by a bounded walk and the largest recorded slot: these
-  pools have no per-slot byte ceiling. A pending root whose identity or complete
+  reuse and victim choice. Admission charges the maximum of its recorded size
+  and the largest recorded slot: these pools have no per-slot byte ceiling and
+  no descriptor-relative observed-byte inventory is available. A pending root whose identity or complete
   walk cannot be established remains isolated before reconciliation may change
   it. The soft-budget and replacement limitation is described in
   [local lease](local-lease.md#capacity-and-eviction). Independent incomplete

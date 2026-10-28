@@ -8,13 +8,14 @@ use super::slice::{
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
-    remove_tree_owned, unexpected_entry, AccountingCoverage, AccountingGap, AccountingGapKind,
-    AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView,
-    MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact, RecordedVolume,
-    ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH,
-    ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CAPACITY_POLICY_VERSION, CONFIG_NAME,
-    LEASE_VERSION, LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION, SLOTS_NAME,
+    remove_tree_owned_checked, unexpected_entry, AccountingCoverage, AccountingGap,
+    AccountingGapKind, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased,
+    LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact,
+    RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
+    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
+    CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
+    LEGACY_CAPACITY_POLICY_VERSION, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
+    MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{
@@ -1080,15 +1081,7 @@ pub(super) fn pending_charge_injected(
         .map(|record| record.unique_bytes)
         .max()
         .unwrap_or(0);
-    let path = opened.slot_path(slot_id)?;
-    let observed = inventory_sizes_with(&path, 0, opened.pressure_limits())
-        .unique
-        .unwrap_or(0);
-    Ok((
-        opened.slot_figure(index, &mut Vec::new())?,
-        largest,
-        observed,
-    ))
+    Ok((opened.slot_figure(index, &mut Vec::new())?, largest, 0))
 }
 
 impl Pool {
@@ -2342,9 +2335,9 @@ impl Pool {
             return Err(LeaseError::UnknownAccounting);
         };
         if slot.state == SlotPersistState::Evicting {
-            // These pools have no per-slot byte ceiling. Use the largest
-            // recorded slot as the fallback floor, and retain any bytes a
-            // bounded walk could observe even if that walk is incomplete.
+            // These pools have no per-slot byte ceiling. The pathname-based
+            // inventory does not pin the root, so it supplies no observation
+            // for an isolated eviction. Use the largest recorded slot instead.
             let largest = self
                 .ledger
                 .slots
@@ -2358,23 +2351,7 @@ impl Pool {
                 .as_ref()
                 .filter(|record| record.for_lease == slot.last_lease_id)
                 .map_or(0, |record| record.unique_bytes);
-            let mut paths = vec![self.slot_path(slot.id)?];
-            if let Some(journal) = &slot.capture {
-                paths.push(paths[0].with_file_name(&journal.root.private));
-            }
-            let observed = paths
-                .iter()
-                .map(|path| match fs::symlink_metadata(path) {
-                    Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                        inventory_sizes_with(path, 0, self.pressure_limits())
-                            .unique
-                            .unwrap_or(0)
-                    }
-                    _ => 0,
-                })
-                .max()
-                .unwrap_or(0);
-            return Ok(largest.max(recorded).max(observed));
+            return Ok(largest.max(recorded));
         }
         let id = slot.id;
         let last_lease_id = slot.last_lease_id.clone();
@@ -2660,7 +2637,7 @@ impl Pool {
             // Keep the last closed observation to charge a blocked eviction.
         }
         self.persist_revised()?;
-        self.remove_owned_slot(id, &path)?;
+        self.remove_owned_slot(id, &path, None)?;
         self.ledger.slots.retain(|slot| slot.id != id);
         self.persist_revised()?;
         Ok(())
@@ -2707,10 +2684,28 @@ impl Pool {
             .collect();
         for id in evicting {
             let path = self.slot_path(id)?;
-            if !self.pending_root_ready(id, &path) {
+            let removed = self
+                .slot(id)
+                .and_then(|slot| slot.capture.as_ref())
+                .is_some_and(|journal| journal.root.phase == RootCapturePhase::Removed);
+            let held_root = if removed {
+                None
+            } else if let Some(root) = self.pending_root_ready(id, &path) {
+                Some(root)
+            } else {
                 self.reconciliation_blocked = true;
                 continue;
-            }
+            };
+            let expected = match held_root.as_ref() {
+                Some(root) => match descriptor_identity(root.as_fd()) {
+                    Ok(identity) => Some(identity),
+                    Err(_) => {
+                        self.reconciliation_blocked = true;
+                        continue;
+                    }
+                },
+                None => None,
+            };
             // A journaled root capture is reconciled first: the recorded path
             // may be absent because the tree is under its private name, and
             // deleting by the recorded path alone would conclude a deletion
@@ -2727,7 +2722,9 @@ impl Pool {
                     continue;
                 }
             }
-            if self.remove_owned_slot(id, &path).is_err() {
+            let removal = self.remove_owned_slot(id, &path, expected);
+            drop(held_root);
+            if removal.is_err() {
                 self.reconciliation_blocked = true;
                 continue;
             }
@@ -2739,43 +2736,56 @@ impl Pool {
 
     /// An uncertain or partially inventoried pending root is isolated before
     /// reconciliation can change a mode, create a journal or delete anything.
-    fn pending_root_ready(&self, id: u64, path: &Path) -> bool {
-        let Some(slot) = self.slot(id) else {
-            return false;
-        };
-        if slot
-            .capture
-            .as_ref()
-            .is_some_and(|journal| journal.root.phase == RootCapturePhase::Removed)
-        {
-            return true;
-        }
+    fn pending_root_ready(&self, id: u64, path: &Path) -> Option<OwnedFd> {
+        let slot = self.slot(id)?;
         if self.checked_slot_scope(path).is_err() {
-            return false;
+            return None;
         }
-        let mut candidates = vec![path.to_path_buf()];
+        let parent = super::open_verified_directory(path.parent()?).ok()?;
+        let original = std::ffi::CString::new(path.file_name()?.as_bytes()).ok()?;
+        let mut candidates = vec![original];
         if let Some(journal) = &slot.capture {
-            candidates.push(path.with_file_name(&journal.root.private));
-        }
-        candidates.into_iter().any(|candidate| {
-            let Ok(meta) = fs::symlink_metadata(&candidate) else {
-                return false;
+            let Ok(private) = std::ffi::CString::new(journal.root.private.as_bytes()) else {
+                return None;
             };
-            if !meta.is_dir()
-                || meta.file_type().is_symlink()
-                || meta.uid() != current_uid()
-                || meta.permissions().mode() & 0o077 != 0
+            candidates.push(private);
+        }
+        candidates.into_iter().find_map(|candidate| {
+            let facts = crate::owned_delete::observe_entry(parent.as_fd(), &candidate).ok()?;
+            if !facts.is_directory() || facts.uid != current_uid() || facts.mode_bits() & 0o077 != 0
             {
-                return false;
+                return None;
             }
             if let Some(journal) = &slot.capture {
-                if meta.dev() != journal.root.device || meta.ino() != journal.root.inode {
-                    return false;
+                if facts.device != journal.root.device || facts.inode != journal.root.inode {
+                    return None;
                 }
             }
-            inventory_sizes_with(&candidate, 0, self.pressure_limits())
-                .require_complete()
-                .is_ok()
+            let root = open_directory_at(parent.as_fd(), &candidate).ok()?;
+            if descriptor_identity(root.as_fd()).ok() != Some((facts.device, facts.inode)) {
+                return None;
+            }
+            let limits = self.pressure_limits();
+            let deadline = Instant::now() + Duration::from_millis(limits.max_elapsed_ms);
+            let mut remaining = limits.max_entries;
+            if !pending_tree_complete(
+                root.as_fd(),
+                facts.device,
+                0,
+                limits.max_depth,
+                &mut remaining,
+                deadline,
+            ) {
+                return None;
+            }
+            crate::owned_delete::observe_entry(parent.as_fd(), &candidate)
+                .ok()
+                .filter(|after| {
+                    after.device == facts.device
+                        && after.inode == facts.inode
+                        && after.is_directory()
+                })
+                .map(|_| root)
         })
     }
 
@@ -2887,10 +2897,17 @@ impl Pool {
         Ok(slots_root)
     }
 
-    fn remove_owned_slot(&mut self, id: u64, path: &Path) -> Result<(), LeaseError> {
+    fn remove_owned_slot(
+        &mut self,
+        id: u64,
+        path: &Path,
+        expected: Option<(u64, u64)>,
+    ) -> Result<(), LeaseError> {
         let slots_root = self.checked_slot_scope(path)?;
         match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() => {
+                return Ok(())
+            }
             Err(error) => return Err(io_error(error)),
             Ok(metadata)
                 if metadata.file_type().is_symlink()
@@ -2907,7 +2924,7 @@ impl Pool {
         // crash at any point in the deletion leaves either the recorded path or
         // the recorded private name findable by the next open.
         let mut journal = SlotCaptureJournal { pool: self, id };
-        remove_tree_owned(&slots_root, path, Some(&mut journal))
+        remove_tree_owned_checked(&slots_root, path, Some(&mut journal), expected)
     }
 
     /// The bounds the next walk may use: this open's limits, with the
@@ -3739,6 +3756,63 @@ fn folder_occupied(folder: &Path) -> Result<bool, LeaseError> {
         }
     }
     Ok(false)
+}
+
+/// Read-only, descriptor-relative completeness preflight. A failed or capped
+/// listing never supplies a partial list to reconciliation.
+fn pending_tree_complete(
+    dir: BorrowedFd<'_>,
+    device: u64,
+    depth: usize,
+    max_depth: usize,
+    remaining: &mut u64,
+    deadline: Instant,
+) -> bool {
+    if Instant::now() >= deadline || depth > max_depth {
+        return false;
+    }
+    let cap = usize::try_from(*remaining).unwrap_or(usize::MAX);
+    let Ok(names) = crate::owned_delete::names_of_bounded(dir, cap) else {
+        return false;
+    };
+    for name in names {
+        if Instant::now() >= deadline || *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+            return false;
+        };
+        let Ok(facts) = crate::owned_delete::observe_entry(dir, &name) else {
+            return false;
+        };
+        if facts.device != device {
+            return false;
+        }
+        if facts.is_directory() {
+            let Ok(child) = open_directory_at(dir, &name) else {
+                return false;
+            };
+            if descriptor_identity(child.as_fd()).ok() != Some((facts.device, facts.inode))
+                || !pending_tree_complete(
+                    child.as_fd(),
+                    device,
+                    depth + 1,
+                    max_depth,
+                    remaining,
+                    deadline,
+                )
+            {
+                return false;
+            }
+            if !crate::owned_delete::observe_entry(dir, &name).is_ok_and(|after| {
+                after.device == facts.device && after.inode == facts.inode && after.is_directory()
+            }) {
+                return false;
+            }
+        }
+    }
+    Instant::now() < deadline
 }
 
 struct Sizes {

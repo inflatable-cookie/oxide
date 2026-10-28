@@ -4467,10 +4467,47 @@ fn an_unjournaled_eviction_over_the_entry_bound_admits_other_work() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
-/// A replacement at the recorded name is outside the verified private root;
-/// its bytes remain in the pool-scope walk and cannot be hidden by the charge.
 #[test]
-fn blocked_capture_collision_is_counted_as_foreign_scope() {
+fn a_changed_pending_root_is_not_journaled_or_deleted() {
+    let fixture = Fixture::new("changed-pending-root");
+    let root = fixture.dir("root");
+    let slot = root.join("slot");
+    fs::create_dir(&slot).unwrap();
+    let actual = fs::symlink_metadata(&slot).unwrap();
+    fs::write(slot.join("keep"), b"unchanged").unwrap();
+    let expected = (actual.dev(), actual.ino().wrapping_add(1));
+    let result = super::remove_tree_owned_checked(&root, &slot, None, Some(expected));
+    assert!(matches!(
+        result,
+        Err(LeaseError::UnsafePath(
+            "pending root changed after its completeness preflight"
+        ))
+    ));
+    assert_eq!(fs::read(slot.join("keep")).unwrap(), b"unchanged");
+}
+
+#[test]
+fn a_private_pending_tree_over_the_entry_bound_is_not_journaled() {
+    let fixture = Fixture::new("private-pending-bound");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+    mark_evicting_for_test(&pool, slot_id).unwrap();
+    for index in 0..40 {
+        fs::write(slot_path.join(format!("entry-{index}")), b"unchanged").unwrap();
+    }
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    with_accounting_limits(20, 64, 60_000, || {
+        let result = lease_injected(request(&pool, &project, &workspace, "other"));
+        assert!(result.is_ok(), "unrelated admission: {result:?}");
+    });
+    assert_eq!(fs::read(slot_path.join("entry-39")).unwrap(), b"unchanged");
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}
+
+/// A replacement at the recorded name stays untouched while the recorded
+/// pending root remains isolated; replacement sizing is outside this charge.
+#[test]
+fn blocked_capture_collision_stays_untouched() {
     let fixture = Fixture::new("blocked-collision-bytes");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-collision-bytes");
     let plan = capture_root_state(&slot_path, slot_id, &pool, true);
@@ -4479,10 +4516,7 @@ fn blocked_capture_collision_is_counted_as_foreign_scope() {
     let project = fixture.dir("other-project");
     let workspace = fixture.dir("other-workspace");
     let result = lease_injected(request(&pool, &project, &workspace, "other"));
-    assert!(
-        matches!(result, Err(LeaseError::Full)),
-        "collision bytes must be charged: {result:?}"
-    );
+    assert!(result.is_ok(), "unrelated admission: {result:?}");
     assert!(slot_path.join("foreign").is_file());
     assert!(slot_path
         .parent()
