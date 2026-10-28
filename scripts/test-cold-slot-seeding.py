@@ -645,6 +645,82 @@ def git_fixture(
     }
 
 
+def host_cargo_root(cargo_home: str | None = None) -> str:
+    """Resolve one real Cargo cache root for the shared bounded seeder.
+
+    The seeder reads `registry/` and `git/` with anchored O_NOFOLLOW
+    descriptors. A Cargo home whose entries are symlinks (for example
+    `~/.cargo/registry` and `~/.cargo/git` pointing into one cache volume)
+    therefore cannot be the seeder's host. This resolver reads the invoking
+    home's metadata only: it accepts exactly one canonical parent where BOTH
+    entries are real non-symlink directories and the home's entries resolve to
+    exactly those paths. A split parent, an absent entry, a link loop or any
+    redirection refuses; it never follows a symlink as the seed input and never
+    relaxes the seeder's own checks.
+    """
+    home = cargo_home or os.environ.get("CARGO_HOME") or os.path.join(
+        real_rustup_home(), "..", ".cargo"
+    )
+    home = os.path.abspath(home)
+    expect(os.path.isdir(home), f"the invoking Cargo home {home} is absent")
+    resolved: dict[str, str] = {}
+    for name in ("registry", "git"):
+        entry = os.path.join(home, name)
+        expect(os.path.lexists(entry), f"the invoking Cargo home {home} has no {name}/ entry")
+        # realpath does not raise on ELOOP, so test that the link chain
+        # actually reaches a directory before accepting anything.
+        expect(os.path.exists(entry), f"{entry} is a link loop or an absent target")
+        target = os.path.realpath(entry)
+        expect(os.path.isdir(target), f"{entry} does not resolve to a directory")
+        resolved[name] = target
+    parents = {os.path.dirname(resolved["registry"]), os.path.dirname(resolved["git"])}
+    expect(
+        len(parents) == 1,
+        f"registry and git resolve to different parents: {sorted(parents)}",
+    )
+    root = os.path.realpath(parents.pop())
+    for name in ("registry", "git"):
+        path = os.path.join(root, name)
+        expect(os.path.isdir(path), f"{path} is not a directory")
+        expect(not os.path.islink(path), f"{path} is a symlink, not a real cache directory")
+        expect(
+            os.path.realpath(os.path.join(home, name)) == path,
+            f"the invoking home's {name}/ does not resolve to {path}",
+        )
+    return root
+
+
+def union_seed_lock(head_lock: bytes | str, fixture_packages: list[dict]) -> bytes:
+    """One seed lock for the private home: fixtures plus this HEAD's lock.
+
+    The shared seeder verifies after every call that the private tree is
+    *exactly* that call's selection, so seeding a second lock into the same
+    home would refuse the first call's files as extra. This builds one lock
+    containing every fixture package, every registry package of this HEAD's
+    lock, and its one pinned Git source (deduplicated by name and version).
+    A HEAD lock with zero or more than one Git source refuses: the helper's
+    private offline build needs the pinned Longhorn source and the seeder
+    serves one Git source per call.
+    """
+    budget = offline_seed.Budget(offline_seed.Limits())
+    text = head_lock.decode() if isinstance(head_lock, bytes) else head_lock
+    registry_packages, git_packages = offline_seed.parse_lock_packages(text, budget)
+    expect(
+        len(git_packages) == 1,
+        f"this HEAD's lock has {len(git_packages)} pinned Git sources; the seed serves one",
+    )
+    packages: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for package in [*fixture_packages, *registry_packages]:
+        key = (package["name"], package["version"])
+        if key in seen:
+            continue
+        seen.add(key)
+        packages.append(package)
+    packages.append(git_packages[0])
+    return lock_text(packages).encode()
+
+
 def seed_registry_homes(proof: Proof, repo: str) -> None:
     """One private offline CARGO_HOME from the shared bounded seeder.
 
@@ -653,36 +729,22 @@ def seed_registry_homes(proof: Proof, repo: str) -> None:
     seeder copies the registry crates and the one pinned Longhorn Git source
     from the host cache within its own bounds.
     """
-    host = os.environ.get("CARGO_HOME") or os.path.join(real_rustup_home(), "..", ".cargo")
-    host = os.path.abspath(host)
-    expect(os.path.isdir(host), f"the host CARGO_HOME {host} is absent")
-    locks = [
-        lock_text(
-            [registry("cfg-if", "1.0.0", CFG_IF_100), registry("cfg-if", "1.0.4", CFG_IF_104)]
-        ).encode(),
-        lock_text(
-            [
-                registry("libsqlite3-sys", "0.28.0", SQLITE_028, ["cc"]),
-                registry("cc", "1.0.79", CC_1079),
-            ]
-        ).encode(),
+    host = host_cargo_root()
+    print(f"host Cargo cache root: {host}", flush=True)
+    fixtures = [
+        registry("cfg-if", "1.0.0", CFG_IF_100),
+        registry("cfg-if", "1.0.4", CFG_IF_104),
+        registry("libsqlite3-sys", "0.28.0", SQLITE_028, ["cc"]),
+        registry("cc", "1.0.79", CC_1079),
     ]
-    for index, lock in enumerate(locks):
-        lock_path = os.path.join(proof.root, f"seed-lock-{index}.lock")
-        with open(lock_path, "wb") as handle:
-            handle.write(lock)
-        manifest = offline_seed.seed_cargo_home(host, proof.cargo_home, lock)
-        print(
-            f"seeded Cargo home {index}: {manifest['packages']} packages, "
-            f"{manifest['aggregate_bytes']} bytes",
-            flush=True,
-        )
-    head_lock = os.path.join(repo, "Cargo.lock")
-    head_bytes = read_bytes(head_lock)
-    manifest = offline_seed.seed_cargo_home(host, proof.cargo_home, head_bytes)
+    lock = union_seed_lock(read_bytes(os.path.join(repo, "Cargo.lock")), fixtures)
+    lock_path = os.path.join(proof.root, "seed-lock.union")
+    with open(lock_path, "wb") as handle:
+        handle.write(lock)
+    manifest = offline_seed.seed_cargo_home(host, proof.cargo_home, lock)
     print(
-        f"seeded this HEAD's lock: {manifest['packages']} packages, "
-        f"{manifest['aggregate_bytes']} bytes",
+        f"seeded the private Cargo home once from a union lock: "
+        f"{manifest['packages']} packages, {manifest['aggregate_bytes']} bytes",
         flush=True,
     )
     expect(
@@ -2470,6 +2532,102 @@ def self_test() -> None:
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
 
+        # The union seed lock: fixtures plus this HEAD's registry and its one
+        # pinned Git source; a HEAD lock with zero or two Git sources refuses.
+        head_registry = registry("serde", "1.0.229", "a" * 64)
+        head_git = git_package("longhorn-storage-layout", "https://example.invalid/longhorn.git", "b" * 40)
+        head_lock = lock_text([head_registry, head_git]).encode()
+        union = union_seed_lock(head_lock, [registry("cfg-if", "1.0.0", CFG_IF_100)])
+        budget = offline_seed.Budget(offline_seed.Limits())
+        union_registry, union_git = offline_seed.parse_lock_packages(union.decode(), budget)
+        expect(
+            {(package["name"], package["version"]) for package in union_registry}
+            == {("serde", "1.0.229"), ("cfg-if", "1.0.0")},
+            f"the union lock lost a registry package: {union_registry}",
+        )
+        expect(len(union_git) == 1 and union_git[0]["rev"] == "b" * 40, "the union lock lost the Git source")
+        for label, lock in (
+            ("no Git source", lock_text([head_registry]).encode()),
+            (
+                "two Git sources",
+                lock_text(
+                    [
+                        head_registry,
+                        head_git,
+                        git_package("other", "https://example.invalid/other.git", "c" * 40),
+                    ]
+                ).encode(),
+            ),
+        ):
+            try:
+                union_seed_lock(lock, [])
+            except RuntimeError:
+                pass
+            else:
+                fail(f"a HEAD lock with {label} did not refuse in the union seed lock")
+
+        # The host cache-root resolver: a real home, linked registry/git with
+        # one real cache parent, and the split/absent/loop/redirected refusals.
+        real_home = os.path.join(base, "host-real")
+        for name in ("registry", "git"):
+            os.makedirs(os.path.join(real_home, name))
+        expect(
+            host_cargo_root(real_home) == os.path.realpath(real_home),
+            "a real Cargo home did not resolve to itself",
+        )
+        cache = os.path.join(base, "host-cache")
+        for name in ("registry", "git"):
+            os.makedirs(os.path.join(cache, name))
+        linked_home = os.path.join(base, "host-linked")
+        os.makedirs(linked_home)
+        for name in ("registry", "git"):
+            os.symlink(os.path.join(cache, name), os.path.join(linked_home, name))
+        expect(
+            host_cargo_root(linked_home) == os.path.realpath(cache),
+            "a linked home with one real cache parent did not resolve to it",
+        )
+        split_home = os.path.join(base, "host-split")
+        os.makedirs(split_home)
+        other = os.path.join(base, "host-other")
+        os.makedirs(os.path.join(other, "git"))
+        os.symlink(os.path.join(cache, "registry"), os.path.join(split_home, "registry"))
+        os.symlink(os.path.join(other, "git"), os.path.join(split_home, "git"))
+        absent_home = os.path.join(base, "host-absent")
+        os.makedirs(os.path.join(absent_home, "registry"))
+        loop_home = os.path.join(base, "host-loop")
+        os.makedirs(loop_home)
+        os.symlink("registry", os.path.join(loop_home, "registry"))
+        os.symlink(os.path.join(cache, "git"), os.path.join(loop_home, "git"))
+        redirected_home = os.path.join(base, "host-redirected")
+        redirected_cache = os.path.join(base, "host-redirected-cache")
+        os.makedirs(os.path.join(redirected_cache, "git"))
+        os.makedirs(os.path.join(redirected_cache, "elsewhere"))
+        os.symlink(
+            os.path.join(redirected_cache, "elsewhere"),
+            os.path.join(redirected_cache, "registry"),
+        )
+        os.makedirs(redirected_home)
+        os.symlink(
+            os.path.join(redirected_cache, "registry"),
+            os.path.join(redirected_home, "registry"),
+        )
+        os.symlink(
+            os.path.join(redirected_cache, "git"),
+            os.path.join(redirected_home, "git"),
+        )
+        for label, home in (
+            ("split", split_home),
+            ("absent", absent_home),
+            ("link loop", loop_home),
+            ("redirected", redirected_home),
+        ):
+            try:
+                host_cargo_root(home)
+            except RuntimeError:
+                pass
+            else:
+                fail(f"the {label} host cache root did not refuse")
+
         # The staged-library locator: both supported layouts, and zero or
         # ambiguous matches refuse. Synthetic stage roots only.
         def rlib(deps: str, name: str = "liboxide_storage-abc.rlib") -> None:
@@ -2678,9 +2836,15 @@ def execute(proof: Proof, repo: str, diagnostic: bool) -> perm.Collection:
 
 def main(argv: list[str]) -> int:
     modes = [flag for flag in argv if flag.startswith("--")]
-    unknown = [flag for flag in modes if flag not in ("--plan", "--self-check", "--self-test", "--diagnostic")]
+    unknown = [
+        flag
+        for flag in modes
+        if flag not in ("--plan", "--self-check", "--self-test", "--host-check", "--diagnostic")
+    ]
     if unknown:
-        fail(f"unknown argument {unknown[0]}; --plan, --self-check, --self-test or --diagnostic")
+        fail(
+            f"unknown argument {unknown[0]}; --plan, --self-check, --self-test, --host-check or --diagnostic"
+        )
     if "--plan" in modes:
         plan()
         return 0
@@ -2689,6 +2853,13 @@ def main(argv: list[str]) -> int:
         return 0
     if "--self-test" in modes:
         self_test()
+        return 0
+    if "--host-check" in modes:
+        root = host_cargo_root()
+        print(f"host Cargo cache root: {root}")
+        for name in ("registry", "git"):
+            print(f"  {name}: real directory, not a symlink")
+        print("read-only: no child, fixture, account state or native was invoked")
         return 0
     diagnostic = "--diagnostic" in modes
     if sys.platform != "darwin":
