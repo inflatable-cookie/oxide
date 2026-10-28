@@ -395,8 +395,8 @@ def registry(name: str, version: str, checksum: str, dependencies: list[str] | N
     }
 
 
-def git_package(name: str, url: str, rev: str) -> dict:
-    return {"name": name, "version": "0.1.0", "source": f"git+{url}#{rev}"}
+def git_package(name: str, url: str, rev: str, version: str = "0.1.0") -> dict:
+    return {"name": name, "version": version, "source": f"git+{url}#{rev}"}
 
 
 def slot_of(stderr: str) -> str:
@@ -690,35 +690,27 @@ def host_cargo_root(cargo_home: str | None = None) -> str:
     return root
 
 
-def union_seed_lock(head_lock: bytes | str, fixture_packages: list[dict]) -> bytes:
-    """One seed lock for the private home: fixtures plus this HEAD's lock.
-
-    The shared seeder verifies after every call that the private tree is
-    *exactly* that call's selection, so seeding a second lock into the same
-    home would refuse the first call's files as extra. This builds one lock
-    containing every fixture package, every registry package of this HEAD's
-    lock, and its one pinned Git source (deduplicated by name and version).
-    A HEAD lock with zero or more than one Git source refuses: the helper's
-    private offline build needs the pinned Longhorn source and the seeder
-    serves one Git source per call.
-    """
+def unique_registry_names(lock: bytes | str) -> None:
+    """The bounded seeder copies one sparse-index cache file per registry
+    package, so two versions of one crate name in a single seed lock collide on
+    that file. Fail closed with that explanation rather than a raw EEXIST."""
     budget = offline_seed.Budget(offline_seed.Limits())
-    text = head_lock.decode() if isinstance(head_lock, bytes) else head_lock
-    registry_packages, git_packages = offline_seed.parse_lock_packages(text, budget)
+    text = lock.decode() if isinstance(lock, bytes) else lock
+    registry_packages, _git = offline_seed.parse_lock_packages(text, budget)
+    names = [package["name"] for package in registry_packages]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
     expect(
-        len(git_packages) == 1,
-        f"this HEAD's lock has {len(git_packages)} pinned Git sources; the seed serves one",
+        not duplicates,
+        f"the seed lock names duplicate registry crates {duplicates}; the seeder copies one index file per name",
     )
-    packages: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for package in [*fixture_packages, *registry_packages]:
-        key = (package["name"], package["version"])
-        if key in seen:
-            continue
-        seen.add(key)
-        packages.append(package)
-    packages.append(git_packages[0])
-    return lock_text(packages).encode()
+
+
+def fixture_seed_lock(packages: list[dict]) -> bytes:
+    """One fixture lock with unique registry names (two cfg-if versions would
+    collide in the seeder's index copy)."""
+    lock = lock_text(packages)
+    unique_registry_names(lock)
+    return lock.encode()
 
 
 def seed_registry_homes(proof: Proof, repo: str) -> None:
@@ -733,24 +725,30 @@ def seed_registry_homes(proof: Proof, repo: str) -> None:
     print(f"host Cargo cache root: {host}", flush=True)
     fixtures = [
         registry("cfg-if", "1.0.0", CFG_IF_100),
-        registry("cfg-if", "1.0.4", CFG_IF_104),
         registry("libsqlite3-sys", "0.28.0", SQLITE_028, ["cc"]),
         registry("cc", "1.0.79", CC_1079),
     ]
-    lock = union_seed_lock(read_bytes(os.path.join(repo, "Cargo.lock")), fixtures)
-    lock_path = os.path.join(proof.root, "seed-lock.union")
-    with open(lock_path, "wb") as handle:
-        handle.write(lock)
-    manifest = offline_seed.seed_cargo_home(host, proof.cargo_home, lock)
-    print(
-        f"seeded the private Cargo home once from a union lock: "
-        f"{manifest['packages']} packages, {manifest['aggregate_bytes']} bytes",
-        flush=True,
-    )
-    expect(
-        os.path.isdir(os.path.join(proof.cargo_home, "registry", "cache")),
-        "the private Cargo home has no registry cache",
-    )
+    fixture_lock = fixture_seed_lock(fixtures)
+    head_lock = read_bytes(os.path.join(repo, "Cargo.lock"))
+    unique_registry_names(head_lock)
+    for label, cargo_home, lock in (
+        ("fixture", proof.cargo_home, fixture_lock),
+        ("helper", proof.helper_cargo_home, head_lock),
+    ):
+        lock_path = os.path.join(proof.root, f"seed-lock.{label}")
+        with open(lock_path, "wb") as handle:
+            handle.write(lock)
+        manifest = offline_seed.seed_cargo_home(host, cargo_home, lock)
+        print(
+            f"seeded the {label} Cargo home: {manifest['packages']} packages, "
+            f"{manifest['aggregate_bytes']} bytes",
+            flush=True,
+        )
+    for label, home in (("fixture", proof.cargo_home), ("helper", proof.helper_cargo_home)):
+        expect(
+            os.path.isdir(os.path.join(home, "registry", "cache")),
+            f"the {label} private Cargo home has no registry cache",
+        )
 
 
 def prime_git_databases(proof: Proof, repositories: dict[str, dict]) -> None:
@@ -877,7 +875,7 @@ def helper_build_env(proof: Proof, stage_root: str) -> dict:
     env.update(
         {
             "HOME": proof.home,
-            "CARGO_HOME": proof.cargo_home,
+            "CARGO_HOME": proof.helper_cargo_home,
             "RUSTUP_HOME": proof.rustup,
             "RUSTUP_TOOLCHAIN": BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
@@ -971,6 +969,7 @@ def setup(proof: Proof, repo: str) -> None:
     proof.rustup = real_rustup_home()
     proof.home = fixture_dir(proof.root, "home.")
     proof.cargo_home = fixture_dir(proof.root, "cargo-home.")
+    proof.helper_cargo_home = fixture_dir(proof.root, "helper-cargo-home.")
     proof.evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
     proof.phase("start")
     proof.binary = layout.stage_at(proof, repo, "candidate", jobs=4)
@@ -1534,16 +1533,27 @@ def case_07(proof: Proof) -> None:
 def case_08(proof: Proof) -> None:
     case = Case(proof, "08")
     _donor, _recipient, donor_slot, _ = cfg_donor_recipient(case)
+    # The recipient's lock names the owned Git "cfg-if" 2.0.0: a different
+    # source and version from the donor's registry 1.0.0, so the donor catalog
+    # offers nothing. Using a Git source also keeps the private seed lock free
+    # of a second registry version of one crate name.
+    repository = proof.repositories["cfgifgit"]
+    rev = repository["revisions"][0]
     manifest = (
         '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
-        '[dependencies]\ncfg-if = "=1.0.4"\n'
+        f'[dependencies]\ncfgifgit = {{ package = "cfg-if", git = "{repository["url"]}", rev = "{rev}" }}\n'
     )
-    files = {"Cargo.toml": manifest, "src/main.rs": 'fn main() { println!("{}", cfg_if::VERSION); }\n'}
-    recipient = case.checkout("changed", files, [registry("cfg-if", "1.0.4", CFG_IF_104)])
-    code, _out, err = case.command(recipient, ["run"], "changed dependency", env=case.env())
-    expect(not seeded(err), "a different version was offered")
+    files = {
+        "Cargo.toml": manifest,
+        "src/main.rs": 'fn main() { println!("{}", cfgifgit::from_git()); }\n',
+    }
+    packages = [git_package("cfg-if", repository["url"], rev, version="2.0.0")]
+    recipient = case.checkout("changed", files, packages)
+    code, stdout, err = case.command(recipient, ["run"], "changed dependency", env=case.env())
+    expect(not seeded(err), "a different source was offered")
     expect(skip_line(err).endswith("no eligible donor"), f"unexpected skip: {skip_line(err)}")
-    print("case 08: a changed dependency offered nothing and built correctly", flush=True)
+    expect(stdout.strip() == "5", f"the changed dependency printed {stdout.strip()!r}")
+    print("case 08: a changed source offered nothing and built correctly", flush=True)
 
 
 GATED_BUILD = r'''fn main() {
@@ -2532,39 +2542,36 @@ def self_test() -> None:
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
 
-        # The union seed lock: fixtures plus this HEAD's registry and its one
-        # pinned Git source; a HEAD lock with zero or two Git sources refuses.
-        head_registry = registry("serde", "1.0.229", "a" * 64)
-        head_git = git_package("longhorn-storage-layout", "https://example.invalid/longhorn.git", "b" * 40)
-        head_lock = lock_text([head_registry, head_git]).encode()
-        union = union_seed_lock(head_lock, [registry("cfg-if", "1.0.0", CFG_IF_100)])
+        # Per-home seed locks: unique registry names are a hard precondition
+        # (the seeder copies one index file per crate name).
+        unique = fixture_seed_lock([registry("cfg-if", "1.0.0", CFG_IF_100)])
         budget = offline_seed.Budget(offline_seed.Limits())
-        union_registry, union_git = offline_seed.parse_lock_packages(union.decode(), budget)
-        expect(
-            {(package["name"], package["version"]) for package in union_registry}
-            == {("serde", "1.0.229"), ("cfg-if", "1.0.0")},
-            f"the union lock lost a registry package: {union_registry}",
-        )
-        expect(len(union_git) == 1 and union_git[0]["rev"] == "b" * 40, "the union lock lost the Git source")
-        for label, lock in (
-            ("no Git source", lock_text([head_registry]).encode()),
-            (
-                "two Git sources",
+        parsed, _git = offline_seed.parse_lock_packages(unique.decode(), budget)
+        expect([package["name"] for package in parsed] == ["cfg-if"], "the fixture lock lost its package")
+        try:
+            fixture_seed_lock(
+                [
+                    registry("cfg-if", "1.0.0", CFG_IF_100),
+                    registry("cfg-if", "1.0.4", CFG_IF_104),
+                ]
+            )
+        except RuntimeError:
+            pass
+        else:
+            fail("a fixture lock with two versions of one crate did not refuse")
+        try:
+            unique_registry_names(
                 lock_text(
                     [
-                        head_registry,
-                        head_git,
-                        git_package("other", "https://example.invalid/other.git", "c" * 40),
+                        registry("cfg-if", "1.0.0", CFG_IF_100),
+                        registry("cfg-if", "1.0.4", CFG_IF_104),
                     ]
-                ).encode(),
-            ),
-        ):
-            try:
-                union_seed_lock(lock, [])
-            except RuntimeError:
-                pass
-            else:
-                fail(f"a HEAD lock with {label} did not refuse in the union seed lock")
+                ).encode()
+            )
+        except RuntimeError:
+            pass
+        else:
+            fail("a seed lock with a duplicate registry name did not refuse")
 
         # The host cache-root resolver: a real home, linked registry/git with
         # one real cache parent, and the split/absent/loop/redirected refusals.
@@ -2710,13 +2717,14 @@ def self_test() -> None:
         fake = types.SimpleNamespace(
             home=os.path.join(base, "fake-home"),
             cargo_home=os.path.join(base, "fake-cargo"),
+            helper_cargo_home=os.path.join(base, "fake-helper-cargo"),
             rustup=os.path.join(base, "fake-rustup"),
         )
         env = helper_build_env(fake, lease_stage)
         expect(
             env["CARGO_TARGET_DIR"] == os.path.join(lease_stage, "target")
             and env["CARGO_BUILD_BUILD_DIR"] == os.path.join(lease_stage, "build")
-            and env["CARGO_HOME"] == fake.cargo_home
+            and env["CARGO_HOME"] == fake.helper_cargo_home
             and env["HOME"] == fake.home
             and env["RUSTUP_TOOLCHAIN"] == BUILDER
             and env["CARGO_NET_OFFLINE"] == "true"
