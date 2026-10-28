@@ -449,7 +449,10 @@ impl OutputsInit {
 impl Default for State {
     fn default() -> Self {
         Self {
-            version: STATE_VERSION,
+            // A pool with no state document and no fence is the unfenced
+            // shape; `save` derives the version that document actually
+            // carries, so this value is never a claim about a fence.
+            version: LEGACY_FIELDS_STATE_VERSION,
             next_id: 1,
             next_use: 1,
             tickets: Vec::new(),
@@ -4793,10 +4796,12 @@ impl Store {
 
     /// The mutating-command gate. Taking it also makes the recorded-accounting
     /// control fence durable, before this command can write a recorded library
-    /// ledger (oxide#146): `STATE_VERSION` 5 is the hand-off trigger an older
-    /// installed binary needs, because the ledger's `capacity_policy: 2` is
-    /// unreadable to it. The write is one-time per pool; a read-only command
-    /// never takes this gate and so never writes.
+    /// ledger (oxide#146): version 5 (`RECORDED_ACCOUNTING_STATE_VERSION`) is
+    /// the hand-off trigger an older installed binary needs, because the
+    /// ledger's `capacity_policy: 2` is unreadable to it. The write is one-time
+    /// per pool; a read-only command never takes this gate and so never writes.
+    /// The one-use fence is a second, later step taken only when a
+    /// class-bearing record is written.
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
         self.fence_recorded_accounting()?;
@@ -6400,7 +6405,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(created.get(), 1);
         let state = internal.load().unwrap();
-        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.version, RECORDED_ACCOUNTING_STATE_VERSION);
         assert!(matches!(
             state.outputs_init,
             Some(OutputsInit::Ready { .. })
@@ -6707,7 +6712,7 @@ pub(crate) mod tests {
             assert_eq!(
                 before.version,
                 if recorded_accounting.is_some() {
-                    STATE_VERSION
+                    RECORDED_ACCOUNTING_STATE_VERSION
                 } else {
                     OLDER_STATE_VERSION
                 },
@@ -8827,6 +8832,7 @@ pub(crate) mod tests {
         // The current representation carries both forward fences, so this is
         // the worst valid version-5 document and not an owned-outputs-only one.
         let mut state = State {
+            version: RECORDED_ACCOUNTING_STATE_VERSION,
             owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
             recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
             ..State::default()
@@ -8880,7 +8886,7 @@ pub(crate) mod tests {
             .save(&state)
             .expect("the escaped worst valid state saves");
         let loaded = store.load().expect("the escaped worst valid state loads");
-        assert_eq!(loaded.version, STATE_VERSION);
+        assert_eq!(loaded.version, RECORDED_ACCOUNTING_STATE_VERSION);
         assert_eq!(
             serde_json::to_vec(&loaded).expect("reserialize loaded"),
             before,
@@ -8896,6 +8902,7 @@ pub(crate) mod tests {
     fn worst_valid_control_state_fits_its_object_and_byte_caps() {
         // The current representation, so the bound covers the version-5 fence.
         let mut state = State {
+            version: RECORDED_ACCOUNTING_STATE_VERSION,
             recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
             ..State::default()
         };
@@ -8947,6 +8954,24 @@ pub(crate) mod tests {
         );
         let object = serde_json::to_vec(&worst_record(1)).expect("record");
         assert!(object.len() <= MAX_RECORD_OBJECT_BYTES);
+        // The class-bearing shape is the largest record this state can carry:
+        // a `one_use` record with a full-length reason still fits the record
+        // object ceiling, and a full record set of them still fits the file.
+        let one_use = Record {
+            class: WorkspaceClass::OneUse,
+            class_reason: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
+            ..worst_record(1)
+        };
+        let object = serde_json::to_vec(&one_use).expect("one-use record");
+        assert!(
+            object.len() <= MAX_RECORD_OBJECT_BYTES,
+            "a one-use record is {} bytes",
+            object.len()
+        );
+        assert!(
+            object.len() * MAX_RECORDS <= MAX_STATE_BYTES as usize,
+            "a full set of one-use records exceeds the state bound"
+        );
     }
 
     #[test]
@@ -9015,7 +9040,10 @@ pub(crate) mod tests {
         };
         store.save(&both).expect("a doubly fenced state saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
+        assert_eq!(
+            stored["version"],
+            serde_json::json!(RECORDED_ACCOUNTING_STATE_VERSION)
+        );
         assert_eq!(
             stored["recorded_accounting"],
             serde_json::json!(RECORDED_ACCOUNTING_FENCE)
@@ -9033,7 +9061,10 @@ pub(crate) mod tests {
             .fence_owned_outputs()
             .expect("the forward fence saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
+        assert_eq!(
+            stored["version"],
+            serde_json::json!(RECORDED_ACCOUNTING_STATE_VERSION)
+        );
         assert_eq!(
             stored["owned_outputs"],
             serde_json::json!(OWNED_OUTPUTS_FENCE)
