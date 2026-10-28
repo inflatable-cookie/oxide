@@ -939,20 +939,41 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"
 
-# Slot headroom (oxide#118): under the qualified shared proof supervisor
-# (oxide#109/#114, bounded-test.py SHA-256
-# d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e), stages
+# Slot headroom (oxide#118, oxide#177): under the qualified shared proof
+# supervisor (oxide#109/#114/#151, bounded-test.py SHA-256
+# bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
-# legacy read without migration, rank exhaustion, a 128-slot pool whose 129th
-# and 130th admissions replace the rank-LRU idle whole slot, the 8-slot
-# project cap with a specific held-slot wait and one LRU idle replacement,
-# compatible reuse first, no eviction below both ceilings, byte-pressure LRU
-# with a held slot excluded, and a foreign payload-entry refusal. Tiny owned
-# fixtures only: no live pool, real drive or large inventory; representation
-# worst cases are unit tests. 300 s and 512 MiB monitored scratch.
+# legacy read without migration, the raised-ceiling fence written at the 129th
+# slot, rank exhaustion, a 256-slot pool whose 257th and 258th admissions
+# replace the rank-LRU idle whole slot, the 12-slot project cap with a specific
+# held-slot wait and one LRU idle replacement, compatible reuse first, no
+# eviction below both ceilings, byte-pressure LRU with a held slot excluded,
+# and a foreign payload-entry refusal. With every slot recorded it also checks
+# oxide#177's accounting-cost gate: no inventory walk at admission, no
+# whole-payload walk on release or default status at 256. Tiny owned fixtures
+# only: no live pool, real drive or large inventory; representation worst cases
+# and the 128- vs 256-slot ledger cost ceiling are unit tests. 300 s and
+# 512 MiB monitored scratch.
 [tasks."rust:slot-headroom"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
+
+# Opt-in uncounted collection for oxide#177: the same fixed script, guard and
+# limits with `--diagnostic`. It records reached/completed/failed/skipped
+# phases and the latched first fault in a bounded `qualified: false` receipt
+# beside the guard's, continues only into phases whose declared dependencies
+# completed without a failure, and aborts on an unknown outcome or an unclosed
+# proof child. It is never a counted native PASS, closure or activation.
+[tasks."rust:slot-headroom:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py --diagnostic"
+
+# Pure apparatus check of the diagnostic collection, through the script's
+# existing `--self-check` mode only: it stages nothing, starts no child,
+# creates no pool or evidence and writes no receipt, so this selector is
+# deliberately not heavy. It is not the native proof and advances no gate.
+[tasks."proof:slot-headroom:test"]
+run = "python3 scripts/test-slot-headroom.py --self-check"
 
 # Pure apparatus checks for oxide#140's command-budget proof, through the
 # script's existing `--self-check` and `--self-test` modes only: they stage

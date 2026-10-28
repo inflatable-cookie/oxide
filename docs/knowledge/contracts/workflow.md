@@ -3920,10 +3920,15 @@ Rules:
   payload-entry refusal. With every slot's record current it also checks
   oxide#177's accounting-cost gate: a new-slot admission at 256 walks no
   inventory, the evicted slot is never walked, a release walks only its own
-  slot, and default `status` at 256 walks nothing. Worst-valid ledger/control
-  serialization, round-trip and oversized-field refusals are unit tests. The
-  thirteen-grant freshness bound is a bounded-loop inspection, not a
-  separately induced native case.
+  slot, and default `status` at 256 walks nothing; it also crosses the legacy
+  128-slot ceiling natively and requires `capacity_policy: 3`. Worst-valid
+  ledger/control serialization, round-trip and oversized-field refusals are
+  unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
+  and limits with `--diagnostic` (uncounted, keep-going, a bounded
+  `qualified: false` receipt, aborting on an unknown outcome or unclosed
+  proof child), and `effigy proof:slot-headroom:test` is its pure
+  `--self-check`. The thirteen-grant freshness bound is a bounded-loop
+  inspection, not a separately induced native case.
 - **Proof.** Current: `effigy rust:oxide-budget-default`
   ([above](#budget-only-default-pool-and-user-configuration)). Historical,
   before the CLI's retirement: `effigy rust:oxide-cli` added a macOS case on two scratch

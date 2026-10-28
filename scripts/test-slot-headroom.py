@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused slot-headroom proof for oxide#118.
+"""Focused slot-headroom proof for oxide#118, extended for oxide#177.
 
 The qualified shared supervisor owns the 300 s deadline, 512 MiB monitored
 scratch, process closure and cleanup. This fixed fixture script reuses the
@@ -15,9 +15,19 @@ default status (oxide#177's accounting-cost gate); the 12-slot project cap with
 a specific held-slot wait, the honest all-held refusal and one LRU idle
 replacement after affinity is dropped; ordinary compatible reuse and no
 eviction below both ceilings; byte-pressure LRU with a held slot excluded; and
-a foreign payload entry refusal. The worst-valid 256-slot ledger and
-512-record control-state serialization/round-trip and oversized-field refusals
-are unit tests in `effigy test rust`, not native fixtures.
+a foreign payload entry refusal, and a native crossing of the legacy 128-slot
+ceiling that must write `capacity_policy: 3`. The worst-valid 256-slot ledger
+and 512-record control-state serialization/round-trip and oversized-field
+refusals are unit tests in `effigy test rust`, not native fixtures.
+
+Modes. The default run is the counted proof and fails fast. `--diagnostic` is
+the uncounted keep-going collection: a recoverable phase failure is recorded
+and only its declared dependents are skipped, while an unknown outcome, an
+unclosed proof child or an exhausted work window aborts the rest. It writes a
+bounded `qualified: false` receipt beside the guard's evidence and never a PASS
+receipt. `--self-check` is the pure apparatus check of that collection (no
+child, scratch, pool or evidence write). An unknown argument refuses before any
+effect.
 """
 
 from __future__ import annotations
@@ -56,6 +66,24 @@ RESULTS = []
 CHILDREN = []
 COUNTER = 0
 
+# The uncounted diagnostic collection mode (oxide#177). It records a
+# recoverable phase failure and continues into the phases that do not depend on
+# it, and aborts on any unknown outcome or unclosed proof child. It never
+# writes a PASS receipt and never claims qualification.
+DIAGNOSTIC = "--diagnostic" in sys.argv[1:]
+SCHEMA = "oxide.slot-headroom.receipt/1"
+MAX_RECEIPT_BYTES = 128 * 1024
+MAX_RECEIPT_ENTRIES = 32
+MAX_RECEIPT_EXCERPT = 500
+PHASE_NAMES: list = []
+PHASE_STATES: dict = {}
+PHASE_FAILURES: list = []
+PHASE_SKIPS: list = []
+TAINTED: set = set()
+ABORTED = False
+PRIMARY: list = []
+SECONDARY: list = []
+
 FIXTURE = {
     "Cargo.toml": '[package]\nname = "slot-headroom-app"\nversion = "0.1.0"\nedition = "2021"\n',
     "src/lib.rs": "pub fn value() -> u32 {\n    3\n}\n",
@@ -74,7 +102,7 @@ def work_left() -> float:
     deadline = int(os.environ["OXIDE_PROOF_DEADLINE_NS"])
     left = (deadline - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9 - SHUTDOWN_MARGIN_S
     if left <= 5:
-        fail("work deadline reached before the supervisor shutdown margin")
+        deadline_fail("work deadline reached before the supervisor shutdown margin")
     return left
 
 
@@ -725,87 +753,408 @@ def prove_foreign_refusal(proof: Proof, pool: str, env: dict, app: str) -> None:
     RESULTS.append({"case": "foreign-payload-entry-refused", "reported": True})
 
 
-def main() -> None:
-    expect(os.path.isdir(ROOT) and os.path.realpath(ROOT) == os.environ["OXIDE_TASK_SCRATCH_ROOT"],
-           "scratch root is not canonical")
-    expect(os.path.isdir(EVIDENCE), "qualified-runner evidence directory is missing")
-    with open(os.path.join(REPO, "scripts", "bounded-test.py"), "rb") as handle:
+class PhaseFailure(Exception):
+    """A recorded phase failure; `abort` marks an outcome no oracle may continue."""
+
+    def __init__(self, message: str, *, abort: bool = False) -> None:
+        super().__init__(message)
+        self.abort = abort
+
+
+def note_fault(message: str) -> None:
+    """Preserve the first fault; later ones stay visible as secondary."""
+    if not PRIMARY:
+        PRIMARY.append(message)
+    else:
+        SECONDARY.append(message)
+
+
+def abort_now(message: str) -> None:
+    """The one abort transition: module state and the first fault."""
+    global ABORTED
+    ABORTED = True
+    note_fault(message)
+
+
+def phase_fail(message: str) -> None:
+    """Diagnostic-mode `fail`: record it instead of exiting the process."""
+    raise PhaseFailure(message)
+
+
+def phase_expect(condition: bool, message: str) -> None:
+    if not condition:
+        raise PhaseFailure(message)
+
+
+def deadline_fail(message: str) -> None:
+    """An exhausted work window ends the collection; it is never an oracle."""
+    if DIAGNOSTIC:
+        raise PhaseFailure(message, abort=True)
+    fail(message)
+
+
+def dispatch(phases: list, diagnostic: bool) -> None:
+    """Run the fixed phases in dependency order.
+
+    Counted mode propagates the first failure. Diagnostic mode records a
+    recoverable failure, skips only phases whose declared prerequisites are
+    tainted, and aborts the collection on an unknown outcome or unclosed proof
+    child (a killed leader can leave its tool group in the supervisor session).
+    """
+    global PHASE_NAMES
+    PHASE_NAMES = [name for name, _, _ in phases]
+    if diagnostic:
+        # Every planned phase starts unrun, so an abort leaves a complete,
+        # truthful map instead of a missing entry.
+        PHASE_STATES.update({name: "not_run" for name in PHASE_NAMES})
+    for name, depends, body in phases:
+        if not diagnostic:
+            body()
+            continue
+        blocked = [dependency for dependency in depends if dependency in TAINTED]
+        if blocked:
+            PHASE_STATES[name] = "skip"
+            PHASE_SKIPS.append((name, f"dependency failed: {', '.join(blocked)}"))
+            TAINTED.add(name)
+            print(f"skip {name} (dependency failed: {', '.join(blocked)})", flush=True)
+            continue
+        PHASE_STATES[name] = "reached"
+        print(f"phase {name}", flush=True)
+        try:
+            body()
+        except PhaseFailure as failure:
+            PHASE_STATES[name] = "aborted" if failure.abort else "fail"
+            PHASE_FAILURES.append((name, str(failure)))
+            TAINTED.add(name)
+            note_fault(f"{name}: {failure}")
+            if failure.abort:
+                abort_now(f"{name}: {failure}")
+                print(f"abort {name}: {failure}", flush=True)
+                return
+            print(f"failed {name}: {failure}", flush=True)
+            if CHILDREN:
+                abort_now(f"{name}: unclosed proof children after a failure")
+                print(f"abort {name}: unclosed proof children", flush=True)
+                return
+        except OSError as error:
+            PHASE_STATES[name] = "aborted"
+            PHASE_FAILURES.append((name, f"infrastructure error: {error}"))
+            abort_now(f"{name}: infrastructure error: {error}")
+            print(f"abort {name}: {error}", flush=True)
+            return
+        except Exception as error:  # noqa: BLE001 - never an oracle continuation
+            PHASE_STATES[name] = "aborted"
+            PHASE_FAILURES.append((name, f"unexpected {type(error).__name__}: {error}"))
+            abort_now(f"{name}: unexpected {type(error).__name__}: {error}")
+            print(f"abort {name}: unexpected {type(error).__name__}: {error}", flush=True)
+            return
+        else:
+            if CHILDREN:
+                PHASE_STATES[name] = "aborted"
+                abort_now(f"{name}: proof children were not closed")
+                print(f"abort {name}: proof children were not closed", flush=True)
+                return
+            PHASE_STATES[name] = "pass"
+
+
+def bounded_excerpt(text) -> str:
+    text = str(text)
+    if len(text) > MAX_RECEIPT_EXCERPT:
+        return text[:MAX_RECEIPT_EXCERPT] + "..."
+    return text
+
+
+def receipt_document(source: str, tree: str, runner_hash: str, binary_sha256: str) -> dict:
+    states = {name: PHASE_STATES.get(name, "not_run") for name in PHASE_NAMES}
+    counts = {
+        "pass": sum(1 for state in states.values() if state == "pass"),
+        "fail": sum(1 for state in states.values() if state == "fail"),
+        "skip": sum(1 for state in states.values() if state == "skip"),
+        "aborted": sum(1 for state in states.values() if state == "aborted"),
+        "not_run": sum(1 for state in states.values() if state == "not_run"),
+        "planned": len(states),
+    }
+    with open(os.path.abspath(__file__), "rb") as handle:
         import hashlib
-        runner_hash = hashlib.sha256(handle.read()).hexdigest()
-    expect(runner_hash == RUNNER_SHA256, f"qualified runner hash mismatch: {runner_hash}")
-    work_left()
-    source = subprocess.check_output(["git", "rev-parse", "HEAD^{commit}"], cwd=REPO, text=True).strip()
-    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=REPO, text=True).strip()
-    dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO, text=True).strip()
-    expect(not dirty, f"source checkout is dirty: {dirty}")
-
-    os.makedirs(os.path.join(ROOT, "home"), mode=0o700, exist_ok=True)
-    os.makedirs(os.path.join(ROOT, "cargo-home"), mode=0o700, exist_ok=True)
-    os.makedirs(os.path.join(ROOT, "markers"), mode=0o700, exist_ok=True)
-    write_file(os.path.join(ROOT, "hold.py"), HOLD_SCRIPT)
-    proof = Proof(ROOT)
-    proof.phase("start")
-    global BINARY
-    BINARY = stage(proof, REPO)
-    import hashlib
-    with open(BINARY, "rb") as handle:
-        binary_sha256 = hashlib.sha256(handle.read()).hexdigest()
-    print(f"staged oxide sha256 {binary_sha256}", flush=True)
-    proof.phase("after staging")
-
-    fences_pool = os.path.join(ROOT, "pool-fences")
-    fences_env = base_env(proof, fences_pool)
-    fences_app = write_tree(os.path.join(ROOT, "checkouts", "fences"), FIXTURE)
-    prove_fences_and_exhaustion(proof, fences_app, fences_pool, fences_env)
-    proof.phase("after fences")
-    raised_pool = os.path.join(ROOT, "pool-raised")
-    prove_raised_fence(
-        proof,
-        raised_pool,
-        base_env(proof, raised_pool),
-        os.path.join(ROOT, "checkouts", "raised"),
-    )
-    proof.phase("after raised fence")
-    prove_pool_ceiling(proof, fences_app, fences_pool, fences_env)
-    proof.phase("after pool ceiling")
-
-    project_pool = os.path.join(ROOT, "pool-project")
-    project_env = base_env(proof, project_pool)
-    prove_project_cap(proof, project_pool, project_env, os.path.join(ROOT, "checkouts", "project"))
-    proof.phase("after project cap")
-
-    reuse_pool = os.path.join(ROOT, "pool-reuse")
-    prove_reuse_and_no_churn(proof, reuse_pool, base_env(proof, reuse_pool), os.path.join(ROOT, "checkouts", "reuse"))
-    proof.phase("after reuse")
-
-    byte_pool = os.path.join(ROOT, "pool-byte")
-    prove_byte_pressure(proof, byte_pool, base_env(proof, byte_pool), os.path.join(ROOT, "checkouts", "byte"))
-    proof.phase("after byte pressure")
-
-    prove_foreign_refusal(proof, reuse_pool, base_env(proof, reuse_pool), os.path.join(ROOT, "checkouts", "reuse", "reuse-app"))
-    proof.phase("after foreign refusal")
-
-    receipt = {
+        script_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    document = {
+        "schema": SCHEMA,
         "task": "oxide#177",
+        "mode": "diagnostic",
+        "qualified": False,
         "source_commit": source,
         "source_tree": tree,
         "binary_sha256": binary_sha256,
         "runner_sha256": runner_hash,
-        "result": "pass",
-        "cases": RESULTS,
+        "script_sha256": script_sha256,
+        "phase_states": states,
+        "counts": counts,
+        "failures": [(name, bounded_excerpt(reason)) for name, reason in PHASE_FAILURES][:MAX_RECEIPT_ENTRIES],
+        "skips": [(name, bounded_excerpt(reason)) for name, reason in PHASE_SKIPS][:MAX_RECEIPT_ENTRIES],
+        "tainted": sorted(TAINTED),
+        "aborted": ABORTED,
+        "primary_error": bounded_excerpt(PRIMARY[0]) if PRIMARY else None,
+        "secondary_errors": [bounded_excerpt(entry) for entry in SECONDARY][:MAX_RECEIPT_ENTRIES // 4],
+        "collection_complete": (not ABORTED) and counts["not_run"] == 0 and counts["skip"] == 0,
         "limits": {
             "wall_clock_seconds": 300,
             "shutdown_margin_seconds": SHUTDOWN_MARGIN_S,
             "scratch_budget_mib": 512,
+            "receipt_bytes": MAX_RECEIPT_BYTES,
+            "receipt_entries": MAX_RECEIPT_ENTRIES,
         },
-        "coverage_gaps": [
-            "worst-valid 256-slot ledger and 512-record control-state serialization/round-trip and oversized-field refusal are unit tests, not native fixtures",
-            "the 128-slot vs 256-slot ledger read/rank/write cost is a unit measurement with a fixed 50 ms ceiling, not a native fixture",
-            "the thirteen-grant freshness bound is a bounded loop inspection, not separately induced natively",
-        ],
+        "claim": "uncounted diagnostic collection; never a PASS, closure or native credit",
     }
-    write_evidence("slot-headroom.json", json.dumps(receipt, indent=2) + "\n")
-    print(f"slot-headroom proof PASS: {len(RESULTS)} cases; source {source}; tree {tree}; runner {runner_hash}", flush=True)
+    encoded = json.dumps(document, indent=2, sort_keys=True)
+    if len(encoded.encode()) > MAX_RECEIPT_BYTES:
+        document["failures"] = document["failures"][: MAX_RECEIPT_ENTRIES // 4]
+        document["skips"] = document["skips"][: MAX_RECEIPT_ENTRIES // 4]
+        document["secondary_errors"] = document["secondary_errors"][: MAX_RECEIPT_ENTRIES // 8]
+        document["omitted"] = "entries truncated to the receipt byte bound"
+        encoded = json.dumps(document, indent=2, sort_keys=True)
+    if len(encoded.encode()) > MAX_RECEIPT_BYTES:
+        raise PhaseFailure("the diagnostic receipt cannot fit its byte bound", abort=True)
+    return document
+
+
+def write_diagnostic_receipt(document: dict) -> str:
+    path = os.path.realpath(
+        os.path.join(EVIDENCE, f"slot-headroom-diagnostic-{os.getpid()}-{time.time_ns()}.json")
+    )
+    expect(path.startswith(EVIDENCE + os.sep), f"diagnostic receipt escaped: {path}")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+    os.chmod(path, 0o600)
+    return path
+
+
+def reset_collection() -> None:
+    global PHASE_NAMES, PHASE_STATES, PHASE_FAILURES, PHASE_SKIPS, TAINTED
+    global ABORTED, PRIMARY, SECONDARY
+    PHASE_NAMES = []
+    PHASE_STATES = {}
+    PHASE_FAILURES = []
+    PHASE_SKIPS = []
+    TAINTED = set()
+    ABORTED = False
+    PRIMARY = []
+    SECONDARY = []
+
+
+def self_check() -> None:
+    """Pure apparatus check of the diagnostic collection: no child, scratch,
+    pool or evidence write."""
+    global PHASE_NAMES, PHASE_FAILURES, PHASE_SKIPS
+
+    def ok() -> None:
+        pass
+
+    def recoverable() -> None:
+        raise PhaseFailure("recoverable oracle failure")
+
+    def unknown() -> None:
+        raise PhaseFailure("custody unknown", abort=True)
+
+    reset_collection()
+    dispatch(
+        [
+            ("a", [], ok),
+            ("b", [], recoverable),
+            ("c", ["b"], ok),
+            ("d", ["a"], ok),
+        ],
+        True,
+    )
+    expect(
+        PHASE_STATES == {"a": "pass", "b": "fail", "c": "skip", "d": "pass"},
+        f"recoverable collection states are wrong: {PHASE_STATES}",
+    )
+    expect(PHASE_FAILURES == [("b", "recoverable oracle failure")], f"failures: {PHASE_FAILURES}")
+    expect(PHASE_SKIPS == [("c", "dependency failed: b")], f"skips: {PHASE_SKIPS}")
+    expect(not ABORTED, "a recoverable failure aborted the collection")
+    expect(PRIMARY == ["b: recoverable oracle failure"], f"primary fault: {PRIMARY}")
+
+    reset_collection()
+    dispatch([("a", [], unknown), ("b", [], ok)], True)
+    expect(PHASE_STATES["a"] == "aborted" and PHASE_STATES["b"] == "not_run",
+           f"an abort did not leave later phases unrun: {PHASE_STATES}")
+    expect(ABORTED, "an unknown outcome did not abort the collection")
+
+    reset_collection()
+    try:
+        dispatch([("a", [], recoverable)], False)
+    except PhaseFailure:
+        pass
+    else:
+        fail("counted dispatch swallowed a failure")
+
+    reset_collection()
+    PHASE_NAMES = ["phase-%02d" % index for index in range(MAX_RECEIPT_ENTRIES)]
+    PHASE_FAILURES = [(name, "x" * 4000) for name in PHASE_NAMES]
+    PHASE_SKIPS = [(name, "y" * 4000) for name in PHASE_NAMES]
+    SECONDARY[:] = ["z" * 4000 for _ in range(MAX_RECEIPT_ENTRIES)]
+    document = receipt_document("a" * 40, "b" * 40, "c" * 64, "d" * 64)
+    encoded = json.dumps(document, indent=2, sort_keys=True)
+    expect(len(encoded.encode()) <= MAX_RECEIPT_BYTES, f"worst receipt {len(encoded)} bytes exceeds the bound")
+    expect(document["qualified"] is False, "a diagnostic receipt claimed qualification")
+    expect(document["mode"] == "diagnostic", "a diagnostic receipt has the wrong mode")
+    expect(document["counts"]["planned"] == MAX_RECEIPT_ENTRIES, "the receipt lost a planned phase")
+    reset_collection()
+    print("slot-headroom self-check PASS: diagnostic collection, taint, abort and receipt bounds", flush=True)
+
+
+def main() -> None:
+    arguments = [argument for argument in sys.argv[1:] if argument != "--diagnostic"]
+    if arguments == ["--self-check"]:
+        self_check()
+        return
+    if arguments:
+        print(f"unknown argument: {arguments[0]}", file=sys.stderr)
+        raise SystemExit(2)
+    expect(os.path.isdir(ROOT) and os.path.realpath(ROOT) == os.environ["OXIDE_TASK_SCRATCH_ROOT"],
+           "scratch root is not canonical")
+    expect(os.path.isdir(EVIDENCE), "qualified-runner evidence directory is missing")
+
+    source = ""
+    tree = ""
+    binary_sha256 = ""
+    runner_hash = ""
+    exit_code = 0
+    try:
+        work_left()
+        with open(os.path.join(REPO, "scripts", "bounded-test.py"), "rb") as handle:
+            import hashlib
+            runner_hash = hashlib.sha256(handle.read()).hexdigest()
+        expect(runner_hash == RUNNER_SHA256, f"qualified runner hash mismatch: {runner_hash}")
+        source = subprocess.check_output(["git", "rev-parse", "HEAD^{commit}"], cwd=REPO, text=True).strip()
+        tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=REPO, text=True).strip()
+        dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO, text=True).strip()
+        expect(not dirty, f"source checkout is dirty: {dirty}")
+
+        os.makedirs(os.path.join(ROOT, "home"), mode=0o700, exist_ok=True)
+        os.makedirs(os.path.join(ROOT, "cargo-home"), mode=0o700, exist_ok=True)
+        os.makedirs(os.path.join(ROOT, "markers"), mode=0o700, exist_ok=True)
+        write_file(os.path.join(ROOT, "hold.py"), HOLD_SCRIPT)
+        proof = Proof(ROOT)
+        proof.phase("start")
+        global BINARY
+        BINARY = stage(proof, REPO)
+        with open(BINARY, "rb") as handle:
+            binary_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        print(f"staged oxide sha256 {binary_sha256}", flush=True)
+        proof.phase("after staging")
+
+        fences_pool = os.path.join(ROOT, "pool-fences")
+        fences_env = base_env(proof, fences_pool)
+        fences_app = write_tree(os.path.join(ROOT, "checkouts", "fences"), FIXTURE)
+        raised_pool = os.path.join(ROOT, "pool-raised")
+        project_pool = os.path.join(ROOT, "pool-project")
+        project_env = base_env(proof, project_pool)
+        reuse_pool = os.path.join(ROOT, "pool-reuse")
+        reuse_env = base_env(proof, reuse_pool)
+        byte_pool = os.path.join(ROOT, "pool-byte")
+        phases = [
+            ("fences", [], lambda: prove_fences_and_exhaustion(proof, fences_app, fences_pool, fences_env)),
+            (
+                "raised_fence",
+                [],
+                lambda: prove_raised_fence(
+                    proof,
+                    raised_pool,
+                    base_env(proof, raised_pool),
+                    os.path.join(ROOT, "checkouts", "raised"),
+                ),
+            ),
+            ("pool_ceiling", ["fences"], lambda: prove_pool_ceiling(proof, fences_app, fences_pool, fences_env)),
+            (
+                "project_cap",
+                [],
+                lambda: prove_project_cap(proof, project_pool, project_env, os.path.join(ROOT, "checkouts", "project")),
+            ),
+            (
+                "reuse",
+                [],
+                lambda: prove_reuse_and_no_churn(
+                    proof, reuse_pool, reuse_env, os.path.join(ROOT, "checkouts", "reuse")
+                ),
+            ),
+            (
+                "byte_pressure",
+                [],
+                lambda: prove_byte_pressure(
+                    proof, byte_pool, base_env(proof, byte_pool), os.path.join(ROOT, "checkouts", "byte")
+                ),
+            ),
+            (
+                "foreign_refusal",
+                ["reuse"],
+                lambda: prove_foreign_refusal(
+                    proof, reuse_pool, base_env(proof, reuse_pool), os.path.join(ROOT, "checkouts", "reuse", "reuse-app")
+                ),
+            ),
+        ]
+        dispatch(phases, DIAGNOSTIC)
+        if not DIAGNOSTIC:
+            receipt = {
+                "task": "oxide#177",
+                "source_commit": source,
+                "source_tree": tree,
+                "binary_sha256": binary_sha256,
+                "runner_sha256": runner_hash,
+                "result": "pass",
+                "cases": RESULTS,
+                "limits": {
+                    "wall_clock_seconds": 300,
+                    "shutdown_margin_seconds": SHUTDOWN_MARGIN_S,
+                    "scratch_budget_mib": 512,
+                },
+                "coverage_gaps": [
+                    "worst-valid 256-slot ledger and 512-record control-state serialization/round-trip and oversized-field refusal are unit tests, not native fixtures",
+                    "the 128-slot vs 256-slot ledger read/rank/write cost is a unit measurement with a fixed 50 ms ceiling, not a native fixture",
+                    "the thirteen-grant freshness bound is a bounded loop inspection, not separately induced natively",
+                ],
+            }
+            write_evidence("slot-headroom.json", json.dumps(receipt, indent=2) + "\n")
+            print(
+                f"slot-headroom proof PASS: {len(RESULTS)} cases; source {source}; tree {tree}; runner {runner_hash}",
+                flush=True,
+            )
+        elif any(state != "pass" for state in PHASE_STATES.values()) or ABORTED:
+            exit_code = 1
+    except PhaseFailure as failure:
+        abort_now(str(failure))
+        if not DIAGNOSTIC:
+            print(f"FAILED: {failure}", flush=True)
+            raise SystemExit(1)
+        exit_code = 1
+    except BaseException as error:  # noqa: BLE001 - re-raised outside diagnostic mode
+        # An unrecordable or unexpected outcome is never an oracle: record it,
+        # then let counted mode re-raise so the failure is not swallowed.
+        abort_now(f"unknown outcome: {type(error).__name__}: {error}")
+        if not DIAGNOSTIC:
+            raise
+        exit_code = 1
+    finally:
+        if DIAGNOSTIC and os.path.isdir(EVIDENCE):
+            try:
+                document = receipt_document(source, tree, runner_hash, binary_sha256)
+                print(f"diagnostic receipt: {write_diagnostic_receipt(document)}", flush=True)
+            except Exception as error:  # noqa: BLE001 - an unwritable receipt is never success
+                print(f"diagnostic receipt failed: {error}", flush=True)
+                exit_code = 1
+    if DIAGNOSTIC:
+        print(
+            json.dumps(
+                {
+                    "phase_states": PHASE_STATES,
+                    "aborted": ABORTED,
+                    "qualified": False,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise SystemExit(exit_code)
 
 
 def terminated(signum, frame) -> None:
@@ -819,6 +1168,10 @@ def overdue(signum, frame) -> None:
 
 
 if __name__ == "__main__":
+    if DIAGNOSTIC:
+        # The uncounted collection records a phase failure instead of exiting.
+        fail = phase_fail
+        expect = phase_expect
     signal.signal(signal.SIGTERM, terminated)
     signal.signal(signal.SIGALRM, overdue)
     try:

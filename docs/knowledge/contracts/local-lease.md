@@ -669,7 +669,13 @@ only its own slot, and default `status` at 256 walks nothing. The worst-valid
 ledger/control serialization, escaped round-trip and oversized-field refusals
 are unit tests in `effigy test rust`, as is a fixed 50 ms ceiling on a
 128-slot and a 256-slot ledger's bounded read, ranked ordering and atomic
-write. Not covered natively: the thirteen-grant freshness bound is a
+write. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
+limits with `--diagnostic`: an uncounted keep-going collection that records
+reached/completed/failed/skipped phases and the latched first fault in a
+bounded `qualified: false` receipt, continues only into phases whose declared
+dependencies completed, and aborts on an unknown outcome or an unclosed proof
+child. `effigy proof:slot-headroom:test` runs only its pure `--self-check`
+(no child, scratch, pool or evidence write). Not covered natively: the thirteen-grant freshness bound is a
 bounded-loop inspection, and no large live inventory or physical
 multi-million-entry performance is claimed.
 
