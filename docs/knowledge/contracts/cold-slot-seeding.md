@@ -67,6 +67,18 @@ another operator ruling. Revision 15 supersedes the build-script,
 proc-macro and Git offers of revisions 11–14 for v1; their text is retained
 as history. The default-on flip remains isolated behind this task's merge
 hold.
+
+The bounded skip message prefers an ambiguous dependency name over the root
+package's generic non-leaf rejection. The collision proof supplies its resolved
+lock before Cargo starts, so it reaches that classification rather than the
+missing-lock precondition. A deleted donor payload may still have a selectable
+catalog: the control-only selection discovers the missing payload under the
+donor pin and skips cold. Neither that skip nor a seeded recipient's retained
+bytes permit it to publish a catalog. A non-seeding command bypasses the seed
+reserve gate but retains the ordinary Cargo watchdog, including its TERM exit
+under injected low readings. Rejection counts are grouped by normalized name;
+unknown `units` are omitted in catalog JSON, while a measured zero is explicit.
+
 **Revision 13** applies Supervisor A2′ at head `c022dc6` (review comment
 `6451786564`, 2026-10-27): the limit-gap/donor-figure publication exception is
 deleted everywhere (§6.3 step 7, §8.1, §8.2, §13, case 24 and the revision
@@ -2130,7 +2142,10 @@ the selected-volume rule.
     **refuse**, retaining the untrusted recipient and its ledger/attempt
     evidence, not perform the A2′ incomplete-walk abandon;
 13. git identity negatives: a dirty, submodule or differently-revisioned
-    checkout is ineligible; a same-name registry/git collision is ineligible;
+    checkout is ineligible; a same-name registry/git collision is ineligible.
+    Both collision checkouts have a resolved lock before Cargo starts and use
+    `--locked`; the skip names the ambiguity even when the non-leaf root
+    package comes first in that lock;
 14. unsupported layout: a fake `cargo` that reports an unverified version
     makes the command skip seeding while Cargo still runs normally;
 15. no donor writes: donor tree content digest, its catalog, ledger bytes and
@@ -2149,12 +2164,16 @@ the selected-volume rule.
 18. seeded recipient never donates: after a successful seed and build, the
     recipient's `attempt` record says `seeded` and a third cold slot must not
     receive a catalog from it, even though its build began empty and
-    succeeded;
+    succeeded. Removing only the original donor's leaf leaves its catalog
+    selectable, so the third command reports `donor payload missing` and
+    compiles the dependency cold; the seeded recipient still has no catalog;
 19. reserve gate: an injected below-trigger reading (the existing debug-only
     free-space seam) makes a command whose only available donor would seed
     **refuse before any child**; a mid-seed breach aborts, retains the
     untrusted generation and refuses;
-    the non-seeding control still runs Cargo as today;
+    the non-seeding control still starts Cargo as today, then its ordinary
+    reserve watchdog sends TERM and Oxide returns 143. That control must name
+    the ordinary watchdog and its Cargo group, never a seed-gate stop;
 20. partial-trust negative: a fault-injected partial recipient is never reused
     as warm by a later command.
 
@@ -2178,17 +2197,22 @@ the selected-volume rule.
     non-vacuous. The reserve-start-gate refusal (case 19) is unchanged and is
     not produced by this race.
 23. **ambiguous-name visibility.** The donor workspace compiles one eligible
-    leaf (`leaf-a`) and a normalized-name collision pair (`foo-bar` and
+    leaf (`cfg-if`) and a normalized-name collision pair (`foo-bar` and
     `foo_bar`, both ineligible on that side). The producing epoch records the
     rejection with the **candidate unit count** it can classify for that name
     (two fingerprint directories), and the catalog carries it. The recipient
-    seeds `leaf-a`: the summary shows the seeded counts **and** the bounded
+    seeds `cfg-if`: the seed summary (separate from the ordinary profile
+    summary) shows the seeded counts **and** the bounded
     suffix naming `ambiguous name (2)`, and `oxide status` renders the same
     recorded bucket from `last.json` without any walk or reconciliation. A
-    second donor with no rejected candidates renders no suffix and an empty
-    bucket set, and a donor whose rejected package could not be classified
-    renders `unknown (1)` instead of a zero count, so the control distinguishes
-    "zero units", "not measured" and "not recorded".
+    second donor compiles only `cfg-if` (`build -p cfg-if`): its unbuilt root
+    app has a known zero candidate count, so it renders no suffix and an empty
+    bucket set. In the workspace donor, the app binary and a planted
+    unclassifiable `baz-qux` fingerprint each have an omitted `units` field,
+    rendering `unknown (2)` instead of zero. The collision pair is one
+    normalized-name rejection with two candidates, not two rejection rows.
+    The pure apparatus accepts omitted unknowns and rejects substituted zeros
+    or a lost grouped count; it also distinguishes the seed and profile lines.
 24. **post-clone walk (publish only on a complete ownership-clean walk).** Two
     controls on one fixture. First, a complete ownership-clean walk publishes
     the seed with the `observed-while-held` fact; `oxide status` shows the

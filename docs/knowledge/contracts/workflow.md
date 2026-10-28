@@ -38,6 +38,13 @@ This adds no grant, no second lease, no deletion path and no new sidecar
 format beyond the bounded `oxide-managed/seeds/` catalog/attempt/last
 documents, and it never mutates the donor.
 
+The bounded skip message names an ambiguous dependency before a generic
+non-leaf root-package rejection. A command with no seed plan bypasses only the
+seed reserve gate: the ordinary Cargo reserve watchdog still runs and can stop
+its child. Catalog rejection counts group a normalized-name collision into one
+row; an omitted `units` means unknown, while an explicit zero means measured
+with no candidates.
+
 Both provided backends seed: an internal `directory-budget-v1` pool's start
 gate is the host reserve (20 GiB + 2 GiB margin, sampled before the durable
 marks and monitored during the clone), and an `apfs-volume-v1` removable pool

@@ -89,7 +89,8 @@ never taints another premise):
 18 A seeded recipient never donates: its attempt says `seeded`, and a third cold
    slot receives no catalog from it.
 19 The reserve gate: an injected below-trigger reading refuses before any child;
-   the non-seeding control still runs Cargo; an injected mid-seed breach retains
+   the non-seeding control starts Cargo and its ordinary watchdog stops it;
+   an injected mid-seed breach retains
    the untrusted generation and refuses.
 20 Partial-trust negative: a fault-injected partial recipient is never reused as
    warm by a later command.
@@ -106,7 +107,8 @@ never taints another premise):
 23 Ambiguous-name visibility: a donor workspace with an eligible leaf and a
    normalized-name collision pair records the candidate-unit counts; the summary
    and `oxide status` render `ambiguous name (2)`, a clean donor renders no
-   suffix, and an unclassifiable rejected package renders `unknown (1)`.
+   suffix for known-zero candidates; the app binary and planted unclassifiable
+   package render `unknown (2)`.
 24 The post-clone walk: a complete ownership-clean walk publishes; each injected
    failure (ownership, unreadable, device boundary, entry limit, walk failure)
    publishes nothing, retains the untrusted recipient, and completes as an
@@ -483,6 +485,12 @@ def seeded_units(stderr: str) -> int:
     match = re.search(r"oxide: seeded (\d+) units", stderr)
     expect(match is not None, f"no seeded summary line: {stderr[-2000:]}")
     return int(match.group(1))
+
+
+def seed_summary(stderr: str) -> str:
+    lines = [line for line in stderr.splitlines() if line.startswith("oxide: seeded ")]
+    expect(len(lines) == 1, f"expected one seed summary: {stderr[-2000:]}")
+    return lines[0]
 
 
 def skip_line(stderr: str) -> str:
@@ -2464,21 +2472,33 @@ def case_13(proof: Proof) -> None:
         ),
         "src/main.rs": CFG_IF_MAIN,
     }
-    collision_donor = case.checkout("collision-donor", collision_files)
-    code, _out, err = case.command(collision_donor, ["build"], "collision donor", env=case.env())
+    # Both gates must see a manifest-consistent lock before Cargo starts.
+    # Otherwise the recipient skips as `lock unavailable`, before it can
+    # classify the same-name entries at all.
+    collision_packages = collision_lock(collision, rev3)
+    collision_donor = case.checkout("collision-donor", collision_files, collision_packages)
+    code, _out, err = case.command(collision_donor, ["build", "--locked"], "collision donor", env=case.env())
     collision_slot = slot_of(err)
     expect(
         not os.path.isfile(catalog_path(case.pool, collision_slot)),
         "a same-name registry/Git collision produced a donor catalog",
     )
-    collision_recipient = case.checkout("collision-recipient", collision_files)
+    collision_recipient = case.checkout("collision-recipient", collision_files, collision_packages)
     code, _out, err = case.command(
-        collision_recipient, ["build"], "collision recipient", env=case.env()
+        collision_recipient, ["build", "--locked"], "collision recipient", env=case.env()
     )
     line = skip_line(err)
     expect(not seeded(err), "a same-name collision was seeded")
     expect("ambiguous name" in line, f"the collision was not named: {line}")
     print("case 13: dirty, re-revisioned, submodule and colliding checkouts are ineligible", flush=True)
+
+
+def collision_lock(repository: dict, rev: str) -> list[dict]:
+    return [
+        {"name": "app", "version": "0.1.0", "dependencies": ["cfg-if 1.0.0", "cfg-if 2.0.0"]},
+        registry("cfg-if", "1.0.0", CFG_IF_100),
+        git_package("cfg-if", f'{repository["url"]}?rev={rev}', rev, version="2.0.0"),
+    ]
 
 
 def case_14(proof: Proof) -> None:
@@ -2676,9 +2696,11 @@ def case_18(proof: Proof) -> None:
     )
     files = {"Cargo.toml": manifest, "src/main.rs": CFG_IF_MAIN}
     third = case.checkout("third", files, [registry("cfg-if", "1.0.0", CFG_IF_100)])
-    code, _out, err = case.command(third, ["build"], "third cold slot", env=case.env())
-    expect(not seeded(err), "a seeded recipient donated a catalog")
-    expect("no eligible donor" in skip_line(err), f"unexpected skip: {skip_line(err)}")
+    code, out, err = case.command(third, ["build", "--message-format=json"], "third cold slot", env=case.env())
+    # The removed donor's catalog remains. Selection is control-only, so it
+    # can select that catalog and discover the missing payload under its pin.
+    expect_missing_donor(err, out)
+    expect(not os.path.isfile(catalog_path(case.pool, seeded_slot)), "the seeded recipient later published a catalog")
     print("case 18: a seeded recipient never donated", flush=True)
 
 
@@ -2706,8 +2728,10 @@ def case_19(proof: Proof) -> None:
     }
     no_donor = control.checkout("no-donor", files, [registry("cfg-if", "1.0.0", CFG_IF_100)])
     env = control.env(extra={"OXIDE_TEST_WATCHDOG_READINGS": readings})
-    code, _out, err = control.command(no_donor, ["build"], "non-seeding control", env=env)
-    expect(not seeded(err) and "seed reserve stop" not in err, "the non-seeding control sampled the gate")
+    code, _out, err = control.command(
+        no_donor, ["build"], "non-seeding control", env=env, expect_code=128 + signal.SIGTERM
+    )
+    expect_ordinary_reserve_stop(code, err)
     breached = Case(proof, "19")
     _d, recipient2, breached_donor, _ = cfg_donor_recipient(breached)
     env = breached.env(extra={"OXIDE_TEST_SEED_BREACH": "after-clone"})
@@ -2726,6 +2750,23 @@ def case_19(proof: Proof) -> None:
     expect(attempt_state(breached.pool, retained) == "reset", "the breach was not recorded as reset")
     expect(leaf_exists(breached.pool, retained), "the breached generation has no retained leaf")
     print("case 19: the start gate refused before any child; the breach retained and refused", flush=True)
+
+
+def expect_missing_donor(stderr: str, stdout: str) -> None:
+    expect(not seeded(stderr), "a seeded recipient donated a catalog")
+    expect("seeding skipped: donor payload missing" in skip_line(stderr), f"unexpected skip: {skip_line(stderr)}")
+    expect(artifact_fresh(stdout, "cfg-if") is False, "the third slot did not compile cfg-if cold")
+
+
+def expect_ordinary_reserve_stop(code: int, stderr: str) -> None:
+    expect(code == 128 + signal.SIGTERM, f"the ordinary watchdog did not return TERM: {code}")
+    expect(not seeded(stderr) and no_seed_skip(stderr), "the non-seeding control did not skip")
+    expect("seed reserve stop" not in stderr, "the non-seeding control sampled the seed gate")
+    expect(
+        "oxide: reserve stop (injected test readings):" in stderr
+        and re.search(r"Cargo group \d+: TERM", stderr) is not None,
+        f"the ordinary Cargo watchdog did not stop its child: {stderr[-1500:]}",
+    )
 
 
 def case_20(proof: Proof) -> None:
@@ -2910,31 +2951,47 @@ def case_23(proof: Proof) -> None:
     code, _out, err = case.command(donor, ["build", "--workspace"], "ambiguous donor", env=case.env())
     donor_slot = slot_of(err)
     catalog = read_json(catalog_path(case.pool, donor_slot))
-    counts = [
-        (rejection["reason"], rejection["units"]) for rejection in catalog.get("rejected", [])
-    ]
-    ambiguous = [entry for entry in counts if entry[0] == "ambiguous_name" and entry[1] == 1]
-    expect(len(ambiguous) == 2, f"no two ambiguous unit counts: {counts}")
-    expect(any(units is None for _reason, units in counts), f"no unknown rejection: {counts}")
+    expect_ambiguous_catalog(catalog)
     recipient = write_workspace_23(case, "recipient")
     code, _out, err = case.command(recipient, ["build", "--workspace"], "ambiguous recipient", env=case.env())
     expect(seeded(err), "the ambiguous fixture did not seed")
-    line = summary(err)
+    line = seed_summary(err)
     expect("ambiguous name (2)" in line, f"the summary does not name the ambiguous units: {line}")
-    expect("unknown (1)" in line, f"the summary does not distinguish unknown from zero: {line}")
+    expect("unknown (2)" in line, f"the summary does not distinguish unknown from zero: {line}")
     code, out, _err = case.command(recipient, ["status"], "ambiguous status", env=case.env())
-    expect("ambiguous name (2)" in out and "unknown (1)" in out, f"status did not render the buckets: {out[-1500:]}")
+    expect("ambiguous name (2)" in out and "unknown (2)" in out, f"status did not render the buckets: {out[-1500:]}")
     last = last_seed(case.pool)
-    expect(last is not None and any(bucket["units"] == 2 for bucket in last.get("buckets", [])), f"last.json buckets: {last}")
-    # A clean donor renders no suffix and an empty bucket set.
+    expect(last is not None and last.get("buckets") == [{"reason": "ambiguous_name", "units": 2}] and last.get("unknown") == 2, f"last.json buckets: {last}")
+    # Compile only the registry leaf. The unbuilt app has a known zero
+    # candidate count, rather than the unclassifiable binary fingerprint an
+    # ordinary app build leaves. Zero counts yield no suffix or last bucket.
     control = Case(proof, "23")
-    _donor, recipient2, _slot, _ = cfg_donor_recipient(control)
-    code, _out, err = control.command(recipient2, ["build"], "clean donor control", env=control.env())
+    donor2 = control.checkout("donor", CFG_APP_FILES, CFG_APP_LOCK)
+    recipient2 = control.checkout("recipient", CFG_APP_FILES, CFG_APP_LOCK)
+    code, _out, err = control.command(donor2, ["build", "-p", "cfg-if"], "zero-candidate donor", env=control.env())
+    catalog = read_json(catalog_path(control.pool, slot_of(err)))
+    expect(catalog.get("rejected") == [{"name": "app", "reason": "non_leaf", "units": 0}], f"the unbuilt app is not a known zero: {catalog.get('rejected')}")
+    code, _out, err = control.command(recipient2, ["build", "-p", "cfg-if"], "clean donor control", env=control.env())
     expect(seeded(err), "the clean control did not seed")
-    expect("skipped" not in summary(err), f"the clean control rendered a suffix: {summary(err)}")
+    expect("skipped" not in seed_summary(err), f"the clean control rendered a suffix: {seed_summary(err)}")
     last = last_seed(control.pool)
     expect(last is not None and not last.get("buckets") and not last.get("unknown"), f"clean buckets: {last}")
-    print("case 23: ambiguous (2) and unknown (1) rendered; the clean donor rendered nothing", flush=True)
+    print("case 23: ambiguous (2) and unknown (2) rendered; known-zero candidates rendered nothing", flush=True)
+
+
+def expect_ambiguous_catalog(catalog: dict) -> None:
+    # SeedRejection serializes None by omitting `units`; two literal names
+    # sharing one normalized name form one rejection with two candidates.
+    rows = catalog.get("rejected", [])
+    counts = {(row["name"], row["reason"]): row.get("units") for row in rows}
+    expect(
+        len(rows) == 3 and counts == {
+            ("foo_bar", "ambiguous_name"): 2,
+            ("app", "non_leaf"): None,
+            ("baz_qux", "unsupported_source"): None,
+        },
+        f"unexpected grouped/unknown candidate counts: {rows}",
+    )
 
 
 def case_24(proof: Proof) -> None:
@@ -3248,6 +3305,65 @@ def self_test() -> None:
         )
         expect(artifact_fresh(messages, "cfg-if") is True, "artifact_fresh() drifted")
         expect(script_execution(messages, "app")["out_dir"] == "/out", "script_execution() drifted")
+
+        # Replay the four parked findings' bytes without Cargo or a child.
+        def must_fail(label, body):
+            try:
+                body()
+            except RuntimeError:
+                return
+            fail(f"{label}: an invalid proof premise was accepted")
+
+        rev = "a" * 40
+        collision = lock_text(collision_lock({"url": "file:///owned/cfgifgit"}, rev))
+        registry_entries, git_entries = offline_seed.parse_lock_packages(
+            collision, offline_seed.Budget(offline_seed.Limits())
+        )
+        expect('dependencies = [\n"cfg-if 1.0.0",\n"cfg-if 2.0.0",\n]' in collision, "the collision lock does not disambiguate the two versions")
+        expect(
+            len(registry_entries) == len(git_entries) == 1
+            and registry_entries[0]["name"] == git_entries[0]["name"] == "cfg-if"
+            and registry_entries[0]["checksum"] == CFG_IF_100
+            and git_entries[0]["source"] == f"git+file:///owned/cfgifgit?rev={rev}#{rev}",
+            f"the collision lock lost a source identity: {registry_entries}, {git_entries}",
+        )
+        case13 = ast.parse(textwrap.dedent(inspect.getsource(case_13)))
+        locked_checkouts = [
+            node for node in ast.walk(case13)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "checkout" and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and str(node.args[0].value).startswith("collision-")
+        ]
+        expect(len(locked_checkouts) == 2 and all(len(node.args) == 3 and isinstance(node.args[2], ast.Name) and node.args[2].id == "collision_packages" for node in locked_checkouts), "a collision checkout omits its pre-Cargo lock")
+
+        missing_donor = "oxide: seeding skipped: donor payload missing; app: non-leaf\n"
+        cold_artifact = json.dumps({"reason": "compiler-artifact", "package_id": "registry#cfg-if@1.0.0", "fresh": False})
+        expect_missing_donor(missing_donor, cold_artifact)
+        must_fail("a missing donor reused cfg-if", lambda: expect_missing_donor(missing_donor, messages))
+        must_fail("a different missing-donor skip", lambda: expect_missing_donor("oxide: seeding skipped: no eligible donor", cold_artifact))
+
+        ordinary_stop = (
+            "oxide: seeding skipped: no eligible donor; app: non-leaf\n"
+            "oxide: reserve stop (injected test readings): pool filesystem available 1 bytes; Cargo group 123: TERM\n"
+        )
+        expect_ordinary_reserve_stop(143, ordinary_stop)
+        must_fail("a reserve stop succeeded", lambda: expect_ordinary_reserve_stop(0, ordinary_stop))
+        must_fail("a seed gate replaced Cargo", lambda: expect_ordinary_reserve_stop(143, ordinary_stop + "seed reserve stop"))
+        must_fail("no ordinary Cargo child", lambda: expect_ordinary_reserve_stop(143, "oxide: seeding skipped: no eligible donor"))
+
+        rejections = [
+            {"name": "foo_bar", "reason": "ambiguous_name", "units": 2},
+            {"name": "app", "reason": "non_leaf"},
+            {"name": "baz_qux", "reason": "unsupported_source"},
+        ]
+        expect_ambiguous_catalog({"rejected": rejections})
+        must_fail("unknown interpreted as zero", lambda: expect_ambiguous_catalog({"rejected": [dict(row, units=row.get("units", 0)) for row in rejections]}))
+        must_fail("grouped count lost", lambda: expect_ambiguous_catalog({"rejected": [dict(rejections[0], units=1), *rejections[1:]]}))
+        seed_line = "oxide: seeded 1 units (0.0 MiB) from slot 1; skipped 2 donor candidate units: ambiguous name (2), unknown (2)"
+        profile_line = "oxide: quick profile, build strategy, slot 2 cold"
+        expect(seed_summary(seed_line + "\n" + profile_line) == seed_line, "the seed oracle reads the ordinary profile summary")
+        must_fail("no seed summary", lambda: seed_summary(profile_line))
 
         # Attempt, ledger row and slot-leaf oracles on one synthetic pool.
         pool = os.path.join(base, "pool")

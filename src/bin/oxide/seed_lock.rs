@@ -76,14 +76,21 @@ pub(crate) struct Analysis {
 
 /// Keep the cold-build reason useful without rendering an unbounded lockfile.
 pub(crate) fn skip_reason(reason: &str, analysis: &Analysis) -> String {
-    let rejected = analysis.rejected.iter().find_map(|entry| {
-        let detail = match entry.reason {
-            SeedRejectReason::AmbiguousName => "ambiguous name",
-            SeedRejectReason::NonLeaf => "non-leaf",
-            _ => return None,
-        };
-        Some((&entry.package.name, detail))
-    });
+    // A root package normally comes first and is non-leaf. Prefer a name
+    // collision so that generic root rejection cannot hide the ambiguity.
+    let rejected = analysis
+        .rejected
+        .iter()
+        .filter(|entry| entry.reason == SeedRejectReason::AmbiguousName)
+        .chain(analysis.rejected.iter())
+        .find_map(|entry| {
+            let detail = match entry.reason {
+                SeedRejectReason::AmbiguousName => "ambiguous name",
+                SeedRejectReason::NonLeaf => "non-leaf",
+                _ => return None,
+            };
+            Some((&entry.package.name, detail))
+        });
     let Some((name, detail)) = rejected else {
         return reason.to_owned();
     };
@@ -241,6 +248,14 @@ dependencies = ["cfg-if"]
         assert_eq!(
             skip_reason("no eligible locked packages", &nonleaf),
             "no eligible locked packages; nonleaf: non-leaf"
+        );
+        let root_first = Analysis {
+            eligible: vec![],
+            rejected: vec![result.rejected[2].clone(), result.rejected[0].clone()],
+        };
+        assert_eq!(
+            skip_reason("no eligible locked packages", &root_first),
+            "no eligible locked packages; foo-bar: ambiguous name"
         );
     }
 
