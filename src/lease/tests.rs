@@ -4237,6 +4237,37 @@ fn replay_concludes_an_unlinked_file_in_the_2255_capture_shape() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
+/// A missing captured directory is never treated as an unlinked file.
+#[test]
+fn an_absent_nested_directory_stays_pending() {
+    let fixture = Fixture::new("absent-captured-directory");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "absent-captured-directory");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(captured.join("nested")).expect("nested directory");
+    let held = File::open(&captured).expect("captured root descriptor");
+    let name = std::ffi::CString::new("nested").expect("name");
+    let entry = crate::owned_delete::capture_entry(held.as_fd(), &name).expect("capture");
+    let facts = crate::owned_delete::observe_entry(held.as_fd(), &entry.private).expect("facts");
+    let private = String::from_utf8(entry.private.as_bytes().to_vec()).expect("private name");
+    let record = crate::owned_delete::CaptureRecord {
+        path: Vec::new(),
+        private: private.clone(),
+        original: "nested".to_owned(),
+        device: facts.device,
+        inode: facts.inode,
+        mode: facts.mode as u32,
+    };
+    fs::remove_dir(captured.join(&private)).expect("modelled missing directory");
+    write_journal(&pool, slot_id, plan, true, vec![record], Vec::new());
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1);
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert!(captured.is_dir());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
 /// A recorded nested capture whose put-back collides (a racer took its observed
 /// name) keeps both names, the record and the refusal; nothing is removed.
 #[test]
@@ -4304,6 +4335,26 @@ fn blocked_eviction_is_charged_but_does_not_block_other_admissions() {
     let granted =
         lease_injected(request(&pool, &project, &workspace, "other")).expect("unrelated admission");
     assert_ne!(granted.slot_id, slot_id.to_string());
+    assert!(captured.is_dir());
+    assert!(slot_path.is_dir());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
+/// The retained recorded charge prevents another allocation when it exhausts
+/// the budget; the blocked slot must stay intact and cannot become a victim.
+#[test]
+fn blocked_eviction_charge_prevents_over_budget_admission() {
+    let fixture = Fixture::new("blocked-charge");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-charge");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(&slot_path).expect("collision");
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    let mut req = request(&pool, &project, &workspace, "other");
+    req.budget_bytes = Some(1);
+    assert!(matches!(lease_injected(req), Err(LeaseError::Full)));
     assert!(captured.is_dir());
     assert!(slot_path.is_dir());
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
