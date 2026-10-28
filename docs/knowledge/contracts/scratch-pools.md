@@ -184,7 +184,8 @@ provenance.
   copied pool cannot inherit a record. A **read-only** `status` / `--measure`
   looks the pool up in the host record **before** the path judgement, applies
   the same verification when the volume is present, needs no declaration, and
-  never leases, creates or writes. Verification runs immediately before the
+  never leases, creates or writes; with **no** record it has no scratch fact and
+  falls through to the ordinary path rules (see "Read-only status"). Verification runs immediately before the
   open. The design claims volume identity and placement, not TOCTOU-freedom:
   the pool's own I/O keeps the existing path-based rules, and S3 may create the
   leaf through `Binding::dir_at` as hardening, not as a promise.
@@ -194,10 +195,12 @@ provenance.
   walk, eviction, lock or write. With a host record: `the scratch pool at <path>
   is bound to volume <uuid> at <mount>; that volume is absent`. Without one:
   `the scratch pool's volume is absent and no host record matches <path>;
-  nothing was created`. A read-only `status` / `--measure` does not refuse: it
-  reports `unavailable` (row 24) and leaves the exit status unchanged. There is
-  no internal fallback, no shadow directory at the absent path and no recreated
-  mount point.
+  nothing was created`. A read-only `status` / `--measure` reports that absent
+  state as `unavailable` (row 24) and leaves the exit status unchanged **only
+  when a host record exists**; with no record it has no scratch fact and takes
+  the ordinary path rules exactly as today, because the record is the only
+  source of that fact. There is no internal fallback, no shadow directory at
+  the absent path and no recreated mount point.
 - **Incomplete.** A leaf holding a valid binding but no pool `config.json` is a
   prepared, uninitialised scratch pool: the creating invocation completes it, a
   later invocation refuses (`scratch-incomplete`) and names the leaf. A pool
@@ -248,8 +251,9 @@ a class.
 | 24 | `status` of a recorded scratch pool whose volume is absent, or whose binding does not verify | `unavailable (<class>)` from the host record, no walk, no write, exit unchanged (see "Read-only status") |
 
 Rows 1–3 and 23 keep today's exact messages; row 5 refuses the declaration
-rather than the path. Row 24 is a report, not a new status failure: `status`
-already reads known pools and registrations read-only.
+rather than the path. Row 24 is a report, not a new status failure, and it
+exists only when a host record does: `status` already reads known pools and
+registrations read-only, and with no record there is no scratch fact to report.
 
 ## Default-pool protection (why it is not weakened)
 
@@ -441,10 +445,10 @@ nothing created, and an external path inside a Git work tree refuses with the
 Git message while an internal one keeps today's; (05) no explicit budget
 refuses; (06) a declared root that is a symlink, group-writable, or a mount root
 refuses, while a declared root on the boot volume is inert and the same recipe
-builds an ordinary internal pool; (07) ordinary detach: `status` reports
-`unavailable (scratch volume <uuid> absent)` with no walk and no write, a leased
-command refuses naming the same UUID from the host record, no shadow directory
-appears and the mount point is not recreated; (08) re-attach the same image:
+builds an ordinary internal pool; (07) ordinary detach, with the host record case 01 wrote still present:
+`status` reports `unavailable (scratch volume <uuid> absent)` with no walk and
+no write, a leased command refuses naming the same UUID from the record, no
+shadow directory appears and the mount point is not recreated; (08) re-attach the same image:
 same UUID, warm reuse; (09) a *different* image at the same mount name refuses
 by UUID; (10) a copied pool (binding edited to another UUID, then the original
 bytes restored) refuses and the pool is untouched; (11) a regular directory left
