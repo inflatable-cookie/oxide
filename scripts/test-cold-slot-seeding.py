@@ -248,7 +248,7 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("03", (), "Git/build-script/OUT_DIR seedctl is a negative control: no catalog, no seed, recipient OUT_DIR"),
     ("04", (), "ambient-reading proc macro has an edge and is ineligible: two cold builds see two values"),
     ("05", (), "proc macros are never offered: Git and non-leaf proc macros build cold with the recipient value"),
-    ("06", (), "offered build-script compile unit is inert: the package lib is rebuilt"),
+    ("06", (), "Git/build-script/OUT_DIR seedctl is unoffered; the package lib and build script rerun cold"),
     ("07", (), "a deleted donor leaves the recipient compiling and running (independent inodes)"),
     ("08", (), "a changed dependency source/version offers nothing and builds correctly"),
     ("09", (), "a held donor is not offered, the recipient builds cold, and the released donor publishes its catalog"),
@@ -1381,8 +1381,14 @@ GIB = 1024 * 1024 * 1024
 def configure_proof_clock() -> None:
     """Use the supervisor's 480 s deadline for this selector, leaving the 30 s
     shutdown margin, instead of the imported finder proof's 300 s constant.
-    The shared helper is untouched for its own selectors; this proof patches
-    only the globals its `Proof` methods read."""
+
+    The base Proof class is assembled from two modules: `run` comes from the
+    pool-layout helper, while `phase`, `close` and `owned_bytes` come from the
+    finder helper. The clock is read by the finder module's `remaining()` (via
+    `phase` after every case and via `owned_bytes`), so patch that module's
+    globals as well as the run globals. Other proofs keep their own 300 s
+    constant; this patch exists only in this script's process.
+    """
     if "OXIDE_PROOF_DEADLINE_NS" not in os.environ:
         return
     Proof.run.__globals__["PROOF_SECONDS"] = 450.0
@@ -1394,6 +1400,12 @@ def configure_proof_clock() -> None:
         return left
 
     Proof.run.__globals__["remaining"] = remaining
+    finder = Proof.phase.__globals__
+    finder["PROOF_SECONDS"] = 450.0
+    finder["remaining"] = remaining
+    if Proof.close.__globals__ is not finder or Proof.close.__globals__ is not Proof.phase.__globals__:
+        Proof.close.__globals__["PROOF_SECONDS"] = 450.0
+        Proof.close.__globals__["remaining"] = remaining
 
 
 def supervisor_remaining() -> float:
@@ -3545,6 +3557,31 @@ def self_test() -> None:
             timing_projection({"01": None, "02": 6.0})["projected_total_s"] == 144.0,
             "a None case entered the projection",
         )
+
+        # The 480 s clock must reach the finder module's phase()/owned_bytes()
+        # path, not only the pool-layout run() globals.
+        saved_deadline = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
+        os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(
+            time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 120_000_000_000
+        )
+        try:
+            configure_proof_clock()
+            finder = Proof.phase.__globals__
+            expect(
+                finder["PROOF_SECONDS"] == 450.0,
+                "the 480 s work clock did not reach the finder phase globals",
+            )
+            expect(
+                Proof.run.__globals__.get("remaining") is finder["remaining"],
+                "run and phase do not share the corrected clock",
+            )
+            left = finder["remaining"]()
+            expect(5.0 < left < 120.0, f"the corrected phase clock is {left}")
+        finally:
+            if saved_deadline is None:
+                os.environ.pop("OXIDE_PROOF_DEADLINE_NS", None)
+            else:
+                os.environ["OXIDE_PROOF_DEADLINE_NS"] = saved_deadline
 
         # Cleanup and checkpoint decisions: the detach window comes from the
         # supervisor deadline (never the finer WORK clock), and the full
