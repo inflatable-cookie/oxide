@@ -2774,7 +2774,7 @@ impl Store {
         let internal_control = self.owner_control().to_path_buf();
         let internal = self.view(&internal_control);
         internal.ensure_control()?;
-        let _internal_admission = internal.admission()?;
+        let _internal_admission = internal.control_admission()?;
         let mut internal_state = internal.load()?;
         let mut fresh = false;
         let transaction = match internal_state.outputs_init.clone() {
@@ -2805,7 +2805,7 @@ impl Store {
                     .map(|sibling| (self.view(&sibling.control), sibling.barrier));
                 if let Some((sibling, _barrier)) = &sibling {
                     sibling.ensure_control()?;
-                    let _admission = sibling.admission()?;
+                    let _admission = sibling.control_admission()?;
                     let mut state = sibling.load()?;
                     match &state.outputs_init {
                         Some(OutputsInit::Ready { transaction, .. })
@@ -2897,7 +2897,7 @@ impl Store {
         let mut sibling_admission = None;
         if let Some((sibling, _barrier)) = &sibling {
             sibling.ensure_control()?;
-            sibling_admission = Some(sibling.admission()?);
+            sibling_admission = Some(sibling.control_admission()?);
             writers_closed(&sibling.load()?, "the paired", own_checkout)?;
         }
         writers_closed(&internal_state, "the internal", own_checkout)?;
@@ -2959,7 +2959,7 @@ impl Store {
             internal.save(&internal_state)?;
         }
         if let Some((sibling, _barrier)) = &sibling {
-            let _admission = sibling.admission()?;
+            let _admission = sibling.control_admission()?;
             let mut state = sibling.load()?;
             if !matches!(
                 &state.outputs_init,
@@ -5067,21 +5067,32 @@ impl Store {
     /// Read-only commands never write the fence.
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
+        let mut state = self.load()?;
+        if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE)
+            || state.eviction_accounting.as_deref() != Some("oxide.eviction-accounting/1")
+        {
+            state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+            state.eviction_accounting = Some("oxide.eviction-accounting/1".to_owned());
+            self.save(&state)?;
+        }
+        Ok(lock)
+    }
+
+    /// Output initialization does not mutate the library ledger. Preserve its
+    /// existing accounting fence without publishing the eviction fence before
+    /// its own refusal checks.
+    fn control_admission(&self) -> Result<File, String> {
+        let lock = lock_admission(&self.control)?;
         self.fence_recorded_accounting()?;
         Ok(lock)
     }
 
-    /// Make both accounting fences durable before the ledger can change.
-    /// Nothing is written when both are already set.
     fn fence_recorded_accounting(&self) -> Result<(), String> {
         let mut state = self.load()?;
-        if state.recorded_accounting.as_deref() == Some(RECORDED_ACCOUNTING_FENCE)
-            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
-        {
+        if state.recorded_accounting.as_deref() == Some(RECORDED_ACCOUNTING_FENCE) {
             return Ok(());
         }
         state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
-        state.eviction_accounting = Some("oxide.eviction-accounting/1".to_owned());
         self.save(&state)
     }
 
@@ -6684,7 +6695,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(created.get(), 1);
         let state = internal.load().unwrap();
-        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.version, RECORDED_ACCOUNTING_STATE_VERSION);
         assert!(matches!(
             state.outputs_init,
             Some(OutputsInit::Ready { .. })
@@ -7058,7 +7069,6 @@ pub(crate) mod tests {
                         ready_ms: 1,
                     }),
                     recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
-                    eviction_accounting: Some("oxide.eviction-accounting/1".to_owned()),
                     ..State::default()
                 })
                 .unwrap();
