@@ -1458,6 +1458,21 @@ def detach_timeout(remaining: float) -> float | None:
     return min(60.0, remaining - 10.0)
 
 
+def timing_projection(seconds: dict, total: int = 24, limit: float = 300.0) -> dict:
+    """Observation only: the reached cases' mean wall time extended to the
+    fixed case count, with the declared limit. Never an acceptance gate."""
+    reached = [value for value in seconds.values() if value is not None]
+    mean = sum(reached) / len(reached) if reached else None
+    projected = round(mean * total, 1) if mean is not None else None
+    return {
+        "reached_cases": len(reached),
+        "mean_case_s": None if mean is None else round(mean, 2),
+        "projected_total_s": projected,
+        "limit_s": limit,
+        "fits_limit": None if projected is None else projected <= limit,
+    }
+
+
 def checkpoint_due(index: int, case: str) -> bool:
     """The full owned-bytes phase walk runs every fourth case and on the last
     case; the shared guard samples owned bytes and host reserve continuously,
@@ -1781,7 +1796,20 @@ def case_01(proof: Proof) -> None:
     )
     line = summary(err)
     expect(seeded(err), f"the SQLite recipient did not seed: {err[-2000:]}")
-    expect(seeded_units(err) == 1, f"expected only the leaf cc unit to be offered: {line}")
+    donor_catalog = read_json(catalog_path(case.pool, donor_slot))
+    offered = sorted(package["name"] for package in donor_catalog["packages"])
+    expect(
+        "libsqlite3-sys" not in offered,
+        f"the ineligible SQLite package was offered: {offered}",
+    )
+    expect(
+        offered and set(offered) <= {"cc", "pkg-config", "vcpkg"},
+        f"the SQLite donor offered unexpected packages: {offered}",
+    )
+    expect(
+        seeded_units(err) == len(offered),
+        f"expected the {len(offered)} offered leaf units: {line}",
+    )
     sqlite = script_execution(out, "libsqlite3-sys")
     expect(sqlite is not None and sqlite.get("fresh") is False, "libsqlite3-sys did not rerun")
     app_script = script_execution(out, "app")
@@ -1791,7 +1819,7 @@ def case_01(proof: Proof) -> None:
     leaf = slot_leaf(case.pool, recipient_slot)
     expect(sqlite["out_dir"].startswith(leaf), f"libsqlite3-sys OUT_DIR {sqlite['out_dir']} is not the recipient's")
     # The donor slot is deleted before the recipient program runs.
-    shutil.rmtree(slot_leaf(case.pool, donor_slot))
+    remove_slot_leaf(case.pool, donor_slot, "donor removal")
     code, stdout, stderr = case.command(recipient, ["run"], "sqlite recipient run", env=base_env)
     values = dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
     expect(values.get("OUT", "").startswith(leaf), f"APP_OUT {values.get('OUT')} is not the recipient's OUT_DIR")
@@ -1859,6 +1887,12 @@ def seedctl_fixture(case: Case, prefix: str = "") -> tuple[str, str, str, str]:
 def case_03(proof: Proof) -> None:
     case = Case(proof, "03")
     _donor, recipient, _slot, donor_out = seedctl_fixture(case)
+    donor_catalog = read_json(catalog_path(case.pool, _slot))
+    offered = [unit["role"] for package in donor_catalog["packages"] for unit in package["units"]]
+    expect(
+        offered == ["build-script-compile"],
+        f"the seedctl catalog offered {offered}, not only the build-script compile unit",
+    )
     code, out, err = case.command(
         recipient, ["build", "--message-format=json"], "seedctl recipient", env=case.env()
     )
@@ -2041,9 +2075,19 @@ def case_05(proof: Proof) -> None:
         donor2, ["build"], "non-leaf donor", env=other.env(extra={"SEEDPM_VALUE": "donor"})
     )
     env2 = other.env(extra={"SEEDPM_VALUE": "nonleaf"})
-    code, out2, err = other.command(recipient2, ["run"], "non-leaf recipient", env=env2)
-    expect(stdout_line(out2) == "nonleaf", f"the non-leaf proc macro printed {stdout_line(out2)!r}")
-    expect(not seeded(err), "a non-leaf proc macro was seeded")
+    code, out2, err = other.command(
+        recipient2, ["build", "--message-format=json"], "non-leaf recipient", env=env2
+    )
+    # The recipient may legitimately seed the leaf cfg-if; the ineligible pmdep
+    # proc macro must have been compiled in the recipient.
+    expect(
+        artifact_fresh(out2, "pmdep") is False,
+        "the non-leaf proc macro artifact was reused",
+    )
+    code, stdout2, err = other.command(
+        recipient2, ["run"], "non-leaf recipient run", env=env2
+    )
+    expect(stdout2.strip() == "nonleaf", f"the non-leaf proc macro printed {stdout2.strip()!r}")
     # A configured fsmonitor hook on the private checkout is never run by the
     # product's sanitized Git verification.
     checkout = find_checkout(proof.cargo_home, "pmrepo")
@@ -2064,11 +2108,6 @@ def case_05(proof: Proof) -> None:
     )
     expect(not os.path.exists(record), "the product's Git verification ran a core.fsmonitor hook")
     print("case 05: leaf proc macro seeded; non-leaf ineligible; fsmonitor hook never ran", flush=True)
-
-
-def stdout_line(stdout: str) -> str:
-    lines = [line for line in stdout.splitlines() if line.strip()]
-    return lines[-1].strip() if lines else ""
 
 
 def find_checkout(cargo_home: str, repository: str) -> str:
@@ -2122,7 +2161,7 @@ def case_07(proof: Proof) -> None:
     expect(bool(cloned), "no cloned cfg-if artifact")
     info = os.lstat(os.path.join(artifact, cloned[0]))
     expect(info.st_nlink == 1, "the seeded file is a hard link to the donor")
-    shutil.rmtree(slot_leaf(case.pool, donor_slot))
+    remove_slot_leaf(case.pool, donor_slot, "donor removal")
     code, stdout, stderr = case.command(recipient, ["run"], "recipient after donor deletion", env=case.env())
     expect(stdout.strip() == CFG_IF_OUTPUT, f"the program printed {stdout.strip()!r}")
     print("case 07: the recipient ran after its donor slot was deleted", flush=True)
@@ -2149,7 +2188,7 @@ def case_08(proof: Proof) -> None:
     recipient = case.checkout("changed", files, packages)
     code, stdout, err = case.command(recipient, ["run"], "changed dependency", env=case.env())
     expect(not seeded(err), "a different source was offered")
-    expect(skip_line(err).endswith("no eligible donor"), f"unexpected skip: {skip_line(err)}")
+    expect("no eligible donor" in skip_line(err), f"unexpected skip: {skip_line(err)}")
     expect(stdout.strip() == "5", f"the changed dependency printed {stdout.strip()!r}")
     print("case 08: a changed source offered nothing and built correctly", flush=True)
 
@@ -2202,10 +2241,14 @@ def case_09(proof: Proof) -> None:
         expect("no eligible donor" in line or "donor busy" in line, f"unexpected skip: {line}")
         expect(not seeded(err), "a held donor was seeded")
         recipient_slot = slot_of(err)
-        # No catalog can exist while the donor is still held: publishing is a
-        # producing-lease step and happens before release.
+        # A held donor publishes nothing; the recipient's own release may
+        # publish its (skipped-attempt) catalog, which is not a donor catalog.
         for name in os.listdir(seeds_dir(case.pool)) if os.path.isdir(seeds_dir(case.pool)) else []:
-            expect(not name.endswith(".catalog.json"), f"a held donor published {name}")
+            if name.endswith(".catalog.json"):
+                expect(
+                    name == f"{recipient_slot}.catalog.json",
+                    f"a held donor published {name}",
+                )
     finally:
         stop_gate(gate)
         code, _out, donor_err = perm.finish_child(proof, child, "gated donor")
@@ -2246,7 +2289,7 @@ def case_10(proof: Proof) -> None:
     expect(os.path.isfile(catalog_path(case.pool, donor_slot)), "the donor published no catalog")
     code, _out, err = case.command(recipient, ["build"], "different-context recipient", env=case.env())
     expect(not seeded(err), "a different producer context was seeded")
-    expect(skip_line(err).endswith("no eligible donor"), f"unexpected skip: {skip_line(err)}")
+    expect("no eligible donor" in skip_line(err), f"unexpected skip: {skip_line(err)}")
     print("case 10: a differing RUSTFLAGS context was ineligible", flush=True)
 
 
@@ -2264,7 +2307,7 @@ def case_11(proof: Proof) -> None:
     crashed_slot = str(held[0]["id"])
     expect(attempt_state(case.pool, crashed_slot) == "intent", "the crash did not leave an intent record")
     expect(leaf_exists(case.pool, crashed_slot), "the crashed generation has no slot leaf")
-    shutil.rmtree(slot_leaf(case.pool, donor_slot))
+    remove_slot_leaf(case.pool, donor_slot, "donor removal")
     code, _out, err = case.command(recipient, ["build"], "crash recovery", env=case.env())
     recovered = slot_of(err)
     expect(recovered != crashed_slot, "the crashed generation was reused")
@@ -2275,6 +2318,19 @@ def case_11(proof: Proof) -> None:
 
 def leaf_exists(pool: str, slot: str) -> bool:
     return bool(glob.glob(os.path.join(payload_slots(pool), "*", f"*-{slot}")))
+
+
+def remove_slot_leaf(pool: str, slot: str, label: str) -> None:
+    """Remove one donor slot leaf with context. A leaf that vanished before the
+    deletion is a case failure with its path, never a bare FileNotFoundError
+    that aborts the whole collection."""
+    expect(leaf_exists(pool, slot), f"{label}: slot {slot} has no leaf to remove")
+    leaf = slot_leaf(pool, slot)
+    expect(os.path.isdir(leaf), f"{label}: {leaf} is not a directory")
+    try:
+        shutil.rmtree(leaf)
+    except FileNotFoundError:
+        fail(f"{label}: {leaf} disappeared before deletion")
 
 
 def case_12(proof: Proof) -> None:
@@ -2590,7 +2646,7 @@ def case_18(proof: Proof) -> None:
     seeded_slot = slot_of(err)
     expect(attempt_state(case.pool, seeded_slot) == "seeded", "the attempt is not seeded")
     expect(not os.path.isfile(catalog_path(case.pool, seeded_slot)), "a seeded recipient published a catalog")
-    shutil.rmtree(slot_leaf(case.pool, donor_slot))
+    remove_slot_leaf(case.pool, donor_slot, "donor removal")
     manifest = (
         '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
         '[dependencies]\ncfg-if = "=1.0.0"\n'
@@ -2664,7 +2720,7 @@ def case_20(proof: Proof) -> None:
         if row["state"] == "idle" and str(row["id"]) != str(donor_slot)
     ]
     expect(len(partial) == 1, f"expected one retained partial generation: {rows}")
-    shutil.rmtree(slot_leaf(case.pool, donor_slot))
+    remove_slot_leaf(case.pool, donor_slot, "donor removal")
     code, _out, err = case.command(recipient, ["build"], "partial-trust recovery", env=case.env())
     reused = slot_of(err)
     expect(reused != partial[0], "the partial generation was reused as warm")
@@ -3422,6 +3478,30 @@ def self_test() -> None:
             "a completed detach was not kept on a subsequent failed collection",
         )
 
+        # The receipt's timing projection is observational and follows the
+        # reached cases only.
+        expect(
+            timing_projection({})["projected_total_s"] is None,
+            "an empty timing projection invented a total",
+        )
+        one = timing_projection({"01": 10.0})
+        expect(
+            one["projected_total_s"] == 240.0 and one["fits_limit"] is True,
+            f"the one-case projection drifted: {one}",
+        )
+        heavy = timing_projection({"01": 10.0, "02": 20.0})
+        expect(
+            heavy["reached_cases"] == 2
+            and heavy["mean_case_s"] == 15.0
+            and heavy["projected_total_s"] == 360.0
+            and heavy["fits_limit"] is False,
+            f"the two-case projection drifted: {heavy}",
+        )
+        expect(
+            timing_projection({"01": None, "02": 6.0})["projected_total_s"] == 144.0,
+            "a None case entered the projection",
+        )
+
         # Cleanup and checkpoint decisions: the detach window comes from the
         # supervisor deadline (never the finer WORK clock), and the full
         # owned-bytes walk runs every fourth case and on the last case.
@@ -3809,6 +3889,7 @@ def diagnostic_document(*, proof, collection, failure) -> dict:
     for case, requires, text in CASES:
         row = {"case": case, "requires": list(requires), "description": text}
         row.update(collection.outcomes.get(case, {"result": "unexecuted"}))
+        row["elapsed_s"] = getattr(collection, "case_seconds", {}).get(case)
         rows.append(row)
     summary = {
         result: sum(1 for row in rows if row["result"] == result)
@@ -3841,6 +3922,10 @@ def diagnostic_document(*, proof, collection, failure) -> dict:
                 "mount": proof.image["mount"],
                 "detached": proof.image["detached"],
             },
+            "case_seconds": getattr(collection, "case_seconds", {}),
+            "timing_projection": timing_projection(
+                getattr(collection, "case_seconds", {})
+            ),
             "unclosed_children": [] if proof is None else sorted(proof.unclosed),
         },
         "limits": {
@@ -3879,6 +3964,7 @@ def write_diagnostic(proof: Proof, collection: perm.Collection, failure) -> str:
 def execute(proof: Proof, repo: str, diagnostic: bool) -> perm.Collection:
     global COLLECTION
     collection = perm.Collection()
+    collection.case_seconds = {}
     COLLECTION = collection
     collection.source = (
         proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30)
@@ -3886,7 +3972,17 @@ def execute(proof: Proof, repo: str, diagnostic: bool) -> perm.Collection:
         .strip()
     )
     setup(proof, repo)
-    table = [(case, requires, (lambda case=case: BODIES[case](proof))) for case, requires, _text in CASES]
+    def timed(case: str, body) -> None:
+        started = time.monotonic()
+        try:
+            body(proof)
+        finally:
+            collection.case_seconds[case] = round(time.monotonic() - started, 2)
+
+    table = [
+        (case, requires, (lambda case=case: timed(case, BODIES[case])))
+        for case, requires, _text in CASES
+    ]
 
     def after_case(case: str) -> None:
         if proof.unclosed:

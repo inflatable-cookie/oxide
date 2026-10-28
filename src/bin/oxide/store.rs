@@ -1509,6 +1509,21 @@ pub(crate) fn source_failure(reason: &'static str) -> SourceFailure {
     }
 }
 
+/// The post-Cargo source may stand in for a pre-Cargo entry only when every
+/// recorded identity fact is unchanged. A newly appearing source has no
+/// pre-Cargo entry and is accepted after the release-time unchanged-since check.
+fn source_identity_matches(
+    previous: &crate::seed_plan::VerifiedSource,
+    post: &crate::seed_plan::VerifiedSource,
+) -> bool {
+    previous.package == post.package
+        && previous.kind == post.kind
+        && previous.root == post.root
+        && previous.verification_root == post.verification_root
+        && previous.tree_digest == post.tree_digest
+        && previous.proc_macro == post.proc_macro
+}
+
 /// Outcome of one pre-child seed attempt. An abandoned recipient must be
 /// released untrusted and the command admitted normally again.
 pub(crate) enum SeedRun {
@@ -1608,20 +1623,26 @@ impl Store {
         let rejected = classifier.rejections(profile, &lock.rejected);
         let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(4));
         let mut packages = Vec::new();
-        for source in before {
-            if !lock.eligible.iter().any(|entry| entry == &source.package) {
+        // The catalog is built from the POST-Cargo verified sources. A first
+        // build extracts a registry or Git source only while Cargo runs, so a
+        // pre-Cargo pass alone can never catalogue it (§4.1/§4.4: the closed
+        // producing epoch is the release-time evidence). An entry that also
+        // appeared before Cargo must still have the same kind, roots, digest
+        // and macro flag; a changed source is skipped, never catalogued. A
+        // newly appearing source is accepted only after the same
+        // unchanged-since check below.
+        for post in after {
+            if !lock.eligible.iter().any(|entry| entry == &post.package) {
                 continue;
             }
-            let Some(post) = after.iter().find(|post| {
-                post.package == source.package
-                    && post.kind == source.kind
-                    && post.root == source.root
-                    && post.verification_root == source.verification_root
-                    && post.tree_digest == source.tree_digest
-                    && post.proc_macro == source.proc_macro
-            }) else {
-                continue;
-            };
+            if let Some(previous) = before
+                .iter()
+                .find(|previous| previous.package == post.package)
+            {
+                if !source_identity_matches(previous, post) {
+                    continue;
+                }
+            }
             if !pass.unchanged_since(&post.verification_root, post.kind, started) {
                 continue;
             }
@@ -6141,6 +6162,36 @@ pub(crate) mod tests {
             Some(Built::Affine(path)) if path == donor_key.checkout
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn post_cargo_source_identity_rejects_a_changed_source_and_accepts_new_ones() {
+        use crate::seed_plan::VerifiedSource;
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = VerifiedSource {
+            package: package.clone(),
+            tree_digest: "b".repeat(64),
+            kind: oxide_storage::lease::managed::SeedSourceKind::Registry,
+            root: "/source".into(),
+            verification_root: "/source".into(),
+            proc_macro: false,
+        };
+        assert!(source_identity_matches(&source, &source));
+        let mut changed = source.clone();
+        changed.tree_digest = "c".repeat(64);
+        assert!(!source_identity_matches(&source, &changed));
+        let mut changed = source.clone();
+        changed.root = "/other".into();
+        assert!(!source_identity_matches(&source, &changed));
+        let mut changed = source.clone();
+        changed.proc_macro = true;
+        assert!(!source_identity_matches(&source, &changed));
+        let mut changed = source.clone();
+        changed.kind = oxide_storage::lease::managed::SeedSourceKind::Git;
+        assert!(!source_identity_matches(&source, &changed));
     }
 
     #[test]

@@ -350,14 +350,18 @@ impl Producer {
                 format!("{profile}/deps")
             };
             let dep_stem = if has_build {
-                "build-script-build"
+                // Cargo 1.97.1's hashed rustc output and dep-info use the
+                // underscored rustc stem inside build/<literal>-<hex>/; the
+                // hyphenated `build-script-build` in the same directory is the
+                // separate uplift checked below.
+                "build_script_build"
             } else {
                 target.as_str()
             };
             let dep = format!("{output_dir}/{dep_stem}-{hash}.d");
             let mut artifacts = Vec::new();
             if has_build {
-                artifacts.push(format!("{output_dir}/build-script-build-{hash}"));
+                artifacts.push(format!("{output_dir}/build_script_build-{hash}"));
             } else {
                 let extensions: &[&str] = if source.proc_macro {
                     &["dylib", "so"]
@@ -565,6 +569,82 @@ mod tests {
             &format!("build/{dep}"),
             &contents.replace(&input.to_string_lossy().to_string(), "/foreign/lib.rs"),
         );
+        assert!(Producer::new(&build)
+            .unwrap()
+            .units("debug", &source)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn build_script_compile_unit_uses_the_underscored_hashed_output_and_uplift() {
+        let fixture = Fixture::new();
+        let lock = format!("version = 4\n[[package]]\nname = 'seedctl'\nversion = '0.1.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source_root = fixture.0.join("source");
+        fixture.write("source/src/lib.rs", "source");
+        let source = VerifiedSource {
+            package,
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root.clone(),
+            proc_macro: false,
+        };
+        let hash = "aaaaaaaaaaaaaaaa";
+        let dir = format!("build/debug/.fingerprint/seedctl-{hash}");
+        for name in [
+            "build-script-build",
+            "build-script-build.json",
+            "dep-build-script-build",
+        ] {
+            fixture.write(&format!("{dir}/{name}"), "fingerprint");
+        }
+        let output = format!("debug/build/seedctl-{hash}");
+        let hashed = format!("{output}/build_script_build-{hash}");
+        let dep = format!("{hashed}.d");
+        let uplift = format!("{output}/build-script-build");
+        fixture.write(&format!("build/{hashed}"), "build-script-output");
+        fixture.write(&format!("build/{uplift}"), "build-script-output");
+        let build = fixture.0.join("build");
+        let input = source_root.join("src/lib.rs");
+        fixture.write(
+            &format!("build/{dep}"),
+            &format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                build.join(&dep).display(),
+                input.display(),
+                build.join(&hashed).display(),
+                input.display(),
+                input.display()
+            ),
+        );
+        let units = Producer::new(&build)
+            .unwrap()
+            .units("debug", &source)
+            .unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].role,
+            oxide_storage::lease::managed::SeedRole::BuildScriptCompile
+        );
+        assert_eq!(units[0].files.len(), 6);
+        // A non-identical uplift is fail-closed.
+        fixture.write(&format!("build/{uplift}"), "different-bytes");
+        assert!(Producer::new(&build)
+            .unwrap()
+            .units("debug", &source)
+            .unwrap()
+            .is_empty());
+        fixture.write(&format!("build/{uplift}"), "build-script-output");
+        // The hyphenated hashed name is not what Cargo 1.97.1 produces.
+        fixture.write(
+            &format!("build/{output}/build-script-build-{hash}"),
+            "build-script-output",
+        );
+        std::fs::remove_file(build.join(&hashed)).unwrap();
         assert!(Producer::new(&build)
             .unwrap()
             .units("debug", &source)

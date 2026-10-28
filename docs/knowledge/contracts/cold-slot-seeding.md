@@ -13,6 +13,27 @@ diagnostic, one counted author native and one separately activated independent
 reviewer native pass at the exact merge head. No live pool, installation, consumer adoption or real-drive
 qualification is authorized by this record.
 
+**Revision 14** applies Supervisor amendment `fe432517`/`8daceb1a`
+(2026-10-28), after the 9d71384 diagnostic exposed two design defects in the
+frozen text. **A1′:** the pinned Cargo 1.97.1 build-script compile unit's hashed
+rustc output and dep-info are `build/<literal package>-<hex>/build_script_build-<hex>`
+and `...-<hex>.d` (**underscores**), while the unhashed uplift remains
+`build/<literal package>-<hex>/build-script-build` and must be byte-identical
+to the hashed output; the earlier hyphenated hashed name is not produced by
+the pinned Cargo and is now a negative fixture. **Catalog timing:** a catalog is
+published from the **post-Cargo** verified sources; a source that first
+appears during the build (a fresh registry archive is extracted, or a Git
+checkout is created, only while Cargo runs) is accepted after the release-time
+unchanged-since check, and a pre-Cargo entry that also appears post-Cargo must
+match kind, roots, digest and macro flag or the package is skipped. The
+§§4.1/§4.4 empty-unseeded-producing-epoch and per-generation rules are
+unchanged. **OUT_DIR boundary:** a library whose `.d` names generated `OUT_DIR`
+inputs remains **unoffered** in v1; case 3's offered unit is the package's
+build-script compile unit, and the seedctl library is the negative exclusion
+control. The proof's case 3 oracle, the pure build-script fixture and the
+catalog/product regressions follow these names; the per-case elapsed timing is
+recorded in the uncounted diagnostic receipt for a measured bound projection.
+
 **Revision 13** applies Supervisor A2′ at head `c022dc6` (review comment
 `6451786564`, 2026-10-27): the limit-gap/donor-figure publication exception is
 deleted everywhere (§6.3 step 7, §8.1, §8.2, §13, case 24 and the revision
@@ -29,7 +50,7 @@ gate are unchanged. A1 and A3 are unchanged.
 comment `6451613293`, 2026-10-27): **the pinned build-script manifest is rebound
 to its source** — the extra filename hash applies to rustc's output *and* its
 dep-info inside the build-script directory, so the hashed files are
-`build/<literal package>-<hex>/build-script-build-<hex>` and `...-<hex>.d`, with
+`build/<literal package>-<hex>/build_script_build-<hex>` and `...-<hex>.d`, with
 the unhashed uplift `build/<literal package>-<hex>/build-script-build` in that
 same directory (byte-identical required); **the incomplete-walk fallback is
 tightened** — the seed publishes only on a complete ownership-clean held-slot
@@ -45,8 +66,8 @@ cold miss.
 **Revision 11** applied Supervisor decision `5073c632`'s three binding
 amendments to the exact head `2cec1af`: **A1** the pinned custom-build layout is
 corrected — the hashed rustc output and its `.d` are
-`build/<literal package>-<hex>/build-script-build-<hex>` and
-`build/<literal package>-<hex>/build-script-build-<hex>.d`, while the separate
+`build/<literal package>-<hex>/build_script_build-<hex>` and
+`build/<literal package>-<hex>/build_script_build-<hex>.d`, while the separate
 unhashed uplift is `build/<literal package>-<hex>/build-script-build` in that
 same directory and is accepted only when it is
 byte-identical to the hashed output (missing, misplaced or non-identical → the
@@ -66,8 +87,8 @@ diagnostic mandatory.
 **Revision 10** answered the CHANGES REQUIRED review of `767f3f6` (review
 comment `6451189343`, 2026-10-27): the build-script compile role now has its
 exact pinned manifest — revised in revision 11: the hashed rustc output
-`build/<literal package>-<hex>/build-script-build-<hex>` with
-`build/<literal package>-<hex>/build-script-build-<hex>.d`, plus Cargo's
+`build/<literal package>-<hex>/build_script_build-<hex>` with
+`build/<literal package>-<hex>/build_script_build-<hex>.d`, plus Cargo's
 unhashed uplift `build/<literal package>-<hex>/build-script-build`
 inside the same hashed directory — with both files recorded and re-verified,
 and the pure fixture plus native oracle corrected (§4.2, §5.1, §16.1, §16.2);
@@ -484,25 +505,32 @@ Consequences, stated rather than hidden:
 
 | `6451189343` finding (revision 10) | Amendment |
 | --- | --- |
-| 1. The build-script role could not satisfy its own join | Revision 10 proposed hashed `deps/build-script-build-<hex>` plus an uplift under `build/`; revision 11 moved the hashed output under `build/`; **revision 12 rebinds the manifest to the pinned `output_dir`/`uplift_to` source**: the hashed rustc output and `.d` are `build/<literal package>-<hex>/build-script-build-<hex>` and `...-<hex>.d`, with the unhashed uplift `build/<literal package>-<hex>/build-script-build` in the same directory, kept fail-closed. The pure fixture and case 3 were corrected again; unsupported shapes skip. |
+| 1. The build-script role could not satisfy its own join | Revision 10 proposed hashed `deps/build-script-build-<hex>` plus an uplift under `build/`; revision 11 moved the hashed output under `build/`; **revision 12 rebinds the manifest to the pinned `output_dir`/`uplift_to` source**: the hashed rustc output and `.d` are `build/<literal package>-<hex>/build_script_build-<hex>` and `...-<hex>.d`, with the unhashed uplift `build/<literal package>-<hex>/build-script-build` in the same directory, kept fail-closed. The pure fixture and case 3 were corrected again; unsupported shapes skip. |
 | 2. The held-recipient reset had no crash-replay journal | §6.5/§6.6/§13 delete the in-slot reset entirely: the design never renames or deletes inside a `Held` slot. Pre-clone failures are `skipped` cold builds; every post-first-clone fault (clone, digest, file type, donor transition, reserve breach, crash) records `reset` as *abandoned*, retains the untrusted generation and refuses, leaving deletion to the existing journaled `Prior::Unknown` eviction. No new capture name, intent format, replay boundary or downgrade fence is added, and a crash in `Spawning` before the group is recorded stays held for explicit recovery. |
 | 3. The accounting statement contradicted the current policy | §8.2 now states oxide#146: per-slot independently measured records, the inode union only within one slot's walk, accepted cross-slot hard-link overcount, no seed-created hard links, no extent-sharing or free-space discount, and the post-seed membership/byte recheck against that figure with an incomplete walk reported as unknown rather than zero. |
 
 | Supervisor `5073c632` (revision 11) | Amendment |
 | --- | --- |
-| A1 pinned custom-build layout | §4.2/§5.1/§10 and the pure/native oracles use the hashed `build/<literal package>-<hex>/build-script-build-<hex>` plus `...-<hex>.d`, with the unhashed uplift `build/<literal package>-<hex>/build-script-build` in the same directory kept fail-closed (byte-identical required). Revision 12 rebinds this to the pinned `output_dir`/`uplift_to` source. |
+| A1 pinned custom-build layout | §4.2/§5.1/§10 and the pure/native oracles use the hashed `build/<literal package>-<hex>/build_script_build-<hex>` plus `...-<hex>.d`, with the unhashed uplift `build/<literal package>-<hex>/build-script-build` in the same directory kept fail-closed (byte-identical required). Revision 12 rebinds this to the pinned `output_dir`/`uplift_to` source. |
 | A2 post-clone byte walk | §6.3 step 7 adds the bounded generation-bound walk before Cargo, recorded as `observed-while-held` (never a closed record, §9.1); revision 13 (A2′) publishes only on a **complete ownership-clean** walk, with no limit-gap or donor-figure substitution, and any incomplete or failed walk abandons seeding only, retains the untrusted recipient and continues as an ordinary cold build under normal admission with no extra grant (§8.1, §8.2, §13, case 24). |
 | A3 seeding never blocks a build | §7/§6.5/§13 and case 22 now make a leased/evicting donor or unknown custody before the first clone a `donor busy` skip with a cold build; the reserve start-gate refusal is unchanged (case 19). |
 
 | `6451613293` finding (revision 12) | Amendment |
 | --- | --- |
-| 1. The build-script manifest named files Cargo does not produce | §4.2/§5.1/§10, the pure fixture and case 3 now use the hashed `build/<literal package>-<hex>/build-script-build-<hex>` and `...-<hex>.d` from the pinned `output_dir`/`FileType`/rustc-preparation source, with the unhashed uplift `build/<literal package>-<hex>/build-script-build` in the same directory (byte-identical required, `.d` never naming the uplift). |
+| 1. The build-script manifest named files Cargo does not produce | §4.2/§5.1/§10, the pure fixture and case 3 now use the hashed `build/<literal package>-<hex>/build_script_build-<hex>` and `...-<hex>.d` from the pinned `output_dir`/`FileType`/rustc-preparation source, with the unhashed uplift `build/<literal package>-<hex>/build-script-build` in the same directory (byte-identical required, `.d` never naming the uplift). |
 | 2. Incomplete walk treated as known accounting | §6.3 step 7/§8.2 require a complete ownership-clean walk to publish. Revision 12 briefly allowed a limit-only gap with the donor's recorded figure; **revision 13 (A2′) deletes that substitution entirely**: any incomplete or failed walk (bound, ownership, device, read) abandons seeding only, publishes nothing, retains the untrusted recipient and continues as an ordinary cold build under normal admission with no extra grant. Case 24 and its controls were rewritten again. |
 | 3. Post-clone lease/gate fallback ambiguous | The cold-build/extra-grant path is removed: no reserved grant, no rebind, no gate re-entry, and the retained slot's accounting/disposal boundaries are named. Revision 13 (A2′) keeps that no-extra-grant rule while making an incomplete or failed *walk* abandon seeding only and continue as an ordinary cold build under normal admission. |
 
 | Supervisor A2′ (revision 13) | Amendment |
 | --- | --- |
 | Complete-walk-only publication | §6.3 step 7, §8.1, §8.2 and §13 now publish only on a complete ownership-clean recipient walk; the limit-gap/donor-figure substitution is deleted. Any incomplete or failed walk abandons seeding only — no publication, untrusted recipient retained and never reused, then an ordinary cold build under normal admission with the ordinary grant bound and no extra grant — and case 24 proves those four facts for ownership, read, device, entry-limit and outright-failure injections. |
+
+| Supervisor `fe432517` (revision 14) | Amendment |
+| --- | --- |
+| A1′ pinned Cargo 1.97.1 build-script names | The hashed rustc output and `.d` are `build/<literal package>-<hex>/build_script_build-<hex>` and `...-<hex>.d` (underscores); the unhashed uplift `build-script-build` remains byte-identical and fail-closed; the hyphenated hashed name is a negative fixture. §4.2/§5.1/§10/§16.1/§16.2 and the product classifier/pure fixtures follow. |
+| Catalog publication timing | The catalog is built from the post-Cargo verified sources; a newly appearing source is accepted only after the release-time unchanged-since check, and a pre-Cargo entry that changes identity is skipped; §§4.1/§4.4 invariants are unchanged. |
+| OUT_DIR libraries unoffered | A library whose `.d` names generated `OUT_DIR` inputs remains unoffered in v1; case 3's offered unit is the build-script compile unit and its library is the negative control. |
+| Per-case timing | The uncounted diagnostic receipt records each reached case's elapsed seconds and an observation-only projection; it is not an acceptance gate. |
 
 ## 4. Unit provenance: the producing epoch and the donor catalog
 
@@ -545,6 +573,13 @@ A slot qualifies as a *producing epoch* only when all of the following hold:
    its Cargo is a verified release with the pinned adapter.
 5. The slot is being released with a recorded `Built` origin — i.e. the
    existing trust record is written as usual.
+6. The catalog is built from the **post-Cargo** verified sources. A source
+   first observed after Cargo (a fresh registry archive is extracted, or a Git
+   checkout is created, only during the build) is accepted only after the
+   release-time unchanged-since check; a package that also appeared before
+   Cargo must have the same kind, roots, tree digest and macro flag, or it is
+   skipped. A pre-Cargo pass alone can never catalogue a first build, and the
+   release-time pass is the closed producing epoch's evidence.
 
 The accepted consequence (binding `d1f281eb`) is a **short donor lifetime**:
 the catalog is bound to that one idle generation and is invalidated by the
@@ -667,7 +702,7 @@ held:
      the whitelisted role artifacts — `deps/lib<stem>-<hex>.rmeta` (the
      ordinary `metadata` emit), `deps/lib<stem>-<hex>.rlib`,
      `deps/lib<stem>-<hex>.{dylib,so}` for a proc macro, or
-     `build/<package>-<hex>/build-script-build-<hex>`. At least one output rule must
+     `build/<package>-<hex>/build_script_build-<hex>`. At least one output rule must
      name a whitelisted artifact, every output target must resolve inside the
      unit's own output directory, and its prerequisites must be non-empty and
      **entirely** inside the package's verified source root (§4.3); a
@@ -701,8 +736,8 @@ held:
    hash applies to rustc's output and to the dep-info name
    (`target_info.rs` `FileType` naming; `core/compiler/mod.rs` rustc
    preparation), so in the supported non-unit-grouped layout the compiled
-   executable is `build/<literal package>-<hex>/build-script-build-<hex>` and
-   its dep-info is `build/<literal package>-<hex>/build-script-build-<hex>.d`,
+   executable is `build/<literal package>-<hex>/build_script_build-<hex>` and
+   its dep-info is `build/<literal package>-<hex>/build_script_build-<hex>.d`,
    with the stem `<hex>` equal to the fingerprint directory suffix (the same
    `unit_id`). Cargo then **uplifts** it to the unhashed
    `build/<literal package>-<hex>/build-script-build` in that same directory.
@@ -939,9 +974,9 @@ verbatim and never predicted.
 
 Every offered unit requires its **join file**: rustc's dep-info in the unit's
 own output directory — `deps/<target_underscored>-<hex>.d` for a library or
-proc macro, and `build/<literal package>-<hex>/build-script-build-<hex>.d` for
+proc macro, and `build/<literal package>-<hex>/build_script_build-<hex>.d` for
 a build-script compile unit (its rustc output is the hashed
-`build/<literal package>-<hex>/build-script-build-<hex>`, which Cargo uplifts
+`build/<literal package>-<hex>/build_script_build-<hex>`, which Cargo uplifts
 to the unhashed `build/<literal package>-<hex>/build-script-build` in that same
 directory, §4.2). All of its rules are parsed; rule order is irrelevant because
 rustc writes the `.d`'s own rule first, and the empty phony rule rustc writes
@@ -953,11 +988,18 @@ without a proven join is not offered.
 | --- | --- | --- |
 | registry/git dependency library | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{rmeta,rlib}`, joined by `deps/<target_underscored>-<hex>.d` |
 | proc macro | `lib-<target>`, `lib-<target>.json`, `dep-lib-<target>` | `deps/lib<target_underscored>-<hex>.{dylib,so}`, joined by `deps/<target_underscored>-<hex>.d`. A `.dSYM` bundle is **excluded** |
-| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | hashed rustc output `build/<literal package>-<hex>/build-script-build-<hex>` joined by `build/<literal package>-<hex>/build-script-build-<hex>.d`, plus Cargo's unhashed uplift `build/<literal package>-<hex>/build-script-build` in that same directory (byte-identical to the hashed output); if either the join or the uplift cannot be proven the role is not offered (its run is excluded anyway) |
+| build-script **compile** unit | `build-script-build`, `build-script-build.json`, `dep-build-script-build` | hashed rustc output `build/<literal package>-<hex>/build_script_build-<hex>` joined by `build/<literal package>-<hex>/build_script_build-<hex>.d`, plus Cargo's unhashed uplift `build/<literal package>-<hex>/build-script-build` in that same directory (byte-identical to the hashed output); if either the join or the uplift cannot be proven the role is not offered (its run is excluded anyway) |
 | build-script **run** unit and its output | **excluded entirely** | `run-build-script-build-script-build*`, `dep-run-build-script-build-script-build`, `build/<literal package>-<hex>/{output,root-output,stderr}`, `build/<literal package>-<hex>/out/**`, `invoked.timestamp` |
 | workspace/path package units | **excluded** | never classified |
 | final outputs, uplifted binaries, test/bench executables | **excluded** | live in the checkout `target/` or are final uplifts |
 | `incremental/**` | **excluded** | |
+
+A library or proc-macro unit whose `.d` names a generated `OUT_DIR` input (a
+build script's generated source, for example) remains **unoffered** in v1: the
+join's prerequisites must sit inside the verified source root, and a generated
+input does not. The package is then represented only by its build-script
+compile unit, if that unit joins; case 3's seedctl package is the native
+negative control and its library is never offered.
 
 Every role below additionally requires the §3.2 leaf boundary: a package with
 any dependency edge is not offered, so a proc-macro dylib can be seeded only
@@ -1623,7 +1665,7 @@ verifies (`workflow.md#cargo-version-matrix`):
   dep-info carries rustc's empty phony source rules, and only the §4.2
   role/layout cases are accepted, library and proc-macro artifacts in
   `<profile>/deps/`, a build-script rustc output as the hashed
-  `<profile>/build/<literal package>-<hex>/build-script-build-<hex>` with
+  `<profile>/build/<literal package>-<hex>/build_script_build-<hex>` with
   Cargo's unhashed uplift `<profile>/build/<literal package>-<hex>/build-script-build`
   in the same directory, the profile directory name is Cargo's, and uplift
   copies finals to `CARGO_TARGET_DIR`;
@@ -1891,9 +1933,13 @@ unclassifiable entry makes that directory unusable; **artifact join, all rules
 parsed**: a `.d` whose first rule is the `.d` itself (the ordinary rustc shape)
 still joins through its later artifact rule; `--emit=dep-info,metadata`
 (`.rmeta`) and `link` (`.rlib`) both join; a proc-macro `.dylib`; a
-build-script hash/uplift pair (`build/<literal package>-<hex>/build-script-build-<hex>`
-plus `build/<literal package>-<hex>/build-script-build-<hex>.d`, and the
-unhashed uplift `build/<literal package>-<hex>/build-script-build`); rustc's **empty
+build-script hash/uplift pair (`build/<literal package>-<hex>/build_script_build-<hex>`
+plus `build/<literal package>-<hex>/build_script_build-<hex>.d`, and the
+unhashed uplift `build/<literal package>-<hex>/build-script-build`); the
+hyphenated hashed name is a negative fixture; a library `.d` naming a generated
+`OUT_DIR` input is not offered (positive package without generated inputs plus
+that negative); a source first observed only post-Cargo is accepted, while a
+pre-Cargo entry that changed identity is skipped; rustc's **empty
 phony source rules** are matched against the accepted prerequisite set and
 contribute no artifact, while a phony rule whose target was never a
 prerequisite, is out of root or is nonempty is rejected; the
@@ -1949,15 +1995,16 @@ pure suite parses these complete shapes, with the output rules followed by
 rustc's empty phony source rules, and requires a *successful* join for a
 `cfg-if` leaf (literal `cfg-if-<hash>` directory, `lib-cfg_if` unit,
 `libcfg_if-<hex>.rmeta` artifact) and for a build-script compile unit
-(hashed rustc output `build/seedctl-<hex>/build-script-build-<hex>` with
-`build/seedctl-<hex>/build-script-build-<hex>.d`, plus Cargo's unhashed uplift
-`build/seedctl-<hex>/build-script-build`):
+(hashed rustc output `build/seedctl-<hex>/build_script_build-<hex>` with
+`build/seedctl-<hex>/build_script_build-<hex>.d`, plus Cargo's unhashed uplift
+`build/seedctl-<hex>/build-script-build`; the hyphenated hashed pair is the
+negative fixture):
 
 ```make
 deps/libcfg_if-<hex>.rmeta: /root/.cargo/registry/src/index.crates.io-<idx>/cfg-if-1.0.0/src/lib.rs
 /root/.cargo/registry/src/index.crates.io-<idx>/cfg-if-1.0.0/src/lib.rs:
 
-build/seedctl-<hex>/build-script-build-<hex>: /root/.cargo/registry/src/index.crates.io-<idx>/seedctl-0.1.0/build.rs
+build/seedctl-<hex>/build_script_build-<hex>: /root/.cargo/registry/src/index.crates.io-<idx>/seedctl-0.1.0/build.rs
 /root/.cargo/registry/src/index.crates.io-<idx>/seedctl-0.1.0/build.rs:
 ```
 
@@ -2013,12 +2060,14 @@ the selected-volume rule.
    the generated source embeds that same absolute path. This case also exercises
    the ordinary rustc dep-info shape (the `.d`'s own rule first, the artifact
    rule later) and the build-script role manifest: the hashed rustc output
-   `build/<literal package>-<hex>/build-script-build-<hex>` with its
-   `build/<literal package>-<hex>/build-script-build-<hex>.d`, plus Cargo's
+   `build/<literal package>-<hex>/build_script_build-<hex>` with its
+   `build/<literal package>-<hex>/build_script_build-<hex>.d`, plus Cargo's
    unhashed uplift `build/<literal package>-<hex>/build-script-build` in the
    same directory. The receipt must list the package's
-   **build-script compile** unit as offered with **both** files in the plan
-   while the plan contains no
+   **build-script compile** unit as offered with **both** hashed files (the
+   underscored rustc output and its `.d`) plus the byte-identical uplift in the
+   plan, while the package's **library** unit is not offered (its `.d` names
+   the generated `OUT_DIR` source) and the plan contains no
    `output`, `root-output`, `out/**` or run fingerprint; the
    recipient's run unit reruns, the crate recompiles, and the program prints
    the **recipient's** `OUT_DIR` and the donor's path is absent from the
@@ -2243,7 +2292,7 @@ comparison as the proof.
 ## 17. Independent review questions
 
 1. Is the §4.2 build-script role manifest accepted — the hashed rustc output
-   `build/<literal package>-<hex>/build-script-build-<hex>` with its
+   `build/<literal package>-<hex>/build_script_build-<hex>` with its
    same-directory `.d` and the unhashed, byte-identical
    `build/<literal package>-<hex>/build-script-build` uplift — together with the
    §6.3 step 7 post-clone walk (publish only on a complete ownership-clean walk;
