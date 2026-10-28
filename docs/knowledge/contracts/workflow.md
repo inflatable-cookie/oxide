@@ -1880,10 +1880,11 @@ Tom, 2026-10-28: "this needs fixing so we can keep it on Builds next time".
 `directory-budget-v1` pool on a verified external volume, so validation and
 proof fixtures need no internal root: an environment-only
 `OXIDE_SCRATCH_ROOT` declaration consulted only at the external-volume
-refusal, a pool-local binding document, the absent-volume refusal, the refusal
-matrix, and a migration list that would drop the exception for ten proofs while
-`rust:outputs-prune`, `rust:prune-absence` and the internal unit fixtures keep
-their boot Data volume root. It is design only: no code, selector, recipe, host
+refusal, the mandatory Git-work-tree recheck for an admitted path, a pool-local
+binding document plus a host-side identity record that survives detach, the
+absent-volume refusal, the refusal matrix, and a migration list that would drop
+the exception for ten proofs while `rust:outputs-prune`, `rust:prune-absence`
+and the internal unit fixtures keep their boot Data volume root. It is design only: no code, selector, recipe, host
 setting, real pool or native run exists, the exception above remains current
 truth for every proof, and each implementation slice needs its own brief and
 independent exact-head review.
