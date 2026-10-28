@@ -21,7 +21,11 @@ Cold-slot seeding is off. Setting `OXIDE_COLD_SEED=1` reports that seeding is
 not yet qualified on this Cargo; it does not seed, produce catalogs, or write
 seed sidecars. The separate qualification proof must pass before the opt-in can
 be honoured. With the variable unset, the existing command behaviour is
-unchanged. The [cold-slot seeding contract](cold-slot-seeding.md) owns the
+unchanged. Merge-base identity for that hold lives in
+`tests/cold_seed_default_off.rs`, behind `#[ignore]`; `effigy rust:seed-default-off`
+stages the merge-base `oxide` into owned scratch, exports
+`OXIDE_SEED_BASELINE_BINARY`, and runs those tests. They are not part of
+`effigy test rust`. The [cold-slot seeding contract](cold-slot-seeding.md) owns the
 proposed transaction and qualification requirements.
 
 ## Shape

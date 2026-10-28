@@ -31,9 +31,9 @@ impl Drop for Scratch {
     }
 }
 
-/// The oxide binary staged from the merge-base source. Covering runs export
-/// `OXIDE_SEED_BASELINE_BINARY`; a missing or non-file value fails the test
-/// loudly so the default-off identity claim cannot pass dormant.
+/// The oxide binary staged from the merge-base source. `effigy rust:seed-default-off`
+/// exports `OXIDE_SEED_BASELINE_BINARY`; a missing or non-file value fails the
+/// test loudly so the default-off identity claim cannot pass dormant.
 fn baseline_binary() -> std::ffi::OsString {
     let base = std::env::var_os("OXIDE_SEED_BASELINE_BINARY")
         .expect("OXIDE_SEED_BASELINE_BINARY must name the staged merge-base oxide binary");
@@ -46,6 +46,7 @@ fn baseline_binary() -> std::ffi::OsString {
 }
 
 #[test]
+#[ignore = "needs OXIDE_SEED_BASELINE_BINARY; run via effigy rust:seed-default-off"]
 fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
     let real_home = std::env::var_os("HOME").expect("invoking HOME");
     let rustup_home = std::env::var_os("RUSTUP_HOME")
@@ -101,6 +102,7 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
 }
 
 #[test]
+#[ignore = "needs OXIDE_SEED_BASELINE_BINARY; run via effigy rust:seed-default-off"]
 fn tiny_build_matches_staged_base_when_seed_is_off() {
     let base = baseline_binary();
     let real_home = std::env::var_os("HOME").expect("invoking HOME");
