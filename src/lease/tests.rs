@@ -478,7 +478,10 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
     // Releasing the new slot walks exactly that slot, never the payload.
     let (_, release_walks) = walked(&pool, || release_injected(&pool, &extra.lease_id));
     assert_eq!(release_walks.len(), 1, "release walks: {release_walks:?}");
-    assert_ne!(release_walks[0], "payload", "release walked the payload");
+    assert!(
+        release_walks[0].starts_with("slots/"),
+        "release walked more than its own slot: {release_walks:?}"
+    );
 
     let status = status_injected(&pool).expect("status");
     assert_eq!(status.slots.len(), super::MAX_SLOTS);
