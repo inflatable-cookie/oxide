@@ -9,7 +9,12 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let template = std::env::temp_dir().join("oxide-seed-off.XXXXXX");
+        // Under the Rust recipe the child's TMPDIR is the selected pool's
+        // slot scratch, so an internal pool fixture must use the internal root.
+        let base = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let template = base.join("seed.XXXXXX");
         let mut name = CString::new(template.as_os_str().as_bytes())
             .unwrap()
             .into_bytes_with_nul();
@@ -24,6 +29,20 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).unwrap();
     }
+}
+
+/// The oxide binary staged from the merge-base source. Covering runs export
+/// `OXIDE_SEED_BASELINE_BINARY`; a missing or non-file value fails the test
+/// loudly so the default-off identity claim cannot pass dormant.
+fn baseline_binary() -> std::ffi::OsString {
+    let base = std::env::var_os("OXIDE_SEED_BASELINE_BINARY")
+        .expect("OXIDE_SEED_BASELINE_BINARY must name the staged merge-base oxide binary");
+    assert!(
+        std::path::Path::new(&base).is_file(),
+        "staged merge-base oxide binary is absent: {}",
+        std::path::Path::new(&base).display()
+    );
+    base
 }
 
 #[test]
@@ -69,14 +88,12 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
         held.stdout.strip_prefix(notice),
         Some(off.stdout.as_slice())
     );
-    // A separately staged merge-base binary turns this into a direct
-    // base-versus-branch comparison; ordinary suite runs need no second build.
-    if let Some(base) = std::env::var_os("OXIDE_SEED_BASELINE_BINARY") {
-        let base = run(&base, None);
-        assert_eq!(base.status.code(), off.status.code());
-        assert_eq!(base.stdout, off.stdout);
-        assert_eq!(base.stderr, off.stderr);
-    }
+    // The merge-base binary is the required comparison: an absent input fails
+    // here instead of letting the identity claim pass dormant.
+    let base = run(&baseline_binary(), None);
+    assert_eq!(base.status.code(), off.status.code());
+    assert_eq!(base.stdout, off.stdout);
+    assert_eq!(base.stderr, off.stderr);
     assert!(!pool.exists());
     assert!(std::fs::read_dir(&home).unwrap().next().is_none());
     assert!(std::fs::read_dir(&cargo_home).unwrap().next().is_none());
@@ -85,11 +102,7 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
 
 #[test]
 fn tiny_build_matches_staged_base_when_seed_is_off() {
-    let Some(base) = std::env::var_os("OXIDE_SEED_BASELINE_BINARY") else {
-        // The covering suite has no implicit second build; the explicit
-        // comparison run supplies a base staged from the merge-base source.
-        return;
-    };
+    let base = baseline_binary();
     let real_home = std::env::var_os("HOME").expect("invoking HOME");
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .filter(|value| !value.is_empty())

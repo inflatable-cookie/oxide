@@ -386,4 +386,371 @@ mod tests {
         let mut compiler: Value = basic_toml::from_str("[build]\nrustc = 'other'\n").unwrap();
         assert!(check_config(&mut compiler, Path::new("/")).is_err());
     }
+
+    /// A private synthetic account tree: `home/cargo-home` is Cargo home,
+    /// `home` is the account home and `home/work/ws/member*` are members.
+    struct Tree {
+        root: PathBuf,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            let template = std::env::temp_dir().join("oxide-seed-context.XXXXXX");
+            let mut name = std::ffi::CString::new(template.as_os_str().as_bytes())
+                .unwrap()
+                .into_bytes_with_nul();
+            // SAFETY: name is writable, NUL-terminated and ends in XXXXXX.
+            assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+            let name = std::ffi::CStr::from_bytes_until_nul(&name).unwrap();
+            let root = fs::canonicalize(PathBuf::from(OsStr::from_bytes(name.to_bytes()))).unwrap();
+            let tree = Self { root };
+            tree.dirs(&[
+                "home/cargo-home",
+                "home/work/ws/member",
+                "home/work/ws/member2",
+                "home/other",
+            ]);
+            tree
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        fn dirs(&self, relative: &[&str]) {
+            for dir in relative {
+                fs::create_dir_all(self.path(dir)).unwrap();
+            }
+        }
+
+        fn write(&self, relative: &str, text: &str) {
+            let path = self.path(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+
+        fn context(
+            &self,
+            cwd: &str,
+            environment: &[(&str, &str)],
+        ) -> Result<Context, &'static str> {
+            let environment: Vec<(OsString, OsString)> = environment
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect();
+            collect(
+                &self.path(cwd),
+                &self.path("home/cargo-home"),
+                &[],
+                &environment,
+            )
+        }
+
+        fn digest(&self, cwd: &str) -> Result<String, &'static str> {
+            self.context(cwd, &[]).map(|context| context.digest)
+        }
+
+        fn files(&self, relative: &[&str]) -> Vec<String> {
+            relative
+                .iter()
+                .map(|path| self.path(path).to_str().unwrap().to_owned())
+                .collect()
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn member_and_above_home_configs_merge_by_cargo_precedence() {
+        let tree = Tree::new();
+        tree.write(".cargo/config.toml", "[build]\njobs = 1\n");
+        tree.write("home/cargo-home/config.toml", "[build]\njobs = 3\n");
+        tree.write("home/work/ws/.cargo/config.toml", "[build]\njobs = 2\n");
+        let member = tree.context("home/work/ws/member", &[]).unwrap();
+        // Highest precedence first: the working directory's ancestor, the
+        // ancestor above the account home, then Cargo home.
+        assert_eq!(
+            member.config_files,
+            tree.files(&[
+                "home/work/ws/.cargo/config.toml",
+                ".cargo/config.toml",
+                "home/cargo-home/config.toml",
+            ])
+        );
+        // Only the winning value enters the digest: a tree that carries just
+        // the member's ancestor config renders the same effective value.
+        let only_ws = Tree::new();
+        only_ws.write("home/work/ws/.cargo/config.toml", "[build]\njobs = 2\n");
+        assert_eq!(
+            member.digest,
+            only_ws.digest("home/work/ws/member").unwrap()
+        );
+        // A sibling member under the same ancestor sees the same context.
+        assert_eq!(member.digest, tree.digest("home/work/ws/member2").unwrap());
+        // Remove the ancestor config: the ancestor above the account home now
+        // supplies the value, as Cargo's walk does.
+        fs::remove_file(tree.path("home/work/ws/.cargo/config.toml")).unwrap();
+        let only_root = Tree::new();
+        only_root.write(".cargo/config.toml", "[build]\njobs = 1\n");
+        assert_eq!(
+            tree.digest("home/work/ws/member").unwrap(),
+            only_root.digest("home/work/ws/member").unwrap()
+        );
+        assert_ne!(member.digest, tree.digest("home/work/ws/member").unwrap());
+    }
+
+    #[test]
+    fn config_and_config_toml_in_one_directory_follow_cargo_pair_precedence() {
+        let tree = Tree::new();
+        tree.write("home/work/ws/.cargo/config", "[build]\njobs = 2\n");
+        tree.write("home/work/ws/.cargo/config.toml", "[build]\njobs = 9\n");
+        let both = tree.context("home/work/ws/member", &[]).unwrap();
+        // `config` is active and `config.toml` is recorded but inert.
+        assert_eq!(
+            both.config_files,
+            tree.files(&[
+                "home/work/ws/.cargo/config",
+                "home/work/ws/.cargo/config.toml",
+            ])
+        );
+        let config_only = {
+            fs::remove_file(tree.path("home/work/ws/.cargo/config.toml")).unwrap();
+            tree.digest("home/work/ws/member").unwrap()
+        };
+        assert_eq!(both.digest, config_only);
+        // With `config` removed, `config.toml` becomes the active file.
+        fs::remove_file(tree.path("home/work/ws/.cargo/config")).unwrap();
+        tree.write("home/work/ws/.cargo/config.toml", "[build]\njobs = 9\n");
+        assert_ne!(both.digest, tree.digest("home/work/ws/member").unwrap());
+    }
+
+    #[test]
+    fn relative_env_values_resolve_against_their_own_config_base() {
+        let tree = Tree::new();
+        tree.dirs(&[
+            "tools",
+            "home/tools",
+            "home/work/ws/tools",
+            "home/work/ws/other",
+        ]);
+        // The ancestor above the account home resolves against its own
+        // directory; Cargo home's values resolve against the parent of Cargo
+        // home, which is the account home.
+        tree.write(
+            ".cargo/config.toml",
+            "[env]\nTOOLS = { value = 'tools', relative = true }\n",
+        );
+        tree.write(
+            "home/cargo-home/config.toml",
+            "[env]\nHOME_TOOLS = { value = 'tools', relative = true }\n",
+        );
+        let root_value = tree.digest("home/other").unwrap();
+        tree.write(
+            "home/work/ws/.cargo/config.toml",
+            "[env]\nTOOLS = { value = 'tools', relative = true }\n",
+        );
+        let ws_value = tree.digest("home/work/ws/member").unwrap();
+        // Two working directories under the same ancestor resolve the same
+        // relative value to the same absolute path.
+        assert_eq!(ws_value, tree.digest("home/work/ws/member2").unwrap());
+        // The member's ws/tools differs from the root's tools.
+        assert_ne!(root_value, ws_value);
+        // A differing relative value changes the digest.
+        tree.write(
+            "home/work/ws/.cargo/config.toml",
+            "[env]\nTOOLS = { value = 'other', relative = true }\n",
+        );
+        assert_ne!(ws_value, tree.digest("home/work/ws/member").unwrap());
+        // An unresolvable Cargo-home relative value refuses the whole context.
+        fs::remove_dir(tree.path("home/tools")).unwrap();
+        assert_eq!(tree.digest("home/other"), Err("unresolved env path"));
+    }
+
+    #[test]
+    fn unresolved_relative_env_and_unsupported_env_shapes_refuse() {
+        let cases = [
+            (
+                "[env]\nFOO = { value = 'missing', relative = true }\n",
+                "unresolved env path",
+            ),
+            (
+                "[env]\nFOO = { value = 'x', extra = 1 }\n",
+                "unsupported env config",
+            ),
+            (
+                "[env]\nFOO = { value = 'x', force = 'yes' }\n",
+                "unsupported env config",
+            ),
+            (
+                "[env]\nFOO = { value = 'x', relative = 'yes' }\n",
+                "unsupported env config",
+            ),
+            (
+                "[env]\nFOO = { relative = true }\n",
+                "unsupported env config",
+            ),
+            ("[env]\nFOO = 1\n", "unsupported env config"),
+            ("[env]\nFOO = [1]\n", "unsupported env config"),
+        ];
+        for (text, reason) in cases {
+            let tree = Tree::new();
+            tree.write("home/work/ws/.cargo/config.toml", text);
+            assert_eq!(tree.digest("home/work/ws/member"), Err(reason), "{text}");
+        }
+    }
+
+    #[test]
+    fn unsupported_tables_and_compiler_or_wrapper_keys_refuse() {
+        let cases = [
+            "[source.crates-io]\nreplace-with = 'vendor'\n",
+            "[patch.crates-io]\nfoo = { path = 'x' }\n",
+            "[registries.internal]\nindex = 'sparse+https://example.invalid/'\n",
+            "[unstable]\nbuild-std = []\n",
+            "[alias]\nb = 'build'\n",
+            "[build]\nrustc = 'other'\n",
+            "[build]\nrustc-wrapper = 'sccache'\n",
+            "[build]\nrustc-workspace-wrapper = 'sccache'\n",
+        ];
+        for text in cases {
+            let tree = Tree::new();
+            tree.write("home/work/ws/.cargo/config.toml", text);
+            assert!(tree.digest("home/work/ws/member").is_err(), "{text}");
+        }
+        // The modelled tables stay accepted.
+        let tree = Tree::new();
+        tree.write(
+            "home/work/ws/.cargo/config.toml",
+            "[build]\njobs = 2\n[profile.dev]\ndebug = false\n[target.x86_64-apple-darwin]\nlinker = 'cc'\n[net]\noffline = true\n",
+        );
+        assert!(tree.digest("home/work/ws/member").is_ok());
+    }
+
+    #[test]
+    fn unreadable_unparseable_and_non_utf8_configs_refuse() {
+        let tree = Tree::new();
+        tree.write("home/work/ws/.cargo/config.toml", "[build\n");
+        assert_eq!(tree.digest("home/work/ws/member"), Err("invalid config"));
+
+        let tree = Tree::new();
+        fs::create_dir_all(tree.path("home/work/ws/.cargo/config.toml")).unwrap();
+        assert_eq!(tree.digest("home/work/ws/member"), Err("unreadable config"));
+
+        let tree = Tree::new();
+        tree.write("home/work/ws/real.toml", "[build]\njobs = 2\n");
+        fs::create_dir_all(tree.path("home/work/ws/.cargo")).unwrap();
+        std::os::unix::fs::symlink(
+            tree.path("home/work/ws/real.toml"),
+            tree.path("home/work/ws/.cargo/config.toml"),
+        )
+        .unwrap();
+        assert_eq!(tree.digest("home/work/ws/member"), Err("unreadable config"));
+
+        let tree = Tree::new();
+        fs::create_dir_all(tree.path("home/work/ws/.cargo")).unwrap();
+        fs::write(tree.path("home/work/ws/.cargo/config"), [0xff, 0xfe, b'\n']).unwrap();
+        assert_eq!(tree.digest("home/work/ws/member"), Err("invalid config"));
+
+        let tree = Tree::new();
+        tree.dirs(&["home/work/ws/elsewhere/.cargo"]);
+        std::os::unix::fs::symlink(
+            tree.path("home/work/ws/elsewhere/.cargo"),
+            tree.path("home/work/ws/.cargo"),
+        )
+        .unwrap();
+        assert_eq!(
+            tree.digest("home/work/ws/member"),
+            Err("unsafe config directory")
+        );
+    }
+
+    #[test]
+    fn config_file_and_rendered_caps_refuse_without_partial_context() {
+        // Sixteen ancestor configs are the most the walk may collect. The
+        // chain stays inside the synthetic tree; the walk above it only reads.
+        let tree = Tree::new();
+        let mut chain = String::from("chain");
+        for level in 0..16 {
+            chain.push_str(&format!("/l{level}"));
+            tree.write(
+                &format!("{chain}/.cargo/config.toml"),
+                "[build]\njobs = 2\n",
+            );
+        }
+        assert!(tree.digest(&chain).is_ok());
+        tree.write(&format!("{chain}/.cargo/config"), "[build]\njobs = 3\n");
+        assert_eq!(tree.digest(&chain), Err("config cap"));
+
+        // A file one byte past the four MiB byte budget is refused unparsed.
+        let tree = Tree::new();
+        let mut text = String::from("#");
+        text.push_str(&"x".repeat(MAX_BYTES));
+        tree.write("home/work/ws/.cargo/config.toml", &text);
+        assert_eq!(tree.digest("home/work/ws/member"), Err("config cap"));
+
+        // Rendered records over 128 KiB refuse even when every file fits.
+        let tree = Tree::new();
+        let flags = vec![format!("'{}'", "f".repeat(120)); 1200].join(", ");
+        tree.write(
+            "home/work/ws/.cargo/config.toml",
+            &format!("[build]\nrustflags = [{flags}]\n"),
+        );
+        assert_eq!(tree.digest("home/work/ws/member"), Err("config cap"));
+    }
+
+    #[test]
+    fn unsupported_arguments_and_environment_refuse_and_digests_track_values() {
+        let tree = Tree::new();
+        let cwd = tree.path("home/work/ws/member");
+        let home = tree.path("home/cargo-home");
+        for argument in ["--config", "--config=build.jobs=1"] {
+            let refused = collect(&cwd, &home, &[OsString::from(argument)], &[]);
+            assert_eq!(
+                refused.err(),
+                Some("unsupported config argument"),
+                "{argument}"
+            );
+        }
+        let refusals = [
+            "CARGO_BUILD_RUSTC",
+            "RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_PROFILE_DEV_OPT_LEVEL",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+        ];
+        for name in refusals {
+            assert!(
+                tree.context("home/work/ws/member", &[(name, "x")]).is_err(),
+                "{name}"
+            );
+        }
+        assert!(tree
+            .context("home/work/ws/member", &[("OXIDE_ALLOW_RUSTC_WRAPPER", "1")])
+            .is_err());
+        assert!(tree
+            .context("home/work/ws/member", &[("OXIDE_ALLOW_RUSTC_WRAPPER", "0")])
+            .is_ok());
+
+        // Flags enter the digest by exact value and presence.
+        let absent = tree.context("home/work/ws/member", &[]).unwrap();
+        let first = tree
+            .context("home/work/ws/member", &[("RUSTFLAGS", "-Copt-level=1")])
+            .unwrap();
+        let again = tree
+            .context("home/work/ws/member", &[("RUSTFLAGS", "-Copt-level=1")])
+            .unwrap();
+        let second = tree
+            .context("home/work/ws/member", &[("RUSTFLAGS", "-Cdebuginfo=0")])
+            .unwrap();
+        assert_eq!(first.digest, again.digest);
+        assert_eq!(first.flags_digest, again.flags_digest);
+        assert_ne!(first.digest, second.digest);
+        assert_ne!(first.flags_digest, second.flags_digest);
+        assert_ne!(absent.flags_digest, first.flags_digest);
+    }
 }

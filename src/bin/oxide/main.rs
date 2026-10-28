@@ -371,7 +371,13 @@ fn cold_seed_active(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 fn cold_seed_qualification_notice(value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
-    (value == Some(std::ffi::OsStr::new("1")))
+    cold_seed_notice_when(COLD_SEED_QUALIFIED, value)
+}
+
+/// The skip notice is only for an opt-in that the qualification hold refuses.
+/// Once #169 flips the constant, an enabled seed must not print it.
+fn cold_seed_notice_when(qualified: bool, value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    (!qualified && value == Some(std::ffi::OsStr::new("1")))
         .then_some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
 }
 
@@ -986,12 +992,8 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             .is_ok_and(|(status, _, _)| status.is_some_and(|status| status.success()))
             && stopped.is_none()
             && budget::origin().is_none();
-        if let Err(reason) =
-            producing.publish(&store, &held, successful, origin.as_ref(), seed_profile)
-        {
-            store.release(held, None)?;
-            return Err(reason);
-        }
+        // A catalog failure never changes the command's result or origin.
+        producing.publish(&store, &held, successful, origin.as_ref(), seed_profile);
     }
     store.release(held, origin)?;
     let (status, executable, drained) = outcome?;
@@ -1187,12 +1189,8 @@ fn run_owned_program(
         let successful = status.is_some_and(|status| status.success())
             && stopped.is_none()
             && budget::origin().is_none();
-        if let Err(reason) =
-            producing.publish(store, &held, successful, origin.as_ref(), seed_profile)
-        {
-            store.release(held, None)?;
-            return Err(reason);
-        }
+        // A catalog failure never changes the command's result or origin.
+        producing.publish(store, &held, successful, origin.as_ref(), seed_profile);
     }
     store.release(held, origin)?;
     if let Some(origin) = budget::origin() {
@@ -2375,6 +2373,12 @@ mod tests {
         assert_eq!(
             cold_seed_qualification_notice(Some(OsStr::new("1"))),
             Some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
+        );
+        // The flip to qualified (#169) removes the notice with the hold.
+        assert_eq!(cold_seed_notice_when(true, Some(OsStr::new("1"))), None);
+        assert_eq!(
+            cold_seed_notice_when(false, Some(OsStr::new("1"))),
+            cold_seed_qualification_notice(Some(OsStr::new("1")))
         );
     }
 

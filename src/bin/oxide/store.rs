@@ -6015,6 +6015,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_refused_catalog_after_a_successful_build_keeps_the_built_origin() {
+        // A catalog the library refuses (here: the producing record is no
+        // longer ours) must leave the successful generation's trusted origin
+        // and slot intact; the caller ignores the refusal (§4.4, §9.1).
+        let (root, store, donor_key) = seed_fixture();
+        let mut donor = seed_fixture_lease(&store, &donor_key);
+        let record_id = donor.record_id();
+        let origin = Built::Affine(donor_key.checkout.clone());
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let cache = oxide_storage::seed_source::SourceCache::new(&donor.store_id).unwrap();
+        let lease_id = std::mem::replace(&mut donor.lease_id, "lost-producer".into());
+        let refused = store.publish_seed_catalog(
+            &donor,
+            seed_test_producer(),
+            &lock,
+            &[],
+            &[],
+            SystemTime::now(),
+            process::now_ms(),
+            true,
+            Some(&origin),
+            "debug",
+            &cache,
+        );
+        assert!(refused.is_err());
+        donor.lease_id = lease_id;
+        assert!(!store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", donor.slot_id))
+            .exists());
+        store.release(donor, Some(origin)).unwrap();
+        let state = store.load().unwrap();
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == record_id)
+            .unwrap();
+        assert!(matches!(
+            store.trusted_origin(record),
+            Some(Built::Affine(path)) if path == donor_key.checkout
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn seed_removable_and_empty_allowlist_skip_without_side_effects() {
         let (root, mut store, key) = seed_fixture();
         let held = lease(&store, &key, None).expect("fresh lease");

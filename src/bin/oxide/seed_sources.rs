@@ -280,8 +280,11 @@ impl Production {
         )
     }
 
-    /// Called only after positive writer closure. Incomplete source evidence
-    /// makes individual packages ineligible; unknown Git closure refuses.
+    /// Called only after positive writer closure. Every failure here (an
+    /// unreadable tree, a sidecar cap, a lost record) writes no catalog and
+    /// returns: the build that already succeeded keeps its result and its
+    /// trusted origin, and the slot simply never donates (§4.4, §9.1).
+    /// Incomplete source evidence makes individual packages ineligible.
     pub fn publish(
         mut self,
         store: &crate::store::Store,
@@ -289,13 +292,14 @@ impl Production {
         successful: bool,
         origin: Option<&crate::freshness::Built>,
         profile: &str,
-    ) -> Result<(), String> {
+    ) {
         if !successful || origin.is_none() {
-            return Ok(());
+            return;
         }
-        let after = verify_pass(&self.cargo_home, &self.lock.eligible, &mut self.cache)
-            .map_err(str::to_owned)?;
-        store.publish_seed_catalog(
+        let Ok(after) = verify_pass(&self.cargo_home, &self.lock.eligible, &mut self.cache) else {
+            return;
+        };
+        let _ = store.publish_seed_catalog(
             held,
             self.producer,
             &self.lock,
@@ -307,7 +311,7 @@ impl Production {
             origin,
             profile,
             &self.cache,
-        )
+        );
     }
 }
 
