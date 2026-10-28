@@ -420,7 +420,7 @@ Consequences, stated rather than hidden:
 | 3. Git identity needs producing-build evidence | Pre/post content verification plus the producing-window mtime rule and donation re-verification (§4.3); the mtime-preserving adversarial residual is named, not hidden. |
 | 4. Run exclusion can be simpler and less beneficial | Adopted as the frozen rule: the whole run unit and its output are excluded unconditionally, and the reach statement replaces the spike's expectation (§5.2, §12). |
 | 5. One recipient transaction, never import donor trust | Durable untrusted origin, clone-then-verify, abandon-or-refuse, no staging protocol (§6). |
-| 6. Freeze custody at the integration point | Seed point after the nine-grant lease and output binding, before `mark_spawning`; library-scoped donor pin and pool lock (§6.1, §7). |
+| 6. Freeze custody at the integration point | Seed point after the thirteen-grant lease and output binding, before `mark_spawning`; library-scoped donor pin and pool lock (§6.1, §7). |
 | 7. Bounded facts and a deliberate older-binary fence | Separate generation-bound sidecars, strict caps, no control/ledger field and an explicit stop condition if one is needed (§9). |
 | 8. Bounds and executable feasibility | Finite bounds table, honest per-inode accounting and a source-derived (UNMEASURED) proof allocation (§8, §16.4). |
 
@@ -1029,7 +1029,7 @@ After `lease_with_gate` returns a `Prior::Fresh` lease and after
 - `mark_spawning` still happens only once a trusted launch is intended, so
   the existing "Cargo may have run unrecorded" semantics are untouched.
 
-Seeding runs at most **once** per command. It adds no grant to the nine-grant
+Seeding runs at most **once** per command. It adds no grant to the thirteen-grant
 loop, and a gate refusal, eviction or reacquisition never triggers a second
 attempt.
 
@@ -1150,7 +1150,7 @@ plan exists.
    never trusted) and the ordinary journaled `Prior::Unknown` whole-slot
    eviction removes it later. The command then proceeds as an **ordinary cold
    build under normal admission**: the normal wait, host-limit, capacity and
-   reserve start-gate behaviour applies, the ordinary nine-grant loop is
+   reserve start-gate behaviour applies, the ordinary thirteen-grant loop is
    unchanged and **no extra, reserved or failure-specific grant exists**. If
    normal admission waits or refuses, the command follows that outcome.
 8. **Release order.** The library drops the pool lock, then the donor record
@@ -1211,7 +1211,7 @@ in-slot "reset" path at all. The outcome classes are:
   retires the slot instead of marking it idle if the flush fails — and is never
   reused and never built in. The command then continues as an **ordinary cold
   build in a normally admitted slot**: the normal wait, host-limit, capacity and
-  reserve start-gate behaviour and the ordinary nine-grant loop apply, with no
+  reserve start-gate behaviour and the ordinary thirteen-grant loop apply, with no
   extra, reserved or failure-specific grant. If normal admission waits or
   refuses, the command follows that outcome.
 - **After the first clone, every other fault refuses and retains.** A clone,
@@ -1254,7 +1254,7 @@ refusal path takes no second lease, each boundary is named once:
   the lease; there is no second bind, no relink and no gate re-entry. The
   freshness gate already ran before the seed and is not re-run for this
   command.
-- **No grant.** The refusal does not re-enter the lease loop, so the nine-grant
+- **No grant.** The refusal does not re-enter the lease loop, so the thirteen-grant
   bound, the host active-build count and the admission ticket are all
   unchanged; a `--admission-budget`/`--execution-budget` expiry is reported by
   its own existing path.
@@ -1424,7 +1424,7 @@ for an incomplete or failed one. Any bound-limited, ownership, device, boundary,
 read or other failure abandons the seeding attempt: nothing is published, the
 cloned recipient is marked untrusted and retained, and the command proceeds as
 an ordinary cold build under normal admission — normal waits, capacity and
-reserve start-gate behaviour, and the ordinary nine-grant loop, with no extra or
+reserve start-gate behaviour, and the ordinary thirteen-grant loop, with no extra or
 reserved grant. The retained generation is never reused; the ordinary journaled
 `Prior::Unknown` eviction removes it later, and until then it is not counted as
 zero (the next admission walks a held slot fresh, and an idle untrusted slot is

@@ -152,7 +152,7 @@ physical-core formula or its fallback; see the workflow's
 [user configuration](workflow.md#budget-only-default-pool-and-user-configuration).
 
 The library also exports `evict_idle_slot` for Oxide's per-project slot cap
-(eight slots per project identity; [workflow](workflow.md#storage-and-space-management)).
+(twelve slots per project identity, oxide#177; [workflow](workflow.md#storage-and-space-management)).
 It retires one recorded idle slot whole through the same durable eviction path
 as capacity eviction, and returns busy for a held slot. The CLI does not
 expose it. Ledger v1, receipt v2, JSON and exits are unchanged. An earlier
@@ -272,7 +272,7 @@ the recorded one) and the [storage inventory](storage-inventory.md)
 unique-allocated figure for owned slots, a `(device, inode)` union so a hard
 link counts once; filesystem metadata directories remain outside that slot
 accounting. Control/ledger headroom stays outside the payload and is bounded
-(`MAX_LEDGER_BYTES` 2 MiB, `MAX_SLOTS` 128). Eviction happens only at lease
+(`MAX_LEDGER_BYTES` 4 MiB, `MAX_SLOTS` 256). Eviction happens only at lease
 time and only for known owned idle whole slots, in the pool's recorded
 least-recently-used order (oxide#118, [below](#slot-headroom-and-ranked-idle-replacement-oxide118)). Held occupancy, foreign
 entries, symlinked pool/payload/slots/slot roots, unknown accounting and
@@ -435,9 +435,10 @@ Only a slot whose own walk completes can be reused; other
 backing failures, foreign entries) are unchanged.
 
 The bounds are finite, not an arbitrary-size guarantee. The entry bound
-covers 128 slots of about 15,600 entries each, not the 60,657-entry
-single-project slot reported for Farmyard (2026-10-20); a pool beyond it
-refuses until idle slots are evicted or cleaned. A walk over a slow or cold volume can reach the deadline;
+covers about 7,800 entries in each of a full 256-slot pool, not the
+60,657-entry single-project slot reported for Farmyard (2026-10-20); a pool
+beyond it refuses until idle slots are evicted or cleaned. A walk over a slow
+or cold volume can reach the deadline;
 `status` reports each walk's elapsed time. One admission may walk the payload
 more than once (the front door's `status`, then the library's admission
 walk), so its cost grows with pool size. The 50,000-entry, depth-24, 5 s
@@ -539,7 +540,7 @@ walk with a different generation. Neither entry point persists anything.
 The front door records one diagnostic fact from the reuse walk an acquiring
 command already makes, in
 `<pool>/oxide-managed/status-observations.json` (schema
-`oxide.status-observations/1`, ≤256 KiB, 128 retained recent facts, each
+`oxide.status-observations/1`, ≤512 KiB, 256 retained recent facts, each
 bound to store ID, slot ID, incarnation, exact recorded directory, wall-clock
 time, allocated bytes, source and measuring lease). The sidecar is an
 auxiliary diagnostic inside an already-tolerated directory: it bumps no core
@@ -551,33 +552,53 @@ never persists.
 
 ### Slot headroom and ranked idle replacement (oxide#118)
 
-Implemented from the approved Queue brief (Tom, 2026-10-26: "Oh yeah, raise
-the slots!", then "Ah yeah, switch to your solution"). Slot headroom only:
-`MAX_SLOTS` is 128 and Oxide's project cap is eight; neither build concurrency
-nor `max_active` changed, and there is no new configuration.
+Implemented from the approved Queue briefs (Tom, 2026-10-26: "Oh yeah, raise
+the slots!", then "Ah yeah, switch to your solution"; Tom, 2026-10-28 raised
+the ceiling in oxide#177: 256 pool slots and twelve per project). Slot headroom
+only: `MAX_SLOTS` is 256 and Oxide's project cap is twelve; neither build
+concurrency nor `max_active` changed, there is no new configuration, and the
+soft byte budget and the 95 GB registered reserve are unchanged.
 
-**Representation.** `MAX_LEDGER_BYTES` is 2 MiB. Every bounded field keeps its
+**Representation.** `MAX_LEDGER_BYTES` is 4 MiB. Every bounded field keeps its
 cap: paths 1024 bytes, holder 128, lease ID 160, slot directory component 80.
 A compact JSON ledger with every field at its ceiling, escaped sixfold and
-with 20-digit integers, is proven by a unit test to fit the cap and round-trip.
-Control state is bounded separately: 256 records, 128 wait tickets, 128 clean
-marks, 16 recoveries, 16 flushes, per-object compact ceilings (record 40 KiB,
-recovery 9 KiB, holder 5 KiB, lost 8 KiB, flush 8 KiB, clean 7 KiB, ticket
-128 B, state header 4 KiB) and a 16 MiB file, whose gross object sum is
-11,702,272 bytes. The two representations are envelopes for valid state, not
-a total control-directory bound: preexisting orphan origins and crash-left
-`ledger.tmp-*` files stay outside them, and nothing here authorizes cleanup.
+with 20-digit integers, is proven by a unit test to fit the cap and round-trip;
+at the 256-slot ceiling it is about 3.9 MB. Control state is bounded
+separately: 512 records (one per slot with the previous 2× headroom), 128 wait
+tickets, 128 clean marks, 16 recoveries, 16 flushes, per-object compact
+ceilings (record 40 KiB, recovery 9 KiB, holder 5 KiB, lost 8 KiB, flush
+8 KiB, clean 7 KiB, ticket 128 B, state header 4 KiB) and a 32 MiB file,
+whose gross object sum is 22,188,032 bytes. Wait tickets and clean marks stay
+at 128 because they bound concurrent waiting commands, not slots. Ranks and
+slot IDs keep their full `u64` headroom with checked exhaustion; the ceiling
+raise changes no ID bound. The two representations are envelopes for valid
+state, not a total control-directory bound: preexisting orphan origins and
+crash-left `ledger.tmp-*` files stay outside them, and nothing here authorizes
+cleanup.
 
 **Permanent fences.** A legacy ledger (no `capacity_policy`/`next_rank`, rank
 0) and a version-1 control state stay readable and are never migrated by
 `status`. The first revised grant, release or recovery, or an explicit
-eviction, installs the library ledger's `capacity_policy: 1` fence and rank
-sequence atomically with that mutation; every Store-controlled mutation writes
-control `version: 2`. A completed legacy `Evicting` reconciliation may still
-finish in the legacy representation. Old binaries refuse the fenced
-representations. Before a revised write, every stored field is validated
-against the raised caps; an oversized legacy field refuses with the original
-file, ownership and quarantine bytes untouched, never truncated or dropped.
+eviction, installs the library ledger's `capacity_policy: 2` fence (the
+recorded-accounting representation, oxide#146) and rank sequence atomically
+with that mutation; the Store-controlled mutation's own recorded-accounting
+control fence is already durable first (see
+[recorded per-slot accounting](#recorded-per-slot-accounting-oxide146-implemented-native-held)).
+A slot table above the legacy 128 carries `capacity_policy: 3` (oxide#177),
+written forward-only, in the same atomic replacement that first records the
+129th slot. An older binary's policy check accepts only 1 and 2, so it refuses
+a `3` ledger with `unknown_accounting` (exit 3) before any mutation; a ledger
+above 128 slots without the fence is a state no writer produces and refuses
+too. A pool that stays at or below 128 slots never carries `3`, so its ledger
+stays readable by an older binary, and the control-state hand-off version is
+unchanged: refusing, not handing off, is the required mixed-version behaviour
+for a slot table an older binary cannot represent, while the existing
+version-5 fence keeps the [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122)
+working exactly as documented. A completed legacy `Evicting` reconciliation
+may still finish in the legacy representation. Before a revised write, every
+stored field is validated against the raised caps; an oversized legacy field
+refuses with the original file, ownership and quarantine bytes untouched,
+never truncated or dropped.
 
 **Hand-off trigger.** The numeric `version` of a control `state.json` (the
 internal pool's and the removable pool's) and of `removable.json` is also the
@@ -617,7 +638,7 @@ the entries it saw initially. Held, retired, uncertain (live or unattributable
 lock), foreign and unmeasurable slots are never eligible, and a safety failure
 stops admission instead of skipping to another slot. With no safely eligible
 idle slot, the lease refuses honestly; it does not promise a deletion through
-a failed safety gate. At the eight-slot project ceiling Oxide replaces that
+a failed safety gate. At the twelve-slot project ceiling Oxide replaces that
 project's oldest eligible idle whole slot, which also frees pool capacity.
 The front door chooses that victim by recorded rank but asks the library to
 retire it as part of the same admission: the count-pressure gate of the
@@ -628,24 +649,29 @@ input.
 A command waits only when a specific held compatible slot of its own checkout
 exists under the existing identity and freshness rules; an unrelated build's
 completion is not assumed to free a count or byte ceiling. The freshness loop
-is bounded at nine grants: the eight project slots a refusal can try plus one
-cold fallback, with sharing off after the first refusal and the existing
+is bounded at thirteen grants: the twelve project slots a refusal can try plus
+one cold fallback, with sharing off after the first refusal and the existing
 discard/unshare before reacquisition.
 
 **Proof and evidence.** `effigy rust:slot-headroom` under the qualified shared
-supervisor covers the fences, no-migration reads, rank exhaustion, a 128-slot
-pool's 129th and 130th replacements, the eight-slot project cap with a specific
+supervisor covers the fences, no-migration reads, rank exhaustion, a 256-slot
+pool's 257th and 258th replacements, the twelve-slot project cap with a specific
 held-slot wait and one LRU idle replacement, compatible reuse, no eviction
 below both ceilings, byte-pressure LRU with a held slot excluded, and a
 foreign payload-entry refusal. It also drives a project replacement whose
 payload walk is incomplete (a depth-bound gap) and checks that the victim
 survives and membership is unchanged; every fixture child stays in the
 qualified supervisor's session and the script starts no session or group of
-its own, so the runner owns closure on any fault. The worst-valid
+its own, so the runner owns closure on any fault. With every slot's record
+current it also checks oxide#177's accounting-cost gate: a new-slot admission
+at 256 walks no inventory, the evicted slot is never walked, a release walks
+only its own slot, and default `status` at 256 walks nothing. The worst-valid
 ledger/control serialization, escaped round-trip and oversized-field refusals
-are unit tests in `effigy test rust`. Not covered natively: the nine-grant
-freshness bound is a bounded-loop inspection, and no large live inventory or
-physical multi-million-entry performance is claimed.
+are unit tests in `effigy test rust`, as is a fixed 50 ms ceiling on a
+128-slot and a 256-slot ledger's bounded read, ranked ordering and atomic
+write. Not covered natively: the thirteen-grant freshness bound is a
+bounded-loop inspection, and no large live inventory or physical
+multi-million-entry performance is claimed.
 
 ### Recorded per-slot accounting (oxide#146: implemented, native held)
 
@@ -730,12 +756,13 @@ and the freshly stamped rank. It is cleared in the same replacement as every
 transition out of `Idle` (`take_idle`, `retire_idle_slot` → `Evicting`). It is
 never written for a `Held` slot and never adopted across incarnations.
 
-Size. `MAX_LEDGER_BYTES` stays 2 MiB and is not raised. The new record costs at
-most `128 × (``"recorded":{…}`` ≈ 960 escaped lease bytes + 4 × 20-digit
-integers)`, about 131 KiB at every bounded field's ceiling. Phase B extends the
-existing worst-valid-ledger unit proof (oxide#118) to include the record; if
-that proof cannot fit 2 MiB, a **fit blocker is reported** and the bound is not
-silently raised.
+Size. At the 128-slot ceiling `MAX_LEDGER_BYTES` stayed 2 MiB and the record
+cost at most `128 × (``"recorded":{…}`` ≈ 960 escaped lease bytes + 4 × 20-digit
+integers)`, about 131 KiB at every bounded field's ceiling; oxide#177 later
+raised the cap to 4 MiB with the 256-slot ceiling (see the slot-headroom
+representation above), and the worst-valid-ledger unit proof carries the
+record there. If a future proof cannot fit the cap, a **fit blocker is
+reported** and the bound is not silently raised.
 
 #### Validity: what makes a record current
 
@@ -867,7 +894,7 @@ the proof oracles) so "zero inventory walks" stays a checkable claim.
 
 One cumulative `ACCOUNTING_MAX_ELAPSED_MS` (60 s) deadline covers every walk of
 one admission, via the existing `walk_limits`/`deadline` mechanism `measure`
-already uses, so a legacy 128-slot pool cannot turn one admission into 128
+already uses, so a legacy 256-slot pool cannot turn one admission into 256
 fresh minutes. Slots the deadline leaves unmeasured stay unrecorded and the
 admission refuses `unknown_accounting` naming `elapsed_deadline` — today's
 refusal for the same pool, arrived at by slot walks instead of one union walk.
@@ -950,7 +977,7 @@ sources, which are never mixed:
 | Source | What it is | Shown as |
 | --- | --- | --- |
 | **Ledger record** (this design) | the admission basis, written by releases and recorded admissions | per-slot bytes with `recorded` / `unrecorded`, and one pool `recorded total` over `recorded n of m slots` |
-| **`oxide-managed/status-observations.json`** (oxide#128) | a diagnostic reuse-walk fact, up to 256 KiB / 128 facts | the existing per-slot line with its age, source and lease, or `not measured` |
+| **`oxide-managed/status-observations.json`** (oxide#128) | a diagnostic reuse-walk fact, up to 512 KiB / 256 facts | the existing per-slot line with its age, source and lease, or `not measured` |
 
 The two are labelled separately and never summed into one number: the #128
 sidecar stays ineligible for a pool total, and the ledger total never borrows a
@@ -1079,7 +1106,7 @@ decision mocks where a real path exists:
 6. **Non-zero/zero discipline.** Malformed, oversized, unknown, stale,
    mismatched-incarnation and unsupported records are never zero; a measured
    zero stays a measured zero; an incomplete walk refuses with its gap kinds.
-7. **Serialization.** Worst-valid 128-record ledger round-trips under
+7. **Serialization.** Worst-valid 256-slot ledger round-trips under
    `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
 8. **Compatibility.** `capacity_policy: 1`, legacy (no fence) and `2` ledgers;
    held IDs preserved; the control fence is `STATE_VERSION` 5 written by the
@@ -1111,10 +1138,10 @@ shared supervisor): tiny private fixtures only, debug staging with
   count-replacement branch of the same `evict_one_idle` / `retire_idle_slot`
   code is proved by the library regression
   `pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count`, which now
-  asserts an empty walk log: neither the 128-slot pool ceiling nor the 8-slot
-  project cap has a cheap CLI fixture, and `OXIDE_POOL_CAP` is a byte budget,
-  not a slot count. Byte pressure in the CLI proof comes from that documented
-  budget at pool creation, never from a proof-invented variable;
+  asserts an empty walk log: neither the 256-slot pool ceiling nor the
+  twelve-slot project cap has a cheap CLI fixture, and `OXIDE_POOL_CAP` is a
+  byte budget, not a slot count. Byte pressure in the CLI proof comes from that
+  documented budget at pool creation, never from a proof-invented variable;
 - B: one unrecorded idle slot → exactly one slot walk, published, and the
   second admission of the same shape walks nothing;
 - C: release publishes a record and the next reuse clears it, with the result
@@ -1419,7 +1446,8 @@ symlinks. These limits are separate from its observed reuse result.
 - Holder ≤ 128 printable ASCII bytes without `/`
 - Paths ≤ 1024 bytes, absolute, canonical, no symlinks
 - Status output default 65536 bytes (minimum 64)
-- Finite slots 128 and a 2 MiB ledger; new slots refuse at exhaustion rather than dropping active state
+- Finite slots 256 (a ledger above 128 carries `capacity_policy: 3`) and a
+  4 MiB ledger; new slots refuse at exhaustion rather than dropping active state
 - Init refuses a declared cap that differs from the image size; pre-rule pools
   refuse as mismatched backing without migration
 

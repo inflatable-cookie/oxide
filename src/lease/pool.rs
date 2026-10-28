@@ -13,8 +13,9 @@ use super::{
     MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact, RecordedVolume,
     ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH,
     ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CAPACITY_POLICY_VERSION, CONFIG_NAME,
-    LEASE_VERSION, LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    LEASE_VERSION, LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME,
+    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS,
+    RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{
@@ -1169,13 +1170,27 @@ impl Pool {
     }
 
     /// A revised mutation: install the permanent capacity-policy fence if
-    /// this ledger predates it, validate every stored field against the
+    /// this ledger predates it, raise that fence when the slot table now
+    /// exceeds the legacy ceiling, validate every stored field against the
     /// raised caps, then replace the ledger atomically. Legacy representation
     /// is never migrated by a read-only observer or by reconciliation alone.
     fn persist_revised(&mut self) -> Result<(), LeaseError> {
         self.ensure_capacity_policy()?;
+        self.raise_capacity_policy_if_needed();
         validate_ledger_write(&self.ledger)?;
         self.persist()
+    }
+
+    /// The raised-ceiling fence (oxide#177) is written forward-only, in the
+    /// same atomic replacement that first records more than
+    /// [`LEGACY_MAX_SLOTS`] slots, so an older binary refuses the ledger
+    /// before it can act on a slot table it cannot represent. Nothing is
+    /// written below that count: a pool at or under 128 slots keeps a fence
+    /// an older binary still reads.
+    fn raise_capacity_policy_if_needed(&mut self) {
+        if self.ledger.slots.len() > LEGACY_MAX_SLOTS {
+            self.ledger.capacity_policy = Some(RAISED_CAPACITY_POLICY_VERSION);
+        }
     }
 
     /// Add the permanent capacity-policy fence to an in-memory ledger that
@@ -1202,7 +1217,10 @@ impl Pool {
         if self.ledger.capacity_policy == Some(LEGACY_CAPACITY_POLICY_VERSION) {
             self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
         }
-        if self.ledger.capacity_policy != Some(CAPACITY_POLICY_VERSION) {
+        if !matches!(
+            self.ledger.capacity_policy,
+            Some(CAPACITY_POLICY_VERSION) | Some(RAISED_CAPACITY_POLICY_VERSION)
+        ) {
             return Err(LeaseError::UnknownAccounting);
         }
         Ok(())
@@ -4047,8 +4065,17 @@ fn write_ledger(pool: &Path, ledger: &Ledger) -> Result<(), LeaseError> {
 /// Read-side shape checks: identities, the recorded slot path and the
 /// capacity-policy/rank fields. Legacy ledgers have no policy fence and rank
 /// 0 everywhere; a rank without its fence is not a representation this
-/// version wrote.
+/// version wrote. A slot count above the legacy ceiling always carries the
+/// raised-ceiling fence (oxide#177), so an older binary refuses it.
 fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
+    if ledger.slots.len() > MAX_SLOTS {
+        return Err(LeaseError::LedgerExhausted);
+    }
+    if ledger.slots.len() > LEGACY_MAX_SLOTS
+        && ledger.capacity_policy != Some(RAISED_CAPACITY_POLICY_VERSION)
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
     match (ledger.capacity_policy, ledger.next_rank) {
         (None, None) => {
             if ledger.slots.iter().any(|slot| slot.rank != 0) {
@@ -4059,16 +4086,20 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
             }
         }
         (Some(policy), Some(next)) => {
-            if (policy != LEGACY_CAPACITY_POLICY_VERSION && policy != CAPACITY_POLICY_VERSION)
-                || next == 0
+            if !matches!(
+                policy,
+                LEGACY_CAPACITY_POLICY_VERSION
+                    | CAPACITY_POLICY_VERSION
+                    | RAISED_CAPACITY_POLICY_VERSION
+            ) || next == 0
             {
                 return Err(LeaseError::UnknownAccounting);
             }
             if ledger.slots.iter().any(|slot| slot.rank >= next) {
                 return Err(LeaseError::UnknownAccounting);
             }
-            // Only the version-2 representation writes records: a version-1
-            // ledger holding one is a state no writer can produce.
+            // Only the version-2 and later representations write records: a
+            // version-1 ledger holding one is a state no writer can produce.
             if policy == LEGACY_CAPACITY_POLICY_VERSION
                 && ledger.slots.iter().any(|slot| slot.recorded.is_some())
             {
@@ -5034,8 +5065,10 @@ mod removable_pool_path_tests {
 #[cfg(test)]
 mod recorded_ledger_tests {
     use super::{validate_ledger_read, Ledger, RecordedSize, SlotPersistState};
+    use crate::lease::LeaseError;
     use crate::lease::{
         Profile, CAPACITY_POLICY_VERSION, LEASE_VERSION, LEGACY_CAPACITY_POLICY_VERSION,
+        LEGACY_MAX_SLOTS, RAISED_CAPACITY_POLICY_VERSION,
     };
     use std::path::PathBuf;
 
@@ -5116,10 +5149,59 @@ mod recorded_ledger_tests {
             true
         ))
         .is_err());
+        // The raised-ceiling fence (oxide#177) carries the same record shape
+        // and stays readable when a pool shrinks back below the legacy
+        // ceiling.
+        assert!(validate_ledger_read(&ledger(
+            Some(RAISED_CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Idle,
+            true
+        ))
+        .is_ok());
         // An unknown fence value refuses, and a legacy ledger holding a record
         // refuses too.
-        assert!(validate_ledger_read(&ledger(Some(3), 1, SlotPersistState::Idle, false)).is_err());
+        assert!(validate_ledger_read(&ledger(Some(4), 1, SlotPersistState::Idle, false)).is_err());
         assert!(validate_ledger_read(&ledger(None, 0, SlotPersistState::Idle, true)).is_err());
+    }
+
+    /// A slot table above the legacy ceiling always carries the raised fence
+    /// (oxide#177). Without it the ledger is a state no writer produces, so a
+    /// reader that would not recognise the fence cannot silently accept a
+    /// 256-slot table.
+    #[test]
+    fn a_slot_table_above_the_legacy_ceiling_requires_the_raised_fence() {
+        let mut fenced = ledger(
+            Some(RAISED_CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Idle,
+            false,
+        );
+        fenced.slots = (1..=LEGACY_MAX_SLOTS as u64 + 1)
+            .map(|id| {
+                let mut slot = fenced.slots[0].clone();
+                slot.id = id;
+                slot.rank = id;
+                slot.last_lease_id = format!("v1.a.{id}.1.1");
+                slot
+            })
+            .collect();
+        fenced.next_slot = LEGACY_MAX_SLOTS as u64 + 2;
+        fenced.next_rank = Some(LEGACY_MAX_SLOTS as u64 + 2);
+        assert!(validate_ledger_read(&fenced).is_ok());
+
+        // The same table under the version-2 fence is refused on read, so an
+        // older binary's stricter check is never the only guard.
+        let mut unfenced = fenced.clone();
+        unfenced.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+        assert_eq!(
+            validate_ledger_read(&unfenced).unwrap_err(),
+            crate::lease::LeaseError::UnknownAccounting
+        );
+        // Exactly the legacy ceiling still reads under the version-2 fence.
+        let mut at_ceiling = unfenced;
+        at_ceiling.slots.pop();
+        assert!(validate_ledger_read(&at_ceiling).is_ok());
     }
 
     /// A root-capture record belongs to a recorded deletion and nowhere else,

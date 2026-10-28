@@ -133,8 +133,9 @@ pub const SEED_WORK_BUDGET_MS: u64 = 5_000;
 /// The front door's control-state version this module can classify. Any other
 /// value is unknown custody, never a guess.
 const CONTROL_STATE_VERSION: u32 = 5;
-/// The control state's whole-file bound, matching the front door's own.
-const CONTROL_STATE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// The control state's whole-file bound, matching the front door's own
+/// (32 MiB since oxide#177's 512-record, 256-slot ceiling).
+const CONTROL_STATE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// The post-clone recipient walk's bounds: the capacity contract's slot walk.
 pub const SEED_WALK_MAX_ENTRIES: u64 = 2_000_000;
 pub const SEED_WALK_MAX_DEPTH: usize = 64;

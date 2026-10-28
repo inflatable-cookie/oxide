@@ -52,15 +52,18 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
 /// Slots one project identity may keep; a new checkout or a command with no
 /// idle compatible slot replaces the least-recently-used eligible idle whole
-/// slot of that project (oxide#118).
-const PROJECT_SLOT_CAP: usize = 8;
+/// slot of that project (oxide#118, raised to twelve by oxide#177).
+pub(crate) const PROJECT_SLOT_CAP: usize = 12;
 const MAX_TICKETS: usize = 128;
 const MAX_CLEANS: usize = 128;
-const MAX_RECORDS: usize = 256;
+/// Control records: one per slot with the previous 2× headroom over the slot
+/// ceiling, so a full 256-slot pool plus slotless and replaced records stays
+/// representable (oxide#177).
+const MAX_RECORDS: usize = 512;
 /// Automatic recoveries kept for `oxide status`, newest last.
 const MAX_RECOVERIES: usize = 16;
 /// Finite control-state file size including the atomic temp.
-pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 /// Legacy control-state files keep their original read limit until the
 /// permanent version-2 fence is actually written.
 const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
@@ -111,8 +114,8 @@ const MAX_STATE_SLOT_ID_BYTES: usize = 160;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 
 /// Compact serialized object ceilings, so the record-count bound and the
-/// byte bound hold together: 256*40960 + 128*128 + 128*7168 + 16*9216 +
-/// 16*8192 + 4096 = 11,702,272 bytes < MAX_STATE_BYTES.
+/// byte bound hold together: 512*40960 + 128*128 + 128*7168 + 16*9216 +
+/// 16*8192 + 4096 = 22,188,032 bytes < MAX_STATE_BYTES (oxide#177).
 const MAX_RECORD_OBJECT_BYTES: usize = 40 * 1024;
 const MAX_TICKET_OBJECT_BYTES: usize = 128;
 const MAX_CLEAN_OBJECT_BYTES: usize = 7 * 1024;
@@ -1236,9 +1239,10 @@ const OBSERVATIONS_SCHEMA: &str = "oxide.status-observations/1";
 const OBSERVATIONS_NAME: &str = "status-observations.json";
 const OBSERVATIONS_TEMP: &str = "status-observations.json.tmp";
 /// The sidecar's whole-file bound and retained observation count. The count
-/// is at least the pool's slot ceiling, so it never lowers real capacity.
-const MAX_OBSERVATIONS_BYTES: u64 = 256 * 1024;
-const MAX_OBSERVATIONS: usize = 128;
+/// is at least the pool's slot ceiling, so it never lowers real capacity
+/// (256 facts at the 256-slot ceiling, oxide#177).
+const MAX_OBSERVATIONS_BYTES: u64 = 512 * 1024;
+const MAX_OBSERVATIONS: usize = 256;
 
 /// One recorded size fact, bound to exactly one slot generation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4340,9 +4344,10 @@ impl Store {
             // or uncertain (a live or unattributable lock) is never a
             // candidate; foreign and unmeasurable slots fail the library's
             // own ownership and accounting checks.
-            // The eight-slot project cap counts **normal** slots only (design
-            // §5.3): a one-use slot never consumes one of a repository's eight
-            // normal slots, and deleting one can never relieve that cap.
+            // The twelve-slot project cap counts **normal** slots only
+            // (design §5.3): a one-use slot never consumes one of a
+            // repository's twelve normal slots, and deleting one can never
+            // relieve that cap.
             let mut candidates: Vec<(u64, u64, u64, String)> = state
                 .records
                 .iter()
@@ -4392,8 +4397,9 @@ impl Store {
             });
             // The cap is a **normal**-slot cap and only a normal admission
             // enters it (§5.3): a one-use slot never consumes one of a
-            // repository's eight normal slots, deleting one can never relieve
-            // that cap (the candidate list below holds no one-use record), and
+            // repository's twelve normal slots, deleting one can never
+            // relieve that cap (the candidate list below holds no one-use
+            // record), and
             // a temporary clone of the same repository therefore no longer
             // competes with its normal checkouts for it. A one-use admission's
             // slot count is bounded by the slice (slice S3) and by `MAX_SLOTS`.
@@ -9483,11 +9489,13 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Retention keeps at most 128 observations, deterministically choosing
-    /// the most recent, so a pool at its slot ceiling still fits.
+    /// Retention keeps at most [`MAX_OBSERVATIONS`] observations,
+    /// deterministically choosing the most recent, so a pool at its slot
+    /// ceiling still fits.
     #[test]
     fn observation_retention_keeps_the_newest_deterministically() {
-        let mut observations: Vec<Observation> = (0..140)
+        let count = MAX_OBSERVATIONS + 12;
+        let mut observations: Vec<Observation> = (0..count)
             .map(|index| {
                 let slot = ledger_slot(&format!("{index}"), "1", None);
                 observation(&slot, 1_000 + index as u64)
@@ -9499,11 +9507,12 @@ pub(crate) mod tests {
             observations.first().map(|item| item.slot_id.as_str()),
             Some("12")
         );
+        let newest = (count - 1).to_string();
         assert_eq!(
             observations.last().map(|item| item.slot_id.as_str()),
-            Some("139")
+            Some(newest.as_str())
         );
-        let mut again: Vec<Observation> = (0..140)
+        let mut again: Vec<Observation> = (0..count)
             .rev()
             .map(|index| {
                 let slot = ledger_slot(&format!("{index}"), "1", None);
@@ -9638,8 +9647,8 @@ pub(crate) mod tests {
         assert!(store.record_observation(observation(&slot, 30)).is_err());
         assert_eq!(fs::read(&path).unwrap(), foreign);
 
-        // The worst case the file allows still fits its byte bound: 128
-        // observations with every bounded field at its ceiling.
+        // The worst case the file allows still fits its byte bound: every
+        // retained observation with every bounded field at its ceiling.
         let mut document = Observations {
             schema: OBSERVATIONS_SCHEMA.to_owned(),
             observations: Vec::new(),
@@ -10010,7 +10019,7 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The eight-slot project cap counts **normal** slots only (§5.3): a
+    /// The twelve-slot project cap counts **normal** slots only (§5.3): a
     /// one-use admission is never blocked by it, and a one-use slot never
     /// relieves it — the cap path can only evict a normal slot, and it refuses
     /// honestly when none is safe.
@@ -10035,7 +10044,7 @@ pub(crate) mod tests {
             lease_as(&store, &key, WorkspaceAdmission::NORMAL, false),
             Err(Wait::Checkout)
         ));
-        // A one-use command is not blocked by eight normal slots of this
+        // A one-use command is not blocked by twelve normal slots of this
         // repository; it takes its own record and its own slot.
         let one_use = lease_as(
             &store,

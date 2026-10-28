@@ -971,9 +971,9 @@ explicit `recover` unless they adopt it.
   may grow past it while real free space holds. Only whole idle slots are
   evicted. The APFS sparse-image backend is retired (oxide#102).
 - The first command creates the pool automatically ([W-1](#open-decisions)).
-- Slot headroom (oxide#118): up to 128 slots per pool and eight per project
-  identity, with compatible reuse first and the oldest eligible idle whole
-  slot replaced under count or byte pressure
+- Slot headroom (oxide#118, oxide#177): up to 256 slots per pool and twelve
+  per project identity, with compatible reuse first and the oldest eligible
+  idle whole slot replaced under count or byte pressure
   ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
   A host-wide limit still bounds concurrent Cargo invocations
   ([W-2](#open-decisions)). Queue/Nucleus still decide which tasks run. Oxide
@@ -1010,7 +1010,7 @@ explicit `recover` unless they adopt it.
   approval. Nothing inside a slot is ever deleted.
 - Recorded observations live in the auxiliary
   `<pool>/oxide-managed/status-observations.json` sidecar (schema
-  `oxide.status-observations/1`, at most 256 KiB and 128 retained recent
+  `oxide.status-observations/1`, at most 512 KiB and 256 retained recent
   facts). It is diagnostic, not pool, ledger, registration or receipt format:
   an older binary may ignore it. Each fact binds `store_id`, slot ID,
   incarnation, the exact recorded directory, wall-clock time, allocated
@@ -3867,22 +3867,25 @@ Rules:
   device refuses.
 - **Admission.** The ledger's rules with this command's soft budget
   (`LeaseRequest.budget_bytes`, else the recorded one) as the cap, and the
-  raised `MAX_SLOTS` 128 / 2 MiB ledger representation
-  ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
+  raised `MAX_SLOTS` 256 / 4 MiB ledger representation (oxide#177;
+  [local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
   A compatible idle slot is reused first and kept warm; the half-budget
   recycling rule is retired. A new slot replaces the least-recently-used
   eligible idle whole slot in two distinct cases: **count** pressure at the
-  128-slot pool ceiling or the eight-slot project ceiling, authorised on a
+  256-slot pool ceiling or the twelve-slot project ceiling, authorised on a
   complete pool figure or a removable pool's bound-only unknown; and
   **recorded byte** pressure, when the attributable pool sum — never the
-  shared volume's total — is at or above the budget. It remeasures after each
-  deletion and refuses `Full` when only held slots remain. A removable pool
-  whose own size is unknown takes the reserve/floor route instead of a byte-cap
-  comparison. Held, uncertain, foreign and unmeasurable slots are never
-  eligible, a safety failure stops admission instead of skipping, and the
-  audit walks behind `status --measure` are not admission input. Nothing
-  enforces the budget while a build writes; a build can pass it, and the next
-  new slot evicts.
+  shared volume's total — is at or above the budget. A ledger whose slot
+  table exceeds 128 carries the forward-only `capacity_policy: 3` fence, so
+  an older binary refuses it at ledger read before any mutation; a pool at or
+  below 128 slots keeps the fence an older binary still reads. It remeasures
+  after each deletion and refuses `Full` when only held slots remain. A
+  removable pool whose own size is unknown takes the reserve/floor route
+  instead of a byte-cap comparison. Held, uncertain, foreign and unmeasurable
+  slots are never eligible, a safety failure stops admission instead of
+  skipping, and the audit walks behind `status --measure` are not admission
+  input. Nothing enforces the budget while a build writes; a build can pass
+  it, and the next new slot evicts.
 - **Watchdog.** Only on a directory pool, only while Oxide supervises a
   leased Cargo group (build and `run` build, `test` execution, building
   passthrough). It samples `statfs` `f_bavail` of the payload directory
@@ -3906,17 +3909,21 @@ Rules:
   overrides the soft budget above every other source. Release builds ignore
   both. The reserve and
   margin have no override.
-- **Slot headroom proof (oxide#118).** `effigy rust:slot-headroom` under the
-  qualified shared proof supervisor stages `oxide` offline with 1.97.1 and
-  proves the permanent ledger/control fences, a legacy read without migration,
-  rank exhaustion before any transition, a 128-slot pool whose 129th and 130th
-  admissions replace the rank-LRU idle whole slot without churn, the eight-slot
-  project cap with a specific held-slot wait and one LRU idle replacement,
-  compatible reuse first, no eviction below both ceilings, byte-pressure LRU
-  with a held slot excluded, and a foreign payload-entry refusal. Worst-valid
-  ledger/control serialization, round-trip and oversized-field refusals are
-  unit tests. The nine-grant freshness bound is a bounded-loop inspection, not
-  a separately induced native case.
+- **Slot headroom proof (oxide#118, oxide#177).** `effigy rust:slot-headroom`
+  under the qualified shared proof supervisor stages `oxide` offline with
+  1.97.1 and proves the permanent ledger/control fences, a legacy read
+  without migration, rank exhaustion before any transition, a 256-slot pool
+  whose 257th and 258th admissions replace the rank-LRU idle whole slot
+  without churn, the twelve-slot project cap with a specific held-slot wait
+  and one LRU idle replacement, compatible reuse first, no eviction below
+  both ceilings, byte-pressure LRU with a held slot excluded, and a foreign
+  payload-entry refusal. With every slot's record current it also checks
+  oxide#177's accounting-cost gate: a new-slot admission at 256 walks no
+  inventory, the evicted slot is never walked, a release walks only its own
+  slot, and default `status` at 256 walks nothing. Worst-valid ledger/control
+  serialization, round-trip and oversized-field refusals are unit tests. The
+  thirteen-grant freshness bound is a bounded-loop inspection, not a
+  separately induced native case.
 - **Proof.** Current: `effigy rust:oxide-budget-default`
   ([above](#budget-only-default-pool-and-user-configuration)). Historical,
   before the CLI's retirement: `effigy rust:oxide-cli` added a macOS case on two scratch

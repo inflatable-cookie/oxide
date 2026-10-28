@@ -7,7 +7,7 @@ use super::{
     remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass,
     LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
     BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_LEDGER_BYTES,
+    MAX_LEDGER_BYTES, RAISED_CAPACITY_POLICY_VERSION,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -445,8 +445,20 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
     let first = first.expect("first slot");
     let first_marker = first.env.cargo_build_build_dir.join("blob");
     fs::write(&first_marker, b"oldest idle slot").expect("oldest payload");
-    // Every record is current, so the 129th admission is a count replacement
-    // from records only: it walks no inventory at all (oxide#146).
+
+    // A full 256-slot pool's recorded status path is membership only: it
+    // walks no payload and no slot (oxide#146, oxide#177).
+    let (view, status_walks) = walked(&pool, || ledger_injected(&pool));
+    let view = view.expect("recorded ledger view");
+    assert_eq!(view.slots.len(), super::MAX_SLOTS);
+    assert!(
+        status_walks.is_empty(),
+        "recorded status walked inventory at 256 slots: {status_walks:?}"
+    );
+
+    // Every record is current, so the 257th admission is a count replacement
+    // from records only: it walks no inventory at all, and the evicted slot
+    // is never walked either (oxide#146).
     let (extra, walks) = crate::inventory::walk_observer::observe(|| {
         lease_injected(request(
             &pool,
@@ -455,13 +467,19 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
             "extra",
         ))
     });
-    let extra = extra.expect("the 129th slot replaces the oldest idle one");
+    let extra = extra.expect("the 257th slot replaces the oldest idle one");
     assert!(!extra.reused_slot);
     assert!(
         walks.is_empty(),
         "the count replacement walked inventory: {walks:?}"
     );
     assert!(!first_marker.exists());
+
+    // Releasing the new slot walks exactly that slot, never the payload.
+    let (_, release_walks) = walked(&pool, || release_injected(&pool, &extra.lease_id));
+    assert_eq!(release_walks.len(), 1, "release walks: {release_walks:?}");
+    assert_ne!(release_walks[0], "payload", "release walked the payload");
+
     let status = status_injected(&pool).expect("status");
     assert_eq!(status.slots.len(), super::MAX_SLOTS);
     assert!(status
@@ -473,6 +491,15 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
         .iter()
         .any(|slot| slot.slot_id == extra.slot_id));
     assert!(status.slots.iter().all(|slot| slot.rank > 0));
+
+    // The raised-ceiling fence is durable in the same ledger as the count.
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(RAISED_CAPACITY_POLICY_VERSION),
+        "a 256-slot ledger must carry the raised-ceiling fence"
+    );
 }
 
 #[test]
@@ -2329,9 +2356,9 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let path = format!("/{}", "\u{1}".repeat(1023));
     let holder = "\u{1}".repeat(MAX_HOLDER_BYTES);
     let lease_id = "\u{1}".repeat(MAX_LEASE_ID_BYTES);
-    // The worst valid ledger is the version-2 representation: every slot idle
-    // with a closed observation whose generation fence is at its own cap, so
-    // the bound covers the record (oxide#146).
+    // The worst valid ledger is the raised-ceiling representation (oxide#177):
+    // every slot idle with a closed observation whose generation fence is at
+    // its own cap, so the bound covers the record (oxide#146).
     let mut slots = Vec::new();
     for id in 1..=super::MAX_SLOTS as u64 {
         let digits = id.to_string().len();
@@ -2361,9 +2388,9 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         "version": 1,
         "store_id": config["store_id"],
         "cap_bytes": 64 * 1024 * 1024,
-        "next_slot": 129,
+        "next_slot": 257,
         "next_lease": 1_000_000,
-        "capacity_policy": 2,
+        "capacity_policy": RAISED_CAPACITY_POLICY_VERSION,
         "next_rank": 1,
         "slots": slots,
     });
@@ -2376,8 +2403,13 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         stored.len()
     );
     assert!(
-        stored.len() > 1_900_000,
+        stored.len() > 3_800_000,
         "fixture is not near the byte cap: {}",
+        stored.len()
+    );
+    // Reported evidence for the oxide#177 accounting-cost gate.
+    println!(
+        "worst valid 256-slot ledger: {} bytes of the {MAX_LEDGER_BYTES}-byte cap",
         stored.len()
     );
     assert_eq!(
@@ -2432,6 +2464,101 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         "an oversized record field was truncated or rewritten"
     );
     fs::write(pool.join("ledger.json"), &before).expect("restore");
+}
+
+/// oxide#177's accounting-cost gate as one fixed measurement: the bounded
+/// read, the ranked ordering admission uses and the atomic write of a valid
+/// ledger at the raised 256-slot ceiling stay under one generous fixed test
+/// ceiling, at the same order as the legacy 128-slot ledger. The figures are
+/// printed for the run record. This is a fixed ceiling on that work, not a
+/// benchmark or a claim about a large live pool.
+#[test]
+fn a_256_slot_ledger_reads_ranks_and_writes_under_the_fixed_cost_ceiling() {
+    use std::time::{Duration, Instant};
+
+    const CEILING: Duration = Duration::from_millis(50);
+    let fx = Fixture::new("ledger-cost");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("config.json")).expect("config")).expect("json");
+    let store_id = config["store_id"].as_str().expect("store id").to_owned();
+    let documented = |slots: usize| {
+        let path = format!("/{}", "p".repeat(200));
+        let mut rows = Vec::with_capacity(slots);
+        for id in 1..=slots as u64 {
+            rows.push(serde_json::json!({
+                "id": id,
+                "incarnation": 1,
+                "state": "idle",
+                "project": path,
+                "workspace": path,
+                "profile": "dev",
+                "holder": "holder",
+                "lease_id": null,
+                "last_lease_id": format!("v1.{store_id}.{id}.1.1"),
+                "dir": format!("label/quick-{id}"),
+                "rank": id,
+            }));
+        }
+        let policy = if slots > super::LEGACY_MAX_SLOTS {
+            RAISED_CAPACITY_POLICY_VERSION
+        } else {
+            super::CAPACITY_POLICY_VERSION
+        };
+        serde_json::json!({
+            "version": 1,
+            "store_id": config["store_id"],
+            "cap_bytes": 64 * 1024 * 1024,
+            "next_slot": slots as u64 + 1,
+            "next_lease": 1_000,
+            "capacity_policy": policy,
+            "next_rank": slots as u64 + 1,
+            "slots": rows,
+        })
+    };
+    let mut measured = Vec::new();
+    for slots in [super::LEGACY_MAX_SLOTS, super::MAX_SLOTS] {
+        let input = serde_json::to_vec(&documented(slots)).expect("ledger");
+        // Warm the code paths and the page cache before the timed rounds: this
+        // fixture proves a fixed ceiling, not a cold-start measurement.
+        super::pool::write_ledger_bytes_injected(&pool, &input).expect("warm write");
+        managed::ledger_view(&pool).expect("warm read");
+        // Best of three rounds, so one scheduling stall on a busy host cannot
+        // turn a generous fixed ceiling into a flaky assertion.
+        let mut best = (Duration::MAX, Duration::MAX, Duration::MAX);
+        for _ in 0..3 {
+            let started = Instant::now();
+            super::pool::write_ledger_bytes_injected(&pool, &input).expect("valid write");
+            let write = started.elapsed();
+            let started = Instant::now();
+            let view = managed::ledger_view(&pool).expect("recorded read");
+            let read = started.elapsed();
+            assert_eq!(view.slots.len(), slots);
+            let started = Instant::now();
+            let mut order: Vec<(u64, u64)> = view
+                .slots
+                .iter()
+                .map(|slot| (slot.rank, slot.slot_id.parse::<u64>().unwrap_or(u64::MAX)))
+                .collect();
+            order.sort();
+            let rank = started.elapsed();
+            assert_eq!(order.first(), Some(&(1, 1)));
+            best = (best.0.min(read), best.1.min(rank), best.2.min(write));
+        }
+        let (read, rank, write) = best;
+        println!(
+            "{slots}-slot ledger (best of 3): read {} us, rank {} us, write+read-back {} us",
+            read.as_micros(),
+            rank.as_micros(),
+            write.as_micros()
+        );
+        assert!(read < CEILING, "{slots}-slot read took {read:?}");
+        assert!(rank < CEILING, "{slots}-slot rank took {rank:?}");
+        assert!(write < CEILING, "{slots}-slot write took {write:?}");
+        measured.push((slots, read, rank, write));
+    }
+    assert_eq!(measured.len(), 2);
 }
 
 #[test]

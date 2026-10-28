@@ -1343,7 +1343,9 @@ struct LeaseGrants {
 impl LeaseGrants {
     fn new() -> Self {
         Self {
-            remaining: 9,
+            // The twelve project slots a refused command can try plus one
+            // cold fallback (oxide#118, oxide#177).
+            remaining: (store::PROJECT_SLOT_CAP + 1) as u8,
             share: true,
         }
     }
@@ -1431,8 +1433,8 @@ fn lease_with_gate(
     grants: &mut LeaseGrants,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     // A refusal leaves this checkout without a record, so the next lease is
-    // a new or evicted slot. At most nine grants: the eight project slots a
-    // refused command can try plus one cold fallback (oxide#118).
+    // a new or evicted slot. At most one grant per project slot plus one cold
+    // fallback (oxide#118, oxide#177).
     while grants.remaining > 0 {
         let mut held = match store.acquire(key, profile, admission, grants.share, label, waits)? {
             Acquired::Lease(held) => held,
@@ -2510,7 +2512,7 @@ mod tests {
     fn lease_grant_limit_is_retained_across_admission_passes() {
         let mut grants = LeaseGrants::new();
         assert!(grants.share);
-        for _ in 0..8 {
+        for _ in 0..store::PROJECT_SLOT_CAP {
             grants.taken();
         }
         grants.share = false;

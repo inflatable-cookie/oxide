@@ -8,15 +8,16 @@ OXIDE_TASK_SCRATCH_ROOT, touches no live pool or drive, and stops work 30
 seconds before the exported absolute deadline.
 
 Covered here: the permanent ledger/control fences and the no-migration read;
-the rank-exhaustion refusal before any transition; a 128-slot pool whose 129th
-admission replaces the rank-LRU idle whole slot and keeps the count; repeated
-replacement; the 8-slot project cap with a specific held-slot wait, the
-honest all-held refusal and one LRU idle replacement after affinity is
-dropped; ordinary compatible reuse and no eviction below both ceilings;
-byte-pressure LRU with a held slot excluded; and a foreign payload entry
-refusal. The worst-valid 128-slot ledger and 256-record control-state
-serialization/round-trip and oversized-field refusals are unit tests in
-`effigy test rust`, not native fixtures.
+the rank-exhaustion refusal before any transition; a 256-slot pool whose 257th
+and 258th admissions replace the rank-LRU idle whole slot and keep the count,
+with no inventory walk at admission and no whole-payload walk on release or
+default status (oxide#177's accounting-cost gate); the 12-slot project cap with
+a specific held-slot wait, the honest all-held refusal and one LRU idle
+replacement after affinity is dropped; ordinary compatible reuse and no
+eviction below both ceilings; byte-pressure LRU with a held slot excluded; and
+a foreign payload entry refusal. The worst-valid 256-slot ledger and
+512-record control-state serialization/round-trip and oversized-field refusals
+are unit tests in `effigy test rust`, not native fixtures.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ REPO = os.path.dirname(HERE)
 ROOT = os.path.realpath(os.environ.get("OXIDE_TASK_SCRATCH_ROOT", ""))
 EVIDENCE = os.path.realpath(os.environ.get("OXIDE_PROOF_EVIDENCE", ""))
 SHUTDOWN_MARGIN_S = 30
-RUNNER_SHA256 = "d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e"
+RUNNER_SHA256 = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
 CANDIDATE = "OxSh" + secrets.token_hex(4)
 RESULTS = []
 CHILDREN = []
@@ -100,6 +101,19 @@ def read_json(path: str):
         return json.load(handle)
 
 
+def walk_log_path() -> str:
+    return os.path.join(ROOT, "walk.log")
+
+
+def walk_snapshot() -> list:
+    """The inventory-walk roots recorded so far, one per line."""
+    try:
+        with open(walk_log_path(), "r", encoding="utf-8", errors="replace") as handle:
+            return [line.strip() for line in handle if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
 def write_json(path: str, value) -> None:
     write_file(path, json.dumps(value, separators=(",", ":")))
 
@@ -142,6 +156,8 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
             "RUSTUP_TOOLCHAIN": fm.BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
             "OXIDE_TASK_SCRATCH_ROOT": ROOT,
+            "OXIDE_TEST_WALK_LOG": walk_log_path(),
+            "OXIDE_TEST_SCOPE_LOG": os.path.join(ROOT, "scope.log"),
             "TMPDIR": ROOT,
             "TMP": ROOT,
             "TEMP": ROOT,
@@ -334,15 +350,15 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     stdout, stderr = run(proof, ["exec", "--", sys.executable, "-c", "pass"], "first-grant", app, env)
     ledger_path = os.path.join(pool, "ledger.json")
     ledger = read_json(ledger_path)
-    expect(ledger.get("capacity_policy") == 1, "the first grant did not install the capacity fence")
+    expect(ledger.get("capacity_policy") == 2, "the first grant did not install the capacity fence")
     expect(ledger.get("next_rank") == 3, f"unexpected rank sequence after grant+release: {ledger.get('next_rank')}")
     expect(len(ledger["slots"]) == 1, "the first grant did not record one slot")
     slot = ledger["slots"][0]
     expect(slot["rank"] == 2 and slot["state"] == "idle", f"release did not stamp the idle rank: {slot}")
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    expect(state["version"] == 2, f"the first mutation did not keep the previous control version before the owned-outputs fence: {state}")
-    RESULTS.append({"case": "fences-installed", "ledger_policy": 1, "state_version": 2})
+    expect(state["version"] == 5, f"the first mutation did not install the recorded-accounting control fence: {state}")
+    RESULTS.append({"case": "fences-installed", "ledger_policy": 2, "state_version": 5})
 
     # A legacy representation (no fence, rank 0) still reads for status and
     # is not migrated by the observer.
@@ -363,7 +379,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(read_json(state_path)["version"] == 1, "a read-only status migrated the legacy control state")
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "legacy-first-write", app, env)
     fenced = read_json(ledger_path)
-    expect(fenced.get("capacity_policy") == 1 and read_json(state_path)["version"] == 2,
+    expect(fenced.get("capacity_policy") == 2 and read_json(state_path)["version"] == 5,
            "the first revised mutation did not install both fences")
     RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True})
 
@@ -382,13 +398,83 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     RESULTS.append({"case": "rank-exhaustion-refuses-before-transition", "unchanged": True})
 
 
+def prove_raised_fence(proof: Proof, pool: str, env: dict, workdir: str) -> None:
+    """A slot table crossing the legacy 128 ceiling must carry the raised
+    fence, written by the product in the same ledger replacement (oxide#177)."""
+    ledger_path = os.path.join(pool, "ledger.json")
+    app = write_tree(os.path.join(workdir, "fence-app"), FIXTURE)
+    run(proof, ["exec", "--", sys.executable, "-c", "pass"], "raised-fence-prime", app, env)
+    ledger = read_json(ledger_path)
+    expect(ledger.get("capacity_policy") == 2, "the priming grant did not install the version-2 fence")
+    real = ledger["slots"][0]
+    folder = real["dir"].split("/", 1)[0]
+    store_id = ledger["store_id"]
+    slots_root = os.path.join(pool, "payload", "slots", folder)
+    os.makedirs(slots_root, mode=0o700, exist_ok=True)
+    os.chmod(slots_root, 0o700)
+    rank = max(record["rank"] for record in ledger["slots"]) + 1
+    for slot_id in range(2, 129):
+        last_lease_id = f"v1.{store_id}.{slot_id}.1.0"
+        ledger["slots"].append({
+            "id": slot_id,
+            "incarnation": 1,
+            "state": "idle",
+            "project": real["project"] + "-seed",
+            "workspace": real["workspace"],
+            "profile": "dev",
+            "holder": "seed",
+            "lease_id": None,
+            "last_lease_id": last_lease_id,
+            "dir": f"{folder}/quick-{slot_id}",
+            "rank": rank,
+            "recorded": {
+                "for_lease": last_lease_id,
+                "unique_bytes": 0,
+                "logical_bytes": 0,
+                "entries": 0,
+                "at_ms": 1,
+            },
+        })
+        rank += 1
+        build = os.path.join(slots_root, f"quick-{slot_id}", "build")
+        os.makedirs(build, mode=0o700, exist_ok=True)
+        for path in (os.path.join(slots_root, f"quick-{slot_id}"), build):
+            os.chmod(path, 0o700)
+    ledger["next_slot"] = 129
+    ledger["next_rank"] = rank
+    write_json(ledger_path, ledger)
+
+    # The version-2 representation at exactly the legacy ceiling still reads.
+    run(proof, ["status"], "raised-fence-128-status", app, env)
+    expect(len(read_json(ledger_path)["slots"]) == 128, "the 128-slot fixture did not read back")
+    # A debug-profile command has no compatible idle slot, so it allocates the
+    # 129th slot. That single ledger replacement must raise the fence.
+    run(
+        proof,
+        ["exec", "--profile", "debug", "--", sys.executable, "-c", "pass"],
+        "raised-fence-129th",
+        app,
+        env,
+    )
+    after = read_json(ledger_path)
+    expect(len(after["slots"]) == 129, f"the 129th slot was not recorded: {len(after['slots'])}")
+    expect(any(record["id"] == 129 for record in after["slots"]), "the 129th slot was not allocated")
+    expect(
+        after.get("capacity_policy") == 3,
+        f"crossing the legacy 128-slot ceiling did not raise the ledger fence: {after.get('capacity_policy')}",
+    )
+    RESULTS.append({"case": "raised-fence-at-129-slots", "policy_before": 2, "policy_after": 3, "slots": 129})
+
+
 def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     ledger_path = os.path.join(pool, "ledger.json")
     ledger = read_json(ledger_path)
     real = ledger["slots"][0]
     folder = real["dir"].split("/", 1)[0]
     # A distinct project path keeps the synthetic idle slots incompatible
-    # with this checkout's record; they exist only as pool members.
+    # with this checkout's record; they exist only as pool members. Every one
+    # carries a current closed observation, so a count replacement walks no
+    # inventory at all (oxide#146).
     module = real["project"] + "-seed"
     workspace = real["workspace"]
     store_id = ledger["store_id"]
@@ -396,7 +482,8 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     os.makedirs(slots_root, mode=0o700, exist_ok=True)
     os.chmod(slots_root, 0o700)
     rank = max(record["rank"] for record in ledger["slots"]) + 1
-    for slot_id in range(2, 129):
+    for slot_id in range(2, 257):
+        last_lease_id = f"v1.{store_id}.{slot_id}.1.0"
         record = {
             "id": slot_id,
             "incarnation": 1,
@@ -406,9 +493,16 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
             "profile": "dev",
             "holder": "seed",
             "lease_id": None,
-            "last_lease_id": f"v1.{store_id}.{slot_id}.1.0",
+            "last_lease_id": last_lease_id,
             "dir": f"{folder}/quick-{slot_id}",
             "rank": rank,
+            "recorded": {
+                "for_lease": last_lease_id,
+                "unique_bytes": 0,
+                "logical_bytes": 0,
+                "entries": 0,
+                "at_ms": 1,
+            },
         }
         ledger["slots"].append(record)
         rank += 1
@@ -416,15 +510,31 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
         os.makedirs(build, mode=0o700, exist_ok=True)
         for path in (os.path.join(slots_root, f"quick-{slot_id}"), build):
             os.chmod(path, 0o700)
-    ledger["next_slot"] = 129
+    ledger["next_slot"] = 257
     ledger["next_lease"] = 1000
     ledger["next_rank"] = rank
+    # A slot table above the legacy 128 must carry the raised-ceiling fence,
+    # which is what an older binary refuses.
+    ledger["capacity_policy"] = 3
     write_json(ledger_path, ledger)
-    run(proof, ["status"], "synthetic-128-status", app, env)
-    expect(len(read_json(ledger_path)["slots"]) == 128, "the 128-slot fixture did not read back")
-    RESULTS.append({"case": "synthetic-128-ledger", "slots": 128})
 
-    # The 129th admission replaces the rank-LRU idle whole slot: slot 1 has
+    # Default status at the 256-slot ceiling is recorded-only: it walks
+    # nothing.
+    before = walk_snapshot()
+    stdout, stderr = run(proof, ["status"], "synthetic-256-status", app, env)
+    added = walk_snapshot()[len(before):]
+    expect(not added, f"default status at 256 slots walked inventory: {added}")
+    expect(
+        "slots 256" in stdout + stderr,
+        f"status did not report the 256 recorded slots: {stdout}{stderr}",
+    )
+    expect(len(read_json(ledger_path)["slots"]) == 256, "the 256-slot fixture did not read back")
+    RESULTS.append({"case": "synthetic-256-ledger", "slots": 256, "status_walks": 0})
+
+    payload_root = os.path.realpath(os.path.join(pool, "payload"))
+    slots_prefix = os.path.join(payload_root, "slots") + os.sep
+
+    # The 257th admission replaces the rank-LRU idle whole slot: slot 1 has
     # rank 2, the oldest. A debug-profile command has no compatible idle slot.
     victim = slot_dir(pool, "1")
     debug_marker = os.path.join(ROOT, "debug-executed")
@@ -432,51 +542,84 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
         os.remove(debug_marker)
     except FileNotFoundError:
         pass
+    before = walk_snapshot()
     _, stderr = run(
         proof,
         ["exec", "--profile", "debug", "--", sys.executable, "-c", "open(%r,'w').close()" % debug_marker],
-        "pool-ceiling-129th",
+        "pool-ceiling-257th",
         app,
         env,
     )
-    expect(os.path.exists(debug_marker), "the 129th command did not run")
+    added = walk_snapshot()[len(before):]
+    expect(os.path.exists(debug_marker), "the 257th command did not run")
     expect(not os.path.lexists(victim), f"the rank-LRU idle slot {victim} was not evicted whole")
+    # No whole-payload walk and no walk of the evicted slot: the only walk is
+    # the release of the command's own new slot.
+    expect(
+        all(root != payload_root for root in added),
+        f"the count replacement walked the whole payload: {added}",
+    )
+    expect(
+        all(not root.startswith(os.path.realpath(victim)) for root in added),
+        f"the count replacement walked the evicted slot: {added}",
+    )
+    expect(
+        len(added) == 1 and added[0].startswith(slots_prefix) and added[0].endswith("-257"),
+        f"the 257th admission/release walked more than its own slot: {added}",
+    )
     after = read_json(ledger_path)
-    expect(len(after["slots"]) == 128, f"pool count {len(after['slots'])} is not 128")
+    expect(len(after["slots"]) == 256, f"pool count {len(after['slots'])} is not 256")
     expect(all(record["id"] != 1 for record in after["slots"]), "the evicted record remains")
-    expect(any(record["id"] == 129 for record in after["slots"]), "the 129th slot was not allocated")
-    RESULTS.append({"case": "pool-ceiling-129th-replaces-rank-lru", "slots": 128, "victim": 1})
+    expect(any(record["id"] == 257 for record in after["slots"]), "the 257th slot was not allocated")
+    expect(after.get("capacity_policy") == 3, "the 257th slot did not raise the ledger fence")
+    RESULTS.append({
+        "case": "pool-ceiling-257th-replaces-rank-lru",
+        "slots": 256,
+        "victim": 1,
+        "walks": len(added),
+    })
 
     # A further quick admission replaces the next oldest idle slot; the count
-    # stays at 128 and no old 32-slot churn occurred.
+    # stays at 256 and no old 32-slot churn occurred.
     victim = slot_dir(pool, "2")
-    run(proof, ["exec", "--", sys.executable, "-c", "pass"], "pool-ceiling-130th", app, env)
+    before = walk_snapshot()
+    run(proof, ["exec", "--", sys.executable, "-c", "pass"], "pool-ceiling-258th", app, env)
+    added = walk_snapshot()[len(before):]
     expect(not os.path.lexists(victim), f"the next rank-LRU idle slot {victim} was not evicted")
+    expect(
+        len(added) == 1 and added[0].startswith(slots_prefix) and added[0].endswith("-258"),
+        f"the 258th admission/release walked more than its own slot: {added}",
+    )
     after = read_json(ledger_path)
-    expect(len(after["slots"]) == 128, f"pool count {len(after['slots'])} is not 128 after replacement")
-    expect(any(record["id"] == 130 for record in after["slots"]), "the 130th slot was not allocated")
-    RESULTS.append({"case": "pool-ceiling-repeats-without-churn", "slots": 128, "victim": 2})
+    expect(len(after["slots"]) == 256, f"pool count {len(after['slots'])} is not 256 after replacement")
+    expect(any(record["id"] == 258 for record in after["slots"]), "the 258th slot was not allocated")
+    RESULTS.append({"case": "pool-ceiling-repeats-without-churn", "slots": 256, "victim": 2, "walks": len(added)})
+
+
+PROJECT_SLOT_CAP = 12
 
 
 def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
     app = write_tree(os.path.join(workdir, "project-app"), FIXTURE)
-    # Create the pool with one sequential command first: eight simultaneous
-    # first commands race the pool's own one-time creation, which is a
-    # separate pre-existing issue and not what this case measures.
+    # Create the pool with one sequential command first: simultaneous first
+    # commands race the pool's own one-time creation, which is a separate
+    # pre-existing issue and not what this case measures.
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "project-priming", app, env)
     holds = []
-    for index in range(8):
+    for index in range(PROJECT_SLOT_CAP):
         holds.append(start(proof, ["exec"], f"project-hold-{index}", app, env, hold=True))
     for child in holds:
         wait_started(child)
     ledger = read_json(os.path.join(pool, "ledger.json"))
-    expect(len(ledger["slots"]) == 8, f"eight concurrent commands did not keep eight slots: {len(ledger['slots'])}")
+    expect(len(ledger["slots"]) == PROJECT_SLOT_CAP,
+           f"{PROJECT_SLOT_CAP} concurrent commands did not keep {PROJECT_SLOT_CAP} slots: {len(ledger['slots'])}")
     expect(all(record["state"] == "held" for record in ledger["slots"]), "a concurrent project slot is not held")
-    RESULTS.append({"case": "project-cap-holds-eight", "slots": 8})
+    RESULTS.append({"case": "project-cap-holds-twelve", "slots": PROJECT_SLOT_CAP})
 
     waiter = start(proof, ["exec"], "project-waiter", app, env, hold=True)
     wait_log(waiter, "waiting for another oxide command in this checkout")
-    expect(not os.path.exists(waiter.marker), "the ninth command started while all eight slots were held")
+    expect(not os.path.exists(waiter.marker),
+           f"the {PROJECT_SLOT_CAP + 1}th command started while all {PROJECT_SLOT_CAP} slots were held")
     RESULTS.append({"case": "project-cap-waits-for-specific-held-slot", "waiting": True})
     release(holds[0])
     wait_started(waiter)
@@ -485,7 +628,8 @@ def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
     for child in holds[1:]:
         release(child)
     ledger = read_json(os.path.join(pool, "ledger.json"))
-    expect(len(ledger["slots"]) == 8, f"release did not leave eight idle slots: {len(ledger['slots'])}")
+    expect(len(ledger["slots"]) == PROJECT_SLOT_CAP,
+           f"release did not leave {PROJECT_SLOT_CAP} idle slots: {len(ledger['slots'])}")
     expect(all(record["state"] == "idle" for record in ledger["slots"]), "a released project slot stayed held")
 
     # Drop this checkout's affinity, then a new command has no slot of its own
@@ -512,19 +656,22 @@ def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
     )
     expect(os.path.isdir(victim), "the victim was deleted before complete accounting")
     expect(
-        len(read_json(os.path.join(pool, "ledger.json"))["slots"]) == 8,
+        len(read_json(os.path.join(pool, "ledger.json"))["slots"]) == PROJECT_SLOT_CAP,
         "an incomplete-accounting refusal changed the project membership",
     )
     RESULTS.append({"case": "project-cap-unknown-refuses-before-deletion", "victim": victim_record["id"]})
     shutil.rmtree(deep)
 
-    _, stderr = run(proof, ["exec", "--", sys.executable, "-c", "pass"], "project-cap-9th", app, env)
-    expect(f"evicted idle slot {victim_record['id']} (project slot cap 8)" in stderr,
-           f"the project cap did not evict the rank-LRU idle slot: {stderr}")
+    _, stderr = run(proof, ["exec", "--", sys.executable, "-c", "pass"], "project-cap-overflow", app, env)
+    expect(
+        f"evicted idle slot {victim_record['id']} (project slot cap {PROJECT_SLOT_CAP})" in stderr,
+        f"the project cap did not evict the rank-LRU idle slot: {stderr}",
+    )
     expect(not os.path.lexists(victim), f"the rank-LRU project slot {victim} was not evicted")
     after = read_json(os.path.join(pool, "ledger.json"))
-    expect(len(after["slots"]) == 8, f"project cap count {len(after['slots'])} is not eight")
-    RESULTS.append({"case": "project-cap-9th-replaces-rank-lru", "slots": 8, "victim": victim_record["id"]})
+    expect(len(after["slots"]) == PROJECT_SLOT_CAP,
+           f"project cap count {len(after['slots'])} is not {PROJECT_SLOT_CAP}")
+    RESULTS.append({"case": "project-cap-overflow-replaces-rank-lru", "slots": PROJECT_SLOT_CAP, "victim": victim_record["id"]})
 
 
 def prove_reuse_and_no_churn(proof: Proof, pool: str, env: dict, workdir: str) -> None:
@@ -611,6 +758,14 @@ def main() -> None:
     fences_app = write_tree(os.path.join(ROOT, "checkouts", "fences"), FIXTURE)
     prove_fences_and_exhaustion(proof, fences_app, fences_pool, fences_env)
     proof.phase("after fences")
+    raised_pool = os.path.join(ROOT, "pool-raised")
+    prove_raised_fence(
+        proof,
+        raised_pool,
+        base_env(proof, raised_pool),
+        os.path.join(ROOT, "checkouts", "raised"),
+    )
+    proof.phase("after raised fence")
     prove_pool_ceiling(proof, fences_app, fences_pool, fences_env)
     proof.phase("after pool ceiling")
 
@@ -631,7 +786,7 @@ def main() -> None:
     proof.phase("after foreign refusal")
 
     receipt = {
-        "task": "oxide#118",
+        "task": "oxide#177",
         "source_commit": source,
         "source_tree": tree,
         "binary_sha256": binary_sha256,
@@ -644,8 +799,9 @@ def main() -> None:
             "scratch_budget_mib": 512,
         },
         "coverage_gaps": [
-            "worst-valid 128-slot ledger and 256-record control-state serialization/round-trip and oversized-field refusal are unit tests, not native fixtures",
-            "the nine-grant freshness bound is a bounded loop inspection, not separately induced natively",
+            "worst-valid 256-slot ledger and 512-record control-state serialization/round-trip and oversized-field refusal are unit tests, not native fixtures",
+            "the 128-slot vs 256-slot ledger read/rank/write cost is a unit measurement with a fixed 50 ms ceiling, not a native fixture",
+            "the thirteen-grant freshness bound is a bounded loop inspection, not separately induced natively",
         ],
     }
     write_evidence("slot-headroom.json", json.dumps(receipt, indent=2) + "\n")

@@ -47,18 +47,31 @@ pub const BUDGET_BACKEND_DIRECTORY_V1: &str = "directory-budget-v1";
 /// volume. Budget-only like the directory backend.
 pub const VOLUME_BACKEND_APFS_V1: &str = "apfs-volume-v1";
 /// Finite slot count. Exhaustion refuses a new slot. Slot headroom only:
-/// it does not raise build concurrency or `max_active` (oxide#118).
-pub const MAX_SLOTS: usize = 128;
+/// it does not raise build concurrency or `max_active` (oxide#118, oxide#177).
+pub const MAX_SLOTS: usize = 256;
+/// The slot ceiling an older binary understands (oxide#118's 128 slots).
+/// A ledger above it must carry [`RAISED_CAPACITY_POLICY_VERSION`] so an
+/// older binary refuses it at ledger read instead of reading a slot table it
+/// cannot represent (oxide#177).
+pub const LEGACY_MAX_SLOTS: usize = 128;
 /// Finite ledger file size including the atomic temp. The worst valid
-/// 128-slot ledger with every bounded field at its ceiling, escaped by
-/// compact JSON, fits this cap with no truncation (oxide#118).
-pub const MAX_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
+/// 256-slot ledger with every bounded field at its ceiling, escaped by
+/// compact JSON, fits this cap with no truncation (oxide#177; the unit proof
+/// reports the exact figure).
+pub const MAX_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
 /// Permanent capacity-policy fence in the library ledger (oxide#118). Its
 /// presence tells an older binary that this ledger uses ranked idle
 /// replacement; the fence is never removed. Version 2 (oxide#146) adds the
 /// closed per-slot size record, so a version-2 ledger also refuses an older
 /// binary's `deny_unknown_fields` parse.
 pub const CAPACITY_POLICY_VERSION: u32 = 2;
+/// The raised-ceiling fence (oxide#177): the ledger holds more than
+/// [`LEGACY_MAX_SLOTS`] slots, which an older binary cannot represent. It is
+/// written forward-only, in the same atomic replacement that first takes the
+/// slot count above 128, and an older binary's policy check refuses it before
+/// any mutation. A pool that stays at or below 128 slots never carries it, so
+/// its ledger stays readable by an older binary.
+pub const RAISED_CAPACITY_POLICY_VERSION: u32 = 3;
 /// The version-1 fence (oxide#118) stays readable and is upgraded by the next
 /// revised write; a version-1 ledger never carries a record.
 pub const LEGACY_CAPACITY_POLICY_VERSION: u32 = 1;
@@ -69,11 +82,12 @@ pub const MAX_PATH_BYTES: usize = 1024;
 /// Finite lease-id text.
 pub const MAX_LEASE_ID_BYTES: usize = 160;
 /// Cooperative inventory bounds for pool accounting (oxide#108), separate
-/// from the inventory tool's defaults. Sized for real build caches: 32 slots
-/// of a 60k-entry Cargo build directory (Farmyard's observed 60,657) stay
-/// under the entry bound; depth covers build-script `out` trees; the
-/// deadline allows a cold walk of a USB pool. A walk that hits any bound is
-/// incomplete and refuses where complete accounting is required.
+/// from the inventory tool's defaults. Sized for real build caches: the
+/// entry bound still admits one 60k-entry Cargo build directory (Farmyard's
+/// observed 60,657) and averages about 7,800 entries across a full 256-slot
+/// pool; depth covers build-script `out` trees; the deadline allows a cold
+/// walk of a USB pool. A walk that hits any bound is incomplete and refuses
+/// where complete accounting is required.
 const ACCOUNTING_MAX_ENTRIES: u64 = 2_000_000;
 const ACCOUNTING_MAX_DEPTH: usize = 64;
 const ACCOUNTING_MAX_ELAPSED_MS: u64 = 60_000;
