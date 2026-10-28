@@ -760,7 +760,7 @@ pub mod managed {
     /// Ledger membership without any accounting walk; it refuses exactly
     /// where [`status`] does.
     pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
-        Pool::open(pool)?.ledger_view()
+        Pool::open_for_lease(pool)?.ledger_view()
     }
 
     /// Recorded identity and ledger membership of a pool, read with no lock,
