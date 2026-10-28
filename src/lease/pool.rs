@@ -757,8 +757,8 @@ pub mod managed {
         Pool::open(pool)?.accounted()
     }
 
-    /// Ledger membership without any accounting walk; it refuses exactly
-    /// where [`status`] does.
+    /// Ledger membership without accounting walks; it uses a bounded pool
+    /// lock wait for callers preparing an admission.
     pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
         Pool::open_for_lease(pool)?.ledger_view()
     }
