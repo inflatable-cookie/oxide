@@ -1103,7 +1103,14 @@ def setup(proof: Proof, repo: str) -> None:
     # retained library stage after the private Cargo home is seeded.
     seed_registry_homes(proof, repo)
     proof.lease_helper = build_lease_helper(proof, repo)
-    inner = git_fixture(proof.root, "innerrepo", {"README.md": "inner\n"})
+    inner = git_fixture(
+        proof.root,
+        "innerrepo",
+        {
+            "Cargo.toml": '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2021"\n',
+            "src/lib.rs": "pub fn value() -> u32 { 0 }\n",
+        },
+    )
     proof.repositories = {
         "seedctl": git_fixture(proof.root, "seedrepo", {
             "Cargo.toml": SEEDCTL_MANIFEST,
@@ -2509,6 +2516,38 @@ def undefined_names(body) -> list[str]:
     return sorted(name for name in loaded if name not in known)
 
 
+def git_fixtures_without_manifest() -> list[str]:
+    """`git_fixture` requires each owned repository to declare a `[package]`
+    name, so a call that passes a files dict without `Cargo.toml` would abort
+    setup before any case. This static check catches that class without
+    creating a repository; a call whose files argument is not a literal dict
+    fails closed instead of being skipped.
+    """
+    with open(__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    missing = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not isinstance(function, ast.Name) or function.id != "git_fixture":
+            continue
+        files = node.args[2] if len(node.args) > 2 else next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "files"), None
+        )
+        if not isinstance(files, ast.Dict):
+            missing.append(f"line {node.lineno}: files is not a literal dict")
+            continue
+        keys = [
+            key.value
+            for key in files.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        ]
+        if len(keys) != len(files.keys) or "Cargo.toml" not in keys:
+            missing.append(f"line {node.lineno}: no literal Cargo.toml entry")
+    return missing
+
+
 def missing_module_helpers() -> list[str]:
     """Attributes this script reads from its imported helper modules that the
     module does not define. The staging helper is `layout.stage_at`, not
@@ -2569,6 +2608,8 @@ def self_check() -> None:
     expect(not unused, f"unused module-level fixture name(s): {unused}")
     missing = missing_module_helpers()
     expect(not missing, f"missing imported helper(s): {missing}")
+    missing = git_fixtures_without_manifest()
+    expect(not missing, f"git_fixture calls without a manifest: {missing}")
     expect(len(set(ids)) == len(ids), "duplicate case id")
     for relative in ("scripts/offline_seed.py", "scripts/bounded-test.py"):
         path = os.path.join(os.path.dirname(HERE), relative)
