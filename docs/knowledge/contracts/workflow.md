@@ -15,6 +15,15 @@ qualification, default-pool creation outside tests, installation (binary or
 skill) or consumer-adoption authority. Other sections
 state the target design.
 
+## Cold-slot seeding qualification hold
+
+Cold-slot seeding is off. Setting `OXIDE_COLD_SEED=1` reports that seeding is
+not yet qualified on this Cargo; it does not seed, produce catalogs, or write
+seed sidecars. The separate qualification proof must pass before the opt-in can
+be honoured. With the variable unset, the existing command behaviour is
+unchanged. The [cold-slot seeding contract](cold-slot-seeding.md) owns the
+proposed transaction and qualification requirements.
+
 ## Shape
 
 `oxide` is Cargo with managed storage, profiles and execution. In an adopted

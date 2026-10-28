@@ -1513,11 +1513,13 @@ fn the_work_budget_is_capped_at_five_seconds_and_checked_within_reads() {
     let file = std::fs::File::open(&path).expect("open fixture file");
     let past = Instant::now() - Duration::from_millis(1);
     assert!(matches!(
-        hash_fd(file.as_fd(), past),
+        hash_fd(file.as_fd(), past, &mut || false),
         Err(StreamError::Deadline)
     ));
     let future = Instant::now() + Duration::from_secs(60);
-    assert!(matches!(hash_fd(file.as_fd(), future), Ok(digest) if digest == sha("rmeta-fixture")));
+    assert!(
+        matches!(hash_fd(file.as_fd(), future, &mut || false), Ok(digest) if digest == sha("rmeta-fixture"))
+    );
 }
 
 #[test]
@@ -2336,6 +2338,49 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
 }
 
 #[test]
+fn publish_refuses_a_catalog_over_its_byte_ceiling_and_writes_nothing() {
+    reset_hooks();
+    let rig = Rig::new("publish-ceiling");
+    let (grant, mut catalog) = held_catalog(&rig, "a");
+    // Package fields are bounded individually and units are optional, so a
+    // full package table validates while its serialized form is over 2 MiB.
+    let long = "v".repeat(500);
+    catalog.packages = (0..SEED_MAX_PACKAGES)
+        .map(|index| SeedPackage {
+            name: format!("p{index:04}-{}", "n".repeat(50)),
+            target: format!("p{index:04}_{}", "n".repeat(50)),
+            version: long.clone(),
+            source: long.clone(),
+            checksum: Some("a".repeat(64)),
+            unique: true,
+            leaf: true,
+            source_root: SeedSourceRoot {
+                kind: SeedSourceKind::Registry,
+                digest: "b".repeat(64),
+            },
+            units: Vec::new(),
+        })
+        .collect();
+    assert!(catalog.validate().is_ok());
+    assert!(catalog.to_bytes().unwrap_err().contains("byte ceiling"));
+    let seeds = rig.pool.join(MANAGED_NAME).join("seeds");
+    let real = seeds.join(format!("{}.catalog.json", grant.slot_id));
+    let ledger = rig.ledger_bytes();
+    let control = fs::read(rig.control().join("state.json")).ok();
+    // The refusal happens before any sidecar directory or file is touched.
+    let refused = publish_seed_catalog(&rig.pool, &catalog);
+    assert!(
+        matches!(refused, Err(LeaseError::InvalidInput(_))),
+        "{refused:?}"
+    );
+    assert!(!real.exists());
+    assert!(!seeds.exists());
+    assert_eq!(rig.ledger_bytes(), ledger);
+    assert_eq!(fs::read(rig.control().join("state.json")).ok(), control);
+    release_injected(&rig.pool, &grant.lease_id).expect("release donor");
+}
+
+#[test]
 fn join_parser_accepts_rustc_shapes_and_refuses_others() {
     reset_hooks();
     let parsed = join::parse(dep_info_text().as_bytes()).expect("parse the fixture");
@@ -2533,4 +2578,120 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     assert!(at_input_cap.validate().is_ok());
     // The catalog's own byte ceiling is enforced before parsing.
     assert!(SeedCatalog::parse(&vec![b' '; SEED_CATALOG_MAX_BYTES + 1]).is_err());
+}
+
+#[test]
+fn join_accepts_absolute_donor_outputs_and_rejects_ambiguous_aliases() {
+    let root = Path::new("/fixture/pool/slot/build");
+    let source = "/fixture/source/lib.rs";
+    let dep = "debug/deps/cfg_if-aaaaaaaaaaaaaaaa.d";
+    let artifact = "debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta";
+    let contents = format!(
+        "{}/{dep}: {source}\n{}/{artifact}: {source}\n{source}:\n# env-dep:EXAMPLE=value\n",
+        root.display(),
+        root.display(),
+    );
+    let parsed = join::parse(contents.as_bytes()).expect("absolute rustc dep-info");
+    let inputs = vec![source.to_owned()];
+    assert!(join::output_rule_proven(&parsed, root, dep, &inputs));
+    assert!(join::output_rule_proven(&parsed, root, artifact, &inputs));
+    let duplicate = format!("{contents}{artifact}: {source}\n");
+    let parsed = join::parse(duplicate.as_bytes()).expect("duplicate rules parse");
+    assert!(!join::output_rule_proven(&parsed, root, artifact, &inputs));
+    assert!(!join::output_rule_proven(
+        &parsed,
+        Path::new("/other"),
+        dep,
+        &inputs
+    ));
+}
+
+#[test]
+fn monitor_stop_after_a_recipient_write_refuses_and_keeps_the_write() {
+    reset_hooks();
+    let rig = Rig::new("monitor-stop");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let fingerprint = grant.env.cargo_build_build_dir.join(FINGERPRINT);
+    let mut monitor = || fingerprint.exists();
+    let result = seed_monitored(&rig.pool, &donor.request(&recipient), &mut monitor);
+    assert!(
+        matches!(result, Err(LeaseError::Io(ref reason)) if reason.contains("monitor stopped"))
+    );
+    assert!(fingerprint.exists());
+}
+
+#[test]
+fn catalog_publication_requires_matching_unseeded_attempt() {
+    reset_hooks();
+    let rig = Rig::new("attempt-catalog");
+    let (grant, mut catalog) = held_catalog(&rig, "a");
+    let mut attempt = SeedAttempt {
+        schema: ATTEMPT_SCHEMA.into(),
+        store_id: grant.store_id.clone(),
+        slot_id: grant.slot_id.clone(),
+        incarnation: grant.incarnation.clone(),
+        lease_id: grant.lease_id.clone(),
+        state: SeedAttemptState::Intent,
+        donor_slot: None,
+        units: None,
+        files: None,
+        logical_bytes: None,
+        catalog_digest: None,
+        observation: None,
+    };
+    write_seed_attempt(&rig.pool, &attempt).expect("intent");
+    assert!(publish_seed_catalog(&rig.pool, &catalog).is_err());
+    attempt.state = SeedAttemptState::Skipped;
+    write_seed_attempt(&rig.pool, &attempt).expect("terminal skip");
+    assert!(publish_seed_catalog(&rig.pool, &catalog).is_err());
+    catalog.attempt = SeedAttemptState::Skipped;
+    publish_seed_catalog(&rig.pool, &catalog).expect("unseeded terminal generation");
+    assert!(write_seed_attempt(&rig.pool, &attempt).is_err());
+}
+
+#[test]
+fn last_seed_read_requires_current_ledger_generation() {
+    reset_hooks();
+    let rig = Rig::new("last-generation");
+    rig.affinity_dir(1);
+    let (grant, _) = lease_recipient(&rig, "last");
+    let last = SeedLast {
+        schema: "oxide.cold-seed/1".into(),
+        store_id: grant.store_id.clone(),
+        slot_id: grant.slot_id.clone(),
+        incarnation: grant.incarnation.clone(),
+        lease_id: grant.lease_id.clone(),
+        donor_slot: "2".into(),
+        units: 1,
+        files: 1,
+        logical_bytes: 1,
+        elapsed_ms: 1,
+        when_ms: 1,
+        buckets: vec![],
+        unknown: 0,
+    };
+    write_seed_last(&rig.pool, &last).expect("write held generation");
+    assert_eq!(read_seed_last(&rig.pool), Some(last.clone()));
+    release_injected(&rig.pool, &grant.lease_id).expect("release");
+    assert_eq!(read_seed_last(&rig.pool), Some(last));
+    tamper_idle_generations_injected(&rig.pool).expect("change generation");
+    assert_eq!(read_seed_last(&rig.pool), None);
+}
+
+#[test]
+fn source_cache_publication_requires_held_generation_and_preserves_invalid_file() {
+    reset_hooks();
+    let rig = Rig::new("sources-generation");
+    rig.affinity_dir(1);
+    let (grant, recipient) = lease_recipient(&rig, "source-cache");
+    let cache = crate::seed_source::SourceCache::new(&grant.store_id).unwrap();
+    write_seed_sources(&rig.pool, &recipient, &cache).expect("publish cache");
+    let path = rig.control().join("seeds/sources.json");
+    assert!(crate::seed_source::SourceCache::try_read(&path, &grant.store_id).is_some());
+    fs::write(&path, b"broken").unwrap();
+    assert!(write_seed_sources(&rig.pool, &recipient, &cache).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"broken");
+    release_injected(&rig.pool, &grant.lease_id).expect("release");
+    assert!(write_seed_sources(&rig.pool, &recipient, &cache).is_err());
 }

@@ -96,7 +96,10 @@ pub use catalog::{
     SEED_MAX_PACKAGES, SEED_MAX_PLAN_INPUTS, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS,
     SEED_MAX_UNITS_PER_PACKAGE, SEED_MAX_UNIT_INPUTS,
 };
-pub use join::{JoinRefusal, ParsedJoin};
+pub use join::{
+    output_rule_proven as seed_output_rule_proven, parse as parse_seed_join, JoinRefusal,
+    ParsedJoin,
+};
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
 use super::pool::{open_seed, SeedPoolView, SeedSlotView};
@@ -105,7 +108,7 @@ use super::{
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
 };
 use crate::owned_delete::open_directory_at;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -316,7 +319,8 @@ pub struct SeedAbandon {
 /// record, never an admission figure. Its byte figures apply the capacity
 /// contract's within-slot inode union: a hard-linked pair inside this one slot
 /// is counted once.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeedObservation {
     pub store_id: String,
     pub slot_id: String,
@@ -335,6 +339,396 @@ impl SeedObservation {
     pub fn complete(&self) -> bool {
         self.gap.is_none()
     }
+}
+
+/// Durable, generation-bound intent and terminal outcome. `None` is not a
+/// writable state: absence is the legacy unseeded fact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedAttempt {
+    pub schema: String,
+    pub store_id: String,
+    pub slot_id: String,
+    pub incarnation: String,
+    pub lease_id: String,
+    pub state: SeedAttemptState,
+    pub donor_slot: Option<String>,
+    pub units: Option<u64>,
+    pub files: Option<u64>,
+    pub logical_bytes: Option<u64>,
+    pub catalog_digest: Option<String>,
+    pub observation: Option<SeedObservation>,
+}
+
+pub const ATTEMPT_SCHEMA: &str = "oxide.cold-seed.attempt/1";
+const ATTEMPT_MAX_BYTES: usize = 4096;
+
+impl SeedAttempt {
+    fn valid(&self) -> bool {
+        fn text(value: &str, cap: usize) -> bool {
+            !value.is_empty() && value.len() <= cap && value.is_ascii()
+        }
+        if self.schema != ATTEMPT_SCHEMA
+            || !text(&self.store_id, 64)
+            || !text(&self.slot_id, 20)
+            || !self.slot_id.bytes().all(|b| b.is_ascii_digit())
+            || !text(&self.incarnation, 64)
+            || !text(&self.lease_id, 160)
+            || self.state == SeedAttemptState::None
+        {
+            return false;
+        }
+        if let Some(observation) = &self.observation {
+            if observation.store_id != self.store_id
+                || observation.slot_id != self.slot_id
+                || observation.incarnation != self.incarnation
+                || observation.lease_id != self.lease_id
+                || observation.limits.max_entries > SEED_WALK_MAX_ENTRIES
+                || observation.limits.max_depth > SEED_WALK_MAX_DEPTH
+                || observation.limits.max_elapsed_ms > SEED_WALK_MAX_ELAPSED_MS
+            {
+                return false;
+            }
+        }
+        if self.state == SeedAttemptState::Seeded {
+            self.donor_slot
+                .as_deref()
+                .is_some_and(|v| text(v, 20) && v.bytes().all(|b| b.is_ascii_digit()))
+                && self
+                    .units
+                    .is_some_and(|v| v > 0 && v <= SEED_MAX_PLAN_UNITS as u64)
+                && self
+                    .files
+                    .is_some_and(|v| v > 0 && v <= SEED_MAX_PLAN_FILES as u64)
+                && self.logical_bytes.is_some_and(|v| v <= SEED_MAX_PLAN_BYTES)
+                && self.catalog_digest.as_deref().is_some_and(|v| {
+                    v.len() == 64
+                        && v.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+                && self
+                    .observation
+                    .as_ref()
+                    .is_some_and(SeedObservation::complete)
+        } else {
+            self.donor_slot.is_none()
+                && self.units.is_none()
+                && self.files.is_none()
+                && self.logical_bytes.is_none()
+                && self.catalog_digest.is_none()
+                && self.observation.is_none()
+        }
+    }
+}
+
+#[derive(Debug)]
+enum AttemptRead {
+    Absent,
+    Invalid,
+    Present(SeedAttempt),
+}
+
+fn read_attempt_at(pool: &Path, slot: &str) -> AttemptRead {
+    let path = pool
+        .join(MANAGED_NAME)
+        .join(SEEDS_DIR)
+        .join(format!("{slot}{ATTEMPT_SUFFIX}"));
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return AttemptRead::Absent,
+        Err(_) => return AttemptRead::Invalid,
+    };
+    let Ok(metadata) = file.metadata() else {
+        return AttemptRead::Invalid;
+    };
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > ATTEMPT_MAX_BYTES as u64
+    {
+        return AttemptRead::Invalid;
+    }
+    let mut bytes = Vec::new();
+    if Read::by_ref(&mut file)
+        .take((ATTEMPT_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > ATTEMPT_MAX_BYTES
+    {
+        return AttemptRead::Invalid;
+    }
+    match serde_json::from_slice::<SeedAttempt>(&bytes) {
+        Ok(record) if record.valid() => AttemptRead::Present(record),
+        _ => AttemptRead::Invalid,
+    }
+}
+
+/// The current held generation's durable attempt state, with corrupt or
+/// inaccessible sidecars treated as unknown rather than an unseeded fact.
+pub fn held_seed_attempt(
+    pool: &Path,
+    recipient: &SeedRecipient,
+) -> Result<SeedAttemptState, LeaseError> {
+    validate_recipient(recipient)?;
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
+    let slot = view
+        .slot(&recipient.slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if !slot.held
+        || slot.incarnation.to_string() != recipient.incarnation
+        || slot.lease_id.as_deref() != Some(recipient.lease_id.as_str())
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    match read_attempt_at(&view.pool_root, &recipient.slot_id) {
+        AttemptRead::Absent => Ok(SeedAttemptState::None),
+        AttemptRead::Invalid => Err(LeaseError::UnknownAccounting),
+        AttemptRead::Present(record)
+            if record.store_id == view.store_id
+                && record.incarnation == recipient.incarnation
+                && record.lease_id == recipient.lease_id =>
+        {
+            Ok(record.state)
+        }
+        AttemptRead::Present(_) => Ok(SeedAttemptState::None),
+    }
+}
+
+fn catalog_unseeded(pool: &Path, catalog: &SeedCatalog) -> bool {
+    match read_attempt_at(pool, &catalog.slot_id) {
+        AttemptRead::Absent => catalog.attempt == SeedAttemptState::None,
+        AttemptRead::Invalid => false,
+        AttemptRead::Present(record)
+            if record.store_id == catalog.store_id
+                && record.incarnation == catalog.incarnation
+                && record.lease_id == catalog.lease_id =>
+        {
+            record.state == catalog.attempt
+                && matches!(
+                    record.state,
+                    SeedAttemptState::Skipped | SeedAttemptState::Reset
+                )
+        }
+        AttemptRead::Present(_) => catalog.attempt == SeedAttemptState::None,
+    }
+}
+
+/// Write intent or its terminal state while this exact generation is held.
+/// The caller retains its admission lifetime around this call.
+pub fn write_seed_attempt(pool: &Path, attempt: &SeedAttempt) -> Result<(), LeaseError> {
+    if !attempt.valid() {
+        return Err(LeaseError::InvalidInput("invalid seed attempt"));
+    }
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
+    let slot = view
+        .slot(&attempt.slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if view.store_id != attempt.store_id
+        || !slot.held
+        || slot.incarnation.to_string() != attempt.incarnation
+        || slot.lease_id.as_deref() != Some(attempt.lease_id.as_str())
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    match read_attempt_at(&view.pool_root, &attempt.slot_id) {
+        AttemptRead::Invalid => return Err(LeaseError::UnknownAccounting),
+        AttemptRead::Absent if attempt.state != SeedAttemptState::Intent => {
+            return Err(LeaseError::UnknownAccounting)
+        }
+        AttemptRead::Present(old)
+            if old.store_id == attempt.store_id
+                && old.incarnation == attempt.incarnation
+                && old.lease_id == attempt.lease_id =>
+        {
+            if old.state != SeedAttemptState::Intent || attempt.state == SeedAttemptState::Intent {
+                return Err(LeaseError::UnknownAccounting);
+            }
+        }
+        AttemptRead::Present(_) if attempt.state != SeedAttemptState::Intent => {
+            return Err(LeaseError::UnknownAccounting)
+        }
+        _ => {}
+    }
+    let bytes = serde_json::to_vec(attempt)
+        .map_err(|_| LeaseError::InvalidInput("invalid seed attempt"))?;
+    if bytes.len() > ATTEMPT_MAX_BYTES {
+        return Err(LeaseError::LedgerExhausted);
+    }
+    let dir = view.pool_root.join(MANAGED_NAME).join(SEEDS_DIR);
+    ensure_private_dir(&dir)?;
+    remove_orphan_sidecars(&dir, view)?;
+    enforce_family_bytes(&dir, bytes.len() as u64, &attempt.slot_id)?;
+    write_sidecar(
+        &dir.join(format!("{}{ATTEMPT_SUFFIX}", attempt.slot_id)),
+        &bytes,
+    )
+}
+
+/// Publish a verified-source cache for the caller's held generation. The
+/// caller holds front-door admission, and this call holds the pool lock while
+/// checking the shared sidecar-family cap and publishing the cache.
+pub fn write_seed_sources(
+    pool: &Path,
+    recipient: &SeedRecipient,
+    cache: &crate::seed_source::SourceCache,
+) -> Result<(), LeaseError> {
+    validate_recipient(recipient)?;
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
+    let slot = view
+        .slot(&recipient.slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if cache.store_id() != view.store_id
+        || !slot.held
+        || slot.incarnation.to_string() != recipient.incarnation
+        || slot.lease_id.as_deref() != Some(recipient.lease_id.as_str())
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let bytes = cache
+        .encode()
+        .map_err(|_| LeaseError::InvalidInput("invalid source cache"))?;
+    let dir = view.pool_root.join(MANAGED_NAME).join(SEEDS_DIR);
+    ensure_private_dir(&dir)?;
+    let path = dir.join("sources.json");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.uid() == current_uid()
+                && metadata.mode() & 0o077 == 0
+                && crate::seed_source::SourceCache::try_read(&path, &view.store_id).is_some() => {}
+        Ok(_) => return Err(LeaseError::UnknownAccounting),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
+    remove_orphan_sidecars(&dir, view)?;
+    enforce_family_bytes(&dir, bytes.len() as u64, &recipient.slot_id)?;
+    cache
+        .write(&path)
+        .map_err(|_| LeaseError::Io("cannot publish source cache".to_owned()))
+}
+
+/// The one bounded, recorded status summary; its facts are descriptive and
+/// are never used for admission or trust.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedLast {
+    pub schema: String,
+    pub store_id: String,
+    pub slot_id: String,
+    pub incarnation: String,
+    pub lease_id: String,
+    pub donor_slot: String,
+    pub units: u64,
+    pub files: u64,
+    pub logical_bytes: u64,
+    pub elapsed_ms: u64,
+    pub when_ms: u64,
+    pub buckets: Vec<SeedBucket>,
+    pub unknown: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedBucket {
+    pub reason: SeedRejectReason,
+    pub units: u32,
+}
+
+impl SeedLast {
+    fn valid(&self) -> bool {
+        let text = |v: &str, max: usize| !v.is_empty() && v.len() <= max && v.is_ascii();
+        let numeric = |v: &str| text(v, 20) && v.bytes().all(|b| b.is_ascii_digit());
+        let mut reasons = std::collections::BTreeSet::new();
+        self.schema == "oxide.cold-seed/1"
+            && text(&self.store_id, 64)
+            && numeric(&self.slot_id)
+            && numeric(&self.donor_slot)
+            && text(&self.incarnation, 64)
+            && text(&self.lease_id, 160)
+            && self.units > 0
+            && self.units <= SEED_MAX_PLAN_UNITS as u64
+            && self.files > 0
+            && self.files <= SEED_MAX_PLAN_FILES as u64
+            && self.logical_bytes <= SEED_MAX_PLAN_BYTES
+            && self.buckets.len() <= 8
+            && self
+                .buckets
+                .iter()
+                .all(|bucket| bucket.units > 0 && reasons.insert(bucket.reason))
+    }
+}
+
+/// Passive bounded read: missing, malformed, symlinked and foreign sidecars
+/// are ignored. The status caller still binds this record to its ledger view.
+pub fn read_seed_last(pool: &Path) -> Option<SeedLast> {
+    let path = pool.join(MANAGED_NAME).join(SEEDS_DIR).join("last.json");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > 2048
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(2049)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 2048 {
+        return None;
+    }
+    let record: SeedLast = serde_json::from_slice(&bytes).ok()?;
+    (record.valid()
+        && super::pool::seed_record_matches(
+            pool,
+            &record.store_id,
+            &record.slot_id,
+            &record.incarnation,
+            &record.lease_id,
+        ))
+    .then_some(record)
+}
+
+/// Publish the last summary only for the caller's still-held generation.
+pub fn write_seed_last(pool: &Path, record: &SeedLast) -> Result<(), LeaseError> {
+    if !record.valid() {
+        return Err(LeaseError::InvalidInput("invalid last seed"));
+    }
+    let opened = open_seed(pool)?;
+    let view = &opened.view;
+    let slot = view
+        .slot(&record.slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if view.store_id != record.store_id
+        || !slot.held
+        || slot.incarnation.to_string() != record.incarnation
+        || slot.lease_id.as_deref() != Some(record.lease_id.as_str())
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let bytes =
+        serde_json::to_vec(record).map_err(|_| LeaseError::InvalidInput("invalid last seed"))?;
+    if bytes.len() > 2048 {
+        return Err(LeaseError::LedgerExhausted);
+    }
+    let dir = view.pool_root.join(MANAGED_NAME).join(SEEDS_DIR);
+    ensure_private_dir(&dir)?;
+    remove_orphan_sidecars(&dir, view)?;
+    enforce_family_bytes(&dir, bytes.len() as u64, &record.slot_id)?;
+    write_sidecar(&dir.join("last.json"), &bytes)
 }
 
 /// Call 1: read-only candidate selection under the pool lock alone.
@@ -384,7 +778,7 @@ pub fn seed_candidates(
             || catalog.slot_id != slot.id.to_string()
             || catalog.incarnation != slot.incarnation.to_string()
             || catalog.lease_id != slot.last_lease_id
-            || catalog.attempt != SeedAttemptState::None
+            || !catalog_unseeded(&view.pool_root, &catalog)
             || bytes.is_empty()
         {
             continue;
@@ -405,6 +799,19 @@ pub fn seed_candidates(
 
 /// Call 2: donor record lock, then pool lock, clone and revalidate.
 pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseError> {
+    seed_monitored(pool, request, &mut || false)
+}
+
+/// Seed with the caller's reserve/admission monitor. A true result stops the
+/// transaction with a refusal, including during hashing and the held walk.
+pub fn seed_monitored(
+    pool: &Path,
+    request: &SeedRequest,
+    monitor: &mut dyn FnMut() -> bool,
+) -> Result<SeedOutcome, LeaseError> {
+    if monitor() {
+        return Err(monitor_stop());
+    }
     let started = Instant::now();
     let budget = work_budget(request.work_budget_ms);
     validate_request(request)?;
@@ -487,7 +894,7 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         || catalog.incarnation != request.donor.incarnation
         || catalog.lease_id != request.donor.lease_id
         || catalog.record_id != request.donor.record_id
-        || catalog.attempt != SeedAttemptState::None
+        || !catalog_unseeded(&view.pool_root, &catalog)
     {
         return Ok(skip(SeedSkipReason::CatalogChanged));
     }
@@ -509,7 +916,7 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     // verified payload root, so a project folder (or the slots root) replaced
     // by a symlink is refused rather than followed to another directory.
     // The returned path is for messages; the descriptor is the custody.
-    let (donor_fd, _donor_slot_path) = open_slot_dirs(payload_root, payload_device, donor)?;
+    let (donor_fd, donor_slot_path) = open_slot_dirs(payload_root, payload_device, donor)?;
     let (recipient_fd, recipient_slot) = open_slot_dirs(payload_root, payload_device, recipient)?;
     // The recipient is this command's fresh slot: its `build/` is absent or
     // an empty owned directory. Anything else is refused, never cleaned.
@@ -535,6 +942,9 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     // internally inconsistent catalog is refused rather than trusted.
     let mut sources = Vec::with_capacity(plan.files.len());
     for planned in &plan.files {
+        if monitor() {
+            return Err(monitor_stop());
+        }
         if Instant::now() > deadline {
             return Ok(skip(SeedSkipReason::WorkDeadline));
         }
@@ -553,14 +963,17 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         }
         match &planned.join {
             Some(unit_join) => {
-                let bytes =
-                    match read_bounded(opened_file.fd.as_fd(), join::MAX_JOIN_BYTES, deadline) {
-                        Ok(bytes) => bytes,
-                        Err(StreamError::Deadline) => {
-                            return Ok(skip(SeedSkipReason::WorkDeadline))
-                        }
-                        Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
-                    };
+                let bytes = match read_bounded(
+                    opened_file.fd.as_fd(),
+                    join::MAX_JOIN_BYTES,
+                    deadline,
+                    monitor,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(StreamError::Deadline) => return Ok(skip(SeedSkipReason::WorkDeadline)),
+                    Err(StreamError::Monitor) => return Err(monitor_stop()),
+                    Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
+                };
                 if catalog_digest(&bytes) != file.digest || file.digest != unit_join.join.digest {
                     return Ok(skip(SeedSkipReason::FileChanged));
                 }
@@ -575,18 +988,29 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
                 // rule or an artifact the `.d` never names is not a proven
                 // unit.
                 let proven = parsed.sets_match(&unit_join.join.targets, &unit_join.join.inputs)
-                    && parsed.rule_for(&unit_join.join.path).is_some()
+                    && join::output_rule_proven(
+                        &parsed,
+                        &donor_slot_path.join("build"),
+                        &unit_join.join.path,
+                        &unit_join.join.inputs,
+                    )
                     && unit_join.artifacts.iter().all(|artifact| {
-                        parsed.artifact_rule_proven(artifact, &unit_join.join.inputs)
+                        join::output_rule_proven(
+                            &parsed,
+                            &donor_slot_path.join("build"),
+                            artifact,
+                            &unit_join.join.inputs,
+                        )
                     });
                 if !proven {
                     return Ok(skip(SeedSkipReason::JoinInconsistent));
                 }
             }
-            None => match hash_fd(opened_file.fd.as_fd(), deadline) {
+            None => match hash_fd(opened_file.fd.as_fd(), deadline, monitor) {
                 Ok(digest) if digest == file.digest => {}
                 Ok(_) => return Ok(skip(SeedSkipReason::FileChanged)),
                 Err(StreamError::Deadline) => return Ok(skip(SeedSkipReason::WorkDeadline)),
+                Err(StreamError::Monitor) => return Err(monitor_stop()),
                 Err(_) => return Ok(skip(SeedSkipReason::FileChanged)),
             },
         }
@@ -621,6 +1045,9 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
         }
     };
     for (index, planned) in plan.files.iter().enumerate() {
+        if monitor() {
+            return Err(monitor_stop());
+        }
         let file = &planned.file;
         if Instant::now() > deadline {
             return if wrote_any {
@@ -691,9 +1118,10 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
             Ok(metadata) => metadata,
             Err(error) => return pre_write(wrote_any, io_error(error)),
         };
-        let digest = match hash_fd(cloned.as_fd(), deadline) {
+        let digest = match hash_fd(cloned.as_fd(), deadline, monitor) {
             Ok(digest) => digest,
             Err(StreamError::Deadline) => return pre_write(wrote_any, work_deadline_after_clone()),
+            Err(StreamError::Monitor) => return Err(monitor_stop()),
             Err(StreamError::Io(error)) => return pre_write(wrote_any, error),
             Err(StreamError::TooLarge) => {
                 return pre_write(
@@ -737,7 +1165,16 @@ pub fn seed(pool: &Path, request: &SeedRequest) -> Result<SeedOutcome, LeaseErro
     let limits = walk_limits();
     // The walk's own cooperative deadline starts here; the seed's 5 s work
     // budget above is a separate bound and is not charged to the walk.
-    let walked = walk::walk_slot_in(recipient_fd.as_fd(), payload_device, limits, Instant::now());
+    let walked = walk::walk_slot_in_monitored(
+        recipient_fd.as_fd(),
+        payload_device,
+        limits,
+        Instant::now(),
+        monitor,
+    );
+    if walked.gap == Some(SeedWalkGap::MonitorStop) || monitor() {
+        return Err(monitor_stop());
+    }
     let observation = SeedObservation {
         store_id: view.store_id.clone(),
         slot_id: recipient.id.to_string(),
@@ -787,9 +1224,9 @@ pub fn publish_seed_catalog(pool: &Path, catalog: &SeedCatalog) -> Result<(), Le
     {
         return Err(LeaseError::UnknownAccounting);
     }
-    if catalog.attempt != SeedAttemptState::None {
+    if !catalog_unseeded(&view.pool_root, catalog) {
         return Err(LeaseError::InvalidInput(
-            "a generation that seeded anything publishes no catalog",
+            "a generation without durable unseeded evidence publishes no catalog",
         ));
     }
     let managed = view.pool_root.join(MANAGED_NAME);
@@ -1575,14 +2012,23 @@ fn fstat(fd: BorrowedFd<'_>) -> std::io::Result<libc::stat> {
 
 /// A streamed read's failure. `Deadline` is the cooperative work bound, `Io`
 /// a real read error and `TooLarge` a bounded read past its ceiling.
+fn monitor_stop() -> LeaseError {
+    LeaseError::Io("cold-seed reserve or admission monitor stopped".to_owned())
+}
+
 enum StreamError {
+    Monitor,
     Io(LeaseError),
     Deadline,
     TooLarge,
 }
 
 /// Hash one file, checking the cooperative deadline between read calls.
-fn hash_fd(fd: BorrowedFd<'_>, deadline: Instant) -> Result<String, StreamError> {
+fn hash_fd(
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+    monitor: &mut dyn FnMut() -> bool,
+) -> Result<String, StreamError> {
     let mut file = File::from(
         fd.try_clone_to_owned()
             .map_err(io_error)
@@ -1591,6 +2037,9 @@ fn hash_fd(fd: BorrowedFd<'_>, deadline: Instant) -> Result<String, StreamError>
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
+        if monitor() {
+            return Err(StreamError::Monitor);
+        }
         if Instant::now() > deadline {
             return Err(StreamError::Deadline);
         }
@@ -1607,7 +2056,12 @@ fn hash_fd(fd: BorrowedFd<'_>, deadline: Instant) -> Result<String, StreamError>
 }
 
 /// Read a bounded file, checking the cooperative deadline between read calls.
-fn read_bounded(fd: BorrowedFd<'_>, max: usize, deadline: Instant) -> Result<Vec<u8>, StreamError> {
+fn read_bounded(
+    fd: BorrowedFd<'_>,
+    max: usize,
+    deadline: Instant,
+    monitor: &mut dyn FnMut() -> bool,
+) -> Result<Vec<u8>, StreamError> {
     let mut file = File::from(
         fd.try_clone_to_owned()
             .map_err(io_error)
@@ -1616,6 +2070,9 @@ fn read_bounded(fd: BorrowedFd<'_>, max: usize, deadline: Instant) -> Result<Vec
     let mut bytes = Vec::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
+        if monitor() {
+            return Err(StreamError::Monitor);
+        }
         if Instant::now() > deadline {
             return Err(StreamError::Deadline);
         }

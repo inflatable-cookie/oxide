@@ -27,7 +27,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Bounds of one walk: the capacity contract's slot-walk limits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WalkLimits {
     pub max_entries: u64,
     pub max_depth: usize,
@@ -36,7 +37,8 @@ pub struct WalkLimits {
 
 /// Why a walk is not clean. The first gap stops the walk: coverage is already
 /// incomplete, so continuing would only spend work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WalkGap {
     EntryLimit,
     DepthLimit,
@@ -48,6 +50,8 @@ pub enum WalkGap {
     /// A listed entry disappeared before it could be classified, so the walk
     /// did not establish coverage of it.
     Vanished,
+    /// The caller's reserve or admission monitor stopped the transaction.
+    MonitorStop,
 }
 
 impl WalkGap {
@@ -61,6 +65,7 @@ impl WalkGap {
             Self::ForeignOwner => "foreign-owner",
             Self::UnexpectedType => "unexpected-type",
             Self::Vanished => "vanished",
+            Self::MonitorStop => "monitor-stop",
         }
     }
 }
@@ -107,7 +112,18 @@ pub fn walk_slot_in(
     limits: WalkLimits,
     started: Instant,
 ) -> WalkOutcome {
+    walk_slot_in_monitored(root, device, limits, started, &mut || false)
+}
+
+pub(super) fn walk_slot_in_monitored(
+    root: BorrowedFd<'_>,
+    device: u64,
+    limits: WalkLimits,
+    started: Instant,
+    monitor: &mut dyn FnMut() -> bool,
+) -> WalkOutcome {
     let mut walk = Walk {
+        monitor,
         limits,
         started,
         deadline: Duration::from_millis(limits.max_elapsed_ms),
@@ -146,10 +162,11 @@ pub fn walk_slot_in(
 /// Whether an owned directory has no entries at all. Used for the recipient's
 /// `build/` precondition: Finder metadata is an entry too.
 pub fn directory_is_empty(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
-    Ok(list_names(fd, 1, None)?.is_empty())
+    Ok(list_names(fd, 1, None, &mut || false)?.is_empty())
 }
 
-struct Walk {
+struct Walk<'a> {
+    monitor: &'a mut dyn FnMut() -> bool,
     limits: WalkLimits,
     started: Instant,
     deadline: Duration,
@@ -161,7 +178,7 @@ struct Walk {
     gap: Option<WalkGap>,
 }
 
-impl Walk {
+impl Walk<'_> {
     fn logical_bytes(&self) -> u64 {
         self.inodes
             .values()
@@ -177,7 +194,7 @@ impl Walk {
     }
 }
 
-impl Walk {
+impl Walk<'_> {
     fn stop(&mut self, gap: WalkGap) {
         if self.gap.is_none() {
             self.gap = Some(gap);
@@ -197,8 +214,13 @@ impl Walk {
             return;
         }
         let remaining = self.limits.max_entries.saturating_sub(self.entries);
-        let names = match list_names(directory, remaining, self.deadline_at()) {
+        let deadline = self.deadline_at();
+        let names = match list_names(directory, remaining, deadline, self.monitor) {
             Ok(names) => names,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                self.stop(WalkGap::MonitorStop);
+                return;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                 self.stop(WalkGap::Deadline);
                 return;
@@ -210,6 +232,10 @@ impl Walk {
         };
         for name in names {
             if self.gap.is_some() {
+                return;
+            }
+            if (self.monitor)() {
+                self.stop(WalkGap::MonitorStop);
                 return;
             }
             if self.out_of_time() {
@@ -356,6 +382,7 @@ fn list_names(
     directory: BorrowedFd<'_>,
     remaining: u64,
     deadline: Option<Instant>,
+    monitor: &mut dyn FnMut() -> bool,
 ) -> std::io::Result<Vec<CString>> {
     // fdopendir owns its descriptor, so hand it a duplicate.
     // SAFETY: `directory` is live.
@@ -372,6 +399,14 @@ fn list_names(
     }
     let mut names = Vec::new();
     loop {
+        if monitor() {
+            // SAFETY: the live directory stream is closed exactly once.
+            unsafe { libc::closedir(stream) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "seed monitor stop",
+            ));
+        }
         if deadline.is_some_and(|deadline| Instant::now() > deadline) {
             // SAFETY: `stream` is live and not used again; it closes `duplicate`.
             unsafe { libc::closedir(stream) };

@@ -1493,7 +1493,426 @@ pub fn admission_budget(settings: &Settings) -> u64 {
     settings.budget
 }
 
+/// A source-verification failure inside the admission lifetime. A failure
+/// before the first clone skips the seed and the command builds cold; only an
+/// unknown Git closure refuses, because its custody is unknown (§6.5, §13).
+pub(crate) enum SourceFailure {
+    Skip(&'static str),
+    Refuse(String),
+}
+
+pub(crate) fn source_failure(reason: &'static str) -> SourceFailure {
+    if reason == "git source verification closure unknown" {
+        SourceFailure::Refuse(reason.to_owned())
+    } else {
+        SourceFailure::Skip(reason)
+    }
+}
+
+/// Outcome of one pre-child seed attempt. An abandoned recipient must be
+/// released untrusted and the command admitted normally again.
+pub(crate) enum SeedRun {
+    Skipped(&'static str),
+    Seeded(
+        oxide_storage::lease::managed::SeedReceipt,
+        oxide_storage::lease::managed::SeedLast,
+    ),
+    Abandoned,
+}
+
 impl Store {
+    /// Verify the locked sources inside the admission lifetime before making
+    /// a plan. Source verification reads Cargo home, never the donor payload.
+    #[allow(dead_code)]
+    pub(crate) fn seed_verified(
+        &self,
+        held: &Lease,
+        producer: &oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
+        cargo_home: &Path,
+        cache: &mut oxide_storage::seed_source::SourceCache,
+    ) -> Result<SeedRun, String> {
+        self.seed(held, producer, lock, |candidates| {
+            let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(3));
+            let offered: Vec<_> = lock
+                .eligible
+                .iter()
+                .filter(|entry| {
+                    candidates.iter().any(|candidate| {
+                        candidate.catalog.packages.iter().any(|package| {
+                            package.name == entry.name
+                                && package.version == entry.version
+                                && Some(package.source.as_str()) == entry.source.as_deref()
+                                && package.checksum == entry.checksum
+                        })
+                    })
+                })
+                .cloned()
+                .collect();
+            let git_hints = pass
+                .discover_git_hints(cargo_home, &offered)
+                .unwrap_or_default();
+            pass.locked(cargo_home, &offered, &git_hints, cache, process::now_ms())
+                .map_err(source_failure)
+        })
+    }
+
+    /// Build and publish a catalog for a successful, still-held producing
+    /// generation. The caller verifies source trees on both sides of Cargo and
+    /// supplies the producing start; all catalog work is bounded and the
+    /// library rechecks the generation before its atomic sidecar write.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub(crate) fn publish_seed_catalog(
+        &self,
+        held: &Lease,
+        producer: oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
+        before: &[crate::seed_plan::VerifiedSource],
+        after: &[crate::seed_plan::VerifiedSource],
+        started: SystemTime,
+        started_ms: u64,
+        successful: bool,
+        origin: Option<&Built>,
+        profile: &str,
+        source_cache: &oxide_storage::seed_source::SourceCache,
+    ) -> Result<(), String> {
+        use oxide_storage::lease::managed::{
+            held_seed_attempt, publish_seed_catalog, SeedAttemptState, SeedCatalog, SeedPackage,
+            SeedRecipient, SeedSourceRoot,
+        };
+        if !successful
+            || origin.is_none()
+            || held.reused
+            || !matches!(held.prior, Prior::Fresh)
+            || self.backend != Backend::DirectoryBudget
+        {
+            return Ok(());
+        }
+        let recipient = SeedRecipient {
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+        };
+        let _sibling = self.sibling_admission()?;
+        let _admission = self.admission()?;
+        let state = self.load()?;
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == held.record)
+            .filter(|record| record.lease_id.as_deref() == Some(held.lease_id.as_str()))
+            .ok_or("the producing record is no longer held")?;
+        let attempt = held_seed_attempt(&self.pool, &recipient)
+            .map_err(|error| lease_error("cannot read seed attempt", &error))?;
+        if !matches!(attempt, SeedAttemptState::None | SeedAttemptState::Skipped) {
+            return Ok(());
+        }
+        let Some(mut classifier) = crate::seed_catalog::Producer::new(&held.build_dir) else {
+            return Ok(());
+        };
+        let rejected = classifier.rejections(profile, &lock.rejected);
+        let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(4));
+        let mut packages = Vec::new();
+        for source in before {
+            if !lock.eligible.iter().any(|entry| entry == &source.package) {
+                continue;
+            }
+            let Some(post) = after.iter().find(|post| {
+                post.package == source.package
+                    && post.kind == source.kind
+                    && post.root == source.root
+                    && post.verification_root == source.verification_root
+                    && post.tree_digest == source.tree_digest
+                    && post.proc_macro == source.proc_macro
+            }) else {
+                continue;
+            };
+            if !pass.unchanged_since(&post.verification_root, post.kind, started) {
+                continue;
+            }
+            let Some(units) = classifier.units(profile, post) else {
+                return Ok(());
+            };
+            if units.is_empty() {
+                continue;
+            }
+            let Some(source_name) = post.package.source.clone() else {
+                continue;
+            };
+            packages.push(SeedPackage {
+                name: post.package.name.clone(),
+                target: post.package.name.replace('-', "_"),
+                version: post.package.version.clone(),
+                source: source_name,
+                checksum: post.package.checksum.clone(),
+                unique: true,
+                leaf: true,
+                source_root: SeedSourceRoot {
+                    kind: post.kind,
+                    digest: post.tree_digest.clone(),
+                },
+                units,
+            });
+        }
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let catalog = SeedCatalog {
+            schema: oxide_storage::lease::seed::SEED_CATALOG_SCHEMA.into(),
+            store_id: held.store_id.clone(),
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+            record_id: held.record,
+            mark: record.last_used,
+            started_at_ms: started_ms,
+            finished_at_ms: process::now_ms(),
+            attempt,
+            producer,
+            packages,
+            rejected,
+        };
+        publish_seed_catalog(&self.pool, &catalog)
+            .map_err(|error| lease_error("cannot publish seed catalog", &error))?;
+        // A cache miss is safe: this sidecar is only a performance hint and
+        // never a trust root. Keep a malformed or over-cap cache untouched.
+        let _ =
+            oxide_storage::lease::managed::write_seed_sources(&self.pool, &recipient, source_cache);
+        Ok(())
+    }
+
+    /// One admission lifetime spans the catalog read, effect-free plan,
+    /// reserve gate, durable intent and pinned library transaction. `held`
+    /// already owns the outermost recipient record lock.
+    pub(crate) fn seed(
+        &self,
+        held: &Lease,
+        producer: &oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
+        verify_sources: impl FnOnce(
+            &[oxide_storage::lease::managed::SeedCandidate],
+        )
+            -> Result<Vec<crate::seed_plan::VerifiedSource>, SourceFailure>,
+    ) -> Result<SeedRun, String> {
+        self.seed_with(
+            held,
+            producer,
+            lock,
+            verify_sources,
+            |pool, request, monitor| {
+                oxide_storage::lease::managed::seed_monitored(pool, request, monitor)
+            },
+        )
+    }
+
+    fn seed_with(
+        &self,
+        held: &Lease,
+        producer: &oxide_storage::lease::managed::SeedProducer,
+        lock: &crate::seed_lock::Analysis,
+        verify_sources: impl FnOnce(
+            &[oxide_storage::lease::managed::SeedCandidate],
+        )
+            -> Result<Vec<crate::seed_plan::VerifiedSource>, SourceFailure>,
+        transaction: impl FnOnce(
+            &Path,
+            &oxide_storage::lease::managed::SeedRequest,
+            &mut dyn FnMut() -> bool,
+        )
+            -> Result<oxide_storage::lease::managed::SeedOutcome, LeaseError>,
+    ) -> Result<SeedRun, String> {
+        use oxide_storage::lease::managed::{
+            seed_candidates, write_seed_attempt, write_seed_last, SeedAttempt, SeedAttemptState,
+            SeedBucket, SeedLast, SeedOutcome, SeedRecipient, ATTEMPT_SCHEMA,
+        };
+        if self.backend == Backend::ApfsVolume {
+            return Ok(SeedRun::Skipped(
+                "seeding not yet supported on a removable pool",
+            ));
+        }
+        if held.reused || !matches!(held.prior, Prior::Fresh) {
+            return Ok(SeedRun::Skipped("recipient not fresh"));
+        }
+        if lock.eligible.is_empty() {
+            return Ok(SeedRun::Skipped("no eligible locked packages"));
+        }
+        let recipient = SeedRecipient {
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+        };
+        let _sibling = self.sibling_admission()?;
+        let _admission = self.admission()?;
+        let state = self.load()?;
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == held.record)
+            .filter(|record| record.lease_id.as_deref() == Some(held.lease_id.as_str()))
+            .ok_or("the recipient record is no longer held")?;
+        let candidates = seed_candidates(&self.pool, &recipient, 8)
+            .map_err(|error| lease_error("cannot inspect seed candidates", &error))?;
+        if candidates.candidates.is_empty() {
+            return Ok(SeedRun::Skipped("no eligible donor"));
+        }
+        let sources = match verify_sources(&candidates.candidates) {
+            Ok(sources) => sources,
+            Err(SourceFailure::Skip(reason)) => return Ok(SeedRun::Skipped(reason)),
+            Err(SourceFailure::Refuse(reason)) => return Err(reason),
+        };
+        let Some(request) = crate::seed_plan::select(
+            &recipient,
+            producer,
+            &lock.eligible,
+            &sources,
+            &candidates.candidates,
+        ) else {
+            return Ok(SeedRun::Skipped("no eligible donor"));
+        };
+        let rejected = candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.slot_id == request.donor.slot_id)
+            .ok_or("the selected donor disappeared")?
+            .catalog
+            .rejected
+            .clone();
+        let watchdog = Watchdog::for_pool(&self.payload);
+        let trigger = HOST_RESERVE_BYTES + crate::watchdog::MARGIN_BYTES;
+        let first = watchdog.seed_sample();
+        if first.is_none_or(|bytes| bytes < trigger) {
+            return Err(format!(
+                "seed reserve stop: available space {first:?}, trigger {trigger} bytes"
+            ));
+        }
+        let mut minimum = first.unwrap();
+        let mut attempt = SeedAttempt {
+            schema: ATTEMPT_SCHEMA.to_owned(),
+            store_id: held.store_id.clone(),
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+            state: SeedAttemptState::Intent,
+            donor_slot: None,
+            units: None,
+            files: None,
+            logical_bytes: None,
+            catalog_digest: None,
+            observation: None,
+        };
+        write_seed_attempt(&self.pool, &attempt)
+            .map_err(|error| lease_error("cannot record seed intent", &error))?;
+        self.write_origin(held.record, record.last_used, None)?;
+        let mut next_sample = Instant::now() + crate::watchdog::INTERVAL;
+        let mut steps = 0usize;
+        let mut stopped = false;
+        let mut admission_stopped = false;
+        let mut monitor = || {
+            if crate::budget::admission_expired() {
+                admission_stopped = true;
+                return true;
+            }
+            steps += 1;
+            if steps < 64 && Instant::now() < next_sample {
+                return false;
+            }
+            steps = 0;
+            next_sample = Instant::now() + crate::watchdog::INTERVAL;
+            match watchdog.seed_sample() {
+                Some(bytes) if bytes >= trigger => {
+                    minimum = minimum.min(bytes);
+                    false
+                }
+                Some(bytes) => {
+                    minimum = minimum.min(bytes);
+                    stopped = true;
+                    true
+                }
+                None => {
+                    stopped = true;
+                    true
+                }
+            }
+        };
+        let outcome = transaction(&self.pool, &request, &mut monitor);
+        drop(monitor);
+        match outcome {
+            Ok(SeedOutcome::Skipped(skip)) => {
+                attempt.state = SeedAttemptState::Skipped;
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record seed skip", &error))?;
+                Ok(SeedRun::Skipped(skip.reason.as_str()))
+            }
+            Ok(SeedOutcome::Abandoned(_)) => {
+                attempt.state = SeedAttemptState::Reset;
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record abandoned seed", &error))?;
+                Ok(SeedRun::Abandoned)
+            }
+            Ok(SeedOutcome::Seeded(receipt)) => {
+                attempt.state = SeedAttemptState::Seeded;
+                attempt.donor_slot = Some(receipt.donor_slot.clone());
+                attempt.units = Some(receipt.units);
+                attempt.files = Some(receipt.files);
+                attempt.logical_bytes = Some(receipt.logical_bytes);
+                attempt.catalog_digest = Some(receipt.catalog_digest.clone());
+                attempt.observation = Some(receipt.observation.clone());
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record completed seed", &error))?;
+                let mut buckets = std::collections::BTreeMap::new();
+                let mut unknown = 0u32;
+                for rejection in rejected {
+                    if let Some(count) = rejection.units {
+                        let current: &mut u32 = buckets.entry(rejection.reason).or_default();
+                        *current = current
+                            .checked_add(count)
+                            .ok_or("seed rejection count overflow")?;
+                    } else {
+                        unknown = unknown
+                            .checked_add(1)
+                            .ok_or("seed rejection count overflow")?;
+                    }
+                }
+                let last = SeedLast {
+                    schema: "oxide.cold-seed/1".into(),
+                    store_id: held.store_id.clone(),
+                    slot_id: held.slot_id.clone(),
+                    incarnation: held.incarnation.clone(),
+                    lease_id: held.lease_id.clone(),
+                    donor_slot: receipt.donor_slot.clone(),
+                    units: receipt.units,
+                    files: receipt.files,
+                    logical_bytes: receipt.logical_bytes,
+                    elapsed_ms: receipt.elapsed_ms,
+                    when_ms: process::now_ms(),
+                    buckets: buckets
+                        .into_iter()
+                        .filter(|(_, units)| *units > 0)
+                        .map(|(reason, units)| SeedBucket { reason, units })
+                        .collect(),
+                    unknown,
+                };
+                write_seed_last(&self.pool, &last)
+                    .map_err(|error| lease_error("cannot record last seed", &error))?;
+                Ok(SeedRun::Seeded(receipt, last))
+            }
+            Err(error) => {
+                attempt.state = SeedAttemptState::Reset;
+                write_seed_attempt(&self.pool, &attempt)
+                    .map_err(|error| lease_error("cannot record stopped seed", &error))?;
+                if stopped {
+                    return Err(format!(
+                        "seed reserve stop: minimum {minimum} bytes, trigger {trigger} bytes"
+                    ));
+                }
+                if admission_stopped {
+                    return Err("seed admission deadline expired".to_owned());
+                }
+                Err(lease_error("cannot seed slot", &error))
+            }
+        }
+    }
+
     /// Open the pool, creating it on first use above the host reserve. A
     /// macOS pool is excluded from Time Machine before any build writes into
     /// it; an unverified exclusion refuses before Cargo starts.
@@ -4562,7 +4981,7 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A ledger as an earlier Oxide wrote it reads back, keeps its stored
@@ -5541,6 +5960,619 @@ mod tests {
             .unwrap();
         store.remove_ticket(ticket).unwrap();
         outcome
+    }
+
+    pub(crate) fn seed_fixture_lease(store: &Store, key: &SlotKey) -> Lease {
+        lease(store, key, None).expect("fixture lease")
+    }
+
+    pub(crate) fn seed_fixture() -> (PathBuf, Store, SlotKey) {
+        use std::ffi::{CStr, CString, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+        let template = std::env::temp_dir().join("oxide-seed-front.XXXXXX");
+        let mut name = CString::new(template.as_os_str().as_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        // SAFETY: name is writable, NUL-terminated and ends in XXXXXX.
+        assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+        let name = CStr::from_bytes_until_nul(&name).unwrap();
+        let root = fs::canonicalize(PathBuf::from(OsStr::from_bytes(name.to_bytes()))).unwrap();
+        let pool = root.join("pool");
+        init_budget_pool(&pool, 1 << 30).unwrap();
+        let store = Store {
+            control: pool.join(MANAGED_NAME),
+            payload: pool.join("payload"),
+            pool: pool.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: Some(1 << 30),
+            recorded_budget: 1 << 30,
+            max_active: 16,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "identity".into(),
+            compatibility: "quick-key".into(),
+        };
+        (root, store, key)
+    }
+
+    fn seed_test_producer() -> oxide_storage::lease::managed::SeedProducer {
+        oxide_storage::lease::managed::SeedProducer {
+            cargo_version: "cargo".into(),
+            rustc_digest: "digest".into(),
+            rustc: "rustc".into(),
+            target: "target".into(),
+            recipe: "quick".into(),
+            backend: "backend".into(),
+            adapter: "adapter".into(),
+            context_digest: "context".into(),
+            config_files: vec![],
+            flags_digest: "flags".into(),
+            cargo_home: "/cargo".into(),
+            command_family: "check".into(),
+            command_class: "check".into(),
+        }
+    }
+
+    #[test]
+    fn seed_with_no_catalog_does_not_verify_sources_or_write_sidecars() {
+        let (root, store, key) = seed_fixture();
+        let held = lease(&store, &key, None).expect("fresh lease");
+        let lock = format!("version = 4\n[[package]]\nname = 'leaf'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let producer = seed_test_producer();
+        let before = fs::read(store.control.join("state.json")).unwrap();
+        let result = store.seed(&held, &producer, &lock, |_| {
+            panic!("source verification ran")
+        });
+        assert!(matches!(result, Ok(SeedRun::Skipped("no eligible donor"))));
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        assert!(!store.control.join("seeds").exists());
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_catalog_after_a_successful_build_keeps_the_built_origin() {
+        // A catalog the library refuses (here: the producing record is no
+        // longer ours) must leave the successful generation's trusted origin
+        // and slot intact; the caller ignores the refusal (§4.4, §9.1).
+        let (root, store, donor_key) = seed_fixture();
+        let mut donor = seed_fixture_lease(&store, &donor_key);
+        let record_id = donor.record_id();
+        let origin = Built::Affine(donor_key.checkout.clone());
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let cache = oxide_storage::seed_source::SourceCache::new(&donor.store_id).unwrap();
+        let lease_id = std::mem::replace(&mut donor.lease_id, "lost-producer".into());
+        let refused = store.publish_seed_catalog(
+            &donor,
+            seed_test_producer(),
+            &lock,
+            &[],
+            &[],
+            SystemTime::now(),
+            process::now_ms(),
+            true,
+            Some(&origin),
+            "debug",
+            &cache,
+        );
+        assert!(refused.is_err());
+        donor.lease_id = lease_id;
+        assert!(!store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", donor.slot_id))
+            .exists());
+        store.release(donor, Some(origin)).unwrap();
+        let state = store.load().unwrap();
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == record_id)
+            .unwrap();
+        assert!(matches!(
+            store.trusted_origin(record),
+            Some(Built::Affine(path)) if path == donor_key.checkout
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seed_removable_and_empty_allowlist_skip_without_side_effects() {
+        let (root, mut store, key) = seed_fixture();
+        let held = lease(&store, &key, None).expect("fresh lease");
+        let lock = crate::seed_lock::analyze(b"version = 4\n").unwrap();
+        let before = fs::read(store.control.join("state.json")).unwrap();
+        let producer = seed_test_producer();
+        let result = store.seed(&held, &producer, &lock, |_| {
+            panic!("source verification ran")
+        });
+        assert!(matches!(
+            result,
+            Ok(SeedRun::Skipped("no eligible locked packages"))
+        ));
+        store.backend = Backend::ApfsVolume;
+        let result = store.seed(&held, &producer, &lock, |_| {
+            panic!("source verification ran")
+        });
+        assert!(matches!(
+            result,
+            Ok(SeedRun::Skipped(
+                "seeding not yet supported on a removable pool"
+            ))
+        ));
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        assert!(!store.control.join("seeds").exists());
+        store.backend = Backend::DirectoryBudget;
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A released donor with a verified catalog that offers cfg-if.
+    fn front_door_donor() -> (
+        PathBuf,
+        Store,
+        SlotKey,
+        crate::seed_lock::Analysis,
+        oxide_storage::lease::managed::SeedProducer,
+    ) {
+        use oxide_storage::lease::managed::{SeedCatalog, SeedSourceKind};
+        let (root, store, donor_key) = seed_fixture();
+        let donor = lease(&store, &donor_key, None).expect("donor lease");
+        let source_root = root.join("source");
+        fs::create_dir_all(source_root.join("src")).unwrap();
+        let input = source_root.join("src/lib.rs");
+        fs::write(&input, "source").unwrap();
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let source = crate::seed_plan::VerifiedSource {
+            package: lock.eligible[0].clone(),
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root,
+            proc_macro: false,
+        };
+        let fingerprint = donor
+            .build_dir
+            .join("debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&fingerprint).unwrap();
+        for name in ["lib-cfg_if", "lib-cfg_if.json", "dep-lib-cfg_if"] {
+            fs::write(fingerprint.join(name), "fingerprint").unwrap();
+        }
+        let deps = donor.build_dir.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let dep = deps.join("cfg_if-aaaaaaaaaaaaaaaa.d");
+        let artifact = deps.join("libcfg_if-aaaaaaaaaaaaaaaa.rmeta");
+        fs::write(&artifact, "artifact").unwrap();
+        fs::write(
+            &dep,
+            format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                dep.display(),
+                input.display(),
+                artifact.display(),
+                input.display(),
+                input.display()
+            ),
+        )
+        .unwrap();
+        let mut producer = seed_test_producer();
+        producer.rustc_digest = "c".repeat(64);
+        producer.context_digest = "d".repeat(64);
+        producer.flags_digest = "e".repeat(64);
+        let origin = Built::Affine(donor_key.checkout.clone());
+        let cache = oxide_storage::seed_source::SourceCache::new(&donor.store_id).unwrap();
+        store
+            .publish_seed_catalog(
+                &donor,
+                producer.clone(),
+                &lock,
+                &[source.clone()],
+                &[source.clone()],
+                SystemTime::now(),
+                process::now_ms(),
+                true,
+                Some(&origin),
+                "debug",
+                &cache,
+            )
+            .unwrap();
+        let catalog_path = store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", donor.slot_id));
+        let catalog = SeedCatalog::parse(&fs::read(&catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog.packages.len(), 1);
+        assert_eq!(catalog.packages[0].units.len(), 1);
+        assert_eq!(catalog.packages[0].units[0].files.len(), 5);
+        assert!(store.control.join("seeds/sources.json").exists());
+        store.release(donor, Some(origin)).unwrap();
+        (root, store, donor_key, lock, producer)
+    }
+
+    #[test]
+    fn a_source_failure_before_the_first_clone_skips_and_only_unknown_closure_refuses() {
+        assert!(matches!(
+            source_failure("injected source failure"),
+            SourceFailure::Skip("injected source failure")
+        ));
+        assert!(matches!(
+            source_failure("git source verification closure unknown"),
+            SourceFailure::Refuse(reason) if reason == "git source verification closure unknown"
+        ));
+        let (root, store, donor_key, lock, producer) = front_door_donor();
+        let recipient_checkout = root.join("recipient");
+        fs::create_dir(&recipient_checkout).unwrap();
+        let recipient_key = SlotKey {
+            checkout: recipient_checkout,
+            identity: "recipient".into(),
+            compatibility: "quick-key".into(),
+        };
+        let recipient = lease(&store, &recipient_key, None).expect("recipient lease");
+        let before = fs::read(store.control.join("state.json")).unwrap();
+        // A skip before the first clone writes no attempt and changes no state:
+        // the command builds cold in the same empty slot.
+        let skipped = store
+            .seed(&recipient, &producer, &lock, |_| {
+                Err(SourceFailure::Skip("injected source failure"))
+            })
+            .unwrap();
+        assert!(matches!(
+            skipped,
+            SeedRun::Skipped("injected source failure")
+        ));
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        assert!(!store
+            .control
+            .join("seeds")
+            .join(format!("{}.attempt.json", recipient.slot_id))
+            .exists());
+        // Only an unknown Git closure refuses, and it still changes nothing.
+        let refused = store.seed(&recipient, &producer, &lock, |_| {
+            Err(SourceFailure::Refuse(
+                "git source verification closure unknown".into(),
+            ))
+        });
+        assert_eq!(
+            refused.err(),
+            Some("git source verification closure unknown".to_owned())
+        );
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        store.release(recipient, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seed_front_door_pins_a_catalog_and_records_the_completed_generation() {
+        use oxide_storage::lease::managed::{read_seed_last, SeedCatalog, SeedSourceKind};
+        let (root, mut store, donor_key) = seed_fixture();
+        let donor = lease(&store, &donor_key, None).expect("donor lease");
+        let source_root = root.join("source");
+        fs::create_dir_all(source_root.join("src")).unwrap();
+        let input = source_root.join("src/lib.rs");
+        fs::write(&input, "source").unwrap();
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let source = crate::seed_plan::VerifiedSource {
+            package: lock.eligible[0].clone(),
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root,
+            proc_macro: false,
+        };
+        let fingerprint = donor
+            .build_dir
+            .join("debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&fingerprint).unwrap();
+        for name in ["lib-cfg_if", "lib-cfg_if.json", "dep-lib-cfg_if"] {
+            fs::write(fingerprint.join(name), "fingerprint").unwrap();
+        }
+        let deps = donor.build_dir.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let dep = deps.join("cfg_if-aaaaaaaaaaaaaaaa.d");
+        let artifact = deps.join("libcfg_if-aaaaaaaaaaaaaaaa.rmeta");
+        fs::write(&artifact, "artifact").unwrap();
+        fs::write(
+            &dep,
+            format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                dep.display(),
+                input.display(),
+                artifact.display(),
+                input.display(),
+                input.display()
+            ),
+        )
+        .unwrap();
+        let mut producer = seed_test_producer();
+        producer.rustc_digest = "c".repeat(64);
+        producer.context_digest = "d".repeat(64);
+        producer.flags_digest = "e".repeat(64);
+        let origin = Built::Affine(donor_key.checkout.clone());
+        let cache = oxide_storage::seed_source::SourceCache::new(&donor.store_id).unwrap();
+        store
+            .publish_seed_catalog(
+                &donor,
+                producer.clone(),
+                &lock,
+                &[source.clone()],
+                &[source.clone()],
+                SystemTime::now(),
+                process::now_ms(),
+                true,
+                Some(&origin),
+                "debug",
+                &cache,
+            )
+            .unwrap();
+        let catalog_path = store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", donor.slot_id));
+        let catalog = SeedCatalog::parse(&fs::read(&catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog.packages.len(), 1);
+        assert_eq!(catalog.packages[0].units.len(), 1);
+        assert_eq!(catalog.packages[0].units[0].files.len(), 5);
+        assert!(store.control.join("seeds/sources.json").exists());
+        let recipient_checkout = root.join("recipient");
+        fs::create_dir(&recipient_checkout).unwrap();
+        let recipient_key = SlotKey {
+            checkout: recipient_checkout,
+            identity: "recipient".into(),
+            compatibility: "quick-key".into(),
+        };
+        let recipient = lease(&store, &recipient_key, None).expect("recipient lease");
+        // A complete catalog is not a donor while its producing generation
+        // is still held: a crash before release cannot make it eligible.
+        let held_donor = store
+            .seed(&recipient, &producer, &lock, |_| {
+                panic!("source verification ran")
+            })
+            .unwrap();
+        assert!(matches!(held_donor, SeedRun::Skipped("no eligible donor")));
+        store.release(donor, Some(origin)).unwrap();
+        // A candidate with no verified overlap skips without sampling the
+        // reserve or creating an attempt, even if the reading is unavailable.
+        let payload = std::mem::replace(&mut store.payload, root.join("missing-reserve"));
+        let skipped = store
+            .seed(&recipient, &producer, &lock, |_| Ok(vec![]))
+            .unwrap();
+        assert!(matches!(skipped, SeedRun::Skipped("no eligible donor")));
+        let attempt = store
+            .control
+            .join("seeds")
+            .join(format!("{}.attempt.json", recipient.slot_id));
+        assert!(!attempt.exists());
+        // With a real plan, the same unavailable reserve is a refusal before
+        // the marker and before any recipient write.
+        let refused = store.seed(&recipient, &producer, &lock, |_| Ok(vec![source.clone()]));
+        assert!(matches!(refused, Err(ref reason) if reason.contains("seed reserve stop")));
+        assert!(!attempt.exists());
+        assert!(fs::read_dir(&recipient.build_dir).unwrap().next().is_none());
+        store.payload = payload;
+        let result = store
+            .seed(&recipient, &producer, &lock, |candidates| {
+                assert_eq!(candidates.len(), 1);
+                assert!(matches!(
+                    probe_lock(&store.lock_path(recipient.record), false).unwrap(),
+                    Probe::Held
+                ));
+                assert!(matches!(
+                    probe_lock(&store.control.join("admission.lock"), false).unwrap(),
+                    Probe::Held
+                ));
+                assert!(matches!(
+                    probe_lock(&store.lock_path(catalog.record_id), false).unwrap(),
+                    Probe::Free(_)
+                ));
+                Ok(vec![source.clone()])
+            })
+            .unwrap();
+        let SeedRun::Seeded(receipt, last) = result else {
+            panic!("seed did not complete")
+        };
+        assert_eq!(receipt.units, 1);
+        assert_eq!(receipt.files, 5);
+        assert_eq!(last.lease_id, recipient.lease_id);
+        let attempt_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&attempt).unwrap()).unwrap();
+        assert_eq!(attempt_json["state"], "seeded");
+        assert_eq!(attempt_json["lease_id"], recipient.lease_id);
+        assert_eq!(
+            read_seed_last(&store.pool).unwrap().lease_id,
+            recipient.lease_id
+        );
+        assert!(recipient
+            .build_dir
+            .join("debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta")
+            .exists());
+        let state = store.load().unwrap();
+        let record = state
+            .records
+            .iter()
+            .find(|record| record.id == recipient.record)
+            .unwrap();
+        assert!(store.trusted_origin(record).is_none());
+        store.release(recipient, None).unwrap();
+
+        // Inject the library outcomes after a recipient write; the library's
+        // own fixtures exercise the real clone and walk fault boundaries.
+        for fault in ["walk", "clone", "reserve"] {
+            use oxide_storage::lease::managed::{
+                SeedAbandon, SeedObservation, SeedOutcome, SeedWalkGap, SeedWalkLimits,
+            };
+            let checkout = root.join(format!("recipient-{fault}"));
+            fs::create_dir(&checkout).unwrap();
+            let key = SlotKey {
+                checkout,
+                identity: format!("recipient-{fault}"),
+                compatibility: "quick-key".into(),
+            };
+            let held = lease(&store, &key, None).expect("fault recipient");
+            let reserve_path = root.join("reserve-probe");
+            let saved_payload = if fault == "reserve" {
+                fs::create_dir(&reserve_path).unwrap();
+                Some(std::mem::replace(&mut store.payload, reserve_path.clone()))
+            } else {
+                None
+            };
+            let result = store.seed_with(
+                &held,
+                &producer,
+                &lock,
+                |_| Ok(vec![source.clone()]),
+                |_, _, monitor| {
+                    fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
+                    if fault == "reserve" {
+                        fs::remove_dir(&reserve_path).unwrap();
+                        assert!((0..64).any(|_| monitor()));
+                        return Err(LeaseError::Io("monitor stopped".into()));
+                    }
+                    if fault == "clone" {
+                        return Err(LeaseError::Io("injected clone failure".into()));
+                    }
+                    Ok(SeedOutcome::Abandoned(SeedAbandon {
+                        observation: SeedObservation {
+                            store_id: held.store_id.clone(),
+                            slot_id: held.slot_id.clone(),
+                            incarnation: held.incarnation.clone(),
+                            lease_id: held.lease_id.clone(),
+                            entries: 1,
+                            logical_bytes: 9,
+                            allocated_bytes: 0,
+                            gap: Some(SeedWalkGap::Unreadable),
+                            limits: SeedWalkLimits {
+                                max_entries: 1,
+                                max_depth: 1,
+                                max_elapsed_ms: 1,
+                            },
+                            elapsed_ms: 0,
+                        },
+                    }))
+                },
+            );
+            if let Some(payload) = saved_payload {
+                store.payload = payload;
+            }
+            if fault == "walk" {
+                assert!(matches!(result, Ok(SeedRun::Abandoned)));
+            } else if fault == "reserve" {
+                assert!(matches!(result, Err(ref reason) if reason.contains("seed reserve stop")));
+            } else {
+                assert!(
+                    matches!(result, Err(ref reason) if reason.contains("injected clone failure"))
+                );
+            }
+            let attempt = store
+                .control
+                .join("seeds")
+                .join(format!("{}.attempt.json", held.slot_id));
+            let attempt_json: serde_json::Value =
+                serde_json::from_slice(&fs::read(attempt).unwrap()).unwrap();
+            assert_eq!(attempt_json["state"], "reset");
+            assert_eq!(read_seed_last(&store.pool).unwrap(), last);
+            store.release(held, None).unwrap();
+            let untrusted = lease(&store, &key, None).expect("untrusted generation");
+            assert!(matches!(untrusted.prior, Prior::Unknown));
+            assert!(untrusted.build_dir.join("partial").exists());
+            store.discard(untrusted).unwrap();
+            let cold = lease(&store, &key, None).expect("cold generation");
+            assert!(matches!(cold.prior, Prior::Fresh));
+            store.release(cold, None).unwrap();
+        }
+
+        // Alter the donor only after the effect-free catalog read. The
+        // pinned second call must see the changed bytes and leave this new
+        // recipient empty, with a terminal skipped attempt.
+        let checkout = root.join("recipient-changed");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "recipient-changed".into(),
+            compatibility: "quick-key".into(),
+        };
+        let held = lease(&store, &key, None).expect("second recipient");
+        let catalog_path = store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", catalog.slot_id));
+        let mut changed = catalog.clone();
+        changed.mark += 1;
+        let result = store
+            .seed(&held, &producer, &lock, |_| {
+                fs::write(&catalog_path, changed.to_bytes().unwrap()).unwrap();
+                Ok(vec![source])
+            })
+            .unwrap();
+        assert!(matches!(result, SeedRun::Skipped("catalog changed")));
+        assert!(fs::read_dir(&held.build_dir).unwrap().next().is_none());
+        let attempt = store
+            .control
+            .join("seeds")
+            .join(format!("{}.attempt.json", held.slot_id));
+        let attempt_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(attempt).unwrap()).unwrap();
+        assert_eq!(attempt_json["state"], "skipped");
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held() {
+        for point in ["before-origin", "intent", "partial", "complete", "running"] {
+            let (root, store, key) = seed_fixture();
+            let held = lease(&store, &key, None).expect("fresh lease");
+            let record_id = held.record;
+            let state = store.load().unwrap();
+            let record = state.records.iter().find(|r| r.id == record_id).unwrap();
+            assert!(store.trusted_origin(record).is_none(), "{point}");
+            if point != "before-origin" {
+                store
+                    .write_origin(record_id, record.last_used, None)
+                    .unwrap();
+            }
+            if matches!(point, "partial" | "complete" | "running") {
+                fs::write(held.build_dir.join("seeded-fixture"), point).unwrap();
+            }
+            if point == "running" {
+                store.mark_spawning(&held).unwrap();
+                store.mark_running(&held, i32::MAX).unwrap();
+            }
+            drop(held);
+            let reacquired = lease(&store, &key, None).expect("recoverable lease");
+            assert!(matches!(reacquired.prior, Prior::Unknown), "{point}");
+            store.discard(reacquired).unwrap();
+            let cold = lease(&store, &key, None).expect("cold lease");
+            assert!(matches!(cold.prior, Prior::Fresh), "{point}");
+            assert!(!cold.build_dir.join("seeded-fixture").exists(), "{point}");
+            store.release(cold, None).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let (root, store, key) = seed_fixture();
+        let held = lease(&store, &key, None).expect("fresh lease");
+        store.mark_spawning(&held).unwrap();
+        let state = store.load().unwrap();
+        let record = state.records.iter().find(|r| r.id == held.record).unwrap();
+        let slot = ledger_view(&store.pool)
+            .unwrap()
+            .slots
+            .into_iter()
+            .find(|slot| slot.slot_id == held.slot_id)
+            .unwrap();
+        assert_eq!(settle(record, Some(&slot), |_| true), Settle::Keep);
+        assert!(store.trusted_origin(record).is_none());
+        // Fixture cleanup explicitly releases the simulated held generation.
+        store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Second-slot rule: a busy slot of this checkout's key sends a further

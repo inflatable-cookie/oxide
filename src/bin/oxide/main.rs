@@ -25,6 +25,18 @@ mod outputs;
 mod process;
 mod prune;
 mod removable;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_catalog;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_context;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_lock;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_plan;
+#[allow(dead_code)] // Integrated by the cold-seeding front door.
+mod seed_sources;
+#[allow(dead_code)] // Enabled after the cold-seeding qualification.
+mod seed_summary;
 mod store;
 mod version;
 mod watchdog;
@@ -351,7 +363,30 @@ fn test_pause_with(point: &str, detail: &str) {
     let _ = (point, detail);
 }
 
+/// Opt-in is deliberately held until the pinned Cargo layout is qualified.
+const COLD_SEED_QUALIFIED: bool = false;
+
+fn cold_seed_active(value: Option<&std::ffi::OsStr>) -> bool {
+    COLD_SEED_QUALIFIED && value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn cold_seed_qualification_notice(value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    cold_seed_notice_when(COLD_SEED_QUALIFIED, value)
+}
+
+/// The skip notice is only for an opt-in that the qualification hold refuses.
+/// Once #169 flips the constant, an enabled seed must not print it.
+fn cold_seed_notice_when(qualified: bool, value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    (!qualified && value == Some(std::ffi::OsStr::new("1")))
+        .then_some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
+}
+
 fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
+    if let Some(reason) =
+        cold_seed_qualification_notice(std::env::var_os("OXIDE_COLD_SEED").as_deref())
+    {
+        eprintln!("oxide: seeding skipped: {reason}");
+    }
     // The clock was installed by `run` before the hand-off check; nothing here
     // may re-arm it (oxide#140).
     let exec = invocation.command == "exec";
@@ -486,15 +521,17 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     }
     let started = Instant::now();
     let mut waits = store::WaitAccounting::default();
+    let mut grants = LeaseGrants::new();
     let resolution = cli::resolution(&invocation.cargo_args);
     let label = exec_label(&invocation.tool);
-    let (mut held, gate) = match lease_with_gate(
+    let (mut held, mut gate) = match lease_with_gate(
         &store,
         &key,
         invocation.profile,
         &resolution,
         label.as_deref(),
         &mut waits,
+        &mut grants,
     )? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
@@ -519,7 +556,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // for every other cooperative command in the checkout to close and blocks
     // new ones until the link is published. It binds exactly the destination
     // the slot was keyed for, or refuses.
-    let binding = match outputs::bind_for_command(
+    let mut binding = match outputs::bind_for_command(
         &store,
         &key.checkout,
         held.record_id(),
@@ -547,6 +584,61 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         let origin = held.prior.unchanged();
         store.release(held, origin)?;
         return Ok(stop_for_admission());
+    }
+    // The seed point is after the output binding and before any recipient
+    // scratch or writer. The qualification gate is false in this slice.
+    let mut production = None;
+    if cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref()) {
+        match seed_sources::Production::prepare(&invocation, &key.checkout, &held, &store) {
+            Ok(mut prepared) => match prepared.seed(&store, &held) {
+                Ok(store::SeedRun::Skipped(reason)) => {
+                    let reason = seed_lock::skip_reason(reason, &prepared.lock);
+                    eprintln!("oxide: seeding skipped: {reason}");
+                    production = Some(prepared);
+                }
+                Ok(store::SeedRun::Seeded(_, last)) => {
+                    eprintln!("{}", seed_summary::summary(&last));
+                    production = Some(prepared);
+                }
+                Ok(store::SeedRun::Abandoned) => {
+                    (held, gate, binding) = match abandon_seed_and_reacquire(
+                        &store,
+                        &key,
+                        invocation.profile,
+                        &resolution,
+                        label.as_deref(),
+                        &mut waits,
+                        &mut grants,
+                        held,
+                        binding,
+                        planned.as_ref(),
+                        pool_fallback.as_deref(),
+                        derives_from_receipt,
+                    )? {
+                        Ok(leased) => leased,
+                        Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
+                        Err(Stop::Cargo(code)) => return Ok(code),
+                        Err(Stop::Admission) => return Ok(stop_for_admission()),
+                    };
+                    eprintln!("oxide: seeding skipped: recipient walk incomplete");
+                }
+                Err(reason) => {
+                    return refuse_seed(&store, held, binding, reason);
+                }
+            },
+            Err(seed_sources::PreparationError::Skip(reason)) => {
+                eprintln!("oxide: seeding skipped: {reason}");
+            }
+            Err(seed_sources::PreparationError::SkipNamed(reason)) => {
+                eprintln!("oxide: seeding skipped: {reason}");
+            }
+            Err(seed_sources::PreparationError::Refuse(reason)) => {
+                drop(binding);
+                let origin = held.prior.unchanged();
+                store.release(held, origin)?;
+                return Err(reason);
+            }
+        }
     }
     for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
@@ -787,6 +879,13 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let note = notes.join(", ");
     let note = (!note.is_empty()).then_some(note);
     let origin = gate.finish(&key.checkout);
+    let seed_profile = if invocation.profile == Profile::Release
+        || (invocation.command == "bench" && !invocation.explicit_profile)
+    {
+        "release"
+    } else {
+        "debug"
+    };
     // A converted checkout's `run` keeps its lease through the program: the
     // program runs as this command's own process group from the real root
     // it bound, under the same custody (a relink waits, a clean waits),
@@ -841,6 +940,8 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             execution_started,
             &mut budget_stop,
             &chosen_temp,
+            production,
+            seed_profile,
         );
     }
     // An unconverted `run` program is an Oxide-launched child too, and when
@@ -881,7 +982,18 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             execution_started,
             &mut budget_stop,
             &chosen_temp,
+            production,
+            seed_profile,
         );
+    }
+    if let Some(producing) = production {
+        let successful = outcome
+            .as_ref()
+            .is_ok_and(|(status, _, _)| status.is_some_and(|status| status.success()))
+            && stopped.is_none()
+            && budget::origin().is_none();
+        // A catalog failure never changes the command's result or origin.
+        producing.publish(&store, &held, successful, origin.as_ref(), seed_profile);
     }
     store.release(held, origin)?;
     let (status, executable, drained) = outcome?;
@@ -993,6 +1105,8 @@ fn run_owned_program(
     execution_started: Option<Instant>,
     budget_stop: &mut process::Stop,
     child_temp: &child_temp::Chosen,
+    production: Option<seed_sources::Production>,
+    seed_profile: &str,
 ) -> Result<u8, String> {
     let mut command = Command::new(program);
     command.args(args).env("CARGO_MANIFEST_DIR", manifest_dir);
@@ -1071,6 +1185,13 @@ fn run_owned_program(
         )?;
         return Ok(1);
     }
+    if let Some(producing) = production {
+        let successful = status.is_some_and(|status| status.success())
+            && stopped.is_none()
+            && budget::origin().is_none();
+        // A catalog failure never changes the command's result or origin.
+        producing.publish(store, &held, successful, origin.as_ref(), seed_profile);
+    }
     store.release(held, origin)?;
     if let Some(origin) = budget::origin() {
         budget::report_stop(origin);
@@ -1138,6 +1259,84 @@ enum Stop {
 /// builds cold. A `--locked` or `--frozen` lock refusal is the command's own
 /// failure: the slot goes back unchanged and the command ends as plain Cargo
 /// would.
+struct LeaseGrants {
+    remaining: u8,
+    share: bool,
+}
+
+impl LeaseGrants {
+    fn new() -> Self {
+        Self {
+            remaining: 9,
+            share: true,
+        }
+    }
+
+    fn taken(&mut self) {
+        self.remaining -= 1;
+    }
+}
+
+fn refuse_seed(
+    store: &Store,
+    held: store::Lease,
+    binding: outputs::OutputBinding,
+    reason: String,
+) -> Result<u8, String> {
+    drop(binding);
+    store.release(held, None)?;
+    if budget::admission_expired() {
+        Ok(stop_for_admission())
+    } else {
+        Err(reason)
+    }
+}
+
+/// Release a failed-walk recipient before using the ordinary admission loop.
+#[allow(clippy::too_many_arguments)]
+fn abandon_seed_and_reacquire(
+    store: &Store,
+    key: &SlotKey,
+    profile: cli::Profile,
+    resolution: &cli::Resolution,
+    label: Option<&str>,
+    waits: &mut store::WaitAccounting,
+    grants: &mut LeaseGrants,
+    held: store::Lease,
+    binding: outputs::OutputBinding,
+    planned: Option<&outputs::Plan>,
+    pool_fallback: Option<&str>,
+    derives_from_receipt: bool,
+) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding), Stop>, String> {
+    drop(binding);
+    store.release(held, None)?;
+    grants.share = false;
+    let (held, gate) = match lease_with_gate(store, key, profile, resolution, label, waits, grants)?
+    {
+        Ok(leased) => leased,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    match outputs::bind_for_command(
+        store,
+        &key.checkout,
+        held.record_id(),
+        planned,
+        pool_fallback,
+        derives_from_receipt,
+    ) {
+        Ok(binding) => Ok(Ok((held, gate, binding))),
+        Err(reason) => {
+            let origin = held.prior.unchanged();
+            store.release(held, origin)?;
+            if budget::admission_expired() {
+                Ok(Err(Stop::Admission))
+            } else {
+                Err(reason)
+            }
+        }
+    }
+}
+
 fn lease_with_gate(
     store: &Store,
     key: &SlotKey,
@@ -1145,17 +1344,18 @@ fn lease_with_gate(
     resolution: &cli::Resolution,
     label: Option<&str>,
     waits: &mut store::WaitAccounting,
+    grants: &mut LeaseGrants,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
-    let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot. At most nine grants: the eight project slots a
     // refused command can try plus one cold fallback (oxide#118).
-    for _ in 0..9 {
-        let mut held = match store.acquire(key, profile, share, label, waits)? {
+    while grants.remaining > 0 {
+        let mut held = match store.acquire(key, profile, grants.share, label, waits)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
             Acquired::AdmissionExpired => return Ok(Err(Stop::Admission)),
         };
+        grants.taken();
         let refusal = freshness::prepare(&key.checkout, &held.prior, resolution);
         // Taken just now, or left on this checkout's record by a command
         // that died before Cargo.
@@ -1178,7 +1378,7 @@ fn lease_with_gate(
                 return Ok(Err(Stop::Cargo(code)));
             }
         };
-        share = false;
+        grants.share = false;
         if held.shared_from.is_some() || foreign.is_some() {
             eprintln!(
                 "oxide: freshness gate refused another checkout's slot ({reason}); building cold"
@@ -1411,6 +1611,11 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         [flag] if flag == "--launch-check" => return launch::run_check(),
         _ => return Err("status takes no arguments except --measure or --launch-check".to_owned()),
     };
+    if let Some(reason) =
+        cold_seed_qualification_notice(std::env::var_os("OXIDE_COLD_SEED").as_deref())
+    {
+        println!("seeding skipped: {reason}");
+    }
     let settings = store::settings()?;
     print_settings(&settings);
     println!(
@@ -1505,6 +1710,11 @@ fn print_pools(
             Section::Internal(note) => {
                 let header = format!("internal pool: {}{note}", internal.pool.display());
                 print_pool(internal, &header, &[], &internal_report, mode)?;
+                let seed_enabled = cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref());
+                if let Some(line) = seed_summary::recorded_if_enabled(&internal.pool, seed_enabled)
+                {
+                    println!("{line}");
+                }
                 for line in crate::prune::status_lines(internal.control()) {
                     println!("  {line}");
                 }
@@ -2153,6 +2363,94 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::ffi::OsStr;
+
+    #[test]
+    fn cold_seed_opt_in_is_qualification_held() {
+        assert!(!cold_seed_active(None));
+        assert!(!cold_seed_active(Some(OsStr::new("1"))));
+        assert_eq!(cold_seed_qualification_notice(None), None);
+        assert_eq!(cold_seed_qualification_notice(Some(OsStr::new("0"))), None);
+        assert_eq!(
+            cold_seed_qualification_notice(Some(OsStr::new("1"))),
+            Some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
+        );
+        // The flip to qualified (#169) removes the notice with the hold.
+        assert_eq!(cold_seed_notice_when(true, Some(OsStr::new("1"))), None);
+        assert_eq!(
+            cold_seed_notice_when(false, Some(OsStr::new("1"))),
+            cold_seed_qualification_notice(Some(OsStr::new("1")))
+        );
+    }
+
+    #[test]
+    fn lease_grant_limit_is_retained_across_admission_passes() {
+        let mut grants = LeaseGrants::new();
+        assert!(grants.share);
+        for _ in 0..8 {
+            grants.taken();
+        }
+        grants.share = false;
+        assert_eq!(grants.remaining, 1);
+        grants.taken();
+        assert_eq!(grants.remaining, 0);
+        assert!(!grants.share);
+    }
+
+    #[test]
+    fn failed_walk_releases_then_reacquires_under_the_original_grant_limit() {
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        std::fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
+        let binding =
+            outputs::bind_for_command(&store, &key.checkout, held.record_id(), None, None, false)
+                .unwrap();
+        let mut grants = LeaseGrants::new();
+        grants.taken();
+        let mut waits = store::WaitAccounting::default();
+        let result = abandon_seed_and_reacquire(
+            &store,
+            &key,
+            cli::Profile::Quick,
+            &cli::Resolution::default(),
+            None,
+            &mut waits,
+            &mut grants,
+            held,
+            binding,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let Ok((cold, _, binding)) = result else {
+            panic!("cold admission stopped")
+        };
+        assert!(matches!(cold.prior, freshness::Prior::Fresh));
+        assert!(!cold.build_dir.join("partial").exists());
+        assert!(grants.remaining < 8);
+        assert!(!grants.share);
+        drop(binding);
+        store.release(cold, None).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_seed_refuses_and_releases_an_untrusted_generation() {
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        std::fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
+        let binding =
+            outputs::bind_for_command(&store, &key.checkout, held.record_id(), None, None, false)
+                .unwrap();
+        assert!(
+            matches!(refuse_seed(&store, held, binding, "seed fault".into()), Err(ref reason) if reason == "seed fault")
+        );
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        assert!(matches!(held.prior, freshness::Prior::Unknown));
+        assert!(held.build_dir.join("partial").exists());
+        store.discard(held).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn const_scan() -> oxide_storage::lease::AccountingScan {
         oxide_storage::lease::AccountingScan {
