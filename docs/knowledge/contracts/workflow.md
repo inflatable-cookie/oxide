@@ -1874,6 +1874,20 @@ migration unless its source changes. Separate ROOT activation still precedes
 each diagnostic or native submission. Briefs, activations and outcomes live in
 Queue; this knowledge record changes no runtime scratch or host setting.
 
+**Scratch pools on an external validation volume (proposed design, oxide#173).**
+Tom, 2026-10-28: "this needs fixing so we can keep it on Builds next time".
+[Scratch pools](scratch-pools.md) is the design for an explicit, UUID-bound
+`directory-budget-v1` pool on a verified external volume, so validation and
+proof fixtures need no internal root: an environment-only
+`OXIDE_SCRATCH_ROOT` declaration consulted only at the external-volume
+refusal, a pool-local binding document, the absent-volume refusal, the refusal
+matrix, and a migration list that would drop the exception for ten proofs while
+`rust:outputs-prune`, `rust:prune-absence` and the internal unit fixtures keep
+their boot Data volume root. It is design only: no code, selector, recipe, host
+setting, real pool or native run exists, the exception above remains current
+truth for every proof, and each implementation slice needs its own brief and
+independent exact-head review.
+
 **Internal unit fixtures (oxide#149).** The selected-volume default leaves two
 macOS unit tests without their premise: the product routes a leased child's
 `TMPDIR` to the selected pool's volume (`MNT_IGNORE_OWNERSHIP` there), so
