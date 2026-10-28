@@ -78,9 +78,9 @@ after the caller's listing, before the removal:
 
 Limits, stated rather than implied: `oxide clean` is deliberately unchanged (it
 removes exactly its enumerated plan, so new content is left and counted) and has
-no case here. No run of this script has passed: its fit is UNMEASURED, and its
-uncounted diagnostic and both counted author and independent reviewer natives
-each need their own owner activation.
+no case here. No run of this script has passed: its fit is UNMEASURED. The
+uncounted diagnostic and counted author native each need owner activation;
+the independent reviewer native is waived for oxide#175.
 
 Diagnostic safety (`--diagnostic`): only a *recoverable oracle* failure is
 recorded and followed by the next independent case. An unknown writer, device,
@@ -715,14 +715,39 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
         with open(os.path.join(env["OXIDE_POOL"], "ledger.json"), encoding="utf-8") as handle:
             ledger = json.load(handle)
         slots = [slot for slot in ledger.get("slots", []) if slot.get("capture")]
-        if len(slots) != 1 or not any(
-            entry.get("original") == "filler" and entry.get("path")
-            for entry in slots[0]["capture"].get("captures", [])
-        ):
+        entries = slots[0]["capture"].get("captures", []) if len(slots) == 1 else []
+        files = [entry for entry in entries if entry.get("original") == "filler" and entry.get("path")]
+        if len(files) != 1 or not stat.S_ISREG(files[0].get("mode", 0)):
             fail(f"{case}: missing nested file capture in ledger")
         private_root = os.path.join(os.path.dirname(victim), slots[0]["capture"]["root"]["private"])
         if not os.path.isdir(private_root) or os.path.exists(victim):
             fail(f"{case}: private root or absent original is not as recorded")
+        root_record = slots[0]["capture"]["root"]
+        root_stat = os.lstat(private_root)
+        if (not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid()
+                or root_stat.st_mode & 0o077 or root_stat.st_dev != root_record["device"]
+                or root_stat.st_ino != root_record["inode"]):
+            fail(f"{case}: private root identity or permissions do not match")
+        parent = private_root
+        chain = []
+        for name in files[0]["path"]:
+            matches = [entry for entry in entries if entry.get("path") == chain
+                       and entry.get("private") == name]
+            if len(matches) != 1:
+                fail(f"{case}: capture ancestry is incomplete")
+            ancestor = matches[0]
+            parent = os.path.join(parent, name)
+            facts = os.lstat(parent)
+            if (not stat.S_ISDIR(facts.st_mode) or facts.st_dev != ancestor["device"]
+                    or facts.st_ino != ancestor["inode"]):
+                fail(f"{case}: captured ancestor identity does not match")
+            chain.append(name)
+        for name in (files[0]["private"], files[0]["original"]):
+            try:
+                os.lstat(os.path.join(parent, name))
+            except FileNotFoundError:
+                continue
+            fail(f"{case}: unlinked file name {name!r} is present")
         # A fixture-owned collision blocks put-back while the unrelated build
         # is admitted. Give it enough budget for the recorded blocked charge.
         os.mkdir(victim)
