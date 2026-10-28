@@ -13,6 +13,7 @@
 mod backing;
 mod pool;
 pub mod seed;
+mod slice;
 
 use crate::owned_delete::{
     capture_entry, capture_planned, descriptor_identity, names_of, observe_entry,
@@ -28,6 +29,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub use pool::{managed, LeaseRequest, SlotLayout};
+pub use slice::{
+    slice_byte_limit, AdmissionClass, MemberPair, MemberSet, OneUseSlice, RestoreOutcome,
+    SliceAdmission, SliceReport, VictimPolicy, ONE_USE_MAX_BYTES, ONE_USE_MAX_SLOTS,
+};
 
 #[cfg(test)]
 mod tests;
@@ -140,6 +145,14 @@ pub enum LeaseError {
     /// A bounded accounting walk that admission, reuse or eviction needed
     /// did not complete. Same reason and exit code as `UnknownAccounting`.
     AccountingIncomplete(Box<AccountingScan>),
+    /// A one-use admission whose measured slice is still full after restore
+    /// (design §6.9): the measured union (or `None` when it could not be
+    /// measured) and the byte bound. Exit code 3, beside `Full` and
+    /// `unknown_accounting`, so a printed message can never claim a pool cap.
+    OneUseBudget {
+        measured: Option<u64>,
+        limit: u64,
+    },
     UnsafePath(&'static str),
     HolderConflict,
     NotFound,
@@ -161,6 +174,7 @@ impl LeaseError {
             | Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(_)
+            | Self::OneUseBudget { .. }
             | Self::LedgerExhausted => 3,
             Self::UnsafePath(_) | Self::BackingMismatch => 4,
             Self::NotFound => 5,
@@ -176,6 +190,7 @@ impl LeaseError {
             Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(_) => "unknown_accounting",
+            Self::OneUseBudget { .. } => "one_use_budget",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
             Self::NotFound => "not_found",
@@ -204,6 +219,16 @@ impl std::fmt::Display for LeaseError {
                     "the {place} holds an unexpected entry \"{entry}\""
                 )
             }
+            Self::OneUseBudget { measured, limit } => match measured {
+                Some(bytes) => write!(
+                    formatter,
+                    "one-use workspace slots are full: measured {bytes} of {limit} bytes with no safely evictable idle one-use slot left"
+                ),
+                None => write!(
+                    formatter,
+                    "one-use workspace slots are full: the member union could not be measured within the {limit}-byte slice bound and no safely evictable idle one-use slot is left"
+                ),
+            },
             Self::AccountingIncomplete(scan) => {
                 write!(formatter, "owned accounting is incomplete: {scan}")
             }
@@ -483,6 +508,11 @@ pub struct Leased {
     /// used bytes as pool usage, and the pool cap stays unverified on this
     /// route. The caller prints it as a warning.
     pub admission_note: Option<String>,
+    /// The one-use slice observation restore made before this admission
+    /// (design §6.1, §6.3). `None` for a normal warm reuse, which measures
+    /// nothing; `Some` for every new-slot admission and every one-use
+    /// admission, including one whose slice was empty (`NotNeeded`).
+    pub slice: Option<SliceReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
