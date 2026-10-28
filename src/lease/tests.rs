@@ -4409,6 +4409,27 @@ fn an_unjournaled_inaccessible_eviction_is_a_conservative_refusal() {
     }
 }
 
+/// A pending unjournaled root that exhausts the scope walk's entry bound is
+/// conservatively charged without deleting it or creating a new slot.
+#[test]
+fn an_unjournaled_eviction_over_the_entry_bound_refuses_conservatively() {
+    let fixture = Fixture::new("pending-entry-bound");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+    mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o755)).expect("non-private slot");
+    for index in 0..40 {
+        fs::write(slot_path.join(format!("entry-{index}")), b"x").expect("fixture entry");
+    }
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    with_accounting_limits(20, 64, 60_000, || {
+        let result = lease_injected(request(&pool, &project, &workspace, "other"));
+        assert!(matches!(result, Err(LeaseError::Full)), "{result:?}");
+    });
+    assert!(slot_path.join("entry-39").is_file());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}
+
 /// A replacement at the recorded name is outside the verified private root;
 /// its bytes remain in the pool-scope walk and cannot be hidden by the charge.
 #[test]

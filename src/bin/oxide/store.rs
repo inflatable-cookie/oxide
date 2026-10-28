@@ -47,6 +47,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+thread_local! {
+    static EVICTION_REJECTION: std::cell::RefCell<Vec<(String, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Automatic creation refuses below this host free space.
 pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
@@ -4070,12 +4075,22 @@ impl Store {
     ) -> Vec<ClassMember> {
         let boot = boot_session();
         let mut evictable = Vec::with_capacity(members.len());
+        #[cfg(test)]
+        EVICTION_REJECTION.with(|value| value.borrow_mut().clear());
         for pair in members {
+            macro_rules! reject {
+                ($reason:literal) => {{
+                    #[cfg(test)]
+                    EVICTION_REJECTION
+                        .with(|value| value.borrow_mut().push((pair.slot_id.clone(), $reason)));
+                    continue;
+                }};
+            }
             let Some(slot) = slots
                 .iter()
                 .find(|slot| slot.slot_id == pair.slot_id && slot.incarnation == pair.incarnation)
             else {
-                continue;
+                reject!("ledger membership");
             };
             // A slot's class is a function of exactly one record's immutable
             // field, matched by its own affinity directory (§5.2).
@@ -4083,27 +4098,29 @@ impl Store {
                 record.class == WorkspaceClass::OneUse
                     && slot.project == self.affinity_dir(record.id)
             }) else {
-                continue;
+                reject!("record mapping");
             };
             if !idle_member_record(record) {
-                continue;
+                reject!("idle record");
             }
             // A free, existing record lock: `Missing` is not free (item 3).
             match probe_lock(&self.lock_path(record.id), false) {
                 Ok(Probe::Free(_probe)) => {}
-                _ => continue,
+                Ok(Probe::Held) => reject!("lock held"),
+                Ok(Probe::Missing) => reject!("lock missing"),
+                Err(_) => reject!("lock error"),
             }
             if self.other_record_active(state, record, own, boot) {
-                continue;
+                reject!("other active record");
             }
             if slot.state != SlotOccupancy::Idle || slot.lease_id.is_some() {
-                continue;
+                reject!("slot occupied or leased");
             }
             let Some(checkout) = record.checkout.as_deref() else {
-                continue;
+                reject!("missing checkout");
             };
             if state.cleans.iter().any(|clean| clean.checkout == checkout) {
-                continue;
+                reject!("clean mark");
             }
             evictable.push(pair.clone());
         }
@@ -10404,7 +10421,11 @@ pub(crate) mod tests {
     /// evictable.
     #[test]
     fn the_evictable_split_protects_every_control_uncertainty() {
-        let (root, store, key) = class_fixture("evictable");
+        check_evictable_split("evictable");
+    }
+
+    fn check_evictable_split(label: &str) {
+        let (root, store, key) = class_fixture(label);
         let held = lease_as(
             &store,
             &key,
@@ -10479,6 +10500,7 @@ pub(crate) mod tests {
             "a held record lock was evictable"
         );
         drop(held_probe);
+        std::thread::yield_now();
         let member = &state.records[index];
         let slot = slots
             .iter()
@@ -10511,7 +10533,9 @@ pub(crate) mod tests {
         );
         assert_eq!(
             store.evictable_members(&state, &slots, &membership.members, 0),
-            vec![pair.clone()]
+            vec![pair.clone()],
+            "actual eviction decision rejected: {:?}",
+            EVICTION_REJECTION.with(|value| value.borrow().clone())
         );
         fs::remove_file(&path).unwrap();
         assert!(
@@ -10537,6 +10561,14 @@ pub(crate) mod tests {
             "a clean mark was evictable"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn evictable_split_fifty_yielded_probe_drops() {
+        for iteration in 0..50 {
+            eprintln!("eviction probe diagnostic iteration {iteration}");
+            check_evictable_split(&format!("evictable-diagnostic-{iteration}"));
+        }
     }
 
     /// The evictable reader reads no sibling-pool state at all (§5.5.2): with
