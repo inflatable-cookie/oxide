@@ -131,21 +131,28 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
    adoption applies; `assert_local_target` positively requires a real local
    `target` after each build.
 5. Cargo external argv: not applicable (no external subcommand fixture).
-6. Owned image: `perm.attach_image(..., owners=True)` and `owners_honored()`
-   prove the mounted root does not carry `MNT_IGNORE_OWNERSHIP`; the one
-   ordinary detach is `perm.run_ordinary_detach`. An uncertain custody fault
-   retains the mounted image, and the backing lives inside the supervisor's
-   monitored scratch (the proof root), removed only after that completed
-   detach.
+6. Owned image: `attach_owned_image()` creates the 128 MiB image and its
+   custody record in the supervisor's never-auto-cleaned evidence directory
+   before attach, and `perm.owners_honored()` proves the mounted root does not
+   carry `MNT_IGNORE_OWNERSHIP`. `detach_owned_image()` performs one ordinary
+   detach (never `-force`, never retried) whose window comes from the
+   supervisor deadline; its disposition is clean only when detach exited zero,
+   the mount is gone and `hdiutil` names neither mount nor backing. The
+   cleanup gate is `perm.detach_decision(collection, proof.unclosed)`: any
+   recorded case failure, latched abort or unclosed child retains the backing,
+   custody record and mount. Only a clean gate may detach; a retained
+   disposition aborts a diagnostic and makes a counted PASS impossible.
 7. Compiler flags: `freeze_compiler_flags` removes `CARGO_ENCODED_RUSTFLAGS`
    and fixes `RUSTFLAGS` for staging and every fixture child; case 10 changes it
    only for its donor command.
 8. Temporary storage: the child env points every temp variable at the
    supervisor's scratch; the private pool is the reviewed internal-placement
-   exception. The image backing is inside that same scratch and is removed only
-   after a completed ordinary detach. The competing-lease helper's library build
-   has its own retained stage under the proof root, seeded from this HEAD's
-   Cargo.lock and removed only after the helper linked.
+   exception. The image backing and custody record live in the supervisor's
+   never-auto-cleaned evidence directory, created and recorded before attach;
+   the backing is removed only after a positively completed ordinary detach.
+   The competing-lease helper's library build has its own retained stage under
+   the proof root, seeded from this HEAD's Cargo.lock and removed only after the
+   helper linked.
 9. macOS `mktemp`: `fixture_dir()` always passes a template under the
    supervisor scratch and verifies the real path.
 
@@ -1340,6 +1347,34 @@ def direct_run(command: list, timeout: float) -> subprocess.CompletedProcess:
     )
 
 
+def bounded_step(seconds: float) -> float:
+    """One setup child's timeout inside the supervisor's hard deadline, with a
+    closure margin. Never starts when the guard is nearly out of time."""
+    remaining = supervisor_remaining()
+    expect(remaining > 20.0, f"only {remaining:.1f} s before the supervisor deadline")
+    return min(seconds, remaining - 10.0)
+
+
+def detach_verdict(exit_code: int, mount_present: bool, names_after: bool) -> str | None:
+    """None only for a positively completed ordinary detach: exit zero, the
+    mount gone, and `hdiutil` naming neither the mount nor the backing."""
+    if exit_code != 0:
+        return f"ordinary detach exited {exit_code}"
+    if mount_present:
+        return "the mount is still present after detach"
+    if names_after:
+        return "hdiutil still names the image after detach"
+    return None
+
+
+def detach_is_clean(disposition: str) -> bool:
+    """A clean disposition is a completed ordinary detach or a positively
+    verified already-detached state; every retained disposition is not."""
+    return disposition.startswith(
+        ("ordinary detach completed", "already detached before cleanup")
+    )
+
+
 def detach_timeout(remaining: float) -> float | None:
     """One ordinary detach's timeout, or None when the guard margin is too
     small to start it. Never -force and never retried."""
@@ -1427,7 +1462,7 @@ def attach_owned_image(proof: Proof) -> dict:
             "SPARSE",
             backing,
         ],
-        120,
+        bounded_step(120),
     )
     expect(created.returncode == 0, f"image creation failed: {created.stderr!r}")
     expect(os.path.isfile(backing), f"image creation left no backing at {backing}")
@@ -1443,7 +1478,7 @@ def attach_owned_image(proof: Proof) -> dict:
     os.chmod(custody, 0o600)
     attached = direct_run(
         ["/usr/bin/hdiutil", "attach", "-owners", "on", "-nobrowse", "-plist", backing],
-        120,
+        bounded_step(120),
     )
     expect(
         attached.returncode == 0,
@@ -1464,7 +1499,7 @@ def attach_owned_image(proof: Proof) -> dict:
         ),
         None,
     )
-    info = direct_run(["/usr/sbin/diskutil", "info", "-plist", mount], 60)
+    info = direct_run(["/usr/sbin/diskutil", "info", "-plist", mount], bounded_step(60))
     uuid = None
     if info.returncode == 0:
         uuid = plistlib.loads(info.stdout.encode()).get("VolumeUUID")
@@ -1511,17 +1546,15 @@ def detach_owned_image(proof: Proof, *, reason: str) -> str:
             )
             return image["detached"]
         result = direct_run(["/usr/bin/hdiutil", "detach", mount], timeout)
-        if result.returncode != 0:
-            image["detached"] = (
-                f"retained: ordinary detach failed ({result.stderr.strip()[:200]}) ({reason})"
-            )
-            return image["detached"]
-        if os.path.ismount(mount):
-            image["detached"] = f"retained: detach returned but {mount} is still mounted ({reason})"
-            return image["detached"]
         info = direct_run(["/usr/bin/hdiutil", "info"], 30)
-        if mount in info.stdout or image["backing"] in info.stdout:
-            image["detached"] = f"retained: hdiutil still names {mount} after detach ({reason})"
+        verdict = detach_verdict(
+            result.returncode,
+            os.path.ismount(mount),
+            mount in info.stdout or image["backing"] in info.stdout,
+        )
+        if verdict is not None:
+            image["detached"] = f"retained: {verdict} ({reason})"
+            _record_custody(image, image["detached"])
             return image["detached"]
         _remove_owned_backing(image)
         image["detached"] = f"ordinary detach completed ({reason}); backing removed"
@@ -1531,6 +1564,34 @@ def detach_owned_image(proof: Proof, *, reason: str) -> str:
     except BaseException as fault:
         image["detached"] = f"retained: cleanup fault ({fault!r}) ({reason})"
         return image["detached"]
+
+
+def retain_owned_image(proof: Proof, reason: str) -> str:
+    """Record a retained disposition without issuing any detach. Used when the
+    shared custody gate refuses, so unknown writer custody is never probed."""
+    image = getattr(proof, "image", None)
+    if image is None:
+        return "no owned image was attached"
+    disposition = f"retained: {reason}"
+    image["detached"] = disposition
+    _record_custody(image, disposition)
+    return disposition
+
+
+def finalize_owned_image(proof: Proof, collection: perm.Collection) -> str:
+    """The one cleanup decision: keep a clean case-16 detach, otherwise gate
+    on the shared `detach_decision`. A refused gate retains without detaching;
+    an allowed gate makes the one ordinary detach. A retained disposition is
+    turned into a latched abort for the collection."""
+    image = getattr(proof, "image", None)
+    if image is None:
+        return "no owned image was attached"
+    if image.get("detached") and detach_is_clean(image["detached"]):
+        return image["detached"]
+    refusal = perm.detach_decision(collection, proof.unclosed)
+    if refusal is not None:
+        return retain_owned_image(proof, refusal)
+    return detach_owned_image(proof, reason="run ended")
 
 
 def run_child(proof: Proof, command: list, cwd: str, env: dict, label: str) -> tuple[int, str, str]:
@@ -2308,7 +2369,10 @@ def case_16(proof: Proof) -> None:
     code, stdout, stderr = case.command(recipient, ["run"], "removable recipient run", env=case.env())
     expect(stdout.strip() == CFG_IF_OUTPUT, f"the removable program printed {stdout.strip()!r}")
     disposition = detach_owned_image(proof, reason="case 16 completed")
-    expect(not os.path.ismount(mount), f"{mount} is still mounted after the ordinary detach: {disposition}")
+    if not detach_is_clean(disposition):
+        if COLLECTION is not None:
+            COLLECTION.detached = disposition
+        raise perm.ProofAbort(f"case 16 image custody was not completed: {disposition}")
     if COLLECTION is not None:
         COLLECTION.detached = disposition
         COLLECTION.mount_present = False
@@ -2990,6 +3054,57 @@ def self_test() -> None:
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
 
+        # Detach decisions: only exit zero, a gone mount and no hdiutil naming
+        # is a completed ordinary detach; every other verdict is retained.
+        expect(detach_verdict(0, False, False) is None, "a clean detach verdict was rejected")
+        for label, verdict in (
+            ("nonzero exit with the mount gone", detach_verdict(1, False, False)),
+            ("mount still present", detach_verdict(0, True, False)),
+            ("hdiutil still names the image", detach_verdict(0, False, True)),
+        ):
+            expect(verdict is not None, f"a {label} verdict was accepted")
+        expect(detach_is_clean("ordinary detach completed (reason); backing removed"), "a completed detach was not clean")
+        expect(detach_is_clean("already detached before cleanup (reason); backing removed"), "an already-detached state was not clean")
+        expect(not detach_is_clean("retained: ordinary detach exited 1"), "a retained disposition was clean")
+
+        # The shared custody gate: any recorded failure, latched abort or
+        # unclosed child refuses the detach; only a clean collection allows it.
+        clean = perm.Collection()
+        expect(perm.detach_decision(clean, set()) is None, "a clean collection refused the detach")
+        failed = perm.Collection()
+        failed.failures.append({"case": "01", "fault": "synthetic"})
+        expect(perm.detach_decision(failed, set()) is not None, "a failed collection allowed the detach")
+        aborted = perm.Collection()
+        aborted.aborted = "synthetic abort"
+        expect(perm.detach_decision(aborted, set()) is not None, "an aborted collection allowed the detach")
+        expect(perm.detach_decision(clean, {123}) is not None, "an unclosed child allowed the detach")
+
+        # A refused gate retains the image without detaching and records the
+        # disposition in custody; a clean already-detached image is kept.
+        custody = os.path.join(base, "image.custody.json")
+        with open(custody, "w", encoding="utf-8") as handle:
+            json.dump({"name": "synthetic"}, handle)
+        fake_proof = types.SimpleNamespace(
+            image={
+                "mount": "/Volumes/o169-synthetic",
+                "backing": os.path.join(base, "synthetic.sparseimage"),
+                "custody": custody,
+                "detached": None,
+            },
+            unclosed=set(),
+        )
+        retained = finalize_owned_image(fake_proof, failed)
+        expect(retained.startswith("retained:"), f"a failed collection did not retain: {retained}")
+        expect(
+            read_json(custody).get("detached") == retained,
+            "the custody record did not carry the retained disposition",
+        )
+        fake_proof.image["detached"] = "ordinary detach completed (synthetic); backing removed"
+        expect(
+            finalize_owned_image(fake_proof, failed) == fake_proof.image["detached"],
+            "a completed detach was not kept on a subsequent failed collection",
+        )
+
         # Cleanup and checkpoint decisions: the detach window comes from the
         # supervisor deadline (never the finer WORK clock), and the full
         # owned-bytes walk runs every fourth case and on the last case.
@@ -3542,9 +3657,11 @@ def main(argv: list[str]) -> int:
         raise
     finally:
         collection = COLLECTION
-        collection.detached = detach_owned_image(proof, reason="run ended")
+        collection.detached = finalize_owned_image(proof, collection)
         image = getattr(proof, "image", None)
         collection.mount_present = None if image is None else os.path.ismount(image["mount"])
+        if not detach_is_clean(collection.detached) and collection.aborted is None:
+            collection.aborted = f"image custody was not completed: {collection.detached}"[:600]
         if diagnostic:
             try:
                 write_diagnostic(proof, collection, failure)
@@ -3575,6 +3692,10 @@ def main(argv: list[str]) -> int:
         f"peak owned {proof.peak // MIB} MiB at phase checks "
         f"(512 MiB budget, checked between phases, not a ceiling), "
         f"host free minimum {proof.low // MIB} MiB; scratch closure and cleanup are the shared runner's"
+    )
+    expect(
+        detach_is_clean(collection.detached),
+        f"image custody was not completed, so this run cannot pass: {collection.detached}",
     )
     expect(passed == len(CASES), f"only {passed} of {len(CASES)} cases completed")
     print(line)
