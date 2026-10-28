@@ -60,9 +60,10 @@ never taints another premise):
    are independent inodes, so the recipient still compiles and runs.
 08 A changed dependency: a recipient lock naming another cfg-if version offers
    nothing from the donor's catalog, and the build is correct.
-09 A held donor: a gated writer holds the only compatible donor, the recipient
-   prints `seeding skipped: donor busy` and builds cold, and the donor tree is
-   unchanged.
+09 A held donor: a gated writer holds the only compatible donor, so call 1
+   cannot offer it and no catalog exists while it is held; the recipient skips
+   seeding, builds cold in its own slot, and the released donor's catalog
+   appears only after its own build.
 10 A differing producer context: a donor built with a different `RUSTFLAGS` is
    not eligible and the recipient builds cold. Case 02 is the equal-context
    control.
@@ -70,8 +71,9 @@ never taints another premise):
    generation, runs no Cargo over the partial slot and builds cold.
 12 Each plan cap (units, files, bytes) and the seed's own work deadline skips
    without donor mutation.
-13 Git identity negatives: a dirty checkout and a differently-revisioned
-   checkout are ineligible; a same-name registry/git collision is ineligible.
+13 Git identity negatives: a dirty checkout, a differently-revisioned
+   checkout, a submodule (gitlink) checkout and a same-name registry/Git
+   collision are ineligible: no donor catalog is produced and nothing seeds.
 14 An unsupported Cargo identity makes the command skip seeding while Cargo
    still runs normally.
 15 No donor writes: the donor tree digest, its catalog, ledger and control bytes
@@ -80,9 +82,10 @@ never taints another premise):
    on`, observed) registered as the removable pool seeds a tiny `cfg-if`
    workspace across two of its slots, the recipient's bytes are on the image,
    and the image is detached ordinarily.
-17 Registry tamper controls: a wrong cached archive, an extra tree file and a
-   tree symlink each make the package ineligible and the command cold, never a
-   seeded copy.
+17 Registry tamper controls: a wrong cached archive, an extra tree file, a
+   tree symlink, an altered file and a missing file each make the package
+   ineligible; nothing is ever seeded from a modified tree (the missing file
+   may fail Cargo's own build, so only the no-seed claim is asserted).
 18 A seeded recipient never donates: its attempt says `seeded`, and a third cold
    slot receives no catalog from it.
 19 The reserve gate: an injected below-trigger reading refuses before any child;
@@ -95,10 +98,12 @@ never taints another premise):
    registry artifact in the plan; `seedctl` is offered from separate per-unit
    fingerprint directories with its run-only directory classified and never
    copied.
-22 Competing custody between selection and the pin: a custody holder on the
-   donor's record lock during the debug-only pause makes the seeded command
-   print `seeding skipped: donor busy`, clone nothing and build cold, with the
-   donor unchanged. Without the interleaving the same fixture seeds.
+22 Competing custody between selection and the pin: a real `managed::lease`
+   competitor (a helper linked against the staged library) leases the selected
+   donor during the debug-only pause and holds it until the seeded command
+   exits. The seeded command prints `seeding skipped: donor busy`, clones
+   nothing and builds cold, with the donor tree and catalog unchanged. Without
+   the interleaving the same fixture seeds.
 23 Ambiguous-name visibility: a donor workspace with an eligible leaf and a
    normalized-name collision pair records the candidate-unit counts; the summary
    and `oxide status` render `ambiguous name (2)`, a clean donor renders no
@@ -174,6 +179,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location(
@@ -248,6 +254,7 @@ OWN_VARS = (
     "OXIDE_TEST_SEED_CRASH",
     "OXIDE_TEST_SEED_BREACH",
     "OXIDE_TEST_SEED_WALK",
+    "OXIDE_TEST_SEED_LIMIT",
     "OXIDE_TEST_WATCHDOG_READINGS",
     "OXIDE_POOL_CAP",
 )
@@ -787,7 +794,7 @@ def setup(proof: Proof, repo: str) -> None:
     proof.cargo_home = fixture_dir(proof.root, "cargo-home.")
     proof.evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
     proof.phase("start")
-    proof.binary = perm.stage_at(proof, repo, "candidate", jobs=4)
+    proof.binary = layout.stage_at(proof, repo, "candidate", jobs=4)
     print(f"staged candidate {proof.binary}", flush=True)
     proof.lease_helper = build_lease_helper(proof)
     seed_registry_homes(proof)
@@ -2186,6 +2193,33 @@ def undefined_names(body) -> list[str]:
     return sorted(name for name in loaded if name not in known)
 
 
+def missing_module_helpers() -> list[str]:
+    """Attributes this script reads from its imported helper modules that the
+    module does not define. The staging helper is `layout.stage_at`, not
+    `perm.stage_at`; the pure self-test must catch that without a native run.
+
+    Only the four modules bound at module level are checked, so instance
+    attributes (`proof.binary`, `case.pool`) and local names are untouched.
+    """
+    with open(__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    modules = {
+        name: value
+        for name in ("perm", "layout", "runner", "offline_seed")
+        if isinstance(value := globals().get(name), types.ModuleType)
+    }
+    missing = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in modules
+            and not hasattr(modules[node.value.id], node.attr)
+        ):
+            missing.append(f"{node.value.id}.{node.attr}")
+    return sorted(set(missing))
+
+
 def unused_module_names() -> list[str]:
     """Module-level names that are never loaded: an unused fixture constant is
     a silent proof-source defect."""
@@ -2217,6 +2251,8 @@ def self_check() -> None:
         expect(not missing, f"case {name} loads unbound name(s): {missing}")
     unused = unused_module_names()
     expect(not unused, f"unused module-level fixture name(s): {unused}")
+    missing = missing_module_helpers()
+    expect(not missing, f"missing imported helper(s): {missing}")
     expect(len(set(ids)) == len(ids), "duplicate case id")
     for relative in ("scripts/offline_seed.py", "scripts/bounded-test.py"):
         path = os.path.join(os.path.dirname(HERE), relative)
