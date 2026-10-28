@@ -127,13 +127,17 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
 5. Cargo external argv: not applicable (no external subcommand fixture).
 6. Owned image: `perm.attach_image(..., owners=True)` and `owners_honored()`
    prove the mounted root does not carry `MNT_IGNORE_OWNERSHIP`; the one
-   ordinary detach is `perm.run_ordinary_detach`.
+   ordinary detach is `perm.run_ordinary_detach`. An uncertain custody fault
+   retains the mounted image, and the backing lives inside the supervisor's
+   monitored scratch (the proof root), removed only after that completed
+   detach.
 7. Compiler flags: `freeze_compiler_flags` removes `CARGO_ENCODED_RUSTFLAGS`
    and fixes `RUSTFLAGS` for staging and every fixture child; case 10 changes it
    only for its donor command.
 8. Temporary storage: the child env points every temp variable at the
    supervisor's scratch; the private pool is the reviewed internal-placement
-   exception; the image backing lives in the evidence directory.
+   exception. The image backing is inside that same scratch and is removed only
+   after a completed ordinary detach.
 9. macOS `mktemp`: `fixture_dir()` always passes a template under the
    supervisor scratch and verifies the real path.
 
@@ -153,9 +157,12 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import ast
+import builtins
 import glob
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -165,6 +172,7 @@ import signal
 import stat
 import subprocess
 import tempfile
+import textwrap
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -470,18 +478,17 @@ def assert_local_target(checkout: str) -> None:
 
 
 def expect_no_seed_mutation(pool: str, slot: str, before: dict) -> None:
+    """The donor's own facts, not the pool's: the recipient's own lease and
+    release legitimately change the shared ledger and control state."""
     expect(slot_tree(pool, slot) == before["tree"], "the donor's build tree changed")
     expect(read_bytes(catalog_path(pool, slot)) == before["catalog"], "the donor's catalog changed")
-    expect(ledger_bytes(pool) == before["ledger"], "the ledger changed")
-    expect(control_bytes(pool) == before["control"], "the control state changed")
+    expect(record_figure(pool, slot) == before["figure"], "the donor's ledger row changed")
 
 
 def record_donor_figure(pool: str, slot: str) -> dict:
     return {
         "tree": slot_tree(pool, slot),
         "catalog": read_bytes(catalog_path(pool, slot)),
-        "ledger": ledger_bytes(pool),
-        "control": control_bytes(pool),
         "figure": record_figure(pool, slot),
         "slot": slot,
     }
@@ -564,14 +571,21 @@ SQLITE_APP_MAIN = '''fn main() {
     println!("SQLITE={}", libsqlite3_sys::SQLITE_VERSION_NUMBER);
 }
 '''
-PLAIN_APP = {
-    "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
-    "src/main.rs": 'fn main() { println!("plain"); }\n',
-}
+def git_fixture(
+    root: str,
+    name: str,
+    files: dict[str, str],
+    *,
+    commits: int = 1,
+    submodule: str | None = None,
+    package: str | None = None,
+) -> dict:
+    """One owned local Git repository under the proof's scratch.
 
-
-def git_fixture(root: str, name: str, files: dict[str, str], *, commits: int = 1) -> dict:
-    """One owned local Git repository under the proof's scratch."""
+    `submodule` adds a real `file://` submodule entry (a gitlink) before the
+    first commit; the proof never initialises it, so the checkout carries an
+    uninitialised gitlink exactly as an untrusted dependency would.
+    """
     repo = os.path.join(root, "git", name)
     os.makedirs(repo, exist_ok=True)
     write_tree(repo, files)
@@ -594,6 +608,16 @@ def git_fixture(root: str, name: str, files: dict[str, str], *, commits: int = 1
         return result.stdout.strip()
 
     git("init", "-q", "-b", "main")
+    if submodule is not None:
+        added = subprocess.run(
+            ["git", "-c", "protocol.file.allow=always", "submodule", "add", submodule, "inner"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        expect(added.returncode == 0, f"submodule add failed: {added.stderr[-400:]}")
     git("add", "-A")
     git("commit", "-q", "-m", "first")
     revisions = [git("rev-parse", "HEAD")]
@@ -604,7 +628,12 @@ def git_fixture(root: str, name: str, files: dict[str, str], *, commits: int = 1
         git("add", "-A")
         git("commit", "-q", "-m", f"revision {index}")
         revisions.append(git("rev-parse", "HEAD"))
-    return {"repo": repo, "url": f"file://{repo}", "revisions": revisions}
+    return {
+        "repo": repo,
+        "url": f"file://{repo}",
+        "package": package or name,
+        "revisions": revisions,
+    }
 
 
 def seed_registry_homes(proof: Proof) -> None:
@@ -649,7 +678,12 @@ def prime_git_databases(proof: Proof, repositories: dict[str, dict]) -> None:
     prime = fixture_dir(proof.root, "git-prime.")
     lines = ['[package]\nname = "prime"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n']
     for name, repository in repositories.items():
-        lines.append(f'{name} = {{ git = "{repository["url"]}", revision = "{repository["revisions"][0]}" }}\n')
+        package = repository.get("package", name)
+        entry = f'git = "{repository["url"]}", rev = "{repository["revisions"][0]}"'
+        if package == name:
+            lines.append(f"{name} = {{ {entry} }}\n")
+        else:
+            lines.append(f'{name} = {{ package = "{package}", {entry} }}\n')
     write_tree(prime, {"Cargo.toml": "".join(lines), "src/lib.rs": "\n"})
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -669,6 +703,81 @@ def prime_git_databases(proof: Proof, repositories: dict[str, dict]) -> None:
     print("primed Cargo's Git databases with one local file:// fetch", flush=True)
 
 
+LEASE_HELPER = r'''use oxide_storage::lease::{managed, LeaseRequest, Profile};
+use std::path::PathBuf;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let pool = PathBuf::from(&args[1]);
+    let project = PathBuf::from(&args[2]);
+    let workspace = PathBuf::from(&args[3]);
+    let gate = PathBuf::from(&args[4]);
+    let grant = managed::lease(LeaseRequest {
+        pool: pool.clone(),
+        project,
+        workspace,
+        profile: Profile::Dev,
+        holder: "proof-competing-lease".to_owned(),
+        budget_bytes: Some(256 * 1024 * 1024),
+        reserve_bytes: None,
+        layout: None,
+        replace_slot: None,
+    })
+    .expect("competing lease");
+    println!("LEASE={}", grant.lease_id);
+    std::fs::write(format!("{}.leased", gate.display()), b"leased").expect("lease marker");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !gate.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    managed::release(&pool, &grant.lease_id).expect("competing release");
+}
+'''
+
+
+def build_lease_helper(proof: Proof) -> str:
+    """One tiny helper linked against the staged library: a real
+    `managed::lease` competitor, not a forged lock or ledger state."""
+    debug = os.path.dirname(os.path.dirname(proof.binary))
+    deps = os.path.join(debug, "deps")
+    rlibs = sorted(glob.glob(os.path.join(deps, "liboxide_storage-*.rlib")))
+    expect(len(rlibs) == 1, f"expected one staged oxide_storage rlib, got {rlibs}")
+    root = os.path.join(proof.root, "lease-helper")
+    os.makedirs(root)
+    source = os.path.join(root, "main.rs")
+    with open(source, "w", encoding="utf-8") as handle:
+        handle.write(LEASE_HELPER)
+    binary = os.path.join(root, "competing-lease")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": proof.home,
+        "RUSTUP_HOME": proof.rustup,
+        "RUSTUP_TOOLCHAIN": BUILDER,
+        "RUSTUP_AUTO_INSTALL": "0",
+    }
+    result = proof.run(
+        [
+            "rustc",
+            "--edition",
+            "2021",
+            "-L",
+            f"dependency={deps}",
+            "--extern",
+            f"oxide_storage={rlibs[0]}",
+            "-o",
+            binary,
+            source,
+        ],
+        env=env,
+        timeout=120,
+    )
+    expect(
+        result.returncode == 0,
+        f"the competing-lease helper did not build: {result.stderr[-1500:]!r}",
+    )
+    return binary
+
+
 def setup(proof: Proof, repo: str) -> None:
     proof.root = os.path.realpath(proof.root)
     scratch = os.path.realpath(os.environ["OXIDE_TASK_SCRATCH_ROOT"])
@@ -680,7 +789,9 @@ def setup(proof: Proof, repo: str) -> None:
     proof.phase("start")
     proof.binary = perm.stage_at(proof, repo, "candidate", jobs=4)
     print(f"staged candidate {proof.binary}", flush=True)
+    proof.lease_helper = build_lease_helper(proof)
     seed_registry_homes(proof)
+    inner = git_fixture(proof.root, "innerrepo", {"README.md": "inner\n"})
     proof.repositories = {
         "seedctl": git_fixture(proof.root, "seedrepo", {
             "Cargo.toml": SEEDCTL_MANIFEST,
@@ -691,6 +802,18 @@ def setup(proof: Proof, repo: str) -> None:
             "Cargo.toml": SEEDPM_MANIFEST,
             "src/lib.rs": SEEDPM_LIB,
         }),
+        "subrepo": git_fixture(proof.root, "subrepo", {
+            "Cargo.toml": (
+                '[package]\nname = "subcrate"\nversion = "0.1.0"\nedition = "2021"\n'
+            ),
+            "src/lib.rs": "pub fn value() -> u32 { 4 }\n",
+        }, submodule=inner["repo"], package="subcrate"),
+        "cfgifgit": git_fixture(proof.root, "cfgifgit", {
+            "Cargo.toml": (
+                '[package]\nname = "cfg-if"\nversion = "2.0.0"\nedition = "2021"\n'
+            ),
+            "src/lib.rs": "pub fn from_git() -> u32 { 5 }\n",
+        }, package="cfg-if"),
     }
     prime_git_databases(proof, proof.repositories)
     proof.phase("after setup")
@@ -825,11 +948,6 @@ def run_child(proof: Proof, command: list, cwd: str, env: dict, label: str) -> t
 # ---------------------------------------------------------------------------
 # Cases 01-12
 # ---------------------------------------------------------------------------
-
-CFG_LOCK = [
-    registry("cfg-if", "1.0.0", CFG_IF_100),
-]
-
 
 def cfg_donor_recipient(case: Case, *, app_version: str = "1.0.0", prefix: str = "") -> tuple[str, str, str, str]:
     manifest = (
@@ -1255,28 +1373,50 @@ GATED_BUILD = r'''fn main() {
 
 def case_09(proof: Proof) -> None:
     case = Case(proof, "09")
-    _donor, recipient, donor_slot, _ = cfg_donor_recipient(case)
+    gated = {
+        "Cargo.toml": (
+            '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
+            '[dependencies]\ncfg-if = "=1.0.0"\n'
+        ),
+        "build.rs": GATED_BUILD,
+        "src/main.rs": 'fn main() { println!("{}", cfg_if::VERSION); }\n',
+    }
+    plain = {
+        "Cargo.toml": (
+            '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            '[dependencies]\ncfg-if = "=1.0.0"\n'
+        ),
+        "src/main.rs": 'fn main() { println!("{}", cfg_if::VERSION); }\n',
+    }
+    packages = [registry("cfg-if", "1.0.0", CFG_IF_100)]
+    donor = case.checkout("donor", gated, packages)
+    recipient = case.checkout("recipient", plain, packages)
     gate = os.path.join(case.root, "donor-gate")
     env = case.env(extra={"OXIDE_SEED_GATE": gate})
-    child = perm.start_child(
-        proof,
-        [proof.binary, "build"],
-        donor,
-        env,
-    )
+    child = perm.start_child(proof, [proof.binary, "build"], donor, env)
+    donor_slot = None
     try:
-        wait_for(gate + ".started", "the donor gate")
-        before = record_donor_figure(case.pool, donor_slot)
-        code, out, err = case.command(recipient, ["build"], "held donor", env=case.env())
+        wait_for(gate + ".started", "the gated donor build script")
+        # The donor is a live writer holding its lease, so call 1 cannot offer
+        # it (the ledger state is the first candidate filter). The recipient
+        # must not wait for it and must build cold in its own fresh slot.
+        code, _out, err = case.command(recipient, ["build"], "held donor", env=case.env())
         line = skip_line(err)
-        expect("donor busy" in line or "no eligible donor" in line, f"unexpected skip: {line}")
+        expect("no eligible donor" in line or "donor busy" in line, f"unexpected skip: {line}")
         expect(not seeded(err), "a held donor was seeded")
-        expect_no_seed_mutation(case.pool, donor_slot, before)
+        recipient_slot = slot_of(err)
+        # No catalog can exist while the donor is still held: publishing is a
+        # producing-lease step and happens before release.
+        for name in os.listdir(seeds_dir(case.pool)) if os.path.isdir(seeds_dir(case.pool)) else []:
+            expect(not name.endswith(".catalog.json"), f"a held donor published {name}")
     finally:
         stop_gate(gate)
-        code, _out, _err = perm.finish_child(proof, child, "gated donor")
+        code, _out, donor_err = perm.finish_child(proof, child, "gated donor")
         expect(code == 0, "the gated donor failed")
-    print("case 09: a held donor skipped with the donor unchanged", flush=True)
+    donor_slot = slot_of(donor_err)
+    expect(donor_slot != recipient_slot, "the recipient reused the held donor's slot")
+    expect(os.path.isfile(catalog_path(case.pool, donor_slot)), "the released donor published no catalog")
+    print("case 09: a held donor was not offered and the recipient built cold", flush=True)
 
 
 def wait_for(path: str, label: str) -> None:
@@ -1384,6 +1524,16 @@ def case_12(proof: Proof) -> None:
 COLLECTION = None
 
 
+def git_app(name: str, url: str, rev: str) -> dict[str, str]:
+    return {
+        "Cargo.toml": (
+            '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            f'[dependencies]\n{name} = {{ git = "{url}", rev = "{rev}" }}\n'
+        ),
+        "src/main.rs": 'fn main() { println!("git identity"); }\n',
+    }
+
+
 def case_13(proof: Proof) -> None:
     case = Case(proof, "13")
     repository = proof.repositories["seedctl"]
@@ -1410,7 +1560,49 @@ def case_13(proof: Proof) -> None:
     code, _out, err = case.command(revision, ["build"], "differently-revisioned checkout", env=case.env())
     expect(not seeded(err), "a differently-revisioned checkout was seeded")
     expect("no eligible donor" in skip_line(err), f"unexpected skip: {skip_line(err)}")
-    print("case 13: dirty and differently-revisioned checkouts are ineligible", flush=True)
+    # A submodule (a gitlink in the checkout) is ineligible: the producing
+    # epoch records no package, so no catalog exists to donate and the
+    # recipient builds cold.
+    submodule = proof.repositories["subrepo"]
+    sub_files = git_app("subcrate", submodule["url"], submodule["revisions"][0])
+    sub_packages = [git_package("subcrate", submodule["url"], submodule["revisions"][0])]
+    sub_donor = case.checkout("submodule-donor", sub_files, sub_packages)
+    code, _out, err = case.command(sub_donor, ["build"], "submodule donor", env=case.env())
+    sub_slot = slot_of(err)
+    expect(
+        not os.path.isfile(catalog_path(case.pool, sub_slot)),
+        "a submodule checkout produced a donor catalog",
+    )
+    sub_recipient = case.checkout("submodule-recipient", sub_files, sub_packages)
+    code, _out, err = case.command(sub_recipient, ["build"], "submodule recipient", env=case.env())
+    expect(not seeded(err), "a submodule checkout was seeded")
+    # The same literal crate name from a registry and a Git source is
+    # ambiguous: the lock has no eligible package, so no catalog is produced.
+    collision = proof.repositories["cfgifgit"]
+    rev3 = collision["revisions"][0]
+    collision_files = {
+        "Cargo.toml": (
+            '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            '[dependencies]\ncfg-if = "=1.0.0"\n'
+            f'cfgifgit = {{ package = "cfg-if", git = "{collision["url"]}", rev = "{rev3}" }}\n'
+        ),
+        "src/main.rs": 'fn main() { println!("{}", cfg_if::VERSION); }\n',
+    }
+    collision_donor = case.checkout("collision-donor", collision_files)
+    code, _out, err = case.command(collision_donor, ["build"], "collision donor", env=case.env())
+    collision_slot = slot_of(err)
+    expect(
+        not os.path.isfile(catalog_path(case.pool, collision_slot)),
+        "a same-name registry/Git collision produced a donor catalog",
+    )
+    collision_recipient = case.checkout("collision-recipient", collision_files)
+    code, _out, err = case.command(
+        collision_recipient, ["build"], "collision recipient", env=case.env()
+    )
+    line = skip_line(err)
+    expect(not seeded(err), "a same-name collision was seeded")
+    expect("ambiguous name" in line, f"the collision was not named: {line}")
+    print("case 13: dirty, re-revisioned, submodule and colliding checkouts are ineligible", flush=True)
 
 
 def case_14(proof: Proof) -> None:
@@ -1567,6 +1759,26 @@ def case_17(proof: Proof) -> None:
         cold_recipient("link", "tree symlink")
     finally:
         os.remove(link)
+    lib = os.path.join(tree, "src", "lib.rs")
+    original_lib = read_bytes(lib)
+    try:
+        with open(lib, "ab") as handle:
+            handle.write(b"\n// altered by the cold-slot seeding proof\n")
+        cold_recipient("altered", "altered tree file")
+    finally:
+        with open(lib, "wb") as handle:
+            handle.write(original_lib)
+    try:
+        os.rename(lib, lib + ".proof-missing")
+        recipient = case.checkout("missing", CFG_APP_FILES, CFG_APP_LOCK)
+        code, _out, err = case.command(
+            recipient, ["build"], "missing tree file", env=case.env(), allow_any_exit=True
+        )
+        # A missing source file can fail Cargo's own build; the claim under
+        # test is only that the product never seeds a modified tree.
+        expect(not seeded(err), "a missing tree file was seeded")
+    finally:
+        os.rename(lib + ".proof-missing", lib)
     print("case 17: each registry tamper control built cold and never seeded", flush=True)
 
 
@@ -1713,41 +1925,52 @@ def case_21(proof: Proof) -> None:
 
 
 def case_22(proof: Proof) -> None:
-    import fcntl
-
     case = Case(proof, "22")
-    _donor, recipient, donor_slot, _ = cfg_donor_recipient(case)
+    donor, recipient, donor_slot, _ = cfg_donor_recipient(case)
     catalog = read_json(catalog_path(case.pool, donor_slot))
-    record = catalog["record_id"]
-    lock_path = os.path.join(case.pool, "oxide-managed", "locks", f"{record}.lock")
-    expect(os.path.isfile(lock_path), f"the donor record lock {lock_path} is absent")
-    gate = os.path.join(case.root, "pause-gate")
-    env = case.env(extra={"OXIDE_TEST_SEED_PAUSE": f"between-calls:{gate}"})
-    before = record_donor_figure(case.pool, donor_slot)
-    child = perm.start_child(proof, [proof.binary, "build"], recipient, env)
-    handle = open(lock_path, "r+")
+    project = os.path.join(case.pool, "oxide-managed", "affinity", str(catalog["record_id"]))
+    pause_gate = os.path.join(case.root, "pause-gate")
+    release_gate = os.path.join(case.root, "competitor-release")
+    before_tree = slot_tree(case.pool, donor_slot)
+    before_catalog = read_bytes(catalog_path(case.pool, donor_slot))
+    env = case.env(extra={"OXIDE_TEST_SEED_PAUSE": f"between-calls:{pause_gate}"})
+    seeded_child = perm.start_child(proof, [proof.binary, "build"], recipient, env)
+    competitor = None
     try:
-        marker = wait_for_glob(gate + ".between-calls-*", "the between-calls pause")
-        print(f"competing custody at {marker}", flush=True)
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with open(gate, "wb") as release:
+        marker = wait_for_glob(pause_gate + ".between-calls-*", "the between-calls pause")
+        print(f"competing lease armed at {marker}", flush=True)
+        competitor_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": proof.home,
+        }
+        competitor = perm.start_child(
+            proof,
+            [proof.lease_helper, case.pool, project, donor, release_gate],
+            donor,
+            competitor_env,
+        )
+        wait_for(release_gate + ".leased", "the competing library lease")
+        with open(pause_gate, "wb") as release:
             release.write(b"release")
-        code, _out, err = perm.finish_child(proof, child, "competing custody")
+        code, _out, err = perm.finish_child(proof, seeded_child, "competing custody")
+        expect(code == 0, f"the competing command failed: {err[-1500:]}")
+        line = skip_line(err)
+        expect("donor busy" in line, f"the competing lease was not a donor-busy skip: {line}")
+        expect(not seeded(err), "a competing lease did not stop the seed")
+        expect(slot_tree(case.pool, donor_slot) == before_tree, "the donor tree changed")
+        expect(read_bytes(catalog_path(case.pool, donor_slot)) == before_catalog, "the donor catalog changed")
     finally:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        finally:
-            handle.close()
-    expect(code == 0, f"the competing command failed: {err[-1500:]}")
-    expect(not seeded(err), "a competing custody holder did not stop the seed")
-    expect("donor busy" in skip_line(err), f"unexpected skip: {skip_line(err)}")
-    expect_no_seed_mutation(case.pool, donor_slot, before)
+        with open(release_gate, "wb") as release:
+            release.write(b"release")
+        if competitor is not None:
+            code, _out, err = perm.finish_child(proof, competitor, "competing lease")
+            expect(code == 0, f"the competing lease failed: {err[-1500:]}")
     # Non-vacuous control: the same fixture without the interleaving seeds.
     control = Case(proof, "22")
     _d, recipient2, _s, _ = cfg_donor_recipient(control)
     code, _out, err = control.command(recipient2, ["build"], "uninterleaved control", env=control.env())
     expect(seeded(err), "the uninterrupted control did not seed")
-    print("case 22: a competing custody holder was a donor-busy skip with no block", flush=True)
+    print("case 22: a real competing lease was a donor-busy skip with no block", flush=True)
 
 
 def wait_for_glob(pattern: str, label: str) -> str:
@@ -1921,12 +2144,79 @@ def plan() -> None:
     print("no effect: this mode starts no child, creates no pool and reads no fixture")
 
 
+def _bound_and_loaded(node: ast.AST) -> tuple[set[str], set[str]]:
+    bound: set[str] = set()
+    loaded: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bound.add(child.name)
+            arguments = [*child.args.posonlyargs, *child.args.args, *child.args.kwonlyargs]
+            bound.update(argument.arg for argument in arguments)
+            if child.args.vararg is not None:
+                bound.add(child.args.vararg.arg)
+            if child.args.kwarg is not None:
+                bound.add(child.args.kwarg.arg)
+        elif isinstance(child, ast.Lambda):
+            arguments = [*child.args.posonlyargs, *child.args.args, *child.args.kwonlyargs]
+            bound.update(argument.arg for argument in arguments)
+            if child.args.vararg is not None:
+                bound.add(child.args.vararg.arg)
+            if child.args.kwarg is not None:
+                bound.add(child.args.kwarg.arg)
+        elif isinstance(child, ast.Name):
+            target = bound if isinstance(child.ctx, (ast.Store, ast.Del)) else loaded
+            target.add(child.id)
+        elif isinstance(child, ast.alias):
+            bound.add((child.asname or child.name).split(".")[0])
+        elif isinstance(child, ast.ExceptHandler) and child.name:
+            bound.add(child.name)
+    return bound, loaded
+
+
+def undefined_names(body) -> list[str]:
+    """Names a case body loads without binding, a module global or a builtin.
+
+    This is the static half of the pure apparatus check: it catches a body that
+    would raise at its first statement (case 09's unbound donor did) without
+    starting any fixture.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(body)))
+    bound, loaded = _bound_and_loaded(tree.body[0])
+    known = bound | set(globals()) | set(dir(builtins))
+    return sorted(name for name in loaded if name not in known)
+
+
+def unused_module_names() -> list[str]:
+    """Module-level names that are never loaded: an unused fixture constant is
+    a silent proof-source defect."""
+    with open(__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    assigned: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            assigned.extend(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assigned.append(node.target.id)
+    loaded = {
+        child.id
+        for child in ast.walk(tree)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+    return sorted(name for name in assigned if name not in loaded)
+
+
 def self_check() -> None:
     ids = [case for case, _requires, _text in CASES]
     expect(ids == [f"{index:02d}" for index in range(1, 25)], f"the case table drifted: {ids}")
     expect(sorted(BODIES) == sorted(ids), "the case table and the dispatcher disagree")
     for name, body in BODIES.items():
         expect(callable(body), f"case {name} has no body")
+        missing = undefined_names(body)
+        expect(not missing, f"case {name} loads unbound name(s): {missing}")
+    unused = unused_module_names()
+    expect(not unused, f"unused module-level fixture name(s): {unused}")
     expect(len(set(ids)) == len(ids), "duplicate case id")
     for relative in ("scripts/offline_seed.py", "scripts/bounded-test.py"):
         path = os.path.join(os.path.dirname(HERE), relative)

@@ -594,7 +594,8 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         return Ok(stop_for_admission());
     }
     // The seed point is after the output binding and before any recipient
-    // scratch or writer. The qualification gate is false in this slice.
+    // scratch or writer. The gate is the default-on qualification constant
+    // with `OXIDE_COLD_SEED=0` as the opt-out.
     let mut production = None;
     if cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref()) {
         match seed_sources::Production::prepare(&invocation, &key.checkout, &held, &store) {
