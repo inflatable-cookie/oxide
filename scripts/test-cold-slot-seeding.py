@@ -243,7 +243,7 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
 ]
 
 PHASES = [
-    "setup: stage this HEAD's oxide and seed one private offline Cargo home",
+    "setup: stage this HEAD's oxide, seed two private offline Cargo homes and build the lease helper",
     "cases 01-15: internal directory-budget pools",
     "case 16: one owned 128 MiB APFS image, ordinary detach",
     "cases 17-24: internal pools after the image phase",
@@ -582,6 +582,107 @@ SQLITE_APP_MAIN = '''fn main() {
     println!("SQLITE={}", libsqlite3_sys::SQLITE_VERSION_NUMBER);
 }
 '''
+def manifest_package_name(manifest: str) -> str:
+    """The single `[package] name` of one owned fixture manifest.
+
+    Only the simple shape these fixtures write is accepted: a `[package]`
+    table with exactly one basic-string `name`. A missing, duplicated,
+    section-misplaced or malformed name refuses, so a fixture descriptor can
+    never advertise a crate name that its Cargo.toml does not declare.
+    """
+    section = None
+    name = None
+    for raw in manifest.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if line.startswith("name") and section == "package":
+            match = re.fullmatch(r'name\s*=\s*"([^"\\\n]+)"', line)
+            expect(match is not None, f"a fixture package name is not a basic string: {line!r}")
+            expect(name is None, "a fixture manifest declares more than one package name")
+            name = match.group(1)
+    expect(name is not None, "a fixture manifest has no [package] name")
+    return name
+
+
+def fixture_package(files: dict[str, str], package: str | None = None) -> str:
+    """The crate a fixture directory really declares, cross-checked against an
+    optional intended name. Missing manifests and mismatches fail closed."""
+    manifest = files.get("Cargo.toml")
+    expect(manifest is not None, "a Git fixture has no Cargo.toml")
+    crate = manifest_package_name(manifest)
+    if package is not None:
+        expect(
+            package == crate,
+            f"the fixture descriptor names {package!r} but its Cargo.toml declares {crate!r}",
+        )
+    return crate
+
+
+def git_dependency(key: str, repository: dict, rev: str, *, rename: bool = False) -> str:
+    """One `[dependencies]` entry for an owned Git fixture.
+
+    Without `rename`, the dependency key must be the crate name. With `rename`,
+    the key is a local alias and the entry names the crate explicitly. A
+    key/crate mismatch refuses either way, so a case can never ask Cargo for a
+    package the fixture does not contain.
+    """
+    crate = repository["package"]
+    entry = f'git = "{repository["url"]}", rev = "{rev}"'
+    if rename:
+        expect(key != crate, f"the rename key {key!r} already names crate {crate!r}")
+        return f'{key} = {{ package = "{crate}", {entry} }}'
+    expect(key == crate, f"the dependency key {key!r} does not name crate {crate!r}")
+    return f"{key} = {{ {entry} }}"
+
+
+def prime_manifest(repositories: dict[str, dict]) -> str:
+    """The prime fixture's manifest, with one dependency entry per repository."""
+    lines = ['[package]\nname = "prime"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n']
+    for name, repository in repositories.items():
+        rename = name != repository["package"]
+        lines.append(
+            git_dependency(name, repository, repository["revisions"][0], rename=rename) + "\n"
+        )
+    text = "".join(lines)
+    verify_prime_manifest(text, repositories)
+    return text
+
+
+def verify_prime_manifest(manifest: str, repositories: dict[str, dict]) -> None:
+    """Every prime dependency key must resolve to its repository's real crate,
+    exactly once, with no extra or missing entry."""
+    section = None
+    seen: dict[str, str] = {}
+    for raw in manifest.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if section != "dependencies":
+            continue
+        match = re.fullmatch(
+            r'([A-Za-z0-9_-]+)\s*=\s*\{\s*(?:package\s*=\s*"([^"]+)"\s*,\s*)?git\s*=\s*"([^"]+)"\s*,\s*rev\s*=\s*"([0-9a-f]{40})"\s*\}',
+            line,
+        )
+        expect(match is not None, f"a prime dependency line has an unexpected shape: {line!r}")
+        key, package, _url, _rev = match.groups()
+        expect(key not in seen, f"the prime manifest repeats dependency {key!r}")
+        crate = package or key
+        seen[key] = crate
+    expect(set(seen) == set(repositories), f"the prime manifest does not name every repository: {sorted(seen)}")
+    for name, repository in repositories.items():
+        expect(
+            seen[name] == repository["package"],
+            f"the prime dependency {name!r} resolves to {seen[name]!r}, not {repository['package']!r}",
+        )
+
+
 def submodule_url(path: str) -> str:
     """A valid `file://` URL for an owned local repository.
 
@@ -617,6 +718,7 @@ def git_fixture(
     first commit; the proof never initialises it, so the checkout carries an
     uninitialised gitlink exactly as an untrusted dependency would.
     """
+    crate = fixture_package(files, package)
     repo = os.path.join(root, "git", name)
     os.makedirs(repo, exist_ok=True)
     write_tree(repo, files)
@@ -670,7 +772,7 @@ def git_fixture(
     return {
         "repo": repo,
         "url": f"file://{repo}",
-        "package": package or name,
+        "package": crate,
         "revisions": revisions,
     }
 
@@ -789,15 +891,7 @@ def prime_git_databases(proof: Proof, repositories: dict[str, dict]) -> None:
     every product command afterwards runs `--offline` with the database present.
     """
     prime = fixture_dir(proof.root, "git-prime.")
-    lines = ['[package]\nname = "prime"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n']
-    for name, repository in repositories.items():
-        package = repository.get("package", name)
-        entry = f'git = "{repository["url"]}", rev = "{repository["revisions"][0]}"'
-        if package == name:
-            lines.append(f"{name} = {{ {entry} }}\n")
-        else:
-            lines.append(f'{name} = {{ package = "{package}", {entry} }}\n')
-    write_tree(prime, {"Cargo.toml": "".join(lines), "src/lib.rs": "\n"})
+    write_tree(prime, {"Cargo.toml": prime_manifest(repositories), "src/lib.rs": "\n"})
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": proof.home,
@@ -1260,7 +1354,7 @@ def seedctl_app(repository: dict, rev: str) -> dict[str, str]:
     return {
         "Cargo.toml": (
             '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
-            f'[dependencies]\nseedctl = {{ git = "{repository["url"]}", rev = "{rev}" }}\n'
+            f'[dependencies]\n{git_dependency("seedctl", repository, rev)}\n'
         ),
         "src/main.rs": (
             'fn main() {\n'
@@ -1417,7 +1511,7 @@ def case_05(proof: Proof) -> None:
     files = {
         "Cargo.toml": (
             '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
-            f'[dependencies]\nseedpm = {{ git = "{repository["url"]}", rev = "{rev}" }}\n'
+            f'[dependencies]\n{git_dependency("seedpm", repository, rev)}\n'
         ),
         "src/main.rs": 'fn main() { println!("{}", seedpm::value!()); }\n',
     }
@@ -1457,7 +1551,7 @@ def case_05(proof: Proof) -> None:
     files2 = {
         "Cargo.toml": (
             '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
-            f'[dependencies]\npmdep = {{ git = "{pmdep_repo["url"]}", rev = "{rev2}" }}\n'
+            f'[dependencies]\n{git_dependency("pmdep", pmdep_repo, rev2)}\n'
             'cfg-if = "=1.0.0"\n'
         ),
         "src/main.rs": 'fn main() { println!("{}", pmdep::value!()); }\n',
@@ -1571,7 +1665,7 @@ def case_08(proof: Proof) -> None:
     rev = repository["revisions"][0]
     manifest = (
         '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
-        f'[dependencies]\ncfgifgit = {{ package = "cfg-if", git = "{repository["url"]}", rev = "{rev}" }}\n'
+        f'[dependencies]\n{git_dependency("cfgifgit", repository, rev, rename=True)}\n'
     )
     files = {
         "Cargo.toml": manifest,
@@ -1753,11 +1847,11 @@ def case_12(proof: Proof) -> None:
 COLLECTION = None
 
 
-def git_app(name: str, url: str, rev: str) -> dict[str, str]:
+def git_app(key: str, repository: dict, rev: str) -> dict[str, str]:
     return {
         "Cargo.toml": (
             '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
-            f'[dependencies]\n{name} = {{ git = "{url}", rev = "{rev}" }}\n'
+            f'[dependencies]\n{git_dependency(key, repository, rev)}\n'
         ),
         "src/main.rs": 'fn main() { println!("git identity"); }\n',
     }
@@ -1793,7 +1887,7 @@ def case_13(proof: Proof) -> None:
     # epoch records no package, so no catalog exists to donate and the
     # recipient builds cold.
     submodule = proof.repositories["subrepo"]
-    sub_files = git_app("subcrate", submodule["url"], submodule["revisions"][0])
+    sub_files = git_app("subcrate", submodule, submodule["revisions"][0])
     sub_packages = [git_package("subcrate", submodule["url"], submodule["revisions"][0])]
     sub_donor = case.checkout("submodule-donor", sub_files, sub_packages)
     code, _out, err = case.command(sub_donor, ["build"], "submodule donor", env=case.env())
@@ -1813,7 +1907,7 @@ def case_13(proof: Proof) -> None:
         "Cargo.toml": (
             '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
             '[dependencies]\ncfg-if = "=1.0.0"\n'
-            f'cfgifgit = {{ package = "cfg-if", git = "{collision["url"]}", rev = "{rev3}" }}\n'
+            f'{git_dependency("cfgifgit", collision, rev3, rename=True)}\n'
         ),
         "src/main.rs": 'fn main() { println!("{}", cfg_if::VERSION); }\n',
     }
@@ -2571,6 +2665,76 @@ def self_test() -> None:
         flags = {"CARGO_ENCODED_RUSTFLAGS": "x"}
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
+
+        # The fixture package-name grammar and descriptor consistency.
+        simple = '[package]\nname = "seedctl"\nversion = "0.1.0"\n'
+        expect(manifest_package_name(simple) == "seedctl", "a simple package name was not read")
+        expect(fixture_package({"Cargo.toml": simple}, "seedctl") == "seedctl", "a matching descriptor refused")
+        for label, manifest in (
+            ("missing name", '[package]\nversion = "0.1.0"\n'),
+            ("duplicate name", '[package]\nname = "a"\nname = "b"\n'),
+            ("name outside package", '[package]\nversion = "1"\n[lib]\nname = "a"\n'),
+            ("malformed name", '[package]\nname = seedctl\n'),
+        ):
+            try:
+                manifest_package_name(manifest)
+            except RuntimeError:
+                pass
+            else:
+                fail(f"a manifest with {label} did not refuse")
+        try:
+            fixture_package({"Cargo.toml": simple}, "seedpm")
+        except RuntimeError:
+            pass
+        else:
+            fail("a descriptor naming a different crate did not refuse")
+        try:
+            fixture_package({})
+        except RuntimeError:
+            pass
+        else:
+            fail("a fixture without a manifest did not refuse")
+
+        # Git dependency entries: same-name keys, explicit renames and the
+        # mismatch refusals; the prime manifest must resolve every key to its
+        # repository's real crate exactly once.
+        repo_a = {"package": "seedctl", "url": "file:///a/seedrepo", "revisions": ["a" * 40]}
+        repo_b = {"package": "cfg-if", "url": "file:///a/cfgifgit", "revisions": ["b" * 40]}
+        expect(
+            git_dependency("seedctl", repo_a, "a" * 40)
+            == 'seedctl = { git = "file:///a/seedrepo", rev = "' + "a" * 40 + '" }',
+            "a same-name Git dependency drifted",
+        )
+        expect(
+            git_dependency("cfgifgit", repo_b, "b" * 40, rename=True)
+            == 'cfgifgit = { package = "cfg-if", git = "file:///a/cfgifgit", rev = "' + "b" * 40 + '" }',
+            "a renamed Git dependency drifted",
+        )
+        for label, call in (
+            ("key/crate mismatch", lambda: git_dependency("seedrepo", repo_a, "a" * 40)),
+            ("rename equals crate", lambda: git_dependency("cfg-if", repo_b, "b" * 40, rename=True)),
+        ):
+            try:
+                call()
+            except RuntimeError:
+                pass
+            else:
+                fail(f"a Git dependency with {label} did not refuse")
+        repositories = {"seedctl": repo_a, "cfgifgit": repo_b}
+        manifest = prime_manifest(repositories)
+        verify_prime_manifest(manifest, repositories)
+        try:
+            verify_prime_manifest(manifest.replace('package = "cfg-if"', 'package = "wrong"'), repositories)
+        except RuntimeError:
+            pass
+        else:
+            fail("a prime manifest with a wrong package did not refuse")
+        try:
+            verify_prime_manifest(manifest.replace('seedctl =', 'seedrepo ='), repositories)
+        except RuntimeError:
+            pass
+        else:
+            fail("a prime manifest with a missing/replaced key did not refuse")
 
         # The owned-submodule URL: Cargo accepts only a URL shape, so an
         # absolute owned path becomes file:///, an existing file URL is kept,
