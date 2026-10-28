@@ -1881,44 +1881,9 @@ mod tests {
         assert_eq!(step(&["test", "-Zunstable-options"], true), "refuse");
     }
 
-    /// Strip CSI. Recipe env `CLICOLOR_FORCE=1` makes Cargo 1.97.1 colour
-    /// piped stderr (`\x1b[1m\x1b[91merror\x1b[0m:`), so production
-    /// `cargo_accepts` (`starts_with("error:")`) sees `first_error=None`.
-    /// A bare ESC not followed by `[` drops the next character; Cargo CSI
-    /// always uses `[`.
-    fn strip_ansi(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                if chars.next() == Some('[') {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-            out.push(c);
-        }
-        out
-    }
-
-    /// Cargo parsed the subcommand, then refused -Z. Stable 1.97.1 wording:
-    /// the -Z flag is only accepted on the nightly channel (exit 101).
-    /// Nightly unknown-flag wording also contains the `-Z` flag token.
-    /// Argument errors exit 1 and never mention -Z. CSI is stripped because
-    /// the recipe env colours the piped `error:` prefix.
-    fn refused_z_flag(code: Option<i32>, stderr: &str) -> bool {
-        code == Some(101) && strip_ansi(stderr).contains("`-Z` flag")
-    }
-
-    /// Real offline Cargo in an empty scratch directory: accepted arguments
-    /// reach Cargo's `-Z` refusal after it has accepted the subcommand.
-    /// A check placed after `--` is not a Cargo argument. Production
-    /// `cargo_accepts` is unchanged and fails under `CLICOLOR_FORCE=1`; this
-    /// test-only oracle hides that product defect.
+    /// Real Cargo in an empty scratch directory: accepted arguments reach the
+    /// `-Z` refusal; anything else, including a check placed after `--`,
+    /// would hit Cargo's argument error or its missing manifest instead.
     #[test]
     fn parse_check_asks_cargo_without_effects() {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
@@ -1926,37 +1891,30 @@ mod tests {
             .unwrap_or_else(std::env::temp_dir);
         let dir = base.join(format!("parse-check-{:x}", std::process::id()));
         fs::create_dir(&dir).expect("scratch dir");
-        let refuses_z = |values: &[&str]| -> Option<bool> {
+        let accepts = |values: &[&str]| -> Option<bool> {
             let values: Vec<OsString> = values.iter().map(OsString::from).collect();
             let invocation =
                 crate::cli::parse_leased(values[0].to_str().expect("UTF-8"), &values[1..])
                     .expect("parses");
             let check = crate::cli::resolution(&invocation.cargo_args).parse_check?;
             let mut command = Command::new(crate::CARGO);
-            command
-                .args(check)
-                .current_dir(&dir)
-                .env("CARGO_NET_OFFLINE", "true");
-            let output = run_cargo(command, MAX_METADATA_ERROR_BYTES).expect("Cargo ran");
-            Some(refused_z_flag(output.status.code(), &output.stderr))
+            command.args(check).current_dir(&dir);
+            Some(cargo_accepts(command).expect("Cargo ran"))
         };
-        assert_eq!(refuses_z(&["test", "--locked"]), Some(true));
+        assert_eq!(accepts(&["test", "--locked"]), Some(true));
         assert_eq!(
-            refuses_z(&["build", "--offline", "--config", "net.offline=false"]),
+            accepts(&["build", "--offline", "--config", "net.offline=false"]),
             Some(true)
         );
         assert_eq!(
-            refuses_z(&["test", "--message-format=json", "--", "--bogus"]),
+            accepts(&["test", "--message-format=json", "--", "--bogus"]),
             Some(true)
         );
-        assert_eq!(refuses_z(&["test", "--bogus"]), Some(false));
-        assert_eq!(refuses_z(&["check", "--message-format=bogus"]), Some(false));
-        assert_eq!(
-            refuses_z(&["build", "--release", "--features"]),
-            Some(false)
-        );
-        assert_eq!(refuses_z(&["nextest", "run"]), None);
-        assert_eq!(refuses_z(&["test", "-Zunstable-options"]), None);
+        assert_eq!(accepts(&["test", "--bogus"]), Some(false));
+        assert_eq!(accepts(&["check", "--message-format=bogus"]), Some(false));
+        assert_eq!(accepts(&["build", "--release", "--features"]), Some(false));
+        assert_eq!(accepts(&["nextest", "run"]), None);
+        assert_eq!(accepts(&["test", "-Zunstable-options"]), None);
         let left: Vec<_> = fs::read_dir(&dir).expect("scratch").collect();
         fs::remove_dir(&dir).expect("parse check left no files");
         assert!(left.is_empty());
