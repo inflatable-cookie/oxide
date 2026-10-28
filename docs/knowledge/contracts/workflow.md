@@ -21,7 +21,11 @@ Cold-slot seeding is off. Setting `OXIDE_COLD_SEED=1` reports that seeding is
 not yet qualified on this Cargo; it does not seed, produce catalogs, or write
 seed sidecars. The separate qualification proof must pass before the opt-in can
 be honoured. With the variable unset, the existing command behaviour is
-unchanged. The [cold-slot seeding contract](cold-slot-seeding.md) owns the
+unchanged. Merge-base identity for that hold lives in
+`tests/cold_seed_default_off.rs`, behind `#[ignore]`; `effigy rust:seed-default-off`
+stages the merge-base `oxide` into owned scratch, exports
+`OXIDE_SEED_BASELINE_BINARY`, and runs those tests. They are not part of
+`effigy test rust`. The [cold-slot seeding contract](cold-slot-seeding.md) owns the
 proposed transaction and qualification requirements.
 
 ## Shape
@@ -1873,6 +1877,21 @@ recipe review; already-passed evidence is not recounted solely for that selector
 migration unless its source changes. Separate ROOT activation still precedes
 each diagnostic or native submission. Briefs, activations and outcomes live in
 Queue; this knowledge record changes no runtime scratch or host setting.
+
+**Scratch pools on an external validation volume (proposed design, oxide#173).**
+Tom, 2026-10-28: "this needs fixing so we can keep it on Builds next time".
+[Scratch pools](scratch-pools.md) is the design for an explicit, UUID-bound
+`directory-budget-v1` pool on a verified external volume, so validation and
+proof fixtures need no internal root: an environment-only
+`OXIDE_SCRATCH_ROOT` declaration consulted only at the external-volume
+refusal, the mandatory Git-work-tree recheck for an admitted path, a pool-local
+binding document plus a host-side identity record that survives detach, the
+absent-volume refusal, the refusal matrix, and a migration list that would drop
+the exception for ten proofs while `rust:outputs-prune`, `rust:prune-absence`
+and the internal unit fixtures keep their boot Data volume root. It is design only: no code, selector, recipe, host
+setting, real pool or native run exists, the exception above remains current
+truth for every proof, and each implementation slice needs its own brief and
+independent exact-head review.
 
 **Internal unit fixtures (oxide#149).** The selected-volume default leaves two
 macOS unit tests without their premise: the product routes a leased child's
@@ -4999,6 +5018,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
     "mode": "ephemeral",
     "reserve_bytes": 21474836480,
     "available": true,
+    "pending_reconciliation_slots": 0,
     "unavailable_reason": null,
     "payload": "/Volumes/Builds/oxide-pool",
     "suggested_scratch_root": "/Volumes/Builds/scratch"
@@ -5016,8 +5036,9 @@ The stable, read-only interface other tools use to find the registered Builds dr
   - the payload directory exists;
   - the removable pool's config and ledger read cleanly, and the config matches the registration (volume, UUID, payload directory and budget).
 
-  Every `diskutil` or `plutil` call is bounded: 5 s each and a 4 MiB output cap. A timeout, oversize output or parse failure counts as unknown. An `Evicting` record in the ledger makes the drive unavailable, because a build's open would reconcile it; `describe` reconciles nothing and reports it.
-- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as the mount parent, read-only, a role or the boot container), `below_reserve`, `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), `payload_missing`, or `pending_reconciliation`. Consumers branch on `available`, not on reason strings.
+  Every `diskutil` or `plutil` call is bounded: 5 s each and a 4 MiB output cap. A timeout, oversize output or parse failure counts as unknown. An `Evicting` record in the ledger does not make the drive unavailable: a build's open reconciles it and selects the drive anyway, the same as `oxide`'s selection (`Store::open_removable`, which never refuses on it). `describe` reconciles nothing and reports the count in `pending_reconciliation_slots` instead (oxide#174; before that it was `available: false` with reason `pending_reconciliation`, which blocked consumers at the 128-slot ceiling).
+- **`pending_reconciliation_slots`** is the number of ledger records in `Evicting` (deletions a build's open reconciles), added in schema 1 by oxide#174. It is advisory and never changes `available`: `0` when none is pending, and `null` when the config and ledger were not read (an unreadable registration, or an earlier check refused). A drive with pending records and every other check passing reports `available: true` with a count of `n`.
+- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as the mount parent, read-only, a role or the boot container), `below_reserve`, `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), or `payload_missing`. `pending_reconciliation` was a reason value before oxide#174 and is no longer emitted; consumers that handled it still see only the values above. Consumers branch on `available`, not on reason strings.
 - **`unavailable_detail`** is a human-readable explanation, added in schema 1. Its text is not stable.
 - **`reserve_bytes`** is the registered reserve in bytes, added in schema 1, and `null` when the registration cannot be read. `available` is only a snapshot of free space above it. A writer rechecks the mount, the volume UUID and free space against this value at use time.
 - **`selected`** is the passive preference: `"removable"` when `available` is true, otherwise `"internal"`. It is not a promise of the next build's selection, which stays authoritative inside the build and may differ, for example after its own reconciliation.
