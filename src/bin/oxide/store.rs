@@ -9742,7 +9742,6 @@ pub(crate) mod tests {
         });
         let error = store.save(&unfenced).unwrap_err();
         assert!(error.contains("without the one-use fence"), "{error}");
-        let _ = key;
         fs::remove_dir_all(root).unwrap();
     }
 
