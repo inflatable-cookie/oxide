@@ -4333,10 +4333,10 @@ fn blocked_capture_collision_is_counted_as_foreign_scope() {
         .is_dir());
 }
 
-/// An eviction held past the second admission's lock deadline returns Busy,
-/// never unknown accounting; once the first finishes, admission succeeds.
+/// A competing admission waits for the pool lock while eviction is in flight,
+/// then succeeds after the first holder finishes.
 #[test]
-fn a_competing_admission_times_out_on_an_inflight_eviction() {
+fn a_competing_admission_waits_for_an_inflight_eviction() {
     use std::sync::mpsc;
     use std::time::Duration;
     let fixture = Fixture::new("concurrent-eviction");
@@ -4367,17 +4367,20 @@ fn a_competing_admission_times_out_on_an_inflight_eviction() {
         let result = lease_injected(second_request);
         done_tx.send(result).expect("report result");
     });
-    let second_result = done_rx.recv_timeout(Duration::from_secs(8));
+    let waiting = done_rx.recv_timeout(Duration::from_millis(250));
     resume_tx.send(()).expect("resume eviction");
+    let second_result = done_rx.recv_timeout(Duration::from_secs(10));
     let first_result = first.join().expect("first worker");
     second.join().expect("second join");
     assert!(
-        matches!(second_result, Ok(Err(LeaseError::Busy))),
+        matches!(waiting, Err(mpsc::RecvTimeoutError::Timeout)),
+        "second admission did not wait: {waiting:?}"
+    );
+    assert!(
+        matches!(second_result, Ok(Ok(_))),
         "second admission: {second_result:?}"
     );
     assert!(first_result.is_ok(), "first admission: {first_result:?}");
-    let retry = lease_injected(request(&pool, &second_project, &workspace, "retry"));
-    assert!(retry.is_ok(), "admission after eviction: {retry:?}");
 }
 
 /// A panic after the product widened the captured root's mode restores the

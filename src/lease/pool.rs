@@ -742,7 +742,7 @@ pub mod managed {
 
     /// [`lease`], with the reuse walk's measurement of the slot it took.
     pub fn lease_measured(request: LeaseRequest) -> Result<Leased, LeaseError> {
-        Pool::open_for_lease(&request.pool)?.lease(&request)
+        Pool::open(&request.pool)?.lease(&request)
     }
 
     pub fn release(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
@@ -757,10 +757,10 @@ pub mod managed {
         Pool::open(pool)?.accounted()
     }
 
-    /// Ledger membership without accounting walks; it uses a bounded pool
-    /// lock wait for callers preparing an admission.
+    /// Ledger membership without accounting walks; it takes the pool lock
+    /// and reconciles recorded evictions before returning.
     pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
-        Pool::open_for_lease(pool)?.ledger_view()
+        Pool::open(pool)?.ledger_view()
     }
 
     /// Recorded identity and ledger membership of a pool, read with no lock,
@@ -1065,22 +1065,10 @@ impl Pool {
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
     pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_with_lock(root, false)
-    }
-
-    fn open_for_lease(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_with_lock(root, true)
-    }
-
-    fn open_with_lock(root: &Path, bounded: bool) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
-        let lock = if bounded {
-            lock_pool_inner(&root, true, Some(Duration::from_secs(5)))?
-        } else {
-            lock_pool(&root)?
-        };
+        let lock = lock_pool(&root)?;
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
         let backing = match config.backend.as_str() {
@@ -4082,10 +4070,10 @@ fn refuse_occupied_init_directory(pool: &Path) -> Result<(), LeaseError> {
 }
 
 fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
-    lock_pool_inner(pool, true, None)
+    lock_pool_inner(pool, true)
 }
 
-fn lock_pool_inner(pool: &Path, create: bool, wait: Option<Duration>) -> Result<File, LeaseError> {
+fn lock_pool_inner(pool: &Path, create: bool) -> Result<File, LeaseError> {
     let path = pool.join(LOCK_NAME);
     let existing = match fs::symlink_metadata(&path) {
         Ok(metadata) => {
@@ -4115,25 +4103,6 @@ fn lock_pool_inner(pool: &Path, create: bool, wait: Option<Duration>) -> Result<
             .is_some_and(|before| before.dev() != metadata.dev() || before.ino() != metadata.ino())
     {
         return Err(LeaseError::UnsafePath("lock file must be private"));
-    }
-    if let Some(wait) = wait {
-        let deadline = Instant::now() + wait;
-        loop {
-            // SAFETY: the live descriptor owns the lock until dropped.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(file);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::WouldBlock
-                && error.kind() != std::io::ErrorKind::Interrupted
-            {
-                return Err(io_error(error));
-            }
-            if Instant::now() >= deadline {
-                return Err(LeaseError::Busy);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
     // SAFETY: `file` is open for the pool lock; flock holds until File drop.
     let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
