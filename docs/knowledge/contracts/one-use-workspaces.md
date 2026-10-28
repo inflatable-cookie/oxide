@@ -72,21 +72,35 @@ implementation review corrected:
   `admission.lock`; the only file a refusal may touch is the checkout binding
   mutex. The caller's revalidation runs again between the two decisions, so a
   change that lands in that window is refused before a mark, and only the
-  proceeding path writes the mark and its `waiters/` lock. The removables' sibling state is read
-  through a checked reader that keeps absence (`Ok(None)`) apart from any other
-  failure — a symlinked *or dangling* document, an inaccessible ancestor, an
-  invalid document — which refuses as unknown custody.
+  proceeding path writes the mark and its `waiters/` lock.
+- **Unknown custody is never absence, on either side of the pair.** The other
+  pool's state is read through a checked reader that inspects its **control
+  directory itself** before the document: a genuinely absent directory means no
+  records, while a symlinked, *dangling*, non-directory, foreign or unreadable
+  one refuses as unknown custody — reading `state.json` alone would map a
+  dangling control directory to `ENOENT` and so to "no records". The admission
+  probe is equally precise: only a `NotFound` open is absence
+  (`AdmissionProbe::Absent`); a symlinked, unreadable or otherwise unusable
+  lock is an error the barrier reports as unknown custody, never as "no lock".
+  Both classes of error are wrapped in the bounded guarded text, so no raw
+  filesystem error escapes a guarded refusal.
 - **The prune-intent check follows the shipped definition.** `unsettled_for`
   answers `Ok(None)` only when there is no registry document at all (a pool
   that never published output authority cannot hold a published intent); every
   read, parse or validation error propagates and refuses; a present intent whose
   phase is terminal **and** whose checkout receipt committed is settled and
   clear, exactly as the shipped verbs treat it; an unfinished intent refuses by
-  ID. The guarded check runs at the effect-free precheck of each verb and again
-  under the checkout binding mutex, and a `Pruning` receipt refuses there too.
-  The registry read is not taken under the publication lock — the same
-  pre-effect property the shipped `bind_for_command`, `reserve` and `detach`
-  have — and S1 adds no weakening to it.
+  ID. **Where** it is checked is per verb, and the distinction matters:
+  `detach` and `cancel-reservation` decide the unsettled intent, the `Pruning`
+  receipt and the `Prepared` transition at the **effect-free precheck**, and
+  revalidate only the `Prepared` transition (receipt and pending migration
+  journal) under the checkout binding mutex before any mark; `adopt` decides
+  everything at its unconditional effect-free refusal; a leased command's
+  binding decides the whole §4.2 table — unsettled intent, `Pruning`,
+  `Prepared` — under the binding mutex in `bind_local_outputs`. The registry
+  read is not taken under the publication lock — the same pre-effect property
+  the shipped `bind_for_command`, `reserve` and `detach` have — and S1 adds no
+  weakening to it.
 - **The dormant `adopt` keeps the shipped error precedence.** Drive mode, then
   the control directory, then the pool: the lazy pool provider is called last,
   so a dormant build reports the pre-S1 refusal when several preconditions are

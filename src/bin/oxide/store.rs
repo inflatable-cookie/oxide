@@ -2610,6 +2610,23 @@ impl Store {
         let Some(sibling) = self.sibling.as_ref() else {
             return Ok(None);
         };
+        // The control directory itself is inspected first: a genuinely absent
+        // one means the other pool has no state at all, while a symlinked,
+        // dangling, foreign or unreadable one is unknown custody. Reading
+        // `state.json` alone would map a dangling control directory to ENOENT
+        // and so to "no records" — exactly the direction this must not take.
+        match fs::symlink_metadata(&sibling.control) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "the other pool's control directory cannot be inspected: {error}"
+                ))
+            }
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err("the other pool's control path is not a real directory".to_owned())
+            }
+            Ok(_) => {}
+        }
         let path = sibling.control.join("state.json");
         let Some(file) = private_file(&path, false)
             .map_err(|error| format!("the other pool's record state is unreadable: {error}"))?
@@ -2905,7 +2922,9 @@ impl Store {
         // the verb cannot create one, so it retries.
         let sibling = self.sibling.as_ref().filter(|sibling| sibling.barrier);
         if let Some(sibling) = sibling {
-            match probe_admission(&sibling.control)? {
+            match probe_admission(&sibling.control)
+                .map_err(|error| crate::one_use::barrier_unknown(&error))?
+            {
                 AdmissionProbe::Free => {}
                 AdmissionProbe::Held => {
                     return Ok(Cleaning::Retry(
@@ -2920,7 +2939,9 @@ impl Store {
                 }
             }
         }
-        match probe_admission(&self.control)? {
+        match probe_admission(&self.control)
+            .map_err(|error| crate::one_use::barrier_unknown(&error))?
+        {
             AdmissionProbe::Free => {}
             AdmissionProbe::Held => {
                 return Ok(Cleaning::Retry(
@@ -2947,7 +2968,9 @@ impl Store {
         // a mark exists. Neither decision can create anything, so a non-clear
         // second answer leaves the pool's files exactly as they were.
         let _sibling = match sibling {
-            Some(sibling) => match acquire_existing_admission(&sibling.control)? {
+            Some(sibling) => match acquire_existing_admission(&sibling.control)
+                .map_err(|error| crate::one_use::barrier_unknown(&error))?
+            {
                 Some(lock) => Some(lock),
                 None => {
                     return Ok(Cleaning::Retry(
@@ -2957,7 +2980,9 @@ impl Store {
             },
             None => None,
         };
-        let Some(_admission) = acquire_existing_admission(&self.control)? else {
+        let Some(_admission) = acquire_existing_admission(&self.control)
+            .map_err(|error| crate::one_use::barrier_unknown(&error))?
+        else {
             return Ok(Cleaning::Retry(
                 "another oxide command holds this pool's admission lock".to_owned(),
             ));
@@ -4638,6 +4663,7 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
     // a valid admission. Both steps keep `O_NOFOLLOW`, so a symlink is never
     // followed, and creation is exclusive so no second file is ever written.
     let mut fd = -1;
+    let mut last = None;
     for _ in 0..3 {
         if create {
             // SAFETY: `name` is a live CString with initialized bytes through
@@ -4677,18 +4703,24 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
         if fd >= 0 {
             break;
         }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+        let error = std::io::Error::last_os_error();
+        let retry = error.kind() == std::io::ErrorKind::NotFound;
+        last = Some(error);
+        if !retry {
             break;
         }
     }
     if fd < 0 {
-        // Without `create`, a missing lock is absence, never an error: a
-        // guarded verb must be able to refuse without creating it.
-        if !create {
+        // A missing lock is absence, and only absence: a symlinked, unreadable
+        // or otherwise unusable lock is an error the caller must treat as
+        // unknown custody, never as "no lock". A guarded verb may not create
+        // the lock, so `create == false` must distinguish the two precisely.
+        let error = last.unwrap_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT));
+        if error.kind() == std::io::ErrorKind::NotFound {
             return Ok(None);
         }
         return Err(format!(
-            "cannot open admission lock in {}: the create did not succeed",
+            "cannot open admission lock in {}: {error}",
             control.display()
         ));
     }
@@ -6340,7 +6372,92 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The guarded order (design §4.1 step 3): the caller's revalidation runs
+    /// A **dangling sibling control directory** is unknown custody, not
+    /// absence: reading `state.json` through it would report ENOENT and let the
+    /// guarded barrier mark the checkout clear.
+    #[test]
+    fn the_guarded_barrier_refuses_a_dangling_sibling_control_directory() {
+        let (root, internal, removable) = paired_controls("guarded-sibling-dangling");
+        lock_pool(&internal);
+        internal.save(&State::default()).unwrap();
+        // Replace the sibling control directory with a symlink to a missing
+        // directory: every open through it reports ENOENT.
+        let control = removable.control.clone();
+        fs::remove_dir_all(&control).unwrap();
+        std::os::unix::fs::symlink(root.join("missing-control"), &control).unwrap();
+        let refused = match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("a dangling sibling control directory refuses"),
+        };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(refused.contains("other pool"), "{refused}");
+        assert!(internal.load().unwrap().cleans.is_empty());
+        // The same control path sitting there as a regular file is refused too.
+        fs::remove_file(&control).unwrap();
+        fs::write(&control, b"not a directory").unwrap();
+        let refused = match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("a non-directory sibling control path refuses"),
+        };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        fs::remove_file(&control).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A symlinked (or otherwise unusable) admission lock is unknown custody,
+    /// not "absent": the probe must refuse rather than report the pool as
+    /// lock-free and retry.
+    #[test]
+    fn the_guarded_barrier_refuses_an_unusable_admission_lock() {
+        let (root, internal, _removable) = paired_controls("guarded-bad-admission");
+        internal.save(&State::default()).unwrap();
+        let admission = internal.control.join("admission.lock");
+        let elsewhere = root.join("elsewhere.lock");
+        fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &admission).unwrap();
+        let probed = probe_admission(&internal.control);
+        assert!(probed.is_err(), "{probed:?}");
+        let refused = match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!("an unusable admission lock refuses"),
+        };
+        assert!(refused.contains("clean barrier refused"), "{refused}");
+        assert!(internal.load().unwrap().cleans.is_empty());
+        assert!(
+            fs::symlink_metadata(&admission)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink is untouched"
+        );
+        fs::remove_file(&admission).unwrap();
+        // Non-vacuity: with the symlink gone the lock is genuinely absent, and
+        // absence is a retry that creates nothing.
+        match internal.begin_clean_barrier(
+            Path::new("/checkout"),
+            &mut WaitAccounting::default(),
+            || Ok(()),
+        ) {
+            Ok(Cleaning::Retry(reason)) => assert!(reason.contains("admission lock"), "{reason}"),
+            _ => panic!("an absent admission lock is a retry"),
+        }
+        assert!(!admission.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The guarded order (design §4.1 step 3): the caller's revalidation runs    /// The guarded order (design §4.1 step 3): the caller's revalidation runs
     /// before any mark, and its refusal is returned unchanged with nothing
     /// allocated. The shipped `Recovering` mode never consults it.
     #[test]
