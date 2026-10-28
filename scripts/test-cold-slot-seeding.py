@@ -142,7 +142,9 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
 8. Temporary storage: the child env points every temp variable at the
    supervisor's scratch; the private pool is the reviewed internal-placement
    exception. The image backing is inside that same scratch and is removed only
-   after a completed ordinary detach.
+   after a completed ordinary detach. The competing-lease helper's library build
+   has its own retained stage under the proof root, seeded from this HEAD's
+   Cargo.lock and removed only after the helper linked.
 9. macOS `mktemp`: `fixture_dir()` always passes a template under the
    supervisor scratch and verifies the real path.
 
@@ -643,8 +645,14 @@ def git_fixture(
     }
 
 
-def seed_registry_homes(proof: Proof) -> None:
-    """One private offline CARGO_HOME from the shared bounded seeder."""
+def seed_registry_homes(proof: Proof, repo: str) -> None:
+    """One private offline CARGO_HOME from the shared bounded seeder.
+
+    Besides the tiny fixture locks, this HEAD's own Cargo.lock is seeded so the
+    helper's private `cargo build --lib` needs no host Cargo home. The shared
+    seeder copies the registry crates and the one pinned Longhorn Git source
+    from the host cache within its own bounds.
+    """
     host = os.environ.get("CARGO_HOME") or os.path.join(real_rustup_home(), "..", ".cargo")
     host = os.path.abspath(host)
     expect(os.path.isdir(host), f"the host CARGO_HOME {host} is absent")
@@ -669,6 +677,14 @@ def seed_registry_homes(proof: Proof) -> None:
             f"{manifest['aggregate_bytes']} bytes",
             flush=True,
         )
+    head_lock = os.path.join(repo, "Cargo.lock")
+    head_bytes = read_bytes(head_lock)
+    manifest = offline_seed.seed_cargo_home(host, proof.cargo_home, head_bytes)
+    print(
+        f"seeded this HEAD's lock: {manifest['packages']} packages, "
+        f"{manifest['aggregate_bytes']} bytes",
+        flush=True,
+    )
     expect(
         os.path.isdir(os.path.join(proof.cargo_home, "registry", "cache")),
         "the private Cargo home has no registry cache",
@@ -746,12 +762,14 @@ def staged_library(stage_root: str) -> tuple[str, str]:
     """The staged `liboxide_storage` rlib and the dependency directory that
     holds it.
 
-    `layout.stage_at` sets `CARGO_BUILD_BUILD_DIR=<stage-root>/build`, so the
-    library's intermediates live under `build/debug/deps`; a plain target
-    directory without a build dir would put them under `target/debug/deps`.
-    Exactly one of those roots may carry the library, and it must carry exactly
-    one rlib: zero or ambiguous matches refuse rather than linking a wrong or
-    partial artifact.
+    The helper builds this stage itself: `layout.stage_at` sets
+    `CARGO_BUILD_BUILD_DIR=<stage-root>/build` and then deletes its entire stage
+    after copying the candidate binary, so no library artifact from it survives.
+    A retained `cargo build --lib` stage therefore places the library under
+    `build/debug/deps`; a plain target directory without a build dir would place
+    it under `target/debug/deps`. Exactly one of those roots may carry the
+    library, and it must carry exactly one rlib: zero or ambiguous matches
+    refuse rather than linking a wrong or partial artifact.
     """
     roots = [
         os.path.join(stage_root, "build", "debug", "deps"),
@@ -776,24 +794,83 @@ def staged_library(stage_root: str) -> tuple[str, str]:
     return deps, rlibs[0]
 
 
-def build_lease_helper(proof: Proof) -> str:
-    """One tiny helper linked against the staged library: a real
-    `managed::lease` competitor, not a forged lock or ledger state."""
-    stage_root = os.path.join(proof.root, "stage-candidate")
+def helper_build_env(proof: Proof, stage_root: str) -> dict:
+    """The private, offline environment for the helper's own library build.
+
+    Same pinned toolchain and frozen flags as the proof's fixtures, with the
+    private HOME and CARGO_HOME (already seeded from the proofs' locks and from
+    this HEAD's Cargo.lock), and both Cargo output directories under the
+    retained stage. Inherited wrappers and Cargo output overrides are removed.
+    """
+    env = dict(os.environ)
+    for name in list(env):
+        if name.startswith(("SCCACHE_", "CARGO_BUILD_", "CARGO_TARGET_")) or name in (
+            "CARGO",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_ENCODED_RUSTFLAGS",
+        ):
+            env.pop(name, None)
+    env.update(
+        {
+            "HOME": proof.home,
+            "CARGO_HOME": proof.cargo_home,
+            "RUSTUP_HOME": proof.rustup,
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TERM_COLOR": "never",
+            "RUSTC_WRAPPER": "",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+            "CARGO_BUILD_RUSTC_WRAPPER": "",
+            "RUSTFLAGS": FROZEN_RUSTFLAGS,
+            "CARGO_TARGET_DIR": os.path.join(stage_root, "target"),
+            "CARGO_BUILD_BUILD_DIR": os.path.join(stage_root, "build"),
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+        }
+    )
+    return env
+
+
+def build_lease_helper(proof: Proof, repo: str) -> str:
+    """One tiny helper linked against a private retained library build: a real
+    `managed::lease` competitor, not a forged lock or ledger state.
+
+    `layout.stage_at` deletes its stage, so this builds the library itself under
+    `<proof.root>/lease-stage` with the pinned offline Cargo and the private
+    Cargo home, links the helper from the one staged rlib, and removes the stage
+    only after that link succeeded. On any failure the stage is kept as
+    evidence and the error propagates.
+    """
+    stage_root = os.path.join(proof.root, "lease-stage")
+    os.makedirs(stage_root, mode=0o700)
+    env = helper_build_env(proof, stage_root)
+    build = proof.run(
+        [
+            "cargo",
+            "build",
+            "--lib",
+            "--locked",
+            "--offline",
+            "--jobs",
+            "4",
+            "--message-format=json-render-diagnostics",
+        ],
+        cwd=repo,
+        env=env,
+        timeout=200,
+    )
+    print(build.stderr.decode(errors="replace")[-4000:], flush=True)
+    expect(build.returncode == 0, f"the helper library build exited {build.returncode}")
     deps, rlib = staged_library(stage_root)
     root = os.path.join(proof.root, "lease-helper")
-    os.makedirs(root)
+    os.makedirs(root, mode=0o700)
     source = os.path.join(root, "main.rs")
     with open(source, "w", encoding="utf-8") as handle:
         handle.write(LEASE_HELPER)
     binary = os.path.join(root, "competing-lease")
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": proof.home,
-        "RUSTUP_HOME": proof.rustup,
-        "RUSTUP_TOOLCHAIN": BUILDER,
-        "RUSTUP_AUTO_INSTALL": "0",
-    }
     result = proof.run(
         [
             "rustc",
@@ -807,13 +884,21 @@ def build_lease_helper(proof: Proof) -> str:
             binary,
             source,
         ],
-        env=env,
+        env=helper_build_env(proof, stage_root),
         timeout=120,
     )
     expect(
         result.returncode == 0,
         f"the competing-lease helper did not build: {result.stderr[-1500:]!r}",
     )
+    expect(
+        os.path.isfile(binary) and not os.path.islink(binary),
+        f"the competing-lease binary is missing at {binary}",
+    )
+    # Linking consumed the staged artifact: the helper is a standalone binary.
+    # Remove the retained stage only now, after that positive child closure.
+    shutil.rmtree(stage_root)
+    print(f"built the competing-lease helper from {rlib}", flush=True)
     return binary
 
 
@@ -828,8 +913,11 @@ def setup(proof: Proof, repo: str) -> None:
     proof.phase("start")
     proof.binary = layout.stage_at(proof, repo, "candidate", jobs=4)
     print(f"staged candidate {proof.binary}", flush=True)
-    proof.lease_helper = build_lease_helper(proof)
-    seed_registry_homes(proof)
+    # layout.stage_at deletes its whole stage after copying this binary, so
+    # nothing below may rely on a staged artifact; the helper builds its own
+    # retained library stage after the private Cargo home is seeded.
+    seed_registry_homes(proof, repo)
+    proof.lease_helper = build_lease_helper(proof, repo)
     inner = git_fixture(proof.root, "innerrepo", {"README.md": "inner\n"})
     proof.repositories = {
         "seedctl": git_fixture(proof.root, "seedrepo", {
@@ -2428,6 +2516,56 @@ def self_test() -> None:
             pass
         else:
             fail("two staged rlibs in one root did not refuse")
+
+        # Counterfactual: layout.stage_at deletes its whole stage after copying
+        # the candidate binary, so a locator that only looked there would find
+        # nothing. Model that deletion and require the refusal.
+        deleted_layout = os.path.join(base, "stage-deleted")
+        rlib(os.path.join(deleted_layout, "build", "debug", "deps"))
+        shutil.rmtree(deleted_layout)
+        try:
+            staged_library(deleted_layout)
+        except RuntimeError:
+            pass
+        else:
+            fail("a deleted stage_at layout did not refuse")
+
+        # The retained-stage lifecycle: locate the artifact, link from it, and
+        # only then remove the stage; the helper output survives the removal.
+        lease_stage = os.path.join(base, "lease-stage")
+        created = os.path.join(lease_stage, "build", "debug", "deps")
+        rlib(created)
+        deps_root, artifact = staged_library(lease_stage)
+        expect(
+            os.path.realpath(deps_root).startswith(os.path.realpath(lease_stage) + os.sep),
+            "the retained deps root is not inside the helper stage",
+        )
+        helper_out = os.path.join(base, "competing-lease")
+        with open(helper_out, "wb") as handle:
+            handle.write(b"synthetic helper\n")
+        shutil.rmtree(lease_stage)
+        expect(os.path.isfile(helper_out), "the helper output did not survive stage removal")
+        expect(not os.path.exists(artifact), "the staged rlib was not consumed by the removed stage")
+
+        # The helper's environment puts both Cargo outputs under its retained
+        # stage and uses the private offline home and pinned toolchain.
+        fake = types.SimpleNamespace(
+            home=os.path.join(base, "fake-home"),
+            cargo_home=os.path.join(base, "fake-cargo"),
+            rustup=os.path.join(base, "fake-rustup"),
+        )
+        env = helper_build_env(fake, lease_stage)
+        expect(
+            env["CARGO_TARGET_DIR"] == os.path.join(lease_stage, "target")
+            and env["CARGO_BUILD_BUILD_DIR"] == os.path.join(lease_stage, "build")
+            and env["CARGO_HOME"] == fake.cargo_home
+            and env["HOME"] == fake.home
+            and env["RUSTUP_TOOLCHAIN"] == BUILDER
+            and env["CARGO_NET_OFFLINE"] == "true"
+            and env["RUSTFLAGS"] == FROZEN_RUSTFLAGS
+            and "CARGO_ENCODED_RUSTFLAGS" not in env,
+            f"the helper build environment drifted: {env}",
+        )
 
         # The receipt builder, on a fake collection.
         collection = perm.Collection()
