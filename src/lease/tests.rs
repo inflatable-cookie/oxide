@@ -4151,11 +4151,10 @@ fn a_refused_eviction_after_the_root_capture_recovers_on_the_next_open() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
-/// A captured private name that vanishes during the live run is never success:
-/// the drain stops, the recorded capture is retained, and the next pool open
-/// stays pending instead of declaring completion.
+/// A vanished captured file stops the live run; replay can conclude its
+/// recorded removal inside the verified private root.
 #[test]
-fn a_captured_private_name_that_vanishes_is_pending_and_never_completes() {
+fn a_captured_private_file_that_vanishes_completes_on_replay() {
     let fixture = Fixture::new("live-vanish");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "live-vanish");
     let parent = slot_path.parent().expect("slot parent").to_path_buf();
@@ -4177,13 +4176,45 @@ fn a_captured_private_name_that_vanishes_is_pending_and_never_completes() {
     );
 
     let after = status_injected(&pool).expect("status");
-    assert_eq!(
-        after.slots.len(),
-        1,
-        "a vanished capture is never completion"
-    );
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+    assert!(after.slots.is_empty(), "the recorded file is concluded on replay");
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}
+
+/// The incident journal has a root, build/debug/deps captures, and one
+/// unlinked file whose removal has not yet been dropped from the journal.
+#[test]
+fn replay_concludes_an_unlinked_file_in_the_2255_capture_shape() {
+    let fixture = Fixture::new("nested-file-2255");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "nested-file-2255");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let mut directory = parent.join(&plan.private);
+    let mut chain = Vec::new();
+    let mut records = Vec::new();
+    for name in ["build", "debug", "deps", "arrow_schema.rcgu.o"] {
+        let leaf = directory.join(name);
+        if name.ends_with(".o") {
+            fs::write(&leaf, b"fixture").expect("file");
+        } else if !leaf.exists() {
+            fs::create_dir(&leaf).expect("directory");
+        }
+        let held = File::open(&directory).expect("directory descriptor");
+        let original = std::ffi::CString::new(name).expect("name");
+        let capture = crate::owned_delete::capture_entry(held.as_fd(), &original).expect("capture");
+        let facts = crate::owned_delete::observe_entry(held.as_fd(), &capture.private).expect("facts");
+        let private = String::from_utf8(capture.private.as_bytes().to_vec()).expect("private name");
+        records.push(crate::owned_delete::CaptureRecord {
+            path: chain.clone(), private: private.clone(), original: name.to_owned(),
+            device: facts.device, inode: facts.inode, mode: facts.mode as u32,
+        });
+        directory.push(&private);
+        chain.push(private);
+    }
+    fs::remove_file(&directory).expect("modelled unlink");
+    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+    let after = status_injected(&pool).expect("replay");
+    assert!(after.slots.is_empty());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
 /// A recorded nested capture whose put-back collides (a racer took its observed
@@ -4313,7 +4344,7 @@ fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
     let captured = parent.join(&plan.private);
     // A search-only nested directory, captured, holding one captured child.
     fs::create_dir(captured.join("nested")).expect("nested directory");
-    fs::write(captured.join("nested").join("inner"), b"x").expect("inner");
+    fs::create_dir(captured.join("nested").join("inner")).expect("inner");
     let held = File::open(&captured).expect("captured root descriptor");
     let nested = std::ffi::CString::new("nested").expect("name");
     let outer = crate::owned_delete::capture_entry(held.as_fd(), &nested).expect("nested capture");
@@ -4347,7 +4378,7 @@ fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
     ];
     // The descendant vanishes, so the rollback cannot resolve it, and the owner
     // left the ancestor search-only.
-    fs::remove_file(nested_dir.join(child.private.to_string_lossy().as_ref()))
+    fs::remove_dir(nested_dir.join(child.private.to_string_lossy().as_ref()))
         .expect("descendant removed");
     write_journal(&pool, slot_id, plan, true, records, Vec::new());
     // The owner left the ancestor search-only, so the replay has to widen it

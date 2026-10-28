@@ -2670,15 +2670,26 @@ impl Pool {
                 // resolved through that name.
                 let private = std::ffi::CString::new(journal.root.private.as_str())
                     .map_err(|_| LeaseError::UnknownAccounting)?;
-                if rollback_captures(parent.as_fd(), &private, &journal).is_err() {
-                    return Ok(CaptureDisposition::Blocked);
+                let root_facts = crate::owned_delete::observe_entry(parent.as_fd(), &private)
+                    .map_err(io_error)?;
+                let private_root = root_facts.uid == current_uid()
+                    && root_facts.mode & 0o077 == 0
+                    && journal.root.mode & 0o077 == 0;
+                let concluded = match rollback_captures(parent.as_fd(), &private, &journal, private_root) {
+                    Ok(concluded) => concluded,
+                    Err(_) => return Ok(CaptureDisposition::Blocked),
+                };
+                if !concluded.is_empty() {
+                    let mut updated = journal.clone();
+                    updated.captures.retain(|record| !concluded.contains(record));
+                    self.record_slot_capture(id, Some(updated)).map_err(LeaseError::Io)?;
                 }
                 if restore_root_capture(parent.as_fd(), &name, &journal.root).is_err() {
                     return Ok(CaptureDisposition::Blocked);
                 }
             }
             RootCaptureState::Original => {
-                if rollback_captures(parent.as_fd(), &name, &journal).is_err() {
+                if rollback_captures(parent.as_fd(), &name, &journal, false).is_err() {
                     return Ok(CaptureDisposition::Blocked);
                 }
             }
@@ -3156,7 +3167,8 @@ fn rollback_captures(
     parent: BorrowedFd<'_>,
     root_name: &std::ffi::CStr,
     journal: &DeletionJournal,
-) -> Result<(), String> {
+    private_root: bool,
+) -> Result<Vec<CaptureRecord>, String> {
     // The captured root may carry the owner's search-only mode. One descriptor,
     // opened without following a link and verified against the record, carries
     // both the rollback and the mode restoration, so a rebound name can never
@@ -3168,6 +3180,7 @@ fn rollback_captures(
         journal.root.inode,
         journal.root.mode,
     )?;
+    let mut concluded = Vec::new();
     let outcome = (|| {
         verify_step_name(
             parent,
@@ -3177,7 +3190,7 @@ fn rollback_captures(
             "the held tree root is not the recorded root",
         )?;
         let mut resolved = 0;
-        restore_captures_in(root.as_fd(), &[], &journal.captures, &mut resolved)?;
+        restore_captures_in(root.as_fd(), &[], &journal.captures, &mut resolved, private_root, &mut concluded)?;
         if resolved != journal.captures.len() {
             // A record the walk could not locate is a representation this replay
             // cannot resolve: fail closed rather than completing past it.
@@ -3190,7 +3203,8 @@ fn rollback_captures(
     })();
     // The root stays under its private name here (its put-back is later), so its
     // recorded mode is restored now, and on any error before this point too.
-    outcome.and(widened.restore())
+    outcome.and(widened.restore())?;
+    Ok(concluded)
 }
 
 fn restore_captures_in(
@@ -3198,6 +3212,8 @@ fn restore_captures_in(
     chain: &[String],
     records: &[CaptureRecord],
     resolved: &mut usize,
+    private_root: bool,
+    concluded: &mut Vec<CaptureRecord>,
 ) -> Result<(), String> {
     let here: Vec<&CaptureRecord> = records
         .iter()
@@ -3239,7 +3255,7 @@ fn restore_captures_in(
                 // is read through the held descriptor; a rebind stops the step
                 // without modifying the replacement.
                 verify_recorded(base, &original, record)?;
-                restore_captures_in(step.as_fd(), &inner, records, resolved)
+                restore_captures_in(step.as_fd(), &inner, records, resolved, private_root, concluded)
             })();
             match stepped {
                 Ok(()) => {
@@ -3270,7 +3286,7 @@ fn restore_captures_in(
         let stepped = (|| {
             let mut inner = chain.to_vec();
             inner.push(record.private.clone());
-            restore_captures_in(step.as_fd(), &inner, records, resolved)?;
+            restore_captures_in(step.as_fd(), &inner, records, resolved, private_root, concluded)?;
             restore_recorded(base, record)?;
             Ok(())
         })();
@@ -3287,6 +3303,26 @@ fn restore_captures_in(
         }
     }
     for record in here.iter().filter(|record| !record.is_directory()) {
+        // A journaled regular file may have been unlinked just before its
+        // record was dropped. Only the verified private root and its verified
+        // ancestor chain give this absence that meaning; errors other than
+        // NotFound, links, and names in a restored root remain uncertain.
+        let absent = |name: &str| -> Result<bool, String> {
+            match crate::owned_delete::observe_entry(base, &recorded_name(name)?) {
+                Ok(_) => Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(format!("a recorded capture cannot be inspected ({error})")),
+            }
+        };
+        if private_root
+            && recorded_type(record) == libc::S_IFREG
+            && absent(&record.private)?
+            && absent(&record.original)?
+        {
+            concluded.push((*record).clone());
+            *resolved += 1;
+            continue;
+        }
         restore_recorded(base, record)?;
         *resolved += 1;
     }
