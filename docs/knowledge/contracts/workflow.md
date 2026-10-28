@@ -18,9 +18,9 @@ state the target design.
 ## Cold-slot seeding
 
 Cold-slot seeding is implemented in the unpublished `oxide` (`oxide#167`,
-`oxide#168`, `oxide#169`) and enabled by default once this slice's one-line
-qualification flip lands; `OXIDE_COLD_SEED=0` is the opt-out and the variable
-was never a permanent switch. A fresh slot of a supported command is warmed once,
+`oxide#168`, `oxide#169`) and **enabled by default**: this slice's one-line
+qualification flip is in the merge head. `OXIDE_COLD_SEED=0` is the opt-out;
+the variable was never a permanent switch. A fresh slot of a supported command is warmed once,
 before any child exists, by cloning matching dependency units from an idle
 donor slot on the same pool under the existing journaled custody: the donor
 record lock and pool lock are held, every artifact, `.d` and fingerprint file
@@ -54,8 +54,9 @@ uncounted diagnostic, one counted author native and one separately activated
 independent reviewer native are owner-activated at the exact head, and the
 [tier is ELEVATED](../vision.md#validation-policy) because a post-clone
 abandon retains an untrusted generation that the ordinary journaled eviction
-later deletes and one case writes removable media. Until those natives pass at
-the merge head the default flip is not merged. The
+later deletes and one case writes removable media. The merge stays held until
+those natives pass at the exact merge head, because the default-on front door
+is product behaviour and not only proof input. The
 [cold-slot seeding contract](cold-slot-seeding.md) owns the transaction, its
 partial-association limit and the proof plan.
 

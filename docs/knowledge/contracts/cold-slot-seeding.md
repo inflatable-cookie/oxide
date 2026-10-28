@@ -5,10 +5,10 @@ oxide#168 and oxide#169.** This document was the design deliverable of
 oxide#137 under the ROOT design-first rebind (standing decision `8ddaa98d`).
 The frozen protocol is implemented: the library custody calls, the front door
 transaction, the debug-only proof controls and the 24-case proof script exist
-at the heads built by those tasks. The default-on flip is the last commit and
-merges only after the owner-activated uncounted diagnostic, one counted author
-native and one separately activated independent reviewer native pass at the
-exact merge head. No live pool, installation, consumer adoption or real-drive
+at the heads built by those tasks. The default-on flip (`COLD_SEED_QUALIFIED`)
+is the slice's last commit; the merge is held until the owner-activated
+uncounted diagnostic, one counted author native and one separately activated
+independent reviewer native pass at the exact merge head. No live pool, installation, consumer adoption or real-drive
 qualification is authorized by this record.
 
 **Revision 13** applies Supervisor A2′ at head `c022dc6` (review comment

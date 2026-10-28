@@ -259,9 +259,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   refuses and retains an untrusted generation for the existing journaled
   eviction, and a seeded recipient never publishes a donor catalog.
   The [design](contracts/cold-slot-seeding.md) owns the protocol and
-  `effigy rust:cold-slot-seeding` its 24-case proof; the default flip merges
-  only after the owner-activated uncounted diagnostic, one counted author
-  native and one independent reviewer native pass at the exact head.
+  `effigy rust:cold-slot-seeding` its 24-case proof. It is enabled by default
+  (`OXIDE_COLD_SEED=0` opts out); the merge is held until the owner-activated
+  uncounted diagnostic, one counted author native and one independent reviewer
+  native pass at the exact head.
 - **Implemented, native held** (Tom, 2026-10-25): recorded per-slot accounting
   replaces whole-payload admission walks. Closed-slot records are bound to
   generation/incarnation; missing or invalid records require bounded slot

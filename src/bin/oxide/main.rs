@@ -366,7 +366,7 @@ fn test_pause_with(point: &str, detail: &str) {
 /// The pinned Cargo layout is qualified (oxide#169). The one-line flip of this
 /// constant is the enablement: seeding is on by default once it is true, and
 /// `OXIDE_COLD_SEED=0` is the opt-out.
-const COLD_SEED_QUALIFIED: bool = false;
+const COLD_SEED_QUALIFIED: bool = true;
 
 fn cold_seed_active(value: Option<&std::ffi::OsStr>) -> bool {
     cold_seed_active_when(COLD_SEED_QUALIFIED, value)
