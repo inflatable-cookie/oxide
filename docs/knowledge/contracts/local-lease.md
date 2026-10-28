@@ -569,14 +569,14 @@ covers the deletion journal (oxide#155), which is the other durable state a
 slot record can hold: an `Evicting` slot may carry a `DeletionJournal` with up
 to 96 outstanding capture records and 32 mismatched captures, each with a chain
 of up to 64 capture names (47 bytes each) and an observed original name of up
-to `NAME_MAX` 255 bytes, escaped sixfold. At most two such journals are
-reachable: an eviction is one `retire_idle_slot` inside one admission and a
-failed deletion aborts that admission's eviction loop; every open reconciles
-all `Evicting` records before admitting anything, so a journal that cannot
-finish sets `reconciliation_blocked` and every lease is refused until it does
-(one that can finish is removed); and a removable pool's single lost-slot
-eviction before its loop aborts can add at most one more. The measured
-two-journal worst-valid ledger is 5,227,058 bytes, and the 8 MiB cap still
+to `NAME_MAX` 255 bytes, escaped sixfold. At most **one** such journal is
+reachable: `retire_idle_slot` is the only path that starts a deletion, and it
+refuses while reconciliation is blocked or any journal is outstanding, so that
+guard covers every entry point including the explicit `evict_idle_slot` that
+does not pass through `lease()`; every open reconciles all `Evicting` records
+before admitting anything, and a journal that cannot finish keeps the pool
+blocked until it does (one that can finish is removed). The measured
+one-journal worst-valid ledger is 4,597,762 bytes, and the 8 MiB cap still
 covers six maximal journals, so even an unexpected co-occurrence is
 representable; a hand-crafted ledger beyond the cap refuses rather than
 truncating. Control state is bounded
@@ -612,8 +612,14 @@ which reads control state rather than the ledger, so the same admission that
 can first add the 129th slot also makes a forward-only **version-7** control
 fence durable first (`oxide.slots/256`): an older binary with version ≤ 6 then
 hands off to a receipt-matching successor instead of refusing a ledger this
-one is about to fence, and a pool below the ceiling keeps version 5, which an
-older binary still reads directly. A completed legacy `Evicting`
+one is about to fence. The same fence has a second, size-based trigger at the
+mutating-command gate: the predecessor binary reads at most 2 MiB, and one
+command can add at most one journal plus a full record refresh plus one row,
+which `MAX_LEDGER_GROWTH` (1 MiB) bounds. A ledger at or above 1 MiB therefore
+makes the version-7 fence durable before its next write, so a journaled ledger
+that stays below 128 slots cannot pass the older binary's read limit while
+still at version 5. A pool below both triggers keeps version 5, which an older
+binary still reads directly. A completed legacy `Evicting`
 reconciliation may still finish in the legacy representation. Before a revised write, every
 stored field is validated against the raised caps; an oversized legacy field
 refuses with the original file, ownership and quarantine bytes untouched,
@@ -685,10 +691,10 @@ its own, so the runner owns closure on any fault. With every slot's record
 current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The worst-valid
-ledger/control serialization — including the reachable two-journal
-`Evicting` state, 5,227,058 bytes against the 8 MiB cap — escaped round-trip
+ledger/control serialization — including the reachable one-journal
+`Evicting` state, 4,597,762 bytes against the 8 MiB cap — escaped round-trip
 and oversized-field refusals are unit tests in `effigy test rust`, as is a
-fixed 500 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
+fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
 trip with a journal (bounded read via the passive snapshot, ranked ordering,
 the actual atomic write and its read-back; the ceiling is generous for the
 included `fsync`, which is host I/O), reporting both measured figures. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and

@@ -2558,9 +2558,11 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
 }
 
 /// The reachable worst valid ledger (oxide#177): the raised-ceiling
-/// representation at 256 slots with every field at its cap, where the two
-/// slots a pool can durably leave `Evicting` carry maximal deletion journals.
-/// Its measured bytes are what `MAX_LEDGER_BYTES` is derived from.
+/// representation at 256 slots with every field at its cap, where the one slot
+/// a pool can durably leave `Evicting` carries a maximal deletion journal. The
+/// library refuses a second deletion while a journal is outstanding, so one is
+/// the reachable maximum; the 8 MiB cap also covers several more. Its measured
+/// bytes are what `MAX_LEDGER_BYTES` is derived from.
 #[test]
 fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-journal-ledger");
@@ -2597,12 +2599,12 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
                 "at_ms": u64::MAX,
             },
         });
-        if index < 2 {
+        if index == 0 {
             // A recorded deletion holds no size observation and may carry the
-            // journal; two is the reachable worst (see `MAX_LEDGER_BYTES`).
+            // journal; one is the reachable worst (see `MAX_LEDGER_BYTES`).
             slot["state"] = serde_json::json!("evicting");
             slot.as_object_mut().expect("object").remove("recorded");
-            slot["capture"] = maximal_journal_json(index);
+            slot["capture"] = maximal_journal_json(0);
         }
         slots.push(slot);
     }
@@ -2629,15 +2631,13 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
         "the journaled fixture did not reach the journal's cost: {}",
         stored.len()
     );
-    // The two journals really round-tripped, not just their slot rows.
-    for id in [u64::MAX - 1, u64::MAX - 2] {
-        let journal = super::pool::capture_record_injected(&pool, id)
-            .unwrap_or_else(|| panic!("the journal of slot {id} did not survive"));
-        assert_eq!(journal.captures.len(), 96);
-        assert_eq!(journal.foreign.len(), 32);
-        assert_eq!(journal.captures[0].path.len(), 64);
-        assert_eq!(journal.captures[0].original.chars().count(), 255);
-    }
+    // The journal really round-tripped, not just its slot row.
+    let journal = super::pool::capture_record_injected(&pool, u64::MAX - 1)
+        .expect("the journal did not survive");
+    assert_eq!(journal.captures.len(), 96);
+    assert_eq!(journal.foreign.len(), 32);
+    assert_eq!(journal.captures[0].path.len(), 64);
+    assert_eq!(journal.captures[0].original.chars().count(), 255);
     println!(
         "worst valid 256-slot journaled ledger: {} bytes of the {MAX_LEDGER_BYTES}-byte cap",
         stored.len()
@@ -2645,7 +2645,7 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     // A passive snapshot reads the journals without reconciling them.
     let snapshot = super::pool::snapshot_injected(&pool).expect("the journaled ledger reads");
     assert_eq!(snapshot.slots.len(), super::MAX_SLOTS);
-    assert_eq!(snapshot.evicting_slot_ids.len(), 2);
+    assert_eq!(snapshot.evicting_slot_ids.len(), 1);
 }
 
 /// A journaled deletion that cannot be classified keeps the pool blocked:
@@ -2690,6 +2690,69 @@ fn a_blocked_journaled_deletion_refuses_every_new_lease() {
     // The journaled record is retained: no second deletion was started.
     let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
     assert_eq!(snapshot.evicting_slot_ids.len(), 1);
+}
+
+/// The single-journal guard covers the explicit eviction path too, which does
+/// not pass through `lease()`'s blocked-reconciliation refusal: a second
+/// `evict_idle_slot` refuses while the blocked journal is retained, so no
+/// second journal can accumulate.
+#[test]
+fn a_blocked_journaled_deletion_refuses_a_second_explicit_eviction() {
+    let fixture = Fixture::new("blocked-second-eviction");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first =
+        lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a")).expect("a");
+    let second =
+        lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")).expect("b");
+    release_injected(&pool, &first.lease_id).expect("release a");
+    release_injected(&pool, &second.lease_id).expect("release b");
+    let first_id: u64 = first.slot_id.parse().expect("slot id");
+    let second_id: u64 = second.slot_id.parse().expect("slot id");
+    let first_path = pool.join("payload/slots").join(&first.slot_id);
+    let second_path = pool.join("payload/slots").join(&second.slot_id);
+
+    // Block the first deletion: its recorded root is gone and neither its
+    // original nor its planned private name holds it, so replay cannot
+    // classify it.
+    super::pool::mark_evicting_for_test(&pool, first_id).expect("recorded deletion");
+    fs::remove_dir_all(&first_path).expect("the recorded root is absent");
+    super::pool::write_capture_record_injected(
+        &pool,
+        first_id,
+        super::pool::DeletionJournal {
+            root: crate::owned_delete::RootCapturePlan {
+                private: format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, 11),
+                phase: crate::owned_delete::RootCapturePhase::Planned,
+                device: 1,
+                inode: 2,
+                parent_device: 1,
+                parent_inode: 3,
+                mode: 0o040700,
+            },
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("journal");
+
+    // The explicit eviction path must refuse while that journal is pending.
+    let outcome = super::pool::evict_idle_slot_injected(&pool, &second_id.to_string());
+    assert!(
+        matches!(outcome, Err(LeaseError::UnknownAccounting)),
+        "a second explicit eviction started while a journal was outstanding: {outcome:?}"
+    );
+
+    // Both records and the journal survive: nothing was deleted or resolved.
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(snapshot.evicting_slot_ids, vec![first.slot_id.clone()]);
+    assert!(snapshot
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == second.slot_id && slot.state == SlotOccupancy::Idle));
+    assert!(second_path.is_dir(), "the second slot was touched");
+    assert!(super::pool::capture_record_injected(&pool, first_id).is_some());
 }
 
 /// oxide#177's accounting-cost gate as one fixed measurement: one whole round

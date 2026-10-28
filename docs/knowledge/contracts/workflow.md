@@ -3928,9 +3928,12 @@ Rules:
   inventory, the evicted slot is never walked, a release walks only its own
   slot, and default `status` at 256 walks nothing; it also crosses the legacy
   128-slot ceiling natively and requires `capacity_policy: 3` plus the
-  version-7 `oxide.slots/256` control fence in the same admission. Worst-valid
-  ledger/control serialization — including the reachable two-journal
-  `Evicting` state — round-trip and oversized-field refusals are unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
+  version-7 `oxide.slots/256` control fence in the same admission; the same
+  gate writes that fence once the ledger reaches 1 MiB, so a journaled ledger
+  below 128 slots cannot exceed the predecessor's 2 MiB read limit at version
+  5. Worst-valid ledger/control serialization — including the reachable
+  one-journal `Evicting` state — round-trip and oversized-field refusals are
+  unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
   and limits with `--diagnostic` (uncounted, keep-going, a bounded
   `qualified: false` receipt, aborting on an unknown outcome or unclosed
   proof child), and `effigy proof:slot-headroom:test` is its pure

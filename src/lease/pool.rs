@@ -764,6 +764,24 @@ pub mod managed {
         Pool::open(pool)?.ledger_view()
     }
 
+    /// The ledger file's current byte length, read from no-follow metadata
+    /// without parsing it, or `None` when the pool has no ledger yet. The
+    /// front door uses it for the forward control fence: an older installed
+    /// binary reads at most its own 2 MiB ledger limit, so the newer binary
+    /// must make the raised-ceiling control fence durable before a write can
+    /// push this file past that limit (oxide#177).
+    pub fn ledger_file_bytes(pool: &Path) -> Result<Option<u64>, LeaseError> {
+        match std::fs::symlink_metadata(pool.join(LEDGER_NAME)) {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.len())),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(LeaseError::UnsafePath("ledger is a symlink"))
+            }
+            Ok(_) => Err(LeaseError::UnknownAccounting),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+
     /// Recorded identity and ledger membership of a pool, read with no lock,
     /// no reconciliation, no creation and no write (oxide#128). A directory
     /// pool's recorded payload root must still be the private, owner-only
@@ -2566,6 +2584,18 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
+        // One durable deletion journal at a time (oxide#177). An eviction is
+        // the only path that starts a journal, and this check covers every
+        // entry point, including the explicit `evict_idle_slot` that does not
+        // pass through `lease()`'s blocked-reconciliation refusal: a second
+        // deletion would interleave two journals and grow the ledger past its
+        // derived bound. The pending record and its journal are kept, and a
+        // later open retries reconciliation.
+        if self.reconciliation_blocked
+            || self.ledger.slots.iter().any(|slot| slot.capture.is_some())
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
         // Every durable idle deletion, including the explicit
         // `evict_idle_slot` path, checks the rank sequence before its first
         // transition: an exhausted or missing-headroom sequence refuses

@@ -113,6 +113,17 @@ pub(crate) const ONE_USE_FENCE: &str = "oxide.one-use/1";
 /// [`State::slot_ceiling`]. A document carrying it is always at
 /// [`STATE_VERSION`], and a version-7 document always carries it.
 pub(crate) const SLOT_CEILING_FENCE: &str = "oxide.slots/256";
+/// The ledger byte limit an older installed binary reads: its own
+/// `MAX_LEDGER_BYTES` at the legacy 2 MiB ceiling (oxide#177).
+const PREDECESSOR_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
+/// The largest amount one mutating command can add to the ledger before the
+/// next admission gate: one maximal deletion journal (about 640 KB by the
+/// library's capture bounds), a full refresh of up to 256 closed size records
+/// (about 256 KB) and one slot row (about 16 KB). 1 MiB is a conservative
+/// ceiling for that sum, so a ledger at or above
+/// `PREDECESSOR_LEDGER_BYTES - MAX_LEDGER_GROWTH` (1 MiB) must make the
+/// version-7 control fence durable before its next write.
+const MAX_LEDGER_GROWTH: u64 = 1024 * 1024;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
 const MAX_IDENTITY_BYTES: usize = 64;
@@ -5098,12 +5109,43 @@ impl Store {
     /// ledger's `capacity_policy: 2` is unreadable to it. The write is one-time
     /// per pool; a read-only command never takes this gate and so never writes.
     /// The one-use fence is a second, later step taken only when a
-    /// class-bearing record is written, and the raised-ceiling fence is the
-    /// per-admission step in `attempt` once the ledger can hold 129 slots.
+    /// class-bearing record is written. The raised-ceiling fence has two
+    /// triggers: `attempt` writes it once the ledger can hold 129 slots
+    /// (`capacity_policy: 3`), and this gate writes it whenever the ledger is
+    /// already large enough that one more command could push it past the
+    /// predecessor's 2 MiB read limit, including a journal write.
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
         self.fence_recorded_accounting()?;
+        self.fence_ledger_for_predecessor_read()?;
         Ok(lock)
+    }
+
+    /// Make the version-7 raised-ceiling fence durable before a command that
+    /// can enlarge the ledger past the older binary's read limit (oxide#177).
+    ///
+    /// The older installed binary reads at most 2 MiB, so a pool that stays
+    /// below 128 slots can still hold a valid journaled ledger it could not
+    /// read — and a ledger-only refusal is not the hand-off this contract
+    /// promises. One command adds at most one journal (the library refuses a
+    /// second while one is outstanding), a full record refresh and one row;
+    /// `MAX_LEDGER_GROWTH` bounds that sum, so a ledger at or above the
+    /// threshold here cannot cross 2 MiB without this fence. The fence is
+    /// forward-only, so its version survives every later `save`.
+    fn fence_ledger_for_predecessor_read(&self) -> Result<(), String> {
+        let bytes = oxide_storage::lease::managed::ledger_file_bytes(&self.pool)
+            .map_err(|error| lease_error("cannot read the pool ledger", &error))?;
+        let Some(bytes) = bytes else {
+            return Ok(());
+        };
+        if bytes < PREDECESSOR_LEDGER_BYTES - MAX_LEDGER_GROWTH {
+            return Ok(());
+        }
+        let mut state = self.load()?;
+        if !Self::mark_slot_ceiling(&mut state) {
+            return Ok(());
+        }
+        self.save(&state)
     }
 
     /// Make the version-7 raised-ceiling fence durable (oxide#177) before any
@@ -5119,13 +5161,20 @@ impl Store {
     /// 5, which an older binary still reads. The fence is forward-only, so its
     /// version survives every later `save`.
     fn fence_raised_slot_ceiling(&self, state: &mut State, slots: usize) -> Result<(), String> {
-        if slots < oxide_storage::lease::LEGACY_MAX_SLOTS
-            || state.slot_ceiling.as_deref() == Some(SLOT_CEILING_FENCE)
-        {
+        if slots < oxide_storage::lease::LEGACY_MAX_SLOTS || !Self::mark_slot_ceiling(state) {
             return Ok(());
         }
-        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
         self.save(state)
+    }
+
+    /// Mark the caller's in-memory state with the raised-ceiling fence.
+    /// Returns whether it changed, so a caller saves once.
+    fn mark_slot_ceiling(state: &mut State) -> bool {
+        if state.slot_ceiling.as_deref() == Some(SLOT_CEILING_FENCE) {
+            return false;
+        }
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        true
     }
 
     /// Make the version-5 recorded-accounting fence durable. Nothing is
@@ -10009,6 +10058,72 @@ pub(crate) mod tests {
         let again = store.load().unwrap();
         assert_eq!(again.version, STATE_VERSION);
         assert_eq!(again.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The predecessor binary reads at most 2 MiB. A pool below 128 slots
+    /// whose ledger is already within one command's growth of that limit makes
+    /// the version-7 control fence durable at the admission gate, before any
+    /// write can push it past the older binary's read limit (including a
+    /// journal write); a small pool keeps version 5.
+    #[test]
+    fn a_ledger_within_growth_of_the_predecessor_limit_fences_before_a_mutation() {
+        let (root, store, _key) = class_fixture("predecessor-fence");
+        // A fresh small ledger stays at the recorded-accounting version.
+        store.admission().unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.version, RECORDED_ACCOUNTING_STATE_VERSION);
+        assert!(state.slot_ceiling.is_none());
+
+        // A valid ledger within one command's growth of the predecessor's
+        // 2 MiB read limit, built from worst-valid rows.
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.pool.join("config.json")).unwrap()).unwrap();
+        let path = format!("/{}", "\u{1}".repeat(1023));
+        let holder = "\u{1}".repeat(128);
+        let lease_id = "\u{1}".repeat(160);
+        let mut slots = Vec::new();
+        for id in 1..=90_u64 {
+            let id_text = id.to_string();
+            let leaf = format!("{}-{id_text}", "b".repeat(80 - id_text.len() - 1));
+            slots.push(serde_json::json!({
+                "id": id,
+                "incarnation": id,
+                "state": "idle",
+                "project": path,
+                "workspace": path,
+                "profile": "dev",
+                "holder": holder,
+                "lease_id": null,
+                "last_lease_id": lease_id,
+                "dir": format!("{}/{leaf}", "a".repeat(80)),
+                "rank": id,
+            }));
+        }
+        let ledger = serde_json::json!({
+            "version": 1,
+            "store_id": config["store_id"],
+            "cap_bytes": config["cap_bytes"],
+            "next_slot": 91,
+            "next_lease": 1_000,
+            "capacity_policy": 2,
+            "next_rank": 91,
+            "slots": slots,
+        });
+        let bytes = serde_json::to_vec(&ledger).unwrap();
+        assert!(
+            bytes.len() as u64 >= PREDECESSOR_LEDGER_BYTES - MAX_LEDGER_GROWTH,
+            "the fixture ledger is only {} bytes",
+            bytes.len()
+        );
+        fs::write(store.pool.join("ledger.json"), &bytes).unwrap();
+        println!("predecessor-limit fixture ledger: {} bytes", bytes.len());
+
+        // The next mutation gate fences before any write can grow it further.
+        store.admission().unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
         fs::remove_dir_all(root).unwrap();
     }
 
