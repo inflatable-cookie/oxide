@@ -817,8 +817,9 @@ pub fn sigpipe_ignored() -> bool {
 /// commands keep the existing blocking call except at the admission gate,
 /// whose per-attempt wait is bounded even without a user budget.
 pub fn lock(file: &std::fs::File, what: &str) -> Result<(), String> {
-    let admission_lock_limit =
-        (what == "admission").then(|| Instant::now() + Duration::from_secs(5));
+    let admission_lock_limit = what
+        .ends_with("admission")
+        .then(|| Instant::now() + Duration::from_secs(5));
     if admission_deadline().is_none() && admission_lock_limit.is_none() {
         return crate::store::flock_blocking(file);
     }
