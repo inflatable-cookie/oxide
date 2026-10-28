@@ -10479,6 +10479,36 @@ pub(crate) mod tests {
             "a held record lock was evictable"
         );
         drop(held_probe);
+        let member = &state.records[index];
+        let slot = slots
+            .iter()
+            .find(|slot| slot.slot_id == pair.slot_id && slot.incarnation == pair.incarnation)
+            .expect("member remains in the ledger");
+        assert_eq!(
+            slot.project,
+            store.affinity_dir(member.id),
+            "member mapping"
+        );
+        assert!(idle_member_record(member), "member record is not idle");
+        match probe_lock(&path, false) {
+            Ok(Probe::Free(probe)) => drop(probe),
+            Ok(Probe::Held) => panic!("member lock remains held after dropping the probe"),
+            Ok(Probe::Missing) => panic!("member lock is missing after dropping the probe"),
+            Err(error) => panic!("member lock probe failed after dropping the probe: {error}"),
+        }
+        assert!(
+            !store.other_record_active(&state, member, 0, boot_session()),
+            "another record has active or unclosed writers"
+        );
+        assert!(
+            slot.state == SlotOccupancy::Idle && slot.lease_id.is_none(),
+            "ledger slot is occupied or leased"
+        );
+        let checkout = member.checkout.as_deref().expect("member checkout missing");
+        assert!(
+            !state.cleans.iter().any(|clean| clean.checkout == checkout),
+            "member checkout has a clean mark"
+        );
         assert_eq!(
             store.evictable_members(&state, &slots, &membership.members, 0),
             vec![pair.clone()]
