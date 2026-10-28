@@ -167,8 +167,10 @@ provenance.
   host record removes only the leaf this invocation just created and refuses
   (`scratch-record-unwritable`). A later **leased** open with a present volume
   and a matching on-volume binding but no host record writes that record once
-  (bounded, atomic) and proceeds; `status` never repairs and never writes, so a
-  pool whose record is missing still reports as a scratch pool without a UUID.
+  (bounded, atomic) and proceeds; `status` never repairs and never writes, and
+  only the record makes a scratch fact, so a pool whose record is missing has
+  **no scratch line at all** until a leased open writes the record (see
+  "Read-only status").
 - **Re-verified.** Every later **leased** open (`check`, `build`, `test`,
   `run`, `exec`, `clean`, recovery) requires all of: the declaration names the
   recorded root; the recorded mount point still binds through
@@ -314,7 +316,7 @@ each script's own selector text and case bodies.
 
 | Selector(s) | Premise today |
 | --- | --- |
-| `rust:installed-handoff` (#122) | two cases create a real directory pool |
+| `rust:installed-handoff` (#122) | two cases create a real directory pool; needs the diagnostic apparatus authored first (S4) |
 | `rust:profile-outputs` (#133) + `:diagnostic` | 20 private directory-budget fixture pools |
 | `rust:pool-temp-scratch` (#136) + `:diagnostic` | directory-budget pool plus one owned image; no boot-Data premise |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
@@ -470,9 +472,10 @@ does not change. So each migration is a proof-authoring change:
   for the changed fixture environment (private `HOME`/`CARGO_HOME`, the
   `OXIDE_`/`XDG_`/`CARGO_*`/`GIT_` scrub, the declaration and cap, `mktemp`-only
   fixture roots, the image custody where one exists);
-- the required **uncounted keep-going diagnostic** (`:diagnostic` twin, all ten
-  have one) before any counted native, as an uncounted collection that never
-  becomes a PASS;
+- the required **uncounted keep-going diagnostic** before any counted native,
+  as an uncounted collection that never becomes a PASS. Nine of the ten already
+  have a `:diagnostic` twin; `rust:installed-handoff` has **none**, so its
+  sub-slice must author it first (below);
 - the **counted author native at the migrated head**, then one distinct
   **independent reviewer native at that exact head**, because every migrated
   child now writes a pool on removable media (the ELEVATED trigger), in
@@ -483,35 +486,52 @@ does not change. So each migration is a proof-authoring change:
 
 The ten sub-slices and the three keeps are listed in "Migration list". Each
 selector keeps **its own** wall clock and scratch budget; there is no uniform
-figure:
+figure, and the columns below are read from the selectors and scripts as they
+stand at this head:
 
-| Selector | Limit / scratch | Pure check available |
-| --- | --- | --- |
-| `rust:installed-handoff` | 120 s / 64 MiB | none; `scripts/test_dogfood_scripts.py` `HandoffSelectorTests` pins its root, limits and body and must change with it |
-| `rust:profile-outputs` (+ diag) | 600 s / 512 MiB | none; `--plan` only |
-| `rust:pool-temp-scratch` (+ diag) | 300 s / 512 MiB | `proof:pool-temp:test` |
-| `rust:recorded-slot-accounting` (+ diag) | 300 s / 512 MiB | `proof:recorded-slot-accounting:test` |
-| `rust:exec-output-inference` (+ diag) | 300 s / 512 MiB | `proof:exec-inference:test` |
-| `rust:auto-adopt-ineligible` (+ diag) | 300 s / 512 MiB | none; `--plan` only (shared #117 fixture) |
-| `rust:prune-authority` (+ diag) | 300 s / 512 MiB | `proof:prune-authority:test` |
-| `rust:oxide-removable-boot-closure` (+ diag) | 300 s / 512 MiB | `rust:oxide-removable-boot-closure:test` |
-| `rust:finder-metadata-race` (+ diag) | 420 s / 512 MiB | `rust:finder-metadata-race:test` |
-| `rust:command-budgets` (+ diag) | 300 s / 512 MiB | `proof:command-budgets:test` |
+| Selector | Limit / scratch | `:diagnostic` twin | Effect-free pre-native check |
+| --- | --- | --- | --- |
+| `rust:installed-handoff` | 120 s / 64 MiB | **none — authored in this sub-slice** | none in the script; only `scripts/test_dogfood_scripts.py` `HandoffSelectorTests` pins its root, limits and body |
+| `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
+| `rust:pool-temp-scratch` | 300 s / 512 MiB | yes | `proof:pool-temp:test`, `--plan` |
+| `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes | `proof:recorded-slot-accounting:test`, `--plan` |
+| `rust:exec-output-inference` | 300 s / 512 MiB | yes | `proof:exec-inference:test`, `--plan` |
+| `rust:auto-adopt-ineligible` | 300 s / 512 MiB | yes | `--plan` (shared #117 fixture, no distinct pure selector) |
+| `rust:prune-authority` | 300 s / 512 MiB | yes | `proof:prune-authority:test` (`--self-check`) |
+| `rust:oxide-removable-boot-closure` | 300 s / 512 MiB | yes | `rust:oxide-removable-boot-closure:test` (`--self-check`) |
+| `rust:finder-metadata-race` | 420 s / 512 MiB | yes | `rust:finder-metadata-race:test`, `--plan` |
+| `rust:command-budgets` | 300 s / 512 MiB | yes | `proof:command-budgets:test`, `--plan` |
 
-Each sub-slice's effect-free checks are `effigy docs:check`, that proof's pure
-check from the table (which pins the new environment contract), and
-`effigy dogfood:scripts:test` (its `HandoffSelectorTests` pins
-`rust:installed-handoff`'s root, limits and body, so it changes in the same
-commit). Where no pure check exists (`installed-handoff`, `profile-outputs`,
-`auto-adopt-ineligible`) the sub-slice adds no new selector and does not invent
-one: that proof's effect-free `--plan` is the only pre-native check, and the
-diagnostic plus the two natives are unchanged in requirement.
+Every sub-slice follows the same six-step path, in this order, and each step's
+result is committed before the next: (1) the script derives
+`OXIDE_SCRATCH_ROOT` from its own `OXIDE_TASK_SCRATCH_ROOT` run root and sets an
+explicit cap; (2) its effect-free pin from the table is updated to assert the
+new environment contract (a pure check where one exists, otherwise `--plan` and
+the dogfood selector pin); (3) `effigy docs:check` plus that proof's effect-free
+check pass; (4) the uncounted diagnostic runs at the new head; (5) the counted
+author native runs; (6) an independent reviewer native runs at that exact head.
+Nothing is carried over between steps: a failing or missing step stops that
+sub-slice, and the design stays valid because every not-yet-migrated proof keeps
+`bd357a4c`.
 
-Cost, stated rather than hidden: ten diagnostics and twenty natives (author and
-reviewer), each at its own budget, sequenced by the owner; the migration is not
-a mechanical selector edit and no previously-passed native is recounted as if it
-were. A proof whose counted native has never passed simply takes its first run
-under the new recipe with the same requirements.
+`rust:installed-handoff` is the one sub-slice that must author apparatus before
+it can migrate: the script has no `--diagnostic`, no `--self-check` and no
+`--plan`. Its bounded path is (a) add a `--diagnostic` keep-going collection
+with a bounded `qualified: false` receipt beside the guard's, (b) add a
+`--self-check` that pins the diagnostic dispatch and the fixture environment
+with no child, pool, Cargo or install, (c) add the two selectors
+`rust:installed-handoff:diagnostic` and `proof:installed-handoff:test` at the
+same guard, 120 s and 64 MiB, and update `HandoffSelectorTests`, then (d) the
+six steps above. If the owner declines that apparatus work, installed-handoff
+stays on `--root-parent /private/tmp` under `bd357a4c`: the migration list is a
+candidate list, and a smaller migration is a legitimate outcome.
+
+Cost, stated rather than hidden: nine existing diagnostics plus one authored
+one, and twenty natives (author and reviewer), each at its own budget,
+sequenced by the owner; the migration is not a mechanical selector edit and no
+previously-passed native is recounted as if it were. A proof whose counted
+native has never passed simply takes its first run under the new recipe with the
+same requirements.
 
 **S5 — record the retirement (optional, docs-only). STANDARD.** Amend the
 `bd357a4c` paragraph to the keep list and, if the owner retires the exception
