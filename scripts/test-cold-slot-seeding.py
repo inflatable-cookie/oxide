@@ -982,7 +982,9 @@ def prime_git_databases(proof: Proof, repositories: dict[str, dict]) -> None:
     print("primed Cargo's Git databases with one local file:// fetch", flush=True)
 
 
-LEASE_HELPER = r'''use oxide_storage::lease::{managed, LeaseRequest, Profile};
+LEASE_HELPER = r'''use oxide_storage::lease::{
+    managed, AdmissionClass, LeaseRequest, Profile, VictimPolicy,
+};
 use std::path::PathBuf;
 
 fn main() {
@@ -1001,6 +1003,12 @@ fn main() {
         reserve_bytes: None,
         layout: None,
         replace_slot: None,
+        // The merged one-use admission adds these fields. A competing
+        // command is an ordinary dormant-normal admission: it must never
+        // take the one-use path or supply a member slice.
+        class: AdmissionClass::Normal,
+        victims: VictimPolicy::Any,
+        slice: None,
     })
     .expect("competing lease");
     println!("LEASE={}", grant.lease_id);
@@ -3232,6 +3240,17 @@ def self_test() -> None:
         flags = {"CARGO_ENCODED_RUSTFLAGS": "x"}
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
+
+        # The competing-lease helper is compiled only natively, so keep the
+        # one-use integration's three new fields visible to the pure check:
+        # a dormant normal admission, with no member slice.
+        expect(
+            "AdmissionClass, LeaseRequest" in LEASE_HELPER
+            and "class: AdmissionClass::Normal" in LEASE_HELPER
+            and "victims: VictimPolicy::Any" in LEASE_HELPER
+            and "slice: None" in LEASE_HELPER,
+            "the competing-lease helper no longer constructs a dormant normal admission",
+        )
 
         # The registered removable pool's own seed sidecars live under
         # <pool>/oxide-managed/removable/oxide-managed/seeds, never the
