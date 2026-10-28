@@ -2287,7 +2287,47 @@ impl Pool {
     /// stays unmeasured keeps today's refusal: its figure is never zero and
     /// never free space.
     fn recorded_total(&mut self) -> Result<u64, LeaseError> {
-        let mut total = self.pool_scope().require_complete()?;
+        let scope = self.pool_scope();
+        let mut total = match scope.require_complete() {
+            Ok(total) => total,
+            Err(original) => {
+                // A journal-less pending root has no recorded identity, so a
+                // failed walk cannot distinguish its old bytes from an
+                // arbitrary replacement. Reserve the entire budget rather
+                // than presenting that uncertainty as global accounting.
+                // This second scope is only a refusal diagnostic: its
+                // unverified stops can never authorize an admission or delete.
+                let pending: Vec<&SlotRecord> = self
+                    .ledger
+                    .slots
+                    .iter()
+                    .filter(|slot| {
+                        slot.state == SlotPersistState::Evicting && slot.capture.is_none()
+                    })
+                    .collect();
+                if !pending.is_empty() {
+                    if pending.iter().any(|slot| self.slot_root(slot.id).is_err()) {
+                        return Err(LeaseError::Full);
+                    }
+                    if let Ok(mut stops) = self.scope_stops() {
+                        for slot in pending {
+                            stops.push(self.slot_relative(slot)?);
+                        }
+                        if scope_sizes_with(
+                            self.backing.payload_root(),
+                            &stops,
+                            self.pressure_limits(),
+                        )
+                        .require_complete()
+                        .is_ok()
+                        {
+                            return Err(LeaseError::Full);
+                        }
+                    }
+                }
+                return Err(original);
+            }
+        };
         let mut pending: Vec<(u64, RecordedSize)> = Vec::new();
         for index in 0..self.ledger.slots.len() {
             let figure = self.slot_figure(index, &mut pending)?;

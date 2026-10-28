@@ -4360,6 +4360,55 @@ fn blocked_eviction_charge_prevents_over_budget_admission() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
 }
 
+/// A pending root without a capture journal cannot be distinguished from a
+/// replacement when its contents are unreadable. It consumes the budget,
+/// while an independent unreadable subtree remains an accounting error.
+#[test]
+fn an_unjournaled_inaccessible_eviction_is_a_conservative_refusal() {
+    for unrelated in [false, true] {
+        let fixture = Fixture::new(if unrelated {
+            "pending-other-gap"
+        } else {
+            "pending-gap"
+        });
+        let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+        mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+        // The non-private root is refused before a capture journal is made.
+        // The inventory hook supplies a deterministic unreadable subtree even
+        // on volumes whose mount ignores ordinary owner permissions.
+        fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o755))
+            .expect("non-private slot");
+        let blocked = slot_path.join("blocked");
+        fs::create_dir(&blocked).expect("blocked directory");
+        let mut faults = vec![serde_json::json!({
+            "path": blocked, "action": "permission_denied_before_read_dir"
+        })];
+        if unrelated {
+            let other = pool.join("payload/slots/unrelated");
+            fs::create_dir(&other).expect("unrelated directory");
+            faults.push(serde_json::json!({
+                "path": other, "action": "permission_denied_before_read_dir"
+            }));
+        }
+        let project = fixture.dir("other-project");
+        let workspace = fixture.dir("other-workspace");
+        let result = crate::inventory::walk_observer::with_mutations(
+            fixture.path(),
+            serde_json::Value::Array(faults).to_string(),
+            || lease_injected(request(&pool, &project, &workspace, "other")),
+        );
+        if unrelated {
+            assert!(
+                matches!(result, Err(LeaseError::AccountingIncomplete(_))),
+                "{result:?}"
+            );
+        } else {
+            assert!(matches!(result, Err(LeaseError::Full)), "{result:?}");
+        }
+        assert!(slot_path.is_dir(), "pending root was removed");
+    }
+}
+
 /// A replacement at the recorded name is outside the verified private root;
 /// its bytes remain in the pool-scope walk and cannot be hidden by the charge.
 #[test]

@@ -3873,7 +3873,12 @@ Rules:
   records without one consume the whole admission budget, a conservative
   decision bound rather than a claim about actual bytes. On the removable
   pool's bounded-scan reserve route, pending charges that alone reach the
-  budget still refuse admission. The scope walk stops
+  budget still refuse admission. If an unjournaled pending root cannot be
+  measured, its identity and replacement bytes are unknown: a second read-only
+  scope check may exclude it only to refuse `Full` at the whole-budget bound;
+  it never authorizes allocation or deletion. If the pending root's own metadata
+  cannot be read, the same whole-budget refusal applies; otherwise an independent
+  incomplete scope remains an accounting error. The scope walk stops
   at the journaled private root only when its recorded identity verifies.
   Status names pending slot IDs, and the read-only drive description names them
   in its pending-reconciliation detail. Other independently owned bytes still

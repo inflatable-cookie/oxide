@@ -939,8 +939,21 @@ def old_counterfactual(oxide: str, old_oxide: str, root: str) -> str:
     # different fixture-owned object occupying the observed name.
     os.rename(victim, private_root)
     os.mkdir(victim, 0o700)
-    if not any(os.path.basename(p) == "foreign.txt" for p in tree_files(private_root)):
-        fail(f"{case}: the raced foreign entry did not survive")
+    replacement = os.lstat(victim)
+
+    def require_same_roots():
+        private = os.lstat(private_root)
+        current = os.lstat(victim)
+        if (not stat.S_ISDIR(private.st_mode) or private.st_uid != os.getuid()
+                or private.st_mode & 0o077
+                or (private.st_dev, private.st_ino) != (root_stat.st_dev, root_stat.st_ino)
+                or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != (replacement.st_dev, replacement.st_ino)):
+            fail(f"{case}: the captured root or replacement identity changed")
+        if not any(os.path.basename(p) == "foreign.txt" for p in tree_files(private_root)):
+            fail(f"{case}: the raced foreign entry did not survive")
+
+    require_same_roots()
     checkout = workspace(env, base, "c")
     roomy = dict(env)
     roomy["OXIDE_TEST_BUDGET_BYTES"] = str(64 * MIB)
@@ -950,8 +963,7 @@ def old_counterfactual(oxide: str, old_oxide: str, root: str) -> str:
     with open(ledger_path, encoding="utf-8") as handle:
         blocked = json.load(handle)
     upgraded = upgraded_counterfactual_ledger(blocked, slot_id, closed)
-    if not os.path.isdir(private_root) or not os.path.isdir(victim):
-        fail(f"{case}: the old refusal changed the blocked tree or replacement")
+    require_same_roots()
     # The old format deliberately clears an Evicting size. Restore the exact
     # preceding idle observation under the new version fence; no payload,
     # captured journal, or requested command changes between the two runs.
@@ -965,9 +977,7 @@ def old_counterfactual(oxide: str, old_oxide: str, root: str) -> str:
     current = run([oxide, "check"], cwd=checkout, env=roomy)
     if current.returncode:
         fail(f"{case}: candidate refused the same admission: {current.stderr[-1500:]}")
-    if (not os.path.isdir(private_root) or not os.path.isdir(victim)
-            or not any(os.path.basename(p) == "foreign.txt" for p in tree_files(private_root))):
-        fail(f"{case}: candidate consumed the blocked tree, replacement or foreign entry")
+    require_same_roots()
     return f"{case}: old {BASE_COMMIT} refused unknown_accounting; candidate admitted with blocked tree kept"
 
 
