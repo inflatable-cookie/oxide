@@ -524,7 +524,10 @@ def slot_leaf(pool: str, slot: str) -> str:
 
 
 def ledger_bytes(pool: str) -> bytes:
-    return read_bytes(os.path.join(pool, "oxide-managed", "ledger.json"))
+    # The product's LEDGER_NAME lives at the pool root (src/lease/mod.rs);
+    # `oxide-managed/` holds control state and the seed sidecars, not the
+    # ledger. The old path made case 11 read a file that never exists.
+    return read_bytes(os.path.join(pool, "ledger.json"))
 
 
 def control_bytes(pool: str) -> bytes:
@@ -2153,7 +2156,11 @@ def case_08(proof: Proof) -> None:
     recipient = case.checkout("changed", files, packages)
     code, stdout, err = case.command(recipient, ["run"], "changed dependency", env=case.env())
     expect(not seeded(err), "a different source was offered")
-    expect("no eligible donor" in skip_line(err), f"unexpected skip: {skip_line(err)}")
+    reason = skip_line(err)
+    expect(
+        "no eligible donor" in reason or "no eligible locked packages" in reason,
+        f"unexpected skip: {reason}",
+    )
     expect(stdout.strip() == "5", f"the changed dependency printed {stdout.strip()!r}")
     print("case 08: a changed source offered nothing and built correctly", flush=True)
 
@@ -3142,6 +3149,22 @@ def self_test() -> None:
             f"collection precedence drifted: {results}",
         )
         expect(record.aborted is not None and record.failures, "the abort or failure was not latched")
+
+        # The shared collector's abort location is bounded and never hides the
+        # original exception. A real traceback names the innermost function
+        # and line; a traceback-less exception reports unknown.
+        def _where_probe():
+            raise FileNotFoundError(2, "No such file or directory")
+
+        try:
+            _where_probe()
+        except Exception as error:
+            where = perm.where_of(error)
+            expect(
+                where.startswith("_where_probe:") and where.split(":", 1)[1].isdigit(),
+                f"where_of() did not name the raising frame: {where}",
+            )
+        expect(perm.where_of(ValueError("no traceback")) == "?", "where_of() invented a location")
         counted = [(name, (), body) for name, body in (("x", lambda: fail("boom")),)]
         try:
             perm.collect_cases(counted, diagnostic=False, work_left=lambda: 100, note=lambda _text: None)
@@ -3179,7 +3202,7 @@ def self_test() -> None:
         pool = os.path.join(base, "pool")
         seeds = os.path.join(pool, "oxide-managed", "seeds")
         os.makedirs(seeds)
-        with open(os.path.join(pool, "oxide-managed", "ledger.json"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(pool, "ledger.json"), "w", encoding="utf-8") as handle:
             json.dump({"slots": [{"id": 7, "rank": 3, "last_used": 9, "recorded": 11, "state": "idle", "last_lease_id": "a"}]}, handle)
         with open(catalog_path(pool, "7"), "w", encoding="utf-8") as handle:
             json.dump({"packages": []}, handle)

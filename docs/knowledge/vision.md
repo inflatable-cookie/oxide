@@ -251,21 +251,12 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).
-- **Implemented, native held: cold-slot seeding** (oxide#169, 2026-10-27):
-  a fresh slot is warmed once from matching dependency units of an idle donor
-  on the same volume, with Cargo still judging freshness, under the donor
-  record lock and one admission lifetime. Internal and removable pools both
-  seed; a pre-write fault skips to the ordinary cold build, a post-write fault
-  refuses and retains an untrusted generation for the existing journaled
-  eviction, and a seeded recipient never publishes a donor catalog.
-  The [design](contracts/cold-slot-seeding.md) owns the protocol and
-  `effigy rust:cold-slot-seeding` its 24-case proof at the operator-approved
-  480 s bound for this selector and its diagnostic twin. v1 offers only plain
-  registry library compile units; proc macros, build-script units, Git sources
-  and outside-root/`OUT_DIR` inputs are negative controls and build cold. It is
-  enabled by default (`OXIDE_COLD_SEED=0` opts out); the merge is held until
-  the owner-activated uncounted diagnostic, one counted author native and one
-  independent reviewer native pass at the exact head.
+- **Implemented, native held: cold-slot seeding** (oxide#169): a fresh slot
+  is warmed once from matching plain registry library compile units of an idle
+  donor on the same volume, removable pools included, with Cargo still judging
+  freshness; default-on, with natives held. The
+  [design](contracts/cold-slot-seeding.md) owns the protocol and
+  `effigy rust:cold-slot-seeding` its 24-case proof.
 - **Implemented, native held** (Tom, 2026-10-25): recorded per-slot accounting
   replaces whole-payload admission walks. Closed-slot records are bound to
   generation/incarnation; missing or invalid records require bounded slot
