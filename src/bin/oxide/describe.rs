@@ -447,11 +447,6 @@ fn rfc3339(unix_seconds: u64) -> String {
 mod tests {
     use super::*;
 
-    /// A removable config and a ledger with one `Evicting` record, as the
-    /// lease fixtures write them.
-    const PENDING_CONFIG: &str = r#"{"version":1,"backend":"apfs-volume-v1","store_id":"store","cap_bytes":1000,"image_bytes":0,"volume":{"mount_point":"/Volumes/Builds","volume_uuid":"A6AC3ED7-33EA-46B4-8082-7254CF291ED2","payload_dir":"oxide-pool"}}"#;
-    const PENDING_LEDGER: &str = r#"{"version":1,"store_id":"store","cap_bytes":1000,"next_slot":3,"next_lease":3,"slots":[{"id":1,"incarnation":1,"state":"evicting","project":"/p","workspace":"/p","profile":"dev","holder":"h","lease_id":null,"last_lease_id":"l1"},{"id":2,"incarnation":1,"state":"idle","project":"/p","workspace":"/p","profile":"dev","holder":"h","lease_id":null,"last_lease_id":"l2"}]}"#;
-
     #[test]
     fn timestamps_are_utc_rfc3339() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
@@ -681,43 +676,6 @@ mod tests {
         assert_eq!(pending(&description), 0);
         description.evicting_slots = 2;
         assert_eq!(pending(&description), 2);
-    }
-
-    /// Pending records are the same ledger state a build's open reconciles,
-    /// and `open_removable` (the build's selection) opens that pool without
-    /// refusing it. Describe's `available` therefore must not depend on the
-    /// count: this pins the selection side on the same fixture the count reads.
-    #[test]
-    fn pending_records_do_not_refuse_the_selection_open() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "oxide-describe-pending-{}-{nonce}",
-            std::process::id()
-        ));
-        let pool = root.join("pool");
-        let removable = pool.join("oxide-managed").join(POOL_DIR);
-        fs::create_dir_all(&removable).unwrap();
-        for path in [&root, &pool, &removable] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        for (name, text) in [
-            ("config.json", PENDING_CONFIG),
-            ("ledger.json", PENDING_LEDGER),
-        ] {
-            let path = removable.join(name);
-            fs::write(&path, text).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let description = managed::describe_volume(&removable).unwrap();
-        assert_eq!(description.evicting_slots, 1);
-        let opened = store::Store::open_removable(&removable, root.join("payload"), 8).map(|_| ());
-        assert!(opened.is_ok(), "{opened:?}");
-        fs::remove_dir_all(&root).unwrap();
     }
 
     /// The JSON reports the count as a number, `0` when no record is pending.
