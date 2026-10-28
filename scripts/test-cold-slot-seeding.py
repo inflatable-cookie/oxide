@@ -47,8 +47,9 @@ never taints another premise):
    normally, reruns the script and prints its own path.
 04 The leaf/ambient control: a proc-macro crate with a dependency edge (so it
    is ineligible) reading an inherited environment variable at expansion; two
-   recipient builds under different values both run cold and produce the two
-   different values. Case 02 is the control.
+   recipients share the donor's pool and seed its eligible cfg-if leaf, while
+   the proc macro rebuilds under each value and produces the two different
+   values. The donor catalog offers only cfg-if.
 05 Proc-macro negative control: a Git proc-macro crate is never offered in v1,
    so it builds cold and expands with the recipient's value; a non-leaf
    proc-macro crate is also unoffered and rebuilds. The product regression
@@ -248,7 +249,7 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
     ("01", (), "SQLite/cc/OUT_DIR at real scope: the run unit reruns, libsqlite3-sys recompiles, OUT_DIR and SQLite version are the recipient's"),
     ("02", (), "leaf cfg-if seeds with the literal-name directory and normalized unit; dropping dep-… rebuilds it"),
     ("03", (), "Git/build-script/OUT_DIR seedctl is a negative control: no catalog, no seed, recipient OUT_DIR"),
-    ("04", (), "ambient-reading proc macro has an edge and is ineligible: two cold builds see two values"),
+    ("04", (), "shared-pool recipients seed the donor's eligible leaf while the unoffered ambient proc macro rebuilds with two values"),
     ("05", (), "proc macros are never offered: Git and non-leaf proc macros build cold with the recipient value"),
     ("06", (), "Git/build-script/OUT_DIR seedctl is unoffered; the package lib and build script rerun cold"),
     ("07", (), "a deleted donor leaves the recipient compiling and running (independent inodes)"),
@@ -2017,31 +2018,36 @@ def case_04(proof: Proof) -> None:
     )
     donor_slot = slot_of(err)
     expect(os.path.isfile(catalog_path(case.pool, donor_slot)), "the ambient donor published no catalog")
-    values = []
+    donor_catalog = read_json(catalog_path(case.pool, donor_slot))
+    offered = sorted(package["name"] for package in donor_catalog["packages"])
+    expect(offered == ["cfg-if"], f"the ambient donor offered non-leaf targets or no eligible leaf: {offered}")
     for index, value in enumerate(("first", "second")):
-        other = Case(proof, "04")
-        checkout = other.checkout("checkout", workspace)
+        checkout = case.checkout(f"recipient-{index}", workspace)
         for name, files in (("app", ambient_app), ("ambient", ambient), ("ambient-pm", ambient_pm)):
             write_tree(os.path.join(checkout, name), files)
         with open(os.path.join(checkout, "Cargo.lock"), "w", encoding="utf-8") as handle:
             handle.write(lock_text(packages))
-        code, out, stderr = other.command(
+        code, out, stderr = case.command(
             checkout,
             ["build", "--message-format=json"],
             f"ambient recipient {index}",
-            env=other.env(extra={"SEEDPM_VALUE": value}),
+            env=case.env(extra={"SEEDPM_VALUE": value}),
         )
-        # cfg-if is a leaf and may be offered; the ambient proc macro has an
-        # edge, so it is never offered and must be compiled in the recipient.
+        # The eligible leaf proves the shared-pool donor was considered;
+        # the non-leaf ambient proc macro must still compile in the recipient.
+        expect(seeded(stderr), f"the ambient recipient did not consider its eligible donor: {stderr[-2000:]}")
+        last = last_seed(case.pool)
+        expect(last is not None and str(last.get("donor_slot")) == donor_slot, f"the ambient recipient seeded from a different donor: {last}")
+        expect(artifact_fresh(out, "cfg-if") is True, "the eligible registry leaf was not reused")
         expect(artifact_fresh(out, "ambient-pm") is False, "an ineligible ambient proc macro was offered")
-        code, stdout, stderr = other.command(
+        code, stdout, stderr = case.command(
             checkout,
             ["run"],
             f"ambient recipient {index} run",
-            env=other.env(extra={"SEEDPM_VALUE": value}),
+            env=case.env(extra={"SEEDPM_VALUE": value}),
         )
         expect(stdout.strip() == value, f"the ambient value leaked: {stdout.strip()!r}, wanted {value!r}")
-    print("case 04: both ambient recipients built cold with their own values", flush=True)
+    print("case 04: both recipients reused the eligible donor leaf and compiled the ambient proc macro with their own values", flush=True)
 
 
 def case_05(proof: Proof) -> None:
@@ -2113,15 +2119,15 @@ def case_05(proof: Proof) -> None:
     code, _out, err = other.command(
         donor2, ["build"], "non-leaf donor", env=other.env(extra={"SEEDPM_VALUE": "donor"})
     )
+    donor2_slot = slot_of(err)
+    expect(os.path.isfile(catalog_path(other.pool, donor2_slot)), "the non-leaf donor published no eligible-leaf catalog")
+    donor2_catalog = read_json(catalog_path(other.pool, donor2_slot))
+    offered2 = sorted(package["name"] for package in donor2_catalog["packages"])
+    expect(offered2 == ["cfg-if"], f"the non-leaf donor offered its proc macro or no eligible leaf: {offered2}")
     env2 = other.env(extra={"SEEDPM_VALUE": "nonleaf"})
     code, out2, err = other.command(
         recipient2, ["build", "--message-format=json"], "non-leaf recipient", env=env2
     )
-    donor2_slot = slot_of(err)
-    if os.path.isfile(catalog_path(other.pool, donor2_slot)):
-        donor2_catalog = read_json(catalog_path(other.pool, donor2_slot))
-        offered2 = sorted(package["name"] for package in donor2_catalog["packages"])
-        expect("pmdep" not in offered2, f"the ineligible non-leaf proc macro was offered: {offered2}")
     expect(
         artifact_fresh(out2, "pmdep") is False,
         "the unoffered non-leaf proc macro artifact was reused",
