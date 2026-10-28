@@ -518,11 +518,15 @@ its own approved brief. What the tree now holds:
   active, so **every production command in this slice admits `Normal`**, writes
   neither field and leaves the numeric version where it found it.
 - **Record identity, the project cap and sharing (§5.2-§5.4).** Second-slot
-  matching, the stale-record sweep and `shared_candidate` all compare class, so
-  an existing record of the other class is never reused, relabelled, evicted,
-  shared or released by this command. The eight-slot project cap counts
-  **normal** records and its replacement candidate list holds only normal
-  records; only a **normal** admission enters the cap path, which is the reading
+  matching and `shared_candidate` compare class, so an existing record of the
+  other class is never reused, relabelled, evicted, shared or released by this
+  command. The **stale-record sweep stays class-agnostic**: it is scoped by
+  *key* (checkout plus compatibility), so an idle slotless record of the other
+  class is still a live record of this checkout and keeps its place — a
+  one-use admission takes a distinct record rather than deleting the normal or
+  legacy one, which the next normal command then reuses. The eight-slot project
+  cap counts **normal** records and its replacement candidate list holds only
+  normal records; only a **normal** admission enters the cap path, which is the reading
   in which a temporary clone of the repository does not compete with its normal
   checkouts for that cap, while deleting a one-use slot can never relieve it.
   The wait justification next to that path is class-scoped for the same reason:

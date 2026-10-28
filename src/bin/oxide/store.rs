@@ -4075,10 +4075,19 @@ impl Store {
                 // record of the other class is never reused or relabelled.
                 && record.class == admission.class
         };
+        // The stale sweep is about **this key**, not this class (design §5.2,
+        // §5.7): an idle slotless record of the other class is still a live
+        // record of this checkout and keeps it, so the one-use command takes a
+        // distinct record instead of deleting the normal or legacy one.
+        let same_key = |record: &Record| {
+            record.phase != Phase::Retired
+                && record.checkout.as_deref() == Some(key.checkout.as_path())
+                && record.compatibility == key.compatibility
+        };
         let stale: Vec<u64> = state
             .records
             .iter()
-            .filter(|record| record.phase == Phase::Idle && !has_slot(record) && !matches(record))
+            .filter(|record| record.phase == Phase::Idle && !has_slot(record) && !same_key(record))
             .map(|record| record.id)
             .collect();
         for id in stale {
@@ -9705,7 +9714,7 @@ pub(crate) mod tests {
     /// fenced pool with no class-bearing record, which every reader accepts.
     #[test]
     fn the_one_use_fence_is_written_only_with_a_class_bearing_record() {
-        let (root, store, key) = class_fixture("fence-order");
+        let (root, store, _key) = class_fixture("fence-order");
         // Every real mutating command takes the admission gate first, which
         // makes the recorded-accounting fence durable; a version-6 document
         // carries both fences, so the fixture starts from the same state.
@@ -9916,15 +9925,11 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Legacy records (§5.7): a record written before this feature has no
-    /// class and reads as **protected normal**. Its next one-use command in a
-    /// temporary workspace classifies `one_use`, which differs from the
-    /// record's class, so it takes a distinct record and the legacy record
-    /// keeps its class and its slot under today's rules.
-    #[test]
-    fn a_legacy_record_reads_as_protected_normal() {
-        let (root, store, key) = class_fixture("legacy");
-        // A document written the way every pre-feature binary wrote it.
+    /// A pre-feature control document: one idle record of `key`'s checkout and
+    /// compatibility, written with neither class field, exactly as every binary
+    /// before this feature wrote it. It has no slot yet, and its affinity
+    /// directory exists because a real record always created one.
+    fn write_slotless_legacy_state(store: &Store, key: &SlotKey) {
         let legacy = format!(
             concat!(
                 "{{\"version\":5,\"next_id\":2,\"next_use\":2,\"tickets\":[],\"cleans\":[],",
@@ -9937,15 +9942,78 @@ pub(crate) mod tests {
             ),
             key.checkout.display()
         );
-        write_raw_state(&store, legacy.as_bytes());
-        // A real pre-feature record always owned its affinity directory; the
-        // hand-written document keeps that fact so the record is reusable.
+        write_raw_state(store, legacy.as_bytes());
         fs::create_dir(store.affinity_dir(1)).unwrap();
         fs::set_permissions(
             store.affinity_dir(1),
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
+    }
+
+    /// The stale sweep is class-agnostic (design §5.2, §5.7): an idle slotless
+    /// record of **this** checkout and compatibility is a live record, so a
+    /// one-use admission takes a distinct record instead of forgetting the
+    /// normal or legacy one. The kept record is not junk either: the next
+    /// normal command reuses it and its slot.
+    #[test]
+    fn a_one_use_admission_keeps_a_slotless_legacy_record_of_the_same_key() {
+        let (root, store, key) = class_fixture("slotless-legacy");
+        write_slotless_legacy_state(&store, &key);
+
+        let one_use = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        assert_ne!(one_use.record_id(), 1);
+        store.release(one_use, None).unwrap();
+
+        let state = store.load().unwrap();
+        let legacy = state
+            .records
+            .iter()
+            .find(|record| record.id == 1)
+            .expect("the slotless legacy record was forgotten");
+        assert_eq!(legacy.class, WorkspaceClass::Normal);
+        assert_eq!(legacy.class_reason, None);
+        assert!(
+            store.affinity_dir(1).is_dir(),
+            "the legacy record's affinity directory was removed with the record"
+        );
+
+        // The kept record is still this key's reusable record, so the next
+        // normal command takes it rather than leaving it behind.
+        let normal =
+            lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("normal lease");
+        assert_eq!(normal.record_id(), 1);
+        store.release(normal, None).unwrap();
+        let slots = store.ledger().unwrap().slots;
+        assert_eq!(slots.len(), 2, "each class keeps its own slot");
+        let state = store.load().unwrap();
+        assert_eq!(
+            state
+                .records
+                .iter()
+                .filter(|record| record.id == 1)
+                .map(|record| record.class)
+                .collect::<Vec<_>>(),
+            vec![WorkspaceClass::Normal]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Legacy records (§5.7): a record written before this feature has no
+    /// class and reads as **protected normal**. Its next one-use command in a
+    /// temporary workspace classifies `one_use`, which differs from the
+    /// record's class, so it takes a distinct record and the legacy record
+    /// keeps its class and its slot under today's rules.
+    #[test]
+    fn a_legacy_record_reads_as_protected_normal() {
+        let (root, store, key) = class_fixture("legacy");
+        write_slotless_legacy_state(&store, &key);
         let state = store.load().unwrap();
         assert_eq!(state.records[0].class, WorkspaceClass::Normal);
         assert_eq!(state.records[0].class_reason, None);
