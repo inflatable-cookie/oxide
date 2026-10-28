@@ -133,8 +133,11 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
 5. Cargo external argv: not applicable (no external subcommand fixture).
 6. Owned image: `attach_owned_image()` creates the 128 MiB image and its
    custody record in the supervisor's never-auto-cleaned evidence directory
-   before attach, and `perm.owners_honored()` proves the mounted root does not
-   carry `MNT_IGNORE_OWNERSHIP`. `detach_owned_image()` performs one ordinary
+   before attach, installs the cleanup handle the moment attach succeeds (or
+   a retained handle when attach fails), and only then parses or looks up
+   mount/device facts, so a late fault cannot leave an attached image without
+   a handle. `perm.owners_honored()` proves the mounted root does not carry
+   `MNT_IGNORE_OWNERSHIP`. `detach_owned_image()` performs one ordinary
    detach (never `-force`, never retried) whose window comes from the
    supervisor deadline; its disposition is clean only when detach exited zero,
    the mount is gone and `hdiutil` names neither mount nor backing. The
@@ -1355,9 +1358,14 @@ def bounded_step(seconds: float) -> float:
     return min(seconds, remaining - 10.0)
 
 
-def detach_verdict(exit_code: int, mount_present: bool, names_after: bool) -> str | None:
+def detach_verdict(
+    exit_code: int, mount_present: bool, names_after: bool, info_ok: bool = True
+) -> str | None:
     """None only for a positively completed ordinary detach: exit zero, the
-    mount gone, and `hdiutil` naming neither the mount nor the backing."""
+    mount gone, and `hdiutil info` readable and naming neither mount nor
+    backing. An unreadable info is unknown custody, never a clean detach."""
+    if not info_ok:
+        return "hdiutil info could not be read"
     if exit_code != 0:
         return f"ordinary detach exited {exit_code}"
     if mount_present:
@@ -1367,12 +1375,42 @@ def detach_verdict(exit_code: int, mount_present: bool, names_after: bool) -> st
     return None
 
 
+def owned_image_handle(
+    name: str,
+    mount: str,
+    backing: str,
+    custody: str,
+    *,
+    device: str | None = None,
+    volume_uuid: str | None = None,
+    detached: str | None = None,
+) -> dict:
+    """The cleanup handle installed the moment `hdiutil attach` succeeds (or
+    fails with a retained backing), so no later parse or check can leave an
+    attached image without a handle."""
+    return {
+        "name": name,
+        "mount": mount,
+        "backing": backing,
+        "custody": custody,
+        "device": device,
+        "volume_uuid": volume_uuid,
+        "detached": detached,
+    }
+
+
 def detach_is_clean(disposition: str) -> bool:
     """A clean disposition is a completed ordinary detach or a positively
     verified already-detached state; every retained disposition is not."""
     return disposition.startswith(
         ("ordinary detach completed", "already detached before cleanup")
     )
+
+
+def custody_completed(disposition: str) -> bool:
+    """A run's image custody is complete when it made a clean detach or never
+    attached an image at all. Any retained disposition is not complete."""
+    return disposition == "no owned image was attached" or detach_is_clean(disposition)
 
 
 def detach_timeout(remaining: float) -> float | None:
@@ -1394,17 +1432,23 @@ def owned_image_attachments() -> list[str]:
     """Read-only names of any still-attached `o169-` proof image."""
     mounts: list[str] = []
     mount_list = direct_run(["/sbin/mount"], 20)
-    if mount_list.returncode == 0:
-        mounts.extend(
-            line.split(" on ", 1)[1].split(" ", 1)[0]
-            for line in mount_list.stdout.splitlines()
-            if " on /Volumes/o169-" in line
-        )
+    expect(
+        mount_list.returncode == 0,
+        f"cannot read the mount table: {mount_list.stderr.strip()[:200]}",
+    )
+    mounts.extend(
+        line.split(" on ", 1)[1].split(" ", 1)[0]
+        for line in mount_list.stdout.splitlines()
+        if " on /Volumes/o169-" in line
+    )
     info = direct_run(["/usr/bin/hdiutil", "info"], 20)
-    if info.returncode == 0:
-        mounts.extend(re.findall(r"/Volumes/o169-[^\s]+", info.stdout))
-        # An attached-but-unmounted image still names its backing.
-        mounts.extend(re.findall(r"/\S*o169-\S+\.sparseimage", info.stdout))
+    expect(
+        info.returncode == 0,
+        f"cannot read hdiutil info: {info.stderr.strip()[:200]}",
+    )
+    mounts.extend(re.findall(r"/Volumes/o169-[^\s]+", info.stdout))
+    # An attached-but-unmounted image still names its backing.
+    mounts.extend(re.findall(r"/\S*o169-\S+\.sparseimage", info.stdout))
     return sorted(set(mounts))
 
 
@@ -1480,16 +1524,32 @@ def attach_owned_image(proof: Proof) -> dict:
         ["/usr/bin/hdiutil", "attach", "-owners", "on", "-nobrowse", "-plist", backing],
         bounded_step(120),
     )
-    expect(
-        attached.returncode == 0,
-        f"attach failed; backing retained at {backing}: {attached.stderr!r}",
-    )
+    if attached.returncode != 0:
+        proof.image = owned_image_handle(
+            name,
+            mount,
+            backing,
+            custody,
+            detached=f"retained: attach failed ({attached.stderr.strip()[:200]})",
+        )
+        expect(
+            False,
+            f"attach failed; backing retained at {backing}: {attached.stderr!r}",
+        )
+    # The handle exists before any parsing or verification below can raise.
+    proof.image = owned_image_handle(name, mount, backing, custody)
+    proof.mount = mount
     plist = plistlib.loads(attached.stdout.encode())
     mounts = [
         entity["mount-point"]
         for entity in plist["system-entities"]
         if entity.get("mount-point")
     ]
+    if len(mounts) == 1:
+        # The handle always names what is actually attached, even when the
+        # volume mounted somewhere other than the expected path.
+        proof.image["mount"] = mounts[0]
+        proof.mount = mounts[0]
     expect(len(mounts) == 1 and mounts[0] == mount, f"expected one mount {mount}, got {mounts}")
     device = next(
         (
@@ -1503,16 +1563,8 @@ def attach_owned_image(proof: Proof) -> dict:
     uuid = None
     if info.returncode == 0:
         uuid = plistlib.loads(info.stdout.encode()).get("VolumeUUID")
-    proof.image = {
-        "name": name,
-        "mount": mount,
-        "backing": backing,
-        "custody": custody,
-        "device": device,
-        "volume_uuid": uuid,
-        "detached": None,
-    }
-    proof.mount = mount
+    proof.image["device"] = device
+    proof.image["volume_uuid"] = uuid
     print(f"attached owned image {backing} at {mount}", flush=True)
     return proof.image
 
@@ -1531,6 +1583,9 @@ def detach_owned_image(proof: Proof, *, reason: str) -> str:
         mount = image["mount"]
         if not os.path.ismount(mount):
             info = direct_run(["/usr/bin/hdiutil", "info"], 30)
+            if info.returncode != 0:
+                image["detached"] = f"retained: hdiutil info could not be read ({reason})"
+                return image["detached"]
             if mount in info.stdout or image["backing"] in info.stdout:
                 image["detached"] = f"retained: {mount} is not mounted but hdiutil still names it ({reason})"
                 return image["detached"]
@@ -1547,10 +1602,14 @@ def detach_owned_image(proof: Proof, *, reason: str) -> str:
             return image["detached"]
         result = direct_run(["/usr/bin/hdiutil", "detach", mount], timeout)
         info = direct_run(["/usr/bin/hdiutil", "info"], 30)
+        info_ok = info.returncode == 0
         verdict = detach_verdict(
             result.returncode,
             os.path.ismount(mount),
-            mount in info.stdout or image["backing"] in info.stdout,
+            (mount in info.stdout or image["backing"] in info.stdout)
+            if info_ok
+            else True,
+            info_ok,
         )
         if verdict is not None:
             image["detached"] = f"retained: {verdict} ({reason})"
@@ -2329,7 +2388,11 @@ def case_15(proof: Proof) -> None:
 
 
 def removable_seeds_dir(pool: str) -> str:
-    return os.path.join(pool, "oxide-managed", "pool", "oxide-managed", "seeds")
+    # The registered removable pool root is <internal>/oxide-managed/removable
+    # (removable::POOL_DIR); its own control and seed sidecars are nested there.
+    return os.path.join(
+        pool, "oxide-managed", "removable", "oxide-managed", "seeds"
+    )
 
 
 def case_16(proof: Proof) -> None:
@@ -3054,6 +3117,48 @@ def self_test() -> None:
         freeze_compiler_flags(flags)
         expect("CARGO_ENCODED_RUSTFLAGS" not in flags and flags["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "freeze_compiler_flags() drifted")
 
+        # The registered removable pool's own seed sidecars live under
+        # <pool>/oxide-managed/removable/oxide-managed/seeds, never the
+        # internal pool's own seeds directory.
+        expect(
+            removable_seeds_dir("/pool")
+            == "/pool/oxide-managed/removable/oxide-managed/seeds",
+            f"the removable seed directory drifted: {removable_seeds_dir('/pool')}",
+        )
+
+        # The cleanup handle exists at the moment attach returns: it names the
+        # mount, backing and custody record before any parse or lookup.
+        handle = owned_image_handle(
+            "o169-abcd", "/Volumes/o169-abcd", "/e/backing", "/e/custody"
+        )
+        expect(
+            handle["mount"] == "/Volumes/o169-abcd"
+            and handle["backing"] == "/e/backing"
+            and handle["custody"] == "/e/custody"
+            and handle["detached"] is None,
+            f"the owned-image handle is missing a cleanup field: {handle}",
+        )
+        attach_source = textwrap.dedent(inspect.getsource(attach_owned_image))
+        attach_lines = attach_source.splitlines()
+        handle_lines = [
+            index
+            for index, line in enumerate(attach_lines)
+            if "proof.image = owned_image_handle" in line
+        ]
+        parse_lines = [
+            index
+            for index, line in enumerate(attach_lines)
+            if "plistlib.loads" in line or "diskutil" in line
+        ]
+        expect(
+            handle_lines and parse_lines and handle_lines[0] < parse_lines[0],
+            "the attach cleanup handle is installed after a parse/lookup step",
+        )
+        expect(
+            "retained: attach failed" in attach_source,
+            "a failed attach does not install a retained handle",
+        )
+
         # Detach decisions: only exit zero, a gone mount and no hdiutil naming
         # is a completed ordinary detach; every other verdict is retained.
         expect(detach_verdict(0, False, False) is None, "a clean detach verdict was rejected")
@@ -3061,11 +3166,14 @@ def self_test() -> None:
             ("nonzero exit with the mount gone", detach_verdict(1, False, False)),
             ("mount still present", detach_verdict(0, True, False)),
             ("hdiutil still names the image", detach_verdict(0, False, True)),
+            ("hdiutil info unreadable", detach_verdict(0, False, False, info_ok=False)),
         ):
             expect(verdict is not None, f"a {label} verdict was accepted")
         expect(detach_is_clean("ordinary detach completed (reason); backing removed"), "a completed detach was not clean")
         expect(detach_is_clean("already detached before cleanup (reason); backing removed"), "an already-detached state was not clean")
         expect(not detach_is_clean("retained: ordinary detach exited 1"), "a retained disposition was clean")
+        expect(custody_completed("no owned image was attached"), "an absent image was not complete custody")
+        expect(not custody_completed("retained: attach failed"), "a retained image was complete custody")
 
         # The shared custody gate: any recorded failure, latched abort or
         # unclosed child refuses the detach; only a clean collection allows it.
@@ -3078,6 +3186,31 @@ def self_test() -> None:
         aborted.aborted = "synthetic abort"
         expect(perm.detach_decision(aborted, set()) is not None, "an aborted collection allowed the detach")
         expect(perm.detach_decision(clean, {123}) is not None, "an unclosed child allowed the detach")
+
+        detach_source = textwrap.dedent(inspect.getsource(detach_owned_image))
+        expect(
+            detach_source.count("info.returncode") >= 2,
+            "a detach verification branch does not require hdiutil info to succeed",
+        )
+        expect(
+            "detach_verdict(" in detach_source,
+            "the detach path does not use the shared verdict",
+        )
+
+        retained_handle = types.SimpleNamespace(
+            image={
+                "mount": "/Volumes/o169-synthetic",
+                "backing": os.path.join(base, "synthetic.sparseimage"),
+                "custody": os.path.join(base, "retained.custody.json"),
+                "detached": "retained: attach failed (synthetic)",
+            },
+            unclosed=set(),
+        )
+        expect(
+            finalize_owned_image(retained_handle, clean)
+            == "retained: attach failed (synthetic)",
+            "a retained attach-failure handle was retried",
+        )
 
         # A refused gate retains the image without detaching and records the
         # disposition in custody; a clean already-detached image is kept.
@@ -3660,7 +3793,7 @@ def main(argv: list[str]) -> int:
         collection.detached = finalize_owned_image(proof, collection)
         image = getattr(proof, "image", None)
         collection.mount_present = None if image is None else os.path.ismount(image["mount"])
-        if not detach_is_clean(collection.detached) and collection.aborted is None:
+        if not custody_completed(collection.detached) and collection.aborted is None:
             collection.aborted = f"image custody was not completed: {collection.detached}"[:600]
         if diagnostic:
             try:
@@ -3694,7 +3827,7 @@ def main(argv: list[str]) -> int:
         f"host free minimum {proof.low // MIB} MiB; scratch closure and cleanup are the shared runner's"
     )
     expect(
-        detach_is_clean(collection.detached),
+        custody_completed(collection.detached),
         f"image custody was not completed, so this run cannot pass: {collection.detached}",
     )
     expect(passed == len(CASES), f"only {passed} of {len(CASES)} cases completed")
