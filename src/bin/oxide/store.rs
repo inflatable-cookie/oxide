@@ -1493,6 +1493,22 @@ pub fn admission_budget(settings: &Settings) -> u64 {
     settings.budget
 }
 
+/// A source-verification failure inside the admission lifetime. A failure
+/// before the first clone skips the seed and the command builds cold; only an
+/// unknown Git closure refuses, because its custody is unknown (§6.5, §13).
+pub(crate) enum SourceFailure {
+    Skip(&'static str),
+    Refuse(String),
+}
+
+pub(crate) fn source_failure(reason: &'static str) -> SourceFailure {
+    if reason == "git source verification closure unknown" {
+        SourceFailure::Refuse(reason.to_owned())
+    } else {
+        SourceFailure::Skip(reason)
+    }
+}
+
 /// Outcome of one pre-child seed attempt. An abandoned recipient must be
 /// released untrusted and the command admitted normally again.
 pub(crate) enum SeedRun {
@@ -1537,7 +1553,7 @@ impl Store {
                 .discover_git_hints(cargo_home, &offered)
                 .unwrap_or_default();
             pass.locked(cargo_home, &offered, &git_hints, cache, process::now_ms())
-                .map_err(str::to_owned)
+                .map_err(source_failure)
         })
     }
 
@@ -1675,7 +1691,8 @@ impl Store {
         lock: &crate::seed_lock::Analysis,
         verify_sources: impl FnOnce(
             &[oxide_storage::lease::managed::SeedCandidate],
-        ) -> Result<Vec<crate::seed_plan::VerifiedSource>, String>,
+        )
+            -> Result<Vec<crate::seed_plan::VerifiedSource>, SourceFailure>,
     ) -> Result<SeedRun, String> {
         self.seed_with(
             held,
@@ -1695,7 +1712,8 @@ impl Store {
         lock: &crate::seed_lock::Analysis,
         verify_sources: impl FnOnce(
             &[oxide_storage::lease::managed::SeedCandidate],
-        ) -> Result<Vec<crate::seed_plan::VerifiedSource>, String>,
+        )
+            -> Result<Vec<crate::seed_plan::VerifiedSource>, SourceFailure>,
         transaction: impl FnOnce(
             &Path,
             &oxide_storage::lease::managed::SeedRequest,
@@ -1737,7 +1755,11 @@ impl Store {
         if candidates.candidates.is_empty() {
             return Ok(SeedRun::Skipped("no eligible donor"));
         }
-        let sources = verify_sources(&candidates.candidates)?;
+        let sources = match verify_sources(&candidates.candidates) {
+            Ok(sources) => sources,
+            Err(SourceFailure::Skip(reason)) => return Ok(SeedRun::Skipped(reason)),
+            Err(SourceFailure::Refuse(reason)) => return Err(reason),
+        };
         let Some(request) = crate::seed_plan::select(
             &recipient,
             producer,
@@ -6089,6 +6111,141 @@ pub(crate) mod tests {
         assert!(!store.control.join("seeds").exists());
         store.backend = Backend::DirectoryBudget;
         store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A released donor with a verified catalog that offers cfg-if.
+    fn front_door_donor() -> (
+        PathBuf,
+        Store,
+        SlotKey,
+        crate::seed_lock::Analysis,
+        oxide_storage::lease::managed::SeedProducer,
+    ) {
+        use oxide_storage::lease::managed::{SeedCatalog, SeedSourceKind};
+        let (root, store, donor_key) = seed_fixture();
+        let donor = lease(&store, &donor_key, None).expect("donor lease");
+        let source_root = root.join("source");
+        fs::create_dir_all(source_root.join("src")).unwrap();
+        let input = source_root.join("src/lib.rs");
+        fs::write(&input, "source").unwrap();
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
+        let source = crate::seed_plan::VerifiedSource {
+            package: lock.eligible[0].clone(),
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root,
+            proc_macro: false,
+        };
+        let fingerprint = donor
+            .build_dir
+            .join("debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&fingerprint).unwrap();
+        for name in ["lib-cfg_if", "lib-cfg_if.json", "dep-lib-cfg_if"] {
+            fs::write(fingerprint.join(name), "fingerprint").unwrap();
+        }
+        let deps = donor.build_dir.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let dep = deps.join("cfg_if-aaaaaaaaaaaaaaaa.d");
+        let artifact = deps.join("libcfg_if-aaaaaaaaaaaaaaaa.rmeta");
+        fs::write(&artifact, "artifact").unwrap();
+        fs::write(
+            &dep,
+            format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                dep.display(),
+                input.display(),
+                artifact.display(),
+                input.display(),
+                input.display()
+            ),
+        )
+        .unwrap();
+        let mut producer = seed_test_producer();
+        producer.rustc_digest = "c".repeat(64);
+        producer.context_digest = "d".repeat(64);
+        producer.flags_digest = "e".repeat(64);
+        let origin = Built::Affine(donor_key.checkout.clone());
+        let cache = oxide_storage::seed_source::SourceCache::new(&donor.store_id).unwrap();
+        store
+            .publish_seed_catalog(
+                &donor,
+                producer.clone(),
+                &lock,
+                &[source.clone()],
+                &[source.clone()],
+                SystemTime::now(),
+                process::now_ms(),
+                true,
+                Some(&origin),
+                "debug",
+                &cache,
+            )
+            .unwrap();
+        let catalog_path = store
+            .control
+            .join("seeds")
+            .join(format!("{}.catalog.json", donor.slot_id));
+        let catalog = SeedCatalog::parse(&fs::read(&catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog.packages.len(), 1);
+        assert_eq!(catalog.packages[0].units.len(), 1);
+        assert_eq!(catalog.packages[0].units[0].files.len(), 5);
+        assert!(store.control.join("seeds/sources.json").exists());
+        store.release(donor, Some(origin)).unwrap();
+        (root, store, donor_key, lock, producer)
+    }
+
+    #[test]
+    fn a_source_failure_before_the_first_clone_skips_and_only_unknown_closure_refuses() {
+        assert!(matches!(
+            source_failure("injected source failure"),
+            SourceFailure::Skip("injected source failure")
+        ));
+        assert!(matches!(
+            source_failure("git source verification closure unknown"),
+            SourceFailure::Refuse(reason) if reason == "git source verification closure unknown"
+        ));
+        let (root, store, donor_key, lock, producer) = front_door_donor();
+        let recipient_checkout = root.join("recipient");
+        fs::create_dir(&recipient_checkout).unwrap();
+        let recipient_key = SlotKey {
+            checkout: recipient_checkout,
+            identity: "recipient".into(),
+            compatibility: "quick-key".into(),
+        };
+        let recipient = lease(&store, &recipient_key, None).expect("recipient lease");
+        let before = fs::read(store.control.join("state.json")).unwrap();
+        // A skip before the first clone writes no attempt and changes no state:
+        // the command builds cold in the same empty slot.
+        let skipped = store
+            .seed(&recipient, &producer, &lock, |_| {
+                Err(SourceFailure::Skip("injected source failure"))
+            })
+            .unwrap();
+        assert!(matches!(
+            skipped,
+            SeedRun::Skipped("injected source failure")
+        ));
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        assert!(!store
+            .control
+            .join("seeds")
+            .join(format!("{}.attempt.json", recipient.slot_id))
+            .exists());
+        // Only an unknown Git closure refuses, and it still changes nothing.
+        let refused = store.seed(&recipient, &producer, &lock, |_| {
+            Err(SourceFailure::Refuse(
+                "git source verification closure unknown".into(),
+            ))
+        });
+        assert_eq!(
+            refused.err(),
+            Some("git source verification closure unknown".to_owned())
+        );
+        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
+        store.release(recipient, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

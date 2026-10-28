@@ -2338,6 +2338,49 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
 }
 
 #[test]
+fn publish_refuses_a_catalog_over_its_byte_ceiling_and_writes_nothing() {
+    reset_hooks();
+    let rig = Rig::new("publish-ceiling");
+    let (grant, mut catalog) = held_catalog(&rig, "a");
+    // Package fields are bounded individually and units are optional, so a
+    // full package table validates while its serialized form is over 2 MiB.
+    let long = "v".repeat(500);
+    catalog.packages = (0..SEED_MAX_PACKAGES)
+        .map(|index| SeedPackage {
+            name: format!("p{index:04}-{}", "n".repeat(50)),
+            target: format!("p{index:04}_{}", "n".repeat(50)),
+            version: long.clone(),
+            source: long.clone(),
+            checksum: Some("a".repeat(64)),
+            unique: true,
+            leaf: true,
+            source_root: SeedSourceRoot {
+                kind: SeedSourceKind::Registry,
+                digest: "b".repeat(64),
+            },
+            units: Vec::new(),
+        })
+        .collect();
+    assert!(catalog.validate().is_ok());
+    assert!(catalog.to_bytes().unwrap_err().contains("byte ceiling"));
+    let seeds = rig.pool.join(MANAGED_NAME).join("seeds");
+    let real = seeds.join(format!("{}.catalog.json", grant.slot_id));
+    let ledger = rig.ledger_bytes();
+    let control = fs::read(rig.control().join("state.json")).ok();
+    // The refusal happens before any sidecar directory or file is touched.
+    let refused = publish_seed_catalog(&rig.pool, &catalog);
+    assert!(
+        matches!(refused, Err(LeaseError::InvalidInput(_))),
+        "{refused:?}"
+    );
+    assert!(!real.exists());
+    assert!(!seeds.exists());
+    assert_eq!(rig.ledger_bytes(), ledger);
+    assert_eq!(fs::read(rig.control().join("state.json")).ok(), control);
+    release_injected(&rig.pool, &grant.lease_id).expect("release donor");
+}
+
+#[test]
 fn join_parser_accepts_rustc_shapes_and_refuses_others() {
     reset_hooks();
     let parsed = join::parse(dep_info_text().as_bytes()).expect("parse the fixture");
