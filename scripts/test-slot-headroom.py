@@ -382,6 +382,20 @@ def slot_dirs(pool: str) -> list:
     return sorted(found)
 
 
+def own_slot_walk_root(payload_root: str, slot_id: str, record: dict) -> str:
+    """The exact own-slot walk root for a slot's release, from its ledger row.
+
+    oxide#104's fallback is the legacy flat `slots/<id>` when no project folder
+    is available (`dir` absent or null); a recorded `folder/leaf` is that exact
+    path under `slots/`.
+    """
+    slots_root = os.path.join(payload_root, "slots")
+    directory = record.get("dir")
+    if directory is None:
+        return os.path.join(slots_root, slot_id)
+    return os.path.join(slots_root, *directory.split("/"))
+
+
 def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) -> None:
     stdout, stderr = run(proof, ["exec", "--", sys.executable, "-c", "pass"], "first-grant", app, env)
     ledger_path = os.path.join(pool, "ledger.json")
@@ -608,7 +622,6 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     RESULTS.append({"case": "synthetic-256-ledger", "slots": 256, "status_walks": 0})
 
     payload_root = os.path.realpath(os.path.join(pool, "payload"))
-    slots_prefix = os.path.join(payload_root, "slots") + os.sep
 
     # The 257th admission replaces the rank-LRU idle whole slot: slot 1 has
     # rank 2, the oldest. A debug-profile command has no compatible idle slot.
@@ -639,11 +652,18 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
         all(not root.startswith(os.path.realpath(victim)) for root in added),
         f"the count replacement walked the evicted slot: {added}",
     )
-    expect(
-        len(added) == 1 and added[0].startswith(slots_prefix) and added[0].endswith("-257"),
-        f"the 257th admission/release walked more than its own slot: {added}",
-    )
+    # The sole added walk is the release of slot 257's own root. Derive that
+    # exact root from the slot's own ledger row: the legacy flat `slots/257`
+    # when `dir` is absent (oxide#104's fallback), otherwise the recorded
+    # folder/leaf path.
     after = read_json(ledger_path)
+    own = next((record for record in after["slots"] if record["id"] == 257), None)
+    expect(own is not None, "the 257th slot has no ledger record")
+    expected_walk = own_slot_walk_root(payload_root, "257", own)
+    expect(
+        added == [expected_walk],
+        f"the 257th admission/release walked {added}, expected only {expected_walk}",
+    )
     expect(len(after["slots"]) == 256, f"pool count {len(after['slots'])} is not 256")
     expect(all(record["id"] != 1 for record in after["slots"]), "the evicted record remains")
     expect(any(record["id"] == 257 for record in after["slots"]), "the 257th slot was not allocated")
@@ -667,11 +687,14 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "pool-ceiling-258th", app, env)
     added = walk_snapshot()[len(before):]
     expect(not os.path.lexists(victim), f"the next rank-LRU idle slot {victim} was not evicted")
-    expect(
-        len(added) == 1 and added[0].startswith(slots_prefix) and added[0].endswith("-258"),
-        f"the 258th admission/release walked more than its own slot: {added}",
-    )
     after = read_json(ledger_path)
+    own = next((record for record in after["slots"] if record["id"] == 258), None)
+    expect(own is not None, "the 258th slot has no ledger record")
+    expected_walk = own_slot_walk_root(payload_root, "258", own)
+    expect(
+        added == [expected_walk],
+        f"the 258th admission/release walked {added}, expected only {expected_walk}",
+    )
     expect(len(after["slots"]) == 256, f"pool count {len(after['slots'])} is not 256 after replacement")
     expect(any(record["id"] == 258 for record in after["slots"]), "the 258th slot was not allocated")
     RESULTS.append({"case": "pool-ceiling-repeats-without-churn", "slots": 256, "victim": 2, "walks": len(added)})
@@ -1081,7 +1104,27 @@ def self_check() -> None:
     expect(document["mode"] == "diagnostic", "a diagnostic receipt has the wrong mode")
     expect(document["counts"]["planned"] == MAX_RECEIPT_ENTRIES, "the receipt lost a planned phase")
     reset_collection()
-    print("slot-headroom self-check PASS: diagnostic collection, taint, abort and receipt bounds", flush=True)
+    # The own-slot walk oracle derives the exact release root from the ledger
+    # row: oxide#104's legacy flat fallback and the recorded labelled path.
+    self_slots = "/tmp/payload/slots"
+    expect(
+        own_slot_walk_root("/tmp/payload", "257", {"id": 257})
+        == os.path.join(self_slots, "257"),
+        "the flat own-slot walk root is wrong",
+    )
+    expect(
+        own_slot_walk_root("/tmp/payload", "257", {"id": 257, "dir": None})
+        == os.path.join(self_slots, "257"),
+        "an explicit null dir is not the flat own-slot walk root",
+    )
+    expect(
+        own_slot_walk_root(
+            "/tmp/payload", "257", {"id": 257, "dir": "fences-abc/quick-257"}
+        )
+        == os.path.join(self_slots, "fences-abc", "quick-257"),
+        "the labelled own-slot walk root is wrong",
+    )
+    print("slot-headroom self-check PASS: diagnostic collection, taint, abort, receipt bounds and own-slot walk paths", flush=True)
 
 
 def main() -> None:
