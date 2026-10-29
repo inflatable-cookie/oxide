@@ -279,6 +279,22 @@ impl CustodyLock {
     }
 }
 
+/// Take the exclusive OS lock on `file` nonblocking. `Ok(true)` means this
+/// open file description now holds it, `Ok(false)` means another holder has it
+/// (a live custodian), and an error is unknown custody. The lock rides on the
+/// descriptor, so it is released exactly when that `File` is dropped and never
+/// inherited by a child (`O_CLOEXEC`).
+fn lock_exclusive(file: &File) -> Result<bool, LeaseError> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(io_error(error))
+}
+
 fn custody_root(pool: &Path) -> PathBuf {
     pool.join(MANAGED_NAME).join(HOLDINGS_NAME)
 }
@@ -389,6 +405,14 @@ pub(super) fn create(
             "the custody lock must be a private regular file",
         ));
     }
+    // The creator takes the exclusive lock before it writes the journal or
+    // returns a `CustodyLock`: from here on this deletion has one live
+    // custodian, and a caller can never publish or replay under a lock it does
+    // not hold. The file was just created owner-only in a fresh private
+    // directory, so a busy lock is a state this writer never produces.
+    if !lock_exclusive(&file)? {
+        return Err(LeaseError::UnknownAccounting);
+    }
     file.sync_all().map_err(io_error)?;
     let bytes = document_bytes(&nonce, &lines, journal)?;
     persist_journal(&journal_path(pool, &nonce), &bytes)?;
@@ -408,9 +432,9 @@ pub(super) fn create(
             .and_then(|held| held.sync_all())
             .map_err(io_error)?;
     }
-    // Claim the exclusive lock this record will name. A lock created and
-    // claimed under the pool lock cannot be busy; anything else is unknown,
-    // and the record is not yet published, so the caller keeps nothing.
+    // Re-verify the names and read the journal under the lock just taken. Any
+    // mismatch is unknown, and the record is not yet published, so the caller
+    // keeps nothing.
     match claim_file(
         &nonce,
         &dir,
@@ -468,13 +492,13 @@ pub(super) fn claim(
     {
         return Ok(Claim::Unknown);
     }
-    // Nonblocking: a live custodian is skipped, never waited for.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(Claim::Busy);
-        }
-        return Ok(Claim::Unknown);
+    // Nonblocking: a live custodian is skipped, never waited for. A lock this
+    // caller cannot take or verify is unknown custody: the record keeps its
+    // charge rather than failing the whole open.
+    match lock_exclusive(&file) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Claim::Busy),
+        Err(_) => return Ok(Claim::Unknown),
     }
     claim_file(
         &custody.nonce,
@@ -487,9 +511,10 @@ pub(super) fn claim(
     )
 }
 
-/// Re-verify the directory, the held lock and the journal, and read the
-/// journal. Anything the caller cannot verify is unknown custody, never an
-/// empty journal.
+/// Re-verify the directory, the already-held lock and the journal, and read
+/// the journal. The caller must hold the exclusive lock on `file`; this
+/// function never takes it. Anything the caller cannot verify is unknown
+/// custody, never an empty journal.
 #[allow(clippy::too_many_arguments)]
 fn claim_file(
     nonce: &str,

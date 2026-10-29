@@ -3037,13 +3037,13 @@ fn assert_control_refusal(
     );
 }
 
-/// A journaled deletion that cannot be classified keeps the pool blocked:
-/// every new lease is refused with `unknown_accounting`, so no second eviction
-/// (and no second journal) can be started while one is outstanding. This is the
-/// writer's single-journal guard (oxide#177); the reader's worst-valid byte
-/// bound is the cap itself, not a journal count.
+/// A journaled deletion that cannot be classified keeps **that object** with
+/// its charge, custody and journal, while an unrelated admission proceeds
+/// (oxide#175 ruling B, oxide#181 per-object isolation). The open's accounting
+/// coverage stays unknown; nothing is deleted or repaired for the blocked
+/// object.
 #[test]
-fn a_blocked_journaled_deletion_refuses_every_new_lease() {
+fn a_blocked_journaled_deletion_stays_charged_and_does_not_refuse_other_leases() {
     let fixture = Fixture::new("blocked-journal");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-journal");
     super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
@@ -3070,24 +3070,37 @@ fn a_blocked_journaled_deletion_refuses_every_new_lease() {
     )
     .expect("journal");
     let workspace = fixture.dir("workspace");
-    assert!(
-        matches!(
-            lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")),
-            Err(LeaseError::UnknownAccounting)
-        ),
-        "a blocked journaled deletion admitted a new lease"
-    );
-    // The journaled record is retained: no second deletion was started.
+    let granted = lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b"))
+        .expect("a blocked object must not refuse an unrelated admission");
+    assert_ne!(granted.slot_id, slot_id.to_string());
+    release_injected(&pool, &granted.lease_id).expect("release the unrelated slot");
+    // The journaled record, its custody and its journal are retained: no
+    // second deletion was started on its behalf and its payload is untouched.
     let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
     assert_eq!(snapshot.evicting_slot_ids.len(), 1);
+    assert!(
+        !slot_path.exists(),
+        "the blocked object's recorded root stays absent"
+    );
+    assert!(
+        super::pool::capture_record_injected(&pool, slot_id).is_some(),
+        "the blocked object lost its journal"
+    );
+    assert!(
+        super::pool::recorded_custody_injected(&pool, slot_id).is_some(),
+        "the blocked object lost its custody"
+    );
+    // Its recorded charge is still part of the pool figure.
+    let (charge, largest, observed) =
+        super::pool::pending_charge_injected(&pool, slot_id).expect("charge");
+    assert_eq!(charge, largest.max(observed));
 }
 
-/// The single-journal guard covers the explicit eviction path too, which does
-/// not pass through `lease()`'s blocked-reconciliation refusal: a second
-/// `evict_idle_slot` refuses while the blocked journal is retained, so no
-/// second journal can accumulate.
+/// Per-object isolation covers the explicit eviction path too: one blocked
+/// object never refuses another eligible idle slot's deletion, and the blocked
+/// record keeps its journal, custody and charge alongside the new one.
 #[test]
-fn a_blocked_journaled_deletion_refuses_a_second_explicit_eviction() {
+fn a_blocked_journaled_deletion_does_not_block_another_explicit_eviction() {
     let fixture = Fixture::new("blocked-second-eviction");
     let pool = fixture.dir("pool");
     create_injected(&pool, 8 * 1024 * 1024).expect("init");
@@ -3127,22 +3140,25 @@ fn a_blocked_journaled_deletion_refuses_a_second_explicit_eviction() {
     )
     .expect("journal");
 
-    // The explicit eviction path must refuse while that journal is pending.
-    let outcome = super::pool::evict_idle_slot_injected(&pool, &second_id.to_string());
-    assert!(
-        matches!(outcome, Err(LeaseError::UnknownAccounting)),
-        "a second explicit eviction started while a journal was outstanding: {outcome:?}"
-    );
+    // The explicit eviction of the other eligible idle slot proceeds.
+    super::pool::evict_idle_slot_injected(&pool, &second_id.to_string())
+        .expect("a blocked object must not refuse another eligible deletion");
 
-    // Both records and the journal survive: nothing was deleted or resolved.
+    // Only the requested slot went; the blocked object keeps its journal,
+    // custody and charge.
     let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
     assert_eq!(snapshot.evicting_slot_ids, vec![first.slot_id.clone()]);
     assert!(snapshot
         .slots
         .iter()
-        .any(|slot| slot.slot_id == second.slot_id && slot.state == SlotOccupancy::Idle));
-    assert!(second_path.is_dir(), "the second slot was touched");
+        .all(|slot| slot.slot_id != second.slot_id));
+    assert!(!second_path.exists(), "the requested slot was not deleted");
+    assert!(
+        !first_path.exists(),
+        "the blocked recorded root is still absent"
+    );
     assert!(super::pool::capture_record_injected(&pool, first_id).is_some());
+    assert!(super::pool::recorded_custody_injected(&pool, first_id).is_some());
 }
 
 /// oxide#177's accounting-cost gate as one fixed measurement: one whole round
@@ -6579,18 +6595,22 @@ mod pre_custody_reader {
     }
 }
 
-/// The deletion-custody fence refuses every older supported reader before any
-/// effect, and it does so in the intermediate state (control fenced, ledger
-/// not yet) as well as the final one.
+/// The ledger half of the deletion-custody fence, checked at document level
+/// against the predecessor's strict slot shape.
+///
+/// The **control** half is proved against the actual pinned predecessor binary
+/// in the native proof (`effigy rust:deletion-custody`), which runs it on the
+/// crash-between-fences state (control fenced, ledger not yet upgraded) and the
+/// final state. A copied parser here cannot prove what a real predecessor does,
+/// so it is not used for that claim.
 #[test]
-fn the_custody_fence_refuses_the_predecessor_reader_in_both_states() {
+fn the_ledger_fence_refuses_the_predecessor_shape_in_both_states() {
     let fixture = Fixture::new("custody-fence");
     let pool = fixture.dir("pool");
     create_injected(&pool, 8 * 1024 * 1024).expect("init");
     let project = fixture.dir("project");
     let workspace = fixture.dir("workspace");
-    // A mutating command publishes the policy-5 ledger fence and the front
-    // door's version-9 control fence.
+    // A mutating command publishes the policy-5 ledger fence.
     let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
     release_injected(&pool, &leased.lease_id).expect("release");
     let bytes = fs::read(pool.join("ledger.json")).expect("ledger");
@@ -6604,39 +6624,38 @@ fn the_custody_fence_refuses_the_predecessor_reader_in_both_states() {
         "the predecessor reader accepted the final policy-5 ledger"
     );
 
-    // The intermediate state: the control fence is durable, the ledger is
-    // still the predecessor's policy-4 shape. The predecessor's control reader
-    // refuses the version-9 document (it accepts only versions at most 8), and
-    // the ledger it would then read carries no custody record yet.
+    // The intermediate ledger state (control fenced, ledger not yet upgraded)
+    // is still exactly the predecessor's readable shape; the control fence is
+    // the only guard there, which is why the native proof runs the real binary.
     let mut intermediate = stored.clone();
     intermediate["capacity_policy"] = serde_json::json!(RAISED_CAPACITY_POLICY_VERSION);
     let intermediate_bytes = serde_json::to_vec(&intermediate).expect("intermediate");
     assert!(
         pre_custody_reader::accepts(&intermediate_bytes),
-        "the intermediate ledger must still be the predecessor's shape"
+        "the intermediate ledger is not the predecessor's shape"
+    );
+
+    // A custody reference under policy 4 is a state no writer produces: the
+    // predecessor's strict slot parse refuses the unknown field, and this
+    // binary refuses it because custody requires the policy-5 fence.
+    let mut with_custody = intermediate;
+    with_custody["slots"][0]["custody"] = serde_json::json!({
+        "nonce": "0123456789abcdef0123456789abcdef",
+        "lock_device": 1,
+        "lock_inode": 2,
+    });
+    let with_custody_bytes = serde_json::to_vec(&with_custody).expect("custody");
+    assert!(
+        !pre_custody_reader::accepts(&with_custody_bytes),
+        "the predecessor slot parse accepted the custody field"
     );
     assert!(
-        !pre_custody_reader::accepts(
-            &serde_json::to_vec(&serde_json::json!({
-                "version": 9,
-                "next_id": 1,
-                "next_use": 1,
-                "tickets": [],
-                "cleans": [],
-                "records": [],
-                "recorded_accounting": "oxide.accounting/1",
-                "eviction_accounting": "oxide.eviction-accounting/1",
-                "slot_ceiling": "oxide.slots/256",
-                "deletion_custody": "oxide.deletion-custody/1",
-            }))
-            .expect("control")
-        ),
-        "the predecessor ledger reader accepted a version-9 control document"
+        super::pool::write_ledger_bytes_injected(&pool, &with_custody_bytes).is_err(),
+        "a policy-4 custody record was accepted"
     );
 
     // A policy-5 ledger that still carries a legacy in-ledger journal is a
-    // state no writer produces, and the strict predecessor reader refuses the
-    // `custody` field as an unknown field in the other direction.
+    // state no writer produces.
     let mut with_journal = stored.clone();
     with_journal["slots"][0]["capture"] = serde_json::json!({
         "root": {
@@ -6659,6 +6678,91 @@ fn the_custody_fence_refuses_the_predecessor_reader_in_both_states() {
         .is_err(),
         "a policy-5 ledger with an in-ledger journal was accepted"
     );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// The creator of a custody directory and the migrator of a legacy record both
+/// publish under a lock they actually hold: a second open file description in
+/// the same process cannot take the exclusive lock until the returned
+/// `CustodyLock` is dropped. Two descriptors prove this where a single
+/// descriptor would mask a missing `flock`.
+#[test]
+fn the_creator_and_the_migrator_hold_the_custody_lock() {
+    use std::os::fd::AsRawFd;
+
+    let try_exclusive = |path: &Path| -> std::io::Result<()> {
+        let second = File::open(path)?;
+        if unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    };
+    let expect_busy = |path: &Path| {
+        let error =
+            try_exclusive(path).expect_err("a second descriptor took the held custody lock");
+        let code = error.raw_os_error();
+        assert!(
+            matches!(code, Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN),
+            "second descriptor failed with {code:?}, not a busy lock"
+        );
+    };
+
+    // Creation: the lock is held before the caller can publish a record.
+    let fixture = Fixture::new("custody-creator");
+    let (pool, slot_id, _path) = idle_slot_for_eviction(&fixture, "custody-creator");
+    let lock = super::pool::create_custody_injected(&pool, slot_id).expect("created custody");
+    let custody = lock.record();
+    let (lock_path, _) = custody_files(&pool, &custody.nonce);
+    expect_busy(&lock_path);
+    drop(lock);
+    try_exclusive(&lock_path).expect("the creator's lock outlived its CustodyLock");
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+
+    // Migration: the legacy journal is published into custody only under the
+    // migrator's held lock.
+    let fixture = Fixture::new("custody-migrator");
+    let (pool, slot_id, _path) = idle_slot_for_eviction(&fixture, "custody-migrator");
+    mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    super::pool::write_legacy_capture_record_injected(
+        &pool,
+        slot_id,
+        super::pool::DeletionJournal {
+            root: crate::owned_delete::RootCapturePlan {
+                private: format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, 7),
+                phase: crate::owned_delete::RootCapturePhase::Planned,
+                device: 1,
+                inode: 2,
+                parent_device: 1,
+                parent_inode: 3,
+                mode: 0o040700,
+            },
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("legacy journal");
+    let lock =
+        super::pool::migrate_legacy_locked_injected(&pool, slot_id).expect("migrated custody");
+    let custody = lock.record();
+    let (lock_path, _) = custody_files(&pool, &custody.nonce);
+    expect_busy(&lock_path);
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION),
+        "the migration published without the policy-5 fence"
+    );
+    assert!(
+        stored["slots"][0]["custody"].is_object(),
+        "the migrated record has no custody reference"
+    );
+    assert!(
+        stored["slots"][0].get("capture").is_none(),
+        "the legacy journal stayed in the ledger"
+    );
+    drop(lock);
+    try_exclusive(&lock_path).expect("the migrator's lock outlived its CustodyLock");
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 

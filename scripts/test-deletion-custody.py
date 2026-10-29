@@ -19,10 +19,15 @@ Slice 1 still deletes under the pool lock: there is no out-of-lock payload
 effect and no worker thread. The cases prove the foundations that let slice 2
 move deletion out of the lock:
 
-- `old-binary-refuses-fenced-pool`: this HEAD's candidate creates and mutates a
-  pool (control version 9 and ledger `capacity_policy: 5`); the pinned
-  merge-base binary (staged from `git archive`, never the working tree) refuses
-  it before any effect and changes neither the ledger bytes nor a slot root.
+- `old-binary-refuses-fenced-pool`: three probes with the pinned merge-base
+  binary (staged from `git archive`, never the working tree), each asserting
+  byte-identical control/ledger and unchanged roots (and, for the pending
+  object, unchanged custody bytes and payload identity): the **intermediate**
+  crash-between-fences state (control version 9, ledger still the predecessor's
+  policy 3), the **final** state (version 9 + policy 5), and a **ledger-only**
+  probe whose control is rewritten to the predecessor's own version 8 so only
+  its ledger parser can refuse a policy-5 ledger carrying `custody`. The
+  exported base tree is asserted not to carry either fence.
 - `custody-and-journal-at-pause`: a real byte-pressure eviction pauses at the
   durable root plan (debug-only seam inside the supervisor layout) and the
   proof reads the private custody directory, its `0600` lock and journal, the
@@ -63,9 +68,18 @@ WALL_LIMIT_S = 300
 SCRATCH_BUDGET_MIB = 512
 PLANT_BYTES = 5 * MIB
 POOL_CAP = "10MiB"
+# The staged build's one frozen rustc flag. CARGO_ENCODED_RUSTFLAGS (which
+# Cargo prefers over RUSTFLAGS) and every cargo/rustc override are scrubbed
+# from the inherited parent, so a hostile shell cannot change the staged
+# binary.
+FROZEN_RUSTFLAGS = "-C strip=symbols"
 STAGE_JOBS = 1
 FIXTURE_JOBS = 1
 PAUSE_POINT = "journal-planned"
+# The predecessor's own control-state version. The ledger-only probe rewrites
+# the fixture control to this version so only the predecessor's ledger parser
+# can refuse the final ledger.
+PREDECESSOR_CONTROL_VERSION = 8
 MAX_RECEIPT_BYTES = 64 * 1024
 SELECTOR = "rust:deletion-custody"
 COMMAND = [
@@ -171,6 +185,44 @@ def read_json(path: str):
         return None
 
 
+def read_text(path: str) -> str:
+    return read_bytes(path).decode("utf-8", errors="replace")
+
+
+def write_private_atomic(path: str, payload: bytes) -> None:
+    """Replace one owner-only file atomically (temp, fsync, rename, dir sync)."""
+    # The pool root tolerates only `ledger.tmp-*` temp names, so the atomic
+    # replace never leaves a foreign entry visible (the same prefix works for
+    # the control document inside `oxide-managed`).
+    temporary = os.path.join(
+        os.path.dirname(path), f"ledger.tmp-{os.getpid()}-proof"
+    )
+    with open(temporary, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    directory = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def tree_digest(directory: str) -> dict:
+    """Mode and content digest of one custody directory (bounded, no recursion)."""
+    digest = {"mode": stat.S_IMODE(os.lstat(directory).st_mode)}
+    for name in sorted(os.listdir(directory)):
+        entry = os.path.join(directory, name)
+        metadata = os.lstat(entry)
+        digest[name] = (
+            stat.S_IMODE(metadata.st_mode),
+            sha256_file(entry) if stat.S_ISREG(metadata.st_mode) else None,
+        )
+    return digest
+
+
 def git(*args: str) -> str:
     result = subprocess.run(
         ["git", *args], cwd=REPO, check=True, capture_output=True, text=True
@@ -217,9 +269,11 @@ def plan_document() -> dict:
         "cases": [
             {
                 "name": "old-binary-refuses-fenced-pool",
-                "oracle": "the merge-base binary exits nonzero on a version-9 "
-                "control and policy-5 ledger before any effect; the ledger "
-                "bytes and every slot root are unchanged",
+                "oracle": "the merge-base binary exits nonzero on the "
+                "intermediate (control v9, policy-3 ledger), final (control v9, "
+                "policy-5 ledger) and ledger-only (control v8, policy-5 ledger "
+                "with custody) states before any effect; control and ledger "
+                "bytes, custody bytes and every slot root are unchanged",
             },
             {
                 "name": "custody-and-journal-at-pause",
@@ -274,7 +328,10 @@ def plan_document() -> dict:
         "provenance": {
             "staging": "invoking Cargo home, --offline; target and build inside "
             "the monitored scratch. Not a claim that staging never reads the "
-            "invoking Cargo home.",
+            "invoking Cargo home. RUSTFLAGS is frozen and "
+            "CARGO_ENCODED_RUSTFLAGS plus every cargo/rustc override is "
+            "scrubbed from the parent (pure hostile-parent control in "
+            "--self-check).",
             "base": "git archive of git merge-base HEAD origin/main into owned "
             "scratch; the working tree is never exported or mutated",
             "fixtures": "private HOME and CARGO_HOME per fixture tree, "
@@ -358,6 +415,10 @@ def self_check() -> None:
     )
     expect(PLANT_BYTES == 5 * MIB and POOL_CAP == "10MiB", "the fixture sizes changed")
     expect(PAUSE_POINT == "journal-planned", "the pause point changed")
+    expect(
+        PREDECESSOR_CONTROL_VERSION == 8,
+        "the predecessor control-version probe constant changed",
+    )
     # The custody layout oracle: a nonce is 32 lowercase hex characters and the
     # two files are the ones this proof reads.
     nonce = "0123456789abcdef0123456789abcdef"
@@ -366,6 +427,72 @@ def self_check() -> None:
         and all(character in "0123456789abcdef" for character in nonce),
         "the nonce oracle changed",
     )
+    expect(FROZEN_RUSTFLAGS == "-C strip=symbols", "the frozen rustc flag changed")
+    # Hostile-parent control: neither the staged build nor a fixture child may
+    # inherit a rustc/cargo override, an OXIDE hook or a foreign target dir.
+    hostile = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/hostile/home",
+        "RUSTUP_HOME": "/hostile/rustup",
+        "CARGO_ENCODED_RUSTFLAGS": "--cfg hostile-encoded",
+        "RUSTFLAGS": "--cfg hostile",
+        "CARGO_BUILD_RUSTFLAGS": "--cfg hostile-build",
+        "CARGO_TARGET_DIR": "/hostile/target",
+        "CARGO_BUILD_BUILD_DIR": "/hostile/build",
+        "RUSTC_WRAPPER": "/hostile/wrapper",
+        "RUSTC_WORKSPACE_WRAPPER": "/hostile/workspace-wrapper",
+        "CARGO": "/hostile/cargo",
+        "RUSTC": "/hostile/rustc",
+        "SCCACHE_DIR": "/hostile/sccache",
+        "OXIDE_POOL": "/hostile/pool",
+        "OXIDE_PROOF_EVIDENCE": "/hostile/evidence",
+    }
+    staged = staging_env(hostile, "/stage")
+    expect(
+        "CARGO_ENCODED_RUSTFLAGS" not in staged,
+        "staging inherited CARGO_ENCODED_RUSTFLAGS",
+    )
+    expect(staged["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "staging did not freeze RUSTFLAGS")
+    expect(
+        "CARGO_BUILD_RUSTFLAGS" not in staged,
+        "staging inherited CARGO_BUILD_RUSTFLAGS",
+    )
+    expect(staged["CARGO_TARGET_DIR"] == "/stage/target", "the staging target dir leaked")
+    expect(staged["CARGO_BUILD_BUILD_DIR"] == "/stage/build", "the staging build dir leaked")
+    expect(
+        staged["RUSTC_WRAPPER"] == ""
+        and "CARGO" not in staged
+        and "RUSTC" not in staged
+        and "SCCACHE_DIR" not in staged
+        and "OXIDE_POOL" not in staged,
+        "staging inherited a compiler, wrapper or hook override",
+    )
+    fixture = fixture_environment(hostile, "/fixture", "/fixture/pool")
+    expect(
+        fixture["HOME"] == "/fixture/home"
+        and fixture["CARGO_HOME"] == "/fixture/cargo-home",
+        "the fixture env did not isolate HOME and CARGO_HOME",
+    )
+    expect(
+        fixture["OXIDE_POOL"] == "/fixture/pool" and fixture["PATH"] == "/usr/bin:/bin",
+        "the fixture env lost its own pool or PATH",
+    )
+    expect(
+        fixture["RUSTUP_HOME"] == "/hostile/rustup"
+        and fixture["RUSTUP_TOOLCHAIN"] == BUILDER,
+        "the fixture env did not pin the toolchain",
+    )
+    for name in (
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+        "CARGO",
+        "RUSTC",
+        "SCCACHE_DIR",
+    ):
+        expect(name not in fixture, f"the fixture env inherited {name}")
     expect(sha256_file(os.path.abspath(__file__)) != "", "the script digest is unreadable")
     print("self-check: ok (pure argument, plan, constant and oracle checks; not evidence)")
 
@@ -374,15 +501,39 @@ def self_check() -> None:
 # The proof. Everything below has effects and requires the supervisor.
 
 
-def stage(source: str, root: str, label: str, log: str) -> str:
-    """Build `oxide` from `source` into its own fresh target and build dirs."""
-    stage_root = os.path.join(root, f"stage-{label}")
-    os.makedirs(stage_root)
+STAGE_SCRUBBED = (
+    "CARGO",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+)
+STAGE_SCRUBBED_PREFIXES = ("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_")
+FIXTURE_INHERITED = (
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "OXIDE_TASK_SCRATCH_ROOT",
+    "OXIDE_PROOF_DEADLINE_NS",
+    "OXIDE_PROOF_EVIDENCE",
+)
+
+
+def staging_env(parent: dict, stage_root: str) -> dict:
+    """The staged build's environment, sanitized against a hostile parent.
+
+    A parent CARGO_ENCODED_RUSTFLAGS (which Cargo prefers over RUSTFLAGS by
+    definition), RUSTFLAGS, CARGO_BUILD_RUSTFLAGS, target/build overrides, a
+    compiler or wrapper override, an OXIDE_* hook or a CARGO/RUSTC override
+    must never reach the staged build: the premise is that the staged binary is
+    exactly this clean HEAD's debug oxide. The one rustc flag is frozen here,
+    never inherited.
+    """
     env = {
         key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_"))
-        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+        for key, value in parent.items()
+        if not key.startswith(STAGE_SCRUBBED_PREFIXES) and key not in STAGE_SCRUBBED
     }
     env.update(
         {
@@ -397,9 +548,46 @@ def stage(source: str, root: str, label: str, log: str) -> str:
             "CARGO_PROFILE_DEV_OPT_LEVEL": "s",
             "CARGO_PROFILE_DEV_CODEGEN_UNITS": "1",
             "CARGO_INCREMENTAL": "0",
-            "RUSTFLAGS": "-C strip=symbols",
+            "RUSTFLAGS": FROZEN_RUSTFLAGS,
         }
     )
+    return env
+
+
+def fixture_environment(parent: dict, root: str, pool: str) -> dict:
+    """The fixture child's allowlisted environment (no filesystem effect).
+
+    A fixture child inherits neither rustc/cargo override: the allowlist below
+    is the whole environment, plus the supervisor's own facts.
+    """
+    env = {
+        "HOME": os.path.join(root, "home"),
+        "OXIDE_TEST_HOME_FROM_ENV": "1",
+        "TMPDIR": root,
+        "TMP": root,
+        "TEMP": root,
+        "OXIDE_POOL": pool,
+        "OXIDE_POOL_CAP": POOL_CAP,
+        "CARGO_HOME": os.path.join(root, "cargo-home"),
+        "PATH": parent.get("PATH", "/usr/bin:/bin"),
+        "NO_COLOR": "1",
+        "CARGO_TERM_COLOR": "never",
+        "CARGO_NET_OFFLINE": "true",
+        "RUSTUP_HOME": parent.get("RUSTUP_HOME") or invoking_rustup_home(),
+        "RUSTUP_TOOLCHAIN": BUILDER,
+        "RUSTUP_AUTO_INSTALL": "0",
+    }
+    for name in FIXTURE_INHERITED:
+        if name in parent:
+            env[name] = parent[name]
+    return env
+
+
+def stage(source: str, root: str, label: str, log: str) -> str:
+    """Build `oxide` from `source` into its own fresh target and build dirs."""
+    stage_root = os.path.join(root, f"stage-{label}")
+    os.makedirs(stage_root)
+    env = staging_env(dict(os.environ), stage_root)
     with open(log, "w", encoding="utf-8") as handle:
         build = subprocess.run(
             [
@@ -454,6 +642,23 @@ def stage_base(root: str) -> tuple[str, str]:
         os.path.isfile(os.path.join(source, "scripts/bounded-test.py")),
         "the exported base tree is not this repository",
     )
+    # Pinned-source premise: the exported tree must predate this slice's
+    # fences, and this HEAD must carry them. A base that already knew the
+    # custody fence could not prove a predecessor refusal.
+    base_pool = read_text(os.path.join(source, "src/lease/pool.rs"))
+    base_control = read_text(os.path.join(source, "src/lease/control.rs"))
+    expect(
+        "DELETION_CUSTODY_CAPACITY_POLICY_VERSION" not in base_pool,
+        "the pinned base tree already carries the custody ledger fence",
+    )
+    expect(
+        "deletion-custody" not in base_control,
+        "the pinned base tree already carries the custody control fence",
+    )
+    expect(
+        "DELETION_CUSTODY_CAPACITY_POLICY_VERSION" in read_text(os.path.join(REPO, "src/lease/pool.rs")),
+        "this HEAD does not carry the custody ledger fence",
+    )
     subject = stage(source, root, "base", os.path.join(root, "stage-base.log"))
     shutil.rmtree(source)
     return subject, base
@@ -467,34 +672,9 @@ def invoking_rustup_home() -> str:
 
 
 def fixture_env(root: str, pool: str) -> dict:
-    home = private_dir(os.path.join(root, "home"))
-    env = {
-        "HOME": home,
-        "OXIDE_TEST_HOME_FROM_ENV": "1",
-        "TMPDIR": root,
-        "TMP": root,
-        "TEMP": root,
-        "OXIDE_POOL": pool,
-        "OXIDE_POOL_CAP": POOL_CAP,
-        "CARGO_HOME": private_dir(os.path.join(root, "cargo-home")),
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "NO_COLOR": "1",
-        "CARGO_TERM_COLOR": "never",
-        "CARGO_NET_OFFLINE": "true",
-        "RUSTUP_HOME": invoking_rustup_home(),
-        "RUSTUP_TOOLCHAIN": BUILDER,
-        "RUSTUP_AUTO_INSTALL": "0",
-    }
-    for name in (
-        "LANG",
-        "LC_ALL",
-        "TZ",
-        "OXIDE_TASK_SCRATCH_ROOT",
-        "OXIDE_PROOF_DEADLINE_NS",
-        "OXIDE_PROOF_EVIDENCE",
-    ):
-        if name in os.environ:
-            env[name] = os.environ[name]
+    env = fixture_environment(dict(os.environ), root, pool)
+    private_dir(env["HOME"])
+    private_dir(env["CARGO_HOME"])
     return env
 
 
@@ -688,59 +868,194 @@ def custody_oracle(pool: str, slot: dict) -> tuple[str, dict]:
     return directory, journal
 
 
+def seed_one_idle_slot(root: str, subject: str) -> tuple[str, dict, str]:
+    """One idle slot of one private project, created by the candidate."""
+    pool = os.path.join(root, "pool")
+    env = fixture_env(root, pool)
+    workspace = create_project(root, "a")
+    code, output = check(subject, workspace, env, "fence-seed")
+    expect(code == 0, f"seeding the fenced pool exited {code}: {output[-3000:]}")
+    document = ledger(pool)
+    expect(len(document["slots"]) == 1, f"expected one slot: {document['slots']}")
+    expect(document["slots"][0]["state"] == "idle", "the seeded slot is not idle")
+    return pool, env, workspace
+
+
+def run_predecessor(base: str, workspace: str, env: dict, label: str) -> tuple[int, str]:
+    """Run the pinned predecessor's own status against one fixture pool."""
+    work_left()
+    result = subprocess.run(
+        [base, "status"],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=work_left(),
+    )
+    combined = f"{result.stdout}{result.stderr}"
+    say(f"predecessor {label}: exit {result.returncode}")
+    return result.returncode, combined
+
+
 def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
+    """The pinned predecessor refuses both fence states without any effect.
+
+    Three probes, each on the real merge-base binary:
+
+    - **intermediate** (crash between the two fences): the control state is
+      version 9 with the custody fence, and the ledger is still the
+      predecessor's own policy-3 shape. The predecessor must refuse at its
+      control parser, before it reads the ledger.
+    - **final**: control version 9 and the policy-5 ledger. Refused at control
+      load, with control, ledger and every slot root byte-identical.
+    - **ledger-only**: a real pending custody record with the predecessor's own
+      control version (8, no custody fence), so the refusal can only come from
+      its ledger parser reading policy 5 and the `custody` field. Custody
+      directory, journal and payload must be byte/identity identical.
+    """
+
     def body() -> None:
-        pool = os.path.join(refusal_root, "pool")
-        env = fixture_env(refusal_root, pool)
-        workspace = create_project(refusal_root, "a")
-        code, output = check(candidate, workspace, env, "fence-seed")
-        expect(code == 0, f"seeding the fenced pool exited {code}: {output[-3000:]}")
-        document = ledger(pool)
+        fence_root = private_dir(os.path.join(refusal_root, "fence"))
+        pool, env, workspace = seed_one_idle_slot(fence_root, candidate)
+        state_path = os.path.join(pool, "oxide-managed", "state.json")
+        ledger_path = os.path.join(pool, "ledger.json")
+        control = read_bytes(state_path)
+        final_ledger = read_bytes(ledger_path)
+        document = json.loads(final_ledger)
         expect(
             document.get("capacity_policy") == 5,
             f"the candidate did not publish the policy-5 ledger fence: {document}",
         )
-        state = read_bytes(os.path.join(pool, "oxide-managed", "state.json"))
         expect(
-            b'"deletion_custody":"oxide.deletion-custody/1"' in state,
+            b'"deletion_custody":"oxide.deletion-custody/1"' in control,
             "the candidate did not publish the deletion-custody control fence",
         )
-        ledger_bytes = read_bytes(os.path.join(pool, "ledger.json"))
         roots = [slot_directory(pool, slot) for slot in document["slots"]]
         identities = [identity(path) for path in roots]
-        # The pinned predecessor: run the merge-base binary's own status and
-        # check on the same fenced pool.
-        refusal = subprocess.run(
-            [base, "status"],
-            cwd=workspace,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=work_left(),
-        )
-        combined = f"{refusal.stdout}{refusal.stderr}"
-        say(f"merge-base status: exit {refusal.returncode}")
+
+        # Intermediate: the control fence is durable, the ledger write that
+        # would carry policy 5 has not happened (the predecessor's own policy 3
+        # is what such a ledger holds).
+        intermediate = dict(document)
+        intermediate["capacity_policy"] = 3
+        write_private_atomic(ledger_path, json.dumps(intermediate).encode())
+        intermediate_ledger = read_bytes(ledger_path)
+        intermediate_exit, output = run_predecessor(base, workspace, env, "intermediate")
         expect(
-            refusal.returncode != 0,
-            f"the merge-base binary accepted a fenced pool: {combined[-2000:]}",
+            intermediate_exit != 0,
+            f"the predecessor accepted the intermediate fence state: {output[-2000:]}",
         )
+        expect(read_bytes(state_path) == control, "the intermediate probe rewrote control")
         expect(
-            read_bytes(os.path.join(pool, "ledger.json")) == ledger_bytes,
-            "the merge-base refusal rewrote the ledger",
+            read_bytes(ledger_path) == intermediate_ledger,
+            "the intermediate probe rewrote the ledger",
         )
         expect(
-            [identity(path) for path in roots] == identities,
-            "the merge-base refusal changed a slot root identity",
+            [identity(path) for path in roots] == identities
+            and all(os.path.isdir(path) for path in roots),
+            "the intermediate probe changed a slot root",
+        )
+
+        # Final: control version 9 and the policy-5 ledger.
+        write_private_atomic(ledger_path, final_ledger)
+        final_exit, output = run_predecessor(base, workspace, env, "final")
+        expect(final_exit != 0, f"the predecessor accepted the final state: {output[-2000:]}")
+        expect(read_bytes(state_path) == control, "the final probe rewrote control")
+        expect(
+            read_bytes(ledger_path) == final_ledger,
+            "the final probe rewrote the ledger",
         )
         expect(
-            all(os.path.isdir(path) for path in roots),
-            "the merge-base refusal changed a slot directory",
+            [identity(path) for path in roots] == identities
+            and all(os.path.isdir(path) for path in roots),
+            "the final probe changed a slot root",
+        )
+
+        # Resume: the crash-between-fences state is recoverable by this binary
+        # without deleting anything. The locked open upgrades the ledger fence
+        # and leaves the control bytes and every slot root alone.
+        write_private_atomic(ledger_path, json.dumps(intermediate).encode())
+        resume_code, resume_output = check(candidate, workspace, env, "fence-resume")
+        expect(
+            resume_code == 0,
+            "the candidate could not resume the intermediate fence state: "
+            f"{resume_output[-3000:]}",
+        )
+        resumed: dict = json.loads(read_bytes(ledger_path))
+        expect(
+            resumed.get("capacity_policy") == 5,
+            f"the resumed ledger did not publish policy 5: {resumed}",
+        )
+        expect(
+            len(resumed.get("slots", [])) == len(document["slots"]),
+            "the resume deleted or added a slot",
+        )
+        expect(read_bytes(state_path) == control, "the resume rewrote the control state")
+        expect(
+            [identity(path) for path in roots] == identities
+            and all(os.path.isdir(path) for path in roots),
+            "the resume changed a slot root",
+        )
+
+        # Ledger-only probe: a real paused deletion, killed mid-deletion, so the
+        # record, custody directory, journal and payload all exist. Its control
+        # state is rewritten to the predecessor's own current version (8, no
+        # custody fence) so the refusal can only be the ledger parser's.
+        probe_root = private_dir(os.path.join(refusal_root, "ledger-probe"))
+        pool2, env2, workspaces2, oldest = seed_two_measured_idle_slots(
+            probe_root, candidate
+        )
+        oldest_path = slot_directory(pool2, oldest)
+        gate = os.path.join(probe_root, "pause-gate")
+        child = begin_paused_admission(candidate, probe_root, pool2, env2, gate)
+        wait_for_marker(gate, child)
+        slot = pending_slot(pool2)
+        expect(slot["id"] == oldest["id"], "the ledger probe paused on another slot")
+        directory, _journal = custody_oracle(pool2, slot)
+        kill_only(child)
+        expect(pending_slot(pool2)["id"] == oldest["id"], "the pending record changed")
+        state2 = os.path.join(pool2, "oxide-managed", "state.json")
+        ledger2 = os.path.join(pool2, "ledger.json")
+        predecessor_control = json.loads(read_bytes(state2))
+        expect(
+            predecessor_control.pop("deletion_custody", None)
+            == "oxide.deletion-custody/1",
+            "the control state had no custody fence to remove",
+        )
+        predecessor_control["version"] = PREDECESSOR_CONTROL_VERSION
+        write_private_atomic(state2, json.dumps(predecessor_control).encode())
+        control2 = read_bytes(state2)
+        ledger2_before = read_bytes(ledger2)
+        custody_before = tree_digest(directory)
+        payload_before = identity(oldest_path)
+        code, output = run_predecessor(base, workspaces2["a"], env2, "ledger-only")
+        expect(
+            code != 0,
+            f"the predecessor accepted a policy-5 ledger with custody: {output[-2000:]}",
+        )
+        expect(read_bytes(state2) == control2, "the ledger probe rewrote control")
+        expect(
+            read_bytes(ledger2) == ledger2_before,
+            "the ledger probe rewrote the ledger",
+        )
+        expect(
+            tree_digest(directory) == custody_before,
+            "the ledger probe changed the custody directory or journal",
+        )
+        expect(
+            identity(oldest_path) == payload_before and os.path.isdir(oldest_path),
+            "the ledger probe changed the pending payload",
         )
         RESULTS.append(
             {
                 "case": "old-binary-refuses-fenced-pool",
-                "base_exit": refusal.returncode,
-                "ledger_unchanged": True,
+                "intermediate_exit": intermediate_exit,
+                "final_exit": final_exit,
+                "resume_exit": resume_code,
+                "ledger_only_exit": code,
+                "intermediate_control_and_ledger_unchanged": True,
+                "final_control_and_ledger_unchanged": True,
+                "ledger_only_control_ledger_custody_payload_unchanged": True,
                 "slot_identities_unchanged": True,
             }
         )

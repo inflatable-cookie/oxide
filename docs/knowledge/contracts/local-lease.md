@@ -455,8 +455,10 @@ is the foundation slice 2 moves out of the lock:
   custody nonce (preserving every concurrent update), syncs it, then removes
   the private directory. A crash after the durable root `removed` phase repeats
   that transaction without touching payload.
-- **Per-object failure.** A busy, unknown or undeletable object keeps its
-  record, charge and custody and does not refuse an unrelated admission; only
+- **Per-object failure.** A busy, unknown or undeletable object — including a
+  journaled root that is at neither its original nor its private name — keeps
+  its record, conservative charge, custody and journal, and does not refuse an
+  unrelated admission or another eligible idle slot's explicit deletion; only
   backing, ledger or fence integrity is global. The oxide#177 single-journal
   guard is retired: journals no longer share the ledger's byte bound, so
   several pending deletions can coexist.
@@ -889,11 +891,13 @@ refuses before it reads the ledger, so no predecessor ledger-size argument is
 needed. An already-current control is not rewritten; a failed fence write
 refuses the command with no ledger or journal write. Passive `status` and
 snapshot readers never take this gate and never fence, so only a pool this
-binary never mutates stays at version 5. A completed legacy `Evicting`
-reconciliation may still finish in the legacy representation. Before a revised
-write, every stored field is validated against the raised caps; an oversized
-legacy field refuses with the original file, ownership and quarantine bytes
-untouched, never truncated or dropped.
+binary never mutates stays at version 5. A legacy in-ledger journal is read
+only for migration: the next locked open copies it byte-exactly into custody
+and publishes the policy-5 fence, so a record this binary reconciles never
+finishes in the legacy representation. Before a revised write, every stored
+field is validated against the raised caps; an oversized legacy field refuses
+with the original file, ownership and quarantine bytes untouched, never
+truncated or dropped.
 
 **Hand-off trigger.** The numeric `version` of a control `state.json` (the
 internal pool's and the removable pool's) and of `removable.json` is also the

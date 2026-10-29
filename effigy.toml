@@ -81,18 +81,24 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --
 # whole command of the qualified shared supervisor: 300 s including two
 # stagings, 512 MiB monitored scratch, 30 s margin. It stages this HEAD and the
 # pinned merge-base tree (git archive, never the working tree) offline with
-# 1.97.1 and proves on private internal directory-budget pools: the merge-base
-# binary refuses a version-9 control / policy-5 ledger before any effect; a real
-# byte-pressure eviction publishes its private custody directory, 0600 lock and
-# per-deletion journal before the payload effect (debug-only pause); a killed
-# fixture process leaves the pending record, custody and payload for exclusive
-# replay by the next command; and a busy custody lock is skipped by a concurrent
-# command that completes by warm reuse. The explicit internal root is the
-# owner-accepted internal-placement exception (decision bd357a4c) because every
-# fixture pool is a genuine internal pool. Deletion still runs under the pool
-# lock: no out-of-lock effect and no worker thread. `:diagnostic` is the
-# uncounted keep-going collection required first; `proof:deletion-custody:test`
-# is pure and spawns nothing. Each native run needs its own owner activation.
+# 1.97.1 (`RUSTFLAGS` frozen, `CARGO_ENCODED_RUSTFLAGS` and every cargo/rustc
+# override scrubbed from the inherited parent) and proves on private internal
+# directory-budget pools: the pinned merge-base binary refuses the intermediate
+# crash-between-fences state (control v9, policy-3 ledger), the final state
+# (control v9, policy-5 ledger) and a ledger-only probe (predecessor control v8
+# over a policy-5 ledger with custody), each with byte-identical control/ledger,
+# custody and slot roots, while this binary resumes the intermediate state
+# without deleting; a real byte-pressure eviction publishes its private custody
+# directory, 0600 lock and per-deletion journal before the payload effect
+# (debug-only pause); a killed fixture process leaves the pending record,
+# custody and payload for exclusive replay by the next command; and a busy
+# custody lock is skipped by a concurrent command that completes by warm reuse.
+# The explicit internal root is the owner-accepted internal-placement exception
+# (decision bd357a4c) because every fixture pool is a genuine internal pool.
+# Deletion still runs under the pool lock: no out-of-lock effect and no worker
+# thread. `:diagnostic` is the uncounted keep-going collection required first;
+# `proof:deletion-custody:test` is pure and spawns nothing. Each native run
+# needs its own owner activation.
 [tasks."rust:deletion-custody"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-deletion-custody.py"

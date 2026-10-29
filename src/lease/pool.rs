@@ -580,13 +580,11 @@ pub(super) struct Pool {
     /// and every slot walk draw on one cumulative budget instead of each
     /// starting a fresh one.
     deadline: Option<Instant>,
+    /// A recorded deletion could not be classified or completed at this open.
+    /// That makes this open's accounting coverage unknown; it never refuses an
+    /// unrelated admission or another eligible slot's explicit deletion
+    /// (oxide#175 ruling B, oxide#181 per-object isolation).
     reconciliation_blocked: bool,
-    /// A recorded journal names a root that is at neither its original nor its
-    /// private name: the deletion cannot be classified, so no new lease is
-    /// admitted (oxide#175, oxide#177). An unjournaled pending root or a
-    /// journaled root that is still present is charged conservatively instead
-    /// and does not block unrelated admissions.
-    reconciliation_unresolved: bool,
     /// Why this open admitted a new slot without a complete walk, if it did.
     admission_note: Option<String>,
     /// The caller's registered free-space reserve for a removable payload.
@@ -1133,6 +1131,38 @@ pub(super) fn write_legacy_capture_record_injected(
     write_ledger(pool, &ledger)
 }
 
+/// Create one deletion's private custody exactly as `retire_idle_slot` does,
+/// and return the held lock. Used by the two-descriptor creator regression.
+#[cfg(test)]
+pub(super) fn create_custody_injected(
+    pool: &Path,
+    slot_id: u64,
+) -> Result<super::custody::CustodyLock, LeaseError> {
+    let ledger = read_ledger(pool)?;
+    let slot = ledger
+        .slots
+        .iter()
+        .find(|slot| slot.id == slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    let identity = fixture_custody_identity(pool, slot)?;
+    super::custody::create(pool, &identity, None)
+}
+
+/// Run the production legacy-journal migration for one record without the pool
+/// lock (the real migration runs under it) and return the held custody lock.
+/// Used by the two-descriptor migration regression: the migrated record must be
+/// published only under a lock this process actually holds.
+#[cfg(test)]
+pub(super) fn migrate_legacy_locked_injected(
+    pool: &Path,
+    slot_id: u64,
+) -> Result<super::custody::CustodyLock, LeaseError> {
+    let mut opened = Pool::open_passive(pool, ACCOUNTING_MAX_ELAPSED_MS)?;
+    opened
+        .migrate_legacy_deletion(slot_id)?
+        .ok_or(LeaseError::UnknownAccounting)
+}
+
 /// Rewrite one published custody journal in place, claiming its lock exactly
 /// as a claimant does. Used by tests to model a later crash boundary.
 #[cfg(test)]
@@ -1153,6 +1183,17 @@ pub(super) fn rewrite_custody_journal_injected(
         Claim::Claimed(mut lock) => lock.replace_journal(Some(journal)).map_err(LeaseError::Io),
         Claim::Busy | Claim::Unknown => Err(LeaseError::UnknownAccounting),
     }
+}
+
+/// The recorded custody reference of one slot, read straight from the ledger.
+#[cfg(test)]
+pub(super) fn recorded_custody_injected(pool: &Path, slot_id: u64) -> Option<DeletionCustody> {
+    read_ledger(pool)
+        .ok()?
+        .slots
+        .iter()
+        .find(|slot| slot.id == slot_id)
+        .and_then(|slot| slot.custody.clone())
 }
 
 /// The recorded deletion journal of one slot, read without opening (and
@@ -1239,7 +1280,6 @@ impl Pool {
             limits: accounting_limits(),
             deadline: None,
             reconciliation_blocked: false,
-            reconciliation_unresolved: false,
             admission_note: None,
             reserve: None,
         };
@@ -1281,7 +1321,6 @@ impl Pool {
             // Coverage for a measurement made without reconciliation is
             // unknown while a recorded deletion is pending.
             reconciliation_blocked: pending,
-            reconciliation_unresolved: false,
             admission_note: None,
             reserve: None,
         })
@@ -1393,13 +1432,9 @@ impl Pool {
     }
 
     fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
-        // A journaled deletion whose recorded root is at neither of its names
-        // leaves the ledger uncertain: no new lease is admitted until it is
-        // resolved (oxide#175 capture recovery, oxide#177 single-journal
-        // guard). Other blocked recoveries are charged, not refused.
-        if self.reconciliation_unresolved {
-            return Err(LeaseError::UnknownAccounting);
-        }
+        // Per-object failure (oxide#175 ruling B): a recorded deletion that
+        // could not be classified stays isolated and conservatively charged
+        // through `slot_figure`, and never refuses an unrelated admission.
         if let Some(budget) = request.budget_bytes {
             if budget == 0 {
                 return Err(LeaseError::InvalidInput("budget must be positive"));
@@ -2770,12 +2805,9 @@ impl Pool {
         profile: Profile,
     ) -> Result<(), LeaseError> {
         // Per-object failure (oxide#175 ruling B): a pending deletion of
-        // another slot no longer refuses this one. Only a journaled root that
-        // is at neither of its names leaves the ledger unclassifiable, and that
-        // refusal is already what `lease()` returns.
-        if self.reconciliation_unresolved {
-            return Err(LeaseError::UnknownAccounting);
-        }
+        // another slot — blocked, unclassifiable or missing its root — never
+        // refuses this eligible slot's deletion. The pending record keeps its
+        // own charge and custody, and this open's coverage stays unknown.
         // Every durable idle deletion, including the explicit
         // `evict_idle_slot` path, checks the rank sequence before its first
         // transition: an exhausted or missing-headroom sequence refuses
@@ -3002,14 +3034,12 @@ impl Pool {
             custody.retire();
             return Ok(());
         }
+        // A missing, uncertain or unclassifiable root keeps this object only:
+        // its record, charge, custody and journal stay, and the open continues
+        // with every other slot.
         let held_root = match self.pending_root_ready(&path, journal.as_ref()) {
             Some(root) => root,
-            None => {
-                if self.recorded_root_is_untracked(&path, journal.as_ref()) {
-                    self.reconciliation_unresolved = true;
-                }
-                return Err(LeaseError::UnknownAccounting);
-            }
+            None => return Err(LeaseError::UnknownAccounting),
         };
         let expected = match descriptor_identity(held_root.as_fd()) {
             Ok(identity) => identity,
@@ -3046,21 +3076,6 @@ impl Pool {
         self.drop_deletion_record(id, incarnation, &custody.record())?;
         custody.retire();
         Ok(())
-    }
-
-    /// A journaled pending root that is at neither its original nor its
-    /// private recorded name cannot be reconciled; it stays pending and no new
-    /// lease is admitted. A root that is still present (a collision or an
-    /// unjournaled pending tree) is charged conservatively instead.
-    fn recorded_root_is_untracked(&self, path: &Path, journal: Option<&DeletionJournal>) -> bool {
-        let Some(journal) = journal else {
-            return false;
-        };
-        let private = path
-            .parent()
-            .map(|parent| parent.join(&journal.root.private));
-        fs::symlink_metadata(path).is_err()
-            && private.is_none_or(|private| fs::symlink_metadata(private).is_err())
     }
 
     /// An uncertain or partially inventoried pending root is isolated before
@@ -4879,7 +4894,6 @@ pub(super) fn volume_pool_for_test(
         limits: accounting_limits(),
         deadline: None,
         reconciliation_blocked: false,
-        reconciliation_unresolved: false,
         admission_note: None,
         reserve,
     })
