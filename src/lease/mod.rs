@@ -224,16 +224,20 @@ pub enum LeaseError {
     /// A bounded accounting walk that admission, reuse or eviction needed
     /// did not complete. Same reason and exit code as `UnknownAccounting`.
     AccountingIncomplete(Box<AccountingScan>),
-    /// Byte capacity could not admit this admission because the slots a
-    /// partial walk left unmeasured are charged conservatively and are never
-    /// evicted on that charge (oxide#186). A bounded capacity refusal: exit
-    /// code 3, the same capacity class as [`LeaseError::Full`], and never
+    /// Capacity could not admit this admission because the slots a partial
+    /// walk left unmeasured are charged conservatively and are never evicted on
+    /// that charge (oxide#186). A bounded capacity refusal: exit code 3, the
+    /// same capacity class as [`LeaseError::Full`], and never
     /// `unknown_accounting`, because no shared authority is unknown. It names
     /// at most [`MAX_REFUSAL_SLOTS`] slots and counts the rest, so one refusal
     /// line stays bounded at the slot ceiling.
     CapacityCharged {
-        measured: u64,
-        limit: u64,
+        /// The conservative pool figure and its budget for a byte-pressure
+        /// refusal, or `None` when the refusal is that a requested idle-slot
+        /// count replacement could not be honoured — a count decision, never a
+        /// byte one, which has no honest byte figure to print.
+        measured: Option<u64>,
+        limit: Option<u64>,
         /// Every slot this admission charged conservatively, in slot order.
         unmeasured: Vec<UnmeasuredSlot>,
     },
@@ -336,11 +340,18 @@ impl std::fmt::Display for LeaseError {
                     .take(MAX_REFUSAL_SLOTS)
                     .map(|slot| slot.slot_id.as_str())
                     .collect();
-                write!(
-                    formatter,
-                    "pool cap cannot admit a new slot: {measured} of {limit} bytes charged; unmeasured slot(s) {}",
-                    named.join(", ")
-                )?;
+                match (measured, limit) {
+                    (Some(measured), Some(limit)) => write!(
+                        formatter,
+                        "pool cap cannot admit a new slot: {measured} of {limit} bytes charged; unmeasured slot(s) {}",
+                        named.join(", ")
+                    )?,
+                    _ => write!(
+                        formatter,
+                        "the requested idle-slot replacement cannot be honoured: unmeasured slot(s) {}",
+                        named.join(", ")
+                    )?,
+                }
                 if let Some(more) = unmeasured.len().checked_sub(named.len()).filter(|n| *n > 0) {
                     write!(formatter, " and {more} more")?;
                 }

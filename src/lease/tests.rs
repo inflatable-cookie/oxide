@@ -3838,9 +3838,9 @@ fn a_bounded_capacity_refusal_names_at_most_eight_slots() {
         })
         .collect();
     let error = LeaseError::CapacityCharged {
-        measured: 4096,
-        limit: 2048,
-        unmeasured,
+        measured: Some(4096),
+        limit: Some(2048),
+        unmeasured: unmeasured.clone(),
     };
     assert_eq!(error.reason(), "full");
     assert_eq!(error.exit_code(), 3);
@@ -3850,6 +3850,30 @@ fn a_bounded_capacity_refusal_names_at_most_eight_slots() {
         "{text}"
     );
     assert!(text.contains("never evicted on a partial walk"), "{text}");
+    assert!(text.len() < 400, "the refusal is not bounded: {text}");
+    // A count replacement the admission could not honour is a count decision:
+    // it prints no byte figure, still names at most eight slots, and refuses
+    // in the same capacity class.
+    let error = LeaseError::CapacityCharged {
+        measured: None,
+        limit: None,
+        unmeasured,
+    };
+    assert_eq!(error.reason(), "full");
+    assert_eq!(error.exit_code(), 3);
+    let text = error.to_string();
+    assert!(
+        text.starts_with("the requested idle-slot replacement cannot be honoured"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unmeasured slot(s) 1, 2, 3, 4, 5, 6, 7, 8 and 120 more"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("bytes"),
+        "a count refusal claimed a byte figure: {text}"
+    );
     assert!(text.len() < 400, "the refusal is not bounded: {text}");
 }
 
@@ -4092,10 +4116,10 @@ fn a_conservative_charge_that_cannot_fit_refuses_only_that_admission() {
             limit,
             unmeasured: named,
         } => {
-            assert_eq!(*limit, cap);
+            assert_eq!(*limit, Some(cap));
             assert!(
-                *measured >= cap,
-                "the refusal does not report the charged figure: {measured}"
+                measured.is_some_and(|measured| measured >= cap),
+                "the refusal does not report the charged figure: {measured:?}"
             );
             assert_eq!(named.len(), 1, "the refusal names exactly the charged slot");
             assert_eq!(named[0].slot_id, unmeasured.to_string());
@@ -4129,8 +4153,40 @@ fn a_conservative_charge_that_cannot_fit_refuses_only_that_admission() {
     assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
 }
 
+/// The front door names an idle slot to retire when a project is at its
+/// twelve-slot cap (`PROJECT_SLOT_CAP` is a front-door policy). The library
+/// contract that keeps that cap is: a count replacement either retires exactly
+/// the named slot and allocates the new one, or the whole admission refuses.
+/// It never allocates without the replacement and never substitutes a slot the
+/// caller did not choose. `project_replacement_requires_complete_accounting_
+/// before_deletion` covers the honoured path; this test covers the refusal a
+/// partial walk forces, and asserts the slot count is unchanged either way.
 #[test]
-fn a_named_count_replacement_keeps_a_slot_its_walk_could_not_measure() {
+fn a_named_count_replacement_refuses_rather_than_exceeding_the_project_cap() {
+    // Control: the same request against a slot with a current record retires
+    // it and allocates one slot, so the count decision itself still works.
+    let control_fx = Fixture::new("replacement-control");
+    let (control_pool, control_target, control_path, control_workspace) =
+        released_idle_slot(&control_fx, "control", 64 * 1024 * 1024);
+    let mut control = request(
+        &control_pool,
+        &control_fx.dir("control-other-project"),
+        &control_workspace,
+        "control",
+    );
+    control.replace_slot = Some(control_target);
+    let granted = lease_injected(control).expect("a verified replacement is honoured");
+    assert!(
+        !control_path.exists(),
+        "the verified victim was not retired"
+    );
+    let view = managed::ledger_view(&control_pool).expect("ledger view");
+    assert_eq!(view.slots.len(), 1);
+    assert!(view
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == granted.slot_id));
+
     let fx = Fixture::new("unmeasured-replacement");
     let (pool, unmeasured, unmeasured_path, workspace) =
         released_idle_slot(&fx, "replacement", 64 * 1024 * 1024);
@@ -4138,36 +4194,55 @@ fn a_named_count_replacement_keeps_a_slot_its_walk_could_not_measure() {
     let before = snapshot_tree(&unmeasured_path);
     let mut replacement = request(&pool, &fx.dir("other-project"), &workspace, "other");
     replacement.replace_slot = Some(unmeasured);
-    // A named replacement is a candidate like any other: its own partial walk
-    // never authorises its deletion (oxide#186), so the replacement is skipped
-    // and the ordinary rules decide the admission.
-    let (admitted, charges) = elapsed_admission(&fx, &unmeasured_path, || {
+    // The caller named this slot to stay at its project cap. Its own partial
+    // walk never authorises its deletion (oxide#186), and substituting another
+    // slot or admitting without the replacement would break the caller's count
+    // decision, so only this admission refuses and names the slot.
+    let refused = elapsed_admission(&fx, &unmeasured_path, || {
         super::pool::lease_with_charges_injected(replacement)
     })
-    .expect("the named replacement is skipped and the admission continues");
-    assert_eq!(charges, vec![(unmeasured, 1)]);
-    assert!(!admitted.grant.reused_slot);
-    assert_ne!(admitted.grant.slot_id, unmeasured.to_string());
+    .expect_err("a replacement whose walk was partial refuses this admission");
+    match &refused {
+        LeaseError::CapacityCharged {
+            measured,
+            limit,
+            unmeasured: named,
+        } => {
+            assert_eq!(*measured, None, "a count refusal claimed a byte figure");
+            assert_eq!(*limit, None, "a count refusal claimed a byte budget");
+            assert_eq!(named.len(), 1);
+            assert_eq!(named[0].slot_id, unmeasured.to_string());
+            let text = refused.to_string();
+            assert!(
+                text.starts_with("the requested idle-slot replacement cannot be honoured"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("slot(s) {unmeasured}")),
+                "the refusal does not name the unmeasured slot: {text}"
+            );
+        }
+        other => panic!("expected a bounded capacity refusal, got {other:?}"),
+    }
+    assert_eq!(refused.reason(), "full");
+    assert_eq!(refused.exit_code(), 3);
     assert!(
         unmeasured_path.is_dir(),
         "a named replacement deleted a slot whose walk was partial"
     );
     assert_eq!(snapshot_tree(&unmeasured_path), before);
-    let note = admitted.admission_note.as_deref().unwrap_or_default();
-    assert!(
-        note.contains(&format!("replacement slot {unmeasured}")),
-        "the skip was not reported: {note}"
-    );
-    assert!(note.contains("kept"), "{note}");
     let view = managed::ledger_view(&pool).expect("ledger view");
+    // Nothing was allocated and nothing was deleted: the project cannot gain a
+    // slot beyond the ceiling the caller asked to respect.
+    assert_eq!(
+        view.slots.len(),
+        1,
+        "the refused admission still added or removed a slot"
+    );
     assert!(view.slots.iter().any(|slot| {
         slot.slot_id == unmeasured.to_string() && slot.state == SlotOccupancy::Idle
     }));
     assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
-    assert!(view
-        .slots
-        .iter()
-        .any(|slot| slot.slot_id == admitted.grant.slot_id));
 }
 
 #[test]

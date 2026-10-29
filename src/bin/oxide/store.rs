@@ -10176,6 +10176,69 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A refused count replacement never becomes a thirteenth project slot.
+    /// At `PROJECT_SLOT_CAP` the front door asks the library to retire one
+    /// named idle slot; when the library refuses that candidate (here because
+    /// its recorded root no longer resolves) the command fails with the
+    /// bounded reason and the pool keeps exactly its capped slot count. The
+    /// library-side refusal for a slot whose own accounting walk was partial
+    /// (`a_named_count_replacement_refuses_rather_than_exceeding_the_project_
+    /// cap`) reaches the same front-door path.
+    #[test]
+    fn a_refused_count_replacement_never_adds_a_thirteenth_project_slot() {
+        let (root, store, key) = class_fixture("cap-refused-replacement");
+        let mut normal = Vec::new();
+        while normal.len() < PROJECT_SLOT_CAP {
+            normal.push(lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("normal"));
+        }
+        // Free one record and its lock so it becomes the cap's replacement
+        // candidate, then make the recorded slot root unresolvable.
+        let victim = normal.pop().expect("a released slot");
+        let victim_slot = victim.slot_id.clone();
+        store.release(victim, None).unwrap();
+        let view = store.ledger().unwrap();
+        let dir = view
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == victim_slot)
+            .and_then(|slot| slot.dir.clone())
+            .expect("the victim's recorded directory");
+        let slot_root = store.payload.join("slots").join(&dir);
+        fs::remove_dir_all(&slot_root).unwrap();
+        fs::write(&slot_root, b"not a directory").unwrap();
+
+        let (ticket, _file) = store.register_ticket().unwrap();
+        let outcome = store.attempt(
+            ticket,
+            &key,
+            Profile::Quick,
+            16,
+            WorkspaceAdmission::NORMAL,
+            false,
+            None,
+        );
+        store.remove_ticket(ticket).unwrap();
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("a refused replacement admitted or waited instead"),
+        };
+        assert!(
+            error.contains("cannot lease a slot"),
+            "the refusal is not the bounded capacity shape: {error}"
+        );
+        let view = store.ledger().unwrap();
+        assert_eq!(
+            view.slots.len(),
+            PROJECT_SLOT_CAP,
+            "the refused replacement still added a slot"
+        );
+        assert!(view.slots.iter().any(|slot| slot.slot_id == victim_slot));
+        for held in normal {
+            drop(held);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// The twelve-slot project cap counts **normal** slots only (§5.3): a
     /// one-use admission is never blocked by it, and a one-use slot never
     /// relieves it — the cap path can only evict a normal slot, and it refuses

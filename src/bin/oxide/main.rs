@@ -2713,23 +2713,6 @@ mod tests {
     /// byte figure and never free quota. A pool with no one-use member prints
     /// no line, which is every pool a dormant build can produce.
     #[test]
-    /// A slot whose last walk stopped partial is rendered as
-    /// `not measured (walk incomplete)` and never with a figure (oxide#186).
-    #[test]
-    fn an_incomplete_walk_slot_line_says_not_measured() {
-        let mut slot = view("7", None, "/work/tmp/repo");
-        slot.size = store::SlotSize::NotMeasured(store::INCOMPLETE_WALK.to_owned());
-        let line = slot_line(&slot, "idle", "/work/tmp/repo");
-        assert!(
-            line.contains("not measured (walk incomplete)"),
-            "the status line does not report the incomplete walk: {line}"
-        );
-        assert!(
-            !line.contains("MiB"),
-            "the status line claimed a size: {line}"
-        );
-    }
-
     fn one_use_status_labels_are_bounded_and_normal_pools_add_nothing() {
         let normal = view("1", None, "/work/tmp/repo");
         let normal_line = slot_line(&normal, "idle", "/work/tmp/repo");
@@ -2775,6 +2758,23 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("MiB") && !line.contains("bytes"), "{line}");
+    }
+
+    /// A slot whose last walk stopped partial is rendered as
+    /// `not measured (walk incomplete)` and never with a figure (oxide#186).
+    #[test]
+    fn an_incomplete_walk_slot_line_says_not_measured() {
+        let mut slot = view("7", None, "/work/tmp/repo");
+        slot.size = store::SlotSize::NotMeasured(store::INCOMPLETE_WALK.to_owned());
+        let line = slot_line(&slot, "idle", "/work/tmp/repo");
+        assert!(
+            line.contains("not measured (walk incomplete)"),
+            "the status line does not report the incomplete walk: {line}"
+        );
+        assert!(
+            !line.contains("MiB"),
+            "the status line claimed a size: {line}"
+        );
     }
 
     /// Equal slot numbers in two pools stay distinct by label and place;

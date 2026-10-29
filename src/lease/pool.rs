@@ -2233,14 +2233,17 @@ impl Pool {
         self.pressure_known_or_bounded_removable()?;
         // The named slot is a candidate like any other: a partial walk proves
         // nothing about its bytes, so it is kept even when it is the slot this
-        // replacement names (oxide#186). The value, not the name, decides a
-        // deletion. The admission continues and the ordinary count and byte
-        // rules pick a verified candidate instead.
+        // replacement names (oxide#186). Substituting an unrelated slot would
+        // delete storage the caller did not choose, and admitting without the
+        // replacement would break the project cap the caller asked to keep, so
+        // only this admission refuses, naming the slot. The value decides, not
+        // the name.
         if self.unmeasured.contains_key(&id) {
-            self.admission_note = Some(format!(
-                "replacement slot {id} could not be measured completely, so it was kept; the ordinary count and byte rules decide this admission"
-            ));
-            return Ok(());
+            return Err(LeaseError::CapacityCharged {
+                measured: None,
+                limit: None,
+                unmeasured: self.unmeasured_slots(),
+            });
         }
         let Some((incarnation, project, profile)) = self
             .slot(id)
@@ -2560,8 +2563,8 @@ impl Pool {
             return LeaseError::Full;
         }
         LeaseError::CapacityCharged {
-            measured,
-            limit: self.budget,
+            measured: Some(measured),
+            limit: Some(self.budget),
             unmeasured: self.unmeasured_slots(),
         }
     }

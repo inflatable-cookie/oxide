@@ -458,12 +458,15 @@ any, the largest recorded slot in the pool)`, at least one byte and never the
 whole budget. It is **kept**: the charge lives only in that admission, no
 record is published, and the slot is never a victim, never reused and never
 adopted on that walk. That holds for a **named count replacement** too: the
-front-door names a victim by recorded rank, and the value decides, not the
-name, so a slot whose own walk was partial is skipped with one bounded note
-and the ordinary count and byte rules select a verified candidate instead. The
-admission continues under the charge and refuses only itself, with a bounded
-capacity reason that names the slot (`full`, at most eight IDs then a count),
-when the pool genuinely cannot fit; a charge that
+front door names a victim by recorded rank and the value decides, not the name,
+so a slot whose own walk was partial is never retired. Substituting an unrelated
+slot would delete storage the caller did not choose, and admitting without the
+replacement would break the slot-count decision the caller asked to keep
+(`PROJECT_SLOT_CAP`), so that admission alone refuses — `full`, bounded, naming
+the slot — and nothing is deleted or allocated. The
+admission otherwise continues under the charge and refuses only itself, with a
+bounded capacity reason that names the slot (`full`, at most eight IDs then a
+count), when the pool genuinely cannot fit; a charge that
 alone exhausts the budget refuses before deleting anything. This removes a
 refusal and narrows eviction eligibility: it adds **no** deletion path or
 authority. Everything shared still refuses globally — the ledger, config,
