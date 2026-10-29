@@ -238,8 +238,15 @@ The slot compatibility key is repository identity + Oxide recipe key +
 resolved toolchain (`rustc -vV`) + target triple + codegen backend, plus an
 owned checkout's final-output destination (its selected root's kind, real
 path, bound volume and creation generation). An ephemeral or detached
-checkout adds no destination, so its keys are exactly what they were. The
+checkout adds no destination component. The
 recipe key is `quick:dev-recipe-2`, `debug:dev-recipe-2` or `release`.
+The effective incremental setting also partitions slots: `CARGO_INCREMENTAL`
+beats `build.incremental` (including `--config`), which beats the profile's
+setting. An older slot has no recorded setting and is treated as the recipe
+default (incremental on for quick/debug, off for release). An unknown setting
+gets a fresh cold key, never a guessed match. External tools without a global
+`CARGO_INCREMENTAL` override choose their own Cargo configuration and profile,
+so their setting is unknown to Oxide.
 Version 1 keys were the bare `quick` and `debug` of the custom-profile
 recipes, so a slot built by them is never reused for the `dev` recipes: the
 first quick or debug command after the change takes a new slot cold. Older

@@ -32,6 +32,7 @@ impl SlotKey {
         recipe: &str,
         target: Option<&str>,
         destination: &str,
+        incremental: &str,
     ) -> Result<Self, String> {
         let checkout = checkout.to_path_buf();
         let identity = digest(&Identity::infer(&checkout).key());
@@ -57,16 +58,41 @@ impl SlotKey {
         } else {
             format!("\n{destination}")
         };
-        let compatibility = digest(&format!(
-            "{identity}\n{recipe}\n{}\n{target}\n{BACKEND}{destination}",
-            digest(&rustc)
-        ));
+        let compatibility = compatibility_key(
+            &identity,
+            recipe,
+            &rustc,
+            &target,
+            &destination,
+            incremental,
+        );
         Ok(Self {
             checkout,
             identity,
             compatibility,
         })
     }
+}
+
+/// Preserve the old key for the recipe default; only its opposite needs a
+/// discriminator. An empty component retains the legacy key.
+fn compatibility_key(
+    identity: &str,
+    recipe: &str,
+    rustc: &str,
+    target: &str,
+    destination: &str,
+    incremental: &str,
+) -> String {
+    let incremental = if incremental.is_empty() {
+        String::new()
+    } else {
+        format!("\nincremental={incremental}")
+    };
+    digest(&format!(
+        "{identity}\n{recipe}\n{}\n{target}\n{BACKEND}{destination}{incremental}",
+        digest(rustc)
+    ))
 }
 
 /// Canonical workspace root from `cargo locate-project --workspace`.
@@ -503,7 +529,7 @@ mod tests {
         fs::write(workspace.join("src/lib.rs"), "").expect("lib");
         let owned =
             locate_workspace(crate::CARGO, Some(&workspace.join("Cargo.toml"))).expect("workspace");
-        let key = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "").expect("slot key");
+        let key = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "", "").expect("slot key");
         assert_eq!(key.checkout, workspace);
         assert!(matches!(Identity::infer(&workspace), Identity::Path(path) if path == workspace));
         let identity = digest(&format!("path:{}", workspace.display()));
@@ -517,6 +543,15 @@ mod tests {
             ))
         );
         fs::remove_dir_all(&dir).expect("remove scratch");
+    }
+
+    #[test]
+    fn incremental_discriminator_separates_slots_and_reuses_the_same_key() {
+        let key = |setting| compatibility_key("repo", "quick", "compiler", "target", "", setting);
+        assert_ne!(key(""), key("false"));
+        assert_ne!(key("true"), key("false"));
+        assert_eq!(key("false"), key("false"));
+        assert_eq!(key(""), key(""));
     }
 
     /// A real final-output destination is part of the compatibility key; an
@@ -535,10 +570,10 @@ mod tests {
         let owned =
             locate_workspace(crate::CARGO, Some(&workspace.join("Cargo.toml"))).expect("workspace");
         let ephemeral =
-            SlotKey::resolve_in(&owned, "quick", Some("x-target"), "").expect("slot key");
-        let external = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "outputs-1 x")
+            SlotKey::resolve_in(&owned, "quick", Some("x-target"), "", "").expect("slot key");
+        let external = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "outputs-1 x", "")
             .expect("slot key");
-        let local = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "outputs-1 y")
+        let local = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "outputs-1 y", "")
             .expect("slot key");
         assert_eq!(ephemeral.identity, external.identity);
         assert_ne!(ephemeral.compatibility, external.compatibility);
