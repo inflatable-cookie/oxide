@@ -987,6 +987,11 @@ def run_proof(scratch: str, commit: str, tree: str, runner_sha: str) -> None:
         "live_pool": False,
         "result": "pass",
     }
+    if DIAGNOSTIC:
+        # A diagnostic is never a PASS: main writes its `qualified: false`
+        # receipt and this counted-shape document is not emitted.
+        print(json.dumps(receipt, indent=2, sort_keys=True), flush=True)
+        return
     write_receipt(receipt)
     print(json.dumps(receipt, indent=2, sort_keys=True), flush=True)
 
