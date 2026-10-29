@@ -2089,23 +2089,30 @@ impl Store {
     /// Release after every writer in the group has exited, recording the
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
-        let _admission = self.admission()?;
-        if !self.discard_scratch(&held) || !self.flush_before_idle(&held.slot_id, held.record)? {
+        let _admission =
+            oxide_storage::release_trace::phase("admission lock", || self.admission())?;
+        if !oxide_storage::release_trace::phase("temporary directory removal", || {
+            self.discard_scratch(&held)
+        }) || !oxide_storage::release_trace::phase("removable flush", || {
+            self.flush_before_idle(&held.slot_id, held.record)
+        })? {
             return Ok(());
         }
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
-        let mut state = self.load()?;
-        if let Some(index) = state
-            .records
-            .iter()
-            .position(|record| record.id == held.record)
-        {
-            state.settle_idle(index);
-            state.touch(index)?;
-            self.write_origin(held.record, state.records[index].last_used, origin)?;
-        }
-        self.save(&state)
+        oxide_storage::release_trace::phase("origin and control write", || {
+            let mut state = self.load()?;
+            if let Some(index) = state
+                .records
+                .iter()
+                .position(|record| record.id == held.record)
+            {
+                state.settle_idle(index);
+                state.touch(index)?;
+                self.write_origin(held.record, state.records[index].last_used, origin)?;
+            }
+            self.save(&state)
+        })
     }
 
     /// The gate refused a slot taken from another checkout before Cargo ran:

@@ -758,7 +758,8 @@ pub mod managed {
     }
 
     pub fn release(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-        Pool::open(pool)?.release_or_recover(lease_id, false)
+        crate::release_trace::phase("pool open", || Pool::open_for_release(pool))?
+            .release_or_recover(lease_id, false)
     }
 
     pub fn recover(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
@@ -1100,10 +1101,22 @@ impl Pool {
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
     pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
+        Self::open_inner(root, false)
+    }
+
+    fn open_for_release(root: &Path) -> Result<Self, LeaseError> {
+        Self::open_inner(root, true)
+    }
+
+    fn open_inner(root: &Path, trace_release: bool) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
-        let lock = lock_pool(&root)?;
+        let lock = if trace_release {
+            crate::release_trace::phase("pool lock", || lock_pool(&root))?
+        } else {
+            lock_pool(&root)?
+        };
         // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
@@ -1145,7 +1158,11 @@ impl Pool {
             admission_note: None,
             reserve: None,
         };
-        pool.reconcile_evicting()?;
+        if trace_release {
+            crate::release_trace::phase("pool reconciliation", || pool.reconcile_evicting())?;
+        } else {
+            pool.reconcile_evicting()?;
+        }
         Ok(pool)
     }
 
@@ -1995,13 +2012,14 @@ impl Pool {
         // removable flush: one bounded walk of this slot while its metadata is
         // warm. A failure leaves the slot honestly unrecorded and never fails
         // an otherwise successful release.
-        let recorded = self.measure_for_release(index);
+        let recorded =
+            crate::release_trace::phase("release walk", || self.measure_for_release(index));
         self.ledger.slots[index].state = SlotPersistState::Idle;
         self.ledger.slots[index].lease_id = None;
         self.ledger.slots[index].recorded = recorded;
         let released = self.ledger.slots[index].id;
         self.stamp_rank(released)?;
-        self.persist_revised()?;
+        crate::release_trace::phase("ledger write", || self.persist_revised())?;
         Ok(ReleaseReceipt {
             version: LEASE_VERSION,
             lease_id: lease_id.to_owned(),

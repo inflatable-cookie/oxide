@@ -4,6 +4,9 @@
 #[cfg(all(test, unix))]
 mod test_fs;
 
+/// Opt-in diagnostics for lease closeout.
+pub mod release_trace;
+
 /// Bounded read-only inventory of one explicitly selected target directory.
 #[cfg(unix)]
 pub mod inventory;
