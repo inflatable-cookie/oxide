@@ -371,7 +371,7 @@ pub(super) fn create(
     // Test-only: one injected staging failure, used to prove that a legacy
     // record whose custody cannot be created keeps only itself.
     #[cfg(test)]
-    if crate::test_fs::take_custody_create_failure() {
+    if crate::test_fs::take_custody_create_failure(identity.slot) {
         return Err(LeaseError::Io(
             "test: injected custody staging failure".to_owned(),
         ));

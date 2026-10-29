@@ -460,11 +460,27 @@ is the foundation slice 2 moves out of the lock:
   in-memory ledger. Staging happens before any ledger change, a failed staging
   or publish publishes nothing and restores the in-memory ledger (orphan
   custody directories are never deletion authority), and the next open
-  retries. While a legacy journal remains, a revised write keeps the
-  predecessor fence (policy 3 or 4) instead of publishing policy 5, because a
-  policy-5 ledger may not carry a `capture`; unrelated admissions, releases and
-  other writes therefore proceed, and no new deletion is started until the
-  journal is migrated (a per-object refusal, not a global one).
+  retries.
+  While a legacy journal remains, a revised write keeps the predecessor fence
+  (policy 3 or 4) instead of publishing policy 5, because a policy-5 ledger may
+  not carry a `capture`; unrelated admissions, releases and other writes
+  therefore proceed. An independent eligible idle slot can still be deleted:
+  while any in-ledger journal remains, that victim's own deletion uses the
+  predecessor's **in-ledger** journal representation (the same #155 capture,
+  ordering and replay semantics, written with the same atomic ledger
+  replacement) instead of a custody directory, so the ledger stays valid and
+  the fence stays at the predecessor level; only the record whose custody could
+  not be staged keeps its journal and charge. Once the legacy journals migrate,
+  new deletions return to the custody representation.
+  The ledger replacement is a temp write, `fsync`, `rename`, then a parent
+  `fsync` (`persist_private_file`). A failure **after** the rename leaves the
+  durable outcome uncertain: the new, complete revision is already visible but
+  its durability is not proven, so the caller reports an error and must never
+  claim the previous bytes survived. This binary restores its in-memory ledger
+  and makes no further effect in that open; the next reader takes whichever
+  complete revision is present, validates it and repairs nothing (a parent-sync
+  failure after the rename is covered by
+  `lease::tests::a_parent_sync_failure_after_the_rename_leaves_an_uncertain_valid_revision`).
 - **Final record removal.** While still holding custody, the final transaction
   reloads the ledger from disk and drops only the matching id, incarnation and
   custody nonce (preserving every concurrent update), syncs it, then removes
@@ -474,8 +490,9 @@ is the foundation slice 2 moves out of the lock:
   journaled root that is at neither its original nor its private name, and a
   legacy record whose custody cannot be staged — keeps its record, conservative
   charge, custody and journal, and does not refuse an unrelated admission,
-  release or another eligible idle slot's explicit deletion; only backing,
-  ledger or fence integrity is global. The oxide#177 single-journal
+  release or another eligible idle slot's explicit deletion (in explicit,
+  count-pressure and byte-pressure deletion). Only backing, ledger or fence
+  integrity is global. The oxide#177 single-journal
   guard is retired: journals no longer share the ledger's byte bound, so
   several pending deletions can coexist.
 

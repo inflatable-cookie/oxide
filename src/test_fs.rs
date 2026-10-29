@@ -755,8 +755,18 @@ pub(crate) fn run_after_custody_lock() {
     }
 }
 
+/// One armed custody staging failure. `slot: None` fails the next attempt for
+/// any slot; `Some(id)` fails every attempt for that slot until the guard is
+/// dropped.
+struct CustodyCreateFailure {
+    slot: Option<u64>,
+    remaining: usize,
+}
+
 thread_local! {
-    static CUSTODY_CREATE_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static CUSTODY_CREATE_FAILURE: RefCell<Option<CustodyCreateFailure>> =
+        const { RefCell::new(None) };
+    static PARENT_SYNC_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Arm one custody staging failure. A test uses this to model a legacy journal
@@ -768,7 +778,25 @@ pub(crate) struct CustodyCreateFailureGuard {
 }
 
 pub(crate) fn fail_next_custody_create() -> CustodyCreateFailureGuard {
-    CUSTODY_CREATE_FAILURE.with(|cell| cell.set(true));
+    CUSTODY_CREATE_FAILURE.with(|cell| {
+        *cell.borrow_mut() = Some(CustodyCreateFailure {
+            slot: None,
+            remaining: 1,
+        });
+    });
+    CustodyCreateFailureGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+/// Arm a persistent staging failure for exactly one slot's custody.
+pub(crate) fn fail_custody_create_for_slot(slot: u64) -> CustodyCreateFailureGuard {
+    CUSTODY_CREATE_FAILURE.with(|cell| {
+        *cell.borrow_mut() = Some(CustodyCreateFailure {
+            slot: Some(slot),
+            remaining: usize::MAX,
+        });
+    });
     CustodyCreateFailureGuard {
         _thread_bound: PhantomData,
     }
@@ -776,12 +804,53 @@ pub(crate) fn fail_next_custody_create() -> CustodyCreateFailureGuard {
 
 impl Drop for CustodyCreateFailureGuard {
     fn drop(&mut self) {
-        CUSTODY_CREATE_FAILURE.with(|cell| cell.set(false));
+        CUSTODY_CREATE_FAILURE.with(|cell| *cell.borrow_mut() = None);
     }
 }
 
-/// Consume the armed staging failure, if any. One-shot: the first `create`
-/// after arming fails and every later one proceeds.
-pub(crate) fn take_custody_create_failure() -> bool {
-    CUSTODY_CREATE_FAILURE.with(|cell| cell.replace(false))
+/// Consume one armed staging failure for `slot`, if the armed fault matches.
+/// A one-shot fault is removed after it fires; a slot-scoped fault stays until
+/// its guard is dropped.
+pub(crate) fn take_custody_create_failure(slot: u64) -> bool {
+    CUSTODY_CREATE_FAILURE.with(|cell| {
+        let mut armed = cell.borrow_mut();
+        let Some(fault) = armed.as_mut() else {
+            return false;
+        };
+        if fault.remaining == 0 || fault.slot.is_some_and(|armed| armed != slot) {
+            return false;
+        }
+        if fault.slot.is_none() {
+            fault.remaining -= 1;
+            if fault.remaining == 0 {
+                *armed = None;
+            }
+        }
+        true
+    })
+}
+
+/// Arm one failure of the parent-directory `fsync` that follows a ledger
+/// rename, so a test can exercise the post-rename durability boundary.
+#[must_use = "dropping the guard ends the armed failure"]
+pub(crate) struct ParentSyncFailureGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn fail_next_parent_sync() -> ParentSyncFailureGuard {
+    PARENT_SYNC_FAILURE.with(|cell| cell.set(true));
+    ParentSyncFailureGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for ParentSyncFailureGuard {
+    fn drop(&mut self) {
+        PARENT_SYNC_FAILURE.with(|cell| cell.set(false));
+    }
+}
+
+/// Consume the armed parent-sync failure, if any (one-shot).
+pub(crate) fn take_parent_sync_failure() -> bool {
+    PARENT_SYNC_FAILURE.with(|cell| cell.replace(false))
 }

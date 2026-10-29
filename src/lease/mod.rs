@@ -835,6 +835,18 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    // The rename already landed: a parent-sync failure here leaves the durable
+    // outcome uncertain (the new bytes are visible but their durability is not
+    // proven). Callers treat the error as "unknown", never as proof that the
+    // previous bytes survived; the next reader takes whichever complete
+    // revision is present and validates it.
+    #[cfg(test)]
+    if crate::test_fs::take_parent_sync_failure() {
+        return Err(io_error(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "test: parent sync failed after rename",
+        )));
+    }
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(io_error)
