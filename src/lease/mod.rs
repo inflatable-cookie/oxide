@@ -79,9 +79,10 @@ pub const LEGACY_MAX_SLOTS: usize = 128;
 /// blocked record, so one open can leave a journal for every failing pending
 /// deletion, up to `MAX_SLOTS`. A write above this cap is refused, so a durable
 /// ledger still never exceeds it, but the 5,624,335-byte state is the maximal
-/// ordinary-path state, not a bound on recovery. The per-command growth the
-/// size-based control fence assumes is therefore not established for recovery;
-/// that is an open design question (see `MAX_LEDGER_GROWTH`). A maximal journal
+/// ordinary-path state, not a bound on recovery. The front door's admission
+/// gate makes the version-7 control fence durable before any locked open it
+/// performs (oxide#177, fence first), so recovery, journal starts and ledger
+/// writes are all preceded by the hand-off fence. A maximal journal
 /// is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture records and
 /// `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a chain of at
 /// most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the enforced

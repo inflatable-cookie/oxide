@@ -764,24 +764,6 @@ pub mod managed {
         Pool::open(pool)?.ledger_view()
     }
 
-    /// The ledger file's current byte length, read from no-follow metadata
-    /// without parsing it, or `None` when the pool has no ledger yet. The
-    /// front door uses it for the forward control fence: an older installed
-    /// binary reads at most its own 2 MiB ledger limit, so the newer binary
-    /// must make the raised-ceiling control fence durable before a write can
-    /// push this file past that limit (oxide#177).
-    pub fn ledger_file_bytes(pool: &Path) -> Result<Option<u64>, LeaseError> {
-        match std::fs::symlink_metadata(pool.join(LEDGER_NAME)) {
-            Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.len())),
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                Err(LeaseError::UnsafePath("ledger is a symlink"))
-            }
-            Ok(_) => Err(LeaseError::UnknownAccounting),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(io_error(error)),
-        }
-    }
-
     /// Recorded identity and ledger membership of a pool, read with no lock,
     /// no reconciliation, no creation and no write (oxide#128). A directory
     /// pool's recorded payload root must still be the private, owner-only

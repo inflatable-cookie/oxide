@@ -587,9 +587,10 @@ creates and persists a fresh `SlotCaptureJournal` through `begin`, without the
 `retire_idle_slot` guard; a recoverable inherited journal is rolled back,
 cleared and restarted the same way. A failed deletion deliberately keeps that
 journal, and the loop continues past a blocked record, so one open can leave a
-journal for every failing pending deletion, up to `MAX_SLOTS`. The size-based
-control fence's per-command growth assumption therefore does not cover recovery
-(see the fence paragraph and `MAX_LEDGER_GROWTH`).
+journal for every failing pending deletion, up to `MAX_SLOTS`. The front
+door's admission gate makes the version-7 control fence durable before any
+locked open (see the fence paragraph), so recovery, journal starts and ledger
+writes are all preceded by the hand-off fence.
 
 **Worst-valid byte bound (oxide#177; Supervisor ruling 49081d79).**
 `MAX_LEDGER_BYTES` *is* the worst-valid byte bound: the read and write paths
@@ -636,25 +637,19 @@ above 128 slots without the fence is a state no writer produces and refuses
 too. A pool that stays at or below 128 slots never carries `3`, so its ledger
 stays readable by an older binary. The ledger alone cannot order that switch
 against the [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122),
-which reads control state rather than the ledger, so the same admission that
-can first add the 129th slot also makes a forward-only **version-7** control
-fence durable first (`oxide.slots/256`): an older binary with version ≤ 6 then
-hands off to a receipt-matching successor instead of refusing a ledger this
-one is about to fence. The same fence has a second, size-based trigger at the
-mutating-command gate: the predecessor binary reads at most 2 MiB, and an
-**ordinary admission** can add at most one journal plus a full record refresh
-plus one row, which `MAX_LEDGER_GROWTH` (1 MiB) bounds. A ledger at or above
-1 MiB therefore makes the version-7 fence durable before its next write, so a
-journaled ledger that stays below 128 slots cannot pass the older binary's read
-limit while still at version 5. **Recovery is not covered by that growth
-bound:** one open can start and leave a journal for each failing pending
-`Evicting` record (up to `MAX_SLOTS`), so a recovery command at version 5 could
-push a ledger below the 1 MiB threshold past the predecessor's 2 MiB read limit
-and the older binary would refuse it instead of handing off. Bounding recovery
-growth — a recovery journal limit per command, an unconditional prefix fence
-before opens that can reconcile, or another rule — is an open design question
-referred to the Oxide Supervisor. A pool below both triggers keeps version 5,
-which an older binary still reads directly until a recovery writes more. A completed legacy `Evicting`
+which reads control state rather than the ledger, so the mutating-command
+admission gate makes a forward-only **version-7** control fence durable as the
+command's first write (`oxide.slots/256`, Oxide Supervisor ruling 4c9984a1,
+fence first). The gate runs under the admission lock and before any locked
+`Pool::open` (which reconciles recorded deletions, can start a recovery
+journal and writes the ledger), so every such effect — ordinary eviction,
+recovery, journal start and ledger write — is preceded by the durable fence. An
+older binary with version ≤ 6 then hands off to a receipt-matching successor
+or refuses before it reads the ledger, so no predecessor ledger-size argument
+is needed. An already-version-7 control is not rewritten; a failed fence write
+refuses the command with no ledger or journal write. Passive `status` and
+snapshot readers never take this gate and never fence, so only a pool this
+binary never mutates stays at version 5. A completed legacy `Evicting`
 reconciliation may still finish in the legacy representation. Before a revised write, every
 stored field is validated against the raised caps; an oversized legacy field
 refuses with the original file, ownership and quarantine bytes untouched,

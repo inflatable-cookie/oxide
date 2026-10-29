@@ -2689,8 +2689,9 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
 /// rolled back and cleared), without `retire_idle_slot`'s single-journal guard;
 /// the loop continues past a blocked record and a failed deletion keeps its
 /// journal. One open can therefore leave a journal per failing pending
-/// deletion, which is why the per-command growth the size-based control fence
-/// assumes is not established for recovery (see `MAX_LEDGER_GROWTH`).
+/// deletion. The admission gate makes the version-7 control fence durable
+/// before the open, so this recovery path is preceded by the hand-off fence
+/// (oxide#177, fence first).
 #[test]
 fn recovery_creates_a_journal_for_a_second_pending_deletion() {
     let fixture = Fixture::new("recovery-journal");
