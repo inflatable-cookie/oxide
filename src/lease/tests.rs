@@ -7991,3 +7991,170 @@ fn a_persistent_legacy_staging_fault_still_replays_the_healthy_legacy_record() {
     assert!(!first_path.exists(), "the retained payload survived");
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
+
+/// Read one idle slot's ledger rows ordered by admission rank, with its path
+/// and recorded closed size, for the two-victim tests.
+fn idle_victims(
+    pool: &Path,
+    fixture: &Fixture,
+) -> (
+    serde_json::Value,
+    u64,
+    PathBuf,
+    u64,
+    PathBuf,
+    serde_json::Value,
+) {
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    let mut rows: Vec<serde_json::Value> = document["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .cloned()
+        .collect();
+    rows.sort_by_key(|row| {
+        (
+            row["rank"].as_u64().unwrap_or(0),
+            row["id"].as_u64().unwrap_or(u64::MAX),
+        )
+    });
+    assert_eq!(rows.len(), 2, "the fixture must hold two idle slots");
+    let path = |row: &serde_json::Value| -> PathBuf {
+        let root = pool.join("payload/slots");
+        match row.get("dir").and_then(|dir| dir.as_str()) {
+            Some(dir) => root.join(dir),
+            None => root.join(row["id"].to_string()),
+        }
+    };
+    let oldest = rows[0].clone();
+    let next = rows[1].clone();
+    assert_eq!(oldest["state"], "idle");
+    assert_eq!(next["state"], "idle");
+    let oldest_id = oldest["id"].as_u64().expect("id");
+    let next_id = next["id"].as_u64().expect("id");
+    let oldest_path = path(&oldest);
+    let next_path = path(&next);
+    let _ = fixture;
+    (oldest, oldest_id, oldest_path, next_id, next_path, next)
+}
+
+/// Two idle victims: the oldest one's own custody staging fails persistently,
+/// so admission skips it (isolated, charged, untouched) and deletes the next
+/// eligible idle victim instead. A later request whose remaining charge cannot
+/// fit refuses with `Full`, never a global unknown-accounting failure.
+#[test]
+fn a_failed_oldest_idle_victim_lets_the_next_eligible_victim_serve_admission() {
+    let fixture = Fixture::new("victim-local-failure");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let first = lease_injected(request(
+        &pool,
+        &fixture.dir("project-a"),
+        &fixture.dir("workspace-a"),
+        "a",
+    ))
+    .expect("a");
+    let second = lease_injected(request(
+        &pool,
+        &fixture.dir("project-b"),
+        &fixture.dir("workspace-b"),
+        "b",
+    ))
+    .expect("b");
+    // The closed observation of each victim must be substantial enough for a
+    // budget that needs exactly one deletion.
+    fs::write(
+        first.env.cargo_build_build_dir.join("oldest.blob"),
+        vec![1_u8; 8192],
+    )
+    .expect("oldest blob");
+    fs::write(
+        second.env.cargo_build_build_dir.join("next.blob"),
+        vec![2_u8; 4096],
+    )
+    .expect("next blob");
+    release_injected(&pool, &first.lease_id).expect("release a");
+    release_injected(&pool, &second.lease_id).expect("release b");
+    let (oldest, oldest_id, oldest_path, next_id, next_path, next) = idle_victims(&pool, &fixture);
+    let oldest_recorded = oldest["recorded"]["unique_bytes"]
+        .as_u64()
+        .expect("oldest recorded bytes");
+    let next_recorded = next["recorded"]["unique_bytes"]
+        .as_u64()
+        .expect("next recorded bytes");
+    assert!(
+        next_recorded > 1024,
+        "the next victim's recorded size is too small for the budget split: {next_recorded}"
+    );
+    // Pressure before the pass is the sum; after the next victim goes it is the
+    // faulted oldest's own recorded size, so this budget needs one deletion.
+    let budget = oldest_recorded + 4096;
+
+    let _fault = super::pool::fail_custody_create_for_slot_injected(oldest_id);
+    let mut demand = request(
+        &pool,
+        &fixture.dir("project-c"),
+        &fixture.dir("workspace-c"),
+        "c",
+    );
+    demand.budget_bytes = Some(budget);
+    let granted =
+        lease_injected(demand).expect("the second eligible idle victim must serve the admission");
+    assert_ne!(granted.slot_id, oldest_id.to_string());
+    assert_ne!(granted.slot_id, next_id.to_string());
+    assert!(
+        !next_path.exists(),
+        "the next eligible victim was not deleted"
+    );
+    assert!(oldest_path.is_dir(), "the failed victim was deleted");
+    // The failed victim is isolated and conservatively charged: its record is
+    // byte-identical (id, incarnation, directory, state, recorded size) and it
+    // was never reused.
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    let row = after["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .find(|slot| slot["id"] == serde_json::json!(oldest_id))
+        .expect("the failed victim's record");
+    assert_eq!(
+        row, &oldest,
+        "the failed victim's record changed or was reused"
+    );
+    let (charge, _largest, _observed) =
+        super::pool::pending_charge_injected(&pool, oldest_id).expect("charge");
+    assert!(
+        charge >= oldest_recorded,
+        "the failed victim lost its charge"
+    );
+
+    // The granted slot is held, so the faulted oldest is the only eligible idle
+    // victim. A request over the remaining pressure cannot fit: it must refuse
+    // as capacity, not as a global accounting failure, and keep the victim.
+    let mut tight = request(
+        &pool,
+        &fixture.dir("project-d"),
+        &fixture.dir("workspace-d"),
+        "d",
+    );
+    tight.budget_bytes = Some(1);
+    let refused = lease_injected(tight);
+    assert!(
+        matches!(refused, Err(LeaseError::Full)),
+        "a failed victim left no deletable capacity but admission did not refuse as full: {refused:?}"
+    );
+    assert!(oldest_path.is_dir(), "the failed victim was deleted");
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    let row = after["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .find(|slot| slot["id"] == serde_json::json!(oldest_id))
+        .expect("the failed victim's record");
+    assert_eq!(row, &oldest, "the refusal changed the failed victim");
+    release_injected(&pool, &granted.lease_id).expect("release the admitted slot");
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}

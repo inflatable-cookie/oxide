@@ -1785,34 +1785,57 @@ may return exit 5 without touching any new holder. Do not treat an unknown
 or mistyped ID as evidence that the intended writer ended. A held compatible
 project/profile returns busy rather than allowing a concurrent writer.
 
-A recorded deletion also journals every capture it makes (oxide#155). The slot's
-ledger record carries the root plan — the planned private name, the root's
-`(device, inode)`, the verified parent's `(device, inode)` and the root's full
-`st_mode`, written before the exclusive rename, then the captured phase after it
-and a `removed` phase only once the root's own removal completed — beside a
-record for every nested capture: its private and observed names, its verified
-`(device, inode)` and full mode, and the chain of captured private names that
-locates its parent. A `removed` record follows each successful unlink, and a
-capture that is not the observed object is recorded as a foreign capture before
-any put-back attempt. Replay never unlinks: it restores the recorded modes, puts
-every recorded capture back under its observed name deepest-first, then puts the
-root back with its recorded mode and retries the deletion. Only a recorded root
+A recorded deletion keeps the oxide#155 journal shape, but oxide#181 moved its
+storage. The journal is a bounded, atomically replaced and synced per-deletion
+file inside the deletion's private custody directory
+(`<pool>/oxide-managed/deletions/<nonce>/journal.json`), bound to the deletion
+nonce and the record's identities: store, backend, slot, incarnation and
+recorded directory. The `Evicting` record names that directory and the stable
+lock file's identity instead of carrying the journal. Its content is unchanged:
+the root plan — the planned private name, the root's `(device, inode)`, the
+verified parent's `(device, inode)` and the root's full `st_mode`, written
+before the exclusive rename, then the captured phase after it and a `removed`
+phase only once the root's own removal completed — beside a record for every
+nested capture: its private and observed names, its verified `(device, inode)`
+and full mode, and the chain of captured private names that locates its parent.
+A `removed` record follows each successful unlink, and a capture that is not
+the observed object is recorded as a foreign capture before any put-back
+attempt. Replay never unlinks: it restores the recorded modes, puts every
+recorded capture back under its observed name deepest-first, then puts the root
+back with its recorded mode and retries the deletion. Only a recorded root
 removal completes the record; two absent names without it stay pending, as does
-an unrecorded private name or any recorded foreign capture, and new leases stay
-refused. A record on anything but an `Evicting` slot, or in a shape no writer
-produces, refuses the ledger read. Every journal write is atomic and synced with
-the rest of the ledger, so a crash between any two steps leaves the records
+an unrecorded private name or any recorded foreign capture. A record on anything
+but an `Evicting` slot, or in a shape no writer produces — including one that
+carries both a legacy journal and a custody reference — refuses the ledger read.
+The custody directory, its stable lock and the initial journal are durable
+before the record that references them, and the journal file is atomically
+replaced and synced, so a crash between any two steps leaves the records
 findable.
 
-If an interrupted `Evicting` deletion cannot safely remove its recorded slot
-root or an owned entry, the generation remains `Evicting` and unavailable.
-Status stays bounded and reports unknown accounting; an unrelated held lease
-can still be released. New leases remain refused until the recorded deletion
-can safely finish. A later open resumes only that recorded slot path. Do not
-edit a live ledger, follow/delete a foreign target, or use TTL to clear a
-refusal. Failed provisioning with files beyond the lock can also need explicit
-owner recovery. The focused real run did not exercise eviction or census slot
-symlinks. These limits are separate from its observed reuse result.
+Earlier (before oxide#181) this journal lived in the slot's ledger record. That
+representation is now **legacy**: it is read only for migration, copied
+byte-exactly into a custody file and never reinterpreted. While an unstaged
+legacy journal remains, the ledger keeps the predecessor fence (policy 3 or 4),
+and that record keeps its journal and conservative charge.
+
+If an interrupted or newly selected `Evicting` deletion cannot safely remove
+its recorded slot root or an owned entry, that generation remains `Evicting`,
+isolated and unavailable for lease, adoption or deletion, and conservatively
+charged (the maximum of its recorded closed size and the largest recorded
+slot). Admission never waits for it: a bounded pass skips it and, while another
+eligible idle whole slot exists, deletes that victim instead; the failed victim
+is never reused or deleted by that admission. Status stays bounded and reports
+unknown coverage for the pending object. Unrelated admissions, releases and
+other eligible victims proceed; only a backing, ledger, fence or
+shared-integrity failure refuses globally. A later open resumes only that
+recorded slot path. Do not edit a live ledger, follow/delete a foreign target,
+or use TTL to clear a pending record. Failed provisioning with files beyond the
+lock can also need explicit owner recovery. The focused real run did not
+exercise eviction or census slot symlinks. These limits are separate from its
+observed reuse result.
+
+Earlier (before oxide#175 ruling B and oxide#181) one blocked journal refused
+every new lease and every other eviction; that behaviour is superseded.
 
 ## Limits
 

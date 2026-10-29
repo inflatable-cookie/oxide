@@ -30,7 +30,7 @@ use crate::owned_delete::{
 };
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -2362,13 +2362,17 @@ impl Pool {
         // Bound admission to the allocated entries it saw when it began, so
         // concurrent-looking state cannot extend the loop.
         let mut remaining = self.ledger.slots.len();
+        // A victim that failed for its own reasons is never selected again in
+        // this admission; the remaining eligible idle victims still get a
+        // bounded chance.
+        let mut skipped = BTreeSet::new();
         while self.ledger.slots.len() > max_slots && remaining > 0 {
             // Count pressure only: a complete pool figure, or a removable
             // pool whose figure is unknown for bound gaps only. It never
             // authorises a byte-pressure deletion.
             self.pressure_known_or_bounded_removable()?;
             let before = self.ledger.slots.len();
-            if !self.evict_one_idle_with(plan)? {
+            if !self.evict_one_idle_with(plan, &mut skipped)? {
                 break;
             }
             if self.ledger.slots.len() >= before {
@@ -2414,6 +2418,10 @@ impl Pool {
             }
         }
         let mut idle_available = true;
+        // A victim that failed for its own reasons is never selected again in
+        // this admission; the remaining eligible idle victims still get a
+        // bounded chance.
+        let mut skipped = BTreeSet::new();
         loop {
             let available = self.volume_available_bytes()?;
             match unknown_removable_step(
@@ -2431,7 +2439,7 @@ impl Pool {
                     // The reserve is a prune trigger: retire one eligible idle
                     // whole slot and re-read free space. When no eligible slot
                     // is left, the floor decides.
-                    idle_available = self.evict_one_idle_with(plan)?;
+                    idle_available = self.evict_one_idle_with(plan, &mut skipped)?;
                     if !idle_available {
                         continue;
                     }
@@ -2752,6 +2760,7 @@ impl Pool {
 
     fn evict_idle_until_under_cap(&mut self, plan: &VictimPlan) -> Result<(), LeaseError> {
         let mut remaining = self.ledger.slots.len();
+        let mut skipped = BTreeSet::new();
         loop {
             // Byte pressure remeasures the recorded figure after each deletion
             // and stops when it is under budget or no safe idle whole slot
@@ -2763,7 +2772,7 @@ impl Pool {
                 return Ok(());
             }
             let before = self.ledger.slots.len();
-            if !self.evict_one_idle_with(plan)? {
+            if !self.evict_one_idle_with(plan, &mut skipped)? {
                 return Ok(());
             }
             if self.ledger.slots.len() >= before {
@@ -2775,16 +2784,56 @@ impl Pool {
 
     /// One eligible idle victim for this admission's policy (design §6.7),
     /// oldest `(rank, numeric slot id)` first. Held, retired-backed and
-    /// unresolved `Evicting` records are never candidates. A safety failure on
-    /// the selected victim stops admission; it never skips to another slot.
+    /// unresolved `Evicting` records are never candidates, and a victim whose
+    /// own deletion failed is never selected again in this pass.
+    ///
+    /// A victim whose custody staging or deletion fails for its own reasons is
+    /// kept isolated and charged (or left untouched) and the pass gives another
+    /// eligible idle victim a bounded chance. Only a backing, ledger, fence or
+    /// shared-integrity failure is returned as a global refusal.
     ///
     /// `Any` is today's behaviour. `Only` selects from the evictable member set
     /// alone, so a normal slot and a class-unknown orphan are impossible
     /// victims. `Prefer` selects an evictable member first and otherwise the
     /// ordinary order with **every** verified one-use pair removed.
-    fn evict_one_idle_with(&mut self, plan: &VictimPlan) -> Result<bool, LeaseError> {
-        let eligible =
-            |slot: &SlotRecord| slot.state == SlotPersistState::Idle && slot.lease_id.is_none();
+    fn evict_one_idle_with(
+        &mut self,
+        plan: &VictimPlan,
+        skipped: &mut BTreeSet<u64>,
+    ) -> Result<bool, LeaseError> {
+        // Each iteration either deletes a victim or adds one distinct id to
+        // `skipped`, so the pass is bounded by the slot table it started from.
+        let bound = self.ledger.slots.len();
+        for _ in 0..bound {
+            let Some((id, incarnation, project, profile)) = self.oldest_idle_victim(plan, skipped)
+            else {
+                return Ok(false);
+            };
+            match self.retire_idle_slot_classified(id, incarnation, &project, profile)? {
+                VictimDeletion::Deleted => return Ok(true),
+                VictimDeletion::Kept(_) => {
+                    // Per-object failure: this victim is isolated and charged
+                    // (or untouched), so it is never reused or deleted by this
+                    // admission and another eligible idle victim may proceed.
+                    skipped.insert(id);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The oldest eligible idle victim for this admission's policy that this
+    /// pass has not already skipped.
+    fn oldest_idle_victim(
+        &self,
+        plan: &VictimPlan,
+        skipped: &BTreeSet<u64>,
+    ) -> Option<(u64, u64, PathBuf, Profile)> {
+        let eligible = |slot: &SlotRecord| {
+            slot.state == SlotPersistState::Idle
+                && slot.lease_id.is_none()
+                && !skipped.contains(&slot.id)
+        };
         let oldest = |predicate: &dyn Fn(&SlotRecord) -> bool| {
             self.ledger
                 .slots
@@ -2800,20 +2849,18 @@ impl Pool {
                     )
                 })
         };
-        let victim = match plan.kind {
+        match plan.kind {
             VictimPlanKind::Any => oldest(&|_| true),
             VictimPlanKind::Only => oldest(&|slot| plan.prefers(slot)),
             VictimPlanKind::Prefer => {
                 oldest(&|slot| plan.prefers(slot)).or_else(|| oldest(&|slot| !plan.excludes(slot)))
             }
-        };
-        let Some((id, incarnation, project, profile)) = victim else {
-            return Ok(false);
-        };
-        self.retire_idle_slot(id, incarnation, &project, profile)?;
-        Ok(true)
+        }
     }
 
+    /// Delete one explicitly requested idle slot. A failure that belongs to
+    /// this victim is returned to the caller unchanged; a pressure path uses
+    /// [`Self::retire_idle_slot_classified`] to continue with other victims.
     fn retire_idle_slot(
         &mut self,
         id: u64,
@@ -2821,23 +2868,58 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
-        // Per-object failure (oxide#175 ruling B): a pending deletion of
-        // another slot — blocked, unclassifiable or missing its root — never
-        // refuses this eligible slot's deletion. The pending record keeps its
-        // own charge and custody, and this open's coverage stays unknown.
-        // Every durable idle deletion, including the explicit
-        // `evict_idle_slot` path, checks the rank sequence before its first
-        // transition: an exhausted or missing-headroom sequence refuses
-        // without deleting anything.
+        match self.retire_idle_slot_classified(id, incarnation, project, profile)? {
+            VictimDeletion::Deleted => Ok(()),
+            VictimDeletion::Kept(error) => Err(error),
+        }
+    }
+
+    /// Delete one selected idle victim and report whether the failure (if any)
+    /// belongs to that object or to shared authority.
+    ///
+    /// Per-object failure (oxide#175 ruling B): a victim whose scope check,
+    /// custody staging, published-custody recheck or tree removal fails for its
+    /// own reasons is left untouched (before publication) or isolated and
+    /// conservatively charged (after publication). Admission may then consider
+    /// another eligible idle victim; this one is never reused or deleted by it.
+    /// A backing, ledger, fence or shared-control-directory failure is returned
+    /// as a global refusal.
+    fn retire_idle_slot_classified(
+        &mut self,
+        id: u64,
+        incarnation: u64,
+        project: &Path,
+        profile: Profile,
+    ) -> Result<VictimDeletion, LeaseError> {
+        // Ledger and fence integrity is global.
         self.ensure_capacity_policy()?;
         self.next_rank()?;
-        let path = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
+        // The victim's own recorded scope: a changed, unsafe-scope or missing
+        // root is per-object; a mismatched backing or an unsafe shared slots
+        // path is global.
+        let path = match self.validate_idle_slot_scope(id, incarnation, project, profile) {
+            Ok(path) => path,
+            Err(error @ (LeaseError::BackingMismatch | LeaseError::UnsafePath(_))) => {
+                return Err(error)
+            }
+            Err(error) => return Ok(VictimDeletion::Kept(error)),
+        };
+        // The record selected from this ledger must still be readable.
+        let identity = self.custody_identity(id)?;
         // Custody first (oxide#181): the private directory, its stable lock
         // file and the initial journal are durable before the record that
         // references them, and before any payload mutation. The lock is
-        // claimed nonblocking here, while this open holds the pool lock.
-        let identity = self.custody_identity(id)?;
-        let mut custody = super::custody::create(&self.root, &identity, None)?;
+        // claimed nonblocking here, while this open holds the pool lock. A
+        // local staging failure leaves the victim untouched; a foreign control
+        // directory or a mismatched backing stays global.
+        let mut custody = match super::custody::create(&self.root, &identity, None) {
+            Ok(custody) => custody,
+            Err(error @ (LeaseError::UnsafePath(_) | LeaseError::BackingMismatch)) => {
+                return Err(error)
+            }
+            Err(error) => return Ok(VictimDeletion::Kept(error)),
+        };
+        let snapshot = self.ledger.clone();
         {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
             slot.state = SlotPersistState::Evicting;
@@ -2848,22 +2930,29 @@ impl Pool {
             // Keep the last closed observation to charge a blocked eviction.
         }
         // One atomic, synced replacement publishes the policy-5 ledger fence
-        // and the `Evicting` record with its custody reference.
-        self.persist_revised()?;
+        // and the `Evicting` record with its custody reference. A failed write
+        // is ledger integrity: restore the in-memory ledger and refuse.
+        if let Err(error) = self.persist_revised() {
+            self.ledger = snapshot;
+            return Err(error);
+        }
         // The claimant rechecks the exact nonce, generation, control-file
         // identity and backing under the pool lock after acquiring custody.
+        // A mismatch keeps the published record isolated and charged.
         if !custody.matches(&self.custody_identity(id)?) {
-            return Err(LeaseError::UnknownAccounting);
+            return Ok(VictimDeletion::Kept(LeaseError::UnknownAccounting));
         }
         crate::proof::deletion_pause("journal-created");
         if let Err(error) = self.remove_owned_slot(&path, None, &mut custody) {
             // The record, its charge and its custody stay; the next open
             // replays them.
-            return Err(error);
+            return Ok(VictimDeletion::Kept(error));
         }
+        // The final record removal is a ledger transaction: its failure is
+        // shared ledger integrity, not a per-object outcome.
         self.drop_deletion_record(id, incarnation, &custody.record())?;
         custody.retire();
-        Ok(())
+        Ok(VictimDeletion::Deleted)
     }
 
     /// The exact identities one record's deletion custody is bound to.
@@ -4024,6 +4113,17 @@ fn require_slot_parent(path: &Path, slots_root: &Path) -> Result<(), LeaseError>
         return Err(LeaseError::UnknownAccounting);
     }
     Ok(())
+}
+
+/// What one selected idle victim's deletion settled, so a pressure path can
+/// decide whether to try another eligible idle victim.
+enum VictimDeletion {
+    Deleted,
+    /// The victim failed for its own reasons and is untouched (before the
+    /// record was published) or isolated and conservatively charged (after it
+    /// was). It is never reused or deleted by this admission, and another
+    /// eligible idle victim may be considered in the same bounded pass.
+    Kept(LeaseError),
 }
 
 /// What reconciling one recorded deletion's journal settled.
@@ -6369,10 +6469,15 @@ mod one_use_slice_tests {
         idle(&mut pool, 1, 1, 0);
         idle(&mut pool, 2, 2, 0);
         let prefer = plan(VictimPlanKind::Prefer, &[], &[1]);
-        assert!(pool.evict_one_idle_with(&prefer).expect("victim"));
+        let mut skipped = BTreeSet::new();
+        assert!(pool
+            .evict_one_idle_with(&prefer, &mut skipped)
+            .expect("victim"));
         assert_eq!(ids(&pool), vec![1], "the fallback took a one-use member");
         assert!(
-            !pool.evict_one_idle_with(&prefer).expect("no victim"),
+            !pool
+                .evict_one_idle_with(&prefer, &mut skipped)
+                .expect("no victim"),
             "the fallback fell through to a one-use member"
         );
     }
@@ -6385,15 +6490,51 @@ mod one_use_slice_tests {
         idle(&mut pool, 1, 1, 0);
         idle(&mut pool, 2, 2, 0);
         let only = plan(VictimPlanKind::Only, &[1], &[1]);
-        assert!(pool.evict_one_idle_with(&only).expect("victim"));
+        let mut skipped = BTreeSet::new();
+        assert!(pool
+            .evict_one_idle_with(&only, &mut skipped)
+            .expect("victim"));
         assert_eq!(
             ids(&pool),
             vec![2],
             "Only did not take the evictable member"
         );
         assert!(
-            !pool.evict_one_idle_with(&only).expect("no victim"),
+            !pool
+                .evict_one_idle_with(&only, &mut skipped)
+                .expect("no victim"),
             "Only fell through to a normal slot"
+        );
+    }
+
+    /// A count-pressure pass skips the oldest victim whose own custody staging
+    /// fails and deletes the next eligible idle victim, keeping the failed
+    /// victim untouched, idle and charged (never reused or deleted).
+    #[test]
+    fn a_failed_oldest_victim_lets_count_pressure_take_the_next_victim() {
+        let fixture = SliceFixture::new("victim-count");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        let failed = idle(&mut pool, 1, 1, 0);
+        let deleted = idle(&mut pool, 2, 2, 0);
+        let _fault = crate::test_fs::fail_custody_create_for_slot(1);
+        pool.evict_idle_until(1, &plan(VictimPlanKind::Any, &[], &[]))
+            .expect("the next eligible idle victim must serve count pressure");
+        assert_eq!(
+            ids(&pool),
+            vec![1],
+            "the failed victim was deleted or a third record appeared"
+        );
+        assert!(failed.is_dir(), "the failed victim's payload was touched");
+        assert!(
+            !deleted.exists(),
+            "the next eligible victim was not deleted"
+        );
+        let row = pool.slot(1).expect("the failed victim's record");
+        assert_eq!(row.state, SlotPersistState::Idle);
+        assert!(row.lease_id.is_none());
+        assert!(
+            row.recorded.is_some(),
+            "the failed victim lost its conservative charge"
         );
     }
 

@@ -29,8 +29,9 @@ move deletion out of the lock:
   its ledger parser can refuse a policy-5 ledger carrying `custody`; because
   that predecessor can reach the pool, its best-effort `status` reports the
   pool-open refusal in its status section and exits 0, so this probe requires
-  that semantic refusal plus byte/identity no-effect instead of a nonzero exit
-  (a source-only audit of the three predecessor probes is in the case comment).
+  that specific `unknown_accounting` refusal plus byte/identity no-effect; a
+  bare nonzero exit is not accepted (a source-only audit of the three
+  predecessor probes is in the case comment).
   This binary then resumes the intermediate state: its own leasing command
   legitimately rewrites its record state (last use, next use, origin), so the
   oracle requires the version-9 fences to be retained, the recorded slot
@@ -287,7 +288,8 @@ def plan_document() -> dict:
                 "policy-5 ledger) and ledger-only (control v8, policy-5 ledger "
                 "with custody) states before any effect — the two control-fence "
                 "probes by a nonzero hand-off refusal and the ledger-only probe "
-                "by its reported pool-open refusal or a nonzero exit — with "
+                "by its specific reported pool-open unknown_accounting refusal — "
+                "with "
                 "control/ledger bytes, custody bytes and slot roots unchanged; "
                 "this binary "
                 "resumes the intermediate state with the version-9 fences "
@@ -465,22 +467,21 @@ def resume_oracle(
 POOL_OPEN_REFUSAL = "cannot open: cannot open the pool: unknown_accounting"
 
 
-def pool_open_refusal_verdict(exit_code: int, output: str) -> tuple[bool, str]:
-    """Whether a status observer refused the pool before any effect.
+def pool_open_refusal_verdict(output: str) -> tuple[bool, str]:
+    """Whether a status observer refused the pool with pool-open unknown_accounting.
 
-    The pinned predecessor's `status` is best-effort: a newer control version is
-    refused by the hand-off preflight (nonzero), while a pool it can reach but
+    The pinned predecessor's `status` is best-effort: a pool it can reach but
     cannot open is reported in its status section and the command still exits 0
     (`run_status` prints `cannot open: {error}` and returns Ok(0) in the
-    merge-base source). This oracle therefore accepts either a nonzero exit or
-    the predecessor's own pool-open refusal line, and it never accepts an output
-    that lacks the refusal. Pure: reads the exit code and captured output only.
+    merge-base source). The ledger-only probe therefore requires the specific
+    refusal line `cannot open: cannot open the pool: unknown_accounting`; a bare
+    nonzero exit is not evidence (it could be any unrelated failure), while the
+    two version-9 control-fence probes keep their own nonzero hand-off oracle.
+    Pure: reads captured output only.
     """
-    if exit_code != 0:
-        return (True, f"status exited {exit_code}")
     if POOL_OPEN_REFUSAL in output:
-        return (True, "status reported the pool-open refusal without opening it")
-    return (False, "status neither failed nor reported the pool-open refusal")
+        return (True, "status reported the pool-open unknown_accounting refusal")
+    return (False, "status did not report the pool-open unknown_accounting refusal")
 
 
 def no_effect_verdict(
@@ -732,27 +733,31 @@ def self_check() -> None:
         not payload_unchanged(sentinel, unexpected)[0],
         "the payload oracle accepted an unexpected added entry",
     )
-    # The ledger-only status oracle accepts a nonzero exit or the
-    # predecessor's reported pool-open refusal, and refuses anything else.
+    # The ledger-only status oracle requires the specific pool-open
+    # unknown_accounting refusal; a bare nonzero failure is not enough.
     expect(
-        pool_open_refusal_verdict(75, "")[0],
-        "the ledger-only oracle rejected a nonzero status exit",
-    )
-    expect(
-        pool_open_refusal_verdict(0, f"  {POOL_OPEN_REFUSAL} (owned accounting is unknown)")[0],
+        pool_open_refusal_verdict(f"  {POOL_OPEN_REFUSAL} (owned accounting is unknown)")[0],
         "the ledger-only oracle rejected the reported pool-open refusal",
     )
     expect(
-        not pool_open_refusal_verdict(0, "")[0],
+        not pool_open_refusal_verdict("")[0],
         "the ledger-only oracle accepted an empty status output",
     )
     expect(
-        not pool_open_refusal_verdict(0, "pool: selected; slots: 1")[0],
+        not pool_open_refusal_verdict("status failed: cannot read the pool config")[0],
+        "the ledger-only oracle accepted an unrelated nonzero-style failure",
+    )
+    expect(
+        not pool_open_refusal_verdict("pool: selected; slots: 1")[0],
         "the ledger-only oracle accepted a status output without a refusal",
     )
     expect(
-        not pool_open_refusal_verdict(0, "cannot open the pool: something else")[0],
+        not pool_open_refusal_verdict("cannot open the pool: something else")[0],
         "the ledger-only oracle accepted an unrelated pool error",
+    )
+    expect(
+        not pool_open_refusal_verdict("the predecessor exited 75")[0],
+        "the ledger-only oracle accepted a bare failure message",
     )
     # The no-effect oracle fails on any mutation of the observed state.
     control_state = b'{"version":9}'
@@ -1431,9 +1436,10 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
     they must exit nonzero (observed 75). The ledger-only probe keeps the
     predecessor's own version 8, which its preflight accepts, so `status` runs,
     reports the pool-open refusal in its status section and exits 0; that probe
-    therefore requires `pool_open_refusal_verdict` plus `no_effect_verdict`,
-    never a bare nonzero exit. No other exit assumption about the predecessor
-    exists in this script.
+    therefore requires the specific reported pool-open `unknown_accounting`
+    refusal (`pool_open_refusal_verdict`) plus `no_effect_verdict`, never a bare
+    nonzero exit. No other exit assumption about the predecessor exists in this
+    script.
     """
 
     def body() -> None:
@@ -1611,10 +1617,11 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
         code, output = run_predecessor(base, workspaces2["a"], env2, "ledger-only")
         # The predecessor's own control version is in play here, so its
         # best-effort `status` reports a pool it cannot open and exits 0. The
-        # oracle is the semantic refusal, not the exit code; the control-fence
-        # probes above keep the nonzero-exit requirement because the hand-off
-        # preflight refuses a newer control version.
-        refusal_ok, refusal_reason = pool_open_refusal_verdict(code, output)
+        # oracle is the specific pool-open unknown_accounting refusal, never a
+        # bare nonzero exit; the control-fence probes above keep their nonzero
+        # hand-off requirement because the preflight refuses a newer control
+        # version.
+        refusal_ok, refusal_reason = pool_open_refusal_verdict(output)
         expect(
             refusal_ok,
             f"the predecessor accepted a policy-5 ledger with custody "

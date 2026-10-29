@@ -91,10 +91,11 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --
 # predecessor's hand-off preflight refuses a newer control version); the
 # ledger-only probe keeps the predecessor's own control version, so its
 # best-effort status reports the pool-open refusal in its status section and
-# exits 0, and the oracle requires that semantic refusal plus the no-effect
-# facts instead of a nonzero exit. A source-only audit of all three predecessor
-# probes is recorded in the script. This binary then resumes the intermediate
-# state: its
+# exits 0, and the oracle requires the specific
+# `cannot open: cannot open the pool: unknown_accounting` refusal plus the
+# no-effect facts; a bare nonzero exit is not accepted. A source-only audit of
+# all three predecessor probes is recorded in the script. This binary then
+# resumes the intermediate state: its
 # own leasing command legitimately rewrites its record state (last use, next
 # use, origin), so the resume oracle requires the version-9 fences to be
 # retained, the recorded slot identity tuples (id, incarnation and recorded
