@@ -4183,6 +4183,22 @@ fn refuse_retired_image_pool(pool: &Path) -> Result<(), LeaseError> {
     }
 }
 
+/// `lstat` of a pool control entry that the listing just named. `NotFound`
+/// means the entry was renamed away or removed in between: a ledger writer
+/// renames its `ledger.tmp-*` onto `ledger.json`, and Finder removes its
+/// metadata files. The caller skips such an entry. Every other error refuses.
+fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError> {
+    #[cfg(test)]
+    let metadata = crate::test_fs::symlink_metadata(path);
+    #[cfg(not(test))]
+    let metadata = fs::symlink_metadata(path);
+    match metadata {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error(error)),
+    }
+}
+
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
     let device = fs::symlink_metadata(pool).map_err(io_error)?.dev();
     for entry in fs::read_dir(pool).map_err(io_error)? {
@@ -4190,7 +4206,9 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
         let name = entry.file_name();
         if is_finder_metadata(&name) {
             // Control-directory bytes, like config and ledger: not payload.
-            let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+            let Some(metadata) = listed_control_entry(&entry.path())? else {
+                continue;
+            };
             if !is_tolerated_metadata_file(&metadata, device) {
                 return Err(unexpected_entry(POOL_PLACE, &name));
             }
@@ -4210,7 +4228,9 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
         if !allowed {
             return Err(unexpected_entry(POOL_PLACE, &name));
         }
-        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+        let Some(metadata) = listed_control_entry(&entry.path())? else {
+            continue;
+        };
         if metadata.file_type().is_symlink() {
             return Err(LeaseError::UnsafePath("symlinks are refused"));
         }

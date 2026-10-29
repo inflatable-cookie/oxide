@@ -1511,7 +1511,7 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     let locked = grant.env.cargo_build_build_dir.join("locked");
     fs::create_dir(&locked).expect("locked dir");
     managed::release(&pool, &grant.lease_id).expect("release");
-    let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
+    let denied = crate::test_fs::InjectedErrorGuard::read_dir(&locked);
     let reuse = managed::lease(request(&pool, &project, &workspace, "b"));
     // Over the tiny budget the recorded idle slot is byte pressure. The
     // accepted stale-idle policy trusts a current record, so a new-slot
@@ -1932,7 +1932,7 @@ fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
         lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
     let slots = denied.join("payload").join("slots");
     let denied_slot_root = slots.join(&denied_grant.slot_id);
-    let denied_lookup = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&denied_slot_root);
+    let denied_lookup = crate::test_fs::InjectedErrorGuard::symlink_metadata(&denied_slot_root);
     let from_status = status_injected(&denied).map(|_| ());
     let from_view = ledger_injected(&denied).map(|_| ());
     assert_eq!(denied_lookup.hits(), 2);
@@ -1997,6 +1997,72 @@ fn ledger_view_refuses_a_foreign_pool_entry_like_status() {
     assert_eq!(ledger_injected(&pool).map(|_| ()), Err(expected));
 }
 
+/// A ledger writer renames `ledger.tmp-*` onto `ledger.json` between the
+/// pool's listing and its lookup, and Finder can remove its metadata the same
+/// way. The lookup then finds the name gone: the entry is neither foreign nor
+/// a symlink, so the open proceeds.
+#[test]
+fn entry_renamed_away_during_pool_open_does_not_fail_the_open() {
+    let fx = Fixture::new("view-renamed-entry");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    for name in ["ledger.tmp-0123abcd", ".DS_Store"] {
+        let entry = pool.join(name);
+        fs::write(&entry, b"{}").expect("listed entry");
+        let vanished = crate::test_fs::InjectedErrorGuard::not_found_symlink_metadata(&entry);
+        assert_eq!(ledger_injected(&pool).map(|_| ()), Ok(()), "{name}");
+        assert_eq!(vanished.hits(), 1, "{name} lookup must be exercised");
+        drop(vanished);
+        fs::remove_file(&entry).expect("cleanup listed entry");
+    }
+}
+
+/// Only a vanished entry is skipped. A `ledger.tmp-*` symlink still refuses,
+/// and any other lookup error on a listed temp still refuses as I/O.
+#[test]
+fn ledger_temp_refusals_survive_the_vanished_entry_rule() {
+    let fx = Fixture::new("view-temp-refusals");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let target = fx.path().join("elsewhere");
+    fs::write(&target, b"{}").expect("symlink target");
+    let link = pool.join("ledger.tmp-0123abcd");
+    symlink(&target, &link).expect("temp symlink");
+    assert_eq!(
+        ledger_injected(&pool).map(|_| ()),
+        Err(LeaseError::UnsafePath("symlinks are refused"))
+    );
+    fs::remove_file(&link).expect("remove temp symlink");
+
+    let temp = pool.join("ledger.tmp-0123abcd");
+    fs::write(&temp, b"{}").expect("temp file");
+    let denied = crate::test_fs::InjectedErrorGuard::symlink_metadata(&temp);
+    assert_eq!(
+        ledger_injected(&pool).map(|_| ()),
+        Err(LeaseError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()
+        ))
+    );
+    assert_eq!(denied.hits(), 1, "the temp lookup must be exercised");
+}
+
+/// An unknown name refuses from the listing alone, before any lookup, so a
+/// vanished-entry lookup armed on it is never reached.
+#[test]
+fn unknown_entry_refuses_before_any_lookup_during_pool_open() {
+    let fx = Fixture::new("view-unknown-lookup");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let stray = pool.join("stray");
+    fs::write(&stray, b"foreign").expect("stray");
+    let vanished = crate::test_fs::InjectedErrorGuard::not_found_symlink_metadata(&stray);
+    assert_eq!(
+        ledger_injected(&pool).map(|_| ()),
+        Err(unexpected("pool directory", "stray"))
+    );
+    assert_eq!(vanished.hits(), 0, "an unknown name is refused unlooked-up");
+}
+
 const VOLUME_UUID: &str = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
 
 const VOLUME_CONFIG: &str = r#"{"version":1,"backend":"apfs-volume-v1","store_id":"store","cap_bytes":1000,"image_bytes":0,"volume":{"mount_point":"/Volumes/Builds","volume_uuid":"A6AC3ED7-33EA-46B4-8082-7254CF291ED2","payload_dir":"oxide-pool"}}"#;
@@ -2058,7 +2124,7 @@ fn volume_description_reports_unreadable_control_metadata_as_io() {
     let control = control_fixture(&fixture, VOLUME_CONFIG, LEDGER_WITH_EVICTING);
     let before = snapshot_tree(&control);
     for name in ["config.json", "ledger.json"] {
-        let denied = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&control.join(name));
+        let denied = crate::test_fs::InjectedErrorGuard::symlink_metadata(&control.join(name));
         assert_eq!(
             managed::describe_volume(&control),
             Err(LeaseError::Io(
