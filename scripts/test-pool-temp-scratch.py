@@ -1466,6 +1466,7 @@ class World:
                 "TMP": self.scratch,
                 "TEMP": self.scratch,
                 "OXIDE_POOL": self.pool,
+                "OXIDE_POOL_CREATE": "1",
                 "OXIDE_POOL_CAP": "64MiB",
                 # A public product control, set explicitly: the live-program
                 # case needs two concurrent slots, and the default already

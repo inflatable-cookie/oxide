@@ -186,7 +186,7 @@ class Proof:
         self.parent = parent
         self.oxide = oxide
         self.pool = os.path.join(parent, "pool")
-        self.env = {**env, "OXIDE_POOL": self.pool}
+        self.env = {**env, "OXIDE_POOL": self.pool, "OXIDE_POOL_CREATE": "1"}
         self.logs = 0
         self.dirs = {}
 

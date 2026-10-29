@@ -1758,17 +1758,43 @@ impl Store {
 
     /// Open the pool, creating it on first use above the host reserve. A
     /// macOS pool is excluded from Time Machine before any build writes into
-    /// it; an unverified exclusion refuses before Cargo starts.
+    /// it; an unverified exclusion refuses before Cargo starts. An absent pool
+    /// named by `OXIDE_POOL` refuses instead of being created silently unless
+    /// `OXIDE_POOL_CREATE=1` or the path is inside the caller's task scratch
+    /// root (oxide#182); the config file and the built-in default are
+    /// unchanged.
     pub fn open_or_create() -> Result<Self, String> {
         let settings = settings()?;
         let path = settings.pool.clone();
         config::refuse_unsafe_pool_path(&path)?;
         match config::inspect(&path) {
-            Found::Absent => create_pool(&path, admission_budget(&settings))?,
+            Found::Absent => {
+                config::pool_creation_allowed(
+                    &path,
+                    settings.pool_source,
+                    std::env::var_os("OXIDE_POOL_CREATE").as_deref(),
+                    std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").as_deref(),
+                )?;
+                create_pool(&path, admission_budget(&settings))?;
+            }
             Found::LegacyImage => return Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {}
         }
-        let store = Self::open_at(&path, &settings)?;
+        let store = match Self::open_at(&path, &settings) {
+            Ok(store) => store,
+            // An explicit path that exists but holds no recognizable Oxide
+            // pool is still this command's pool: name it in the refusal
+            // (oxide#182), so a typo or a non-pool directory is actionable.
+            Err(error)
+                if matches!(
+                    settings.pool_source,
+                    config::Source::Environment("OXIDE_POOL")
+                ) =>
+            {
+                return Err(format!("OXIDE_POOL names {}: {error}", path.display()))
+            }
+            Err(error) => return Err(error),
+        };
         if !config::has_sticky_exclusion(&store.pool) {
             match config::exclude_from_backup(&store.pool) {
                 Backup::Excluded | Backup::NotApplicable => {}

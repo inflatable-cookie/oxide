@@ -545,6 +545,16 @@ fn flag_values(args: &[OsString], flag: &str) -> Vec<String> {
     values
 }
 
+/// Whether one command asks Cargo for help before any `--` (oxide#182):
+/// `oxide <cmd> --help` and `oxide <cmd> -h` forward to Cargo's own help with
+/// no pool, lease, admission or slot wait, exactly as `cargo <cmd> --help`.
+/// Help after `--` belongs to the program Cargo runs, so it is not this.
+pub fn cargo_help(args: &[OsString]) -> bool {
+    args.iter()
+        .take_while(|argument| *argument != "--")
+        .any(|argument| matches!(argument.to_str(), Some("-h" | "--help")))
+}
+
 /// `--manifest-path`, for commands Oxide does not otherwise parse.
 pub fn manifest_path(args: &[OsString]) -> Option<PathBuf> {
     flag_value(args, "--manifest-path").map(PathBuf::from)
@@ -900,6 +910,24 @@ mod tests {
         }
         assert!(refuse_storage_overrides(&args(&["--config", "net.offline=true"])).is_ok());
         assert!(refuse_storage_overrides(&args(&["--", "--target-dir", "x"])).is_ok());
+    }
+
+    /// oxide#182: help before `--` is Cargo's help and never a leased
+    /// command; help after `--` is the program's own argument. The
+    /// counterfactual is the old behaviour: no detector, so `test --help`
+    /// reached the lease and opened the pool before Cargo printed anything.
+    #[test]
+    fn help_before_a_double_dash_is_cargos_help() {
+        assert!(cargo_help(&args(&["--help"])));
+        assert!(cargo_help(&args(&["-h"])));
+        assert!(cargo_help(&args(&["--locked", "--help"])));
+        assert!(cargo_help(&args(&["-p", "app", "-h"])));
+        assert!(!cargo_help(&args(&[])));
+        assert!(!cargo_help(&args(&["--", "--help"])));
+        assert!(!cargo_help(&args(&["--", "-h"])));
+        assert!(!cargo_help(&args(&["--profile", "release"])));
+        // A value that happens to contain help text is not help.
+        assert!(!cargo_help(&args(&["--config", "net.offline=true"])));
     }
 
     #[test]

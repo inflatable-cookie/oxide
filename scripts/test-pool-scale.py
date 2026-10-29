@@ -185,7 +185,7 @@ def entries(root: str) -> int:
 class Pool:
     def __init__(self, parent: str, name: str, base_env: dict):
         self.root = os.path.join(parent, name)
-        self.env = {**base_env, "OXIDE_POOL": self.root}
+        self.env = {**base_env, "OXIDE_POOL": self.root, "OXIDE_POOL_CREATE": "1"}
 
     def call(self, oxide: str, cwd: str, args: list, extra: dict | None = None, timeout: float = 90):
         result = subprocess.run([oxide, *args], cwd=cwd, env={**self.env, **(extra or {})},

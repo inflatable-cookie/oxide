@@ -811,6 +811,9 @@ class Fixture:
                 "CARGO_HOME": self.cargo_home,
                 "OXIDE_TEST_HOME_FROM_ENV": "1",
                 "OXIDE_POOL": self.pool,
+                # The fixture creates its own pool, outside the published
+                # task scratch root, so it takes the explicit opt-in.
+                "OXIDE_POOL_CREATE": "1",
                 # The documented soft byte budget for the next pool creation.
                 "OXIDE_POOL_CAP": str(self.budget_bytes),
                 "TMPDIR": self.temp,

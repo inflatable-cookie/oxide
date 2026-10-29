@@ -586,6 +586,7 @@ def run(proof: Proof, parent: str) -> None:
     env.update(
         {
             "OXIDE_POOL": pool,
+            "OXIDE_POOL_CREATE": "1",
             "OXIDE_POOL_BACKEND": "directory-budget",
             "OXIDE_POOL_CAP": "64MiB",
             "CARGO_HOME": cargo_home,

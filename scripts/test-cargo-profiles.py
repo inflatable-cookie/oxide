@@ -446,7 +446,7 @@ class Oxide:
     def __init__(self, parent: str, binary: str, env: dict):
         self.binary = binary
         self.pool = os.path.join(parent, "pool")
-        self.env = {**env, "OXIDE_POOL": self.pool}
+        self.env = {**env, "OXIDE_POOL": self.pool, "OXIDE_POOL_CREATE": "1"}
 
     def call(self, cwd: str, args: list, extra: dict = None) -> str:
         return run([self.binary, *args], cwd, {**self.env, **(extra or {})}, "oxide " + " ".join(args))
