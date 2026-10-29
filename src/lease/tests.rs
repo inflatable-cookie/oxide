@@ -2382,7 +2382,9 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
             "workspace": path,
             "profile": "full-debug",
             "holder": holder,
-            "lease_id": null,
+            // The widest accepted lease id: the write bound is 160 bytes and
+            // the validator imposes no state/lease-id pairing.
+            "lease_id": lease_id,
             "last_lease_id": lease_id,
             "dir": format!("{}/{leaf}", "a".repeat(80)),
             "rank": rank,
@@ -2514,11 +2516,16 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
     };
     let chain: Vec<String> = (0..64).map(&name).collect();
     assert!(chain.iter().all(|item| item.len() <= 47));
-    // The longest bounded journal name: PATH_MAX bytes as NAME_MAX components,
-    // all control bytes so compact JSON's sixfold escape is maximal.
-    let component = "\u{1}".repeat(255);
-    let original = format!("{component}/{component}/{component}/{component}");
-    assert_eq!(original.len(), 1023);
+    // The longest bounded journal name: exactly PATH_MAX bytes as NAME_MAX
+    // components, all control bytes so compact JSON's sixfold escape is
+    // maximal.
+    let component = "\u{1}".repeat(204);
+    let original = std::iter::repeat_with(|| component.clone())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("/");
+    assert_eq!(original.len(), 1024);
+    assert!(original.split('/').all(|part| part.len() <= 255));
     let found = original.clone();
     let captures: Vec<serde_json::Value> = (0..96)
         .map(|index| {
@@ -2542,7 +2549,9 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
                 "original": original,
                 "expected_device": u64::MAX,
                 "expected_inode": u64::MAX,
-                "expected_mode": 0o120777,
+                // `is_valid` does not constrain this field, so its widest
+                // accepted form is the u32 maximum.
+                "expected_mode": u32::MAX,
                 "found": found,
                 "restored": false,
             })
@@ -2598,7 +2607,9 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
             "workspace": path,
             "profile": "full-debug",
             "holder": holder,
-            "lease_id": null,
+            // The widest accepted lease id: the write bound is 160 bytes and
+            // the validator imposes no state/lease-id pairing.
+            "lease_id": lease_id,
             "last_lease_id": lease_id,
             "dir": format!("{}/{leaf}", "a".repeat(80)),
             "rank": rank,
@@ -2648,8 +2659,9 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(journal.captures.len(), 96);
     assert_eq!(journal.foreign.len(), 32);
     assert_eq!(journal.captures[0].path.len(), 64);
-    assert_eq!(journal.captures[0].original.len(), 1023);
-    assert_eq!(journal.foreign[0].found.len(), 1023);
+    assert_eq!(journal.captures[0].original.len(), 1024);
+    assert_eq!(journal.foreign[0].found.len(), 1024);
+    assert_eq!(journal.foreign[0].expected_mode, u32::MAX);
     println!(
         "worst valid 256-slot journaled ledger: {} bytes of the {MAX_LEDGER_BYTES}-byte cap",
         stored.len()

@@ -564,8 +564,8 @@ cap: paths 1024 bytes, holder 128, lease ID 160, slot directory component 80.
 A compact JSON ledger with every field at its ceiling, escaped sixfold and with
 20-digit integers, is proven by unit tests to fit the cap and round-trip. The
 all-idle worst-valid 256-slot ledger (every numeric field at its full 20-digit
-width, including `cap_bytes`, and every string at its cap) measures 3,968,478
-bytes. The bound also covers the deletion journal (oxide#155), which is the
+width, including `cap_bytes`, and every string at its cap, including the
+widest accepted `lease_id`) measures 4,213,726 bytes. The bound also covers the deletion journal (oxide#155), which is the
 other durable state a slot record can hold: an `Evicting` slot may carry a
 `DeletionJournal` with up to 96 outstanding capture records and 32 mismatched
 captures, each with a chain of up to 64 capture private names, and every
@@ -579,8 +579,10 @@ outstanding, so that guard covers every entry point including the explicit
 `evict_idle_slot` that does not pass through `lease()`; every open reconciles
 all `Evicting` records before admitting anything, and a journal that cannot
 finish keeps the pool blocked until it does (one that can finish is removed).
-The measured one-journal worst-valid ledger is 5,378,767 bytes, and the 8 MiB
-cap still covers two more maximal journals, so an unexpected co-occurrence is
+The measured one-journal worst-valid ledger is 5,624,335 bytes (the journal's
+name fields at the full PATH_MAX 1024 bytes, `expected_mode` at the
+unrestricted u32 maximum, maximum record counts), and the 8 MiB cap still
+covers one more maximal journal, so an unexpected co-occurrence is
 representable; a hand-crafted ledger beyond the cap refuses rather than
 truncating. Control state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
@@ -698,7 +700,7 @@ current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The worst-valid
 ledger/control serialization — including the reachable one-journal
-`Evicting` state, 5,378,767 bytes against the 8 MiB cap — escaped round-trip
+`Evicting` state, 5,624,335 bytes against the 8 MiB cap — escaped round-trip
 and oversized-field refusals are unit tests in `effigy test rust`, as is a
 fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
 trip with a journal (bounded read via the passive snapshot, ranked ordering,
