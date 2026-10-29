@@ -610,11 +610,13 @@ def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
     return env, base
 
 
-def workspace(env: dict, base: str, name: str) -> str:
+def workspace(env: dict, base: str, name: str, package: str = "app") -> str:
     """A tiny private Git checkout whose ignore rule covers `target`."""
     path = os.path.join(base, "workspaces", name)
     os.makedirs(os.path.join(path, "src"), exist_ok=True)
     for relative, contents in CRATE.items():
+        if relative == "Cargo.toml" and package != "app":
+            contents = contents.replace('name = "app"', f'name = "{package}"', 1)
         with open(os.path.join(path, relative), "w", encoding="utf-8") as handle:
             handle.write(contents)
     with open(os.path.join(path, ".gitignore"), "w", encoding="utf-8") as handle:
@@ -828,7 +830,11 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
             fail(f"{case}: the blocked slot has no positive recorded charge")
         tight = dict(env)
         tight["OXIDE_TEST_BUDGET_BYTES"] = "1"
-        refused = run([oxide, "check"], cwd=workspace(env, base, "d"), env=tight)
+        # A different package identity cannot reuse checkout c's warm slot:
+        # this request must need a new slot and encounter the capacity check.
+        refused = run(
+            [oxide, "check"], cwd=workspace(env, base, "d", "capacity-control"), env=tight
+        )
         if refused.returncode == 0 or "unknown_accounting" in refused.stderr:
             fail(f"{case}: exhausted budget did not refuse on capacity: {refused.stderr[-1500:]}")
         if "pool cap cannot admit a new slot" not in refused.stderr:
