@@ -1773,14 +1773,20 @@ impl Pool {
         // that declared a new slot is held to the stricter threshold even if
         // the reuse branch is taken.
         let new_slot_needed = reuse.is_none() || slice.kind == SliceAdmission::NewSlot;
-        loop {
+        // A member that fails for its own reasons stays charged and counted in
+        // the slice, and the pass gives another eligible member a bounded
+        // chance to satisfy the threshold.
+        let mut skipped = BTreeSet::new();
+        let bound = members.len();
+        for _ in 0..bound {
             let threshold = members.len() > slice.max_slots
                 || (new_slot_needed && members.len() >= slice.max_slots)
                 || bytes > slice.max_bytes;
             if !threshold {
                 break;
             }
-            let Some((id, incarnation)) = self.pick_restore_victim(&members, plan, reuse) else {
+            let Some((id, incarnation)) = self.pick_restore_victim(&members, plan, reuse, &skipped)
+            else {
                 break;
             };
             let Some(index) = self.ledger.slots.iter().position(|slot| {
@@ -1793,24 +1799,32 @@ impl Pool {
             };
             let project = self.ledger.slots[index].project.clone();
             let profile = self.ledger.slots[index].profile;
-            self.retire_idle_slot(id, incarnation, &project, profile)?;
-            members.retain(|member| member.id != id);
-            bytes = match self.member_union(&members) {
-                Ok(bytes) => bytes,
-                Err(gap) => {
-                    let outcome = RestoreOutcome::Unmeasured {
-                        reason: union_gap_reason(&gap),
+            match self.retire_idle_slot_classified(id, incarnation, &project, profile)? {
+                VictimDeletion::Deleted => {
+                    members.retain(|member| member.id != id);
+                    bytes = match self.member_union(&members) {
+                        Ok(bytes) => bytes,
+                        Err(gap) => {
+                            let outcome = RestoreOutcome::Unmeasured {
+                                reason: union_gap_reason(&gap),
+                            };
+                            let protected = self.protected_members(&members, plan, reuse);
+                            return Ok(Self::slice_report(
+                                slice,
+                                outcome,
+                                members.len(),
+                                protected,
+                                unverified,
+                            ));
+                        }
                     };
-                    let protected = self.protected_members(&members, plan, reuse);
-                    return Ok(Self::slice_report(
-                        slice,
-                        outcome,
-                        members.len(),
-                        protected,
-                        unverified,
-                    ));
                 }
-            };
+                VictimDeletion::Kept(_) => {
+                    // Per-object failure: keep the member charged and counted;
+                    // another eligible member may still satisfy the threshold.
+                    skipped.insert(id);
+                }
+            }
         }
         let still_over = members.len() > slice.max_slots
             || (new_slot_needed && members.len() >= slice.max_slots)
@@ -1880,11 +1894,13 @@ impl Pool {
         members: &[VerifiedMember],
         plan: &VictimPlan,
         reuse: Option<(u64, u64)>,
+        skipped: &BTreeSet<u64>,
     ) -> Option<(u64, u64)> {
         members
             .iter()
             .filter(|member| plan.prefers_id(member.id, member.incarnation))
             .filter(|member| Some((member.id, member.incarnation)) != reuse)
+            .filter(|member| !skipped.contains(&member.id))
             .filter_map(|member| {
                 self.slot(member.id)
                     .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
@@ -2944,8 +2960,15 @@ impl Pool {
         }
         crate::proof::deletion_pause("journal-created");
         if let Err(error) = self.remove_owned_slot(&path, None, &mut custody) {
-            // The record, its charge and its custody stay; the next open
-            // replays them.
+            // The record, its charge and its custody stay. A removal failure
+            // under a shared scope that no longer verifies — a vanished or
+            // changed removable volume, a missing or unsafe slots root, or a
+            // broken recorded parent binding — is a backing or shared-integrity
+            // refusal, not this victim's own failure.
+            if let Err(shared) = self.checked_slot_scope(&path) {
+                return Err(shared);
+            }
+            // Only an object-local removal failure stays per-object.
             return Ok(VictimDeletion::Kept(error));
         }
         // The final record removal is a ledger transaction: its failure is
@@ -4117,6 +4140,7 @@ fn require_slot_parent(path: &Path, slots_root: &Path) -> Result<(), LeaseError>
 
 /// What one selected idle victim's deletion settled, so a pressure path can
 /// decide whether to try another eligible idle victim.
+#[derive(Debug)]
 enum VictimDeletion {
     Deleted,
     /// The victim failed for its own reasons and is untouched (before the
@@ -6378,6 +6402,102 @@ mod one_use_slice_tests {
         let report = leased.slice.expect("a one-use admission always reports");
         assert_eq!(report.members, 15);
         assert_eq!(ids(&pool).len(), 16);
+    }
+
+    /// A restore pass skips a selected member whose own custody staging fails
+    /// and reclaims the next eligible member instead, keeping the failed member
+    /// charged, published and counted in the slice.
+    #[test]
+    fn a_failed_restore_member_lets_the_next_eligible_member_satisfy_the_threshold() {
+        let fixture = SliceFixture::new("restore-failure");
+        let (_root, mut pool) = fixture.pool("pool", 1 << 30);
+        let failed = idle(&mut pool, 1, 1, 0);
+        let reclaimed = idle(&mut pool, 2, 2, 0);
+        let _fault = crate::test_fs::fail_custody_create_for_slot(1);
+        let report = pool
+            .restore(
+                &slice(&[1, 2], SliceAdmission::NewSlot, 2, 1 << 30),
+                &plan(VictimPlanKind::Only, &[1, 2], &[]),
+                AdmissionClass::OneUse,
+                None,
+            )
+            .expect("restore");
+        assert_eq!(
+            report.members, 1,
+            "the failed member left the slice instead of staying counted"
+        );
+        assert!(matches!(report.outcome, RestoreOutcome::Within { .. }));
+        assert!(failed.is_dir(), "the failed member's payload was touched");
+        assert!(
+            !reclaimed.exists(),
+            "the next eligible member was not reclaimed"
+        );
+        assert_eq!(ids(&pool), vec![1], "the failed member was deleted");
+        let row = pool.slot(1).expect("the failed member's record");
+        assert_eq!(row.state, SlotPersistState::Idle);
+        assert!(row.recorded.is_some(), "the failed member lost its charge");
+    }
+
+    /// A removable volume that stops verifying while the selected victim is
+    /// being removed is a backing refusal, not a per-object one: the call
+    /// refuses globally, the published record keeps its custody reference and
+    /// charge, and the other eligible victim is untouched.
+    #[test]
+    fn a_vanished_volume_during_victim_removal_refuses_globally() {
+        use crate::volume::verified_facts::{self, VolumeFacts};
+
+        let fixture = SliceFixture::new("vanished-volume");
+        let pool_root = fixture.pool_root("pool");
+        let payload = fixture.dir("volume");
+        verified_facts::with(
+            VolumeFacts {
+                verify_error_after: Some(1),
+                ..VolumeFacts::default()
+            },
+            || {
+                let mut pool = volume_pool_for_test(&pool_root, &payload, 1 << 30, None)
+                    .expect("removable fixture pool");
+                let victim =
+                    add_idle_slot_for_test(&mut pool, 1, 1, 1024, 0).expect("the selected victim");
+                let other =
+                    add_idle_slot_for_test(&mut pool, 2, 2, 1024, 0).expect("the other victim");
+                for path in [
+                    &payload.join(SLOTS_NAME),
+                    &victim,
+                    &victim.join("build"),
+                    &other,
+                    &other.join("build"),
+                ] {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                        .expect("private slot scope");
+                }
+                // A private capture name that no record names refuses the walk
+                // for an object-local reason, so the recheck of the shared
+                // scope is what decides the outcome.
+                fs::write(
+                    victim.join(".oxide-capture-0123456789abcdef0123456789abcdef"),
+                    b"kept",
+                )
+                .expect("private capture name");
+                let (project, profile) = {
+                    let slot = pool.slot(1).expect("the victim record");
+                    (slot.project.clone(), slot.profile)
+                };
+                let outcome = pool.retire_idle_slot_classified(1, 1, &project, profile);
+                assert!(
+                    matches!(outcome, Err(LeaseError::BackingMismatch)),
+                    "a vanished volume was not a global backing refusal: {outcome:?}"
+                );
+                let slot = pool.slot(1).expect("the published record");
+                assert_eq!(slot.state, SlotPersistState::Evicting);
+                assert!(
+                    slot.custody.is_some(),
+                    "the published custody reference was lost"
+                );
+                assert!(slot.recorded.is_some(), "the charge was lost");
+                assert!(other.is_dir(), "the other eligible victim was touched");
+            },
+        );
     }
 
     /// A warm reuse at the ceiling adds no slot, so it admits with all 16

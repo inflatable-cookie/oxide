@@ -1815,20 +1815,27 @@ findable.
 Earlier (before oxide#181) this journal lived in the slot's ledger record. That
 representation is now **legacy**: it is read only for migration, copied
 byte-exactly into a custody file and never reinterpreted. While an unstaged
-legacy journal remains, the ledger keeps the predecessor fence (policy 3 or 4),
-and that record keeps its journal and conservative charge.
+legacy journal remains, the ledger keeps the current policy-5 fence in its
+transitional shape: that record's legacy journal may coexist with other
+records' custody references, a predecessor still refuses policy 5 and the
+`custody` field before any effect, and that record keeps its journal and
+conservative charge. One record never carries both a legacy journal and a
+custody reference.
 
 If an interrupted or newly selected `Evicting` deletion cannot safely remove
 its recorded slot root or an owned entry, that generation remains `Evicting`,
 isolated and unavailable for lease, adoption or deletion, and conservatively
 charged (the maximum of its recorded closed size and the largest recorded
-slot). Admission never waits for it: a bounded pass skips it and, while another
-eligible idle whole slot exists, deletes that victim instead; the failed victim
-is never reused or deleted by that admission. Status stays bounded and reports
-unknown coverage for the pending object. Unrelated admissions, releases and
-other eligible victims proceed; only a backing, ledger, fence or
-shared-integrity failure refuses globally. A later open resumes only that
-recorded slot path. Do not edit a live ledger, follow/delete a foreign target,
+slot). Admission does not wait for that object's custody: a bounded pass skips
+it and, while another eligible idle whole slot exists, deletes that victim
+instead, and the failed victim is never reused or deleted by that admission.
+Reconciliation still runs under the pool lock in this slice, however, so a
+large deletion can delay another admission until that lock is released (as the
+[implemented slice-1 boundary](#implemented-slice-1-deletion-custody-and-the-journal-migration-oxide181)
+states). Status stays bounded and reports unknown coverage for the pending
+object. Unrelated admissions, releases and other eligible victims proceed; only
+a backing, ledger, fence or shared-integrity failure refuses globally. A later
+open resumes only that recorded slot path. Do not edit a live ledger, follow/delete a foreign target,
 or use TTL to clear a pending record. Failed provisioning with files beyond the
 lock can also need explicit owner recovery. The focused real run did not
 exercise eviction or census slot symlinks. These limits are separate from its
