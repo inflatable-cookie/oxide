@@ -348,7 +348,7 @@ impl std::fmt::Display for LeaseError {
                     )?,
                     _ => write!(
                         formatter,
-                        "the requested idle-slot replacement cannot be honoured: unmeasured slot(s) {}",
+                        "cannot admit a new slot: unmeasured slot(s) {}",
                         named.join(", ")
                     )?,
                 }

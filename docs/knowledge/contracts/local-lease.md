@@ -467,7 +467,15 @@ the slot — and nothing is deleted or allocated. The
 admission otherwise continues under the charge and refuses only itself, with a
 bounded capacity reason that names the slot (`full`, at most eight IDs then a
 count), when the pool genuinely cannot fit; a charge that
-alone exhausts the budget refuses before deleting anything. This removes a
+alone exhausts the budget refuses before deleting anything.
+
+A **count** decision follows the same rule. The pool-wide slot ceiling
+(`MAX_SLOTS`) is met only by retiring a verified idle whole slot, so when the
+admission has charged a slot conservatively and no verified victim is left,
+the ceiling cannot be met: that admission alone refuses with the same bounded
+reason, naming the unmeasured slot and carrying no byte figures (a count
+decision has none), while nothing is deleted or allocated. Whenever every slot
+was measured, the shipped `LedgerExhausted` refusal stands unchanged. This removes a
 refusal and narrows eviction eligibility: it adds **no** deletion path or
 authority. Everything shared still refuses globally — the ledger, config,
 backing and fence, the pool scope pass, a slot root that cannot even be

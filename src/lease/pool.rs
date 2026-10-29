@@ -1889,7 +1889,12 @@ impl Pool {
         if self.ledger.slots.len() >= MAX_SLOTS {
             self.evict_idle_until(MAX_SLOTS - 1, plan)?;
             if self.ledger.slots.len() >= MAX_SLOTS {
-                return Err(LeaseError::LedgerExhausted);
+                // A slot this admission could not measure is kept, so the only
+                // idle slot may have been excluded from the victim set and the
+                // ceiling cannot be met (oxide#186). That is a bounded capacity
+                // refusal naming the slot, never the unnamed count refusal;
+                // with every slot measured the shipped refusal stands.
+                return Err(self.count_selection_refusal());
             }
         }
         // New-slot admission compares the pool's own recorded bytes with its
@@ -2239,11 +2244,7 @@ impl Pool {
         // only this admission refuses, naming the slot. The value decides, not
         // the name.
         if self.unmeasured.contains_key(&id) {
-            return Err(LeaseError::CapacityCharged {
-                measured: None,
-                limit: None,
-                unmeasured: self.unmeasured_slots(),
-            });
+            return Err(self.count_selection_refusal());
         }
         let Some((incarnation, project, profile)) = self
             .slot(id)
@@ -2565,6 +2566,24 @@ impl Pool {
         LeaseError::CapacityCharged {
             measured: Some(measured),
             limit: Some(self.budget),
+            unmeasured: self.unmeasured_slots(),
+        }
+    }
+
+    /// The refusal when a **count** decision cannot be honoured because the
+    /// slot it needs is one a partial walk left unmeasured: the pool-wide slot
+    /// ceiling with no verified victim left, or a named project-cap
+    /// replacement whose victim cannot be deleted (oxide#186). It is a bounded
+    /// capacity reason naming the slot and carries no byte figures, because a
+    /// count decision has none; the slot is kept and nothing is allocated.
+    /// [`LeaseError::LedgerExhausted`] stands when every slot was measured.
+    fn count_selection_refusal(&self) -> LeaseError {
+        if self.unmeasured.is_empty() {
+            return LeaseError::LedgerExhausted;
+        }
+        LeaseError::CapacityCharged {
+            measured: None,
+            limit: None,
             unmeasured: self.unmeasured_slots(),
         }
     }
@@ -4912,6 +4931,31 @@ pub(super) fn volume_pool_for_test(
         unmeasured: BTreeMap::new(),
         reserve,
     })
+}
+
+/// Test-only: one revised write that fills the whole slot table with **held**
+/// slots, so an admission at the ceiling has no evictable idle victim. Returns
+/// the last slot's ID and lease ID, which a caller can release to create the
+/// only idle slot (oxide#186 ceiling fixtures). No payload is written.
+#[cfg(test)]
+pub(super) fn fill_held_slot_table_for_test(pool: &Path) -> Result<(u64, String), LeaseError> {
+    let mut opened = Pool::open(pool)?;
+    for id in 1..=MAX_SLOTS as u64 {
+        add_idle_slot_for_test(&mut opened, id, id, 0, 0)?;
+        let slot = opened.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
+        slot.state = SlotPersistState::Held;
+        slot.holder = format!("holder-{id}");
+        slot.lease_id = Some(slot.last_lease_id.clone());
+        slot.recorded = None;
+    }
+    opened.persist_revised()?;
+    let last = opened
+        .ledger
+        .slots
+        .last()
+        .map(|slot| (slot.id, slot.last_lease_id.clone()))
+        .ok_or(LeaseError::UnknownAccounting)?;
+    Ok(last)
 }
 
 /// Test-only: give this pool an idle whole slot with a closed observation.

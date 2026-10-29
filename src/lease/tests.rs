@@ -3863,7 +3863,7 @@ fn a_bounded_capacity_refusal_names_at_most_eight_slots() {
     assert_eq!(error.exit_code(), 3);
     let text = error.to_string();
     assert!(
-        text.starts_with("the requested idle-slot replacement cannot be honoured"),
+        text.starts_with("cannot admit a new slot: unmeasured slot(s)"),
         "{text}"
     );
     assert!(
@@ -4153,6 +4153,115 @@ fn a_conservative_charge_that_cannot_fit_refuses_only_that_admission() {
     assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
 }
 
+/// At the pool-wide slot ceiling (`MAX_SLOTS`) the admission can only proceed
+/// by retiring a verified idle whole slot. When the only idle slot is one a
+/// partial walk left unmeasured, the ceiling cannot be met: that admission
+/// alone refuses with a bounded capacity reason naming the slot, nothing is
+/// deleted or allocated, and the ledger is byte-identical. With every slot
+/// measured the shipped `LedgerExhausted` stands (the control in the same
+/// fixture).
+#[test]
+fn a_slot_ceiling_refusal_names_the_unmeasured_idle_slot() {
+    let fx = Fixture::new("ceiling-unmeasured");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    // One write fills the table with held slots: at the ceiling no verified
+    // idle victim exists, which is the shipped ceiling refusal.
+    let (last_id, last_lease) =
+        super::pool::fill_held_slot_table_for_test(&pool).expect("a full held slot table");
+    let ledger_full = fs::read(pool.join("ledger.json")).expect("stored ledger");
+
+    // Control: every slot is measured (held slots are walked fresh), so the
+    // ceiling keeps the shipped `LedgerExhausted` refusal and changes nothing.
+    let exhausted = lease_injected(request(
+        &pool,
+        &fx.dir("extra-project"),
+        &workspace,
+        "extra",
+    ));
+    assert!(
+        matches!(exhausted, Err(LeaseError::LedgerExhausted)),
+        "{exhausted:?}"
+    );
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("stored ledger"),
+        ledger_full
+    );
+    assert_eq!(
+        status_injected(&pool).expect("status").slots.len(),
+        super::MAX_SLOTS
+    );
+
+    // The last slot becomes the only idle one, and its record is taken away so
+    // admission must walk it. That walk stops at its elapsed bound.
+    release_injected(&pool, &last_lease).expect("release the last slot");
+    super::pool::drop_record_for_test(&pool, last_id).expect("drop the record");
+    let idle_id = last_id.to_string();
+    let idle_path = pool.join("payload").join("slots").join(&idle_id);
+    let ledger_before = fs::read(pool.join("ledger.json")).expect("stored ledger");
+    let payload_before = snapshot_tree(&idle_path);
+    let refused = crate::inventory::walk_observer::with_mutations(
+        fx.path(),
+        serde_json::json!([{
+            "path": idle_path, "action": "delay_before_read_dir", "delay_ms": 300
+        }])
+        .to_string(),
+        || {
+            with_accounting_limits(2_000_000, 64, 100, || {
+                super::pool::lease_with_charges_injected(request(
+                    &pool,
+                    &fx.dir("next-project"),
+                    &workspace,
+                    "next",
+                ))
+            })
+        },
+    )
+    .expect_err("the ceiling refuses this admission");
+    match &refused {
+        LeaseError::CapacityCharged {
+            measured,
+            limit,
+            unmeasured: named,
+        } => {
+            assert_eq!(*measured, None, "a count refusal claimed a byte figure");
+            assert_eq!(*limit, None, "a count refusal claimed a byte budget");
+            assert_eq!(named.len(), 1, "the refusal names more than the kept slot");
+            assert_eq!(named[0].slot_id, idle_id);
+            let generation = managed::ledger_view(&pool)
+                .expect("ledger view")
+                .slots
+                .iter()
+                .find(|slot| slot.slot_id == idle_id)
+                .cloned()
+                .expect("the unmeasured slot is still in the ledger");
+            assert_eq!(named[0].incarnation, generation.incarnation);
+            assert_eq!(named[0].dir, generation.dir);
+            let text = refused.to_string();
+            assert!(
+                text.contains(&format!("slot(s) {idle_id}")),
+                "the refusal does not name the unmeasured slot: {text}"
+            );
+            assert!(text.len() < 400, "the refusal is not bounded: {text}");
+        }
+        other => panic!("expected a bounded capacity refusal, got {other:?}"),
+    }
+    assert_eq!(refused.reason(), "full");
+    assert_eq!(refused.exit_code(), 3);
+    // Nothing was deleted, no slot was added and no record was published.
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("stored ledger"),
+        ledger_before,
+        "the refused admission wrote the ledger"
+    );
+    assert_eq!(snapshot_tree(&idle_path), payload_before);
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert_eq!(view.slots.len(), super::MAX_SLOTS);
+    assert!(recorded_of(&view, &idle_id).is_none());
+    assert!(view.slots.iter().any(|slot| slot.slot_id == idle_id));
+}
+
 /// The front door names an idle slot to retire when a project is at its
 /// twelve-slot cap (`PROJECT_SLOT_CAP` is a front-door policy). The library
 /// contract that keeps that cap is: a count replacement either retires exactly
@@ -4214,7 +4323,7 @@ fn a_named_count_replacement_refuses_rather_than_exceeding_the_project_cap() {
             assert_eq!(named[0].slot_id, unmeasured.to_string());
             let text = refused.to_string();
             assert!(
-                text.starts_with("the requested idle-slot replacement cannot be honoured"),
+                text.starts_with("cannot admit a new slot: unmeasured slot(s)"),
                 "{text}"
             );
             assert!(

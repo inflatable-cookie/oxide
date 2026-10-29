@@ -3626,9 +3626,10 @@ oxide#102.
   walk of an idle slot with no current record on the internal directory pool:
   that slot is charged conservatively (the maximum of the bytes observed so
   far, its last record and the largest recorded slot, never zero and never the
-  whole budget) and kept — never evicted (a named count replacement included,
-  which refuses rather than exceed the caller's slot-count decision), reused or
-  adopted on that walk, and no record — while only an admission whose pool
+  whole budget) and kept — never evicted (a named count replacement and the
+  pool-wide slot ceiling included: each refuses, naming the slot, rather than
+  delete unmeasured storage or exceed the caller's slot-count decision), reused
+  or adopted on that walk, and no record — while only an admission whose pool
   capacity genuinely cannot fit refuses, with a bounded reason naming it.
   Status reports it as `not measured (walk incomplete)` from the recorded
   incomplete-walk fact, never as a figure (oxide#186). Every other
