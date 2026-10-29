@@ -1,19 +1,25 @@
 //! Effective Cargo incremental setting for slot compatibility.
-use crate::{cargo_home, cli, prune, wrapper};
+use crate::{cargo_home, cli, wrapper};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::path::Path;
 
-/// A missing discriminator preserves the pre-change recipe-default key. An
-/// unknown gets a fresh key, so no prior build can be mistaken for it.
+/// An empty discriminator preserves the pre-change recipe-default key.
+/// Unknown settings share their own key, separate from either known value.
 pub fn key_component(checkout: &Path, invocation: &cli::Invocation) -> Result<String, String> {
-    match resolve(checkout, invocation) {
-        Ok(value) if value == (invocation.profile != cli::Profile::Release) => Ok(String::new()),
-        Ok(value) => Ok(value.to_string()),
-        Err(reason) => {
-            eprintln!("oxide: incremental setting unknown ({reason}); building cold");
-            Ok(format!("unknown-{}", prune::fresh_nonce()?))
-        }
+    let setting = resolve(checkout, invocation);
+    if let Err(reason) = &setting {
+        eprintln!("oxide: incremental setting unknown ({reason}); using an unknown-setting slot");
+    }
+    Ok(component(invocation.profile, setting.as_ref().ok().copied()).to_owned())
+}
+
+fn component(profile: cli::Profile, setting: Option<bool>) -> &'static str {
+    match setting {
+        Some(value) if value == (profile != cli::Profile::Release) => "",
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
     }
 }
 
@@ -180,6 +186,81 @@ fn resolve_lower(checkout: &Path, invocation: &cli::Invocation) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn component_preserves_defaults_and_partitions_unknown() {
+        for profile in [cli::Profile::Quick, cli::Profile::Debug] {
+            assert_eq!(component(profile, Some(true)), "");
+            assert_eq!(component(profile, Some(false)), "false");
+            assert_eq!(component(profile, None), "unknown");
+            assert_eq!(component(profile, None), component(profile, None));
+        }
+        assert_eq!(component(cli::Profile::Release, Some(false)), "");
+        assert_eq!(component(cli::Profile::Release, Some(true)), "true");
+        assert_eq!(component(cli::Profile::Release, None), "unknown");
+    }
+
+    #[test]
+    fn global_incremental_precedes_build_config_and_profile() {
+        use std::ffi::OsString;
+        use std::fs;
+        use std::process::Command;
+
+        if let Some(case) = std::env::var_os("OXIDE_TEST_INCREMENTAL_CASE") {
+            let root = std::env::current_dir().unwrap();
+            let args = if case == "profile" {
+                Vec::new()
+            } else {
+                vec![
+                    OsString::from("--config"),
+                    OsString::from("build.incremental=false"),
+                ]
+            };
+            let invocation = cli::parse_leased("build", &args).unwrap();
+            let expected = case == "env-on" || case == "profile";
+            assert_eq!(resolve(&root, &invocation).unwrap(), expected);
+            return;
+        }
+
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "incremental-{}",
+            crate::prune::fresh_nonce().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let home = root.join("cargo-home");
+        fs::create_dir(&home).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[profile.dev]\nincremental = true\n",
+        )
+        .unwrap();
+        for case in ["env-on", "env-off", "config", "profile"] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "incremental::tests::global_incremental_precedes_build_config_and_profile",
+                    "--test-threads=1",
+                ])
+                .current_dir(&root)
+                .env_clear()
+                .env("HOME", &root)
+                .env("CARGO_HOME", &home)
+                .env("OXIDE_TEST_INCREMENTAL_CASE", case);
+            if case == "env-on" {
+                child.env("CARGO_INCREMENTAL", "1");
+            }
+            if case == "env-off" {
+                child.env("CARGO_INCREMENTAL", "0");
+            }
+            let status = child.status().unwrap();
+            assert!(status.success(), "precedence case {case}: {status}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn configuration_layers_and_malformed_values() {
         let docs = [

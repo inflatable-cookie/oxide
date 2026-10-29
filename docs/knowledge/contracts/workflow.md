@@ -244,9 +244,11 @@ The effective incremental setting also partitions slots: `CARGO_INCREMENTAL`
 beats `build.incremental` (including `--config`), which beats the profile's
 setting. An older slot has no recorded setting and is treated as the recipe
 default (incremental on for quick/debug, off for release). An unknown setting
-gets a fresh cold key, never a guessed match. External tools without a global
+uses a stable unknown-setting key, distinct from either known setting; repeated
+unknown commands can reuse it. External tools without a global
 `CARGO_INCREMENTAL` override choose their own Cargo configuration and profile,
-so their setting is unknown to Oxide.
+so their setting is unknown to Oxide. Inline `--config` values are considered;
+unreadable or unclassifiable config layers stay unknown.
 Version 1 keys were the bare `quick` and `debug` of the custom-profile
 recipes, so a slot built by them is never reused for the `dev` recipes: the
 first quick or debug command after the change takes a new slot cold. Older
@@ -861,9 +863,9 @@ oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <co
   same caller-Cargo and toolchain identity rules as `build`. Neither moves the
   tool's working directory or changes its arguments. One Cargo workspace per
   invocation.
-- **Lease.** The same slot key (recipe, compiler, target), freshness gate,
-  admission, host limit, clean barrier and reserve watchdog as a leased Cargo
-  command. The gate runs with Cargo's defaults: the tool's own lock or network
+- **Lease.** The same slot-key components (recipe, compiler, target and
+  effective incremental setting), freshness gate, admission, host limit,
+  clean barrier and reserve watchdog as a leased Cargo command. The gate runs with Cargo's defaults: the tool's own lock or network
   flags are not known to Oxide. A tool that will compile never skips it.
 - **Environment.** The same storage, recipe and rustc-wrapper function as
   every leased command (`apply_storage`): intermediates go to the held slot,
@@ -1480,7 +1482,9 @@ Tom ruled on 2026-10-25 that every Rust project in `~/Dev/projects` moves fully 
 - **Named proof exceptions.** Only a proof whose subject is Cargo's own target layout (for example a scanner that reads `target/<profile>/deps`) or that must build without any shared intermediate state may set its own build directory. It runs under `oxide exec`, places that private directory under the drive's `scratch/<project>/` or the proof's `OXIDE_TASK_SCRATCH_ROOT` (never `/var/folders`, `~` or a drive root), removes it afterwards, and is listed by name in the project as an intentional proof exception.
 - **Stays on Cargo:** CI and release workflows (above), container builds inside Linux images without `oxide`, product code that runs Cargo as part of its own behaviour, and test fixtures.
   - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user; #106 moved only the final outputs to `target/debug/`. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
-- **nextest.** `oxide nextest run` with no profile flag builds with the quick recipe in the quick slot. In a profile-layout checkout the external subcommand derives its member set from the committed receipt like `oxide exec` (oxide#164), so it runs instead of refusing, and any directory the tool owns that is not a member (`target/nextest`) stays a real local directory reported once. Drop an existing `--cargo-profile oxide-quick`: it still builds, but into `target/oxide-quick/`.
+- **nextest.** `oxide nextest run` with no profile flag builds with the quick recipe in the quick slot. Without `CARGO_INCREMENTAL`, its
+  incremental setting is unknown and it shares the unknown-setting slot with
+  compatible `oxide exec` commands. In a profile-layout checkout the external subcommand derives its member set from the committed receipt like `oxide exec` (oxide#164), so it runs instead of refusing, and any directory the tool owns that is not a member (`target/nextest`) stays a real local directory reported once. Drop an existing `--cargo-profile oxide-quick`: it still builds, but into `target/oxide-quick/`.
 - **Final outputs.** Since #106, `quick` and `debug` binaries are in `target/debug/`, so scripts that read them there can move to `oxide`. Earlier adopters' `target/oxide-quick/` directories are left alone; `oxide clean` removes them with the rest of `target/`.
 - **Worktree seeding.** Selectors that move to `oxide` drop any copy of a primary checkout's `target/` into worktrees. The shared slot is the warm state.
 - **Proof per project:**
