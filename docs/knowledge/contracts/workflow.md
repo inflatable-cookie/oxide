@@ -1661,10 +1661,12 @@ necessary.
   marker refusal and inertness; foreign, path, hash, size, capability,
   ownership, `PATH`, same-inode and replacement refusals; skipped commands; and
   a final-release error after effects that never executes anything. What it
-  exercises is a binary staged from this HEAD carrying control state version 5
-  with a compiled recording stub candidate that reports the newer version 6; it
+  exercises is a binary staged from this HEAD carrying control state version 8
+  with a compiled recording stub candidate that reports the newer version 9; it
   is not a real installed version-4 binary handing off to version 5, and it
-  claims no host install. That real forward-fence hand-off stays behind the
+  claims no host install. `effigy proof:installed-handoff:test` checks the
+  fixture control-state and ledger versions against product constants without
+  staging a binary. That real forward-fence hand-off stays behind the
   separate QA-compatibility-window and receipt-matching install gate. It never
   touches the real `~/.local/bin/oxide`, a real install receipt or a live pool,
   and is not a benchmark or an alias for full QA.
@@ -4473,7 +4475,11 @@ migration and consumer adoption remain separate gates.
 shared proof supervisor (`bounded-test.py --limit 300 --scratch-budget-mib
 512`, oxide#109). It stages this clean HEAD's `oxide` offline with 1.97.1,
 models the permanent drive as one owned 128 MiB APFS sparse image at a unique
-`/Volumes/<name>`, and covers: the effect-free plan; refusals for a nonempty
+`/Volumes/<name>`. The backing stays in the guard evidence directory until an
+ordinary detach positively removes both the mount and recorded devices; unknown
+custody retains it and fails the run. The same custody rule applies to every
+focused mode, and `effigy proof:exec-inference:test` checks its counterfactuals.
+The proof covers: the effect-free plan; refusals for a nonempty
 real target and a foreign symlink with no mutation; explicit conversion and
 builds, `run`, `test`, `--profile debug` and `target/debug` binaries through
 the link; the local fallback while the drive is absent and redocking with

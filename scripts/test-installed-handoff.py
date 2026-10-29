@@ -35,6 +35,7 @@ sys.dont_write_bytecode = True
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -60,6 +61,7 @@ NEWER_STATE_VERSION = STATE_VERSION + 1
 # What the product writes for this proof's small fixture pool: the admission
 # gate fences every mutating command at the newest version.
 WITNESS_STATE_VERSION = SLOT_CEILING_STATE_VERSION
+LEDGER_VERSION = 1
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
@@ -110,6 +112,18 @@ def write(path: str, contents: str, mode: int) -> None:
 RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
 EVICTION_ACCOUNTING_FENCE = "oxide.eviction-accounting/1"
 SLOT_CEILING_FENCE = "oxide.slots/256"
+
+
+def check_source_versions() -> None:
+    source_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    def literal(path: str, name: str) -> int:
+        with open(os.path.join(source_dir, path), encoding="utf-8") as handle:
+            matches = re.findall(r"^pub const " + name + r": u32 = (\d+);$", handle.read(), re.MULTILINE)
+        expect(len(matches) == 1, f"cannot read product constant {name}")
+        return int(matches[0])
+    expect(STATE_VERSION == literal("src/lease/control.rs", "STATE_VERSION"), "control-state fixture version drift")
+    expect(SLOT_CEILING_STATE_VERSION == literal("src/lease/mod.rs", "CONTROL_FENCE_VERSION"), "control fence fixture drift")
+    expect(LEDGER_VERSION == literal("src/lease/mod.rs", "LEASE_VERSION"), "ledger fixture version drift")
 
 
 def current_state(version: int = STATE_VERSION) -> str:
@@ -752,7 +766,7 @@ def check_final_release(root: str, binary: str) -> None:
         + "  exit 0\n"
         + "fi\n"
     )
-    # A first command creates the pool and its version-2 state; Cargo fails,
+    # A first command creates the current pool and fenced state; Cargo fails,
     # so nothing else happens.
     write(os.path.join(fixture.tools, "cargo"), header + "exit 1\n", 0o755)
     scaffold = subprocess.run(
@@ -766,6 +780,8 @@ def check_final_release(root: str, binary: str) -> None:
     expect(scaffold.returncode == 1, f"scaffold exit {scaffold.returncode}: {scaffold.stderr!r}")
     with open(state, encoding="utf-8") as handle:
         expect(json.load(handle)["version"] == WITNESS_STATE_VERSION, "the pool did not start at the recorded-accounting state version")
+    with open(os.path.join(fixture.pool, "ledger.json"), encoding="utf-8") as handle:
+        expect(json.load(handle)["version"] == LEDGER_VERSION, "the pool ledger version drifted")
     expect(NOTICE not in scaffold.stderr, "the scaffold handed off")
     # The real command: a newer writer fences the state while Cargo runs.
     # The newer writer waits until the command has recorded its running
@@ -856,6 +872,11 @@ def check_cargo_exit_75(root: str, binary: str) -> None:
 
 
 def main() -> int:
+    check_source_versions()
+    if sys.argv[1:] == ["--self-test"]:
+        print("installed-handoff source version checks passed")
+        return 0
+    expect(not sys.argv[1:], "unknown arguments")
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
     expect(bool(evidence) and os.path.isdir(evidence), "not running under the shared supervisor")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
