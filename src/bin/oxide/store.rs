@@ -2090,7 +2090,7 @@ impl Store {
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission =
-            oxide_storage::release_trace::phase("admission lock", || self.admission())?;
+            oxide_storage::release_trace::phase("admission lock", || self.release_admission())?;
         if !oxide_storage::release_trace::phase("temporary directory removal", || {
             self.discard_scratch(&held)
         }) || !oxide_storage::release_trace::phase("removable flush", || {
@@ -4750,6 +4750,12 @@ impl Store {
         Ok(lock)
     }
 
+    fn release_admission(&self) -> Result<File, String> {
+        let lock = lock_admission_inner(&self.control, Some(&self.pool))?;
+        self.fence_admission_state()?;
+        Ok(lock)
+    }
+
     /// Output initialization does not mutate the library ledger. Preserve its
     /// existing recorded-accounting fence without publishing the eviction or
     /// raised-ceiling fences before its own refusal checks.
@@ -5216,6 +5222,10 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
 }
 
 pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
+    lock_admission_inner(control, None)
+}
+
+fn lock_admission_inner(control: &Path, release_pool: Option<&Path>) -> Result<File, String> {
     // The shipped messages are part of the pre-S1 behaviour this slice must
     // keep byte-identical while it is dormant, so they are produced here
     // exactly as they were: an absent control directory names itself, and any
@@ -5232,7 +5242,37 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
             ))
         };
     };
-    crate::budget::lock(&file, "admission")?;
+    if let Some(pool) = release_pool {
+        let started = Instant::now();
+        let mut noticed = false;
+        loop {
+            if flock_nonblocking(&file)? {
+                break;
+            }
+            if crate::budget::admission_deadline().is_some() && crate::budget::admission_expired() {
+                return Err(
+                    "the admission budget expired while waiting for the admission lock".to_owned(),
+                );
+            }
+            if !noticed && started.elapsed() >= Duration::from_secs(5) {
+                let slot = snapshot(pool)
+                    .ok()
+                    .and_then(|view| view.evicting_slot_ids.into_iter().next());
+                match slot {
+                    Some(id) => eprintln!("oxide: waiting for the admission lock (slot {id} is recorded as being deleted; its current writer is unknown)"),
+                    None => eprintln!("oxide: waiting for the admission lock (holder unknown)"),
+                }
+                noticed = true;
+                if crate::budget::admission_deadline().is_none() {
+                    flock_blocking(&file)?;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        crate::budget::lock(&file, "admission")?;
+    }
     Ok(file)
 }
 

@@ -1113,7 +1113,7 @@ impl Pool {
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
         let lock = if trace_release {
-            crate::release_trace::phase("pool lock", || lock_pool(&root))?
+            crate::release_trace::phase("pool lock", || lock_pool_inner(&root, true, true))?
         } else {
             lock_pool(&root)?
         };
@@ -4424,10 +4424,10 @@ fn refuse_occupied_init_directory(pool: &Path) -> Result<(), LeaseError> {
 }
 
 fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
-    lock_pool_inner(pool, true)
+    lock_pool_inner(pool, true, false)
 }
 
-fn lock_pool_inner(pool: &Path, create: bool) -> Result<File, LeaseError> {
+fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, LeaseError> {
     let path = pool.join(LOCK_NAME);
     let existing = match fs::symlink_metadata(&path) {
         Ok(metadata) => {
@@ -4458,12 +4458,57 @@ fn lock_pool_inner(pool: &Path, create: bool) -> Result<File, LeaseError> {
     {
         return Err(LeaseError::UnsafePath("lock file must be private"));
     }
+    if notice {
+        wait_before_pool_notice(&file, Duration::from_secs(5), || {
+            let slot = read_ledger(pool).ok().and_then(|ledger| {
+                ledger
+                    .slots
+                    .into_iter()
+                    .find(|slot| slot.state == SlotPersistState::Evicting)
+            });
+            match slot {
+                Some(slot) => eprintln!("oxide: waiting for the pool lock (slot {} is recorded as being deleted; its current writer is unknown)", slot.id),
+                None => eprintln!("oxide: waiting for the pool lock (holder unknown)"),
+            }
+        })?;
+        return Ok(file);
+    }
     // SAFETY: `file` is open for the pool lock; flock holds until File drop.
     let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if status != 0 {
         return Err(LeaseError::Io("exclusive pool lock failed".into()));
     }
     Ok(file)
+}
+
+// Poll only until the one notice, then return to the ordinary blocking flock.
+fn wait_before_pool_notice(
+    file: &File,
+    delay: Duration,
+    notice: impl FnOnce(),
+) -> Result<(), LeaseError> {
+    let started = Instant::now();
+    loop {
+        // SAFETY: the descriptor stays open through this call and until release.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(LeaseError::Io(format!(
+                "exclusive pool lock failed: {error}"
+            )));
+        }
+        if started.elapsed() >= delay {
+            notice();
+            // SAFETY: the descriptor stays open and owns the lock on success.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(LeaseError::Io("exclusive pool lock failed".into()));
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100).min(delay.saturating_sub(started.elapsed())));
+    }
 }
 
 fn write_config(pool: &Path, config: &PoolConfig) -> Result<(), LeaseError> {
@@ -5082,6 +5127,34 @@ mod removable_pool_path_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn release_pool_wait_notices_once_only_when_contended() {
+        let fixture = Fixture::new("release-wait-notice");
+        let path = fixture.root.join("lock");
+        let holder = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let waiter = OpenOptions::new().write(true).open(&path).unwrap();
+        // SAFETY: both descriptors remain open and refer to this fixture's lock.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let mut calls = 0;
+        wait_before_pool_notice(&waiter, Duration::ZERO, || {
+            calls += 1;
+            // SAFETY: holder owns the fixture lock, and remains open.
+            assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        // SAFETY: waiter owns the lock after the wait.
+        assert_eq!(unsafe { libc::flock(waiter.as_raw_fd(), libc::LOCK_UN) }, 0);
+        wait_before_pool_notice(&waiter, Duration::ZERO, || {
+            panic!("uncontended lock noticed")
+        })
+        .unwrap();
     }
 
     fn bounds_scan() -> AccountingScan {

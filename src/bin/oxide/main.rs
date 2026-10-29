@@ -946,9 +946,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // The one bounded notice for what this tool created in the checkout's real
     // target (oxide#164). Printed after the writer's group closed and before
     // the summary, once, and only on the receipt-derived profile-member layout.
-    if let Some(note) =
+    if let Some(note) = oxide_storage::release_trace::phase("tool directory notice", || {
         outputs::tool_directories_note(&key.checkout, target_entries_before.as_deref())
-    {
+    }) {
         eprintln!("oxide: {note}");
     }
     let mut notes = [gate.describe(), wrapper_note, output_note]
@@ -996,8 +996,12 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             // Cargo path when no root was bound (a bounded run without a
             // converted checkout).
             let program = match root {
-                Some(root) => outputs::program_target(&key.checkout, root, &program)
-                    .unwrap_or_else(|| program.clone()),
+                Some(root) => {
+                    oxide_storage::release_trace::phase("program target resolution", || {
+                        outputs::program_target(&key.checkout, root, &program)
+                    })
+                    .unwrap_or_else(|| program.clone())
+                }
                 None => program.clone(),
             };
             Some((program, manifest_dir.clone()))

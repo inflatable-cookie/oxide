@@ -45,6 +45,8 @@ mod tests {
         for name in [
             "cargo group closure",
             "run group closure",
+            "tool directory notice",
+            "program target resolution",
             "freshness finish",
             "seed publication",
             "admission lock",
