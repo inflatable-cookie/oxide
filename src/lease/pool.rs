@@ -2960,11 +2960,16 @@ impl Pool {
         }
         crate::proof::deletion_pause("journal-created");
         if let Err(error) = self.remove_owned_slot(&path, None, &mut custody) {
-            // The record, its charge and its custody stay. A removal failure
-            // under a shared scope that no longer verifies — a vanished or
-            // changed removable volume, a missing or unsafe slots root, or a
-            // broken recorded parent binding — is a backing or shared-integrity
-            // refusal, not this victim's own failure.
+            // The record, its charge and its custody stay. A backing failure is
+            // decided by the original error, before any recheck: a transient
+            // volume-verification failure that would succeed on a second check
+            // must never be downgraded to a per-object victim failure.
+            if matches!(error, LeaseError::BackingMismatch) {
+                return Err(error);
+            }
+            // Another shared failure (a vanished or changed volume on the
+            // recheck, a missing or unsafe slots root, or a broken recorded
+            // parent binding) also refuses globally.
             if let Err(shared) = self.checked_slot_scope(&path) {
                 return Err(shared);
             }
@@ -5492,6 +5497,7 @@ mod removable_pool_path_tests {
             verify_error: None,
             available_sequence: Vec::new(),
             verify_error_after: None,
+            verify_error_once: false,
             reads: 0,
         }
     }
@@ -6496,6 +6502,123 @@ mod one_use_slice_tests {
                 );
                 assert!(slot.recorded.is_some(), "the charge was lost");
                 assert!(other.is_dir(), "the other eligible victim was touched");
+            },
+        );
+    }
+
+    /// A backing failure on the first shared-scope check is decided by that
+    /// original error even when a later recheck would verify: it must never be
+    /// downgraded to a per-object victim failure. The published record, its
+    /// custody reference, its charge and both payloads stay byte-identical,
+    /// and no other eligible victim is touched.
+    #[test]
+    fn a_transient_first_backing_failure_is_never_downgraded_to_a_local_victim_failure() {
+        use crate::volume::verified_facts::{self, VolumeFacts};
+
+        let fixture = SliceFixture::new("transient-backing");
+        let pool_root = fixture.pool_root("pool");
+        let payload = fixture.dir("volume");
+        verified_facts::with(
+            VolumeFacts {
+                verify_error_once: true,
+                ..VolumeFacts::default()
+            },
+            || {
+                let mut pool = volume_pool_for_test(&pool_root, &payload, 1 << 30, None)
+                    .expect("removable fixture pool");
+                let victim =
+                    add_idle_slot_for_test(&mut pool, 1, 1, 1024, 0).expect("the selected victim");
+                let other =
+                    add_idle_slot_for_test(&mut pool, 2, 2, 1024, 0).expect("the other victim");
+                for path in [
+                    &payload.join(SLOTS_NAME),
+                    &victim,
+                    &victim.join("build"),
+                    &other,
+                    &other.join("build"),
+                ] {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                        .expect("private slot scope");
+                }
+                let victim_payload = victim.join("build").join("kept.bin");
+                fs::write(&victim_payload, b"victim").expect("victim payload");
+                let other_payload = other.join("build").join("kept.bin");
+                fs::write(&other_payload, b"other").expect("other payload");
+                let victim_before = fs::symlink_metadata(&victim_payload).expect("victim metadata");
+                let other_before = fs::symlink_metadata(&other_payload).expect("other metadata");
+                let other_row = {
+                    let slot = pool.slot(2).expect("the other victim's row");
+                    (
+                        slot.state,
+                        slot.lease_id.clone(),
+                        slot.custody.clone(),
+                        slot.recorded.clone(),
+                        slot.capture.clone(),
+                    )
+                };
+                let (project, profile) = {
+                    let slot = pool.slot(1).expect("the selected victim's row");
+                    (slot.project.clone(), slot.profile)
+                };
+                let outcome = pool.retire_idle_slot_classified(1, 1, &project, profile);
+                assert!(
+                    matches!(outcome, Err(LeaseError::BackingMismatch)),
+                    "a transient first backing failure was not a global refusal: {outcome:?}"
+                );
+                assert_eq!(
+                    verified_facts::reads(),
+                    0,
+                    "the production path re-verified after the original backing failure"
+                );
+                // The published record keeps its custody reference and charge,
+                // and both victims' payloads are untouched.
+                let slot = pool.slot(1).expect("the published record");
+                assert_eq!(slot.state, SlotPersistState::Evicting);
+                assert!(
+                    slot.custody.is_some(),
+                    "the published custody reference was lost"
+                );
+                assert!(slot.recorded.is_some(), "the charge was lost");
+                assert_eq!(
+                    fs::read(&victim_payload).expect("victim payload"),
+                    b"victim"
+                );
+                assert_eq!(fs::read(&other_payload).expect("other payload"), b"other");
+                assert_eq!(
+                    fs::symlink_metadata(&victim_payload)
+                        .expect("victim metadata")
+                        .ino(),
+                    victim_before.ino()
+                );
+                assert_eq!(
+                    fs::symlink_metadata(&other_payload)
+                        .expect("other metadata")
+                        .ino(),
+                    other_before.ino()
+                );
+                let slot = pool.slot(2).expect("the other victim's row");
+                assert_eq!(
+                    (
+                        slot.state,
+                        slot.lease_id.clone(),
+                        slot.custody.clone(),
+                        slot.recorded.clone(),
+                        slot.capture.clone(),
+                    ),
+                    other_row,
+                    "the other eligible victim's record changed"
+                );
+                // The second verification now succeeds, which is exactly the
+                // case that must not downgrade the original failure.
+                assert!(
+                    pool.checked_slot_scope(&victim).is_ok(),
+                    "the modelled failure was not transient"
+                );
+                assert_eq!(
+                    verified_facts::reads(),
+                    1,
+                    "the explicit recheck did not verify exactly once"
+                );
             },
         );
     }

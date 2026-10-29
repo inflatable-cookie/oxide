@@ -171,6 +171,10 @@ pub(crate) mod verified_facts {
         pub available_sequence: Vec<Option<u64>>,
         /// Fail verification once this many successful readings have happened.
         pub verify_error_after: Option<u64>,
+        /// Fail the next verification exactly once, then verify normally. Used
+        /// to prove that a transient first shared-scope failure is never
+        /// downgraded when a recheck would succeed.
+        pub verify_error_once: bool,
         /// How many substituted verifications have happened (test sequencing).
         pub reads: u64,
     }
@@ -208,6 +212,19 @@ pub(crate) mod verified_facts {
         };
         if let Some(error) = current.verify_error {
             return Err(error);
+        }
+        let fail_once = CURRENT.with(|cell| {
+            let mut borrowed = cell.borrow_mut();
+            let installed = borrowed.as_mut().expect("adapter installed");
+            if installed.verify_error_once {
+                installed.verify_error_once = false;
+                true
+            } else {
+                false
+            }
+        });
+        if fail_once {
+            return Err("the fixture volume failed one verification".to_owned());
         }
         let read = CURRENT.with(|cell| {
             let mut borrowed = cell.borrow_mut();
