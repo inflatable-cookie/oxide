@@ -5243,37 +5243,59 @@ fn lock_admission_inner(control: &Path, release_pool: Option<&Path>) -> Result<F
         };
     };
     if let Some(pool) = release_pool {
-        let started = Instant::now();
-        let mut noticed = false;
-        loop {
-            if flock_nonblocking(&file)? {
-                break;
-            }
-            if crate::budget::admission_deadline().is_some() && crate::budget::admission_expired() {
-                return Err(
-                    "the admission budget expired while waiting for the admission lock".to_owned(),
-                );
-            }
-            if !noticed && started.elapsed() >= Duration::from_secs(5) {
+        wait_release_admission(
+            &file,
+            Duration::from_secs(5),
+            || crate::budget::admission_deadline().is_some(),
+            crate::budget::admission_expired,
+            || {
                 let slot = snapshot(pool)
                     .ok()
                     .and_then(|view| view.evicting_slot_ids.into_iter().next());
-                match slot {
-                    Some(id) => eprintln!("oxide: waiting for the admission lock (slot {id} is recorded as being deleted; its current writer is unknown)"),
-                    None => eprintln!("oxide: waiting for the admission lock (holder unknown)"),
-                }
-                noticed = true;
-                if crate::budget::admission_deadline().is_none() {
-                    flock_blocking(&file)?;
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+                eprintln!("{}", admission_wait_message(slot.as_deref()));
+            },
+        )?;
     } else {
         crate::budget::lock(&file, "admission")?;
     }
     Ok(file)
+}
+
+fn admission_wait_message(slot: Option<&str>) -> String {
+    match slot {
+        Some(id) => format!("oxide: waiting for the admission lock (slot {id} is recorded as being deleted; its current writer is unknown)"),
+        None => "oxide: waiting for the admission lock (holder unknown)".to_owned(),
+    }
+}
+
+fn wait_release_admission(
+    file: &File,
+    notice_delay: Duration,
+    budgeted: impl Fn() -> bool,
+    expired: impl Fn() -> bool,
+    notice: impl FnOnce(),
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut notice = Some(notice);
+    loop {
+        if flock_nonblocking(file)? {
+            return Ok(());
+        }
+        if budgeted() && expired() {
+            return Err(
+                "the admission budget expired while waiting for the admission lock".to_owned(),
+            );
+        }
+        if notice.is_some() && started.elapsed() >= notice_delay {
+            if let Some(notice) = notice.take() {
+                notice();
+            }
+            if !budgeted() {
+                return flock_blocking(file);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// One non-blocking admission look, **without creating anything**: `Held` when
@@ -5704,6 +5726,65 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn release_admission_notice_and_budget_are_bounded_and_truthful() {
+        let (root, _store, _key) = class_fixture("release-admission-notice");
+        let path = root.join("notice-lock");
+        let holder = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let waiter = OpenOptions::new().write(true).open(&path).unwrap();
+        flock_blocking(&holder).unwrap();
+        let calls = std::cell::Cell::new(0);
+        wait_release_admission(
+            &waiter,
+            Duration::ZERO,
+            || false,
+            || false,
+            || {
+                calls.set(calls.get() + 1);
+                // SAFETY: holder owns this fixture lock.
+                assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        // SAFETY: waiter owns this fixture lock.
+        assert_eq!(unsafe { libc::flock(waiter.as_raw_fd(), libc::LOCK_UN) }, 0);
+        wait_release_admission(
+            &waiter,
+            Duration::from_secs(5),
+            || false,
+            || false,
+            || panic!("uncontended notice"),
+        )
+        .unwrap();
+        // SAFETY: waiter owns this fixture lock.
+        assert_eq!(unsafe { libc::flock(waiter.as_raw_fd(), libc::LOCK_UN) }, 0);
+        flock_blocking(&holder).unwrap();
+        assert_eq!(
+            wait_release_admission(
+                &waiter,
+                Duration::ZERO,
+                || true,
+                || true,
+                || panic!("expired notice")
+            )
+            .unwrap_err(),
+            "the admission budget expired while waiting for the admission lock"
+        );
+        assert_eq!(admission_wait_message(Some("17")), "oxide: waiting for the admission lock (slot 17 is recorded as being deleted; its current writer is unknown)");
+        assert_eq!(
+            admission_wait_message(None),
+            "oxide: waiting for the admission lock (holder unknown)"
+        );
+        drop(holder);
+        drop(waiter);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// A ledger as an earlier Oxide wrote it reads back, keeps its stored
     /// digests and serializes to the same bytes (oxide#103 sha2 0.11.0).

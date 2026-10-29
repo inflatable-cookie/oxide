@@ -691,8 +691,9 @@ members after two seconds. The release walk has a cooperative 60-second,
 and pool locks, temporary removal, eviction reconciliation, Git freshness
 work, flush and durable writes have no hard elapsed bound. Removable flush
 also opens the pool and can wait on its lock or reconcile eviction before the
-volume flush itself. Stream writes and scheduling may block too. Release emits one admission-lock or pool-lock wait
-notice after about five seconds even without tracing. An evicting slot in the
+volume flush itself. Stream writes and scheduling may block too. Release emits
+one notice per admission-lock or pool-lock wait after about five seconds even
+without tracing, including the removable flush's pool open. An evicting slot in the
 unlocked ledger snapshot is identified as recorded, not asserted to be the
 current lock holder; unreadable or absent evidence yields `holder unknown`.
 

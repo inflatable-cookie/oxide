@@ -694,7 +694,7 @@ pub mod managed {
     /// return the time the flush took. Any doubt about the volume is an
     /// error.
     pub fn flush_volume(pool: &Path) -> Result<Duration, LeaseError> {
-        let opened = Pool::open(pool)?;
+        let opened = crate::release_trace::phase("pool open", || Pool::open_for_release(pool))?;
         match &opened.backing {
             Payload::Volume { binding, .. } => binding.flush().map_err(LeaseError::Io),
             Payload::Budget(_) => Err(LeaseError::Unsupported(
