@@ -26,6 +26,7 @@ use crate::freshness::{Built, Prior};
 use crate::identity::{self, SlotKey};
 use crate::process;
 use crate::watchdog::Watchdog;
+pub(crate) use oxide_storage::lease::control::*;
 use oxide_storage::lease::managed::{
     evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view, measure_within,
     recover, release, snapshot, status as pool_status,
@@ -57,199 +58,15 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
 /// Slots one project identity may keep; a new checkout or a command with no
 /// idle compatible slot replaces the least-recently-used eligible idle whole
-/// slot of that project (oxide#118).
-const PROJECT_SLOT_CAP: usize = 8;
-const MAX_TICKETS: usize = 128;
-const MAX_CLEANS: usize = 128;
-const MAX_RECORDS: usize = 256;
-/// Automatic recoveries kept for `oxide status`, newest last.
-const MAX_RECOVERIES: usize = 16;
+/// slot of that project (oxide#118, raised to twelve by oxide#177).
+pub(crate) const PROJECT_SLOT_CAP: usize = 12;
 /// Finite control-state file size including the atomic temp.
-pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
-/// Legacy control-state files keep their original read limit until the
-/// permanent version-2 fence is actually written.
-const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Permanent control-state fence for revised Store mutations (oxide#118).
-/// Version 7 fences eviction accounting before an Evicting record retains
-/// its closed size. Version 6 carries the one-use fence (design §5.1, §10.1): a record may
-/// carry a workspace class only under this version and its durable
-/// `oxide.one-use/1` fence, so an older strict parser can never meet a class
-/// field it does not know. It is written **only** when a class-bearing record
-/// is first written, so a normal-only pool stays at version 5 or below.
-/// Version 5 carries the recorded per-slot accounting fence (oxide#146): the
-/// library ledger's `capacity_policy: 2` refuses an older binary's strict
-/// parse, so this control fence must be durable *before* the first recorded
-/// ledger write, and a newer binary hands off before it reads that ledger.
-/// Version 4 (the profile-member owned-outputs fence, oxide#133), version 3
-/// (the whole-target registry transaction, oxide#129) and version 2
-/// (oxide#128) remain readable until a forward fence upgrades them.
-pub(crate) const STATE_VERSION: u32 = 7;
-/// Version 6 carries the one-use fence.
-const ONE_USE_STATE_VERSION: u32 = 6;
-/// Version 5 is the recorded-accounting fence (oxide#146), still written for
-/// a pool that has not opted into one-use workspaces.
-const RECORDED_ACCOUNTING_STATE_VERSION: u32 = 5;
-/// Version 4 is the owned-outputs fence this version supersedes.
-const PREVIOUS_STATE_VERSION: u32 = 4;
-/// Version 3 is the unfenced-shape successor of version 2: a pool with the
-/// whole-target `oxide.outputs/2` fence keeps it so a state-3 binary can still
-/// run.
-const OLDER_STATE_VERSION: u32 = 3;
-/// Version 2 (oxide#128) is read with the same strict field bounds.
-const LEGACY_FIELDS_STATE_VERSION: u32 = 2;
-const LEGACY_STATE_VERSION: u32 = 1;
-/// The recorded-accounting fence value; see [`State::recorded_accounting`].
-pub(crate) const RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
-/// The one-use fence value; see [`State::one_use_workspaces`]. A document
-/// carrying it is at version 6 or later, and a document with either
-/// `class` or `class_reason` in any record always carries it.
-pub(crate) const ONE_USE_FENCE: &str = "oxide.one-use/1";
 
-/// UTF-8 byte caps for control-state fields (oxide#118).
-const MAX_IDENTITY_BYTES: usize = 64;
-const MAX_COMPATIBILITY_BYTES: usize = 64;
-const MAX_PROFILE_BYTES: usize = 16;
-const MAX_PATH_TEXT_BYTES: usize = 1024;
-const MAX_LEASE_HOLDER_BYTES: usize = 128;
-/// `exec_label` can carry 160 four-byte characters plus its prefix and
-/// ellipsis.
-const MAX_COMMAND_BYTES: usize = 648;
-const MAX_STATE_LEASE_ID_BYTES: usize = 160;
-const MAX_STATE_SLOT_ID_BYTES: usize = 160;
-const MAX_DIAGNOSTIC_BYTES: usize = 1024;
-
-/// Compact serialized object ceilings, so the record-count bound and the
-/// byte bound hold together: 256*40960 + 128*128 + 128*7168 + 16*9216 +
-/// 16*8192 + 4096 = 11,702,272 bytes < MAX_STATE_BYTES.
-const MAX_RECORD_OBJECT_BYTES: usize = 40 * 1024;
-const MAX_TICKET_OBJECT_BYTES: usize = 128;
-const MAX_CLEAN_OBJECT_BYTES: usize = 7 * 1024;
-const MAX_RECOVERY_OBJECT_BYTES: usize = 9 * 1024;
-const MAX_FLUSH_OBJECT_BYTES: usize = 8 * 1024;
-const MAX_LOST_OBJECT_BYTES: usize = 8 * 1024;
-const MAX_HOLDER_OBJECT_BYTES: usize = 5 * 1024;
-const MAX_STATE_HEADER_BYTES: usize = 4 * 1024;
-/// The owned-outputs fence value; see [`State::owned_outputs`].
-pub(crate) const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3";
-/// The published whole-target fence: read unchanged (its legacy receipts keep
-/// their place and key) and upgraded only by the explicit successor
-/// transaction. Version 1 is the released original.
-const LEGACY_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/2";
-const RELEASED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
-
-/// A fence this binary accepts as a legitimate predecessor of
-/// [`OWNED_OUTPUTS_FENCE`]: the published whole-target `/2` fence and the
-/// released `/1` fence it superseded. Every branch that meets a paired
-/// removable control accepts exactly this set — plus an absent fence where the
-/// control may be new — so a pool fenced by the released binary can never be
-/// migrated by one branch and refused as unknown by another (oxide#159).
-/// [`Store::load`] is the validation gate for every other value.
-fn predecessor_owned_outputs_fence(fence: &str) -> bool {
-    fence == LEGACY_OWNED_OUTPUTS_FENCE || fence == RELEASED_OWNED_OUTPUTS_FENCE
-}
-
-const MAX_INIT_TRANSACTION_BYTES: usize = 64;
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
 const WAIT_POLL: Duration = Duration::from_millis(200);
-/// Removable-volume flushes kept for `oxide status`, newest last.
-const MAX_FLUSHES: usize = 16;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    Idle,
-    /// A lease may exist; no Cargo has started.
-    Acquiring,
-    /// Cargo may have started; its group is not recorded yet.
-    Spawning,
-    /// Cargo runs as leader of `process_group`.
-    Running,
-    /// A removable-volume slot whose flush before release failed or is
-    /// unknown. Its lease stays held: never reused, recovered or deleted
-    /// here.
-    Retired,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Record {
-    id: u64,
-    identity: String,
-    compatibility: String,
-    profile: String,
-    /// `None` once `oxide clean` dropped this checkout's affinity.
-    checkout: Option<PathBuf>,
-    phase: Phase,
-    process_group: Option<i32>,
-    last_used: u64,
-    /// Holder of the current command; set while the record is not idle.
-    #[serde(default)]
-    holder: Option<Holder>,
-    /// Lease ID once the library granted it.
-    #[serde(default)]
-    lease_id: Option<String>,
-    /// Written before the ledger recovery, so the event survives a crash
-    /// between that recovery and moving it into the log.
-    #[serde(default)]
-    pending_recovery: Option<Recovery>,
-    /// Why a [`Phase::Retired`] slot was retired.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    retired: Option<String>,
-    /// Set when the slot was retired because its removable volume vanished
-    /// while the record held it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    lost: Option<Lost>,
-    /// Wall clock of the latest use, milliseconds since the epoch, written
-    /// with `last_used`. `last_used` orders uses within one pool only; this
-    /// lets `status` compare pools. Absent on records last used before it
-    /// existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_used_ms: Option<u64>,
-    /// This record's workspace class (design §5.1). Class is written once,
-    /// when the record is created, and never relabelled (§5.2).
-    ///
-    /// A **normal** record omits both new fields, so the bytes a version-6
-    /// binary writes for an ordinary slot are exactly the bytes a version-5
-    /// binary wrote and reads (`Record` denies unknown fields, and its
-    /// preflight compares only numeric versions). A `one_use` record is
-    /// therefore always accompanied by the durable fence, which is what tells
-    /// an older reader that this document is beyond it.
-    #[serde(default, skip_serializing_if = "class_is_normal")]
-    class: WorkspaceClass,
-    /// Bounded reason this workspace classified one-use (§5.1, §10.5). Only a
-    /// `one_use` record may carry one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    class_reason: Option<String>,
-}
-
-/// A slot record's workspace class (design §5.1).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceClass {
-    /// The protected class (§5.7): every pre-feature record reads as this, and
-    /// a normal slot keeps the project-cap and eviction rules it always had.
-    #[default]
-    Normal,
-    /// A temporary workspace's slot: never counted against the project cap
-    /// (§5.3), never shared with a normal command (§5.4).
-    OneUse,
-}
-
-/// The serializer omission rule of design §5.1: a normal record prints
-/// neither class field, so a superseded reader's strict parse still accepts
-/// the document.
-fn class_is_normal(class: &WorkspaceClass) -> bool {
-    *class == WorkspaceClass::Normal
-}
-
-/// The class one front-door command gives the record it creates or reuses
-/// (design §3.6, §5.1).
-///
-/// It is `Normal` for every production command in this slice: the one-use
-/// feature is dormant, so classification is never computed and no command can
-/// ask for `OneUse`. A [`WorkspaceAdmission::one_use`] admission is reachable
-/// from unit tests only, and it is the seam the proof slice's activation uses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WorkspaceAdmission<'a> {
     pub class: WorkspaceClass,
@@ -275,61 +92,6 @@ impl<'a> WorkspaceAdmission<'a> {
     }
 }
 
-impl Record {
-    /// Holds a command now: neither idle nor retired.
-    fn active(&self) -> bool {
-        !matches!(self.phase, Phase::Idle | Phase::Retired)
-    }
-}
-
-/// A slot held when its removable volume vanished (surprise removal). It is
-/// never reused. Once the volume returns it is deleted whole only if every
-/// writer is positively closed; otherwise it is quarantined: held, bytes
-/// counted, never reused or deleted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Lost {
-    slot_id: String,
-    at_ms: u64,
-    /// Why closure of every writer is not established; `None` when the
-    /// holding command saw its own group empty and started nothing Oxide
-    /// knows may outlive it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    unclosed: Option<String>,
-}
-
-impl Lost {
-    fn describe(&self, closed_by_boot: bool) -> String {
-        match (&self.unclosed, closed_by_boot) {
-            (None, _) => {
-                "lost with the removable volume; deleted whole when the volume returns".to_owned()
-            }
-            (Some(why), false) => format!(
-                "quarantined: lost with the removable volume and {why}; kept with its bytes, never reused or deleted"
-            ),
-            (Some(why), true) => format!(
-                "lost with the removable volume and {why}; its holder predates this boot session, so it is deleted whole when the volume returns"
-            ),
-        }
-    }
-}
-
-/// The `oxide` process holding a record, and the lease holder string it
-/// passed to the library.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Holder {
-    pid: u32,
-    /// Wall-clock start of the holder process, milliseconds since the epoch.
-    started_ms: u64,
-    lease_holder: String,
-    /// What `oxide status` names as the holder: `exec <program>` for an
-    /// exec command, absent for Cargo commands.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    command: Option<String>,
-}
-
-/// A slot's last recorded build. `mark` is the record's use counter when it
 /// was written; leasing re-stamps it and Cargo's start advances the counter,
 /// so a mismatch means Cargo may have run unrecorded. `origin: None` is an
 /// untrusted slot. An untrusted slot is never reused: the next command evicts
@@ -340,186 +102,6 @@ struct OriginFile {
     version: u32,
     mark: u64,
     origin: Option<Built>,
-}
-
-/// One automatic recovery, kept for `oxide status`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Recovery {
-    pub slot_id: String,
-    pub lease_id: String,
-    pub checkout: Option<PathBuf>,
-    pub holder_pid: u32,
-    pub holder_started_ms: u64,
-    /// `None` when Cargo never started.
-    pub process_group: Option<i32>,
-    pub recovered_ms: u64,
-    pub recovered_by: u32,
-}
-
-/// One flush of a removable-volume pool before a slot went idle.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Flush {
-    pub slot_id: String,
-    pub at_ms: u64,
-    /// `None` when the flush failed and the slot was retired.
-    pub micros: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// The flush failed because the volume was gone (surprise removal).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub lost: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Ticket {
-    id: u64,
-    pid: u32,
-}
-
-/// A running `oxide clean`; commands for the same checkout wait while it
-/// exists. Its lock (in `waiters/`) is shared with the `cargo clean` child, so
-/// it stays held while either lives. The mark is dropped only when the lock is
-/// free and the recorded Cargo group, if any, is empty.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Clean {
-    id: u64,
-    checkout: PathBuf,
-    #[serde(default)]
-    process_group: Option<i32>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct State {
-    version: u32,
-    next_id: u64,
-    next_use: u64,
-    tickets: Vec<Ticket>,
-    #[serde(default)]
-    cleans: Vec<Clean>,
-    records: Vec<Record>,
-    #[serde(default)]
-    recoveries: Vec<Recovery>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    flushes: Vec<Flush>,
-    /// Forward-only downgrade fence, set before any checkout's first owned
-    /// output link is published and never cleared. An Oxide without owned
-    /// outputs parses state strictly, so it refuses this pool rather than
-    /// building through an owned link without its binding, custody and
-    /// clean checks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owned_outputs: Option<String>,
-    /// Owned-outputs registry initialization (oxide#129). `Initializing` is
-    /// durable before either control is fenced; `Ready` is published only
-    /// after the registry and its directory are durable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    outputs_init: Option<OutputsInit>,
-    /// Forward-only recorded-accounting fence (oxide#146), set durably before
-    /// any library write that can record a per-slot observation and never
-    /// cleared. The library ledger's `capacity_policy: 2` is unreadable to an
-    /// older binary, so this must be durable first: an older binary then hands
-    /// off to a receipt-matching successor instead of refusing the pool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    recorded_accounting: Option<String>,
-    /// Forward-only one-use fence (design §5.1, §10.1), written durably
-    /// **before** the first state document that carries a class-bearing
-    /// record and never cleared. A normal-only pool written by this binary
-    /// never sets it, so its numeric version does not advance.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    one_use_workspaces: Option<String>,
-    /// Forward fence for the eviction accounting ledger shape (oxide#175).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    eviction_accounting: Option<String>,
-}
-
-/// The durable initialization record shared by both pools of a pair.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum OutputsInit {
-    Initializing {
-        transaction: String,
-        started_ms: u64,
-    },
-    Ready {
-        transaction: String,
-        ready_ms: u64,
-    },
-}
-
-impl OutputsInit {
-    fn transaction(&self) -> &str {
-        match self {
-            Self::Initializing { transaction, .. } | Self::Ready { transaction, .. } => transaction,
-        }
-    }
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            // A pool with no state document and no fence is the unfenced
-            // shape; `save` derives the version that document actually
-            // carries, so this value is never a claim about a fence.
-            version: LEGACY_FIELDS_STATE_VERSION,
-            next_id: 1,
-            next_use: 1,
-            tickets: Vec::new(),
-            cleans: Vec::new(),
-            records: Vec::new(),
-            recoveries: Vec::new(),
-            flushes: Vec::new(),
-            owned_outputs: None,
-            outputs_init: None,
-            recorded_accounting: None,
-            one_use_workspaces: None,
-            eviction_accounting: None,
-        }
-    }
-}
-
-impl State {
-    fn take_id(&mut self) -> Result<u64, String> {
-        let id = self.next_id;
-        self.next_id = id.checked_add(1).ok_or("Oxide ID sequence exhausted")?;
-        Ok(id)
-    }
-
-    fn touch(&mut self, index: usize) -> Result<(), String> {
-        let use_id = self.next_use;
-        self.next_use = use_id
-            .checked_add(1)
-            .ok_or("Oxide use sequence exhausted")?;
-        self.records[index].last_used = use_id;
-        self.records[index].last_used_ms = Some(process::now_ms());
-        Ok(())
-    }
-
-    fn settle_idle(&mut self, index: usize) {
-        let record = &mut self.records[index];
-        record.phase = Phase::Idle;
-        record.process_group = None;
-        record.holder = None;
-        record.lease_id = None;
-        record.pending_recovery = None;
-    }
-
-    fn log_flush(&mut self, flush: Flush) {
-        if self.flushes.len() >= MAX_FLUSHES {
-            self.flushes.remove(0);
-        }
-        self.flushes.push(flush);
-    }
-
-    fn log_recovery(&mut self, recovery: Recovery) {
-        if self.recoveries.len() >= MAX_RECOVERIES {
-            self.recoveries.remove(0);
-        }
-        self.recoveries.push(recovery);
-    }
 }
 
 /// What a command may do with a non-idle record whose lock it could take,
@@ -1248,9 +830,10 @@ const OBSERVATIONS_SCHEMA: &str = "oxide.status-observations/1";
 const OBSERVATIONS_NAME: &str = "status-observations.json";
 const OBSERVATIONS_TEMP: &str = "status-observations.json.tmp";
 /// The sidecar's whole-file bound and retained observation count. The count
-/// is at least the pool's slot ceiling, so it never lowers real capacity.
-const MAX_OBSERVATIONS_BYTES: u64 = 256 * 1024;
-const MAX_OBSERVATIONS: usize = 128;
+/// is at least the pool's slot ceiling, so it never lowers real capacity
+/// (256 facts at the 256-slot ceiling, oxide#177).
+const MAX_OBSERVATIONS_BYTES: u64 = 512 * 1024;
+const MAX_OBSERVATIONS: usize = 256;
 
 /// One recorded size fact, bound to exactly one slot generation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4364,9 +3947,10 @@ impl Store {
             // or uncertain (a live or unattributable lock) is never a
             // candidate; foreign and unmeasurable slots fail the library's
             // own ownership and accounting checks.
-            // The eight-slot project cap counts **normal** slots only (design
-            // §5.3): a one-use slot never consumes one of a repository's eight
-            // normal slots, and deleting one can never relieve that cap.
+            // The twelve-slot project cap counts **normal** slots only
+            // (design §5.3): a one-use slot never consumes one of a
+            // repository's twelve normal slots, and deleting one can never
+            // relieve that cap.
             let mut candidates: Vec<(u64, u64, u64, String)> = state
                 .records
                 .iter()
@@ -4416,8 +4000,9 @@ impl Store {
             });
             // The cap is a **normal**-slot cap and only a normal admission
             // enters it (§5.3): a one-use slot never consumes one of a
-            // repository's eight normal slots, deleting one can never relieve
-            // that cap (the candidate list below holds no one-use record), and
+            // repository's twelve normal slots, deleting one can never
+            // relieve that cap (the candidate list below holds no one-use
+            // record), and
             // a temporary clone of the same repository therefore no longer
             // competes with its normal checkouts for it. A one-use admission's
             // slot count is bounded by the slice (slice S3) and by `MAX_SLOTS`.
@@ -5079,38 +4664,79 @@ impl Store {
         self.control.join("waiters").join(format!("{id}.lock"))
     }
 
-    /// The mutating-command gate publishes the version-7 hand-off fence
-    /// before any library write can use the new eviction accounting shape.
-    /// Read-only commands never write the fence.
+    /// The mutating-command gate: fence first (oxide#177; Supervisor ruling
+    /// 4c9984a1). Taking it makes the control fences durable as this command's
+    /// first write, under the admission lock, before any locked pool open
+    /// (which reconciles recorded deletions and can start a recovery journal)
+    /// and before any ledger write.
+    ///
+    /// The gate writes the recorded-accounting fence (oxide#146), the
+    /// eviction-accounting fence (oxide#175) and the version-8 raised-ceiling
+    /// fence (`oxide.slots/256`) in one state document when any is missing.
+    /// Version 8 is what an older installed binary meets before it reads the
+    /// ledger, so it hands off to a receipt-matching successor or refuses
+    /// instead of meeting a `capacity_policy: 4` ledger or a multi-journal
+    /// recovery ledger. An already-version-8 control is not rewritten, and a
+    /// failed fence write refuses the command with no ledger or journal write.
+    /// The one-use fence stays a later step taken only when a class-bearing
+    /// record is written, and passive `status`/snapshot reads never take this
+    /// gate.
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
-        let mut state = self.load()?;
-        if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE)
-            || state.eviction_accounting.as_deref() != Some("oxide.eviction-accounting/1")
-        {
-            state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
-            state.eviction_accounting = Some("oxide.eviction-accounting/1".to_owned());
-            self.save(&state)?;
-        }
+        self.fence_admission_state()?;
         Ok(lock)
     }
 
     /// Output initialization does not mutate the library ledger. Preserve its
-    /// existing accounting fence without publishing the eviction fence before
-    /// its own refusal checks.
+    /// existing recorded-accounting fence without publishing the eviction or
+    /// raised-ceiling fences before its own refusal checks.
     fn control_admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
         self.fence_recorded_accounting()?;
         Ok(lock)
     }
 
+    /// Make the recorded-accounting fence durable. Nothing is written when it
+    /// is already set.
     fn fence_recorded_accounting(&self) -> Result<(), String> {
         let mut state = self.load()?;
-        if state.recorded_accounting.as_deref() == Some(RECORDED_ACCOUNTING_FENCE) {
+        if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
+            state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+            self.save(&state)?;
+        }
+        Ok(())
+    }
+
+    /// Make the version-8 control fences durable when they are not already
+    /// there. Returns without writing for an already-fenced control.
+    fn fence_admission_state(&self) -> Result<(), String> {
+        let mut state = self.load()?;
+        let mut changed = false;
+        if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
+            state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+            changed = true;
+        }
+        if state.eviction_accounting.as_deref() != Some(EVICTION_ACCOUNTING_FENCE) {
+            state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
+            changed = true;
+        }
+        if Self::mark_slot_ceiling(&mut state) {
+            changed = true;
+        }
+        if !changed {
             return Ok(());
         }
-        state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
         self.save(&state)
+    }
+
+    /// Mark the caller's in-memory state with the raised-ceiling fence.
+    /// Returns whether it changed, so a caller saves once.
+    fn mark_slot_ceiling(state: &mut State) -> bool {
+        if state.slot_ceiling.as_deref() == Some(SLOT_CEILING_FENCE) {
+            return false;
+        }
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        true
     }
 
     /// Make the one-use fence durable **before** the first document that
@@ -5140,34 +4766,10 @@ impl Store {
         let mut bytes = Vec::new();
         crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
             .map_err(|error| format!("cannot read Oxide state: {error}"))?;
-        if bytes.len() as u64 > MAX_STATE_BYTES {
-            return Err("Oxide state exceeds its byte limit".to_owned());
-        }
-        // The bounded presence-aware decode runs over these same bytes, once,
-        // before the typed parse (design §5.1).
-        reject_class_fields_before_six(&bytes)?;
-        let state: State = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("Oxide state is invalid: {error}"))?;
-        let legacy = match state.version {
-            LEGACY_STATE_VERSION => true,
-            LEGACY_FIELDS_STATE_VERSION
-            | OLDER_STATE_VERSION
-            | PREVIOUS_STATE_VERSION
-            | RECORDED_ACCOUNTING_STATE_VERSION
-            | ONE_USE_STATE_VERSION
-            | STATE_VERSION => false,
-            _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
-        };
-        if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
-            return Err("Oxide state exceeds its byte limit".to_owned());
-        }
-        if state.owned_outputs.as_deref().is_some_and(|fence| {
-            fence != OWNED_OUTPUTS_FENCE && !predecessor_owned_outputs_fence(fence)
-        }) {
-            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-        }
-        validate_state(&state, legacy)?;
-        Ok(state)
+        // The shared parser is the fence's acceptance test too
+        // (`oxide_storage::lease::control::parse_state`), so the two writers
+        // cannot disagree about what a valid control document is.
+        parse_state(&bytes)
     }
 
     fn save(&self, state: &State) -> Result<(), String> {
@@ -5185,11 +4787,18 @@ impl Store {
         // advances nothing.
         let recorded = fenced.recorded_accounting.is_some();
         let one_use = fenced.one_use_workspaces.is_some();
+        let slot_ceiling = fenced.slot_ceiling.is_some();
         let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
-        fenced.version = if fenced.eviction_accounting.is_some() {
-            STATE_VERSION
+        fenced.version = if slot_ceiling {
+            // Version 8 is the raised-ceiling fence (oxide#177) and the
+            // hand-off trigger that must precede the ledger's policy-4 write.
+            SLOT_CEILING_STATE_VERSION
+        } else if fenced.eviction_accounting.is_some() {
+            // Version 7 is the eviction-accounting fence (oxide#175) and the
+            // hand-off trigger that must precede the retained-record write.
+            EVICTION_ACCOUNTING_STATE_VERSION
         } else if one_use {
             ONE_USE_STATE_VERSION
         } else if recorded {
@@ -5225,308 +4834,6 @@ impl Store {
             .and_then(|()| File::open(&self.control)?.sync_all())
             .map_err(|error| format!("cannot replace Oxide state: {error}"))
     }
-}
-
-/// The bounded presence-aware decode of design §5.1, over the **same** bytes
-/// `load` already read (one parse, no re-serialisation, no payload walk).
-///
-/// `#[serde(default)]` makes an explicit `"class":"normal"` indistinguishable
-/// from an absent field in the typed parse, so the presence of either field
-/// needs its own pass: a document below [`ONE_USE_STATE_VERSION`] that names `class` or
-/// `class_reason` in **any** record object is refused here. At or above the
-/// one-use version presence is expected and [`validate_state`] decides.
-///
-/// A document this pass cannot read is left to the typed parse, which reports
-/// the same malformed input with its own diagnostic. Field presence is read
-/// through a small raw schema rather than `serde_json::Value`, so the pass
-/// allocates only the two fields per record it is looking for.
-fn reject_class_fields_before_six(bytes: &[u8]) -> Result<(), String> {
-    #[derive(Deserialize)]
-    struct RawDocument {
-        version: Option<u64>,
-        one_use_workspaces: Option<String>,
-        records: Option<Vec<RawRecord>>,
-    }
-    // `Option<_>` cannot tell an absent key from an explicit `null` (serde
-    // maps `null` to `None`), and both are present fields, so the marker
-    // accepts and discards any value while reporting whether the key existed.
-    #[derive(Default)]
-    struct Present(bool);
-
-    impl<'de> Deserialize<'de> for Present {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            serde::de::IgnoredAny::deserialize(deserializer).map(|_| Self(true))
-        }
-    }
-
-    #[derive(Deserialize)]
-    struct RawRecord {
-        #[serde(default)]
-        class: Present,
-        #[serde(default)]
-        class_reason: Present,
-    }
-    let Ok(document) = serde_json::from_slice::<RawDocument>(bytes) else {
-        return Ok(());
-    };
-    let Some(version) = document.version else {
-        return Ok(());
-    };
-    if version >= u64::from(ONE_USE_STATE_VERSION)
-        && document.one_use_workspaces.as_deref() == Some(ONE_USE_FENCE)
-    {
-        return Ok(());
-    }
-    if document.records.is_some_and(|records| {
-        records
-            .iter()
-            .any(|record| record.class.0 || record.class_reason.0)
-    }) {
-        return Err(format!(
-            "Oxide state is invalid: a version-{version} record carries a one-use class field"
-        ));
-    }
-    Ok(())
-}
-
-/// Validate one control-state document. A legacy version-1 document keeps
-/// the legacy read limits (its byte cap is checked by `load`); a version-2
-/// document must satisfy every field cap and compact-object ceiling, so the
-/// record-count and byte bounds hold together.
-fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
-    if !matches!(
-        state.version,
-        LEGACY_STATE_VERSION
-            | LEGACY_FIELDS_STATE_VERSION
-            | OLDER_STATE_VERSION
-            | PREVIOUS_STATE_VERSION
-            | RECORDED_ACCOUNTING_STATE_VERSION
-            | ONE_USE_STATE_VERSION
-            | STATE_VERSION
-    ) {
-        return Err("Oxide state has an unsupported version".to_owned());
-    }
-    // A document at or above the recorded-accounting version must carry its
-    // fence; a fence value this binary does not know refuses rather than being
-    // guessed at.
-    match state.recorded_accounting.as_deref() {
-        None => {
-            if state.version >= RECORDED_ACCOUNTING_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
-        }
-        Some(fence) if fence == RECORDED_ACCOUNTING_FENCE => {}
-        Some(_) => {
-            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
-        }
-    }
-    // The one-use fence and the numeric version are equivalent (design §5.1,
-    // §10.1): a class-bearing record always travels under both, a fenced
-    // document is always at the one-use version, and an unknown fence value
-    // refuses instead of being guessed at. Presence itself is decided by
-    // `reject_class_fields_before_six`, which the typed parse cannot do.
-    match state.eviction_accounting.as_deref() {
-        None if state.version == STATE_VERSION => {
-            return Err("Oxide state lacks the eviction accounting fence".to_owned())
-        }
-        Some("oxide.eviction-accounting/1") if state.version == STATE_VERSION => {}
-        None => {}
-        _ => return Err("Oxide state has an invalid eviction accounting fence".to_owned()),
-    }
-    match state.one_use_workspaces.as_deref() {
-        None => {
-            if state.version == ONE_USE_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
-            if state
-                .records
-                .iter()
-                .any(|record| record.class != WorkspaceClass::Normal)
-            {
-                return Err(
-                    "Oxide state has a class-bearing record without the one-use fence".to_owned(),
-                );
-            }
-        }
-        Some(fence) if fence == ONE_USE_FENCE => {
-            if state.version < ONE_USE_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
-        }
-        Some(_) => {
-            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
-        }
-    }
-    if state
-        .outputs_init
-        .as_ref()
-        .is_some_and(|init| !bounded_text(init.transaction(), MAX_INIT_TRANSACTION_BYTES))
-    {
-        return Err("Oxide state has an invalid output-registry transaction".to_owned());
-    }
-    if state.tickets.len() > MAX_TICKETS
-        || state.cleans.len() > MAX_CLEANS
-        || state.records.len() > MAX_RECORDS
-        || state.recoveries.len() > MAX_RECOVERIES
-        || state.flushes.len() > MAX_FLUSHES
-    {
-        return Err("Oxide state exceeds a collection limit".to_owned());
-    }
-    if legacy {
-        return Ok(());
-    }
-    if state.next_id == 0 || state.next_use == 0 {
-        return Err("Oxide state has an exhausted or invalid ID sequence".to_owned());
-    }
-    let header = State {
-        tickets: Vec::new(),
-        cleans: Vec::new(),
-        records: Vec::new(),
-        recoveries: Vec::new(),
-        flushes: Vec::new(),
-        outputs_init: None,
-        ..state.clone()
-    };
-    object_fits(&header, MAX_STATE_HEADER_BYTES, "state header")?;
-    for ticket in &state.tickets {
-        if ticket.id == 0 {
-            return Err("Oxide wait ticket has no ID".to_owned());
-        }
-        object_fits(ticket, MAX_TICKET_OBJECT_BYTES, "wait ticket")?;
-    }
-    for clean in &state.cleans {
-        if clean.id == 0 || !path_text(&clean.checkout) {
-            return Err("Oxide clean mark exceeds its field bounds".to_owned());
-        }
-        object_fits(clean, MAX_CLEAN_OBJECT_BYTES, "clean mark")?;
-    }
-    for record in &state.records {
-        if record.id == 0
-            || !bounded_text(&record.identity, MAX_IDENTITY_BYTES)
-            || !bounded_text(&record.compatibility, MAX_COMPATIBILITY_BYTES)
-            || !bounded_text(&record.profile, MAX_PROFILE_BYTES)
-            || record
-                .checkout
-                .as_ref()
-                .is_some_and(|path| !path_text(path))
-            || record
-                .lease_id
-                .as_ref()
-                .is_some_and(|value| value.len() > MAX_STATE_LEASE_ID_BYTES)
-            || record
-                .retired
-                .as_ref()
-                .is_some_and(|value| value.len() > MAX_DIAGNOSTIC_BYTES)
-        {
-            return Err("Oxide record exceeds its field bounds".to_owned());
-        }
-        // A class reason belongs to a one-use record alone, and is bounded like
-        // every other diagnostic (design §5.1).
-        match record.class {
-            WorkspaceClass::Normal => {
-                if record.class_reason.is_some() {
-                    return Err("Oxide record has an invalid workspace class".to_owned());
-                }
-            }
-            WorkspaceClass::OneUse => {
-                if record
-                    .class_reason
-                    .as_deref()
-                    .is_some_and(|value| !bounded_text(value, MAX_DIAGNOSTIC_BYTES))
-                {
-                    return Err("Oxide record has an invalid workspace class".to_owned());
-                }
-            }
-        }
-        if let Some(holder) = &record.holder {
-            if !bounded_text(&holder.lease_holder, MAX_LEASE_HOLDER_BYTES)
-                || holder
-                    .command
-                    .as_ref()
-                    .is_some_and(|value| value.len() > MAX_COMMAND_BYTES)
-            {
-                return Err("Oxide holder exceeds its field bounds".to_owned());
-            }
-            object_fits(holder, MAX_HOLDER_OBJECT_BYTES, "holder")?;
-        }
-        if let Some(lost) = &record.lost {
-            if !bounded_text(&lost.slot_id, MAX_STATE_SLOT_ID_BYTES)
-                || lost
-                    .unclosed
-                    .as_ref()
-                    .is_some_and(|value| value.len() > MAX_DIAGNOSTIC_BYTES)
-            {
-                return Err("Oxide lost slot exceeds its field bounds".to_owned());
-            }
-            object_fits(lost, MAX_LOST_OBJECT_BYTES, "lost slot")?;
-        }
-        if let Some(recovery) = &record.pending_recovery {
-            validate_recovery(recovery)?;
-        }
-        object_fits(record, MAX_RECORD_OBJECT_BYTES, "record")?;
-    }
-    for recovery in &state.recoveries {
-        validate_recovery(recovery)?;
-    }
-    for flush in &state.flushes {
-        if !bounded_text(&flush.slot_id, MAX_STATE_SLOT_ID_BYTES)
-            || flush
-                .error
-                .as_ref()
-                .is_some_and(|value| value.len() > MAX_DIAGNOSTIC_BYTES)
-        {
-            return Err("Oxide flush record exceeds its field bounds".to_owned());
-        }
-        object_fits(flush, MAX_FLUSH_OBJECT_BYTES, "flush record")?;
-    }
-    Ok(())
-}
-
-fn validate_recovery(recovery: &Recovery) -> Result<(), String> {
-    if !bounded_text(&recovery.slot_id, MAX_STATE_SLOT_ID_BYTES)
-        || !bounded_text(&recovery.lease_id, MAX_STATE_LEASE_ID_BYTES)
-        || recovery
-            .checkout
-            .as_ref()
-            .is_some_and(|path| !path_text(path))
-    {
-        return Err("Oxide recovery exceeds its field bounds".to_owned());
-    }
-    object_fits(recovery, MAX_RECOVERY_OBJECT_BYTES, "recovery")
-}
-
-fn bounded_text(value: &str, max: usize) -> bool {
-    !value.is_empty() && value.len() <= max
-}
-
-/// Keep a stored class reason inside the state's diagnostic bound, on a
-/// character boundary. Classification reasons embed a path, and a pathological
-/// one must not turn a lease into a state error: the reason is a bounded
-/// diagnostic, so it is truncated rather than invented or refused.
-fn bounded_class_reason(reason: &str) -> String {
-    if reason.len() <= MAX_DIAGNOSTIC_BYTES {
-        return reason.to_owned();
-    }
-    let mut end = MAX_DIAGNOSTIC_BYTES;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    reason[..end].to_owned()
-}
-
-fn path_text(path: &Path) -> bool {
-    path.as_os_str().as_bytes().len() <= MAX_PATH_TEXT_BYTES
-}
-
-fn object_fits<T: Serialize>(value: &T, max: usize, what: &str) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    if bytes.len() > max {
-        return Err(format!("Oxide {what} exceeds its {max}-byte object limit"));
-    }
-    Ok(())
 }
 
 /// Caller-available bytes of the filesystem holding the new pool's parent.
@@ -9360,10 +8667,10 @@ pub(crate) mod tests {
             .expect("an unfenced state saves");
 
         // The *path* truth: `fence_owned_outputs` is a mutating command, so it
-        // takes the admission gate, which makes the recorded-accounting fence
-        // durable first. That is the ordering the design requires — the
-        // control hand-off must precede any incompatible ledger write — and it
-        // is why this path ends at version 5 with both fences.
+        // takes the admission gate, which makes the control fence durable
+        // first. That is the ordering the design requires — the control
+        // hand-off must precede any incompatible ledger write or locked pool
+        // open — and it is why this path ends at version 8 with both fences.
         store
             .fence_owned_outputs()
             .expect("the forward fence saves");
@@ -9377,22 +8684,31 @@ pub(crate) mod tests {
             stored["recorded_accounting"],
             serde_json::json!(RECORDED_ACCOUNTING_FENCE)
         );
-        // A repeated recorded fence is idempotent.
+        // A repeated admission fence is idempotent.
         let fenced = stored;
         store
-            .fence_recorded_accounting()
+            .fence_admission_state()
             .expect("a repeated fence is a no-op");
         store
-            .fence_recorded_accounting()
+            .fence_admission_state()
             .expect("a repeated fence is a no-op");
         let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(after, fenced, "a repeated fence rewrote the state");
-        // Version 5 without the fence, and an unknown fence, both refuse.
+        // Genuine absence at version 8 refuses, and an explicit JSON null is a
+        // present non-string field that the shared parser refuses too.
         let mut unfenced = fenced.clone();
-        unfenced["recorded_accounting"] = serde_json::Value::Null;
+        unfenced
+            .as_object_mut()
+            .expect("object")
+            .remove("recorded_accounting");
         write_private(&path, &serde_json::to_vec(&unfenced).unwrap());
         let error = store.load().unwrap_err();
         assert!(error.contains("unsupported version"), "{error}");
+        let mut nulled = fenced.clone();
+        nulled["recorded_accounting"] = serde_json::Value::Null;
+        write_private(&path, &serde_json::to_vec(&nulled).unwrap());
+        let error = store.load().unwrap_err();
+        assert!(error.contains("not a string"), "{error}");
         let mut unknown = fenced.clone();
         unknown["recorded_accounting"] = serde_json::json!("oxide.accounting/9");
         write_private(&path, &serde_json::to_vec(&unknown).unwrap());
@@ -9526,11 +8842,13 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Retention keeps at most 128 observations, deterministically choosing
-    /// the most recent, so a pool at its slot ceiling still fits.
+    /// Retention keeps at most [`MAX_OBSERVATIONS`] observations,
+    /// deterministically choosing the most recent, so a pool at its slot
+    /// ceiling still fits.
     #[test]
     fn observation_retention_keeps_the_newest_deterministically() {
-        let mut observations: Vec<Observation> = (0..140)
+        let count = MAX_OBSERVATIONS + 12;
+        let mut observations: Vec<Observation> = (0..count)
             .map(|index| {
                 let slot = ledger_slot(&format!("{index}"), "1", None);
                 observation(&slot, 1_000 + index as u64)
@@ -9542,11 +8860,12 @@ pub(crate) mod tests {
             observations.first().map(|item| item.slot_id.as_str()),
             Some("12")
         );
+        let newest = (count - 1).to_string();
         assert_eq!(
             observations.last().map(|item| item.slot_id.as_str()),
-            Some("139")
+            Some(newest.as_str())
         );
-        let mut again: Vec<Observation> = (0..140)
+        let mut again: Vec<Observation> = (0..count)
             .rev()
             .map(|index| {
                 let slot = ledger_slot(&format!("{index}"), "1", None);
@@ -9681,8 +9000,8 @@ pub(crate) mod tests {
         assert!(store.record_observation(observation(&slot, 30)).is_err());
         assert_eq!(fs::read(&path).unwrap(), foreign);
 
-        // The worst case the file allows still fits its byte bound: 128
-        // observations with every bounded field at its ceiling.
+        // The worst case the file allows still fits its byte bound: every
+        // retained observation with every bounded field at its ceiling.
         let mut document = Observations {
             schema: OBSERVATIONS_SCHEMA.to_owned(),
             observations: Vec::new(),
@@ -9932,6 +9251,505 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Fence first (oxide#177; Supervisor ruling 4c9984a1): the first mutating
+    /// command makes version 8 durable at the admission gate, before any locked
+    /// pool open or ledger write, for every pool — no slot-count or ledger-size
+    /// condition. An already-version-8 control is not rewritten, and a later
+    /// ordinary save keeps the version.
+    #[test]
+    fn an_admission_fences_the_control_state_to_version_eight() {
+        let (root, store, _key) = class_fixture("fence-first-gate");
+        store.admission().unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+        assert_eq!(
+            state.recorded_accounting.as_deref(),
+            Some(RECORDED_ACCOUNTING_FENCE)
+        );
+
+        // A second gate finds version 8 already durable: no write at all.
+        let bytes = fs::read(store.control.join("state.json")).unwrap();
+        store.admission().unwrap();
+        assert_eq!(
+            fs::read(store.control.join("state.json")).unwrap(),
+            bytes,
+            "an already-version-8 control was rewritten"
+        );
+
+        // Forward-only: a later ordinary save keeps the version.
+        store.save(&state).unwrap();
+        let again = store.load().unwrap();
+        assert_eq!(again.version, STATE_VERSION);
+        assert_eq!(again.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pool with one idle slot made `Evicting` without a journal, its
+    /// recorded slot root renamed aside so the recovery preflight finds it
+    /// absent: the next locked open keeps the record and starts no journal,
+    /// and renaming it back lets the following open journal and conclude. The
+    /// fixture carries a version-5 control state (the recorded-accounting fence
+    /// without the raised fence). Nothing in it is unreadable, so the shared
+    /// supervisor's scratch measurement can always walk it. Returns the fixture
+    /// root, the store, the key, the recorded slot root and the hidden path.
+    fn pending_deletion_fixture(label: &str) -> (PathBuf, Store, SlotKey, PathBuf, PathBuf) {
+        let (root, store, key) = class_fixture(label);
+        let held = lease(&store, &key, None).expect("a slot");
+        let build = held.build_dir.clone();
+        store.release(held, None).expect("idle slot");
+
+        // Make the recorded slot Evicting with no journal.
+        let ledger_path = store.pool.join("ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let slot = ledger["slots"]
+            .as_array_mut()
+            .expect("slots")
+            .iter_mut()
+            .next()
+            .expect("one recorded slot");
+        slot["state"] = serde_json::json!("evicting");
+        slot["lease_id"] = serde_json::json!(null);
+        slot.as_object_mut().expect("object").remove("recorded");
+        fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        // Move the recorded root aside: the preflight then finds it absent,
+        // which keeps the `Evicting` record and starts no journal.
+        let slot_root = build.parent().expect("the slot root").to_path_buf();
+        let hidden = slot_root.with_file_name(format!(
+            "{}.pending",
+            slot_root
+                .file_name()
+                .expect("the slot leaf")
+                .to_string_lossy()
+        ));
+        fs::rename(&slot_root, &hidden).expect("hide the pending slot root");
+
+        downgrade_control_to_recorded_accounting(&store);
+        (root, store, key, slot_root, hidden)
+    }
+
+    /// Rewrite a pool's control state as version 5 with only the
+    /// recorded-accounting fence, the shape a predecessor leaves behind.
+    fn downgrade_control_to_recorded_accounting(store: &Store) {
+        let state_path = store.control.join("state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state["version"] = serde_json::json!(RECORDED_ACCOUNTING_STATE_VERSION);
+        state["recorded_accounting"] = serde_json::json!(RECORDED_ACCOUNTING_FENCE);
+        for field in ["slot_ceiling", "eviction_accounting", "one_use_workspaces"] {
+            state.as_object_mut().expect("object").remove(field);
+        }
+        write_raw_state(store, &serde_json::to_vec(&state).unwrap());
+    }
+
+    /// A pool with one idle slot made `Evicting` (no journal) whose root is
+    /// ready for the recovery preflight, and a version-5 control state.
+    /// Returns the fixture root, the store, the key and the ledger path.
+    fn ready_pending_deletion_fixture(label: &str) -> (PathBuf, Store, SlotKey, PathBuf) {
+        let (root, store, key) = class_fixture(label);
+        let held = lease(&store, &key, None).expect("a slot");
+        store.release(held, None).expect("idle slot");
+        let ledger_path = store.pool.join("ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let slot = ledger["slots"]
+            .as_array_mut()
+            .expect("slots")
+            .iter_mut()
+            .next()
+            .expect("one recorded slot");
+        slot["state"] = serde_json::json!("evicting");
+        slot["lease_id"] = serde_json::json!(null);
+        fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        downgrade_control_to_recorded_accounting(&store);
+        (root, store, key, ledger_path)
+    }
+
+    /// The real pre-Store entry (`open_removable` calls `ledger_view` before a
+    /// `Store` exists) fences version 8 before it reconciles a ready pending
+    /// deletion (oxide#177, ruling 4c9984a1). The fixture records a directory
+    /// backend, so the call itself ends in the backend refusal after the open.
+    #[test]
+    fn a_real_open_fences_version_eight_before_its_recovery_journal() {
+        let (root, store, _key, ledger_path) = ready_pending_deletion_fixture("open-fences");
+        assert_eq!(
+            store.load().unwrap().version,
+            RECORDED_ACCOUNTING_STATE_VERSION
+        );
+        let result = Store::open_removable(&store.pool, store.payload.clone(), 8);
+        assert!(
+            result.is_err(),
+            "a directory pool was accepted as a removable pool"
+        );
+        let state = store.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION, "the open did not fence v8");
+        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        assert!(
+            !after["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|slot| slot["id"] == 1),
+            "the pending record was not reconciled after the fence"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A fence-write failure in the real entry refuses before the recovery
+    /// journal or any ledger write: the bytes stay identical (oxide#177).
+    #[test]
+    fn a_failed_real_open_fence_leaves_the_ledger_byte_identical() {
+        let (root, store, _key, ledger_path) = ready_pending_deletion_fixture("open-fence-fails");
+        let ledger_bytes = fs::read(&ledger_path).unwrap();
+        let mode = fs::metadata(&store.control).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(&store.control, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = Store::open_removable(&store.pool, store.payload.clone(), 8);
+        assert!(result.is_err(), "a failed fence did not refuse the open");
+        assert_eq!(
+            fs::read(&ledger_path).unwrap(),
+            ledger_bytes,
+            "the ledger changed although the fence failed"
+        );
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let pending = after["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|slot| slot["id"] == 1)
+            .expect("the pending record was dropped");
+        assert_eq!(pending["state"], "evicting");
+        assert!(
+            pending.get("capture").is_none(),
+            "a journal started although the fence failed"
+        );
+        fs::set_permissions(&store.control, fs::Permissions::from_mode(mode)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `Store::ledger` is the `recover-interrupted` path's pre-admission read.
+    /// Its locked open fences before it reconciles, so the pending record is
+    /// concluded under an already version-8 control.
+    #[test]
+    fn a_ledger_read_fences_version_eight_before_its_recovery() {
+        let (root, store, _key, _ledger_path) = ready_pending_deletion_fixture("ledger-fences");
+        let view = store.ledger().expect("the ledger view");
+        assert!(
+            !view.slots.iter().any(|slot| slot.slot_id == "1"),
+            "the pending record was not reconciled"
+        );
+        assert_eq!(store.load().unwrap().version, STATE_VERSION);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Fence first before recovery (oxide#177; Supervisor ruling 4c9984a1): a
+    /// pending deletion is opened only under an already version-8 control. The
+    /// gate makes the fence durable before the locked open, so a blocked root
+    /// keeps its record and starts no journal, and the open that can start the
+    /// journal (after the root becomes ready) runs under that durable fence.
+    #[test]
+    fn a_pending_deletion_is_fenced_version_eight_before_its_recovery_journal() {
+        let (root, store, key, slot_root, hidden) =
+            pending_deletion_fixture("fence-before-recovery");
+        let ledger_path = store.pool.join("ledger.json");
+        let before: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        assert!(
+            before["slots"][0].get("capture").is_none(),
+            "the fixture already carries a journal"
+        );
+        assert_eq!(
+            store.load().unwrap().version,
+            RECORDED_ACCOUNTING_STATE_VERSION
+        );
+
+        // The first mutating command fences version 8 at the gate; its open
+        // finds the root blocked, so it keeps the pending record and starts no
+        // journal. (A conservatively blocked pool may still admit a fresh
+        // slot, which is oxide#175's behaviour; its bytes are counted.)
+        let (ticket, _file) = store.register_ticket().unwrap();
+        let outcome = store.attempt(
+            ticket,
+            &key,
+            Profile::Quick,
+            16,
+            WorkspaceAdmission::NORMAL,
+            false,
+            None,
+        );
+        if let Ok(Ok(lease)) = outcome {
+            store.release(lease, None).unwrap();
+        }
+        let state = store.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION, "the gate did not fence v8");
+        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+        assert_eq!(
+            state.eviction_accounting.as_deref(),
+            Some(EVICTION_ACCOUNTING_FENCE)
+        );
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let pending = after["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|slot| slot["id"] == 1)
+            .expect("the pending record was dropped");
+        assert_eq!(pending["state"], "evicting");
+        assert!(
+            pending.get("capture").is_none(),
+            "recovery journaled an absent root"
+        );
+
+        // The fence is already durable, so the open that can journal (once the
+        // recorded root is back) is preceded by it.
+        fs::rename(&hidden, &slot_root).expect("restore the pending slot root");
+        // The open that can now start and finish the recovery journal runs
+        // under the version-8 control the first command already made durable.
+        let view = store.ledger().expect("the recovery open");
+        assert!(
+            !view.slots.iter().any(|slot| slot.slot_id == "1"),
+            "a ready pending record was not concluded"
+        );
+        assert_eq!(store.load().unwrap().version, STATE_VERSION);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A failed fence write refuses at the gate with the ledger and journals
+    /// byte-identical: the fence is the command's first durable effect.
+    #[test]
+    fn a_failed_fence_write_leaves_the_ledger_and_journals_byte_identical() {
+        let (root, store, _key, _slot_root, hidden) =
+            pending_deletion_fixture("fence-write-failure");
+        let ledger_path = store.pool.join("ledger.json");
+        let state_path = store.control.join("state.json");
+        let ledger_bytes = fs::read(&ledger_path).unwrap();
+        let state_bytes = fs::read(&state_path).unwrap();
+        // Force the atomic state write to fail: its temp path is a directory.
+        let temp = store.control.join("state.json.tmp");
+        if temp.exists() {
+            fs::remove_file(&temp).unwrap();
+        }
+        fs::create_dir(&temp).unwrap();
+
+        let outcome = store.admission();
+        assert!(outcome.is_err(), "a failed fence write did not refuse");
+        assert_eq!(
+            fs::read(&ledger_path).unwrap(),
+            ledger_bytes,
+            "a failed fence write changed the ledger"
+        );
+        assert_eq!(
+            fs::read(&state_path).unwrap(),
+            state_bytes,
+            "a failed fence write changed the control state"
+        );
+        assert!(
+            hidden.is_dir(),
+            "a failed fence write touched the pending slot"
+        );
+        let ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+        assert!(
+            ledger["slots"][0].get("capture").is_none(),
+            "a failed fence write started a recovery journal"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A version-8 control is newer than the one-use and eviction-accounting
+    /// fences a predecessor knows, so a binary that only reads up to version 7
+    /// refuses it before reading the ledger; this binary refuses an unknown
+    /// version by the same rule (oxide#122, oxide#175, oxide#177).
+    #[test]
+    fn a_version_eight_control_is_newer_than_a_predecessor_knows() {
+        assert!(
+            STATE_VERSION > EVICTION_ACCOUNTING_STATE_VERSION
+                && STATE_VERSION > ONE_USE_STATE_VERSION,
+            "a predecessor that knows version 7 or 6 must see version 8 as newer"
+        );
+        let (root, store, _key) = class_fixture("v7-predecessor");
+        store.admission().unwrap();
+        let bytes = fs::read(store.control.join("state.json")).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["version"], serde_json::json!(STATE_VERSION));
+        assert_eq!(
+            document["slot_ceiling"],
+            serde_json::json!(SLOT_CEILING_FENCE)
+        );
+
+        // A predecessor knows at most version 7, so it refuses this real
+        // version-8 document before reading the ledger. The model is local
+        // because the test build has no older binary; it mirrors the one rule
+        // such a reader applies (oxide#122).
+        assert!(
+            predecessor_accepts_control(&bytes).is_err(),
+            "a predecessor accepted the version-8 control"
+        );
+        // This binary applies the same rule to a version it does not know.
+        let mut newer = document;
+        newer["version"] = serde_json::json!(STATE_VERSION + 1);
+        write_raw_state(&store, &serde_json::to_vec(&newer).unwrap());
+        let error = store.load().unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Stand-in for an installed predecessor's strict control reader: it
+    /// accepts the versions it knows and refuses anything newer before reading
+    /// the ledger (oxide#122).
+    fn predecessor_accepts_control(bytes: &[u8]) -> Result<(), String> {
+        let document: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("unparseable control state: {error}"))?;
+        let version = document
+            .get("version")
+            .and_then(|version| version.as_u64())
+            .ok_or("the control state has no numeric version")?;
+        if version > u64::from(EVICTION_ACCOUNTING_STATE_VERSION) {
+            return Err("Oxide state has an unsupported version".to_owned());
+        }
+        Ok(())
+    }
+
+    /// The fence's parser and the front door's `Store::load` are the same
+    /// shared function (`oxide_storage::lease::control::parse_state`), so they
+    /// must agree on every document the fence is asked to inspect.
+    #[test]
+    fn the_fence_parser_and_store_load_agree_on_control_documents() {
+        use serde_json::json;
+        let (root, store, key) = class_fixture("control-parity");
+        let held = lease(&store, &key, None).expect("a slot");
+        store.release(held, None).expect("idle slot");
+        let path = store.control.join("state.json");
+        let valid: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // Each invalid case is a complete document with only the named field
+        // wrong, so it cannot be rejected for a missing scalar first.
+        let complete_v8 = json!({
+            "version": 8,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "records": [],
+            "cleans": [],
+            "recorded_accounting": "oxide.accounting/1",
+            "eviction_accounting": "oxide.eviction-accounting/1",
+            "slot_ceiling": "oxide.slots/256",
+        });
+        let mut malformed = complete_v8.clone();
+        malformed["records"] = json!(42);
+        let unsupported = json!({
+            "version": 0,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "records": [],
+            "cleans": [],
+        });
+        let missing_one_use = json!({
+            "version": 6,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "records": [],
+            "cleans": [],
+            "recorded_accounting": "oxide.accounting/1",
+        });
+        let mut non_string = complete_v8.clone();
+        non_string["slot_ceiling"] = json!(42);
+        let mut null_fence = complete_v8.clone();
+        null_fence["slot_ceiling"] = serde_json::Value::Null;
+        for (label, document) in [
+            ("valid", valid),
+            ("malformed records", malformed),
+            ("unsupported version", unsupported),
+            ("version 6 without one use", missing_one_use),
+            ("non-string ceiling", non_string),
+            ("null ceiling", null_fence),
+        ] {
+            let bytes = serde_json::to_vec(&document).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let shared = oxide_storage::lease::control::parse_state(&bytes);
+            let front_door = store.load();
+            assert_eq!(
+                shared.is_ok(),
+                front_door.is_ok(),
+                "{label}: the fence and Store::load disagree ({shared:?} vs {front_door:?})"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A version-8 document always carries the raised-ceiling fence and a
+    /// smaller document never does; an unknown fence value and a version-8
+    /// document without the fence are states no writer produces. Version 8
+    /// carries the eviction-accounting fence too and may carry the one-use
+    /// fence, so a one-use pool at the raised ceiling keeps all three.
+    #[test]
+    fn the_raised_slot_ceiling_fence_and_version_are_equivalent() {
+        let mut state = State::default();
+        state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
+        state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
+
+        state.version = STATE_VERSION;
+        assert!(
+            validate_state(&state, false).is_err(),
+            "version 8 without the raised fence was accepted"
+        );
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        assert!(validate_state(&state, false).is_ok());
+
+        // Version 7 is the eviction-accounting shape without the raised fence.
+        state.version = EVICTION_ACCOUNTING_STATE_VERSION;
+        state.slot_ceiling = None;
+        assert!(validate_state(&state, false).is_ok());
+        assert!(
+            validate_state(
+                &State {
+                    slot_ceiling: Some(SLOT_CEILING_FENCE.to_owned()),
+                    ..state.clone()
+                },
+                false
+            )
+            .is_err(),
+            "the raised fence at version 7 was accepted"
+        );
+
+        // Version 6 requires the one-use fence and carries neither later one.
+        state.version = ONE_USE_STATE_VERSION;
+        state.eviction_accounting = None;
+        assert!(
+            validate_state(&state, false).is_err(),
+            "version 6 without the one-use fence was accepted"
+        );
+        state.one_use_workspaces = Some(ONE_USE_FENCE.to_owned());
+        assert!(
+            validate_state(&state, false).is_ok(),
+            "the one-use version must stay readable without the raised fence"
+        );
+        state.one_use_workspaces = None;
+
+        // An unknown raised-ceiling fence, or a version-8 document without
+        // it, is a state no writer produces.
+        state.version = STATE_VERSION;
+        state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
+        state.slot_ceiling = Some("oxide.slots/128".to_owned());
+        assert!(
+            validate_state(&state, false).is_err(),
+            "an unknown raised-ceiling fence was accepted"
+        );
+
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        state.one_use_workspaces = Some(ONE_USE_FENCE.to_owned());
+        assert!(
+            validate_state(&state, false).is_ok(),
+            "a one-use pool at the raised ceiling must keep every fence"
+        );
+    }
+
     /// The serializer omission rule of §5.1. A fresh normal record and a
     /// rewritten normal-only state print **neither** class field, a version-5
     /// reader's strict parse accepts the bytes and re-serializes them
@@ -9953,8 +9771,9 @@ pub(crate) mod tests {
         );
 
         // A freshly created normal record, written by a full lease cycle: the
-        // pool's numeric version stays the recorded-accounting predecessor and
-        // no class field appears anywhere.
+        // admission gate's raised-ceiling fence puts the pool at version 8 and
+        // no class field appears anywhere. A version-5 reader refuses the
+        // document by version, which is the hand-off an older binary takes.
         let held = lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("lease");
         store.release(held, None).unwrap();
         let bytes = class_state_bytes(&store);
@@ -9962,18 +9781,23 @@ pub(crate) mod tests {
         assert!(!text.contains("\"class\""), "{text}");
         assert!(!text.contains("class_reason"), "{text}");
         assert!(
-            text.contains("\"version\":7"),
-            "eviction fence missing: {text}"
+            text.contains("\"version\":8"),
+            "a normal admission did not carry the raised-ceiling version: {text}"
         );
         assert_eq!(
             store.load().unwrap().one_use_workspaces,
             None,
             "a normal admission wrote the one-use fence"
         );
-        assert!(serde_json::from_slice::<v5::State>(&bytes).is_err());
+        assert!(
+            serde_json::from_slice::<v5::State>(&bytes).is_err(),
+            "a version-5 reader accepted a version-8 document"
+        );
 
-        // A one-use record carries the class, its reason and the fence, and
-        // the numeric version advanced to the one-use version.
+        // A one-use record carries the class, its reason and the fence; the
+        // document stays at version 8 because it also carries the
+        // raised-ceiling fence, and a class-bearing record requires at least
+        // version 6.
         let held = lease_as(
             &store,
             &key,
@@ -9984,6 +9808,8 @@ pub(crate) mod tests {
         let slot = held.slot_id.clone();
         store.release(held, None).unwrap();
         let state = store.load().unwrap();
+        // The admission gate's raised-ceiling fence puts the document at
+        // version 8; a class-bearing record still requires at least version 6.
         assert_eq!(state.version, STATE_VERSION);
         assert_eq!(state.one_use_workspaces.as_deref(), Some(ONE_USE_FENCE));
         let record = state
@@ -10061,7 +9887,7 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The eight-slot project cap counts **normal** slots only (§5.3): a
+    /// The twelve-slot project cap counts **normal** slots only (§5.3): a
     /// one-use admission is never blocked by it, and a one-use slot never
     /// relieves it — the cap path can only evict a normal slot, and it refuses
     /// honestly when none is safe.
@@ -10086,7 +9912,7 @@ pub(crate) mod tests {
             lease_as(&store, &key, WorkspaceAdmission::NORMAL, false),
             Err(Wait::Checkout)
         ));
-        // A one-use command is not blocked by eight normal slots of this
+        // A one-use command is not blocked by twelve normal slots of this
         // repository; it takes its own record and its own slot.
         let one_use = lease_as(
             &store,

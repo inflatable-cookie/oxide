@@ -7,7 +7,7 @@ use super::{
     remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass,
     LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
     BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_LEDGER_BYTES,
+    MAX_LEDGER_BYTES, RAISED_CAPACITY_POLICY_VERSION,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -445,8 +445,20 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
     let first = first.expect("first slot");
     let first_marker = first.env.cargo_build_build_dir.join("blob");
     fs::write(&first_marker, b"oldest idle slot").expect("oldest payload");
-    // Every record is current, so the 129th admission is a count replacement
-    // from records only: it walks no inventory at all (oxide#146).
+
+    // A full 256-slot pool's recorded status path is membership only: it
+    // walks no payload and no slot (oxide#146, oxide#177).
+    let (view, status_walks) = walked(&pool, || ledger_injected(&pool));
+    let view = view.expect("recorded ledger view");
+    assert_eq!(view.slots.len(), super::MAX_SLOTS);
+    assert!(
+        status_walks.is_empty(),
+        "recorded status walked inventory at 256 slots: {status_walks:?}"
+    );
+
+    // Every record is current, so the 257th admission is a count replacement
+    // from records only: it walks no inventory at all, and the evicted slot
+    // is never walked either (oxide#146).
     let (extra, walks) = crate::inventory::walk_observer::observe(|| {
         lease_injected(request(
             &pool,
@@ -455,13 +467,22 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
             "extra",
         ))
     });
-    let extra = extra.expect("the 129th slot replaces the oldest idle one");
+    let extra = extra.expect("the 257th slot replaces the oldest idle one");
     assert!(!extra.reused_slot);
     assert!(
         walks.is_empty(),
         "the count replacement walked inventory: {walks:?}"
     );
     assert!(!first_marker.exists());
+
+    // Releasing the new slot walks exactly that slot, never the payload.
+    let (_, release_walks) = walked(&pool, || release_injected(&pool, &extra.lease_id));
+    assert_eq!(release_walks.len(), 1, "release walks: {release_walks:?}");
+    assert!(
+        release_walks[0].starts_with("slots/"),
+        "release walked more than its own slot: {release_walks:?}"
+    );
+
     let status = status_injected(&pool).expect("status");
     assert_eq!(status.slots.len(), super::MAX_SLOTS);
     assert!(status
@@ -473,6 +494,15 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
         .iter()
         .any(|slot| slot.slot_id == extra.slot_id));
     assert!(status.slots.iter().all(|slot| slot.rank > 0));
+
+    // The raised-ceiling fence is durable in the same ledger as the count.
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(RAISED_CAPACITY_POLICY_VERSION),
+        "a 256-slot ledger must carry the raised-ceiling fence"
+    );
 }
 
 #[test]
@@ -2391,31 +2421,41 @@ fn labelled_slot_eviction_and_malformed_dir() {
 fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-ledger");
     let pool = fx.dir("pool");
-    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    // The supported budget is a u64, so its widest decimal form is 20 digits;
+    // the config records the same value so the pair still matches.
+    create_injected(&pool, u64::MAX).expect("init");
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(pool.join("config.json")).expect("config")).expect("json");
     let path = format!("/{}", "\u{1}".repeat(1023));
     let holder = "\u{1}".repeat(MAX_HOLDER_BYTES);
     let lease_id = "\u{1}".repeat(MAX_LEASE_ID_BYTES);
-    // The worst valid ledger is the version-2 representation: every slot idle
-    // with a closed observation whose generation fence is at its own cap, so
-    // the bound covers the record (oxide#146).
+    // The maximal all-idle serialization (oxide#177): every slot idle with a
+    // closed observation whose generation fence is at its own cap, so the
+    // bound covers the record (oxide#146). Every numeric field is at its
+    // widest too: 20-digit ids, incarnations and ranks and the maximum `u64`
+    // in every recorded figure, so the measured state is a real maximum for
+    // this shape rather than a short-number fixture.
     let mut slots = Vec::new();
-    for id in 1..=super::MAX_SLOTS as u64 {
-        let digits = id.to_string().len();
-        let leaf = format!("{}-{id}", "b".repeat(80 - digits - 1));
+    for index in 0..super::MAX_SLOTS as u64 {
+        let id = u64::MAX - 1 - index;
+        let rank = u64::MAX - 1 - index;
+        let id_text = id.to_string();
+        assert_eq!(id_text.len(), 20, "fixture ids must use the full width");
+        let leaf = format!("{}-{id_text}", "b".repeat(80 - id_text.len() - 1));
         slots.push(serde_json::json!({
             "id": id,
-            "incarnation": id,
+            "incarnation": u64::MAX,
             "state": "idle",
             "project": path,
             "workspace": path,
             "profile": "full-debug",
             "holder": holder,
-            "lease_id": null,
+            // The widest accepted lease id: the write bound is 160 bytes and
+            // the validator imposes no state/lease-id pairing.
+            "lease_id": lease_id,
             "last_lease_id": lease_id,
             "dir": format!("{}/{leaf}", "a".repeat(80)),
-            "rank": 0,
+            "rank": rank,
             "recorded": {
                 "for_lease": lease_id,
                 "unique_bytes": u64::MAX,
@@ -2428,24 +2468,30 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let ledger = serde_json::json!({
         "version": 1,
         "store_id": config["store_id"],
-        "cap_bytes": 64 * 1024 * 1024,
-        "next_slot": 129,
-        "next_lease": 1_000_000,
-        "capacity_policy": 2,
-        "next_rank": 1,
+        "cap_bytes": u64::MAX,
+        "next_slot": u64::MAX,
+        "next_lease": u64::MAX,
+        "capacity_policy": RAISED_CAPACITY_POLICY_VERSION,
+        "next_rank": u64::MAX,
         "slots": slots,
     });
-    let input = serde_json::to_vec(&ledger).expect("worst valid ledger");
+    let input = serde_json::to_vec(&ledger).expect("maximal all-idle ledger");
     let stored = super::pool::write_ledger_bytes_injected(&pool, &input)
-        .expect("the worst valid ledger is accepted");
+        .expect("the maximal all-idle ledger is accepted");
+    let headroom = MAX_LEDGER_BYTES - stored.len() as u64;
     assert!(
-        stored.len() as u64 <= MAX_LEDGER_BYTES,
-        "worst valid ledger {} exceeds {MAX_LEDGER_BYTES}",
+        headroom > 0,
+        "the writer-reachable all-idle maximum {} does not fit {MAX_LEDGER_BYTES}",
         stored.len()
     );
     assert!(
-        stored.len() > 1_900_000,
-        "fixture is not near the byte cap: {}",
+        stored.len() > 3_800_000,
+        "fixture is not substantial: {}",
+        stored.len()
+    );
+    // Reported evidence for the oxide#177 accounting-cost gate.
+    println!(
+        "measured ordinary-path writer-reachable 256-slot ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
         stored.len()
     );
     assert_eq!(
@@ -2458,48 +2504,757 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(status.slots.len(), super::MAX_SLOTS);
 
     // The same shape with one field over its new cap refuses the revised
-    // write and leaves the stored bytes untouched.
-    let before = fs::read(pool.join("ledger.json")).expect("stored ledger");
-    let mut oversized = ledger.clone();
-    let mut slot = ledger["slots"][0].clone();
-    slot["holder"] = serde_json::json!("x".repeat(MAX_HOLDER_BYTES + 1));
-    oversized["slots"] = serde_json::json!([slot]);
-    oversized["next_slot"] = serde_json::json!(2);
-    let bytes = serde_json::to_vec(&oversized).expect("oversized ledger");
-    fs::write(pool.join("ledger.json"), &bytes).expect("legacy oversized field");
+    // write and leaves the stored bytes untouched. The negative fixtures use
+    // ordinary (not maximum-width) numbers so the admission reaches the field
+    // check instead of stopping at exhausted rank headroom.
     let project = fx.dir("project");
     let workspace = fx.dir("workspace");
-    assert!(matches!(
-        lease_injected(request(&pool, &project, &workspace, "holder")),
-        Err(LeaseError::UnknownAccounting)
-    ));
-    assert_eq!(
-        fs::read(pool.join("ledger.json")).expect("untouched"),
-        bytes,
-        "an oversized legacy field was truncated or rewritten"
-    );
-    fs::write(pool.join("ledger.json"), &before).expect("restore");
+    let one_slot = |holder: &str, for_lease: &str| {
+        serde_json::json!({
+            "version": 1,
+            "store_id": config["store_id"],
+            "cap_bytes": config["cap_bytes"],
+            "next_slot": 2,
+            "next_lease": 1_000_000,
+            "capacity_policy": super::CAPACITY_POLICY_VERSION,
+            "next_rank": 2,
+            "slots": [{
+                "id": 1,
+                "incarnation": 1,
+                "state": "idle",
+                "project": path,
+                "workspace": path,
+                "profile": "full-debug",
+                "holder": holder,
+                "lease_id": null,
+                "last_lease_id": lease_id,
+                "dir": format!("{}/{}", "a".repeat(80), format!("{}-1", "b".repeat(78))),
+                "rank": 1,
+                // Small figures: an enormous recorded size would trigger
+                // byte-pressure eviction of this very slot before the field
+                // check the case is about.
+                "recorded": {
+                    "for_lease": for_lease,
+                    "unique_bytes": 4_096,
+                    "logical_bytes": 8_192,
+                    "entries": 16,
+                    "at_ms": 1,
+                },
+            }],
+        })
+    };
+    for (label, document) in [
+        (
+            "an oversized holder",
+            one_slot(&"x".repeat(MAX_HOLDER_BYTES + 1), &lease_id),
+        ),
+        (
+            "an oversized record generation fence",
+            one_slot("holder", &"x".repeat(MAX_LEASE_ID_BYTES + 1)),
+        ),
+    ] {
+        let before = fs::read(pool.join("ledger.json")).expect("stored ledger");
+        let bytes = serde_json::to_vec(&document).expect("oversized ledger");
+        fs::write(pool.join("ledger.json"), &bytes).expect("oversized field fixture");
+        let outcome = lease_injected(request(&pool, &project, &workspace, "holder"));
+        assert!(
+            matches!(outcome, Err(LeaseError::UnknownAccounting)),
+            "{label} did not refuse the revised write: {outcome:?}"
+        );
+        assert_eq!(
+            fs::read(pool.join("ledger.json")).expect("untouched"),
+            bytes,
+            "{label} was truncated or rewritten"
+        );
+        fs::write(pool.join("ledger.json"), &before).expect("restore");
+    }
+}
 
-    // A record whose generation fence is over its cap refuses the revised
-    // write too, with the stored bytes untouched.
-    let before = fs::read(pool.join("ledger.json")).expect("stored ledger");
-    let mut oversized = ledger.clone();
-    let mut slot = ledger["slots"][0].clone();
-    slot["recorded"]["for_lease"] = serde_json::json!("x".repeat(MAX_LEASE_ID_BYTES + 1));
-    oversized["slots"] = serde_json::json!([slot]);
-    oversized["next_slot"] = serde_json::json!(2);
-    let bytes = serde_json::to_vec(&oversized).expect("oversized record ledger");
-    fs::write(pool.join("ledger.json"), &bytes).expect("oversized record field");
-    assert!(matches!(
-        lease_injected(request(&pool, &project, &workspace, "holder")),
-        Err(LeaseError::UnknownAccounting)
-    ));
-    assert_eq!(
-        fs::read(pool.join("ledger.json")).expect("untouched"),
-        bytes,
-        "an oversized record field was truncated or rewritten"
+/// A maximal valid deletion journal (oxide#155): one root plan plus the most
+/// capture and foreign records the validator allows, each with the longest
+/// chain of the longest capture names and the longest observed original name a
+/// writer can produce, so a byte bound measured with it covers everything a
+/// recorded deletion can durably hold.
+fn maximal_journal_json(tag: u64) -> serde_json::Value {
+    let name = |value: u64| {
+        format!(
+            "{}{:032x}",
+            crate::owned_delete::CAPTURE_PREFIX,
+            tag * 10_000 + value
+        )
+    };
+    let chain: Vec<String> = (0..64).map(&name).collect();
+    assert!(chain.iter().all(|item| item.len() <= 47));
+    // The longest bounded journal name: exactly PATH_MAX bytes as NAME_MAX
+    // components, all control bytes so compact JSON's sixfold escape is
+    // maximal.
+    let component = "\u{1}".repeat(204);
+    let original = std::iter::repeat_with(|| component.clone())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("/");
+    assert_eq!(original.len(), 1024);
+    assert!(original.split('/').all(|part| part.len() <= 255));
+    let found = original.clone();
+    let captures: Vec<serde_json::Value> = (0..96)
+        .map(|index| {
+            serde_json::json!({
+                "path": chain,
+                "private": name(1_000 + index),
+                "original": original,
+                "device": u64::MAX,
+                "inode": u64::MAX,
+                // The largest valid capture mode: symbolic link bits plus every
+                // permission bit.
+                "mode": 0o120777,
+            })
+        })
+        .collect();
+    let foreign: Vec<serde_json::Value> = (0..32)
+        .map(|index| {
+            serde_json::json!({
+                "path": chain,
+                "private": name(2_000 + index),
+                "original": original,
+                "expected_device": u64::MAX,
+                "expected_inode": u64::MAX,
+                // `is_valid` does not constrain this field, so its widest
+                // accepted form is the u32 maximum.
+                "expected_mode": u32::MAX,
+                "found": found,
+                "restored": false,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "root": {
+            "private": name(0),
+            // The longest phase name the enum can carry.
+            "phase": "captured",
+            "device": u64::MAX,
+            "inode": u64::MAX,
+            "parent_device": u64::MAX,
+            "parent_inode": u64::MAX,
+            // The largest valid directory mode (type bits plus every
+            // permission bit); JSON prints it in decimal.
+            "mode": 0o040777,
+        },
+        "captures": captures,
+        "foreign": foreign,
+    })
+}
+
+/// The maximal ledger this writer reaches on its **ordinary eviction path**
+/// (oxide#177): the raised-ceiling representation at 256 slots with every field
+/// at its cap, where the one slot a pool can durably leave `Evicting` carries a
+/// maximal deletion journal. `retire_idle_slot` refuses a second deletion while
+/// a journal is outstanding, so an admission starts one. `MAX_LEDGER_BYTES` is
+/// the *worst-valid byte bound* — a larger ledger is corrupt and refused, and
+/// the reader accepts any otherwise-valid ledger at or below it. Recovery can
+/// leave more journals (see
+/// `recovery_creates_a_journal_for_a_second_pending_deletion`), so this figure
+/// is the maximal ordinary-path state, not a bound on recovery.
+#[test]
+fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
+    let fx = Fixture::new("worst-journal-ledger");
+    let pool = fx.dir("pool");
+    // The supported budget is a u64, so its widest decimal form is 20 digits;
+    // the config records the same value so the pair still matches.
+    create_injected(&pool, u64::MAX).expect("init");
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("config.json")).expect("config")).expect("json");
+    let path = format!("/{}", "\u{1}".repeat(1023));
+    let holder = "\u{1}".repeat(MAX_HOLDER_BYTES);
+    let lease_id = "\u{1}".repeat(MAX_LEASE_ID_BYTES);
+    let mut slots = Vec::new();
+    for index in 0..super::MAX_SLOTS as u64 {
+        let id = u64::MAX - 1 - index;
+        let rank = u64::MAX - 1 - index;
+        let id_text = id.to_string();
+        let leaf = format!("{}-{id_text}", "b".repeat(80 - id_text.len() - 1));
+        let mut slot = serde_json::json!({
+            "id": id,
+            "incarnation": u64::MAX,
+            "state": "idle",
+            "project": path,
+            "workspace": path,
+            "profile": "full-debug",
+            "holder": holder,
+            // The widest accepted lease id: the write bound is 160 bytes and
+            // the validator imposes no state/lease-id pairing.
+            "lease_id": lease_id,
+            "last_lease_id": lease_id,
+            "dir": format!("{}/{leaf}", "a".repeat(80)),
+            "rank": rank,
+            "recorded": {
+                "for_lease": lease_id,
+                "unique_bytes": u64::MAX,
+                "logical_bytes": u64::MAX,
+                "entries": u64::MAX,
+                "at_ms": u64::MAX,
+            },
+        });
+        if index == 0 {
+            // The raised-ceiling representation retains the closed size
+            // observation on an `Evicting` record (oxide#175), and this slot
+            // carries the maximal deletion journal. Both together are this
+            // writer's reachable ordinary-path maximum (see
+            // `MAX_LEDGER_BYTES`).
+            slot["state"] = serde_json::json!("evicting");
+            slot["capture"] = maximal_journal_json(0);
+        }
+        slots.push(slot);
+    }
+    let ledger = serde_json::json!({
+        "version": 1,
+        "store_id": config["store_id"],
+        "cap_bytes": u64::MAX,
+        "next_slot": u64::MAX,
+        "next_lease": u64::MAX,
+        "capacity_policy": RAISED_CAPACITY_POLICY_VERSION,
+        "next_rank": u64::MAX,
+        "slots": slots,
+    });
+    let input = serde_json::to_vec(&ledger).expect("maximal writer-reachable journaled ledger");
+    let stored = super::pool::write_ledger_bytes_injected(&pool, &input)
+        .expect("the maximal writer-reachable journaled ledger is accepted");
+    let headroom = MAX_LEDGER_BYTES - stored.len() as u64;
+    assert!(
+        headroom > 0,
+        "the writer-reachable journaled maximum {} does not fit {MAX_LEDGER_BYTES}",
+        stored.len()
     );
-    fs::write(pool.join("ledger.json"), &before).expect("restore");
+    assert!(
+        headroom >= 2 * 1024 * 1024,
+        "the writer-reachable maximum leaves only {headroom} bytes of headroom"
+    );
+    assert!(
+        stored.len() > 4_500_000,
+        "the journaled fixture did not reach the journal's cost: {}",
+        stored.len()
+    );
+    // The journal really round-tripped, not just its slot row.
+    let journal = super::pool::capture_record_injected(&pool, u64::MAX - 1)
+        .expect("the journal did not survive");
+    assert_eq!(journal.captures.len(), 96);
+    assert_eq!(journal.foreign.len(), 32);
+    assert_eq!(journal.captures[0].path.len(), 64);
+    assert_eq!(journal.captures[0].original.len(), 1024);
+    assert_eq!(journal.foreign[0].found.len(), 1024);
+    assert_eq!(journal.foreign[0].expected_mode, u32::MAX);
+    println!(
+        "measured ordinary-path writer-reachable 256-slot journaled ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
+        stored.len()
+    );
+    // A passive snapshot reads the journals without reconciling them.
+    let snapshot = super::pool::snapshot_injected(&pool).expect("the journaled ledger reads");
+    assert_eq!(snapshot.slots.len(), super::MAX_SLOTS);
+    assert_eq!(snapshot.evicting_slot_ids.len(), 1);
+}
+
+/// Recovery is a second journal path (oxide#177): `Pool::open` reconciles
+/// every `Evicting` record, and `remove_owned_slot` creates and persists a fresh
+/// `SlotCaptureJournal` for one that has none (or after a recoverable journal is
+/// rolled back and cleared), without `retire_idle_slot`'s single-journal guard;
+/// the loop continues past a blocked record and a failed deletion keeps its
+/// journal. One open can therefore leave a journal per failing pending
+/// deletion. The admission gate and the library's locked open make the
+/// version-8 control fence durable before the open, so this recovery path is
+/// preceded by the hand-off fence (oxide#177, fence first).
+#[test]
+fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
+    let fixture = Fixture::new("recovery-journal");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first =
+        lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a")).expect("a");
+    let second =
+        lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")).expect("b");
+    release_injected(&pool, &first.lease_id).expect("release a");
+    release_injected(&pool, &second.lease_id).expect("release b");
+    let first_id: u64 = first.slot_id.parse().expect("slot id");
+    let second_id: u64 = second.slot_id.parse().expect("slot id");
+    let first_path = pool.join("payload/slots").join(&first.slot_id);
+    let second_path = pool.join("payload/slots").join(&second.slot_id);
+
+    // Slot A: an unclassifiable journal, so reconciliation blocks and keeps it.
+    super::pool::mark_evicting_for_test(&pool, first_id).expect("recorded deletion");
+    fs::remove_dir_all(&first_path).expect("the recorded root is absent");
+    super::pool::write_capture_record_injected(
+        &pool,
+        first_id,
+        super::pool::DeletionJournal {
+            root: crate::owned_delete::RootCapturePlan {
+                private: format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, 31),
+                phase: crate::owned_delete::RootCapturePhase::Planned,
+                device: 1,
+                inode: 2,
+                parent_device: 1,
+                parent_inode: 3,
+                mode: 0o040700,
+            },
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("journal");
+
+    // Slot B: `Evicting` with no journal, and a tree the deletion cannot
+    // finish (a directory with no search bit), so recovery refuses before its
+    // preflight and keeps the record without starting a journal (oxide#175).
+    super::pool::mark_evicting_for_test(&pool, second_id).expect("recorded deletion");
+    let blocked = second_path.join("blocked");
+    fs::create_dir(&blocked).expect("blocked directory");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("no search bit");
+
+    // One open reconciles them: A stays blocked with its journal, and B stays
+    // pending with no journal, so recovery never starts a second one
+    // (oxide#177's single-journal writer guard, kept by the fence-first run).
+    let _ = status_injected(&pool);
+    assert!(
+        super::pool::capture_record_injected(&pool, first_id).is_some(),
+        "the blocked journal is retained"
+    );
+    assert!(
+        super::pool::capture_record_injected(&pool, second_id).is_none(),
+        "recovery started a second journal"
+    );
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(
+        snapshot.evicting_slot_ids.len(),
+        2,
+        "both pending deletions are retained: {:?}",
+        snapshot.evicting_slot_ids
+    );
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore for cleanup");
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A control-state lookup that fails for any reason other than absence must
+/// refuse the open before any reconciliation (oxide#177, fence first). Only
+/// `NotFound` means "a library fixture with nothing to fence"; every other
+/// metadata failure refuses, so recovery never runs unfenced (Supervisor
+/// ruling 4c9984a1). A regular file where the control directory belongs makes
+/// `oxide-managed/state.json` fail with ENOTDIR without leaving an
+/// unsearchable directory in the monitored scratch root.
+#[test]
+fn an_unreadable_control_state_refuses_before_recovery() {
+    let fixture = Fixture::new("unreadable-control");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "unreadable-control");
+    // The slot is `Evicting` with its root ready: a reconciling open deletes
+    // it and rewrites the ledger, so byte identity proves no reconciliation
+    // ran.
+    super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    let control = pool.join(MANAGED_NAME);
+    if control.is_dir() {
+        fs::remove_dir_all(&control).expect("control dir");
+    }
+    fs::write(&control, b"not a control directory").expect("control placeholder");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).expect("control mode");
+
+    let ledger_path = pool.join("ledger.json");
+    let before = fs::read(&ledger_path).expect("ledger");
+    let result = lease_injected(request(
+        &pool,
+        &fixture.dir("other-project"),
+        &fixture.dir("other-workspace"),
+        "other",
+    ));
+    assert!(
+        result.is_err(),
+        "an unreadable control state admitted a lease"
+    );
+    assert_eq!(
+        fs::read(&ledger_path).expect("ledger"),
+        before,
+        "recovery ran although the control state could not be inspected"
+    );
+    let ledger: serde_json::Value = serde_json::from_slice(&before).expect("ledger json");
+    assert_eq!(
+        ledger["slots"][0]["state"], "evicting",
+        "the pending record was dropped"
+    );
+    assert!(
+        ledger["slots"][0].get("capture").is_none(),
+        "a recovery journal was started"
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A control document at the fence version that carries a present-but-invalid
+/// fence value is corrupt, not an older document to upgrade. The fence writer
+/// refuses and repairs nothing, so no recovery journal starts (oxide#177,
+/// Supervisor ruling 4c9984a1).
+#[test]
+fn an_invalid_control_fence_value_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "invalid-control-fence",
+        br#"{"version":8,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[],"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":42}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "an invalid control fence admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// Version 0 is not a document the front door's typed reader accepts, so the
+/// fence writer refuses it instead of upgrading it to version 8 (oxide#177).
+#[test]
+fn an_unsupported_control_version_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "unsupported-control-version",
+        br#"{"version":0,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[]}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "an unsupported control version admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// Version 6 requires the one-use fence, so a version-6 document without it
+/// is corrupt; the fence writer refuses rather than advancing it to version 8
+/// (oxide#177).
+#[test]
+fn a_version_six_control_without_its_one_use_fence_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "missing-one-use-fence",
+        br#"{"version":6,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[],"recorded_accounting":"oxide.accounting/1"}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "a version-6 control without its one-use fence admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A structurally malformed control document (a non-array `records` field) is
+/// corrupt, not an older shape to upgrade: the fence and the front door's
+/// `Store::load` share one parser, and it refuses before any write.
+#[test]
+fn a_malformed_records_field_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "malformed-records",
+        br#"{"version":5,"next_id":1,"next_use":1,"tickets":[],"records":42,"cleans":[],"recorded_accounting":"oxide.accounting/1"}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "a malformed records field admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// An explicit JSON `null` on a fence is a present non-string value, not an
+/// absent field: a complete version-5 document otherwise valid must refuse
+/// rather than have the fence inserted (oxide#177).
+#[test]
+fn an_explicit_null_fence_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "null-fence",
+        br#"{"version":5,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[],"recorded_accounting":"oxide.accounting/1","slot_ceiling":null}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "an explicit null fence admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A pool with a ready pending `Evicting` record and the given control-state
+/// bytes: a reconciling open would rewrite the ledger, so byte identity proves
+/// no reconciliation ran. Returns the fixture, the pool, the control path, the
+/// control bytes and the ledger bytes.
+fn control_refusal_fixture(
+    label: &str,
+    control_bytes: &[u8],
+) -> (Fixture, PathBuf, PathBuf, Vec<u8>, Vec<u8>) {
+    let fixture = Fixture::new(label);
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, label);
+    super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    let control = pool.join(MANAGED_NAME);
+    fs::create_dir_all(&control).expect("control dir");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("control mode");
+    let state = control.join("state.json");
+    fs::write(&state, control_bytes).expect("control state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).expect("state mode");
+    let ledger = fs::read(pool.join("ledger.json")).expect("ledger");
+    (fixture, pool, state, control_bytes.to_vec(), ledger)
+}
+
+fn assert_control_refusal(
+    fixture: &Fixture,
+    pool: &Path,
+    state: &Path,
+    state_before: &[u8],
+    ledger_before: &[u8],
+    admitted: &str,
+) {
+    let result = lease_injected(request(
+        pool,
+        &fixture.dir("other-project"),
+        &fixture.dir("other-workspace"),
+        "other",
+    ));
+    assert!(result.is_err(), "{admitted}");
+    assert_eq!(
+        fs::read(state).expect("state"),
+        state_before,
+        "the fence writer changed a refused control state"
+    );
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("ledger"),
+        ledger_before,
+        "recovery ran under a refused control state"
+    );
+    let ledger: serde_json::Value = serde_json::from_slice(ledger_before).expect("ledger json");
+    assert_eq!(ledger["slots"][0]["state"], "evicting");
+    assert!(
+        ledger["slots"][0].get("capture").is_none(),
+        "a recovery journal was started"
+    );
+}
+
+/// A journaled deletion that cannot be classified keeps the pool blocked:
+/// every new lease is refused with `unknown_accounting`, so no second eviction
+/// (and no second journal) can be started while one is outstanding. This is the
+/// writer's single-journal guard (oxide#177); the reader's worst-valid byte
+/// bound is the cap itself, not a journal count.
+#[test]
+fn a_blocked_journaled_deletion_refuses_every_new_lease() {
+    let fixture = Fixture::new("blocked-journal");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-journal");
+    super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    let plan = crate::owned_delete::RootCapturePlan {
+        private: format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, 0),
+        phase: crate::owned_delete::RootCapturePhase::Planned,
+        device: 1,
+        inode: 2,
+        parent_device: 1,
+        parent_inode: 3,
+        mode: 0o040700,
+    };
+    // The recorded root is gone and neither its original nor its planned
+    // private name holds it, so replay must keep the deletion pending.
+    fs::remove_dir_all(&slot_path).expect("the recorded root is absent");
+    super::pool::write_capture_record_injected(
+        &pool,
+        slot_id,
+        super::pool::DeletionJournal {
+            root: plan,
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("journal");
+    let workspace = fixture.dir("workspace");
+    assert!(
+        matches!(
+            lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")),
+            Err(LeaseError::UnknownAccounting)
+        ),
+        "a blocked journaled deletion admitted a new lease"
+    );
+    // The journaled record is retained: no second deletion was started.
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(snapshot.evicting_slot_ids.len(), 1);
+}
+
+/// The single-journal guard covers the explicit eviction path too, which does
+/// not pass through `lease()`'s blocked-reconciliation refusal: a second
+/// `evict_idle_slot` refuses while the blocked journal is retained, so no
+/// second journal can accumulate.
+#[test]
+fn a_blocked_journaled_deletion_refuses_a_second_explicit_eviction() {
+    let fixture = Fixture::new("blocked-second-eviction");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first =
+        lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a")).expect("a");
+    let second =
+        lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")).expect("b");
+    release_injected(&pool, &first.lease_id).expect("release a");
+    release_injected(&pool, &second.lease_id).expect("release b");
+    let first_id: u64 = first.slot_id.parse().expect("slot id");
+    let second_id: u64 = second.slot_id.parse().expect("slot id");
+    let first_path = pool.join("payload/slots").join(&first.slot_id);
+    let second_path = pool.join("payload/slots").join(&second.slot_id);
+
+    // Block the first deletion: its recorded root is gone and neither its
+    // original nor its planned private name holds it, so replay cannot
+    // classify it.
+    super::pool::mark_evicting_for_test(&pool, first_id).expect("recorded deletion");
+    fs::remove_dir_all(&first_path).expect("the recorded root is absent");
+    super::pool::write_capture_record_injected(
+        &pool,
+        first_id,
+        super::pool::DeletionJournal {
+            root: crate::owned_delete::RootCapturePlan {
+                private: format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, 11),
+                phase: crate::owned_delete::RootCapturePhase::Planned,
+                device: 1,
+                inode: 2,
+                parent_device: 1,
+                parent_inode: 3,
+                mode: 0o040700,
+            },
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("journal");
+
+    // The explicit eviction path must refuse while that journal is pending.
+    let outcome = super::pool::evict_idle_slot_injected(&pool, &second_id.to_string());
+    assert!(
+        matches!(outcome, Err(LeaseError::UnknownAccounting)),
+        "a second explicit eviction started while a journal was outstanding: {outcome:?}"
+    );
+
+    // Both records and the journal survive: nothing was deleted or resolved.
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(snapshot.evicting_slot_ids, vec![first.slot_id.clone()]);
+    assert!(snapshot
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == second.slot_id && slot.state == SlotOccupancy::Idle));
+    assert!(second_path.is_dir(), "the second slot was touched");
+    assert!(super::pool::capture_record_injected(&pool, first_id).is_some());
+}
+
+/// oxide#177's accounting-cost gate as one fixed measurement: one whole round
+/// trip of the real recorded representation — the bounded ledger read, the
+/// ranked ordering admission uses, and the actual atomic ledger write that
+/// reads its result back — at the legacy 128-slot ceiling and at the raised
+/// 256-slot ceiling. Both figures are printed and each whole round trip must
+/// stay under one generous fixed test ceiling.
+///
+/// The round trip includes the atomic replacement's durable `fsync` of a
+/// ledger that now reaches the journaled worst-valid size, which is host I/O
+/// and dominates the figure on a loaded machine (195.7 ms was observed for the
+/// 256-slot round trip there), so the ceiling is 1000 ms: a fixed sanity bound
+/// on the requested write round trip, not on the representation work alone. It
+/// still catches a whole-payload walk or a per-slot quadratic regression,
+/// which is what the gate is for. This is not a benchmark or a claim about a
+/// large live pool.
+#[test]
+fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
+    use std::time::{Duration, Instant};
+
+    const CEILING: Duration = Duration::from_millis(1_000);
+    let fx = Fixture::new("ledger-cost");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("config.json")).expect("config")).expect("json");
+    let store_id = config["store_id"].as_str().expect("store id").to_owned();
+    let documented = |slots: usize| {
+        let path = format!("/{}", "p".repeat(200));
+        let mut rows = Vec::with_capacity(slots);
+        for id in 1..=slots as u64 {
+            let last_lease_id = format!("v1.{store_id}.{id}.1.1");
+            rows.push(serde_json::json!({
+                "id": id,
+                "incarnation": 1,
+                "state": "idle",
+                "project": path,
+                "workspace": path,
+                "profile": "dev",
+                "holder": "holder",
+                "lease_id": null,
+                "last_lease_id": last_lease_id,
+                "dir": format!("label/quick-{id}"),
+                "rank": id,
+                // The admission basis is the recorded representation, so the
+                // measured round trip carries one current observation per slot.
+                "recorded": {
+                    "for_lease": last_lease_id,
+                    "unique_bytes": 4_096,
+                    "logical_bytes": 8_192,
+                    "entries": 16,
+                    "at_ms": 1,
+                },
+            }));
+        }
+        // One recorded deletion carries a maximal journal, so the measured
+        // read, rank and write also cover journal parsing and serialization.
+        rows[0]["state"] = serde_json::json!("evicting");
+        rows[0].as_object_mut().expect("object").remove("recorded");
+        rows[0]["capture"] = maximal_journal_json(0);
+        let policy = if slots > super::LEGACY_MAX_SLOTS {
+            RAISED_CAPACITY_POLICY_VERSION
+        } else {
+            super::CAPACITY_POLICY_VERSION
+        };
+        serde_json::json!({
+            "version": 1,
+            "store_id": config["store_id"],
+            "cap_bytes": 64 * 1024 * 1024,
+            "next_slot": slots as u64 + 1,
+            "next_lease": 1_000,
+            "capacity_policy": policy,
+            "next_rank": slots as u64 + 1,
+            "slots": rows,
+        })
+    };
+    let mut measured = Vec::new();
+    for slots in [super::LEGACY_MAX_SLOTS, super::MAX_SLOTS] {
+        let input = serde_json::to_vec(&documented(slots)).expect("ledger");
+        // Warm the code paths once (this write is not measured).
+        super::pool::write_ledger_bytes_injected(&pool, &input).expect("warm write");
+        // Whole round trips for this size: read the recorded ledger, rank it
+        // exactly as admission does, then perform the actual atomic ledger
+        // write and read its result back. The gate is the whole round trip, not
+        // its parts; the best of three keeps one scheduler stall from turning a
+        // generous fixed ceiling into a flaky assertion.
+        let mut best = Duration::MAX;
+        for _ in 0..3 {
+            let started = Instant::now();
+            // The passive snapshot reads and validates the ledger (including
+            // the journal) without reconciling the recorded deletion.
+            let view = super::pool::snapshot_injected(&pool).expect("recorded read");
+            assert_eq!(view.slots.len(), slots);
+            assert_eq!(view.evicting_slot_ids.len(), 1);
+            let mut order: Vec<(u64, u64)> = view
+                .slots
+                .iter()
+                .map(|slot| (slot.rank, slot.slot_id.parse::<u64>().unwrap_or(u64::MAX)))
+                .collect();
+            order.sort();
+            assert_eq!(order.first(), Some(&(1, 1)));
+            super::pool::write_ledger_bytes_injected(&pool, &input).expect("valid write");
+            best = best.min(started.elapsed());
+        }
+        println!(
+            "{slots}-slot ledger round trip, best of 3 (read, rank, atomic write and read-back): {} us",
+            best.as_micros()
+        );
+        assert!(best < CEILING, "{slots}-slot round trip took {best:?}");
+        measured.push((slots, best));
+    }
+    assert_eq!(measured.len(), 2);
 }
 
 #[test]

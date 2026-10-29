@@ -247,10 +247,18 @@ impl StateRecord {
     }
 
     fn json(&self) -> serde_json::Value {
+        // The rig's state is read by the same parser the front door uses
+        // (`control::parse_state`), so every required record field is present.
         let mut value = serde_json::json!({
             "id": self.id,
-            "phase": self.phase,
+            "identity": "fixture",
+            "compatibility": "fixture",
+            "profile": "dev",
             "checkout": self.checkout,
+            "phase": self.phase,
+            "process_group": serde_json::Value::Null,
+            "last_used": 1,
+            "last_used_ms": 1,
         });
         if self.held {
             value["holder"] = serde_json::json!({
@@ -264,6 +272,12 @@ impl StateRecord {
             value["pending_recovery"] = serde_json::json!({
                 "slot_id": self.id.to_string(),
                 "lease_id": "fixture-lease",
+                "checkout": self.checkout,
+                "holder_pid": 1,
+                "holder_started_ms": 0,
+                "process_group": serde_json::Value::Null,
+                "recovered_ms": 1,
+                "recovered_by": 1,
             });
         }
         if self.retired {
@@ -426,11 +440,30 @@ impl Rig {
             .iter()
             .map(|checkout| serde_json::json!({"id": 1, "checkout": checkout}))
             .collect();
-        let state = serde_json::json!({
+        let mut state = serde_json::json!({
             "version": version,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
             "records": records,
             "cleans": cleans,
         });
+        // A document at a forward-fence version must carry that fence, or the
+        // donor reader refuses it as a state no writer produces. The rig
+        // rewrites the current version after a locked open has fenced it.
+        if version >= 5 {
+            state["recorded_accounting"] =
+                serde_json::json!(super::super::CONTROL_RECORDED_ACCOUNTING_FENCE);
+        }
+        if version >= 7 {
+            state["eviction_accounting"] =
+                serde_json::json!(super::super::CONTROL_EVICTION_ACCOUNTING_FENCE);
+        }
+        if version == 6 {
+            state["one_use_workspaces"] = serde_json::json!(super::super::CONTROL_ONE_USE_FENCE);
+        } else if version >= super::super::CONTROL_FENCE_VERSION {
+            state["slot_ceiling"] = serde_json::json!(super::super::CONTROL_SLOT_CEILING_FENCE);
+        }
         let path = control.join("state.json");
         fs::write(&path, serde_json::to_vec(&state).expect("control json")).expect("control state");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("state mode");

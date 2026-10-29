@@ -14,8 +14,9 @@ use super::{
     RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
     ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
     CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
-    LEGACY_CAPACITY_POLICY_VERSION, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION, SLOTS_NAME,
+    LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
+    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION,
+    RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{
@@ -572,6 +573,12 @@ pub(super) struct Pool {
     /// starting a fresh one.
     deadline: Option<Instant>,
     reconciliation_blocked: bool,
+    /// A recorded journal names a root that is at neither its original nor its
+    /// private name: the deletion cannot be classified, so no new lease is
+    /// admitted (oxide#175, oxide#177). An unjournaled pending root or a
+    /// journaled root that is still present is charged conservatively instead
+    /// and does not block unrelated admissions.
+    reconciliation_unresolved: bool,
     /// Why this open admitted a new slot without a complete walk, if it did.
     admission_note: Option<String>,
     /// The caller's registered free-space reserve for a removable payload.
@@ -1093,6 +1100,11 @@ impl Pool {
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
         let lock = lock_pool(&root)?;
+        // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
+        // state reaches the current fence version before this open can start a
+        // recovery journal or finish a recorded deletion. A library fixture
+        // has no control state and nothing to fence.
+        super::fence_managed_control(&root)?;
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
         let backing = match config.backend.as_str() {
@@ -1125,6 +1137,7 @@ impl Pool {
             limits: accounting_limits(),
             deadline: None,
             reconciliation_blocked: false,
+            reconciliation_unresolved: false,
             admission_note: None,
             reserve: None,
         };
@@ -1166,6 +1179,7 @@ impl Pool {
             // Coverage for a measurement made without reconciliation is
             // unknown while a recorded deletion is pending.
             reconciliation_blocked: pending,
+            reconciliation_unresolved: false,
             admission_note: None,
             reserve: None,
         })
@@ -1194,13 +1208,27 @@ impl Pool {
     }
 
     /// A revised mutation: install the permanent capacity-policy fence if
-    /// this ledger predates it, validate every stored field against the
+    /// this ledger predates it, raise that fence when the slot table now
+    /// exceeds the legacy ceiling, validate every stored field against the
     /// raised caps, then replace the ledger atomically. Legacy representation
     /// is never migrated by a read-only observer or by reconciliation alone.
     fn persist_revised(&mut self) -> Result<(), LeaseError> {
         self.ensure_capacity_policy()?;
+        self.raise_capacity_policy_if_needed();
         validate_ledger_write(&self.ledger)?;
         self.persist()
+    }
+
+    /// The raised-ceiling fence (oxide#177) is written forward-only, in the
+    /// same atomic replacement that first records more than
+    /// [`LEGACY_MAX_SLOTS`] slots, so an older binary refuses the ledger
+    /// before it can act on a slot table it cannot represent. Nothing is
+    /// written below that count: a pool at or under 128 slots keeps a fence
+    /// an older binary still reads.
+    fn raise_capacity_policy_if_needed(&mut self) {
+        if self.ledger.slots.len() > LEGACY_MAX_SLOTS {
+            self.ledger.capacity_policy = Some(RAISED_CAPACITY_POLICY_VERSION);
+        }
     }
 
     /// Add the permanent capacity-policy fence to an in-memory ledger that
@@ -1229,7 +1257,10 @@ impl Pool {
         {
             self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
         }
-        if self.ledger.capacity_policy != Some(CAPACITY_POLICY_VERSION) {
+        if !matches!(
+            self.ledger.capacity_policy,
+            Some(CAPACITY_POLICY_VERSION) | Some(RAISED_CAPACITY_POLICY_VERSION)
+        ) {
             return Err(LeaseError::UnknownAccounting);
         }
         Ok(())
@@ -1256,6 +1287,13 @@ impl Pool {
     }
 
     fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
+        // A journaled deletion whose recorded root is at neither of its names
+        // leaves the ledger uncertain: no new lease is admitted until it is
+        // resolved (oxide#175 capture recovery, oxide#177 single-journal
+        // guard). Other blocked recoveries are charged, not refused.
+        if self.reconciliation_unresolved {
+            return Err(LeaseError::UnknownAccounting);
+        }
         if let Some(budget) = request.budget_bytes {
             if budget == 0 {
                 return Err(LeaseError::InvalidInput("budget must be positive"));
@@ -2624,6 +2662,18 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
+        // One durable deletion journal at a time (oxide#177). An eviction is
+        // the only path that starts a journal, and this check covers every
+        // entry point, including the explicit `evict_idle_slot` that does not
+        // pass through `lease()`'s blocked-reconciliation refusal: a second
+        // deletion would interleave two journals and grow the ledger past its
+        // derived bound. The pending record and its journal are kept, and a
+        // later open retries reconciliation.
+        if self.reconciliation_blocked
+            || self.ledger.slots.iter().any(|slot| slot.capture.is_some())
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
         // Every durable idle deletion, including the explicit
         // `evict_idle_slot` path, checks the rank sequence before its first
         // transition: an exhausted or missing-headroom sequence refuses
@@ -2693,6 +2743,9 @@ impl Pool {
             } else if let Some(root) = self.pending_root_ready(id, &path) {
                 Some(root)
             } else {
+                if self.recorded_root_is_untracked(id, &path) {
+                    self.reconciliation_unresolved = true;
+                }
                 self.reconciliation_blocked = true;
                 continue;
             };
@@ -2732,6 +2785,21 @@ impl Pool {
             self.persist()?;
         }
         Ok(())
+    }
+
+    /// A journaled pending root that is at neither its original nor its
+    /// private recorded name cannot be reconciled; it stays pending and no new
+    /// lease is admitted. A root that is still present (a collision or an
+    /// unjournaled pending tree) is charged conservatively instead.
+    fn recorded_root_is_untracked(&self, id: u64, path: &Path) -> bool {
+        let Some(journal) = self.slot(id).and_then(|slot| slot.capture.as_ref()) else {
+            return false;
+        };
+        let private = path
+            .parent()
+            .map(|parent| parent.join(&journal.root.private));
+        fs::symlink_metadata(path).is_err()
+            && private.is_none_or(|private| fs::symlink_metadata(private).is_err())
     }
 
     /// An uncertain or partially inventoried pending root is isolated before
@@ -4389,8 +4457,17 @@ fn write_ledger(pool: &Path, ledger: &Ledger) -> Result<(), LeaseError> {
 /// Read-side shape checks: identities, the recorded slot path and the
 /// capacity-policy/rank fields. Legacy ledgers have no policy fence and rank
 /// 0 everywhere; a rank without its fence is not a representation this
-/// version wrote.
+/// version wrote. A slot count above the legacy ceiling always carries the
+/// raised-ceiling fence (oxide#177), so an older binary refuses it.
 fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
+    if ledger.slots.len() > MAX_SLOTS {
+        return Err(LeaseError::LedgerExhausted);
+    }
+    if ledger.slots.len() > LEGACY_MAX_SLOTS
+        && ledger.capacity_policy != Some(RAISED_CAPACITY_POLICY_VERSION)
+    {
+        return Err(LeaseError::UnknownAccounting);
+    }
     match (ledger.capacity_policy, ledger.next_rank) {
         (None, None) => {
             if ledger.slots.iter().any(|slot| slot.rank != 0) {
@@ -4401,18 +4478,21 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
             }
         }
         (Some(policy), Some(next)) => {
-            if (policy != LEGACY_CAPACITY_POLICY_VERSION
-                && policy != PREVIOUS_CAPACITY_POLICY_VERSION
-                && policy != CAPACITY_POLICY_VERSION)
-                || next == 0
+            if !matches!(
+                policy,
+                LEGACY_CAPACITY_POLICY_VERSION
+                    | PREVIOUS_CAPACITY_POLICY_VERSION
+                    | CAPACITY_POLICY_VERSION
+                    | RAISED_CAPACITY_POLICY_VERSION
+            ) || next == 0
             {
                 return Err(LeaseError::UnknownAccounting);
             }
             if ledger.slots.iter().any(|slot| slot.rank >= next) {
                 return Err(LeaseError::UnknownAccounting);
             }
-            // Only the version-2 representation writes records: a version-1
-            // ledger holding one is a state no writer can produce.
+            // Only the version-2 and later representations write records: a
+            // version-1 ledger holding one is a state no writer can produce.
             if policy == LEGACY_CAPACITY_POLICY_VERSION
                 && ledger.slots.iter().any(|slot| slot.recorded.is_some())
             {
@@ -4431,7 +4511,10 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         if slot.recorded.is_some()
             && (slot.state == SlotPersistState::Held
                 || (slot.state == SlotPersistState::Evicting
-                    && ledger.capacity_policy != Some(CAPACITY_POLICY_VERSION)))
+                    && !matches!(
+                        ledger.capacity_policy,
+                        Some(CAPACITY_POLICY_VERSION) | Some(RAISED_CAPACITY_POLICY_VERSION)
+                    )))
         {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -4645,6 +4728,7 @@ pub(super) fn volume_pool_for_test(
         limits: accounting_limits(),
         deadline: None,
         reconciliation_blocked: false,
+        reconciliation_unresolved: false,
         admission_note: None,
         reserve,
     })
@@ -5425,8 +5509,10 @@ mod removable_pool_path_tests {
 #[cfg(test)]
 mod recorded_ledger_tests {
     use super::{validate_ledger_read, Ledger, RecordedSize, SlotPersistState};
+    use crate::lease::LeaseError;
     use crate::lease::{
         Profile, CAPACITY_POLICY_VERSION, LEASE_VERSION, LEGACY_CAPACITY_POLICY_VERSION,
+        LEGACY_MAX_SLOTS, RAISED_CAPACITY_POLICY_VERSION,
     };
     use std::path::PathBuf;
 
@@ -5507,10 +5593,157 @@ mod recorded_ledger_tests {
             true
         ))
         .is_ok());
+        // The raised-ceiling fence (oxide#177, policy 4) carries the same
+        // record shape, including the version-3 retained record on an
+        // eviction, and stays readable when a pool shrinks back below the
+        // legacy ceiling.
+        assert!(validate_ledger_read(&ledger(
+            Some(RAISED_CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Idle,
+            true
+        ))
+        .is_ok());
+        assert!(validate_ledger_read(&ledger(
+            Some(RAISED_CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Evicting,
+            true
+        ))
+        .is_ok());
         // An unknown fence value refuses, and a legacy ledger holding a record
         // refuses too.
-        assert!(validate_ledger_read(&ledger(Some(4), 1, SlotPersistState::Idle, false)).is_err());
+        assert!(validate_ledger_read(&ledger(Some(5), 1, SlotPersistState::Idle, false)).is_err());
         assert!(validate_ledger_read(&ledger(None, 0, SlotPersistState::Idle, true)).is_err());
+    }
+
+    /// A slot table above the legacy ceiling always carries the raised fence
+    /// (oxide#177). Without it the ledger is a state no writer produces, so a
+    /// reader that would not recognise the fence cannot silently accept a
+    /// 256-slot table.
+    #[test]
+    fn a_slot_table_above_the_legacy_ceiling_requires_the_raised_fence() {
+        let mut fenced = ledger(
+            Some(RAISED_CAPACITY_POLICY_VERSION),
+            1,
+            SlotPersistState::Idle,
+            false,
+        );
+        fenced.slots = (1..=LEGACY_MAX_SLOTS as u64 + 1)
+            .map(|id| {
+                let mut slot = fenced.slots[0].clone();
+                slot.id = id;
+                slot.rank = id;
+                slot.last_lease_id = format!("v1.a.{id}.1.1");
+                slot
+            })
+            .collect();
+        fenced.next_slot = LEGACY_MAX_SLOTS as u64 + 2;
+        fenced.next_rank = Some(LEGACY_MAX_SLOTS as u64 + 2);
+        assert!(validate_ledger_read(&fenced).is_ok());
+
+        // The same table under the version-2 fence is refused on read, so an
+        // older binary's stricter check is never the only guard.
+        let mut unfenced = fenced.clone();
+        unfenced.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+        assert_eq!(
+            validate_ledger_read(&unfenced).unwrap_err(),
+            crate::lease::LeaseError::UnknownAccounting
+        );
+        // Exactly the legacy ceiling still reads under the version-2 fence.
+        let mut at_ceiling = unfenced;
+        at_ceiling.slots.pop();
+        assert!(validate_ledger_read(&at_ceiling).is_ok());
+    }
+
+    /// Journal name fields are bounded for the reader as well as the writer
+    /// (oxide#177): a name over `PATH_MAX`, a component over `NAME_MAX`, a
+    /// capture private name longer than its writer form and an over-long
+    /// mismatched-capture description all refuse, and the writer refuses such
+    /// an object per object without deleting it.
+    #[test]
+    fn journaled_names_are_bounded_on_read() {
+        use crate::owned_delete::{
+            CaptureRecord, ForeignCapture, RootCapturePhase, RootCapturePlan,
+        };
+
+        let private = format!("{}{}", crate::owned_delete::CAPTURE_PREFIX, "a".repeat(32));
+        let root = RootCapturePlan {
+            private: private.clone(),
+            phase: RootCapturePhase::Captured,
+            device: 1,
+            inode: 2,
+            parent_device: 1,
+            parent_inode: 3,
+            mode: 0o040777,
+        };
+        assert!(root.is_valid());
+        let capture = |original: String| CaptureRecord {
+            path: vec![private.clone()],
+            private: private.clone(),
+            original,
+            device: 1,
+            inode: 2,
+            mode: 0o100777,
+        };
+        let foreign = |original: String, found: String| ForeignCapture {
+            path: vec![private.clone()],
+            private: private.clone(),
+            original,
+            expected_device: 1,
+            expected_inode: 2,
+            expected_mode: 0o100777,
+            found,
+            restored: false,
+        };
+        let journal = |captures, foreign| super::DeletionJournal {
+            root: root.clone(),
+            captures,
+            foreign,
+        };
+        let mut accepted = ledger(None, 0, SlotPersistState::Evicting, false);
+        accepted.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+        accepted.next_rank = Some(1);
+        accepted.slots[0].capture = Some(journal(
+            vec![capture("observed name".to_owned())],
+            vec![foreign(
+                "observed name".to_owned(),
+                "regular file".to_owned(),
+            )],
+        ));
+        assert!(validate_ledger_read(&accepted).is_ok());
+
+        // PATH_MAX bytes with one component over NAME_MAX; more than PATH_MAX
+        // in NAME_MAX components; a component one byte over NAME_MAX.
+        let over_name = "x".repeat(1024);
+        let over_path = vec!["a".repeat(255); 5].join("/");
+        let over_component = format!("{}/{}", "a".repeat(256), "b");
+        assert!(over_path.len() > 1024 && over_component.len() <= 1024);
+        for original in [over_name.clone(), over_path.clone(), over_component.clone()] {
+            assert!(!capture(original).is_valid());
+        }
+        for bad in [
+            foreign(over_name.clone(), "regular file".to_owned()),
+            foreign("observed name".to_owned(), over_name.clone()),
+            foreign("observed name".to_owned(), over_path.clone()),
+        ] {
+            assert!(!bad.is_valid());
+        }
+        let mut long_private = capture("observed name".to_owned());
+        long_private.private = format!("{}{}", crate::owned_delete::CAPTURE_PREFIX, "a".repeat(48));
+        assert!(!long_private.is_valid());
+        let mut long_foreign_private =
+            foreign("observed name".to_owned(), "regular file".to_owned());
+        long_foreign_private.private =
+            format!("{}{}", crate::owned_delete::CAPTURE_PREFIX, "a".repeat(48));
+        assert!(!long_foreign_private.is_valid());
+
+        // The whole journal refuses on read with any over-bound member.
+        let mut refused = ledger(None, 0, SlotPersistState::Evicting, false);
+        refused.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+        refused.next_rank = Some(1);
+        refused.slots[0].capture = Some(journal(vec![capture(over_name)], Vec::new()));
+        assert!(validate_ledger_read(&refused).is_err());
     }
 
     /// A root-capture record belongs to a recorded deletion and nowhere else,

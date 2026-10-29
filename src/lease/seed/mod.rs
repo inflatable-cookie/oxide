@@ -133,8 +133,9 @@ pub const SEED_WORK_BUDGET_MS: u64 = 5_000;
 /// Legacy front-door version this module can classify; version 7 is accepted
 /// only with its exact eviction fence and no one-use fields.
 const CONTROL_STATE_VERSION: u32 = 5;
-/// The control state's whole-file bound, matching the front door's own.
-const CONTROL_STATE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// The control state's whole-file bound, matching the front door's own
+/// (32 MiB since oxide#177's 512-record, 256-slot ceiling).
+const CONTROL_STATE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// The post-clone recipient walk's bounds: the capacity contract's slot walk.
 pub const SEED_WALK_MAX_ENTRIES: u64 = 2_000_000;
 pub const SEED_WALK_MAX_DEPTH: usize = 64;
@@ -1453,6 +1454,8 @@ struct ControlState {
     #[serde(default)]
     eviction_accounting: Option<String>,
     #[serde(default)]
+    slot_ceiling: Option<String>,
+    #[serde(default)]
     one_use_workspaces: Option<String>,
     #[serde(default)]
     records: Vec<ControlRecord>,
@@ -1511,6 +1514,14 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
     let supported = state.version == CONTROL_STATE_VERSION
         || (state.version == 7
             && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.one_use_workspaces.is_none()
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0))
+        || (state.version == 8
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
             && state.one_use_workspaces.is_none()
             && state
                 .records

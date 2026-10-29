@@ -45,11 +45,21 @@ import time
 MIB = 1024 * 1024
 NOTICE = "oxide: handing off to the installed binary (state is newer than this one).\n"
 REFUSAL = "oxide: oxide was upgraded during this command; re-run.\n"
-# This tree's control-state version: version 5 is the recorded per-slot
-# accounting fence (oxide#146). Hand-off triggers only on a numeric
-# version GREATER than this one, so the newer-than-self case is 6 and an
-# equal 5 is deliberately not a trigger.
-STATE_VERSION = 5
+# Control-state versions this proof models. Hand-off triggers only on a numeric
+# version GREATER than the running binary's, so "newer than self" is 8.
+# Version 5 is the recorded per-slot accounting fence (oxide#146). Version 7
+# is the eviction-accounting fence (oxide#175). Version 8 is the newest this
+# tree writes: the raised-ceiling fence (oxide#177), which the admission gate
+# installs on every mutating command. The staged subject's capability probe
+# reports 8.
+RECORDED_ACCOUNTING_STATE_VERSION = 5
+EVICTION_ACCOUNTING_STATE_VERSION = 7
+SLOT_CEILING_STATE_VERSION = 8
+STATE_VERSION = SLOT_CEILING_STATE_VERSION
+NEWER_STATE_VERSION = STATE_VERSION + 1
+# What the product writes for this proof's small fixture pool: the admission
+# gate fences every mutating command at the newest version.
+WITNESS_STATE_VERSION = SLOT_CEILING_STATE_VERSION
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
@@ -98,6 +108,8 @@ def write(path: str, contents: str, mode: int) -> None:
 
 
 RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
+EVICTION_ACCOUNTING_FENCE = "oxide.eviction-accounting/1"
+SLOT_CEILING_FENCE = "oxide.slots/256"
 
 
 def current_state(version: int = STATE_VERSION) -> str:
@@ -110,10 +122,15 @@ def current_state(version: int = STATE_VERSION) -> str:
         "records": [],
     }
     # Version 5 is the recorded-accounting fence (oxide#146) and must carry it;
-    # the versions below it never do. A version-4 document is the old-binary
-    # side this proof keeps readable.
-    if version >= STATE_VERSION:
+    # the versions below it never do. Version 7 is the raised-ceiling fence
+    # (oxide#177) and always carries its own fence too. A version-4 document is
+    # the old-binary side this proof keeps readable.
+    if version >= RECORDED_ACCOUNTING_STATE_VERSION:
         document["recorded_accounting"] = RECORDED_ACCOUNTING_FENCE
+    if version >= EVICTION_ACCOUNTING_STATE_VERSION:
+        document["eviction_accounting"] = EVICTION_ACCOUNTING_FENCE
+    if version >= SLOT_CEILING_STATE_VERSION:
+        document["slot_ceiling"] = SLOT_CEILING_FENCE
     return json.dumps(document)
 
 
@@ -342,7 +359,7 @@ class Fixture:
         path: str | None = None,
         digest: str | None = None,
         size: int | None = None,
-        state: int | None = STATE_VERSION + 1,
+        state: int | None = NEWER_STATE_VERSION,
         registration: int | None = REGISTRATION_VERSION,
     ) -> None:
         installed = {
@@ -442,7 +459,7 @@ def expect_handoff_refusal(result, fixture: Fixture, name: str, before: list | N
 
 def newer_fixture(root: str, name: str) -> Fixture:
     fixture = Fixture(os.path.join(root, name))
-    fixture.plant_state(STATE_VERSION + 1)
+    fixture.plant_state(NEWER_STATE_VERSION)
     return fixture
 
 
@@ -491,8 +508,8 @@ def check_no_trigger(root: str, binary: str) -> None:
     documents = {
         "malformed": "{",
         "array": "[]",
-        "older": current_state(STATE_VERSION - 1),
-        "string_version": json.dumps({"version": str(STATE_VERSION + 1)}),
+        "older": current_state(RECORDED_ACCOUNTING_STATE_VERSION),
+        "string_version": json.dumps({"version": str(NEWER_STATE_VERSION)}),
         "negative": json.dumps({"version": -1}),
         "above_u32": json.dumps({"version": 2**32}),
         "float": json.dumps({"version": 3.5}),
@@ -748,7 +765,7 @@ def check_final_release(root: str, binary: str) -> None:
     )
     expect(scaffold.returncode == 1, f"scaffold exit {scaffold.returncode}: {scaffold.stderr!r}")
     with open(state, encoding="utf-8") as handle:
-        expect(json.load(handle)["version"] == STATE_VERSION, "the pool did not start at the current state version")
+        expect(json.load(handle)["version"] == WITNESS_STATE_VERSION, "the pool did not start at the recorded-accounting state version")
     expect(NOTICE not in scaffold.stderr, "the scaffold handed off")
     # The real command: a newer writer fences the state while Cargo runs.
     # The newer writer waits until the command has recorded its running
@@ -764,7 +781,7 @@ def check_final_release(root: str, binary: str) -> None:
     )
     write(
         os.path.join(fixture.tools, "cargo"),
-        header + poll + "printf '%s' " + shlex.quote(current_state(STATE_VERSION + 1)) + " > " + shlex.quote(state) + "\nexit 0\n",
+        header + poll + "printf '%s' " + shlex.quote(current_state(NEWER_STATE_VERSION)) + " > " + shlex.quote(state) + "\nexit 0\n",
         0o755,
     )
     result = subprocess.run(
@@ -785,7 +802,7 @@ def check_final_release(root: str, binary: str) -> None:
     expect(fixture.stub_runs() == 0, "final release executed the candidate")
     expect(fixture.cargo_calls() != [], "the command never reached Cargo, so it had no effects to replay")
     with open(state, encoding="utf-8") as handle:
-        expect(json.load(handle)["version"] == STATE_VERSION + 1, "the newer state was not written")
+        expect(json.load(handle)["version"] == NEWER_STATE_VERSION, "the newer state was not written")
     expect(
         os.path.exists(os.path.join(fixture.control, "admission.lock")),
         "the pool shows no command effects",
@@ -835,7 +852,7 @@ def check_cargo_exit_75(root: str, binary: str) -> None:
         expect(fixture.stub_runs() == 0, f"cargo 75 {label} ran the candidate")
     state = os.path.join(fixture.control, "state.json")
     with open(state, encoding="utf-8") as handle:
-        expect(json.load(handle)["version"] == STATE_VERSION, "the pool state is not current")
+        expect(json.load(handle)["version"] == WITNESS_STATE_VERSION, "the pool state is not the recorded-accounting version")
 
 
 def main() -> int:

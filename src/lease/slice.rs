@@ -25,7 +25,7 @@
 use super::MAX_SLOTS;
 
 /// The hard ceiling on one-use members per pool (§6.5), independent of
-/// [`MAX_SLOTS`] and of the normal eight-slot project cap.
+/// [`MAX_SLOTS`] and of the normal twelve-slot project cap.
 pub const ONE_USE_MAX_SLOTS: usize = 16;
 
 /// The byte cap on the one-use member union (§6.5): a tenth of this

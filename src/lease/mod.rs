@@ -11,6 +11,7 @@
 //! `docs/knowledge/contracts/workflow.md`.
 
 mod backing;
+pub mod control;
 mod pool;
 pub mod seed;
 mod slice;
@@ -47,21 +48,75 @@ pub const BUDGET_BACKEND_DIRECTORY_V1: &str = "directory-budget-v1";
 /// volume. Budget-only like the directory backend.
 pub const VOLUME_BACKEND_APFS_V1: &str = "apfs-volume-v1";
 /// Finite slot count. Exhaustion refuses a new slot. Slot headroom only:
-/// it does not raise build concurrency or `max_active` (oxide#118).
-pub const MAX_SLOTS: usize = 128;
-/// Finite ledger file size including the atomic temp. The worst valid
-/// 128-slot ledger with every bounded field at its ceiling, escaped by
-/// compact JSON, fits this cap with no truncation (oxide#118).
-pub const MAX_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
+/// it does not raise build concurrency or `max_active` (oxide#118, oxide#177).
+pub const MAX_SLOTS: usize = 256;
+/// The slot ceiling an older binary understands (oxide#118's 128 slots).
+/// A ledger above it must carry [`RAISED_CAPACITY_POLICY_VERSION`] so an
+/// older binary refuses it at ledger read instead of reading a slot table it
+/// cannot represent (oxide#177).
+pub const LEGACY_MAX_SLOTS: usize = 128;
+/// Finite ledger file size including the atomic temp. This constant is the
+/// **worst-valid byte bound** (oxide#177; Oxide Supervisor ruling 49081d79):
+/// the read and write paths refuse a ledger above it, so a larger ledger is
+/// corrupt and refused, and any otherwise-valid ledger at or below it is
+/// accepted — including one that carries more than one `Evicting` journal,
+/// because the reader validates each slot's journal independently and bounds no
+/// journal count. No count rule is added and the cap does not grow for
+/// multi-journal states.
+///
+/// The measured states this writer reaches on its **ordinary eviction path**
+/// from a fresh pool are reported separately: the raised-ceiling
+/// representation at `MAX_SLOTS` with every bounded field and numeric field at
+/// its maximum is 4,213,726 bytes all-idle, and 5,625,456 bytes with this
+/// writer's maximal single `DeletionJournal` on an `Evicting` record that also
+/// keeps its closed observation — 2,763,152 bytes below the cap.
+/// Ordinary evictions go through `retire_idle_slot`, which refuses while
+/// reconciliation is blocked or any journal is outstanding, so an admission
+/// starts at most one journal. **Recovery is a second journal path**: every
+/// `Pool::open` runs `reconcile_evicting`, and `remove_owned_slot` creates and
+/// persists a `SlotCaptureJournal` for an `Evicting` record that has none —
+/// but only after the bounded `pending_root_ready` preflight completes, so a
+/// blocked or partially inventoried tree keeps the record and starts no
+/// journal. A journaled deletion whose own removal fails keeps its journal and
+/// is retried on the next open. An earlier write can still have left more than
+/// one such journal in a pool, and the reader accepts any otherwise-valid
+/// ledger below this cap. A write above the cap is refused, so a durable
+/// ledger never exceeds it; the 5,625,456-byte state is what this writer
+/// reaches on its ordinary path. The front door's admission gate, and the
+/// library's own locked open before reconciliation, make the version-8 control
+/// fence durable (oxide#177, fence first), so recovery, journal starts and
+/// ledger writes are all preceded by the hand-off fence. A maximal journal
+/// is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture records and
+/// `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a chain of at
+/// most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the enforced
+/// journal-name bounds: a name field of at most `PATH_MAX` (1024) bytes in
+/// `NAME_MAX` (255)-byte components, escaped sixfold by compact JSON. The
+/// writer refuses an over-bound object per object without deleting it, and the
+/// reader refuses a ledger that carries one.
+pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 /// Permanent capacity-policy fence in the library ledger (oxide#118). Its
 /// presence tells an older binary that this ledger uses ranked idle
 /// replacement; the fence is never removed. Version 2 (oxide#146) adds the
 /// closed per-slot size record, so a version-2 ledger also refuses an older
-/// binary's `deny_unknown_fields` parse. Version 3 retains the closed size
+/// binary's `deny_unknown_fields` parse. Version 3 retains that closed size
 /// across an eviction so older readers refuse the changed state semantics.
+/// Version 4
+/// (oxide#177) is the raised-ceiling fence: the ledger holds more than
+/// [`LEGACY_MAX_SLOTS`] slots, which an older binary cannot represent. It is
+/// written forward-only, in the same atomic replacement that first takes the
+/// slot count above 128, and an older binary's policy check refuses it before
+/// any mutation. A pool that stays at or below 128 slots never carries it, so
+/// its ledger stays readable by an older binary. The front door's version-8
+/// `oxide.slots/256` control fence is durable before that first policy-4
+/// write, so an older installed binary hands off before it opens such a
+/// ledger instead of meeting the refusal.
 pub const CAPACITY_POLICY_VERSION: u32 = 3;
 /// Version 2 recorded only idle sizes and remains readable.
 pub const PREVIOUS_CAPACITY_POLICY_VERSION: u32 = 2;
+/// The raised-ceiling fence value (oxide#177): more than [`LEGACY_MAX_SLOTS`]
+/// slots, written forward-only in the replacement that first records the
+/// 129th slot.
+pub const RAISED_CAPACITY_POLICY_VERSION: u32 = 4;
 /// The version-1 fence (oxide#118) stays readable and is upgraded by the next
 /// revised write; a version-1 ledger never carries a record.
 pub const LEGACY_CAPACITY_POLICY_VERSION: u32 = 1;
@@ -72,11 +127,12 @@ pub const MAX_PATH_BYTES: usize = 1024;
 /// Finite lease-id text.
 pub const MAX_LEASE_ID_BYTES: usize = 160;
 /// Cooperative inventory bounds for pool accounting (oxide#108), separate
-/// from the inventory tool's defaults. Sized for real build caches: 32 slots
-/// of a 60k-entry Cargo build directory (Farmyard's observed 60,657) stay
-/// under the entry bound; depth covers build-script `out` trees; the
-/// deadline allows a cold walk of a USB pool. A walk that hits any bound is
-/// incomplete and refuses where complete accounting is required.
+/// from the inventory tool's defaults. Sized for real build caches: the
+/// entry bound still admits one 60k-entry Cargo build directory (Farmyard's
+/// observed 60,657) and averages about 7,800 entries across a full 256-slot
+/// pool; depth covers build-script `out` trees; the deadline allows a cold
+/// walk of a USB pool. A walk that hits any bound is incomplete and refuses
+/// where complete accounting is required.
 const ACCOUNTING_MAX_ENTRIES: u64 = 2_000_000;
 const ACCOUNTING_MAX_DEPTH: usize = 64;
 const ACCOUNTING_MAX_ELAPSED_MS: u64 = 60_000;
@@ -774,24 +830,162 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
 }
 
 fn read_private_file(path: &Path) -> Result<Vec<u8>, LeaseError> {
+    read_private_file_bounded(path, MAX_LEDGER_BYTES)
+}
+
+fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseError> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
         || metadata.permissions().mode() & 0o077 != 0
         || metadata.uid() != current_uid()
-        || metadata.len() > MAX_LEDGER_BYTES
+        || metadata.len() > max
     {
         return Err(LeaseError::UnknownAccounting);
     }
     let file = File::open(path).map_err(io_error)?;
     let mut bytes = Vec::new();
-    file.take(MAX_LEDGER_BYTES + 1)
+    file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    if bytes.len() as u64 > MAX_LEDGER_BYTES {
+    if bytes.len() as u64 > max {
         return Err(LeaseError::LedgerExhausted);
     }
     Ok(bytes)
+}
+
+/// The front door's raised-ceiling control fence (oxide#177, Oxide Supervisor
+/// ruling 4c9984a1). The library writes only these fields and the version,
+/// preserving every other field, so a locked [`pool::Pool::open`] can raise
+/// the fence before it reconciles a recorded deletion. `src/bin/oxide/store.rs`
+/// owns the same values; its constants alias these so the two writers cannot
+/// drift.
+pub const CONTROL_FENCE_VERSION: u32 = 8;
+pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
+pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
+pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
+pub const CONTROL_ONE_USE_FENCE: &str = "oxide.one-use/1";
+/// The control version that must carry [`CONTROL_ONE_USE_FENCE`].
+const CONTROL_ONE_USE_VERSION: u64 = 6;
+/// Raise a front-door control state to the current fence version before a
+/// locked pool open reconciles a recorded deletion (oxide#177; fence first).
+///
+/// The caller already holds the pool lock. An absent control state means the
+/// pool has never been used by the front door (`oxide-managed/state.json` is
+/// its document), so a library fixture has nothing to fence. A state already
+/// at the fence version with every fence is not rewritten. A newer version, an
+/// unknown fence value, a present non-string fence, a version/fence
+/// combination no writer produces (including version 0, a version-6 document
+/// without its one-use fence, and a class-bearing record without that fence)
+/// or a non-numeric version refuses: this binary never downgrades or silently
+/// repairs a document a successor wrote. Only a field genuinely absent from an
+/// older document is inserted. The
+/// admission lock is taken
+/// non-blocking because the front door's order is admission then pool; if
+/// another writer holds it, the open refuses instead of reconciling under an
+/// unfenced control. Passive snapshots never call this.
+pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
+    let control = pool.join(MANAGED_NAME);
+    let path = control.join("state.json");
+    // Only an absent control state means "a library fixture with nothing to
+    // fence". Any other metadata failure is a refusal: a state this binary
+    // cannot inspect must never let recovery run unfenced.
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(error)),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > control::MAX_STATE_BYTES
+    {
+        return Err(LeaseError::UnsafePath(
+            "control state must be a private regular file",
+        ));
+    }
+    let bytes = read_private_file_bounded(&path, control::MAX_STATE_BYTES)?;
+    // The acceptance test is the front door's own parse-and-validate function:
+    // a document this refuses is exactly a document `Store::load` refuses, and
+    // a corrupt or unsupported one is never upgraded.
+    let state = control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    if state.version == control::STATE_VERSION {
+        return Ok(());
+    }
+    let admission = open_control_admission(&control)?;
+    // Re-read under the writer lock: another command may have fenced while
+    // this one waited for the pool lock.
+    let bytes = read_private_file_bounded(&path, control::MAX_STATE_BYTES)?;
+    let state = control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    if state.version == control::STATE_VERSION {
+        drop(admission);
+        return Ok(());
+    }
+    let fenced = control::fenced_state(state).map_err(|_| LeaseError::UnknownAccounting)?;
+    let bytes = serde_json::to_vec(&fenced).map_err(|error| LeaseError::Io(error.to_string()))?;
+    if bytes.len() as u64 > control::MAX_STATE_BYTES {
+        return Err(LeaseError::LedgerExhausted);
+    }
+    // Prove the bytes the front door will read back are accepted by the same
+    // parser before replacing the durable document.
+    control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    persist_control_state(&path, &bytes)?;
+    drop(admission);
+    Ok(())
+}
+
+fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
+    let path = control.join("admission.lock");
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(&path).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(LeaseError::UnsafePath(
+            "control admission lock must be a private regular file",
+        ));
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        return Err(io_error(error));
+    }
+    Ok(file)
+}
+
+fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
+    let parent = path
+        .parent()
+        .ok_or(LeaseError::InvalidInput("control state has no parent"))?;
+    let mut temp_name = String::from("state.tmp-");
+    temp_name.push_str(&random_hex(8)?);
+    let temp_path = parent.join(temp_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(&temp_path).map_err(io_error)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(io_error(error));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(io_error(error));
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)
 }
 
 fn random_hex(bytes: usize) -> Result<String, LeaseError> {

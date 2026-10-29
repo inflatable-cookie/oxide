@@ -978,9 +978,9 @@ explicit `recover` unless they adopt it.
   may grow past it while real free space holds. Only whole idle slots are
   evicted. The APFS sparse-image backend is retired (oxide#102).
 - The first command creates the pool automatically ([W-1](#open-decisions)).
-- Slot headroom (oxide#118): up to 128 slots per pool and eight per project
-  identity, with compatible reuse first and the oldest eligible idle whole
-  slot replaced under count or byte pressure
+- Slot headroom (oxide#118, oxide#177): up to 256 slots per pool and twelve
+  per project identity, with compatible reuse first and the oldest eligible
+  idle whole slot replaced under count or byte pressure
   ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
   A host-wide limit still bounds concurrent Cargo invocations
   ([W-2](#open-decisions)). Queue/Nucleus still decide which tasks run. Oxide
@@ -1017,7 +1017,7 @@ explicit `recover` unless they adopt it.
   approval. Nothing inside a slot is ever deleted.
 - Recorded observations live in the auxiliary
   `<pool>/oxide-managed/status-observations.json` sidecar (schema
-  `oxide.status-observations/1`, at most 256 KiB and 128 retained recent
+  `oxide.status-observations/1`, at most 512 KiB and 256 retained recent
   facts). It is diagnostic, not pool, ledger, registration or receipt format:
   an older binary may ignore it. Each fact binds `store_id`, slot ID,
   incarnation, the exact recorded directory, wall-clock time, allocated
@@ -1517,7 +1517,11 @@ necessary.
   the removable pool's `removable/state.json` and `removable.json`. Each is
   parsed as a bounded `serde_json::Value`, and only a numeric `u32` `version`
   above this binary's `STATE_VERSION` or `REGISTRATION_VERSION` triggers,
-  whatever other fields the document carries. A missing pool or file, an IO or
+  whatever other fields the document carries. (The admission gate writes
+  control version 8 with the raised-ceiling fence as every mutating command's
+  first durable effect, so an older binary hands off or refuses before it can
+  meet a `capacity_policy: 4` ledger; a pool this binary never mutates stays
+  at version 5.) A missing pool or file, an IO or
   permission error, an oversized document, a non-object, and a missing, non-numeric,
   negative or wider-than-`u32` version are not proof of a newer format: those
   keep the existing errors and never execute anything. Plain passthrough
@@ -3874,22 +3878,29 @@ Rules:
   device refuses.
 - **Admission.** The ledger's rules with this command's soft budget
   (`LeaseRequest.budget_bytes`, else the recorded one) as the cap, and the
-  raised `MAX_SLOTS` 128 / 2 MiB ledger representation
-  ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
+  raised `MAX_SLOTS` 256 / 8 MiB ledger representation (oxide#177;
+  [local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
   A compatible idle slot is reused first and kept warm; the half-budget
   recycling rule is retired. A new slot replaces the least-recently-used
   eligible idle whole slot in two distinct cases: **count** pressure at the
-  128-slot pool ceiling or the eight-slot project ceiling, authorised on a
+  256-slot pool ceiling or the twelve-slot project ceiling, authorised on a
   complete pool figure or a removable pool's bound-only unknown; and
   **recorded byte** pressure, when the attributable pool sum — never the
-  shared volume's total — is at or above the budget. It remeasures after each
-  deletion and refuses `Full` when only held slots remain. A removable pool
-  whose own size is unknown takes the reserve/floor route instead of a byte-cap
-  comparison. Held, uncertain, foreign and unmeasurable slots are never
-  eligible, a safety failure stops admission instead of skipping, and the
-  audit walks behind `status --measure` are not admission input. Nothing
-  enforces the budget while a build writes; a build can pass it, and the next
-  new slot evicts.
+  shared volume's total — is at or above the budget. A ledger whose slot
+  table exceeds 128 carries the forward-only `capacity_policy: 4` fence; every
+  mutating command's admission gate makes the version-8 `oxide.slots/256`
+  control fence durable as its first write, before any locked pool open or
+  ledger write, and a locked `Pool::open` raises the same fence itself under
+  the pool lock before reconciliation, so pre-Store entries and direct library
+  opens cannot journal first. An older binary meets version 8 and hands off or
+  refuses before reading a policy-4 ledger or a multi-journal recovery ledger. It remeasures
+  after each deletion and refuses `Full` when only held slots remain. A
+  removable pool whose own size is unknown takes the reserve/floor route
+  instead of a byte-cap comparison. Held, uncertain, foreign and unmeasurable
+  slots are never eligible, a safety failure stops admission instead of
+  skipping, and the audit walks behind `status --measure` are not admission
+  input. Nothing enforces the budget while a build writes; a build can pass
+  it, and the next new slot evicts.
   A deletion that cannot reconcile stays `Evicting` and is excluded from
   reuse and victim choice. Admission charges the maximum of its recorded size
   and the largest recorded slot: these pools have no per-slot byte ceiling and
@@ -3905,9 +3916,11 @@ Rules:
   lock and the lease library's pool lock retain their existing blocking behavior
   for unbudgeted commands. Reconciliation runs under the pool lock, so a very
   large eviction can delay another admission until the lock is released.
-  Before writing this new ledger shape, the mutating front door publishes a
-  version-7 control fence; the library uses capacity-policy version 3, so
-  older readers refuse or hand off before interpreting an `Evicting` size.
+  Before writing this new ledger shape, the mutating front door publishes the
+  version-8 control fence (recorded accounting, eviction accounting and the
+  raised ceiling) as its first write; the library uses capacity-policy
+  version 3 or, above 128 slots, version 4, so older readers refuse or hand
+  off before interpreting an `Evicting` size or a raised slot table.
 - **Watchdog.** Only on a directory pool, only while Oxide supervises a
   leased Cargo group (build and `run` build, `test` execution, building
   passthrough). It samples `statfs` `f_bavail` of the payload directory
@@ -3931,17 +3944,35 @@ Rules:
   overrides the soft budget above every other source. Release builds ignore
   both. The reserve and
   margin have no override.
-- **Slot headroom proof (oxide#118).** `effigy rust:slot-headroom` under the
-  qualified shared proof supervisor stages `oxide` offline with 1.97.1 and
-  proves the permanent ledger/control fences, a legacy read without migration,
-  rank exhaustion before any transition, a 128-slot pool whose 129th and 130th
-  admissions replace the rank-LRU idle whole slot without churn, the eight-slot
-  project cap with a specific held-slot wait and one LRU idle replacement,
-  compatible reuse first, no eviction below both ceilings, byte-pressure LRU
-  with a held slot excluded, and a foreign payload-entry refusal. Worst-valid
-  ledger/control serialization, round-trip and oversized-field refusals are
-  unit tests. The nine-grant freshness bound is a bounded-loop inspection, not
-  a separately induced native case.
+- **Slot headroom proof (oxide#118, oxide#177).** `effigy rust:slot-headroom`
+  under the qualified shared proof supervisor (with `--root-parent /private/tmp`,
+  the owner-accepted internal-placement exception bd357a4c, because its
+  fixtures create a genuine internal directory-budget pool that the product
+  correctly refuses on an external volume) stages `oxide` offline with 1.97.1
+  and proves the permanent ledger/control fences, a legacy read
+  without migration, rank exhaustion before any transition, a 256-slot pool
+  whose 257th and 258th admissions replace the rank-LRU idle whole slot
+  without churn, the twelve-slot project cap with a specific held-slot wait
+  and one LRU idle replacement, compatible reuse first, no eviction below
+  both ceilings, byte-pressure LRU with a held slot excluded, and a foreign
+  payload-entry refusal. With every slot's record current it also checks
+  oxide#177's accounting-cost gate: a new-slot admission at 256 walks no
+  inventory, the evicted slot is never walked, a release walks only its own
+  slot, and default `status` at 256 walks nothing; it also crosses the legacy
+  128-slot ceiling natively and requires `capacity_policy: 4` plus the
+  version-8 `oxide.slots/256` control fence, which the admission gate writes
+  as the command's first durable effect and a locked `Pool::open` raises
+  itself before reconciliation, before any journal start or ledger write, so
+  an older binary meets version 8 and hands off or refuses before reading the
+  ledger.
+  Worst-valid ledger/control serialization — including the reachable
+  one-journal `Evicting` state — round-trip and oversized-field refusals are
+  unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
+  and limits with `--diagnostic` (uncounted, keep-going, a bounded
+  `qualified: false` receipt, aborting on an unknown outcome or unclosed
+  proof child), and `effigy proof:slot-headroom:test` is its pure
+  `--self-check`. The thirteen-grant freshness bound is a bounded-loop
+  inspection, not a separately induced native case.
 - **Proof.** Current: `effigy rust:oxide-budget-default`
   ([above](#budget-only-default-pool-and-user-configuration)). Historical,
   before the CLI's retirement: `effigy rust:oxide-cli` added a macOS case on two scratch

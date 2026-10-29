@@ -524,7 +524,7 @@ its own approved brief. What the tree now holds:
   *key* (checkout plus compatibility), so an idle slotless record of the other
   class is still a live record of this checkout and keeps its place — a
   one-use admission takes a distinct record rather than deleting the normal or
-  legacy one, which the next normal command then reuses. The eight-slot project
+  legacy one, which the next normal command then reuses. The twelve-slot project
   cap counts **normal** records and its replacement candidate list holds only
   normal records; only a **normal** admission enters the cap path, which is the reading
   in which a temporary clone of the repository does not compete with its normal
@@ -713,7 +713,7 @@ fact.
 | Idle enumeration and eviction | `pool.rs:1759-1784` (`evict_idle_until_under_cap`), `1786-1806` (`evict_one_idle`), `1808-1845` (`retire_idle_slot`), `1399-1418` (`replace_idle_slot_for_admission`), `1455-1510` (`admit_unknown_removable`) | **Read and parameterized**, never reimplemented (§6.7). |
 | Pool pressure figure | `pool.rs:1515-1544` (`pressure`), `1546-1578` (`recorded_total`), `1580-1680` (`slot_figure`) | **Read.** The recorded per-slot policy stays the pool figure; the one-use slice is a separate, bounded member measure (§6.4). |
 | Removable pool-root allowlist | `pool.rs:3424-3457` (`refuse_foreign_pool_entries`), called from `snapshot` (`522`), `describe_volume` (`583`), `Pool::open` (`762`) and `Pool::open_passive` (`810`) | **One scoped, validated exception** for the legacy fence document; every other name keeps its shipped refusal (§10.4). |
-| Ledger record and fence | `src/lease/mod.rs:45` (`MAX_SLOTS = 128`), `54-58` (`CAPACITY_POLICY_VERSION = 2`), `src/lease/pool.rs:169-232` (`Ledger`, `SlotRecord`, `RecordedSize`), `src/lease/mod.rs:295-435` (`SlotStatus`, `LedgerSlot`, `PassiveSnapshot`) | **Format unchanged, no bump.** Class lives in Oxide state; the library receives verified membership (§6.2, §10.2). |
+| Ledger record and fence | `src/lease/mod.rs:45` (`MAX_SLOTS = 256`), `54-58` (`CAPACITY_POLICY_VERSION = 2`), `src/lease/pool.rs:169-232` (`Ledger`, `SlotRecord`, `RecordedSize`), `src/lease/mod.rs:295-435` (`SlotStatus`, `LedgerSlot`, `PassiveSnapshot`) | **Format unchanged, no bump.** Class lives in Oxide state; the library receives verified membership (§6.2, §10.2). |
 | Accounting walks | `src/inventory.rs:436` (`inventory_directory`), `460` (`scope_directory`), the `(device, inode)` union; `local-lease.md#capacity-and-eviction` | **One bounded multi-root union walk added** for the slice (§6.4). |
 | Owned-output receipt, prepared transition | `src/bin/oxide/outputs.rs:397-425` (`Receipt`), `225-232` (`Prepared`), `358-377` (`ReceiptState`), `64-76` (`RECEIPT_VERSION /2`, `PROFILE_RECEIPT_VERSION /3`, `MARKER_VERSION /2`, `PLAN_VERSION /2`) | **Format unchanged.** States are read exactly as today (§4.2). |
 | Automatic first conversion | `outputs.rs:3843-3886` (`AutoFacts`/`auto_adopts`), `3888-3970` (`auto_adopt`), called from `main.rs:414` | **Skipped for a guarded workspace, before any effect** (§4.1). |
@@ -1425,20 +1425,21 @@ effect.
   field. It is **never inferred** from a directory name, a project folder, a
   profile label, a rank, an mtime or a payload shape.
 
-### 5.3 The eight-slot project cap counts normal slots only
+### 5.3 The twelve-slot project cap counts normal slots only
 
 `project_slots` (`store.rs:3129-3145`) and the replacement candidate list
 (`store.rs:3100-3120`) filter `record.class == Normal`. Consequences, all
 deliberate:
 
-- a one-use slot never consumes one of a repository's eight normal slots;
+- a one-use slot never consumes one of a repository's twelve normal slots;
 - deleting a one-use slot can never relieve the normal project cap — the
   replacement list contains no one-use record, so the cap path can only evict a
   normal slot (and refuses honestly when none is safe);
 - the class-scoped identity filter is by *repository* identity, so a temporary
   clone of the same repository no longer competes with its normal checkouts for
   the cap;
-- `MAX_SLOTS = 128` still bounds every slot, one-use included.
+- `MAX_SLOTS = 256` still bounds every slot, one-use included, and a slot
+  table above the legacy 128 carries `capacity_policy: 4` (oxide#177).
 
 ### 5.4 Sharing is class-matched
 
@@ -1466,7 +1467,7 @@ unknown   = for each ledger slot that no record owns (no record's affinity
                 unreadable): (slot_id, incarnation)
 ```
 
-bounded by `MAX_SLOTS` (128) pairs each and encoded as fixed-size vectors. Each
+bounded by `MAX_SLOTS` (256) pairs each and encoded as fixed-size vectors. Each
 pair is verified by the library against the ledger under the pool lock (§6.2).
 A slot with a stale incarnation or a missing ledger row is **unverified** and is
 reported as such; it is never a victim and never free quota.
@@ -1875,7 +1876,7 @@ hint for *which* slots to expect bytes in, never for the slice figure.
 
 | Bound | Value | Why |
 | --- | --- | --- |
-| One-use members per pool | **16** | hard count ceiling, independent of `MAX_SLOTS` (128) and the normal eight-slot project cap |
+| One-use members per pool | **16** | hard count ceiling, independent of `MAX_SLOTS` (256) and the normal twelve-slot project cap |
 | New one-use slot needs | `member_count <= 15` after restore | the new slot must have a free place; reaching 16 by eviction and then refusing is not allowed |
 | Warm reuse needs | a **verified member** candidate, `member_count <= 16` | it adds no slot; 16 members with a protected candidate is admissible if the bytes fit |
 | Slice bytes | **min(admission_budget / 10, 32 GiB)**, at least 1 | a tenth of this admission's effective soft budget, capped so a large pool cannot reserve an unbounded disposable region |
@@ -2929,7 +2930,7 @@ permanent-mode cases. Fixed case list, 27 cases (no case may be reported
    matching record); a normal admission at the ceiling reclaims the one-use
    member first, and a one-use admission at the ceiling reclaims only a one-use
    member or refuses.
-6. normal project-cap protection: at the eight-slot **normal** cap with eligible
+6. normal project-cap protection: at the twelve-slot **normal** cap with eligible
    one-use members, the replacement deletes exactly one idle **normal** slot
    while the one-use members survive (the front-door list has no one-use
    candidate).

@@ -235,7 +235,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   settings stay as they are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
-- **Sharing builds:** slots share warm builds across worktrees, up to 8 per
+- **Sharing builds:** slots share warm builds across worktrees, up to 12 per
   project, with least-recently-used idle slots evicted under the byte budget.
 - **Cold slots:** the chosen direction instead of sccache is seeding a cold
   slot by cloning matching dependency units from other slots on the same
