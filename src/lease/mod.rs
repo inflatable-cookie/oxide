@@ -863,6 +863,9 @@ pub const CONTROL_FENCE_VERSION: u32 = 8;
 pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
 pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
+pub const CONTROL_ONE_USE_FENCE: &str = "oxide.one-use/1";
+/// The control version that must carry [`CONTROL_ONE_USE_FENCE`].
+const CONTROL_ONE_USE_VERSION: u64 = 6;
 /// The control state's owner-only size cap, matching the front door's
 /// `MAX_STATE_BYTES`. The fence only adds fields, so an otherwise-valid
 /// document stays within it.
@@ -886,9 +889,11 @@ const CONTROL_FENCES: [(&str, &str, u64); 3] = [
 /// its document), so a library fixture has nothing to fence. A state already
 /// at the fence version with every fence is not rewritten. A newer version, an
 /// unknown fence value, a present non-string fence, a version/fence
-/// combination no writer produces or a non-numeric version refuses: this
-/// binary never downgrades or silently repairs a document a successor wrote.
-/// Only a field genuinely absent from an older document is inserted. The
+/// combination no writer produces (including version 0, a version-6 document
+/// without its one-use fence, and a class-bearing record without that fence)
+/// or a non-numeric version refuses: this binary never downgrades or silently
+/// repairs a document a successor wrote. Only a field genuinely absent from an
+/// older document is inserted. The
 /// admission lock is taken
 /// non-blocking because the front door's order is admission then pool; if
 /// another writer holds it, the open refuses instead of reconciling under an
@@ -968,8 +973,27 @@ fn control_fence_state(value: &serde_json::Value) -> Result<bool, LeaseError> {
         .get("version")
         .and_then(|value| value.as_u64())
         .ok_or(LeaseError::UnknownAccounting)?;
-    if version > u64::from(CONTROL_FENCE_VERSION) {
+    // The front door's typed reader accepts versions 1 through 8; version 0
+    // and anything newer is not a document this binary can upgrade.
+    if version == 0 || version > u64::from(CONTROL_FENCE_VERSION) {
         return Err(LeaseError::UnknownAccounting);
+    }
+    // The one-use fence is mandatory at version 6 and may travel from version
+    // 6 on; a class-bearing record always travels under it. A present unknown
+    // value is corrupt, and a version-6 document without it is a state the
+    // front door rejects, so neither is repaired.
+    match object.get("one_use_workspaces") {
+        Some(serde_json::Value::String(existing)) if existing == CONTROL_ONE_USE_FENCE => {
+            if version < CONTROL_ONE_USE_VERSION {
+                return Err(LeaseError::UnknownAccounting);
+            }
+        }
+        Some(_) => return Err(LeaseError::UnknownAccounting),
+        None => {
+            if version == CONTROL_ONE_USE_VERSION || control_records_carry_class(object) {
+                return Err(LeaseError::UnknownAccounting);
+            }
+        }
     }
     for (name, fence, minimum) in CONTROL_FENCES {
         match object.get(name) {
@@ -987,6 +1011,22 @@ fn control_fence_state(value: &serde_json::Value) -> Result<bool, LeaseError> {
         }
     }
     Ok(version == u64::from(CONTROL_FENCE_VERSION))
+}
+
+/// A class-bearing control record omits neither `class` nor `class_reason`
+/// from the serialized document; the front door writes them only under the
+/// one-use fence.
+fn control_records_carry_class(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object
+        .get("records")
+        .and_then(|records| records.as_array())
+        .is_some_and(|records| {
+            records.iter().any(|record| {
+                record.as_object().is_some_and(|record| {
+                    record.contains_key("class") || record.contains_key("class_reason")
+                })
+            })
+        })
 }
 
 fn open_control_admission(control: &Path) -> Result<File, LeaseError> {

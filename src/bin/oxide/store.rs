@@ -120,7 +120,7 @@ pub(crate) const RECORDED_ACCOUNTING_FENCE: &str =
 /// The one-use fence value; see [`State::one_use_workspaces`]. A document
 /// carrying it is at version 6 or later, and a document with either
 /// `class` or `class_reason` in any record always carries it.
-pub(crate) const ONE_USE_FENCE: &str = "oxide.one-use/1";
+pub(crate) const ONE_USE_FENCE: &str = oxide_storage::lease::CONTROL_ONE_USE_FENCE;
 /// The eviction-accounting fence value (oxide#175); see
 /// [`State::eviction_accounting`]. A document carrying it is at version 7 or
 /// later, and a version-7 or version-8 document always carries it.

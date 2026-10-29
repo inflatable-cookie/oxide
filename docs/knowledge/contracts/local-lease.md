@@ -670,9 +670,10 @@ That library path writes only the version and the three fence fields, taking
 the admission lock non-blocking and refusing rather than reconciling under
 contention; an absent control state (a library fixture) and passive
 `status`/snapshot readers are never fenced. A present but non-string or
-non-matching fence value, or a version/fence combination no front door writer
-produces, refuses without repair: only a fence field genuinely absent from an
-older document is inserted. An older binary with version ≤ 7 then hands off to a
+non-matching fence value, a version/fence combination no front door writer
+produces (including a version-6 document without its one-use fence), or an
+unsupported version such as 0, refuses without repair: only a fence field
+genuinely absent from an older document is inserted. An older binary with version ≤ 7 then hands off to a
 receipt-matching successor or refuses before it reads the ledger, so no
 predecessor ledger-size argument is needed. An already-version-8 control is
 not rewritten; a failed fence write refuses the command with no ledger or

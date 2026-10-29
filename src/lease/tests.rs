@@ -2888,49 +2888,112 @@ fn an_unreadable_control_state_refuses_before_recovery() {
 /// Supervisor ruling 4c9984a1).
 #[test]
 fn an_invalid_control_fence_value_refuses_before_recovery() {
-    let fixture = Fixture::new("invalid-control-fence");
-    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "invalid-control-fence");
-    // The slot is `Evicting` with its root ready: a reconciling open rewrites
-    // the ledger, so byte identity proves no reconciliation ran.
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "invalid-control-fence",
+        br#"{"version":8,"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":42,"records":[],"cleans":[]}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "an invalid control fence admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// Version 0 is not a document the front door's typed reader accepts, so the
+/// fence writer refuses it instead of upgrading it to version 8 (oxide#177).
+#[test]
+fn an_unsupported_control_version_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "unsupported-control-version",
+        br#"{"version":0,"records":[],"cleans":[]}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "an unsupported control version admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// Version 6 requires the one-use fence, so a version-6 document without it
+/// is corrupt; the fence writer refuses rather than advancing it to version 8
+/// (oxide#177).
+#[test]
+fn a_version_six_control_without_its_one_use_fence_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "missing-one-use-fence",
+        br#"{"version":6,"recorded_accounting":"oxide.accounting/1","records":[],"cleans":[]}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "a version-6 control without its one-use fence admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A pool with a ready pending `Evicting` record and the given control-state
+/// bytes: a reconciling open would rewrite the ledger, so byte identity proves
+/// no reconciliation ran. Returns the fixture, the pool, the control path, the
+/// control bytes and the ledger bytes.
+fn control_refusal_fixture(
+    label: &str,
+    control_bytes: &[u8],
+) -> (Fixture, PathBuf, PathBuf, Vec<u8>, Vec<u8>) {
+    let fixture = Fixture::new(label);
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, label);
     super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
     let control = pool.join(MANAGED_NAME);
     fs::create_dir_all(&control).expect("control dir");
     fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("control mode");
     let state = control.join("state.json");
-    fs::write(
-        &state,
-        br#"{"version":8,"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":42,"records":[],"cleans":[]}"#,
-    )
-    .expect("control state");
+    fs::write(&state, control_bytes).expect("control state");
     fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).expect("state mode");
-    let state_before = fs::read(&state).expect("state");
-    let ledger_path = pool.join("ledger.json");
-    let ledger_before = fs::read(&ledger_path).expect("ledger");
+    let ledger = fs::read(pool.join("ledger.json")).expect("ledger");
+    (fixture, pool, state, control_bytes.to_vec(), ledger)
+}
 
+fn assert_control_refusal(
+    fixture: &Fixture,
+    pool: &Path,
+    state: &Path,
+    state_before: &[u8],
+    ledger_before: &[u8],
+    admitted: &str,
+) {
     let result = lease_injected(request(
-        &pool,
+        pool,
         &fixture.dir("other-project"),
         &fixture.dir("other-workspace"),
         "other",
     ));
-    assert!(result.is_err(), "an invalid control fence admitted a lease");
+    assert!(result.is_err(), "{admitted}");
     assert_eq!(
-        fs::read(&state).expect("state"),
+        fs::read(state).expect("state"),
         state_before,
-        "the fence writer repaired a corrupt control state"
+        "the fence writer changed a refused control state"
     );
     assert_eq!(
-        fs::read(&ledger_path).expect("ledger"),
+        fs::read(pool.join("ledger.json")).expect("ledger"),
         ledger_before,
-        "recovery ran under an invalid control fence"
+        "recovery ran under a refused control state"
     );
-    let ledger: serde_json::Value = serde_json::from_slice(&ledger_before).expect("ledger json");
+    let ledger: serde_json::Value = serde_json::from_slice(ledger_before).expect("ledger json");
     assert_eq!(ledger["slots"][0]["state"], "evicting");
     assert!(
         ledger["slots"][0].get("capture").is_none(),
         "a recovery journal was started"
     );
-    fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 
 /// A journaled deletion that cannot be classified keeps the pool blocked:
