@@ -247,10 +247,18 @@ impl StateRecord {
     }
 
     fn json(&self) -> serde_json::Value {
+        // The rig's state is read by the same parser the front door uses
+        // (`control::parse_state`), so every required record field is present.
         let mut value = serde_json::json!({
             "id": self.id,
-            "phase": self.phase,
+            "identity": "fixture",
+            "compatibility": "fixture",
+            "profile": "dev",
             "checkout": self.checkout,
+            "phase": self.phase,
+            "process_group": serde_json::Value::Null,
+            "last_used": 1,
+            "last_used_ms": 1,
         });
         if self.held {
             value["holder"] = serde_json::json!({
@@ -264,6 +272,12 @@ impl StateRecord {
             value["pending_recovery"] = serde_json::json!({
                 "slot_id": self.id.to_string(),
                 "lease_id": "fixture-lease",
+                "checkout": self.checkout,
+                "holder_pid": 1,
+                "holder_started_ms": 0,
+                "process_group": serde_json::Value::Null,
+                "recovered_ms": 1,
+                "recovered_by": 1,
             });
         }
         if self.retired {
@@ -428,6 +442,9 @@ impl Rig {
             .collect();
         let mut state = serde_json::json!({
             "version": version,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
             "records": records,
             "cleans": cleans,
         });
@@ -442,7 +459,9 @@ impl Rig {
             state["eviction_accounting"] =
                 serde_json::json!(super::super::CONTROL_EVICTION_ACCOUNTING_FENCE);
         }
-        if version >= super::super::CONTROL_FENCE_VERSION {
+        if version == 6 {
+            state["one_use_workspaces"] = serde_json::json!(super::super::CONTROL_ONE_USE_FENCE);
+        } else if version >= super::super::CONTROL_FENCE_VERSION {
             state["slot_ceiling"] = serde_json::json!(super::super::CONTROL_SLOT_CEILING_FENCE);
         }
         let path = control.join("state.json");

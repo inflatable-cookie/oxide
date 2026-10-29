@@ -673,7 +673,10 @@ contention; an absent control state (a library fixture) and passive
 non-matching fence value, a version/fence combination no front door writer
 produces (including a version-6 document without its one-use fence), or an
 unsupported version such as 0, refuses without repair: only a fence field
-genuinely absent from an older document is inserted. An older binary with version ≤ 7 then hands off to a
+genuinely absent from an older document is inserted. The fence path and the
+front door's `Store::load` share one parse-and-validate function
+(`lease::control::parse_state`), so a structurally malformed document (for
+example a non-array `records` field) is refused identically by both. An older binary with version ≤ 7 then hands off to a
 receipt-matching successor or refuses before it reads the ledger, so no
 predecessor ledger-size argument is needed. An already-version-8 control is
 not rewritten; a failed fence write refuses the command with no ledger or

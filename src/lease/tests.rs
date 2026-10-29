@@ -2942,6 +2942,26 @@ fn a_version_six_control_without_its_one_use_fence_refuses_before_recovery() {
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 
+/// A structurally malformed control document (a non-array `records` field) is
+/// corrupt, not an older shape to upgrade: the fence and the front door's
+/// `Store::load` share one parser, and it refuses before any write.
+#[test]
+fn a_malformed_records_field_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "malformed-records",
+        br#"{"version":5,"recorded_accounting":"oxide.accounting/1","next_id":1,"next_use":1,"tickets":[],"records":42,"cleans":[]}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "a malformed records field admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
 /// A pool with a ready pending `Evicting` record and the given control-state
 /// bytes: a reconciling open would rewrite the ledger, so byte identity proves
 /// no reconciliation ran. Returns the fixture, the pool, the control path, the
