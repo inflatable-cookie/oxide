@@ -190,6 +190,23 @@ pub enum SlotOccupancy {
     Abandoned,
 }
 
+/// One slot an admission walked but could not measure completely, bound to the
+/// exact generation that walk covered (oxide#186).
+///
+/// It carries no size: the conservative charge stays in the admission's memory
+/// and is never persisted. The front door records only the incomplete outcome,
+/// as the oxide#128 diagnostic fact that makes default status say
+/// `not measured (walk incomplete)` until a later complete walk records the
+/// slot normally. Nothing derives a record, an eviction or any authority from
+/// it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnmeasuredSlot {
+    pub slot_id: String,
+    pub incarnation: String,
+    /// The ledger's recorded slot directory; `None` is the legacy `<id>`.
+    pub dir: Option<String>,
+}
+
 /// Why a command refused. Mapped to a small exit set by [`LeaseError::exit_code`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LeaseError {
@@ -209,15 +226,16 @@ pub enum LeaseError {
     AccountingIncomplete(Box<AccountingScan>),
     /// Byte capacity could not admit this admission because the slots a
     /// partial walk left unmeasured are charged conservatively and are never
-    /// evicted on that charge (oxide#186). A bounded capacity refusal naming
-    /// them: at most [`MAX_REFUSAL_SLOTS`] IDs, then a count. Exit code 3, the
-    /// same capacity class as [`LeaseError::Full`], and never
-    /// `unknown_accounting`: no shared authority is unknown.
+    /// evicted on that charge (oxide#186). A bounded capacity refusal: exit
+    /// code 3, the same capacity class as [`LeaseError::Full`], and never
+    /// `unknown_accounting`, because no shared authority is unknown. It names
+    /// at most [`MAX_REFUSAL_SLOTS`] slots and counts the rest, so one refusal
+    /// line stays bounded at the slot ceiling.
     CapacityCharged {
         measured: u64,
         limit: u64,
-        slots: Vec<String>,
-        omitted: usize,
+        /// Every slot this admission charged conservatively, in slot order.
+        unmeasured: Vec<UnmeasuredSlot>,
     },
     /// A one-use admission whose measured slice is still full after restore
     /// (design §6.9): the measured union (or `None` when it could not be
@@ -311,16 +329,20 @@ impl std::fmt::Display for LeaseError {
             Self::CapacityCharged {
                 measured,
                 limit,
-                slots,
-                omitted,
+                unmeasured,
             } => {
+                let named: Vec<&str> = unmeasured
+                    .iter()
+                    .take(MAX_REFUSAL_SLOTS)
+                    .map(|slot| slot.slot_id.as_str())
+                    .collect();
                 write!(
                     formatter,
                     "pool cap cannot admit a new slot: {measured} of {limit} bytes charged; unmeasured slot(s) {}",
-                    slots.join(", ")
+                    named.join(", ")
                 )?;
-                if *omitted > 0 {
-                    write!(formatter, " and {omitted} more")?;
+                if let Some(more) = unmeasured.len().checked_sub(named.len()).filter(|n| *n > 0) {
+                    write!(formatter, " and {more} more")?;
                 }
                 formatter.write_str(" are kept and never evicted on a partial walk")
             }
@@ -607,6 +629,11 @@ pub struct Leased {
     /// nothing; `Some` for every new-slot admission and every one-use
     /// admission, including one whose slice was empty (`NotNeeded`).
     pub slice: Option<SliceReport>,
+    /// Slots this admission could not measure completely and charged
+    /// conservatively instead (oxide#186). Empty when every walk completed.
+    /// Their charge is not reported: only the incomplete outcome is, so a
+    /// caller can record it as the oxide#128 diagnostic fact.
+    pub unmeasured: Vec<UnmeasuredSlot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

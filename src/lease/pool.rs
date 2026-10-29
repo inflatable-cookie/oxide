@@ -11,7 +11,7 @@ use super::{
     remove_tree_owned_checked, unexpected_entry, AccountingCoverage, AccountingGap,
     AccountingGapKind, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased,
     LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact,
-    RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
+    RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus, UnmeasuredSlot,
     ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
     CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
     LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
@@ -1104,7 +1104,7 @@ pub(super) fn pending_charge_injected(
 #[cfg(test)]
 pub(super) fn lease_with_charges_injected(
     request: LeaseRequest,
-) -> Result<(LeaseGrant, Vec<(u64, u64)>), LeaseError> {
+) -> Result<(Leased, Vec<(u64, u64)>), LeaseError> {
     let mut opened = Pool::open(&request.pool)?;
     let leased = opened.lease(&request)?;
     let charges = opened
@@ -1112,7 +1112,7 @@ pub(super) fn lease_with_charges_injected(
         .iter()
         .map(|(id, charge)| (*id, *charge))
         .collect();
-    Ok((leased.grant, charges))
+    Ok((leased, charges))
 }
 
 impl Pool {
@@ -1346,6 +1346,7 @@ impl Pool {
                     measured: None,
                     admission_note: None,
                     slice: None,
+                    unmeasured: Vec::new(),
                 });
             }
             if existing.state == SlotPersistState::Held {
@@ -1425,6 +1426,7 @@ impl Pool {
                 measured: None,
                 admission_note: self.admission_note.take(),
                 slice: Some(report),
+                unmeasured: self.unmeasured_slots(),
             });
         }
         if let Some((idle, incarnation)) = candidate {
@@ -1458,6 +1460,7 @@ impl Pool {
             measured: None,
             admission_note: self.admission_note.take(),
             slice: slice_report,
+            unmeasured: self.unmeasured_slots(),
         })
     }
 
@@ -1503,6 +1506,7 @@ impl Pool {
             }),
             admission_note: None,
             slice: None,
+            unmeasured: Vec::new(),
         })
     }
 
@@ -2227,6 +2231,17 @@ impl Pool {
         // unknown for bound gaps only. An internal or mixed incompleteness
         // still refuses before anything is deleted.
         self.pressure_known_or_bounded_removable()?;
+        // The named slot is a candidate like any other: a partial walk proves
+        // nothing about its bytes, so it is kept even when it is the slot this
+        // replacement names (oxide#186). The value, not the name, decides a
+        // deletion. The admission continues and the ordinary count and byte
+        // rules pick a verified candidate instead.
+        if self.unmeasured.contains_key(&id) {
+            self.admission_note = Some(format!(
+                "replacement slot {id} could not be measured completely, so it was kept; the ordinary count and byte rules decide this admission"
+            ));
+            return Ok(());
+        }
         let Some((incarnation, project, profile)) = self
             .slot(id)
             .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
@@ -2544,21 +2559,27 @@ impl Pool {
         if self.unmeasured.is_empty() {
             return LeaseError::Full;
         }
-        let mut slots = Vec::new();
-        let mut omitted = 0_usize;
-        for id in self.unmeasured.keys() {
-            if slots.len() == MAX_REFUSAL_SLOTS {
-                omitted += 1;
-                continue;
-            }
-            slots.push(id.to_string());
-        }
         LeaseError::CapacityCharged {
             measured,
             limit: self.budget,
-            slots,
-            omitted,
+            unmeasured: self.unmeasured_slots(),
         }
+    }
+
+    /// The slots this admission charged conservatively, bound to the exact
+    /// generation the incomplete walk covered, in slot order. The charge is
+    /// deliberately not reported: a caller may record only the incomplete
+    /// outcome, never a size (oxide#186).
+    fn unmeasured_slots(&self) -> Vec<UnmeasuredSlot> {
+        self.unmeasured
+            .keys()
+            .filter_map(|id| self.slot(*id))
+            .map(|slot| UnmeasuredSlot {
+                slot_id: slot.id.to_string(),
+                incarnation: slot.incarnation.to_string(),
+                dir: slot.dir.clone(),
+            })
+            .collect()
     }
 
     /// Whether one conservative charge alone already exhausts the budget. No

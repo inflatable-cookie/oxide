@@ -1087,9 +1087,14 @@ explicit `recover` unless they adopt it.
   facts). It is diagnostic, not pool, ledger, registration or receipt format:
   an older binary may ignore it. Each fact binds `store_id`, slot ID,
   incarnation, the exact recorded directory, wall-clock time, allocated
-  bytes, source and the measuring lease. Only the reuse walk an acquiring
-  command already made is recorded, atomically and with no extra walk;
-  persistence failure changes no admission, ownership or exit status. A
+  bytes, source and the measuring lease. Only walks an acquiring command
+  already made are recorded, atomically and with no extra walk: the reuse walk
+  with its figure, and an admission walk that stopped partial with no figure at
+  all (source `admission-walk-incomplete`, whose `allocated_bytes` is written
+  as 0 and read by nothing; oxide#186), which status reports as `not measured
+  (walk incomplete)`. A release's ledger record is reported before any of these
+  facts, so a later complete walk supersedes them. Persistence failure changes
+  no admission, ownership or exit status. A
   missing, unreadable, foreign, corrupt, unknown-version or
   generation-mismatched sidecar reads as not measured and never falls back
   to a scan. A same-generation fact stays a historical observation that may
@@ -3621,9 +3626,11 @@ oxide#102.
   walk of an idle slot with no current record on the internal directory pool:
   that slot is charged conservatively (the maximum of the bytes observed so
   far, its last record and the largest recorded slot, never zero and never the
-  whole budget) and kept — never evicted, reused or adopted on that walk, and
-  no record — while only an admission whose pool capacity genuinely cannot fit
-  refuses, with a bounded reason naming it (oxide#186). Every other
+  whole budget) and kept — never evicted (a named count replacement included),
+  reused or adopted on that walk, and no record — while only an admission whose
+  pool capacity genuinely cannot fit refuses, with a bounded reason naming it.
+  Status reports it as `not measured (walk incomplete)` from the recorded
+  incomplete-walk fact, never as a figure (oxide#186). Every other
   incomplete walk, including a held slot's, the payload scope pass and a
   removable pool's, still refuses. The bounds are finite: a larger pool
   refuses until idle slots are evicted or cleaned. A `NotFound` bound to a

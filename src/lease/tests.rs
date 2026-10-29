@@ -3830,12 +3830,17 @@ fn a_stale_record_is_never_current_and_is_remeasured_instead() {
 
 #[test]
 fn a_bounded_capacity_refusal_names_at_most_eight_slots() {
-    let named: Vec<String> = (1..=MAX_REFUSAL_SLOTS).map(|id| id.to_string()).collect();
+    let unmeasured: Vec<super::UnmeasuredSlot> = (1..=128)
+        .map(|id| super::UnmeasuredSlot {
+            slot_id: id.to_string(),
+            incarnation: "1".to_owned(),
+            dir: None,
+        })
+        .collect();
     let error = LeaseError::CapacityCharged {
         measured: 4096,
         limit: 2048,
-        slots: named,
-        omitted: 120,
+        unmeasured,
     };
     assert_eq!(error.reason(), "full");
     assert_eq!(error.exit_code(), 3);
@@ -3872,8 +3877,8 @@ fn released_idle_slot(
 fn elapsed_admission(
     fixture: &Fixture,
     delayed: &Path,
-    body: impl FnOnce() -> Result<(super::LeaseGrant, Vec<(u64, u64)>), LeaseError>,
-) -> Result<(super::LeaseGrant, Vec<(u64, u64)>), LeaseError> {
+    body: impl FnOnce() -> Result<(super::Leased, Vec<(u64, u64)>), LeaseError>,
+) -> Result<(super::Leased, Vec<(u64, u64)>), LeaseError> {
     crate::inventory::walk_observer::with_mutations(
         fixture.path(),
         serde_json::json!([{
@@ -3904,8 +3909,8 @@ fn an_unrecorded_slot_whose_admission_walk_elapses_is_charged_and_kept() {
         ))
     })
     .expect("a partial slot walk no longer refuses the admission");
-    assert!(!admitted.reused_slot);
-    assert_ne!(admitted.slot_id, slot_id.to_string());
+    assert!(!admitted.grant.reused_slot);
+    assert_ne!(admitted.grant.slot_id, slot_id.to_string());
     assert_eq!(
         charges,
         vec![(slot_id, 1)],
@@ -3918,12 +3923,29 @@ fn an_unrecorded_slot_whose_admission_walk_elapses_is_charged_and_kept() {
     );
     assert!(slot_path.is_dir());
     let view = managed::ledger_view(&pool).expect("ledger view");
+    let generation = view
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_id.to_string())
+        .expect("the unmeasured slot is still in the ledger");
+    assert_eq!(
+        admitted.unmeasured.len(),
+        1,
+        "the caller cannot see the fact"
+    );
+    assert_eq!(admitted.unmeasured[0].slot_id, slot_id.to_string());
+    assert_eq!(admitted.unmeasured[0].incarnation, generation.incarnation);
+    assert_eq!(admitted.unmeasured[0].dir, generation.dir);
+    assert_eq!(
+        admitted.admission_note, None,
+        "an ordinary admission gained a note"
+    );
     assert!(
         recorded_of(&view, &slot_id.to_string()).is_none(),
         "a partial walk published a record"
     );
     assert_eq!(
-        recorded_of(&view, &admitted.slot_id),
+        recorded_of(&view, &admitted.grant.slot_id),
         None,
         "the new slot was never measured"
     );
@@ -3959,7 +3981,7 @@ fn a_partial_slot_walk_is_charged_the_bytes_it_observed() {
         ))
     })
     .expect("a bounded slot walk no longer refuses the admission");
-    assert!(!admitted.reused_slot);
+    assert!(!admitted.grant.reused_slot);
     assert_eq!(
         charges,
         vec![(slot_id, observed)],
@@ -4010,8 +4032,8 @@ fn byte_pressure_evicts_a_verified_idle_slot_never_the_unmeasured_one() {
         vec![(unmeasured, recorded_bytes)],
         "the charge is the largest recorded slot"
     );
-    assert!(!admitted.reused_slot);
-    assert_ne!(admitted.slot_id, unmeasured.to_string());
+    assert!(!admitted.grant.reused_slot);
+    assert_ne!(admitted.grant.slot_id, unmeasured.to_string());
     assert!(
         unmeasured_path.is_dir(),
         "the unmeasured slot was evicted on a partial walk"
@@ -4058,20 +4080,30 @@ fn a_conservative_charge_that_cannot_fit_refuses_only_that_admission() {
         ))
     })
     .expect_err("a charge that cannot fit refuses this admission");
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    let generation = view
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == unmeasured.to_string())
+        .expect("the unmeasured slot is still in the ledger");
     match &refused {
         LeaseError::CapacityCharged {
             measured,
             limit,
-            slots,
-            omitted,
+            unmeasured: named,
         } => {
             assert_eq!(*limit, cap);
             assert!(
                 *measured >= cap,
                 "the refusal does not report the charged figure: {measured}"
             );
-            assert_eq!(slots, &vec![unmeasured.to_string()]);
-            assert_eq!(*omitted, 0);
+            assert_eq!(named.len(), 1, "the refusal names exactly the charged slot");
+            assert_eq!(named[0].slot_id, unmeasured.to_string());
+            assert_eq!(
+                named[0].incarnation, generation.incarnation,
+                "the reported slot is not bound to the generation that was walked"
+            );
+            assert_eq!(named[0].dir, generation.dir);
             let text = refused.to_string();
             assert!(
                 text.contains(&format!("slot(s) {unmeasured}")),
@@ -4095,6 +4127,47 @@ fn a_conservative_charge_that_cannot_fit_refuses_only_that_admission() {
     assert_eq!(snapshot_tree(&over_path), over_before);
     let view = managed::ledger_view(&pool).expect("ledger view");
     assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
+}
+
+#[test]
+fn a_named_count_replacement_keeps_a_slot_its_walk_could_not_measure() {
+    let fx = Fixture::new("unmeasured-replacement");
+    let (pool, unmeasured, unmeasured_path, workspace) =
+        released_idle_slot(&fx, "replacement", 64 * 1024 * 1024);
+    super::pool::drop_record_for_test(&pool, unmeasured).expect("drop the record");
+    let before = snapshot_tree(&unmeasured_path);
+    let mut replacement = request(&pool, &fx.dir("other-project"), &workspace, "other");
+    replacement.replace_slot = Some(unmeasured);
+    // A named replacement is a candidate like any other: its own partial walk
+    // never authorises its deletion (oxide#186), so the replacement is skipped
+    // and the ordinary rules decide the admission.
+    let (admitted, charges) = elapsed_admission(&fx, &unmeasured_path, || {
+        super::pool::lease_with_charges_injected(replacement)
+    })
+    .expect("the named replacement is skipped and the admission continues");
+    assert_eq!(charges, vec![(unmeasured, 1)]);
+    assert!(!admitted.grant.reused_slot);
+    assert_ne!(admitted.grant.slot_id, unmeasured.to_string());
+    assert!(
+        unmeasured_path.is_dir(),
+        "a named replacement deleted a slot whose walk was partial"
+    );
+    assert_eq!(snapshot_tree(&unmeasured_path), before);
+    let note = admitted.admission_note.as_deref().unwrap_or_default();
+    assert!(
+        note.contains(&format!("replacement slot {unmeasured}")),
+        "the skip was not reported: {note}"
+    );
+    assert!(note.contains("kept"), "{note}");
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(view.slots.iter().any(|slot| {
+        slot.slot_id == unmeasured.to_string() && slot.state == SlotOccupancy::Idle
+    }));
+    assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
+    assert!(view
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == admitted.grant.slot_id));
 }
 
 #[test]

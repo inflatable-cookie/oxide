@@ -457,18 +457,31 @@ unreadable entry — the slot is charged
 any, the largest recorded slot in the pool)`, at least one byte and never the
 whole budget. It is **kept**: the charge lives only in that admission, no
 record is published, and the slot is never a victim, never reused and never
-adopted on that walk. The admission continues under the charge and refuses only
-itself, with a bounded capacity reason that names the slot (`full`, at most
-eight IDs then a count), when the pool genuinely cannot fit; a charge that
+adopted on that walk. That holds for a **named count replacement** too: the
+front-door names a victim by recorded rank, and the value decides, not the
+name, so a slot whose own walk was partial is skipped with one bounded note
+and the ordinary count and byte rules select a verified candidate instead. The
+admission continues under the charge and refuses only itself, with a bounded
+capacity reason that names the slot (`full`, at most eight IDs then a count),
+when the pool genuinely cannot fit; a charge that
 alone exhausts the budget refuses before deleting anything. This removes a
 refusal and narrows eviction eligibility: it adds **no** deletion path or
 authority. Everything shared still refuses globally — the ledger, config,
 backing and fence, the pool scope pass, a slot root that cannot even be
 opened, a held slot's live figure, the reuse candidate's own required-complete
 walk, and a removable pool's bounded walks (its unknown-size reserve route is
-unchanged). `status` keeps showing such a slot as not measured, the ledger
-total stays a stated lower bound over it, and the next release or admission
-walk records it normally.
+unchanged).
+
+`status` reports such a slot as **`not measured (walk incomplete)`** and never
+with a figure. The front door records only the incomplete outcome, as one
+diagnostic fact in the oxide#128 sidecar bound to the walked generation; the
+charge itself is never persisted, the ledger total stays a stated lower bound
+over the slot, and nothing derives admission, ownership or deletion authority
+from the fact. A later complete walk of the same generation supersedes it
+normally: a release writes the ledger record (which status reports first) and a
+reuse walk writes its own fact. The same fact is recorded when a
+`capacity_charged` refusal is what stopped the admission, so the slot that
+blocked it is visible afterwards.
 
 **A command's child temporary directory is inside its slot (oxide#136).**
 `<slot>/scratch` is an ordinary owned entry of the slot tree, so the same
@@ -725,17 +738,22 @@ After walking it re-reads the pair once; if any slot's ID, incarnation,
 directory or occupancy changed, coverage is unknown rather than pairing a
 walk with a different generation. Neither entry point persists anything.
 
-The front door records one diagnostic fact from the reuse walk an acquiring
-command already makes, in
+The front door records diagnostic facts from walks an acquiring command
+already makes, in
 `<pool>/oxide-managed/status-observations.json` (schema
 `oxide.status-observations/1`, ≤512 KiB, 256 retained recent facts, each
 bound to store ID, slot ID, incarnation, exact recorded directory, wall-clock
-time, allocated bytes, source and measuring lease). The sidecar is an
+time, allocated bytes, source and measuring lease). There are two sources: the
+reuse walk (`lease-reuse`, with its measured figure) and an admission walk that
+stopped partial (`admission-walk-incomplete`, which carries **no** figure — its
+`allocated_bytes` is written as 0 and read by nothing, and it reads as
+`not measured (walk incomplete)`; oxide#186). The sidecar is an
 auxiliary diagnostic inside an already-tolerated directory: it bumps no core
-format, an older binary may ignore it, and a write failure changes no
-admission, ownership or exit status. A missing, unreadable, foreign, corrupt,
-unknown-version or mismatched sidecar reads as not measured, never as a
-fallback scan. Default status never creates or refreshes it and `--measure`
+format, an older binary may ignore it (or refuse its unknown source and report
+every fact as not measured, which never claims a size), and a write failure
+changes no admission, ownership or exit status. A missing, unreadable, foreign,
+corrupt, unknown-version or mismatched sidecar reads as not measured, never as
+a fallback scan. Default status never creates or refreshes it and `--measure`
 never persists.
 
 ### Slot headroom and ranked idle replacement (oxide#118)
@@ -1265,7 +1283,7 @@ sources, which are never mixed:
 | Source | What it is | Shown as |
 | --- | --- | --- |
 | **Ledger record** (this design) | the admission basis, written by releases and recorded admissions | per-slot bytes with `recorded` / `unrecorded`, and one pool `recorded total` over `recorded n of m slots` |
-| **`oxide-managed/status-observations.json`** (oxide#128) | a diagnostic reuse-walk fact, up to 512 KiB / 256 facts | the existing per-slot line with its age, source and lease, or `not measured` |
+| **`oxide-managed/status-observations.json`** (oxide#128) | a diagnostic reuse-walk fact or an incomplete admission-walk fact (oxide#186), up to 512 KiB / 256 facts | the existing per-slot line with its age, source and lease, `not measured (walk incomplete)`, or `not measured` |
 
 The two are labelled separately and never summed into one number: the #128
 sidecar stays ineligible for a pool total, and the ledger total never borrows a
