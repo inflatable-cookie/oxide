@@ -2361,12 +2361,12 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let path = format!("/{}", "\u{1}".repeat(1023));
     let holder = "\u{1}".repeat(MAX_HOLDER_BYTES);
     let lease_id = "\u{1}".repeat(MAX_LEASE_ID_BYTES);
-    // The worst valid ledger is the raised-ceiling representation (oxide#177):
-    // every slot idle with a closed observation whose generation fence is at
-    // its own cap, so the bound covers the record (oxide#146). Every numeric
-    // field is at its widest too: 20-digit ids, incarnations and ranks and the
-    // maximum `u64` in every recorded figure, so the measured maximum is the
-    // real worst-valid serialization rather than a short-number fixture.
+    // The maximal all-idle serialization (oxide#177): every slot idle with a
+    // closed observation whose generation fence is at its own cap, so the
+    // bound covers the record (oxide#146). Every numeric field is at its
+    // widest too: 20-digit ids, incarnations and ranks and the maximum `u64`
+    // in every recorded figure, so the measured state is a real maximum for
+    // this shape rather than a short-number fixture.
     let mut slots = Vec::new();
     for index in 0..super::MAX_SLOTS as u64 {
         let id = u64::MAX - 1 - index;
@@ -2575,12 +2575,13 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
     })
 }
 
-/// The reachable worst valid ledger (oxide#177): the raised-ceiling
+/// The maximal ledger this writer can reach (oxide#177): the raised-ceiling
 /// representation at 256 slots with every field at its cap, where the one slot
 /// a pool can durably leave `Evicting` carries a maximal deletion journal. The
 /// library refuses a second deletion while a journal is outstanding, so one is
-/// the reachable maximum; the 8 MiB cap also covers several more. Its measured
-/// bytes are what `MAX_LEDGER_BYTES` is derived from.
+/// the writer-reachable maximum. The reader also accepts multi-journal states
+/// (an open bound question, see `MAX_LEDGER_BYTES`); this fixture measures the
+/// writer-reachable state, which is what the acceptance cap must cover.
 #[test]
 fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-journal-ledger");

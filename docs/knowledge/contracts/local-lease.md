@@ -562,29 +562,38 @@ soft byte budget and the 95 GB registered reserve are unchanged.
 **Representation.** `MAX_LEDGER_BYTES` is 8 MiB. Every bounded field keeps its
 cap: paths 1024 bytes, holder 128, lease ID 160, slot directory component 80.
 A compact JSON ledger with every field at its ceiling, escaped sixfold and with
-20-digit integers, is proven by unit tests to fit the cap and round-trip. The
-all-idle worst-valid 256-slot ledger (every numeric field at its full 20-digit
-width, including `cap_bytes`, and every string at its cap, including the
-widest accepted `lease_id`) measures 4,213,726 bytes. The bound also covers the deletion journal (oxide#155), which is the
-other durable state a slot record can hold: an `Evicting` slot may carry a
-`DeletionJournal` with up to 96 outstanding capture records and 32 mismatched
-captures, each with a chain of up to 64 capture private names, and every
-journal name field is bounded: at most `PATH_MAX` 1024 bytes in total and at
-most `NAME_MAX` 255 bytes per `/`-separated component, escaped sixfold. The
-writer refuses an over-bound object per object and puts it back without
-deleting it; the reader refuses a ledger that carries one. At most **one**
-such journal is reachable: `retire_idle_slot` is the only path that starts a
-deletion, and it refuses while reconciliation is blocked or any journal is
-outstanding, so that guard covers every entry point including the explicit
-`evict_idle_slot` that does not pass through `lease()`; every open reconciles
-all `Evicting` records before admitting anything, and a journal that cannot
-finish keeps the pool blocked until it does (one that can finish is removed).
-The measured one-journal worst-valid ledger is 5,624,335 bytes (the journal's
-name fields at the full PATH_MAX 1024 bytes, `expected_mode` at the
-unrestricted u32 maximum, maximum record counts), and the 8 MiB cap still
-covers one more maximal journal, so an unexpected co-occurrence is
-representable; a hand-crafted ledger beyond the cap refuses rather than
-truncating. Control state is bounded
+20-digit integers, is proven by unit tests to fit the cap and round-trip.
+`MAX_LEDGER_BYTES` is the **acceptance** bound: the read and write paths refuse
+a larger ledger, so every accepted ledger is at most 8 MiB.
+
+The measured state the current writer can reach from an empty ledger is
+serialized at every bounded maximum: the all-idle 256-slot ledger (numeric
+fields at their full 20-digit width including `cap_bytes`, every string at its
+cap including the widest accepted `lease_id`) measures 4,213,726 bytes, and
+with **one** maximal `DeletionJournal` (96 capture records and 32 mismatched
+captures, chains of 64 capture private names, name fields at `PATH_MAX` 1024
+bytes in `NAME_MAX` 255-byte components, `expected_mode` at the unrestricted
+u32 maximum, maximal sixfold escapes) it measures 5,624,335 bytes. The writer
+refuses an over-bound journal object per object and puts it back without
+deleting it; the reader refuses a ledger that carries one. This head's writer
+starts at most one journal: `retire_idle_slot` is the only path that starts a
+deletion and it refuses while reconciliation is blocked or any journal is
+outstanding, so the guard covers `evict_idle_slot` too, and every open
+reconciles all `Evicting` records before admitting anything.
+
+**Open bound question (oxide#177).** The reader validates each `Evicting`
+slot's journal independently and bounds no journal *count*, so an accepted
+ledger may carry more than one. A predecessor binary (whose `retire_idle_slot`
+had no single-journal guard, and whose own ledger was capped at 2 MiB) could
+write several; this head only preserves inherited journals and cannot add one
+while any exists, so the maximal *writer-reachable* ledger is the measured
+5,624,335-byte single-journal state, and an inherited predecessor ledger is
+bounded by that binary's own 2 MiB write cap plus the closed records this
+binary adds. The maximal *reader-accepted* multi-journal representation, and
+any enforced count bound for pre-existing pools, are an open design question
+referred to the Oxide Supervisor: a count refusal would be a different rule
+for pre-existing pools, and three reader-maximal journals already exceed
+8 MiB. This head does not invent that bound. Control state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
 tickets, 128 clean marks, 16 recoveries, 16 flushes, per-object compact
 ceilings (record 40 KiB, recovery 9 KiB, holder 5 KiB, lost 8 KiB, flush
@@ -699,10 +708,11 @@ qualified supervisor's session and the script starts no session or group of
 its own, so the runner owns closure on any fault. With every slot's record
 current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
-only its own slot, and default `status` at 256 walks nothing. The worst-valid
-ledger/control serialization — including the reachable one-journal
-`Evicting` state, 5,624,335 bytes against the 8 MiB cap — escaped round-trip
-and oversized-field refusals are unit tests in `effigy test rust`, as is a
+only its own slot, and default `status` at 256 walks nothing. The maximal
+writer-reachable ledger serialization — the measured one-journal `Evicting`
+state, 5,624,335 bytes against the 8 MiB acceptance cap (the reader-accepted
+multi-journal maximum is the open question above) — escaped round-trip and
+oversized-field refusals are unit tests in `effigy test rust`, as is a
 fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
 trip with a journal (bounded read via the passive snapshot, ranked ordering,
 the actual atomic write and its read-back; the ceiling is generous for the

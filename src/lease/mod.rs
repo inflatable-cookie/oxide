@@ -54,24 +54,35 @@ pub const MAX_SLOTS: usize = 256;
 /// older binary refuses it at ledger read instead of reading a slot table it
 /// cannot represent (oxide#177).
 pub const LEGACY_MAX_SLOTS: usize = 128;
-/// Finite ledger file size including the atomic temp. The worst valid ledger
-/// is the raised-ceiling representation at `MAX_SLOTS` with every bounded
-/// field at its ceiling and every numeric field at its full 20-digit width,
-/// plus the one deletion journal an `Evicting` record can durably hold. A
-/// maximal journal is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture
-/// records and `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a
-/// chain of at most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the
-/// enforced journal-name bounds: a name field of at most `PATH_MAX` (1024)
-/// bytes in `NAME_MAX` (255)-byte components, escaped sixfold by compact JSON.
-/// The writer refuses such an over-bound object per object without deleting it,
-/// and the reader refuses a ledger that carries one. At most one journal is
-/// reachable: `retire_idle_slot` is the only path that starts a deletion and it
-/// refuses while reconciliation is blocked or any journal is outstanding, and
-/// every open reconciles all `Evicting` records before admitting anything. The
-/// 8 MiB cap is derived from the measured one-journal worst valid ledger (the
-/// unit proof reports both exact figures) and still covers several maximal
-/// journals, so an unexpected co-occurrence is representable; a hand-crafted
-/// ledger beyond the cap refuses rather than truncating.
+/// Finite ledger file size including the atomic temp. This constant is the
+/// **acceptance** bound: the read and write paths refuse a ledger above it, so
+/// every accepted ledger is at most 8 MiB. The measured maximal state the
+/// current writer can reach from an empty ledger is the raised-ceiling
+/// representation at `MAX_SLOTS` with every bounded field and numeric field at
+/// its maximum plus **one** maximal `DeletionJournal` (the unit proof reports
+/// both exact figures). A maximal journal is bounded by
+/// `MAX_OUTSTANDING_CAPTURES` (96) capture records and `MAX_FOREIGN_CAPTURES`
+/// (32) mismatched captures, each with a chain of at most `MAX_CAPTURE_DEPTH`
+/// (64) capture private names, and by the enforced journal-name bounds: a name
+/// field of at most `PATH_MAX` (1024) bytes in `NAME_MAX` (255)-byte
+/// components, escaped sixfold by compact JSON. The writer refuses an over-bound
+/// object per object without deleting it, and the reader refuses a ledger that
+/// carries one.
+///
+/// **Open bound question (oxide#177).** The reader validates each `Evicting`
+/// slot's journal independently and bounds no journal *count*, so an accepted
+/// ledger may carry more than one (a predecessor binary, whose
+/// `retire_idle_slot` had no single-journal guard, could write them; its own
+/// ledger was capped at 2 MiB). This head's writer starts at most one journal
+/// (`retire_idle_slot` refuses while reconciliation is blocked or any journal
+/// is outstanding) and only preserves inherited ones, so the maximal
+/// *writer-reachable* ledger is the measured single-journal state, and an
+/// inherited predecessor ledger is bounded by that binary's own 2 MiB write
+/// cap plus the closed records this binary adds. The maximal *reader-accepted*
+/// multi-journal representation would need either a reader-side journal-count
+/// refusal (a different rule for pre-existing pools) or a larger cap; that is
+/// an open design question referred to the Oxide Supervisor, not a bound this
+/// constant claims.
 pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 /// Permanent capacity-policy fence in the library ledger (oxide#118). Its
 /// presence tells an older binary that this ledger uses ranked idle
