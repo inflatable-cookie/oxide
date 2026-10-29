@@ -102,7 +102,7 @@ pub fn inherited(config_args: &[OsString]) -> Inherited {
 /// directory. `config` wins over `config.toml` when both exist, and Cargo
 /// ignores the `.toml`. The clean safety gate's own helper deliberately reads
 /// both; this one mirrors Cargo for an accurate name.
-fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+pub(crate) fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut files = Vec::new();
     let mut seen = Vec::new();
@@ -222,7 +222,7 @@ fn program(value: &str, source: &str) -> Inherited {
 }
 
 /// `--config` values before any `--`, in order.
-fn config_values(args: &[OsString]) -> Vec<String> {
+pub(crate) fn config_values(args: &[OsString]) -> Vec<String> {
     let mut values = Vec::new();
     let mut iter = args.iter();
     while let Some(argument) = iter.next() {

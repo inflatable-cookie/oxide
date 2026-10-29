@@ -19,6 +19,7 @@ mod freshness;
 mod guidance;
 mod handoff;
 mod identity;
+mod incremental;
 mod launch;
 mod layout;
 mod one_use;
@@ -583,6 +584,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         invocation.profile.recipe_key(),
         invocation.target.as_deref(),
         &destination,
+        &prep!(incremental::key_component(&checkout, &invocation)),
     ));
     test_pause_with("keyed", &destination);
     if budget::admission_expired() {
