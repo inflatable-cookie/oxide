@@ -1027,7 +1027,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # --root-parent /private/tmp (the owner-accepted internal-placement exception,
 # decision bd357a4c) because the proof's own pool is a genuine internal
 # directory-budget pool and one case registers a removable pool from an
-# internal control directory. 300 s, 512 MiB monitored scratch, one owned
+# internal control directory. 600 s (Tom 1527723f), 512 MiB monitored scratch, one owned
 # 128 MiB APFS image attached with `hdiutil -owners on`, ordinary detach. It stages
 # this HEAD's debug `oxide` and seeds one private offline CARGO_HOME from a
 # union lock with the shared bounded seeder (scripts/offline_seed.py), then
@@ -1036,7 +1036,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # independently activated reviewer native are separately owner-activated.
 [tasks."rust:cold-slot-seeding"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 480 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
 
 # Uncounted keep-going collection for oxide#169, run through the same
 # qualified guard, root, bounds and custody. Its receipt is distinctly
@@ -1046,7 +1046,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 480 --
 # outcome aborts and retains the image.
 [tasks."rust:cold-slot-seeding:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 480 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py --diagnostic"
 
 # The pure apparatus of the cold-slot seeding proof: the case table, the
 # keep-going/fail-fast collection semantics, the receipt builder, the lock

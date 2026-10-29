@@ -57,9 +57,16 @@ The qualification apparatus is one fixed 24-case script,
 `scripts/test-cold-slot-seeding.py`:
 `effigy rust:cold-slot-seeding` and `:diagnostic` run it under the qualified
 shared supervisor with the internal-placement exception
-(`bd357a4c`), **480 s** (Tom's decision `e3540b1c`, this selector and its
+(`bd357a4c`), **600 s** (Tom's decision `1527723f`, this selector and its
 diagnostic twin only), 512 MiB monitored scratch and one owned 128 MiB image;
-`effigy proof:cold-slot-seeding:test` runs only its pure apparatus. The
+`effigy proof:cold-slot-seeding:test` runs only its pure apparatus. Case 21
+compares canonical dep-info and workspace source paths, with relative paths
+resolved from the workspace and an owned-alias pure regression. The earlier
+480 s diagnostic at `86208d1` failed case 21, aborted case 22 at its work
+cutoff and left cases 23–24 unexecuted; it remains historical with no counted
+credit or complete fit. The new 600 s bound retains the 30 s margin and all
+other safeguards. A fresh exact-head source review must precede the next
+separately owner-activated diagnostic. The
 uncounted diagnostic, one counted author native and one separately activated
 independent reviewer native are owner-activated at the exact head; cases 01
 (non-leaf SQLite), 03/06 (Git/build-script/`OUT_DIR` seedctl) and 05 (proc

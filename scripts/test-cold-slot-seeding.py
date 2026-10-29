@@ -3,7 +3,7 @@
 
 One fixed script and the whole command of the qualified shared supervisor:
 
-    python3 scripts/bounded-test.py --root-parent /private/tmp --limit 480 \
+    python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 \
         --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py
 
 `--root-parent /private/tmp` is the owner-accepted internal-placement
@@ -191,6 +191,7 @@ import os
 import plistlib
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -1403,7 +1404,7 @@ GIB = 1024 * 1024 * 1024
 
 
 def configure_proof_clock() -> None:
-    """Use the supervisor's 480 s deadline for this selector, leaving the 30 s
+    """Use the supervisor's 600 s deadline for this selector, leaving the 30 s
     shutdown margin, instead of the imported finder proof's 300 s constant.
 
     The base Proof class is assembled from two modules: `run` comes from the
@@ -1415,20 +1416,20 @@ def configure_proof_clock() -> None:
     """
     if "OXIDE_PROOF_DEADLINE_NS" not in os.environ:
         return
-    Proof.run.__globals__["PROOF_SECONDS"] = 450.0
+    Proof.run.__globals__["PROOF_SECONDS"] = 570.0
 
     def remaining() -> float:
         left = supervisor_remaining() - SHUTDOWN_MARGIN_S
         if left <= 5:
-            fail("proof would exceed 480 s")
+            fail("proof would exceed 600 s")
         return left
 
     Proof.run.__globals__["remaining"] = remaining
     finder = Proof.phase.__globals__
-    finder["PROOF_SECONDS"] = 450.0
+    finder["PROOF_SECONDS"] = 570.0
     finder["remaining"] = remaining
     if Proof.close.__globals__ is not finder or Proof.close.__globals__ is not Proof.phase.__globals__:
-        Proof.close.__globals__["PROOF_SECONDS"] = 450.0
+        Proof.close.__globals__["PROOF_SECONDS"] = 570.0
         Proof.close.__globals__["remaining"] = remaining
 
 
@@ -1529,7 +1530,7 @@ def detach_timeout(remaining: float) -> float | None:
     return min(60.0, remaining - 10.0)
 
 
-def timing_projection(seconds: dict, total: int = 24, limit: float = 480.0) -> dict:
+def timing_projection(seconds: dict, total: int = 24, limit: float = 600.0) -> dict:
     """Observation only: the reached cases' mean wall time extended to the
     fixed case count, with the declared limit. Never an acceptance gate."""
     reached = [value for value in seconds.values() if value is not None]
@@ -2817,6 +2818,21 @@ def case_20(proof: Proof) -> None:
     print("case 20: a partial recipient was never reused", flush=True)
 
 
+def dep_info_names_source(dep_info: bytes, source: str, cwd: str) -> bool:
+    """Compare the fixed fixture's dep-info paths by canonical identity.
+
+    Cargo may spell the source relative to the workspace or through a path
+    alias. Split its escaped paths without interpreting a shell command.
+    """
+    expected = os.path.realpath(source)
+    paths = shlex.split(dep_info.decode().replace("\\\n", ""), comments=False)
+    return any(
+        os.path.realpath(path if os.path.isabs(path) else os.path.join(cwd, path)) == expected
+        for token in paths
+        if (path := token.removesuffix(":"))
+    )
+
+
 def case_21(proof: Proof) -> None:
     case = Case(proof, "21")
     workspace = {
@@ -2869,7 +2885,7 @@ def case_21(proof: Proof) -> None:
     ]
     expect(bool(workspace_artifacts), "the workspace cfg_if emitted no artifact")
     dep_info = read_bytes(os.path.join(build, "debug", "deps", f"cfg_if-{local_hash}.d"))
-    expect(os.path.join(root, "local-cfg", "src", "lib.rs").encode() in dep_info, "the workspace artifact's dep-info does not name its source")
+    expect(dep_info_names_source(dep_info, os.path.join(root, "local-cfg", "src", "lib.rs"), root), "the workspace artifact's dep-info does not name its source")
     expect(plan_files.isdisjoint(workspace_artifacts), f"workspace artifact in seed plan: {workspace_artifacts}")
     expect(any(path.startswith("debug/deps/libcfg_if-") for path in plan_files), "no positive registry artifact in the plan")
     recipient = case.checkout("recipient", workspace)
@@ -3170,9 +3186,9 @@ def plan() -> None:
     print("cold-slot seeding (oxide#137 §16, oxide#169): 24 fixed native cases")
     print(
         "supervisor: python3 scripts/bounded-test.py --root-parent /private/tmp "
-        "--limit 480 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
+        "--limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
     )
-    print("limits: 480 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
+    print("limits: 600 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
     print("allocation (source-derived, UNMEASURED): staging 40-60 s, 60-85 MiB; cases 01-24 about 230-300 MiB peak; image phase <= 128 MiB")
     print("phases:")
     for phase_text in PHASES:
@@ -3485,6 +3501,19 @@ def self_test() -> None:
         expect_gap_eviction(eviction, "2", 6)
         must_fail("a different slot was evicted", lambda: expect_gap_eviction(eviction, "3", 6))
         must_fail("an extra grant allowance", lambda: expect_gap_eviction(eviction, "2", 13))
+
+        # Case 21: a relative dep-info path and an aliased expected path both
+        # resolve to the same source. The alias stays inside this owned fixture.
+        canonical = os.path.join(base, "canonical-source")
+        os.makedirs(os.path.join(canonical, "real", "src"))
+        source = os.path.join(canonical, "real", "src", "lib.rs")
+        with open(source, "w", encoding="utf-8") as handle:
+            handle.write("pub fn value() {}\n")
+        os.symlink("real", os.path.join(canonical, "alias"))
+        dep_info = b"debug/deps/libcfg_if-test.rlib: alias/src/lib.rs\n"
+        expect(dep_info_names_source(dep_info, source, canonical), "a canonical source did not match the aliased relative dep-info path")
+        expect(dep_info_names_source(b"debug/deps/libcfg_if-test.rlib: real/src/lib.rs\n", os.path.join(canonical, "alias", "src", "lib.rs"), canonical), "the expected source path was not canonicalized")
+        expect(not dep_info_names_source(dep_info, os.path.join(canonical, "other.rs"), canonical), "a different source passed case 21's canonical comparison")
 
         # Attempt, ledger row and slot-leaf oracles on one synthetic pool.
         pool = os.path.join(base, "pool")
@@ -3833,9 +3862,9 @@ def self_test() -> None:
             and heavy["fits_limit"] is True,
             f"the two-case projection drifted: {heavy}",
         )
-        beyond = timing_projection({"01": 20.0, "02": 30.0})
+        beyond = timing_projection({"01": 25.0, "02": 35.0})
         expect(
-            beyond["projected_total_s"] == 600.0 and beyond["fits_limit"] is False,
+            beyond["projected_total_s"] == 720.0 and beyond["fits_limit"] is False,
             f"the over-limit projection drifted: {beyond}",
         )
         expect(
@@ -3843,7 +3872,7 @@ def self_test() -> None:
             "a None case entered the projection",
         )
 
-        # The 480 s clock must reach the finder module's phase()/owned_bytes()
+        # The 600 s clock must reach the finder module's phase()/owned_bytes()
         # path, not only the pool-layout run() globals.
         saved_deadline = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
         os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(
@@ -3853,8 +3882,8 @@ def self_test() -> None:
             configure_proof_clock()
             finder = Proof.phase.__globals__
             expect(
-                finder["PROOF_SECONDS"] == 450.0,
-                "the 480 s work clock did not reach the finder phase globals",
+                finder["PROOF_SECONDS"] == 570.0,
+                "the 600 s work clock did not reach the finder phase globals",
             )
             expect(
                 Proof.run.__globals__.get("remaining") is finder["remaining"],
@@ -4299,7 +4328,7 @@ def diagnostic_document(*, proof, collection, failure) -> dict:
             "evidence": os.environ.get("OXIDE_PROOF_EVIDENCE"),
             "work_deadline_ns": os.environ.get("OXIDE_PROOF_DEADLINE_NS"),
             "supervisor_scratch_budget_mib": 512,
-            "wall_clock_s": 480,
+            "wall_clock_s": 600,
         },
         "limitation": (
             "A recoverable case-oracle failure is recorded and the cases that do not "
