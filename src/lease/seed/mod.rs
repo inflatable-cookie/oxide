@@ -45,17 +45,14 @@
 //! seed would create one — refuses on either side of that boundary, because a
 //! safety fault is never disguised as a cold fallback.
 //!
-//! **Tier and scope: internal pools only.** This slice writes only a
-//! `directory-budget-v1` pool's payload. Removable `apfs-volume-v1` custody is
-//! reassigned to Elevated slice 4 with its removable-media native case (Oxide
-//! Supervisor ruling at PR #159 head `394c0c6`), so until then [`seed`] skips
-//! such a pool with the reason "seeding not yet supported on a removable pool"
-//! and [`seed_candidates`] offers no candidate from one. The command takes the
-//! normal cold build. The custody seam describes a removable pool from its
-//! config and ledger alone and opens no payload for it, so the gate runs
-//! **before any payload or volume access**: no removable payload is read or
-//! written on these paths. The frozen eventual behaviour is unchanged by that
-//! reassignment.
+//! **Both pool backends.** Slice 4 writes a `directory-budget-v1` pool's
+//! payload and a registered `apfs-volume-v1` volume's payload. For the
+//! removable backend call 2 opens the payload through the same strict mount
+//! and volume-UID binding a mutating pool open uses, so a removed, remounted or
+//! substituted volume refuses before any donor payload is read (§7). Call 1
+//! and the sidecar writers open no payload at all. The caller's monitor owns
+//! the removable removal stop and the internal reserve stop (§8.3); this
+//! module makes no volume or reserve decision of its own.
 //!
 //! The donor predicate of §7 has two halves and both are checked here. The
 //! ledger half is state `Idle`, no lease, the catalog's lease as
@@ -102,7 +99,7 @@ pub use join::{
 };
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
-use super::pool::{open_seed, SeedPoolView, SeedSlotView};
+use super::pool::{open_seed, open_seed_payload, SeedPoolView, SeedSlotView};
 use super::{
     current_uid, ensure_private_dir, io_error, random_hex, LeaseError, MANAGED_NAME,
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
@@ -274,13 +271,6 @@ pub enum SeedSkipReason {
     /// no clone was created, so the attempt is abandoned and the same slot
     /// still builds cold (§6.5's point of no return is the first clone).
     CloneFailed,
-    /// This slice's custody calls only write an internal `directory-budget-v1`
-    /// pool's payload. Removable support is reassigned to Elevated slice 4
-    /// (Oxide Supervisor ruling at PR #159 head `394c0c6`) together with its
-    /// removable-media native case, so until then an `apfs-volume-v1` pool is a
-    /// fail-closed seeding skip reported as "seeding not yet supported on a
-    /// removable pool" and the command takes the normal cold build.
-    RemovablePoolUnsupported,
     /// This platform has no `clonefile`.
     Unsupported,
 }
@@ -302,7 +292,6 @@ impl SeedSkipReason {
             Self::FileChanged => "file changed",
             Self::JoinInconsistent => "join inconsistent",
             Self::CloneFailed => "clone failed",
-            Self::RemovablePoolUnsupported => "seeding not yet supported on a removable pool",
             Self::Unsupported => "unsupported",
         }
     }
@@ -744,10 +733,6 @@ pub fn seed_candidates(
     let held = view
         .slot(&recipient.slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
-    // This slice never writes a removable volume's payload (see
-    // `SeedSkipReason::RemovablePoolUnsupported`), so a removable pool offers
-    // no candidate and the front door does not plan a seed it cannot perform.
-    let removable = !internal_backend(&view.backend);
     if !held.held
         || held.incarnation.to_string() != recipient.incarnation
         || held.lease_id.as_deref() != Some(recipient.lease_id.as_str())
@@ -762,12 +747,6 @@ pub fn seed_candidates(
     donors.sort_by(|left, right| right.rank.cmp(&left.rank).then(left.id.cmp(&right.id)));
     donors.truncate(max_candidates.clamp(1, SEED_MAX_CANDIDATES));
     let mut candidates = Vec::new();
-    if removable {
-        return Ok(SeedCandidates {
-            recipient: recipient.clone(),
-            candidates,
-        });
-    }
     for slot in donors {
         let Some((catalog, bytes, catalog_digest)) = read_catalog(&view.pool_root, slot.id) else {
             continue;
@@ -821,13 +800,6 @@ pub fn seed_monitored(
             reason: SeedSkipReason::Unsupported,
         }));
     }
-    // The removable gate comes before any lock outcome: brief v2 requires the
-    // unsupported reason for a removable pool, never a donor-lock skip or a
-    // lock refusal. The backend is read from the config alone, without the pool
-    // lock and without touching any payload.
-    if !internal_backend(&super::pool::recorded_backend(pool)?) {
-        return Ok(skip(SeedSkipReason::RemovablePoolUnsupported));
-    }
     // The donor's record lock is the front door's lock for exactly the record
     // the plan names: `<pool>/oxide-managed/locks/<record_id>.lock`. A caller
     // supplies no path, so a free unrelated lock can never stand in for the
@@ -853,14 +825,11 @@ pub fn seed_monitored(
         }
     };
     // The non-reconciling open: a recorded `Evicting` slot is never finished,
-    // deleted or mutated by a seed.
-    // The seam opens no removable payload: the backend alone decides the gate,
-    // before any payload or volume access.
-    let opened = open_seed(pool)?;
+    // deleted or mutated by a seed. This is the payload seam: for a removable
+    // pool it verifies the recorded mount and volume UUID under the pool lock
+    // before any donor payload is opened.
+    let opened = open_seed_payload(pool)?;
     let view = &opened.view;
-    if !internal_backend(&view.backend) {
-        return Ok(skip(SeedSkipReason::RemovablePoolUnsupported));
-    }
     let payload_root = view
         .payload_root
         .as_deref()
@@ -917,7 +886,16 @@ pub fn seed_monitored(
     // verified payload root, so a project folder (or the slots root) replaced
     // by a symlink is refused rather than followed to another directory.
     // The returned path is for messages; the descriptor is the custody.
-    let (donor_fd, donor_slot_path) = open_slot_dirs(payload_root, payload_device, donor)?;
+    let Some((donor_fd, donor_slot_path)) =
+        open_donor_slot_dirs(payload_root, payload_device, donor)?
+    else {
+        // A donor that was evicted or whose leaf vanished before this call is
+        // simply unavailable. No recipient write has happened yet, so this is
+        // a cold skip, never an unsafe-path refusal for a path that no longer
+        // exists. An existing foreign, linked or wrong-device entry still
+        // refuses in the helper below.
+        return Ok(skip(SeedSkipReason::DonorPayloadMissing));
+    };
     let (recipient_fd, recipient_slot) = open_slot_dirs(payload_root, payload_device, recipient)?;
     // The recipient is this command's fresh slot: its `build/` is absent or
     // an empty owned directory. Anything else is refused, never cleaned.
@@ -927,13 +905,30 @@ pub fn seed_monitored(
         return Ok(skip(SeedSkipReason::DonorPayloadMissing));
     };
     // Plan from the re-read catalog's own recorded file lists.
-    let plan = match plan_units(&catalog, &request.units) {
+    let mut plan = match plan_units(&catalog, &request.units) {
         Ok(plan) => plan,
         Err(reason) => return Ok(skip(reason)),
     };
     // The five-second cooperative work bound starts with donor revalidation,
     // and every read and clone step below checks it.
     let deadline = Instant::now() + budget;
+    if proof_breach("verify") {
+        return Err(monitor_stop());
+    }
+    // Debug-only oracle controls (absent from release builds; armed only under
+    // the shared proof supervisor's own layout): `drop-dep` removes the
+    // fingerprint `dep-…` file from the plan, and `admit-run` adds the
+    // build-script run payload and run fingerprint the adapter deliberately
+    // never offers. Both let the native oracle prove it distinguishes a
+    // reused unit from a rerun.
+    proof_adjust_plan(
+        &mut plan,
+        &catalog,
+        &request.units,
+        &donor_slot_path,
+        deadline,
+        monitor,
+    )?;
     test_point(TestPoint::BeforeVerify { pool });
     // Every donor payload read happens here, under the pin: each planned file
     // is opened without following a link, checked against the catalog's
@@ -1109,6 +1104,10 @@ pub fn seed_monitored(
             index,
             path: &recipient_path,
         });
+        proof_crash_after_first_clone();
+        if proof_breach("after-clone") {
+            return Err(monitor_stop());
+        }
         // The clone is hashed against the same recorded digest; a clone that
         // does not reproduce it is never published.
         let cloned = match walk::open_regular(&directory, &name) {
@@ -1176,6 +1175,10 @@ pub fn seed_monitored(
     if walked.gap == Some(SeedWalkGap::MonitorStop) || monitor() {
         return Err(monitor_stop());
     }
+    // Debug-only walk-gap control (absent from release builds; armed only under
+    // the shared proof supervisor's own layout): the native proof injects each
+    // failure class it cannot create on disk to prove publication is withheld.
+    let walked = proof_inject_walk_gap(walked);
     let observation = SeedObservation {
         store_id: view.store_id.clone(),
         slot_id: recipient.id.to_string(),
@@ -1244,6 +1247,218 @@ pub fn publish_seed_catalog(pool: &Path, catalog: &SeedCatalog) -> Result<(), Le
 
 fn skip(reason: SeedSkipReason) -> SeedOutcome {
     SeedOutcome::Skipped(SeedSkip { reason })
+}
+
+/// A debug-only proof seam's value, when the shared supervisor armed this
+/// process and the variable is set. Absent from release builds, and never read
+/// in an ordinary run.
+#[cfg(debug_assertions)]
+fn proof_seam(name: &str) -> Option<String> {
+    crate::proof::evidence()?;
+    std::env::var(name).ok()
+}
+
+#[cfg(not(debug_assertions))]
+fn proof_seam(_name: &str) -> Option<String> {
+    None
+}
+
+/// The debug-only plan controls. `drop-dep` drops only the fingerprint
+/// `dep-…` files; `admit-run` appends the run payload and run fingerprint of
+/// each selected build-script package, with sizes and digests computed here.
+/// Both are absent from release builds and armed only under the supervisor.
+fn proof_adjust_plan(
+    plan: &mut Plan,
+    catalog: &SeedCatalog,
+    units: &[SeedUnitRef],
+    donor_slot: &Path,
+    deadline: Instant,
+    monitor: &mut dyn FnMut() -> bool,
+) -> Result<(), LeaseError> {
+    let Some(mode) = proof_seam("OXIDE_TEST_SEED_PLAN") else {
+        return Ok(());
+    };
+    if mode == "drop-dep" {
+        plan.files.retain(|planned| {
+            !planned
+                .file
+                .path
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with("dep-"))
+        });
+        plan.logical_bytes = plan.files.iter().fold(0u64, |total, planned| {
+            total.saturating_add(planned.file.size)
+        });
+        return Ok(());
+    }
+    if mode != "admit-run" {
+        return Ok(());
+    }
+    let selected: Vec<&str> = units
+        .iter()
+        .filter(|unit| unit.role == SeedRole::BuildScriptCompile)
+        .filter_map(|unit| {
+            catalog
+                .packages
+                .iter()
+                .find(|package| {
+                    package
+                        .units
+                        .iter()
+                        .any(|candidate| candidate.fingerprint_dir == unit.fingerprint_dir)
+                })
+                .map(|package| package.name.as_str())
+        })
+        .collect();
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let profile = match catalog.producer.recipe.as_str() {
+        "debug" => "debug",
+        "release" => "release",
+        _ => "debug",
+    };
+    let root = donor_slot.join("build");
+    let mut extras: Vec<(String, PathBuf)> = Vec::new();
+    let entries = match fs::read_dir(root.join(profile).join(".fingerprint")) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((literal, hash)) = name.rsplit_once('-') else {
+            continue;
+        };
+        if !selected.contains(&literal) || hash.len() != 16 {
+            continue;
+        }
+        for file in [
+            "run-build-script-build-script-build",
+            "run-build-script-build-script-build.json",
+        ] {
+            let path = format!("{profile}/.fingerprint/{name}/{file}");
+            extras.push((path.clone(), root.join(&path)));
+        }
+        for file in ["output", "root-output", "stderr", "invoked.timestamp"] {
+            let path = format!("{profile}/build/{name}/{file}");
+            extras.push((path.clone(), root.join(&path)));
+        }
+        let out = format!("{profile}/build/{name}/out");
+        let mut pending = vec![(out.clone(), root.join(&out))];
+        while let Some((relative, directory)) = pending.pop() {
+            if extras.len() > SEED_MAX_PLAN_FILES || Instant::now() > deadline || monitor() {
+                return Ok(());
+            }
+            let Ok(items) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for item in items.flatten() {
+                let Some(child) = item.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let child_relative = format!("{relative}/{child}");
+                let child_path = root.join(&child_relative);
+                let Ok(metadata) = fs::symlink_metadata(&child_path) else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    pending.push((child_relative, child_path));
+                } else if metadata.is_file() && metadata.uid() == current_uid() {
+                    extras.push((child_relative, child_path));
+                }
+            }
+        }
+    }
+    for (relative, path) in extras {
+        if plan
+            .files
+            .iter()
+            .any(|planned| planned.file.path == relative)
+        {
+            continue;
+        }
+        let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        else {
+            continue;
+        };
+        let metadata = match fstat(file.as_fd()) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_uid != current_uid() {
+            continue;
+        }
+        let size = metadata.st_size.max(0) as u64;
+        let digest = match hash_fd(file.as_fd(), deadline, monitor) {
+            Ok(digest) => digest,
+            Err(_) => continue,
+        };
+        plan.files.push(PlannedFile {
+            join: None,
+            file: SeedFile {
+                path: relative,
+                size,
+                mtime_ms: 0,
+                digest,
+                kind: SeedFileKind::Fingerprint,
+            },
+        });
+        plan.logical_bytes = plan.logical_bytes.saturating_add(size);
+    }
+    Ok(())
+}
+
+/// The debug-only injected-stop seam: report the caller's monitor stop at a
+/// named point, so the native proof can exercise a mid-seed fault that retains
+/// the untrusted generation and refuses. Armed only under the supervisor.
+fn proof_breach(point: &str) -> bool {
+    proof_seam("OXIDE_TEST_SEED_BREACH").as_deref() == Some(point)
+}
+
+/// The debug-only crash seam: after the first clone exists and before any
+/// digest check, abort this command. The untrusted origin and the partial
+/// recipient survive for the next command's journaled whole-slot eviction.
+fn proof_crash_after_first_clone() {
+    if proof_seam("OXIDE_TEST_SEED_CRASH").as_deref() == Some("after-first-clone") {
+        std::process::abort();
+    }
+}
+
+/// Replace a completed walk's clean result with an injected gap, so the native
+/// proof can exercise each failure class it cannot create on disk. A real gap
+/// is never overwritten (the injected value applies only to a clean walk).
+#[cfg(debug_assertions)]
+fn proof_inject_walk_gap(walked: walk::WalkOutcome) -> walk::WalkOutcome {
+    if walked.gap.is_some() {
+        return walked;
+    }
+    let Some(gap) = proof_seam("OXIDE_TEST_SEED_WALK") else {
+        return walked;
+    };
+    let gap = match gap.as_str() {
+        "foreign-owner" | "ownership" => SeedWalkGap::ForeignOwner,
+        "unreadable" | "failed" => SeedWalkGap::Unreadable,
+        "device-boundary" => SeedWalkGap::DeviceBoundary,
+        "entry-limit" => SeedWalkGap::EntryLimit,
+        "depth-limit" => SeedWalkGap::DepthLimit,
+        "unexpected-type" => SeedWalkGap::UnexpectedType,
+        _ => return walked,
+    };
+    walk::WalkOutcome {
+        gap: Some(gap),
+        ..walked
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn proof_inject_walk_gap(walked: walk::WalkOutcome) -> walk::WalkOutcome {
+    walked
 }
 
 fn walk_limits() -> SeedWalkLimits {
@@ -1390,10 +1605,6 @@ fn validate_request(request: &SeedRequest) -> Result<(), LeaseError> {
 /// This slice's custody calls write only an internal directory-budget pool's
 /// payload. A removable `apfs-volume-v1` payload is the Elevated path and is
 /// not written here at all.
-fn internal_backend(backend: &str) -> bool {
-    backend == super::BUDGET_BACKEND_DIRECTORY_V1
-}
-
 /// The pool's front-door affinity directory for one record. The front door
 /// passes it as the lease's `project`, so the donor slot's recorded project is
 /// the binding between a slot and the record a catalog names.
@@ -1843,6 +2054,63 @@ fn slot_custody_error() -> LeaseError {
 
 fn missing_directory() -> LeaseError {
     LeaseError::Io("a created seed directory is missing".to_owned())
+}
+
+/// Open the donor's slot path, distinguishing a vanished path from an unsafe
+/// one. A missing payload root, `slots`, project folder or leaf means the donor
+/// is unavailable before any recipient write, so the caller skips cold. An
+/// existing path that is foreign-owned, linked, the wrong type or on another
+/// device still refuses through the same custody checks as the recipient.
+fn open_donor_slot_dirs(
+    payload_root: &Path,
+    device: u64,
+    slot: &SeedSlotView,
+) -> Result<Option<(OwnedFd, PathBuf)>, LeaseError> {
+    let payload = match open_path_directory(payload_root) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(slot_custody_error()),
+    };
+    let payload = require_owned_directory(payload, device)?;
+    let Some(slots) = open_slot_component_optional(payload.as_fd(), c"slots", device)? else {
+        return Ok(None);
+    };
+    let root = payload_root.join("slots");
+    match slot.dir.as_deref() {
+        None => {
+            let name = cstring(&slot.id.to_string())?;
+            let Some(fd) = open_slot_component_optional(slots.as_fd(), &name, device)? else {
+                return Ok(None);
+            };
+            Ok(Some((fd, root.join(slot.id.to_string()))))
+        }
+        Some(dir) => {
+            let (folder, leaf) = dir.split_once('/').ok_or_else(slot_custody_error)?;
+            let Some(folder_fd) =
+                open_slot_component_optional(slots.as_fd(), &cstring(folder)?, device)?
+            else {
+                return Ok(None);
+            };
+            let Some(leaf_fd) =
+                open_slot_component_optional(folder_fd.as_fd(), &cstring(leaf)?, device)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((leaf_fd, root.join(dir))))
+        }
+    }
+}
+
+fn open_slot_component_optional(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    device: u64,
+) -> Result<Option<OwnedFd>, LeaseError> {
+    match open_directory_at(parent, name) {
+        Ok(fd) => Ok(Some(require_owned_directory(fd, device)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(slot_custody_error()),
+    }
 }
 
 /// Open one recorded slot beneath the payload's own descriptors, one

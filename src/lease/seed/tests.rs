@@ -11,7 +11,6 @@ use super::super::pool::{
 };
 use super::super::{
     AdmissionClass, LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, VictimPolicy,
-    BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1,
 };
 use super::*;
 use std::cell::{Cell, RefCell};
@@ -1144,24 +1143,13 @@ fn seed_skips_a_catalog_whose_record_is_not_the_donor_slots_affinity() {
 }
 
 #[test]
-fn this_slice_never_writes_a_removable_payload() {
-    reset_hooks();
-    assert!(internal_backend(BUDGET_BACKEND_DIRECTORY_V1));
-    assert!(!internal_backend(VOLUME_BACKEND_APFS_V1));
-    assert_eq!(
-        SeedSkipReason::RemovablePoolUnsupported.as_str(),
-        "seeding not yet supported on a removable pool"
-    );
-}
-
-#[test]
-fn a_removable_pool_is_skipped_before_any_payload_access() {
+fn a_removable_pool_reads_no_payload_and_refuses_a_removed_volume_before_the_clone() {
     reset_hooks();
     let rig = Rig::new("removable-gate");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    // A second producing lease, still held, so the internal sidecar write can
-    // also be exercised on the same pool.
+    // A second producing lease, still held, so the internal catalog sidecar
+    // write is exercised on a pool whose backend is removable.
     let record_id = rig.next_record_id();
     let held = rig.lease_at("donor-b", "donor", rig.affinity_dir(record_id));
     let files = default_files();
@@ -1169,21 +1157,19 @@ fn a_removable_pool_is_skipped_before_any_payload_access() {
     let held_catalog = catalog_for(&held, record_id, &files);
 
     // Record the pool as a removable volume whose mount point does not exist:
-    // any attempt to open or probe its payload would fail here.
+    // any attempt to open or probe its payload fails here.
     let absent_mount = rig.fx.path.join("absent-volume");
     rewrite_removable_backend_injected(&rig.pool, &absent_mount).expect("rewrite backend");
 
-    // Call 1 answers from the ledger alone: no candidate, no volume access.
-    assert!(candidates(&rig, &recipient).candidates.is_empty());
-    // Call 2 is the fail-closed skip with the reported reason; the normal cold
-    // build follows.
-    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
-    assert_eq!(
-        outcome,
-        SeedOutcome::Skipped(SeedSkip {
-            reason: SeedSkipReason::RemovablePoolUnsupported
-        })
-    );
+    // Call 1 reads the ledger and catalogs on the internal side only, so the
+    // candidate is offered without any volume access.
+    assert_eq!(candidates(&rig, &recipient).candidates.len(), 1);
+    // Call 2 needs the payload, so it verifies the recorded mount and volume
+    // UUID first: an absent volume refuses before any donor payload is read.
+    assert!(matches!(
+        seed(&rig.pool, &donor.request(&recipient)),
+        Err(LeaseError::BackingMismatch)
+    ));
     // The catalog sidecar is internal, so publishing still works with no
     // volume present.
     publish_seed_catalog(&rig.pool, &held_catalog).expect("publish catalog");
@@ -1193,7 +1179,7 @@ fn a_removable_pool_is_skipped_before_any_payload_access() {
 }
 
 #[test]
-fn a_removable_pool_reports_the_unsupported_skip_before_donor_lock_outcomes() {
+fn a_removable_pool_still_reports_donor_lock_custody_before_the_payload() {
     reset_hooks();
     let rig = Rig::new("removable-before-lock");
     let donor = make_donor(&rig, "a");
@@ -1201,19 +1187,18 @@ fn a_removable_pool_reports_the_unsupported_skip_before_donor_lock_outcomes() {
     let absent_mount = rig.fx.path.join("absent-volume");
     rewrite_removable_backend_injected(&rig.pool, &absent_mount).expect("rewrite backend");
 
-    // A missing donor lock would be a donor-lock skip on an internal pool; the
-    // removable reason must win.
+    // The donor's custody is read before the payload: a missing lock is still
+    // the precise skip, never a volume refusal or a cold fallback.
     fs::remove_file(rig.donor_lock(donor.record_id)).expect("remove donor lock");
     let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
     assert_eq!(
         outcome,
         SeedOutcome::Skipped(SeedSkip {
-            reason: SeedSkipReason::RemovablePoolUnsupported
+            reason: SeedSkipReason::DonorLockMissing
         })
     );
 
-    // A held donor lock would be a donor-busy skip; the removable reason still
-    // wins.
+    // A held donor lock is the donor-busy skip, unchanged by the backend.
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1225,7 +1210,7 @@ fn a_removable_pool_reports_the_unsupported_skip_before_donor_lock_outcomes() {
     assert_eq!(
         outcome,
         SeedOutcome::Skipped(SeedSkip {
-            reason: SeedSkipReason::RemovablePoolUnsupported
+            reason: SeedSkipReason::DonorBusy
         })
     );
 }
@@ -1886,6 +1871,81 @@ fn a_missing_walk_root_is_an_unreadable_gap() {
     );
     assert_eq!(outcome.gap, Some(SeedWalkGap::Unreadable));
     assert_eq!(outcome.entries, 0);
+}
+
+#[test]
+fn seed_skips_a_vanished_donor_slot_before_any_recipient_write() {
+    reset_hooks();
+    let rig = Rig::new("donor-vanished");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let donor_slot = donor
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .expect("donor slot dir")
+        .to_path_buf();
+    fs::remove_dir_all(&donor_slot).expect("evict donor slot");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("cold skip");
+    assert!(
+        matches!(
+            outcome,
+            SeedOutcome::Skipped(SeedSkip {
+                reason: SeedSkipReason::DonorPayloadMissing
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+    release_injected(&rig.pool, &grant.lease_id).expect("release recipient");
+}
+
+#[test]
+fn seed_skips_a_missing_donor_slot_folder_before_any_recipient_write() {
+    reset_hooks();
+    let rig = Rig::new("donor-folder-missing");
+    let donor = make_donor_in_folder(&rig, "a", "donor-folder");
+    let (grant, recipient) = lease_recipient_in_folder(&rig, "a", "recipient-folder");
+    let folder = rig.pool.join("payload").join("slots").join("donor-folder");
+    fs::remove_dir_all(&folder).expect("remove donor folder");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("cold skip");
+    assert!(
+        matches!(
+            outcome,
+            SeedOutcome::Skipped(SeedSkip {
+                reason: SeedSkipReason::DonorPayloadMissing
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+    release_injected(&rig.pool, &grant.lease_id).expect("release recipient");
+}
+
+#[test]
+fn seed_refuses_an_existing_foreign_donor_slot_path() {
+    reset_hooks();
+    let rig = Rig::new("donor-existing-foreign");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let donor_slot = donor
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .expect("donor slot dir")
+        .to_path_buf();
+    let outside = rig.fx.dir("outside-donor");
+    fs::remove_dir_all(&donor_slot).expect("remove donor slot");
+    symlink(&outside, &donor_slot).expect("foreign donor link");
+    let refused = seed(&rig.pool, &donor.request(&recipient));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
+    release_injected(&rig.pool, &grant.lease_id).expect("release recipient");
 }
 
 #[test]

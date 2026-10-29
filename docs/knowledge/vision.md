@@ -243,18 +243,20 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   build scripts whose outputs record absolute paths rerun.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
-  The concrete protocol, its partial-association limit and its unproven
-  status are in the [proposed cold-slot seeding design](contracts/cold-slot-seeding.md).
+  The concrete protocol, its partial-association limit and its implementation
+  record are in the [cold-slot seeding design](contracts/cold-slot-seeding.md).
 - **Approved, not built:**
-  - cold-slot seeding from matching units, conservative first, with
-    one-use temp workspaces handled as seeded, first-evicted slots
-    ([proposed design](contracts/cold-slot-seeding.md), unimplemented and not
-    frozen);
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).
+- **Implemented, native held: cold-slot seeding** (oxide#169): a fresh slot
+  is warmed once from matching plain registry library compile units of an idle
+  donor on the same volume, removable pools included, with Cargo still judging
+  freshness; default-on, with natives held. The
+  [design](contracts/cold-slot-seeding.md) owns the protocol and
+  `effigy rust:cold-slot-seeding` its 24-case proof.
 - **Implemented, native held** (Tom, 2026-10-25): recorded per-slot accounting
   replaces whole-payload admission walks. Closed-slot records are bound to
   generation/incarnation; missing or invalid records require bounded slot

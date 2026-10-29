@@ -364,19 +364,27 @@ fn test_pause_with(point: &str, detail: &str) {
     let _ = (point, detail);
 }
 
-/// Opt-in is deliberately held until the pinned Cargo layout is qualified.
-const COLD_SEED_QUALIFIED: bool = false;
+/// The pinned Cargo layout is qualified (oxide#169). The one-line flip of this
+/// constant is the enablement: seeding is on by default once it is true, and
+/// `OXIDE_COLD_SEED=0` is the opt-out.
+const COLD_SEED_QUALIFIED: bool = true;
 
 fn cold_seed_active(value: Option<&std::ffi::OsStr>) -> bool {
-    COLD_SEED_QUALIFIED && value == Some(std::ffi::OsStr::new("1"))
+    cold_seed_active_when(COLD_SEED_QUALIFIED, value)
+}
+
+/// Once qualified, seeding is enabled by default and only the exact value `0`
+/// opts out. Before qualification it is never active.
+fn cold_seed_active_when(qualified: bool, value: Option<&std::ffi::OsStr>) -> bool {
+    qualified && value != Some(std::ffi::OsStr::new("0"))
 }
 
 fn cold_seed_qualification_notice(value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
     cold_seed_notice_when(COLD_SEED_QUALIFIED, value)
 }
 
-/// The skip notice is only for an opt-in that the qualification hold refuses.
-/// Once #169 flips the constant, an enabled seed must not print it.
+/// The skip notice is only for an opt-in that a pre-qualification hold refuses.
+/// A qualified build prints no notice for `1` or an unset value; `0` is silent.
 fn cold_seed_notice_when(qualified: bool, value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
     (!qualified && value == Some(std::ffi::OsStr::new("1")))
         .then_some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
@@ -660,7 +668,8 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         return Ok(stop_for_admission());
     }
     // The seed point is after the output binding and before any recipient
-    // scratch or writer. The qualification gate is false in this slice.
+    // scratch or writer. The gate is the default-on qualification constant
+    // with `OXIDE_COLD_SEED=0` as the opt-out.
     let mut production = None;
     if cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref()) {
         match seed_sources::Production::prepare(&invocation, &key.checkout, &held, &store) {
@@ -1815,6 +1824,10 @@ fn print_pools(
                 };
                 let header = format!("removable pool: {}", status.lines[0]);
                 print_pool(store, &header, &status.lines[1..], report, mode)?;
+                let seed_enabled = cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref());
+                if let Some(line) = seed_summary::recorded_if_enabled(&store.pool, seed_enabled) {
+                    println!("{line}");
+                }
             }
             Section::RemovableUnread(reason) => {
                 let Some(status) = &removable else {
@@ -2491,21 +2504,28 @@ mod tests {
     use std::ffi::OsStr;
 
     #[test]
-    fn cold_seed_opt_in_is_qualification_held() {
-        assert!(!cold_seed_active(None));
-        assert!(!cold_seed_active(Some(OsStr::new("1"))));
-        assert_eq!(cold_seed_qualification_notice(None), None);
-        assert_eq!(cold_seed_qualification_notice(Some(OsStr::new("0"))), None);
-        assert_eq!(
-            cold_seed_qualification_notice(Some(OsStr::new("1"))),
-            Some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
-        );
-        // The flip to qualified (#169) removes the notice with the hold.
-        assert_eq!(cold_seed_notice_when(true, Some(OsStr::new("1"))), None);
+    fn cold_seed_gate_is_off_before_qualification_and_default_on_after() {
+        // Before the one-line qualification flip: never active, and an
+        // explicit opt-in gets the hold's notice instead.
+        assert!(!cold_seed_active_when(false, None));
+        assert!(!cold_seed_active_when(false, Some(OsStr::new("1"))));
+        assert!(!cold_seed_active_when(false, Some(OsStr::new("0"))));
         assert_eq!(
             cold_seed_notice_when(false, Some(OsStr::new("1"))),
-            cold_seed_qualification_notice(Some(OsStr::new("1")))
+            Some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
         );
+        assert_eq!(cold_seed_notice_when(false, None), None);
+        assert_eq!(cold_seed_notice_when(false, Some(OsStr::new("0"))), None);
+        // After the flip: enabled by default (and for `1`), and only the exact
+        // `0` opts out. No notice is printed in any qualified case.
+        assert!(cold_seed_active_when(true, None));
+        assert!(cold_seed_active_when(true, Some(OsStr::new("1"))));
+        assert!(!cold_seed_active_when(true, Some(OsStr::new("0"))));
+        assert_eq!(cold_seed_notice_when(true, None), None);
+        assert_eq!(cold_seed_notice_when(true, Some(OsStr::new("1"))), None);
+        assert_eq!(cold_seed_notice_when(true, Some(OsStr::new("0"))), None);
+        // The outer gate is exactly the constant this slice flips last.
+        assert_eq!(cold_seed_active(None), COLD_SEED_QUALIFIED);
     }
 
     #[test]

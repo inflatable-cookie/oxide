@@ -15,18 +15,75 @@ qualification, default-pool creation outside tests, installation (binary or
 skill) or consumer-adoption authority. Other sections
 state the target design.
 
-## Cold-slot seeding qualification hold
+## Cold-slot seeding
 
-Cold-slot seeding is off. Setting `OXIDE_COLD_SEED=1` reports that seeding is
-not yet qualified on this Cargo; it does not seed, produce catalogs, or write
-seed sidecars. The separate qualification proof must pass before the opt-in can
-be honoured. With the variable unset, the existing command behaviour is
-unchanged. Merge-base identity for that hold lives in
-`tests/cold_seed_default_off.rs`, behind `#[ignore]`; `effigy rust:seed-default-off`
-stages the merge-base `oxide` into owned scratch, exports
-`OXIDE_SEED_BASELINE_BINARY`, and runs those tests. They are not part of
-`effigy test rust`. The [cold-slot seeding contract](cold-slot-seeding.md) owns the
-proposed transaction and qualification requirements.
+Cold-slot seeding is implemented in the unpublished `oxide` (`oxide#167`,
+`oxide#168`, `oxide#169`) and **enabled by default**: this slice's one-line
+qualification flip is in the merge head. `OXIDE_COLD_SEED=0` is the opt-out;
+the variable was never a permanent switch. A fresh slot of a supported command is warmed once,
+before any child exists, by cloning matching dependency units from an idle
+donor slot on the same pool under the existing journaled custody: the donor
+record lock and pool lock are held, every artifact, `.d` and fingerprint file
+is re-hashed against the generation-bound catalog, and the recipient publishes
+only after a complete ownership-clean post-clone walk. v1 offers **only plain
+registry library compile units**: nothing is offered for a non-leaf package, a
+proc macro, a build-script compile/run unit, an outside-root/`OUT_DIR` `.d`
+input, a Git/Git-revision or path source, an unprovable `.d` join, a differing
+producer context or a run-only fingerprint. A failure before the first
+recipient write skips to the normal cold build; every later clone, digest or
+custody fault refuses, releases the slot with no trusted origin and leaves the
+untrusted generation to the ordinary journaled whole-slot eviction. A failed
+post-clone walk publishes nothing and cold-builds in a newly admitted slot.
+This adds no grant, no second lease, no deletion path and no new sidecar
+format beyond the bounded `oxide-managed/seeds/` catalog/attempt/last
+documents, and it never mutates the donor.
+
+The bounded skip message names an ambiguous dependency before a generic
+non-leaf root-package rejection. A command with no seed plan bypasses only the
+seed reserve gate: the ordinary Cargo reserve watchdog still runs and can stop
+its child. Catalog rejection counts group a normalized-name collision into one
+row; an omitted `units` means unknown, while an explicit zero means measured
+with no candidates.
+
+Both provided backends seed: an internal `directory-budget-v1` pool's start
+gate is the host reserve (20 GiB + 2 GiB margin, sampled before the durable
+marks and monitored during the clone), and an `apfs-volume-v1` removable pool
+re-verifies its registration's mount/volume-UID binding and reserve before the
+marks and monitors that binding at the watchdog cadence. A missing
+`clonefile`, an unknown source identity or a lost volume follows the existing
+refusal, removal and quarantine rules.
+
+The qualification apparatus is one fixed 24-case script,
+`scripts/test-cold-slot-seeding.py`:
+`effigy rust:cold-slot-seeding` and `:diagnostic` run it under the qualified
+shared supervisor with the internal-placement exception
+(`bd357a4c`), **600 s** (Tom's decision `1527723f`, this selector and its
+diagnostic twin only), 512 MiB monitored scratch and one owned 128 MiB image;
+`effigy proof:cold-slot-seeding:test` runs only its pure apparatus. Case 21
+compares canonical dep-info and workspace source paths, with relative paths
+resolved from the workspace and an owned-alias pure regression. The earlier
+480 s diagnostic at `86208d1` failed case 21, aborted case 22 at its work
+cutoff and left cases 23–24 unexecuted; it remains historical with no counted
+credit or complete fit. The new 600 s bound retains the 30 s margin and all
+other safeguards. A fresh exact-head source review must precede the next
+separately owner-activated diagnostic. The
+uncounted diagnostic, one counted author native and one separately activated
+independent reviewer native are owner-activated at the exact head; cases 01
+(non-leaf SQLite), 03/06 (Git/build-script/`OUT_DIR` seedctl) and 05 (proc
+macro) are negative controls, and positives are plain registry libraries. The
+[tier is ELEVATED](../vision.md#validation-policy) because a post-clone
+abandon retains an untrusted generation that the ordinary journaled eviction
+later deletes and one case writes removable media. The merge stays held until
+those natives pass at the exact merge head, because the default-on front door
+is product behaviour and not only proof input. The
+[cold-slot seeding contract](cold-slot-seeding.md) owns the transaction, its
+partial-association limit and the proof plan.
+
+The default-off merge-base identity checks remain in
+`tests/cold_seed_default_off.rs`, behind `#[ignore]`; the separate
+`effigy rust:seed-default-off` selector stages the qualification-held merge-base
+`oxide` and exports `OXIDE_SEED_BASELINE_BINARY`. They are not part of
+`effigy test rust` and do not qualify the default-on candidate.
 
 ## Shape
 

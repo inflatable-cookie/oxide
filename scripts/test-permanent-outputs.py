@@ -2889,6 +2889,25 @@ def require_case_resources(*, peak_bytes: int, low_bytes: int | None, case: str)
         )
 
 
+def where_of(error):
+    """Bounded innermost traceback function and line for an abort record.
+
+    The original exception is preserved; this only augments the diagnostic.
+    No traceback, a malformed one or a frame lookup failure reports `?`.
+    """
+    try:
+        traceback = error.__traceback__
+        for _ in range(64):
+            if traceback is None or traceback.tb_next is None:
+                break
+            traceback = traceback.tb_next
+        if traceback is None:
+            return "?"
+        return f"{traceback.tb_frame.f_code.co_name}:{traceback.tb_lineno}"[:120]
+    except BaseException:
+        return "?"
+
+
 def collect_cases(
     cases, *, diagnostic: bool, work_left, after_case=None, note=None, record=None
 ):
@@ -2962,7 +2981,10 @@ def collect_cases(
                 # case-oracle failure, so it aborts like the custody seam below.
                 if not diagnostic:
                     raise
-                result = {"result": "aborted", "fault": f"unexpected {fault!r}"[:600]}
+                result = {
+                    "result": "aborted",
+                    "fault": f"unexpected {fault!r} at {where_of(fault)}"[:600],
+                }
             # Custody and the run's own resource samples are checked after the
             # case, whatever its own oracle did.
             if after_case is not None and result["result"] != "aborted":

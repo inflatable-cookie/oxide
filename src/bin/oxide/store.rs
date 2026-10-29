@@ -1296,6 +1296,21 @@ pub(crate) fn source_failure(reason: &'static str) -> SourceFailure {
     }
 }
 
+/// The post-Cargo source may stand in for a pre-Cargo entry only when every
+/// recorded identity fact is unchanged. A newly appearing source has no
+/// pre-Cargo entry and is accepted after the release-time unchanged-since check.
+fn source_identity_matches(
+    previous: &crate::seed_plan::VerifiedSource,
+    post: &crate::seed_plan::VerifiedSource,
+) -> bool {
+    previous.package == post.package
+        && previous.kind == post.kind
+        && previous.root == post.root
+        && previous.verification_root == post.verification_root
+        && previous.tree_digest == post.tree_digest
+        && previous.proc_macro == post.proc_macro
+}
+
 /// Outcome of one pre-child seed attempt. An abandoned recipient must be
 /// released untrusted and the command admitted normally again.
 pub(crate) enum SeedRun {
@@ -1367,12 +1382,7 @@ impl Store {
             held_seed_attempt, publish_seed_catalog, SeedAttemptState, SeedCatalog, SeedPackage,
             SeedRecipient, SeedSourceRoot,
         };
-        if !successful
-            || origin.is_none()
-            || held.reused
-            || !matches!(held.prior, Prior::Fresh)
-            || self.backend != Backend::DirectoryBudget
-        {
+        if !successful || origin.is_none() || held.reused || !matches!(held.prior, Prior::Fresh) {
             return Ok(());
         }
         let recipient = SeedRecipient {
@@ -1400,20 +1410,26 @@ impl Store {
         let rejected = classifier.rejections(profile, &lock.rejected);
         let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(4));
         let mut packages = Vec::new();
-        for source in before {
-            if !lock.eligible.iter().any(|entry| entry == &source.package) {
+        // The catalog is built from the POST-Cargo verified sources. A first
+        // build extracts a registry or Git source only while Cargo runs, so a
+        // pre-Cargo pass alone can never catalogue it (§4.1/§4.4: the closed
+        // producing epoch is the release-time evidence). An entry that also
+        // appeared before Cargo must still have the same kind, roots, digest
+        // and macro flag; a changed source is skipped, never catalogued. A
+        // newly appearing source is accepted only after the same
+        // unchanged-since check below.
+        for post in after {
+            if !lock.eligible.iter().any(|entry| entry == &post.package) {
                 continue;
             }
-            let Some(post) = after.iter().find(|post| {
-                post.package == source.package
-                    && post.kind == source.kind
-                    && post.root == source.root
-                    && post.verification_root == source.verification_root
-                    && post.tree_digest == source.tree_digest
-                    && post.proc_macro == source.proc_macro
-            }) else {
-                continue;
-            };
+            if let Some(previous) = before
+                .iter()
+                .find(|previous| previous.package == post.package)
+            {
+                if !source_identity_matches(previous, post) {
+                    continue;
+                }
+            }
             if !pass.unchanged_since(&post.verification_root, post.kind, started) {
                 continue;
             }
@@ -1512,11 +1528,6 @@ impl Store {
             seed_candidates, write_seed_attempt, write_seed_last, SeedAttempt, SeedAttemptState,
             SeedBucket, SeedLast, SeedOutcome, SeedRecipient, ATTEMPT_SCHEMA,
         };
-        if self.backend == Backend::ApfsVolume {
-            return Ok(SeedRun::Skipped(
-                "seeding not yet supported on a removable pool",
-            ));
-        }
         if held.reused || !matches!(held.prior, Prior::Fresh) {
             return Ok(SeedRun::Skipped("recipient not fresh"));
         }
@@ -1556,6 +1567,12 @@ impl Store {
         ) else {
             return Ok(SeedRun::Skipped("no eligible donor"));
         };
+        // Debug-only proof pause, ordered between call 1 (the candidate read)
+        // and call 2 (the donor pin). Absent from release builds and armed only
+        // under the shared proof supervisor's own layout, so a competing
+        // command can lease or evict the selected donor while this one waits.
+        #[cfg(debug_assertions)]
+        seed_proof_pause("between-calls");
         let rejected = candidates
             .candidates
             .iter()
@@ -1564,15 +1581,29 @@ impl Store {
             .catalog
             .rejected
             .clone();
-        let watchdog = Watchdog::for_pool(&self.payload);
-        let trigger = HOST_RESERVE_BYTES + crate::watchdog::MARGIN_BYTES;
-        let first = watchdog.seed_sample();
-        if first.is_none_or(|bytes| bytes < trigger) {
-            return Err(format!(
-                "seed reserve stop: available space {first:?}, trigger {trigger} bytes"
-            ));
-        }
-        let mut minimum = first.unwrap();
+        // The seed point's start gate (§8.3). The internal pool samples the
+        // host reserve that will later stop its Cargo; a removable pool
+        // re-verifies its mount/volume-UID binding and the registration's
+        // reserve (the existing admission rule) and then monitors the binding.
+        // A command with nothing to seed never reaches here.
+        let (watchdog, trigger) = match self.backend {
+            Backend::DirectoryBudget => {
+                let watchdog = Watchdog::for_pool(&self.payload);
+                let trigger = HOST_RESERVE_BYTES + crate::watchdog::MARGIN_BYTES;
+                let first = watchdog.seed_sample();
+                if first.is_none_or(|bytes| bytes < trigger) {
+                    return Err(format!(
+                        "seed reserve stop: available space {first:?}, trigger {trigger} bytes"
+                    ));
+                }
+                (watchdog, Some(trigger))
+            }
+            Backend::ApfsVolume => {
+                let mount = self.seed_removable_gate()?;
+                (Watchdog::for_volume(&mount), None)
+            }
+        };
+        let mut minimum: Option<u64> = None;
         let mut attempt = SeedAttempt {
             schema: ATTEMPT_SCHEMA.to_owned(),
             store_id: held.store_id.clone(),
@@ -1605,17 +1636,20 @@ impl Store {
             }
             steps = 0;
             next_sample = Instant::now() + crate::watchdog::INTERVAL;
-            match watchdog.seed_sample() {
-                Some(bytes) if bytes >= trigger => {
-                    minimum = minimum.min(bytes);
+            match (trigger, watchdog.seed_sample()) {
+                (Some(trigger), Some(bytes)) if bytes >= trigger => {
+                    minimum = Some(minimum.map_or(bytes, |low| low.min(bytes)));
                     false
                 }
-                Some(bytes) => {
-                    minimum = minimum.min(bytes);
+                (Some(_), Some(bytes)) => {
+                    minimum = Some(minimum.unwrap_or(bytes).min(bytes));
                     stopped = true;
                     true
                 }
-                None => {
+                // A removable pool has no space trigger: only a failed
+                // binding (a removal or remount) stops the seed.
+                (None, Some(_)) => false,
+                (Some(_), None) | (None, None) => {
                     stopped = true;
                     true
                 }
@@ -1688,9 +1722,17 @@ impl Store {
                 write_seed_attempt(&self.pool, &attempt)
                     .map_err(|error| lease_error("cannot record stopped seed", &error))?;
                 if stopped {
-                    return Err(format!(
-                        "seed reserve stop: minimum {minimum} bytes, trigger {trigger} bytes"
-                    ));
+                    let minimum =
+                        minimum.map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string());
+                    return match trigger {
+                        Some(trigger) => Err(format!(
+                            "seed reserve stop: minimum {minimum} bytes, trigger {trigger} bytes"
+                        )),
+                        None => Err(format!(
+                            "seed volume stop: the removable volume under {} is gone or was remounted",
+                            self.payload.display()
+                        )),
+                    };
                 }
                 if admission_stopped {
                     return Err("seed admission deadline expired".to_owned());
@@ -1698,6 +1740,20 @@ impl Store {
                 Err(lease_error("cannot seed slot", &error))
             }
         }
+    }
+
+    /// The seed's removable start gate: the registration read from this
+    /// removable pool's paired internal control, re-verified for its
+    /// mount/volume-UID binding and its free-space reserve (§8.3).
+    fn seed_removable_gate(&self) -> Result<PathBuf, String> {
+        let sibling = self
+            .sibling
+            .as_ref()
+            .ok_or("the removable pool has no paired internal control")?;
+        let registration = crate::removable::read_registration(&sibling.control)?
+            .ok_or("the removable pool has no registration")?;
+        crate::removable::verified_registration(&registration)?;
+        Ok(registration.mount_point)
     }
 
     /// Open the pool, creating it on first use above the host reserve. A
@@ -5569,6 +5625,31 @@ pub(crate) fn statfs(path: &Path) -> Option<libc::statfs> {
     (result == 0).then(|| unsafe { sample.assume_init() })
 }
 
+/// Debug-only proof pause (absent from release builds): under the shared proof
+/// supervisor's layout, `OXIDE_TEST_SEED_PAUSE=<point>:<gate>` writes
+/// `<gate>.<point>-<pid>` and waits (at most 120 s) for `<gate>`.
+#[cfg(debug_assertions)]
+fn seed_proof_pause(point: &str) {
+    if oxide_storage::proof::evidence().is_none() {
+        return;
+    }
+    let Some(gate) = std::env::var("OXIDE_TEST_SEED_PAUSE")
+        .ok()
+        .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
+    else {
+        return;
+    };
+    let marker = format!("{gate}.{point}-{}", std::process::id());
+    let staged = format!("{gate}.staging-{point}-{}", std::process::id());
+    if std::fs::write(&staged, b"paused").is_ok() {
+        let _ = std::fs::rename(&staged, &marker);
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !Path::new(&gate).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn lease_error(context: &str, error: &LeaseError) -> String {
     format!("{context}: {} ({error})", error.reason())
 }
@@ -7299,8 +7380,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn seed_removable_and_empty_allowlist_skip_without_side_effects() {
-        let (root, mut store, key) = seed_fixture();
+    fn post_cargo_source_identity_rejects_a_changed_source_and_accepts_new_ones() {
+        use crate::seed_plan::VerifiedSource;
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = VerifiedSource {
+            package: package.clone(),
+            tree_digest: "b".repeat(64),
+            kind: oxide_storage::lease::managed::SeedSourceKind::Registry,
+            root: "/source".into(),
+            verification_root: "/source".into(),
+            proc_macro: false,
+        };
+        assert!(source_identity_matches(&source, &source));
+        let mut changed = source.clone();
+        changed.tree_digest = "c".repeat(64);
+        assert!(!source_identity_matches(&source, &changed));
+        let mut changed = source.clone();
+        changed.root = "/other".into();
+        assert!(!source_identity_matches(&source, &changed));
+        let mut changed = source.clone();
+        changed.proc_macro = true;
+        assert!(!source_identity_matches(&source, &changed));
+        let mut changed = source.clone();
+        changed.kind = oxide_storage::lease::managed::SeedSourceKind::Git;
+        assert!(!source_identity_matches(&source, &changed));
+    }
+
+    #[test]
+    fn seed_with_an_empty_allowlist_skips_without_side_effects() {
+        let (root, store, key) = seed_fixture();
         let held = lease(&store, &key, None).expect("fresh lease");
         let lock = crate::seed_lock::analyze(b"version = 4\n").unwrap();
         let before = fs::read(store.control.join("state.json")).unwrap();
@@ -7312,20 +7423,26 @@ pub(crate) mod tests {
             result,
             Ok(SeedRun::Skipped("no eligible locked packages"))
         ));
-        store.backend = Backend::ApfsVolume;
-        let result = store.seed(&held, &producer, &lock, |_| {
-            panic!("source verification ran")
-        });
-        assert!(matches!(
-            result,
-            Ok(SeedRun::Skipped(
-                "seeding not yet supported on a removable pool"
-            ))
-        ));
         assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
         assert!(!store.control.join("seeds").exists());
-        store.backend = Backend::DirectoryBudget;
         store.release(held, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_removable_store_without_its_registration_refuses_its_start_gate() {
+        // §8.3: the removable start gate re-verifies the registration's
+        // mount/volume-UID binding and reserve inside the admission lifetime.
+        // A removable store with no paired internal control cannot prove that,
+        // so its gate refuses before the attempt record or untrusted origin.
+        let (root, mut store, _key) = seed_fixture();
+        store.backend = Backend::ApfsVolume;
+        let refused = store.seed_removable_gate();
+        assert!(matches!(
+            refused,
+            Err(ref reason) if reason.contains("no paired internal control")
+        ));
+        assert!(!store.control.join("seeds").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7422,7 +7539,7 @@ pub(crate) mod tests {
             source_failure("git source verification closure unknown"),
             SourceFailure::Refuse(reason) if reason == "git source verification closure unknown"
         ));
-        let (root, store, donor_key, lock, producer) = front_door_donor();
+        let (root, store, _donor_key, lock, producer) = front_door_donor();
         let recipient_checkout = root.join("recipient");
         fs::create_dir(&recipient_checkout).unwrap();
         let recipient_key = SlotKey {
