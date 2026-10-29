@@ -66,8 +66,9 @@ pub const LEGACY_MAX_SLOTS: usize = 128;
 /// The measured states this writer reaches on its **ordinary eviction path**
 /// from a fresh pool are reported separately: the raised-ceiling
 /// representation at `MAX_SLOTS` with every bounded field and numeric field at
-/// its maximum is 4,213,726 bytes all-idle, and 5,624,335 bytes with this
-/// writer's maximal single `DeletionJournal` — 2,764,273 bytes below the cap.
+/// its maximum is 4,213,726 bytes all-idle, and 5,625,456 bytes with this
+/// writer's maximal single `DeletionJournal` on an `Evicting` record that also
+/// keeps its closed observation — 2,763,152 bytes below the cap.
 /// Ordinary evictions go through `retire_idle_slot`, which refuses while
 /// reconciliation is blocked or any journal is outstanding, so an admission
 /// starts at most one journal. **Recovery is a second journal path**: every
@@ -79,11 +80,11 @@ pub const LEGACY_MAX_SLOTS: usize = 128;
 /// is retried on the next open. An earlier write can still have left more than
 /// one such journal in a pool, and the reader accepts any otherwise-valid
 /// ledger below this cap. A write above the cap is refused, so a durable
-/// ledger never exceeds it; the 5,624,335-byte state is what this writer
-/// reaches on its ordinary path. The front door's admission gate makes the
-/// version-8 control fence durable before any locked open it performs
-/// (oxide#177, fence first), so recovery, journal starts and ledger writes are
-/// all preceded by the hand-off fence. A maximal journal
+/// ledger never exceeds it; the 5,625,456-byte state is what this writer
+/// reaches on its ordinary path. The front door's admission gate, and the
+/// library's own locked open before reconciliation, make the version-8 control
+/// fence durable (oxide#177, fence first), so recovery, journal starts and
+/// ledger writes are all preceded by the hand-off fence. A maximal journal
 /// is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture records and
 /// `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a chain of at
 /// most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the enforced
@@ -828,24 +829,190 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
 }
 
 fn read_private_file(path: &Path) -> Result<Vec<u8>, LeaseError> {
+    read_private_file_bounded(path, MAX_LEDGER_BYTES)
+}
+
+fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseError> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
         || metadata.permissions().mode() & 0o077 != 0
         || metadata.uid() != current_uid()
-        || metadata.len() > MAX_LEDGER_BYTES
+        || metadata.len() > max
     {
         return Err(LeaseError::UnknownAccounting);
     }
     let file = File::open(path).map_err(io_error)?;
     let mut bytes = Vec::new();
-    file.take(MAX_LEDGER_BYTES + 1)
+    file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    if bytes.len() as u64 > MAX_LEDGER_BYTES {
+    if bytes.len() as u64 > max {
         return Err(LeaseError::LedgerExhausted);
     }
     Ok(bytes)
+}
+
+/// The front door's raised-ceiling control fence (oxide#177, Oxide Supervisor
+/// ruling 4c9984a1). The library writes only these fields and the version,
+/// preserving every other field, so a locked [`pool::Pool::open`] can raise
+/// the fence before it reconciles a recorded deletion. `src/bin/oxide/store.rs`
+/// owns the same values; its constants alias these so the two writers cannot
+/// drift.
+pub const CONTROL_FENCE_VERSION: u32 = 8;
+pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
+pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
+pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
+/// The control state's owner-only size cap, matching the front door's
+/// `MAX_STATE_BYTES`. The fence only adds fields, so an otherwise-valid
+/// document stays within it.
+const CONTROL_STATE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+const CONTROL_FENCES: [(&str, &str); 3] = [
+    ("recorded_accounting", CONTROL_RECORDED_ACCOUNTING_FENCE),
+    ("eviction_accounting", CONTROL_EVICTION_ACCOUNTING_FENCE),
+    ("slot_ceiling", CONTROL_SLOT_CEILING_FENCE),
+];
+
+/// Raise a front-door control state to the current fence version before a
+/// locked pool open reconciles a recorded deletion (oxide#177; fence first).
+///
+/// The caller already holds the pool lock. An absent control state means the
+/// pool has never been used by the front door (`oxide-managed/state.json` is
+/// its document), so a library fixture has nothing to fence. A state already
+/// at the fence version with every fence is not rewritten. A newer version, an
+/// unknown fence value or a non-numeric version refuses: this binary never
+/// downgrades a document a successor wrote. The admission lock is taken
+/// non-blocking because the front door's order is admission then pool; if
+/// another writer holds it, the open refuses instead of reconciling under an
+/// unfenced control. Passive snapshots never call this.
+pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
+    let control = pool.join(MANAGED_NAME);
+    let path = control.join("state.json");
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > CONTROL_STATE_MAX_BYTES
+    {
+        return Err(LeaseError::UnsafePath(
+            "control state must be a private regular file",
+        ));
+    }
+    let bytes = read_private_file_bounded(&path, CONTROL_STATE_MAX_BYTES)?;
+    if control_state_is_fenced(&bytes)? {
+        return Ok(());
+    }
+    let admission = open_control_admission(&control)?;
+    // Re-read under the writer lock: another command may have fenced while
+    // this one waited for the pool lock.
+    let bytes = read_private_file_bounded(&path, CONTROL_STATE_MAX_BYTES)?;
+    if control_state_is_fenced(&bytes)? {
+        drop(admission);
+        return Ok(());
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    let version = value
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if version > u64::from(CONTROL_FENCE_VERSION) {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let object = value.as_object_mut().ok_or(LeaseError::UnknownAccounting)?;
+    for (name, fence) in CONTROL_FENCES {
+        match object.get(name).and_then(|value| value.as_str()) {
+            Some(existing) if existing == fence => {}
+            Some(_) => return Err(LeaseError::UnknownAccounting),
+            None => {
+                object.insert(name.to_owned(), serde_json::Value::String(fence.to_owned()));
+            }
+        }
+    }
+    object.insert(
+        "version".to_owned(),
+        serde_json::Value::from(CONTROL_FENCE_VERSION),
+    );
+    let bytes = serde_json::to_vec(&value).map_err(|error| LeaseError::Io(error.to_string()))?;
+    if bytes.len() as u64 > CONTROL_STATE_MAX_BYTES {
+        return Err(LeaseError::LedgerExhausted);
+    }
+    persist_control_state(&path, &bytes)?;
+    drop(admission);
+    Ok(())
+}
+
+fn control_state_is_fenced(bytes: &[u8]) -> Result<bool, LeaseError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    let version = value
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if version > u64::from(CONTROL_FENCE_VERSION) {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    Ok(version == u64::from(CONTROL_FENCE_VERSION)
+        && CONTROL_FENCES
+            .iter()
+            .all(|(name, fence)| value.get(*name).and_then(|value| value.as_str()) == Some(*fence)))
+}
+
+fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
+    let path = control.join("admission.lock");
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(&path).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(LeaseError::UnsafePath(
+            "control admission lock must be a private regular file",
+        ));
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        return Err(io_error(error));
+    }
+    Ok(file)
+}
+
+fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
+    let parent = path
+        .parent()
+        .ok_or(LeaseError::InvalidInput("control state has no parent"))?;
+    let mut temp_name = String::from("state.tmp-");
+    temp_name.push_str(&random_hex(8)?);
+    let temp_path = parent.join(temp_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(&temp_path).map_err(io_error)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(io_error(error));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(io_error(error));
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)
 }
 
 fn random_hex(bytes: usize) -> Result<String, LeaseError> {

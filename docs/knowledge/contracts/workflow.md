@@ -3890,8 +3890,10 @@ Rules:
   table exceeds 128 carries the forward-only `capacity_policy: 4` fence; every
   mutating command's admission gate makes the version-8 `oxide.slots/256`
   control fence durable as its first write, before any locked pool open or
-  ledger write, so an older binary meets version 8 and hands off or refuses
-  before reading a policy-4 ledger or a multi-journal recovery ledger. It remeasures
+  ledger write, and a locked `Pool::open` raises the same fence itself under
+  the pool lock before reconciliation, so pre-Store entries and direct library
+  opens cannot journal first. An older binary meets version 8 and hands off or
+  refuses before reading a policy-4 ledger or a multi-journal recovery ledger. It remeasures
   after each deletion and refuses `Full` when only held slots remain. A
   removable pool whose own size is unknown takes the reserve/floor route
   instead of a byte-cap comparison. Held, uncertain, foreign and unmeasurable
@@ -3959,9 +3961,10 @@ Rules:
   slot, and default `status` at 256 walks nothing; it also crosses the legacy
   128-slot ceiling natively and requires `capacity_policy: 4` plus the
   version-8 `oxide.slots/256` control fence, which the admission gate writes
-  as the command's first durable effect before any locked open (which can
-  reconcile a recorded deletion), journal start or ledger write, so an older
-  binary meets version 8 and hands off or refuses before reading the ledger.
+  as the command's first durable effect and a locked `Pool::open` raises
+  itself before reconciliation, before any journal start or ledger write, so
+  an older binary meets version 8 and hands off or refuses before reading the
+  ledger.
   Worst-valid ledger/control serialization — including the reachable
   one-journal `Evicting` state — round-trip and oversized-field refusals are
   unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard

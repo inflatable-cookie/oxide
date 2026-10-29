@@ -97,7 +97,7 @@ pub(crate) const STATE_VERSION: u32 = 8;
 /// Version 7 is the eviction-accounting fence (oxide#175).
 const EVICTION_ACCOUNTING_STATE_VERSION: u32 = 7;
 /// Version 8 is the raised-ceiling fence (oxide#177).
-const SLOT_CEILING_STATE_VERSION: u32 = 8;
+const SLOT_CEILING_STATE_VERSION: u32 = oxide_storage::lease::CONTROL_FENCE_VERSION;
 /// Version 6 carries the one-use fence. A version-7 or version-8 document may
 /// also carry it, so presence requires at least this version and version 6
 /// requires the fence itself.
@@ -115,7 +115,8 @@ const OLDER_STATE_VERSION: u32 = 3;
 const LEGACY_FIELDS_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 /// The recorded-accounting fence value; see [`State::recorded_accounting`].
-pub(crate) const RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
+pub(crate) const RECORDED_ACCOUNTING_FENCE: &str =
+    oxide_storage::lease::CONTROL_RECORDED_ACCOUNTING_FENCE;
 /// The one-use fence value; see [`State::one_use_workspaces`]. A document
 /// carrying it is at version 6 or later, and a document with either
 /// `class` or `class_reason` in any record always carries it.
@@ -123,11 +124,13 @@ pub(crate) const ONE_USE_FENCE: &str = "oxide.one-use/1";
 /// The eviction-accounting fence value (oxide#175); see
 /// [`State::eviction_accounting`]. A document carrying it is at version 7 or
 /// later, and a version-7 or version-8 document always carries it.
-pub(crate) const EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
+pub(crate) const EVICTION_ACCOUNTING_FENCE: &str =
+    oxide_storage::lease::CONTROL_EVICTION_ACCOUNTING_FENCE;
 /// The raised-ceiling fence value (oxide#177); see
 /// [`State::slot_ceiling`]. A document carrying it is always at version 8,
-/// and a version-8 document always carries it.
-pub(crate) const SLOT_CEILING_FENCE: &str = "oxide.slots/256";
+/// and a version-8 document always carries it. The library's fence writer and
+/// this store use one value.
+pub(crate) const SLOT_CEILING_FENCE: &str = oxide_storage::lease::CONTROL_SLOT_CEILING_FENCE;
 /// UTF-8 byte caps for control-state fields (oxide#118).
 const MAX_IDENTITY_BYTES: usize = 64;
 const MAX_COMPATIBILITY_BYTES: usize = 64;
@@ -10115,7 +10118,13 @@ pub(crate) mod tests {
         fs::create_dir(&blocked).unwrap();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
 
-        // A version-5 control: the recorded-accounting fence, no raised fence.
+        downgrade_control_to_recorded_accounting(&store);
+        (root, store, key, blocked)
+    }
+
+    /// Rewrite a pool's control state as version 5 with only the
+    /// recorded-accounting fence, the shape a predecessor leaves behind.
+    fn downgrade_control_to_recorded_accounting(store: &Store) {
         let state_path = store.control.join("state.json");
         let mut state: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
@@ -10124,8 +10133,109 @@ pub(crate) mod tests {
         for field in ["slot_ceiling", "eviction_accounting", "one_use_workspaces"] {
             state.as_object_mut().expect("object").remove(field);
         }
-        write_raw_state(&store, &serde_json::to_vec(&state).unwrap());
-        (root, store, key, blocked)
+        write_raw_state(store, &serde_json::to_vec(&state).unwrap());
+    }
+
+    /// A pool with one idle slot made `Evicting` (no journal) whose root is
+    /// ready for the recovery preflight, and a version-5 control state.
+    /// Returns the fixture root, the store, the key and the ledger path.
+    fn ready_pending_deletion_fixture(label: &str) -> (PathBuf, Store, SlotKey, PathBuf) {
+        let (root, store, key) = class_fixture(label);
+        let held = lease(&store, &key, None).expect("a slot");
+        store.release(held, None).expect("idle slot");
+        let ledger_path = store.pool.join("ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let slot = ledger["slots"]
+            .as_array_mut()
+            .expect("slots")
+            .iter_mut()
+            .next()
+            .expect("one recorded slot");
+        slot["state"] = serde_json::json!("evicting");
+        slot["lease_id"] = serde_json::json!(null);
+        fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        downgrade_control_to_recorded_accounting(&store);
+        (root, store, key, ledger_path)
+    }
+
+    /// The real pre-Store entry (`open_removable` calls `ledger_view` before a
+    /// `Store` exists) fences version 8 before it reconciles a ready pending
+    /// deletion (oxide#177, ruling 4c9984a1). The fixture records a directory
+    /// backend, so the call itself ends in the backend refusal after the open.
+    #[test]
+    fn a_real_open_fences_version_eight_before_its_recovery_journal() {
+        let (root, store, _key, ledger_path) = ready_pending_deletion_fixture("open-fences");
+        assert_eq!(
+            store.load().unwrap().version,
+            RECORDED_ACCOUNTING_STATE_VERSION
+        );
+        let result = Store::open_removable(&store.pool, store.payload.clone(), 8);
+        assert!(
+            result.is_err(),
+            "a directory pool was accepted as a removable pool"
+        );
+        let state = store.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION, "the open did not fence v8");
+        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        assert!(
+            !after["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|slot| slot["id"] == 1),
+            "the pending record was not reconciled after the fence"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A fence-write failure in the real entry refuses before the recovery
+    /// journal or any ledger write: the bytes stay identical (oxide#177).
+    #[test]
+    fn a_failed_real_open_fence_leaves_the_ledger_byte_identical() {
+        let (root, store, _key, ledger_path) = ready_pending_deletion_fixture("open-fence-fails");
+        let ledger_bytes = fs::read(&ledger_path).unwrap();
+        let mode = fs::metadata(&store.control).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(&store.control, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = Store::open_removable(&store.pool, store.payload.clone(), 8);
+        assert!(result.is_err(), "a failed fence did not refuse the open");
+        assert_eq!(
+            fs::read(&ledger_path).unwrap(),
+            ledger_bytes,
+            "the ledger changed although the fence failed"
+        );
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let pending = after["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|slot| slot["id"] == 1)
+            .expect("the pending record was dropped");
+        assert_eq!(pending["state"], "evicting");
+        assert!(
+            pending.get("capture").is_none(),
+            "a journal started although the fence failed"
+        );
+        fs::set_permissions(&store.control, fs::Permissions::from_mode(mode)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `Store::ledger` is the `recover-interrupted` path's pre-admission read.
+    /// Its locked open fences before it reconciles, so the pending record is
+    /// concluded under an already version-8 control.
+    #[test]
+    fn a_ledger_read_fences_version_eight_before_its_recovery() {
+        let (root, store, _key, _ledger_path) = ready_pending_deletion_fixture("ledger-fences");
+        let view = store.ledger().expect("the ledger view");
+        assert!(
+            !view.slots.iter().any(|slot| slot.slot_id == "1"),
+            "the pending record was not reconciled"
+        );
+        assert_eq!(store.load().unwrap().version, STATE_VERSION);
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Fence first before recovery (oxide#177; Supervisor ruling 4c9984a1): a
@@ -10262,15 +10372,37 @@ pub(crate) mod tests {
             serde_json::json!(SLOT_CEILING_FENCE)
         );
 
-        // The same rule a binary that reads up to version 7 applies to
-        // version 8: an unknown version refuses in `load`, before any ledger
-        // read.
+        // A predecessor knows at most version 7, so it refuses this real
+        // version-8 document before reading the ledger. The model is local
+        // because the test build has no older binary; it mirrors the one rule
+        // such a reader applies (oxide#122).
+        assert!(
+            predecessor_accepts_control(&bytes).is_err(),
+            "a predecessor accepted the version-8 control"
+        );
+        // This binary applies the same rule to a version it does not know.
         let mut newer = document;
         newer["version"] = serde_json::json!(STATE_VERSION + 1);
         write_raw_state(&store, &serde_json::to_vec(&newer).unwrap());
         let error = store.load().unwrap_err();
         assert!(error.contains("unsupported version"), "{error}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Stand-in for an installed predecessor's strict control reader: it
+    /// accepts the versions it knows and refuses anything newer before reading
+    /// the ledger (oxide#122).
+    fn predecessor_accepts_control(bytes: &[u8]) -> Result<(), String> {
+        let document: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("unparseable control state: {error}"))?;
+        let version = document
+            .get("version")
+            .and_then(|version| version.as_u64())
+            .ok_or("the control state has no numeric version")?;
+        if version > u64::from(EVICTION_ACCOUNTING_STATE_VERSION) {
+            return Err("Oxide state has an unsupported version".to_owned());
+        }
+        Ok(())
     }
 
     /// A version-8 document always carries the raised-ceiling fence and a

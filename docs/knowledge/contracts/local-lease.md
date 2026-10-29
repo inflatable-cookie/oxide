@@ -586,7 +586,8 @@ cap including the widest accepted `lease_id`) measures 4,213,726 bytes, and
 with **one** maximal `DeletionJournal` (96 capture records and 32 mismatched
 captures, chains of 64 capture private names, name fields at `PATH_MAX` 1024
 bytes in `NAME_MAX` 255-byte components, `expected_mode` at the unrestricted
-u32 maximum, maximal sixfold escapes) it measures 5,624,335 bytes. The writer
+u32 maximum, maximal sixfold escapes) it measures 5,625,456 bytes on an
+`Evicting` record that retains its closed observation. The writer
 refuses an over-bound journal object per object and puts it back without
 deleting it; the reader refuses a ledger that carries one. Ordinary evictions go
 through `retire_idle_slot`, which refuses while reconciliation is blocked or any
@@ -602,9 +603,10 @@ cleared and restarted the same way. The journal is started only after
 `pending_root_ready` completes its bounded preflight, so a blocked or
 partially inventoried tree keeps its record and starts no journal; a failed
 deletion that did start one keeps it and is retried on the next open. The front
-door's admission gate makes the version-8 control fence durable before any
-locked open (see the fence paragraph), so recovery, journal starts and ledger
-writes are all preceded by the hand-off fence.
+door's admission gate and the library's own locked open make the version-8
+control fence durable before any reconciliation (see the fence paragraph), so
+recovery, journal starts and ledger writes are all preceded by the hand-off
+fence.
 
 **Worst-valid byte bound (oxide#177; Supervisor ruling 49081d79).**
 `MAX_LEDGER_BYTES` *is* the worst-valid byte bound: the read and write paths
@@ -615,11 +617,12 @@ independently and no journal count is bounded). No count rule is added and the
 cap does not grow for multi-journal states.
 
 The measured *ordinary-path writer-reachable* maxima are reported separately:
-the all-idle figure above, and 5,624,335 bytes with this writer's maximal single
-journal, leaving **2,764,273 bytes headroom** under the cap. An earlier write can still
-have left more than one journal in a pool, and the reader accepts any
+the all-idle figure above, and 5,625,456 bytes with this writer's maximal single
+journal on an `Evicting` record that retains its closed observation, leaving
+**2,763,152 bytes headroom** under the cap. An earlier write can still have
+left more than one journal in a pool, and the reader accepts any
 otherwise-valid ledger at or below this cap — a write above 8 MiB is refused —
-so the 5,624,335-byte state is what this writer reaches on its ordinary path. The journal name fields keep their enforced `PATH_MAX` 1024 bytes /
+so the 5,625,456-byte state is what this writer reaches on its ordinary path. The journal name fields keep their enforced `PATH_MAX` 1024 bytes /
 `NAME_MAX` 255-byte component bounds at writer and reader. Control
 state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
@@ -659,7 +662,14 @@ ruling 4c9984a1, fence first). The gate runs under the admission lock and
 before any locked `Pool::open` (which reconciles recorded deletions, can start
 a recovery journal and writes the ledger), so every such effect — ordinary
 eviction, recovery, journal start and ledger write — is preceded by the
-durable fence. An older binary with version ≤ 7 then hands off to a
+durable fence. A locked `Pool::open` also raises the same fence itself, under
+the pool lock, before its first reconciliation: pre-Store entries
+(`Store::open_at`, `Store::open_removable` and `recover-interrupted`'s ledger
+read) and a direct library open therefore cannot start a journal before it.
+That library path writes only the version and the three fence fields, taking
+the admission lock non-blocking and refusing rather than reconciling under
+contention; an absent control state (a library fixture) and passive
+`status`/snapshot readers are never fenced. An older binary with version ≤ 7 then hands off to a
 receipt-matching successor or refuses before it reads the ledger, so no
 predecessor ledger-size argument is needed. An already-version-8 control is
 not rewritten; a failed fence write refuses the command with no ledger or
@@ -741,7 +751,7 @@ current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The maximal
 writer-reachable ledger serialization — the measured one-journal `Evicting`
-state, 5,624,335 bytes with 2,764,273 bytes headroom under the 8 MiB
+state, 5,625,456 bytes with 2,763,152 bytes headroom under the 8 MiB
 worst-valid byte bound — escaped round-trip and oversized-field refusals are
 unit tests in `effigy test rust`, as is a
 fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
@@ -774,7 +784,8 @@ by the next revised write; oxide#177 adds the raised-ceiling policy 4 above
 128 slots, and oxide#175's eviction accounting is policy 3), and the front
 door's control `STATE_VERSION` is **8**, carrying the recorded-accounting,
 eviction-accounting and raised-ceiling fences written durably by the first
-mutating command's admission gate, before any locked open or library write. `Pool::recorded_total()` replaces the whole-payload admission walk
+mutating command's admission gate and, for a pre-Store entry, by the locked
+`Pool::open` itself before reconciliation. `Pool::recorded_total()` replaces the whole-payload admission walk
 with `pool_scope()` (a new `inventory::scope_directory` entry point with a
 ledger-membership hard stop, observed on its own debug-only
 `OXIDE_TEST_SCOPE_LOG`) plus one figure per slot, and `Pool::pressure()` is
@@ -1201,9 +1212,10 @@ decision mocks where a real path exists:
 8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2`, `3` and
    `4` ledgers; held IDs preserved; the admission gate writes control version
    8 (recorded, eviction-accounting and raised-ceiling fences) as every
-   mutating command's first write, before any locked open, recovery journal or
-   ledger write, so a pool this binary mutates never feeds a predecessor a
-   ledger it cannot represent or a control version it cannot read; an
+   mutating command's first write, and a locked `Pool::open` raises it before
+   its recovery, journal start or ledger write, so a pool this binary mutates
+   never feeds a predecessor a ledger it cannot represent or a control version
+   it cannot read; an
    owned-outputs-only state derives version 4 (proved on `save` directly, not
    through a path that takes admission), a v4 control still hands off, a v5
    document without the recorded fence or with an unknown fence value refuses,

@@ -2695,11 +2695,12 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
             },
         });
         if index == 0 {
-            // A recorded deletion holds no size observation and may carry the
-            // journal; one is this writer's reachable maximum (see
+            // The raised-ceiling representation retains the closed size
+            // observation on an `Evicting` record (oxide#175), and this slot
+            // carries the maximal deletion journal. Both together are this
+            // writer's reachable ordinary-path maximum (see
             // `MAX_LEDGER_BYTES`).
             slot["state"] = serde_json::json!("evicting");
-            slot.as_object_mut().expect("object").remove("recorded");
             slot["capture"] = maximal_journal_json(0);
         }
         slots.push(slot);
@@ -2757,9 +2758,9 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
 /// rolled back and cleared), without `retire_idle_slot`'s single-journal guard;
 /// the loop continues past a blocked record and a failed deletion keeps its
 /// journal. One open can therefore leave a journal per failing pending
-/// deletion. The admission gate makes the version-7 control fence durable
-/// before the open, so this recovery path is preceded by the hand-off fence
-/// (oxide#177, fence first).
+/// deletion. The admission gate and the library's locked open make the
+/// version-8 control fence durable before the open, so this recovery path is
+/// preceded by the hand-off fence (oxide#177, fence first).
 #[test]
 fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     let fixture = Fixture::new("recovery-journal");

@@ -1100,6 +1100,11 @@ impl Pool {
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
         let lock = lock_pool(&root)?;
+        // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
+        // state reaches the current fence version before this open can start a
+        // recovery journal or finish a recorded deletion. A library fixture
+        // has no control state and nothing to fence.
+        super::fence_managed_control(&root)?;
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
         let backing = match config.backend.as_str() {

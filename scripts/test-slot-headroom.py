@@ -386,7 +386,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     stdout, stderr = run(proof, ["exec", "--", sys.executable, "-c", "pass"], "first-grant", app, env)
     ledger_path = os.path.join(pool, "ledger.json")
     ledger = read_json(ledger_path)
-    expect(ledger.get("capacity_policy") == 2, "the first grant did not install the capacity fence")
+    expect(ledger.get("capacity_policy") == 3, "the first grant did not install the merged capacity fence")
     expect(ledger.get("next_rank") == 3, f"unexpected rank sequence after grant+release: {ledger.get('next_rank')}")
     expect(len(ledger["slots"]) == 1, "the first grant did not record one slot")
     slot = ledger["slots"][0]
@@ -396,7 +396,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(state["version"] == 8, f"the first mutation did not install the version-8 control fences: {state}")
     expect(state.get("slot_ceiling") == "oxide.slots/256", f"the raised-ceiling fence is missing: {state}")
     expect(state.get("eviction_accounting") == "oxide.eviction-accounting/1", f"the eviction-accounting fence is missing: {state}")
-    RESULTS.append({"case": "fences-installed", "ledger_policy": 2, "state_version": 8})
+    RESULTS.append({"case": "fences-installed", "ledger_policy": 3, "state_version": 8})
 
     # A legacy representation (no fence, rank 0) still reads for status and
     # is not migrated by the observer.
@@ -429,7 +429,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "legacy-first-write", app, env)
     fenced = read_json(ledger_path)
     fenced_state = read_json(state_path)
-    expect(fenced.get("capacity_policy") == 2 and fenced_state["version"] == 8,
+    expect(fenced.get("capacity_policy") == 3 and fenced_state["version"] == 8,
            "the first revised mutation did not install the version-8 control fences")
     # Fence first: even this one-slot pool gains the raised-ceiling and
     # eviction-accounting fences before its first ledger write.
@@ -461,7 +461,7 @@ def prove_raised_fence(proof: Proof, pool: str, env: dict, workdir: str) -> None
     app = write_tree(os.path.join(workdir, "fence-app"), FIXTURE)
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "raised-fence-prime", app, env)
     ledger = read_json(ledger_path)
-    expect(ledger.get("capacity_policy") == 2, "the priming grant did not install the version-2 fence")
+    expect(ledger.get("capacity_policy") == 3, "the priming grant did not install the merged fence")
     real = ledger["slots"][0]
     folder = real["dir"].split("/", 1)[0]
     store_id = ledger["store_id"]
@@ -526,7 +526,7 @@ def prove_raised_fence(proof: Proof, pool: str, env: dict, workdir: str) -> None
     )
     RESULTS.append({
         "case": "raised-fence-at-129-slots",
-        "policy_before": 2,
+        "policy_before": 3,
         "policy_after": 4,
         "state_version": state["version"],
         "slots": 129,

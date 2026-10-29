@@ -426,11 +426,25 @@ impl Rig {
             .iter()
             .map(|checkout| serde_json::json!({"id": 1, "checkout": checkout}))
             .collect();
-        let state = serde_json::json!({
+        let mut state = serde_json::json!({
             "version": version,
             "records": records,
             "cleans": cleans,
         });
+        // A document at a forward-fence version must carry that fence, or the
+        // donor reader refuses it as a state no writer produces. The rig
+        // rewrites the current version after a locked open has fenced it.
+        if version >= 5 {
+            state["recorded_accounting"] =
+                serde_json::json!(super::super::CONTROL_RECORDED_ACCOUNTING_FENCE);
+        }
+        if version >= 7 {
+            state["eviction_accounting"] =
+                serde_json::json!(super::super::CONTROL_EVICTION_ACCOUNTING_FENCE);
+        }
+        if version >= super::super::CONTROL_FENCE_VERSION {
+            state["slot_ceiling"] = serde_json::json!(super::super::CONTROL_SLOT_CEILING_FENCE);
+        }
         let path = control.join("state.json");
         fs::write(&path, serde_json::to_vec(&state).expect("control json")).expect("control state");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("state mode");
