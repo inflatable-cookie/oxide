@@ -5,7 +5,7 @@
 The qualified shared supervisor owns the 300 s deadline, 512 MiB monitored
 scratch, process closure and cleanup. This script reuses the reviewed
 oxide#104 staging/child helper and writes only inside the supervisor-owned
-scratch. It stages this clean HEAD's `oxide` offline with 1.97.1, models the
+scratch and its evidence directory. It stages this clean HEAD's `oxide` offline with 1.97.1, models the
 permanent drive as one owned 128 MiB APFS sparse image attached at a unique
 /Volumes/<name>, and proves:
 
@@ -65,6 +65,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import errno
 import glob
 import hashlib
 import importlib.util
@@ -85,8 +86,46 @@ _spec = importlib.util.spec_from_file_location(
 )
 layout = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(layout)
-Proof = layout.Proof
 expect, fail, summary, MIB = layout.expect, layout.fail, layout.summary, layout.MIB
+
+
+def positively_absent(path: str) -> bool:
+    try:
+        os.lstat(path)
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            return True
+        raise
+    return False
+
+
+class Proof(layout.Proof):
+    def __init__(self, root: str):
+        super().__init__(root)
+        self.image = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "permanent-outputs.sparseimage")
+        self.devices = []
+        self.detach_confirmed = False
+        self.detach_attempted = False
+
+    def detach(self) -> None:
+        if self.detach_confirmed:
+            return
+        if self.detach_attempted:
+            raise RuntimeError(f"detach already attempted; retained {self.image}")
+        self.detach_attempted = True
+        if not self.mount or not self.devices:
+            raise RuntimeError(f"attachment identity unknown; retained {self.image}")
+        if not os.path.ismount(self.mount):
+            raise RuntimeError(f"mount not present for ordinary detach; retained {self.image}")
+        super().detach()
+        if not positively_absent(self.mount) or not all(positively_absent(dev) for dev in self.devices):
+            raise RuntimeError(f"ordinary detach did not remove mount and devices; retained {self.image}")
+        self.detach_confirmed = True
+
+    def remove_backing(self) -> None:
+        if self.detach_confirmed:
+            os.unlink(self.image)
+
 
 BUILDER = "1.97.1"
 SHUTDOWN_MARGIN_S = 30
@@ -486,9 +525,14 @@ def attach_image(
     """Attach this proof's OWNED sparse image. `owners` is an optional
     `hdiutil attach -owners on` request used only by a proof that needs
     filesystem ownership honored on its private image; `image_name` selects a
-    distinct owned image file when a proof needs a second isolated volume. Both
-    defaults keep every existing selector's command and behaviour unchanged."""
-    image = os.path.join(root, image_name)
+    image filename is fixed for this proof; the backing is retained in evidence
+    unless an ordinary detach positively removes the mount and devices."""
+    expect(image_name == "volume.sparseimage", "unexpected image name")
+    image = proof.image
+    proof.detach_confirmed = False
+    proof.detach_attempted = False
+    proof.mount = None
+    proof.devices = []
     if not os.path.exists(image):
         created = proof.run(
             ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name]
@@ -505,9 +549,12 @@ def attach_image(
         attached.returncode == 0,
         f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}",
     )
+    entities = plistlib.loads(attached.stdout)["system-entities"]
+    proof.devices = [entity["dev-entry"] for entity in entities if entity.get("dev-entry")]
+    expect(bool(proof.devices), f"attachment devices unknown; retained {image}")
     mounts = [
         entity["mount-point"]
-        for entity in plistlib.loads(attached.stdout)["system-entities"]
+        for entity in entities
         if entity.get("mount-point")
     ]
     expect(len(mounts) == 1, f"expected one mount, got {mounts}")
@@ -1287,7 +1334,7 @@ def run(proof: Proof, repo: str) -> None:
     runner = start_child(proof, [proof.binary, "run", "--bin", "poutputs"], app, removal_env)
     try:
         wait_for(os.path.join(removal_gate, "exe"), "gated run before removal")
-        force_detach(proof, os.path.join(root, "volume.sparseimage"), mount, good)
+        force_detach(proof, proof.image, mount, good)
         code, stdout, stderr = finish_child(proof, runner, "run program stopped by removal")
     finally:
         open(os.path.join(removal_gate, "release"), "wb").close()
@@ -1590,7 +1637,7 @@ def detach_run(proof: Proof, repo: str) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
-    image = os.path.join(root, "volume.sparseimage")
+    image = proof.image
 
     maker = fresh_checkout(proof, root, "pool-maker")
     code, _, stderr = proof.oxide(["build"], "unregistered build keeps a real target", maker)
@@ -1844,7 +1891,7 @@ def auto_run(proof: Proof, repo: str) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
-    image = os.path.join(root, "volume.sparseimage")
+    image = proof.image
 
     # The internal pool exists before any drive is registered: a build then
     # keeps its real target, as it always has.
@@ -3911,6 +3958,33 @@ def exec_self_test() -> None:
             f"{body_map[case]} calls helpers that do not exist at runtime: {unbound}",
         )
 
+    # The shared helper must retain the backing if detach reports success but
+    # either the mount or a recorded device survives.
+    from unittest.mock import patch
+    fake = object.__new__(Proof)
+    fake.mount, fake.devices, fake.image = "/mount", ["/dev/disk-test"], "/evidence/image"
+    fake.detach_confirmed = False
+    for survivor in (fake.mount, fake.devices[0]):
+        fake.detach_attempted = False
+        with patch.object(layout.Proof, "detach"), patch("os.path.ismount", return_value=True), patch(
+            __name__ + ".positively_absent", side_effect=lambda path: path != survivor
+        ), patch("os.unlink") as unlink:
+            try:
+                fake.detach()
+            except RuntimeError as fault:
+                expect(fake.image in str(fault), "retained image not named")
+            else:
+                raise RuntimeError("surviving attachment accepted")
+            fake.remove_backing()
+            expect(not unlink.called, "surviving attachment lost its backing")
+    fake.detach_attempted = False
+    with patch.object(layout.Proof, "detach"), patch("os.path.ismount", return_value=True), patch(
+        __name__ + ".positively_absent", return_value=True
+    ), patch("os.unlink") as unlink:
+        fake.detach()
+        fake.remove_backing()
+        unlink.assert_called_once_with(fake.image)
+
     # 7f. Failure cleanup obeys the same retention gate as the clean tail: after
     #     a custody abort (or with an unclosed child) it must NOT detach the run's
     #     image, and the collection records the retention so the receipt matches
@@ -5945,7 +6019,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
             "OXIDE_EXTERNAL_MARKER": tool_marker,
         }
         volume_uuid = real_uuid(pool)
-        force_detach(proof, os.path.join(root, "volume.sparseimage"), mount, volume_uuid)
+        force_detach(proof, proof.image, mount, volume_uuid)
 
         def reattach() -> None:
             mounted_now = attach_image(proof, root, name, owners=True)
@@ -6661,7 +6735,7 @@ def cleanup_after_failure(proof: Proof, collection: "Collection | None" = None) 
     no keep-going collection, which keeps that mode's shipped behaviour."""
     # The alarm would cut the cleanup short; the proof clock still bounds it.
     signal.setitimer(signal.ITIMER_REAL, 0)
-    image = os.path.join(proof.root, "volume.sparseimage")
+    image = getattr(proof, "image", os.path.join(proof.root, "volume.sparseimage"))
     mount = proof.mount
     if not mount:
         return f"no mount attached by this run (image {image})"
@@ -6776,10 +6850,16 @@ def main() -> int:
             f"{label} proof failed; scratch {root} left to the shared supervisor",
             file=sys.stderr,
         )
+        if diagnostic:
+            with open(os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "custody-failure.json"), "w", encoding="utf-8") as handle:
+                json.dump({"qualified": False, "failure": repr(failure), "cleanup": cleanup, "image": proof.image}, handle)
+        proof.remove_backing()
         # The first fault is re-raised; a cleanup failure is only recorded.
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
+    expect(proof.detach_confirmed, f"ordinary detach unconfirmed; retained {proof.image}")
+    proof.remove_backing()
     elapsed = time.monotonic() - layout.runner.STARTED
     summary_line = (
         f"{label} proof held: {elapsed:.0f} s script time, peak owned "
