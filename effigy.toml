@@ -90,10 +90,11 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --
 # custody and slot roots. This binary then resumes the intermediate state: its
 # own leasing command legitimately rewrites its record state (last use, next
 # use, origin), so the resume oracle requires the version-9 fences to be
-# retained and the recorded slot set and every slot root to be unchanged (never
-# byte identity), and the ledger to publish policy 5 — a pure counterfactual
-# fails on a fence rollback or a deletion. A real byte-pressure eviction
-# publishes its private custody
+# retained, the recorded slot identity tuples (id, incarnation and recorded
+# directory) and every slot root to be unchanged (never byte identity, and a
+# same-count substituted record fails), and the ledger to publish policy 5 —
+# pure counterfactuals fail on a fence rollback, a substitution or a deletion.
+# A real byte-pressure eviction publishes its private custody
 # directory, 0600 lock and per-deletion journal before the payload effect
 # (debug-only pause); a killed fixture process leaves the pending record,
 # custody and payload for exclusive replay by the next command; and a busy

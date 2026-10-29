@@ -29,10 +29,11 @@ move deletion out of the lock:
   its ledger parser can refuse a policy-5 ledger carrying `custody`. This
   binary then resumes the intermediate state: its own leasing command
   legitimately rewrites its record state (last use, next use, origin), so the
-  oracle requires the version-9 fences to be retained and the recorded slot set
-  and every slot root to be unchanged (never byte identity), and the ledger to
-  publish policy 5. The exported base tree is asserted not to carry either
-  fence.
+  oracle requires the version-9 fences to be retained, the recorded slot
+  identity tuples (id, incarnation and recorded directory) and every slot root
+  to be unchanged (never byte identity, and a same-count substituted record
+  fails), and the ledger to publish policy 5. The exported base tree is asserted
+  not to carry either fence.
 - `custody-and-journal-at-pause`: a real byte-pressure eviction pauses at the
   durable root plan (debug-only seam inside the supervisor layout) and the
   proof reads the private custody directory, its `0600` lock and journal, the
@@ -280,7 +281,9 @@ def plan_document() -> dict:
                 "with custody) states before any effect, with control/ledger "
                 "bytes, custody bytes and slot roots unchanged; this binary "
                 "resumes the intermediate state with the version-9 fences "
-                "retained, policy 5 published and no slot or payload deleted",
+                "retained, the recorded slot identity tuples and every slot "
+                "root unchanged, policy 5 published and no slot or payload "
+                "deleted",
             },
             {
                 "name": "custody-and-journal-at-pause",
@@ -406,26 +409,34 @@ def fence_state_verdict(payload: bytes, version: int = 9) -> tuple[bool, str]:
 
 def resume_oracle(
     state_payload: bytes,
+    slots_before: list[tuple[int, int, str | None]],
+    slots_after: list[tuple[int, int, str | None]],
     roots_before: list[tuple[int, int, bool]],
     roots_after: list[tuple[int, int, bool]],
-    slots_before: int,
-    slots_after: int,
 ) -> tuple[bool, str]:
-    """The fence-resume facts: no rollback and no slot or payload deletion.
+    """The fence-resume facts: no rollback, no substitution, no deletion.
 
     A candidate leasing command legitimately rewrites its own record state
     (last use, next use, compile origin), so byte identity is not the oracle.
-    What must hold is that the control document keeps the version-9 fences and
-    that the recorded slot set and every slot root are unchanged and still
-    directories. Pure: compares the given bytes and identities only.
+    What must hold is that the control document keeps the version-9 fences, that
+    the recorded slot identity tuples — id, incarnation and recorded directory —
+    are unchanged (a same-count substituted record fails), and that every slot
+    root is still the same directory. Pure: compares the given bytes and
+    identities only.
     """
     ok, reason = fence_state_verdict(state_payload)
     if not ok:
         return (False, reason)
+    if len(slots_after) != len(slots_before):
+        return (
+            False,
+            f"the resume changed the ledger slot count {len(slots_before)} -> {len(slots_after)}",
+        )
     if slots_after != slots_before:
         return (
             False,
-            f"the resume changed the ledger slot count {slots_before} -> {slots_after}",
+            "the resume substituted a recorded slot identity "
+            "(id, incarnation or recorded directory)",
         )
     if len(roots_before) != len(roots_after):
         return (False, "the resume changed the recorded slot root set")
@@ -434,7 +445,10 @@ def resume_oracle(
             return (False, "the resume changed a slot root identity")
         if not after[2]:
             return (False, "the resume removed a slot root")
-    return (True, "no fence rollback and no slot or payload deleted")
+    return (
+        True,
+        "no fence rollback, no slot identity substitution and no slot or payload deleted",
+    )
 
 
 def custody_entries(pool: str) -> list[str]:
@@ -526,25 +540,63 @@ def self_check() -> None:
         "the fence oracle accepted an unknown custody fence",
     )
     roots = [(16777229, 1234, True)]
+    slot_tuples = [(1, 2, "app-1/quick-1")]
     expect(
-        resume_oracle(control_bytes, roots, roots, 1, 1)[0],
+        resume_oracle(control_bytes, slot_tuples, slot_tuples, roots, roots)[0],
         "the resume oracle rejected an unchanged fenced state",
     )
     expect(
-        not resume_oracle(json.dumps(rollback).encode(), roots, roots, 1, 1)[0],
+        not resume_oracle(json.dumps(rollback).encode(), slot_tuples, slot_tuples, roots, roots)[0],
         "the resume oracle accepted a fence rollback",
     )
     expect(
-        not resume_oracle(control_bytes, roots, [(16777229, 1235, True)], 1, 1)[0],
+        not resume_oracle(control_bytes, slot_tuples, [(1, 2, "other-1/quick-1")], roots, roots)[0],
+        "the resume oracle accepted a substituted recorded directory at the same count",
+    )
+    expect(
+        not resume_oracle(control_bytes, slot_tuples, [(1, 3, "app-1/quick-1")], roots, roots)[0],
+        "the resume oracle accepted a substituted incarnation at the same count",
+    )
+    expect(
+        not resume_oracle(control_bytes, slot_tuples, [(2, 2, "app-1/quick-1")], roots, roots)[0],
+        "the resume oracle accepted a substituted slot id at the same count",
+    )
+    expect(
+        not resume_oracle(control_bytes, slot_tuples, slot_tuples, roots, [(16777229, 1235, True)])[
+            0
+        ],
         "the resume oracle accepted a replaced slot root",
     )
     expect(
-        not resume_oracle(control_bytes, roots, [(16777229, 1234, False)], 1, 1)[0],
+        not resume_oracle(control_bytes, slot_tuples, slot_tuples, roots, [(16777229, 1234, False)])[
+            0
+        ],
         "the resume oracle accepted a deleted slot root",
     )
     expect(
-        not resume_oracle(control_bytes, roots, roots, 1, 2)[0],
+        not resume_oracle(
+            control_bytes,
+            slot_tuples,
+            slot_tuples + [(2, 2, "app-2/quick-2")],
+            roots,
+            roots + [(16777229, 1236, True)],
+        )[0],
         "the resume oracle accepted a changed slot count",
+    )
+    ok, _reason, parsed = ledger_slot_identities(
+        {"slots": [{"id": 2, "incarnation": 3, "dir": "b/quick-2"}, {"id": 1, "incarnation": 2}]}
+    )
+    expect(
+        ok and parsed == [(1, 2, None), (2, 3, "b/quick-2")],
+        "the ledger slot identity tuples were not stable and sorted",
+    )
+    expect(
+        not ledger_slot_identities({"slots": [{"id": 1}]})[0],
+        "the ledger slot identity reader accepted a record without an incarnation",
+    )
+    expect(
+        not ledger_slot_identities({"slots": [{"id": 1, "incarnation": 2, "dir": 7}]})[0],
+        "the ledger slot identity reader accepted a non-string directory",
     )
     expect(FROZEN_RUSTFLAGS == "-C strip=symbols", "the frozen rustc flag changed")
     # Hostile-parent control: neither the staged build nor a fixture child may
@@ -840,6 +892,53 @@ def slot_directory(pool: str, slot: dict) -> str:
     return os.path.join(root, str(slot["id"]))
 
 
+def ledger_slot_identities(
+    document: dict,
+) -> tuple[bool, str, list[tuple[int, int, str | None]]]:
+    """The stable ledger slot identity tuples: id, incarnation, recorded dir.
+
+    Sorted so a before/after comparison is order-insensitive but still fails on
+    any same-count substitution of a record. Pure: reads the parsed document.
+    """
+    slots = document.get("slots")
+    if not isinstance(slots, list):
+        return (False, "the ledger has no slot list", [])
+    rows = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            return (False, "a ledger slot is not an object", [])
+        slot_id = slot.get("id")
+        incarnation = slot.get("incarnation")
+        directory = slot.get("dir")
+        if not isinstance(slot_id, int) or not isinstance(incarnation, int):
+            return (False, "a ledger slot has no numeric id or incarnation", [])
+        if directory is not None and not isinstance(directory, str):
+            return (False, "a ledger slot has a non-string recorded directory", [])
+        rows.append((slot_id, incarnation, directory))
+    rows.sort(key=lambda row: (row[0], row[1], row[2] or ""))
+    return (True, "", rows)
+
+
+def ledger_slot_roots(
+    pool: str, document: dict
+) -> tuple[bool, str, list[tuple[int, int, bool]]]:
+    """The recorded slot root identities, aligned with the sorted slot tuples."""
+    ok, reason, _identities = ledger_slot_identities(document)
+    if not ok:
+        return (False, reason, [])
+    rows = []
+    for slot in document.get("slots", []):
+        path = slot_directory(pool, slot)
+        try:
+            root = identity(path)
+        except OSError as error:
+            return (False, f"a recorded slot root is not observable ({error})", [])
+        key = (slot["id"], slot["incarnation"], slot.get("dir"))
+        rows.append((key, root))
+    rows.sort(key=lambda row: (row[0][0], row[0][1], row[0][2] or ""))
+    return (True, "", [row[1] for row in rows])
+
+
 def seed_two_measured_idle_slots(root: str, subject: str) -> tuple[str, dict, dict, dict]:
     """Two idle slots whose closed observations include a 5 MiB planted file.
 
@@ -1051,6 +1150,10 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
         )
         roots = [slot_directory(pool, slot) for slot in document["slots"]]
         identities = [identity(path) for path in roots]
+        before_ok, before_reason, before_slots = ledger_slot_identities(document)
+        expect(before_ok, before_reason)
+        before_roots_ok, before_roots_reason, before_roots = ledger_slot_roots(pool, document)
+        expect(before_roots_ok, before_roots_reason)
 
         # Intermediate: the control fence is durable, the ledger write that
         # would carry policy 5 has not happened (the predecessor's own policy 3
@@ -1109,12 +1212,16 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
             resumed.get("capacity_policy") == 5,
             f"the resumed ledger did not publish policy 5: {resumed}",
         )
+        after_ok, after_reason, after_slots = ledger_slot_identities(resumed)
+        expect(after_ok, after_reason)
+        after_roots_ok, after_roots_reason, after_roots = ledger_slot_roots(pool, resumed)
+        expect(after_roots_ok, after_roots_reason)
         resume_ok, resume_reason = resume_oracle(
             read_bytes(state_path),
-            identities,
-            [identity(path) for path in roots],
-            len(document["slots"]),
-            len(resumed.get("slots", [])),
+            before_slots,
+            after_slots,
+            before_roots,
+            after_roots,
         )
         expect(
             resume_ok,
@@ -1178,6 +1285,8 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
                 "final_exit": final_exit,
                 "resume_exit": resume_code,
                 "resume_fence_retained": True,
+                "resume_slot_identities_unchanged": True,
+                "resume_payload_unchanged": True,
                 "resume_no_deletion": True,
                 "resume_oracle": resume_reason,
                 "ledger_only_exit": code,
