@@ -87,7 +87,14 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --
 # crash-between-fences state (control v9, policy-3 ledger), the final state
 # (control v9, policy-5 ledger) and a ledger-only probe (predecessor control v8
 # over a policy-5 ledger with custody), each with byte-identical control/ledger,
-# custody and slot roots. This binary then resumes the intermediate state: its
+# custody and slot roots. The two control-fence probes must exit nonzero (the
+# predecessor's hand-off preflight refuses a newer control version); the
+# ledger-only probe keeps the predecessor's own control version, so its
+# best-effort status reports the pool-open refusal in its status section and
+# exits 0, and the oracle requires that semantic refusal plus the no-effect
+# facts instead of a nonzero exit. A source-only audit of all three predecessor
+# probes is recorded in the script. This binary then resumes the intermediate
+# state: its
 # own leasing command legitimately rewrites its record state (last use, next
 # use, origin), so the resume oracle requires the version-9 fences to be
 # retained, the recorded slot identity tuples (id, incarnation and recorded

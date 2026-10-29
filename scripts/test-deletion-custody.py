@@ -26,8 +26,12 @@ move deletion out of the lock:
   crash-between-fences state (control version 9, ledger still the predecessor's
   policy 3), the **final** state (version 9 + policy 5), and a **ledger-only**
   probe whose control is rewritten to the predecessor's own version 8 so only
-  its ledger parser can refuse a policy-5 ledger carrying `custody`. This
-  binary then resumes the intermediate state: its own leasing command
+  its ledger parser can refuse a policy-5 ledger carrying `custody`; because
+  that predecessor can reach the pool, its best-effort `status` reports the
+  pool-open refusal in its status section and exits 0, so this probe requires
+  that semantic refusal plus byte/identity no-effect instead of a nonzero exit
+  (a source-only audit of the three predecessor probes is in the case comment).
+  This binary then resumes the intermediate state: its own leasing command
   legitimately rewrites its record state (last use, next use, origin), so the
   oracle requires the version-9 fences to be retained, the recorded slot
   identity tuples (id, incarnation and recorded directory) and every slot root
@@ -281,8 +285,11 @@ def plan_document() -> dict:
                 "oracle": "the merge-base binary exits nonzero on the "
                 "intermediate (control v9, policy-3 ledger), final (control v9, "
                 "policy-5 ledger) and ledger-only (control v8, policy-5 ledger "
-                "with custody) states before any effect, with control/ledger "
-                "bytes, custody bytes and slot roots unchanged; this binary "
+                "with custody) states before any effect — the two control-fence "
+                "probes by a nonzero hand-off refusal and the ledger-only probe "
+                "by its reported pool-open refusal or a nonzero exit — with "
+                "control/ledger bytes, custody bytes and slot roots unchanged; "
+                "this binary "
                 "resumes the intermediate state with the version-9 fences "
                 "retained, the recorded slot identity tuples and every slot "
                 "root unchanged, the untouched sentinel slot's bounded nested "
@@ -452,6 +459,59 @@ def resume_oracle(
     return (
         True,
         "no fence rollback, no slot identity substitution and no recorded slot root changed",
+    )
+
+
+POOL_OPEN_REFUSAL = "cannot open: cannot open the pool: unknown_accounting"
+
+
+def pool_open_refusal_verdict(exit_code: int, output: str) -> tuple[bool, str]:
+    """Whether a status observer refused the pool before any effect.
+
+    The pinned predecessor's `status` is best-effort: a newer control version is
+    refused by the hand-off preflight (nonzero), while a pool it can reach but
+    cannot open is reported in its status section and the command still exits 0
+    (`run_status` prints `cannot open: {error}` and returns Ok(0) in the
+    merge-base source). This oracle therefore accepts either a nonzero exit or
+    the predecessor's own pool-open refusal line, and it never accepts an output
+    that lacks the refusal. Pure: reads the exit code and captured output only.
+    """
+    if exit_code != 0:
+        return (True, f"status exited {exit_code}")
+    if POOL_OPEN_REFUSAL in output:
+        return (True, "status reported the pool-open refusal without opening it")
+    return (False, "status neither failed nor reported the pool-open refusal")
+
+
+def no_effect_verdict(
+    control_before: bytes,
+    control_after: bytes,
+    ledger_before: bytes,
+    ledger_after: bytes,
+    custody_before: dict,
+    custody_after: dict,
+    payload_before: tuple[int, int, bool],
+    payload_after: tuple[int, int, bool],
+) -> tuple[bool, str]:
+    """Byte and identity equality of everything a passive probe may touch.
+
+    Pure: compares the captured values only. It fails on any changed control
+    document, ledger, custody directory digest or payload root identity, and it
+    also fails when the payload root is no longer a directory.
+    """
+    for label, before, after in (
+        ("control", control_before, control_after),
+        ("ledger", ledger_before, ledger_after),
+        ("custody", custody_before, custody_after),
+        ("payload", payload_before, payload_after),
+    ):
+        if before != after:
+            return (False, f"the probe changed the {label} state")
+    if not payload_after[2]:
+        return (False, "the probe removed the pending payload root")
+    return (
+        True,
+        "control, ledger, custody and payload are byte/identity identical",
     )
 
 
@@ -672,6 +732,69 @@ def self_check() -> None:
         not payload_unchanged(sentinel, unexpected)[0],
         "the payload oracle accepted an unexpected added entry",
     )
+    # The ledger-only status oracle accepts a nonzero exit or the
+    # predecessor's reported pool-open refusal, and refuses anything else.
+    expect(
+        pool_open_refusal_verdict(75, "")[0],
+        "the ledger-only oracle rejected a nonzero status exit",
+    )
+    expect(
+        pool_open_refusal_verdict(0, f"  {POOL_OPEN_REFUSAL} (owned accounting is unknown)")[0],
+        "the ledger-only oracle rejected the reported pool-open refusal",
+    )
+    expect(
+        not pool_open_refusal_verdict(0, "")[0],
+        "the ledger-only oracle accepted an empty status output",
+    )
+    expect(
+        not pool_open_refusal_verdict(0, "pool: selected; slots: 1")[0],
+        "the ledger-only oracle accepted a status output without a refusal",
+    )
+    expect(
+        not pool_open_refusal_verdict(0, "cannot open the pool: something else")[0],
+        "the ledger-only oracle accepted an unrelated pool error",
+    )
+    # The no-effect oracle fails on any mutation of the observed state.
+    control_state = b'{"version":9}'
+    ledger_state = b'{"slots":[]}'
+    custody_state = {"lock": (0o600, "a" * 64)}
+    payload_state = (16777229, 1234, True)
+    expect(
+        no_effect_verdict(
+            control_state,
+            control_state,
+            ledger_state,
+            ledger_state,
+            custody_state,
+            custody_state,
+            payload_state,
+            payload_state,
+        )[0],
+        "the no-effect oracle rejected an unchanged state",
+    )
+    unchanged = (
+        control_state,
+        control_state,
+        ledger_state,
+        ledger_state,
+        custody_state,
+        custody_state,
+        payload_state,
+        payload_state,
+    )
+    for label, position, value in (
+        ("control", 1, b'{"version":8}'),
+        ("ledger", 3, b'{"slots":[1]}'),
+        ("custody", 5, {"lock": (0o600, "b" * 64)}),
+        ("payload", 7, (16777229, 1235, True)),
+        ("removed payload", 7, (16777229, 1234, False)),
+    ):
+        mutated = list(unchanged)
+        mutated[position] = value
+        expect(
+            not no_effect_verdict(*mutated)[0],
+            f"the no-effect oracle accepted a mutated {label}",
+        )
     expect(FROZEN_RUSTFLAGS == "-C strip=symbols", "the frozen rustc flag changed")
     # Hostile-parent control: neither the staged build nor a fixture child may
     # inherit a rustc/cargo override, an OXIDE hook or a foreign target dir.
@@ -1301,6 +1424,16 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
       control version (8, no custody fence), so the refusal can only come from
       its ledger parser reading policy 5 and the `custody` field. Custody
       directory, journal and payload must be byte/identity identical.
+
+    Source-only audit of every predecessor probe (the only three in this
+    script): the intermediate and final probes present a version-9 control, so
+    the predecessor's hand-off preflight refuses them before `status` runs and
+    they must exit nonzero (observed 75). The ledger-only probe keeps the
+    predecessor's own version 8, which its preflight accepts, so `status` runs,
+    reports the pool-open refusal in its status section and exits 0; that probe
+    therefore requires `pool_open_refusal_verdict` plus `no_effect_verdict`,
+    never a bare nonzero exit. No other exit assumption about the predecessor
+    exists in this script.
     """
 
     def body() -> None:
@@ -1476,23 +1609,33 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
         custody_before = tree_digest(directory)
         payload_before = identity(oldest_path)
         code, output = run_predecessor(base, workspaces2["a"], env2, "ledger-only")
+        # The predecessor's own control version is in play here, so its
+        # best-effort `status` reports a pool it cannot open and exits 0. The
+        # oracle is the semantic refusal, not the exit code; the control-fence
+        # probes above keep the nonzero-exit requirement because the hand-off
+        # preflight refuses a newer control version.
+        refusal_ok, refusal_reason = pool_open_refusal_verdict(code, output)
         expect(
-            code != 0,
-            f"the predecessor accepted a policy-5 ledger with custody: {output[-2000:]}",
+            refusal_ok,
+            f"the predecessor accepted a policy-5 ledger with custody "
+            f"({refusal_reason}): {output[-2000:]}",
         )
-        expect(read_bytes(state2) == control2, "the ledger probe rewrote control")
+        no_effect_ok, no_effect_reason = no_effect_verdict(
+            control2,
+            read_bytes(state2),
+            ledger2_before,
+            read_bytes(ledger2),
+            custody_before,
+            tree_digest(directory),
+            payload_before,
+            identity(oldest_path),
+        )
         expect(
-            read_bytes(ledger2) == ledger2_before,
-            "the ledger probe rewrote the ledger",
+            no_effect_ok,
+            f"the ledger probe was not a no-effect refusal: {no_effect_reason}",
         )
-        expect(
-            tree_digest(directory) == custody_before,
-            "the ledger probe changed the custody directory or journal",
-        )
-        expect(
-            identity(oldest_path) == payload_before and os.path.isdir(oldest_path),
-            "the ledger probe changed the pending payload",
-        )
+        say(f"ledger-only refusal: {refusal_reason}")
+        say(f"ledger-only no-effect: {no_effect_reason}")
         RESULTS.append(
             {
                 "case": "old-binary-refuses-fenced-pool",
@@ -1507,9 +1650,10 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
                 "resume_oracle": resume_reason,
                 "resume_payload_oracle": payload_reason,
                 "ledger_only_exit": code,
+                "ledger_only_refusal": refusal_reason,
+                "ledger_only_no_effect": no_effect_reason,
                 "intermediate_control_and_ledger_unchanged": True,
                 "final_control_and_ledger_unchanged": True,
-                "ledger_only_control_ledger_custody_payload_unchanged": True,
                 "slot_identities_unchanged": True,
             }
         )
