@@ -898,13 +898,15 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // Release only after positive closure. A watchdog that cannot confirm
     // the stopped group closed leaves the lease held and the record naming
     // the group, so a later command recovers it once the group is empty.
-    let mut closed = match (watchdog.as_mut(), &outcome) {
-        (Some(_), Ok((None, _, _))) => None,
-        (Some(watchdog), _) => {
-            process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
+    let mut closed = oxide_storage::release_trace::phase("cargo group closure", || {
+        match (watchdog.as_mut(), &outcome) {
+            (Some(_), Ok((None, _, _))) => None,
+            (Some(watchdog), _) => {
+                process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
+            }
+            (None, _) => process::wait_group_empty_budgeted(group.id, &mut budget_stop),
         }
-        (None, _) => process::wait_group_empty_budgeted(group.id, &mut budget_stop),
-    };
+    });
     if budget::closure_stuck() {
         // Debug proof control: report the group and drain as unconfirmed even
         // though the kernel says otherwise, so the held-custody path is
@@ -946,9 +948,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // The one bounded notice for what this tool created in the checkout's real
     // target (oxide#164). Printed after the writer's group closed and before
     // the summary, once, and only on the receipt-derived profile-member layout.
-    if let Some(note) =
+    if let Some(note) = oxide_storage::release_trace::phase("tool directory notice", || {
         outputs::tool_directories_note(&key.checkout, target_entries_before.as_deref())
-    {
+    }) {
         eprintln!("oxide: {note}");
     }
     let mut notes = [gate.describe(), wrapper_note, output_note]
@@ -965,7 +967,8 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     }
     let note = notes.join(", ");
     let note = (!note.is_empty()).then_some(note);
-    let origin = gate.finish(&key.checkout);
+    let origin =
+        oxide_storage::release_trace::phase("freshness finish", || gate.finish(&key.checkout));
     let seed_profile = if invocation.profile == Profile::Release
         || (invocation.command == "bench" && !invocation.explicit_profile)
     {
@@ -995,8 +998,12 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             // Cargo path when no root was bound (a bounded run without a
             // converted checkout).
             let program = match root {
-                Some(root) => outputs::program_target(&key.checkout, root, &program)
-                    .unwrap_or_else(|| program.clone()),
+                Some(root) => {
+                    oxide_storage::release_trace::phase("program target resolution", || {
+                        outputs::program_target(&key.checkout, root, &program)
+                    })
+                    .unwrap_or_else(|| program.clone())
+                }
                 None => program.clone(),
             };
             Some((program, manifest_dir.clone()))
@@ -1080,7 +1087,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             && stopped.is_none()
             && budget::origin().is_none();
         // A catalog failure never changes the command's result or origin.
-        producing.publish(&store, &held, successful, origin.as_ref(), seed_profile);
+        oxide_storage::release_trace::phase("seed publication", || {
+            producing.publish(&store, &held, successful, origin.as_ref(), seed_profile)
+        });
     }
     store.release(held, origin)?;
     let (status, executable, drained) = outcome?;
@@ -1239,13 +1248,15 @@ fn run_owned_program(
         Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, budget_stop)?,
         None => process::wait_leader_budgeted(&mut group, budget_stop)?,
     };
-    let mut closed = match (watchdog.as_mut(), status) {
-        (Some(_), None) => None,
-        (Some(watchdog), Some(_)) => {
-            process::wait_group_empty_watched(group.id, watchdog, budget_stop)
+    let mut closed = oxide_storage::release_trace::phase("run group closure", || {
+        match (watchdog.as_mut(), status) {
+            (Some(_), None) => None,
+            (Some(watchdog), Some(_)) => {
+                process::wait_group_empty_watched(group.id, watchdog, budget_stop)
+            }
+            (None, _) => process::wait_group_empty_budgeted(group.id, budget_stop),
         }
-        (None, _) => process::wait_group_empty_budgeted(group.id, budget_stop),
-    };
+    });
     if budget::closure_stuck() {
         closed = None;
     }

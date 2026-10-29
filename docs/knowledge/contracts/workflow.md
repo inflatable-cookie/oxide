@@ -686,6 +686,26 @@ root. A new Cargo release needs this check before it joins the table.
    time still covers its original interval, including gate and execution
    work; it is not a compilation-only duration.
 
+For closeout diagnosis, `OXIDE_TRACE_RELEASE=1` prints a start and elapsed
+completion line for Cargo and owned-run group closure, tool-directory notice,
+program target resolution, freshness finish, optional seed
+publication, admission lock and fence, owned temporary removal, removable
+flush, pool open (including its lock and eviction reconciliation), release
+walk, ledger write, and origin/control write. A started phase without a finish
+identifies the operation in progress, not why it is blocked. The trace is
+opt-in, writes to stderr, and does not change custody or deadlines. Group
+closure can wait indefinitely without a stop and already reports lingering
+members after two seconds. The release walk has a cooperative 60-second,
+2-million-entry bound; individual filesystem calls can exceed it. Admission
+and pool locks, temporary removal, eviction reconciliation, Git freshness
+work, flush and durable writes have no hard elapsed bound. Removable flush
+also opens the pool and can wait on its lock or reconcile eviction before the
+volume flush itself. Stream writes and scheduling may block too. Release emits
+one notice per admission-lock or pool-lock wait after about five seconds even
+without tracing, including the removable flush's pool open. An evicting slot in the
+unlocked ledger snapshot is identified as recorded, not asserted to be the
+current lock holder; unreadable or absent evidence yields `holder unknown`.
+
 ### Command time budgets (oxide#140)
 
 Opt-in, leased commands only (`check`, `build`, `test`, `clippy`, `run`,
