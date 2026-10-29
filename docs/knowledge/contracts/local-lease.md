@@ -457,29 +457,29 @@ is the foundation slice 2 moves out of the lock:
   atomic, validated ledger revision**: a predecessor may leave several valid
   journals under the 8 MiB bound, one-record-at-a-time migration would make the
   first policy-5 write invalidate the others, and a failure would leave a mixed
-  in-memory ledger. Staging happens before any ledger change, a failed staging
-  or publish publishes nothing and restores the in-memory ledger (orphan
-  custody directories are never deletion authority), and the next open
-  retries.
-  While a legacy journal remains, a revised write keeps the predecessor fence
-  (policy 3 or 4) instead of publishing policy 5, because a policy-5 ledger may
-  not carry a `capture`; unrelated admissions, releases and other writes
-  therefore proceed. An independent eligible idle slot can still be deleted:
-  while any in-ledger journal remains, that victim's own deletion uses the
-  predecessor's **in-ledger** journal representation (the same #155 capture,
-  ordering and replay semantics, written with the same atomic ledger
-  replacement) instead of a custody directory, so the ledger stays valid and
-  the fence stays at the predecessor level; only the record whose custody could
-  not be staged keeps its journal and charge. Once the legacy journals migrate,
-  new deletions return to the custody representation.
+  in-memory ledger. Staging happens before any ledger change; a failed staging,
+  or a publish that failed before its rename, changes nothing durably and
+  restores the in-memory ledger (orphan custody directories are never deletion
+  authority), and the next open retries.
+  A policy-5 ledger may keep a record's **legacy** in-ledger journal while its
+  custody cannot be staged, so a failed migration for one object never blocks
+  the others: other admissions, releases, explicit evictions and count/byte
+  pressure deletions proceed under the same policy-5 fence, every new deletion
+  still uses the custody representation (private lock and per-deletion
+  journal), and the unstaged record alone keeps its journal, its conservative
+  charge and its payload. That transitional shape is fenced exactly like the
+  custody-only one — a predecessor refuses the policy *and* the `custody`
+  field before any effect — and the unstaged journal is never replayed from the
+  ledger: it is migrated or kept pending, never reinterpreted.
   The ledger replacement is a temp write, `fsync`, `rename`, then a parent
-  `fsync` (`persist_private_file`). A failure **after** the rename leaves the
-  durable outcome uncertain: the new, complete revision is already visible but
-  its durability is not proven, so the caller reports an error and must never
-  claim the previous bytes survived. This binary restores its in-memory ledger
-  and makes no further effect in that open; the next reader takes whichever
-  complete revision is present, validates it and repairs nothing (a parent-sync
-  failure after the rename is covered by
+  `fsync` (`persist_private_file`). A failure **before** the rename changes
+  nothing durably. A failure **after** the rename leaves the durable outcome
+  uncertain: the new, complete revision is already visible but its durability
+  is not proven, so the caller reports an error and must never claim the
+  previous bytes survived. This binary restores its in-memory ledger and makes
+  no further effect in that open; the next reader takes whichever complete
+  revision is present, validates it and repairs nothing (a parent-sync failure
+  after the rename is covered by
   `lease::tests::a_parent_sync_failure_after_the_rename_leaves_an_uncertain_valid_revision`).
 - **Final record removal.** While still holding custody, the final transaction
   reloads the ledger from disk and drops only the matching id, incarnation and
@@ -489,12 +489,11 @@ is the foundation slice 2 moves out of the lock:
 - **Per-object failure.** A busy, unknown or undeletable object — including a
   journaled root that is at neither its original nor its private name, and a
   legacy record whose custody cannot be staged — keeps its record, conservative
-  charge, custody and journal, and does not refuse an unrelated admission,
-  release or another eligible idle slot's explicit deletion (in explicit,
-  count-pressure and byte-pressure deletion). Only backing, ledger or fence
-  integrity is global. The oxide#177 single-journal
-  guard is retired: journals no longer share the ledger's byte bound, so
-  several pending deletions can coexist.
+  charge, custody or legacy journal, and does not refuse an unrelated
+  admission, release or another eligible idle slot's deletion (explicit,
+  count-pressure or byte-pressure). Only backing, ledger or fence integrity is
+  global. The oxide#177 single-journal guard is retired: journals no longer
+  share the ledger's byte bound, so several pending deletions can coexist.
 
 Status adds no new mutation: it reports pending deletions as before, and a
 locked open still reconciles a recorded deletion exactly as oxide#155/#177 did
@@ -889,7 +888,9 @@ policy-5 ledger above that ceiling is also accepted; both are written
 forward-only. An older binary's policy check accepts only 1–4 (1 and 2 from
 oxide#146, 3 from oxide#175, 4 from oxide#177), so it refuses a `5` ledger with
 `unknown_accounting` (exit 3) before any mutation, and its strict slot parse
-refuses the `custody` field too. A ledger above 128 slots without policies 4 or
+refuses the `custody` field too. A policy-5 ledger may also retain a legacy
+`capture` for a record whose custody could not be staged; that transitional
+shape is refused by a predecessor for both reasons alike. A ledger above 128 slots without policies 4 or
 5 is a state no writer produces and refuses. This binary therefore never
 leaves a pool it mutates readable by a predecessor. The ledger alone cannot
 order that switch against the [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122),

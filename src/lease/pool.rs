@@ -1413,27 +1413,15 @@ impl Pool {
         ) {
             self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
         }
-        // A legacy in-ledger journal this open could not stage keeps the
-        // predecessor's fence. Policy 5 is invalid while a `capture` remains,
-        // so an unrelated write proceeds under policy 3 or 4 (the exact shape
-        // the predecessor wrote, which it can still read) instead of blocking.
-        // The record itself stays isolated and the next open retries the
-        // migration (oxide#175 ruling B, oxide#181 per-object isolation).
-        if self.ledger.slots.iter().any(|slot| slot.capture.is_some()) {
-            if !matches!(
-                self.ledger.capacity_policy,
-                Some(CAPACITY_POLICY_VERSION) | Some(RAISED_CAPACITY_POLICY_VERSION)
-            ) {
-                return Err(LeaseError::UnknownAccounting);
-            }
-            return Ok(());
-        }
-        // With no legacy journal left, every ledger revision publishes the
-        // deletion-custody fence (oxide#181), upgrading the older readable
-        // policies in the same atomic replacement. The step is one-way: an
-        // older binary refuses a policy-5 ledger and a `custody` field before
-        // any effect, which is why the front door's version-9 control fence is
-        // durable first.
+        // Every ledger revision publishes the deletion-custody fence
+        // (oxide#181), upgrading the older readable policies in the same
+        // atomic replacement. A legacy journal whose custody could not be
+        // staged stays in the ledger under this same fence (the validator
+        // accepts that transitional shape) and keeps its record, charge and
+        // journal; the next open retries its migration. The step is one-way:
+        // an older binary refuses a policy-5 ledger and a `custody` field
+        // before any effect, which is why the front door's version-9 control
+        // fence is durable first.
         if self.ledger.capacity_policy != Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION) {
             self.ledger.capacity_policy = Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION);
         }
@@ -2837,17 +2825,6 @@ impl Pool {
         // another slot — blocked, unclassifiable or missing its root — never
         // refuses this eligible slot's deletion. The pending record keeps its
         // own charge and custody, and this open's coverage stays unknown.
-        // A ledger that still carries an unstaged legacy journal cannot also
-        // publish a custody record (the two representations need different
-        // fences). The requested victim is independent of that object, so it
-        // is deleted through the predecessor's own in-ledger journal instead:
-        // that representation is crash-safe, keeps the predecessor fence while
-        // any legacy journal remains, and stays readable by both this binary
-        // and a predecessor. The unstaged journal keeps its representation and
-        // its charge, and the next open retries its migration.
-        if self.ledger.slots.iter().any(|slot| slot.capture.is_some()) {
-            return self.retire_idle_slot_with_ledger_journal(id, incarnation, project, profile);
-        }
         // Every durable idle deletion, including the explicit
         // `evict_idle_slot` path, checks the rank sequence before its first
         // transition: an exhausted or missing-headroom sequence refuses
@@ -2886,41 +2863,6 @@ impl Pool {
         }
         self.drop_deletion_record(id, incarnation, &custody.record())?;
         custody.retire();
-        Ok(())
-    }
-
-    /// Delete one independent idle slot through the predecessor's in-ledger
-    /// journal (oxide#181 fallback).
-    ///
-    /// This runs only while another record's legacy journal is still in the
-    /// ledger, so the custody fence cannot be published. The #155 journal
-    /// semantics are identical: the slot record carries the root plan and the
-    /// captures, written with the same atomic, synced ledger replacement before
-    /// each capture acts and after each removal completes. The requested
-    /// victim's own record is new; the unstaged journal elsewhere is untouched
-    /// and keeps its charge.
-    fn retire_idle_slot_with_ledger_journal(
-        &mut self,
-        id: u64,
-        incarnation: u64,
-        project: &Path,
-        profile: Profile,
-    ) -> Result<(), LeaseError> {
-        self.ensure_capacity_policy()?;
-        self.next_rank()?;
-        let path = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
-        {
-            let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
-            slot.state = SlotPersistState::Evicting;
-            // The journal is written by the seam below, in the ledger, so this
-            // record never carries a custody reference.
-            slot.custody = None;
-            slot.capture = None;
-        }
-        self.persist_revised()?;
-        self.remove_owned_slot_with_ledger_journal(id, &path, None)?;
-        self.ledger.slots.retain(|slot| slot.id != id);
-        self.persist_revised()?;
         Ok(())
     }
 
@@ -3399,40 +3341,6 @@ impl Pool {
         let slots_root = canonical_existing_dir(&slots_root, true)?;
         require_slot_parent(path, &slots_root)?;
         Ok(slots_root)
-    }
-
-    /// [`remove_owned_slot`] for the predecessor-representation fallback: the
-    /// seam writes the slot's own ledger `capture` field, exactly as #155 did.
-    fn remove_owned_slot_with_ledger_journal(
-        &mut self,
-        id: u64,
-        path: &Path,
-        expected: Option<(u64, u64)>,
-    ) -> Result<(), LeaseError> {
-        let slots_root = self.checked_slot_scope(path)?;
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() => {
-                return Ok(())
-            }
-            Err(error) => return Err(io_error(error)),
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || !metadata.file_type().is_dir()
-                    || metadata.uid() != current_uid()
-                    || metadata.permissions().mode() & 0o077 != 0 =>
-            {
-                return Err(LeaseError::UnknownAccounting);
-            }
-            Ok(_) => {}
-        }
-        canonical_existing_dir(path, true)?;
-        let mut journal = LegacyLedgerJournal { pool: self, id };
-        remove_tree_owned_checked(
-            &slots_root,
-            path,
-            Some(&mut journal as &mut dyn RootCaptureJournal),
-            expected,
-        )
     }
 
     fn remove_owned_slot(
@@ -4118,164 +4026,6 @@ enum CaptureDisposition {
     /// The names, the records and the objects do not agree well enough to act.
     /// Every record and object is kept and the pool keeps its refusal.
     Blocked,
-}
-
-/// The predecessor's in-ledger journal for one slot deletion (oxide#155),
-/// kept for the fallback used while an unstaged legacy journal forces the
-/// ledger to stay below the custody fence. The `Evicting` slot record carries
-/// the root plan, the outstanding captures and the foreign captures, written
-/// with the same atomic, synced replacement as every other ledger write before
-/// each capture acts and after each removal completes.
-struct LegacyLedgerJournal<'a> {
-    pool: &'a mut Pool,
-    id: u64,
-}
-
-impl LegacyLedgerJournal<'_> {
-    fn update<T>(
-        &mut self,
-        change: impl FnOnce(&mut DeletionJournal) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let (outcome, changed) = {
-            let slot = self
-                .pool
-                .slot_mut(self.id)
-                .ok_or("the recorded slot disappeared")?;
-            if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
-                return Err("a capture journal belongs to a recorded deletion".to_owned());
-            }
-            let journal = slot
-                .capture
-                .as_mut()
-                .ok_or("the recorded deletion has no journal")?;
-            let before = journal.clone();
-            let outcome = change(journal)?;
-            if !journal.is_valid() {
-                *journal = before;
-                return Err("the capture journal would not be one a writer produces".to_owned());
-            }
-            (outcome, *journal != before)
-        };
-        if changed {
-            self.pool.persist().map_err(|error| error.to_string())?;
-        }
-        Ok(outcome)
-    }
-
-    /// Open the journal for this generation's first capture. The plan is
-    /// durable before the exclusive rename, so a crash can never leave the tree
-    /// under a private name the ledger does not name.
-    fn begin(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        let journal = DeletionJournal {
-            root: plan.clone(),
-            captures: Vec::new(),
-            foreign: Vec::new(),
-        };
-        if !journal.is_valid() {
-            return Err("the capture journal is not one a writer produces".to_owned());
-        }
-        {
-            let slot = self
-                .pool
-                .slot_mut(self.id)
-                .ok_or("the recorded slot disappeared")?;
-            if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
-                return Err("a capture journal belongs to a recorded deletion".to_owned());
-            }
-            if slot.capture.is_some() {
-                return Err("the recorded deletion already has a journal".to_owned());
-            }
-            slot.capture = Some(journal);
-        }
-        self.pool.persist().map_err(|error| error.to_string())
-    }
-}
-
-impl RootCaptureJournal for LegacyLedgerJournal<'_> {
-    fn planned(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        if self
-            .pool
-            .slot(self.id)
-            .is_some_and(|slot| slot.capture.is_none())
-        {
-            return self.begin(plan);
-        }
-        self.update(|journal| {
-            journal.root = plan.clone();
-            Ok(())
-        })
-    }
-
-    fn captured(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        self.update(|journal| {
-            journal.root = RootCapturePlan {
-                phase: RootCapturePhase::Captured,
-                ..plan.clone()
-            };
-            Ok(())
-        })
-    }
-
-    fn record_captured(&mut self, record: &CaptureRecord) -> Result<(), String> {
-        self.update(|journal| {
-            if journal
-                .captures
-                .iter()
-                .any(|existing| existing.private == record.private)
-            {
-                return Err("a capture record already names this private name".to_owned());
-            }
-            if journal.captures.len() >= MAX_OUTSTANDING_CAPTURES {
-                return Err(
-                    "the deletion has more outstanding captures than it may record".to_owned(),
-                );
-            }
-            journal.captures.push(record.clone());
-            Ok(())
-        })
-    }
-
-    fn record_removed(&mut self, record: &CaptureRecord) -> Result<(), String> {
-        self.update(|journal| {
-            let position = journal
-                .captures
-                .iter()
-                .position(|existing| {
-                    existing.private == record.private && existing.path == record.path
-                })
-                .ok_or("the recorded capture is not the one this deletion recorded")?;
-            journal.captures.remove(position);
-            Ok(())
-        })
-    }
-
-    fn record_foreign(&mut self, capture: &ForeignCapture) -> Result<(), String> {
-        self.update(|journal| {
-            if let Some(existing) = journal
-                .foreign
-                .iter_mut()
-                .find(|existing| existing.private == capture.private)
-            {
-                *existing = capture.clone();
-                return Ok(());
-            }
-            if journal.foreign.len() >= MAX_FOREIGN_CAPTURES {
-                return Err("the deletion has more foreign captures than it may record".to_owned());
-            }
-            journal.foreign.push(capture.clone());
-            Ok(())
-        })
-    }
-
-    fn record_root_removed(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        self.update(|journal| {
-            journal.root = RootCapturePlan {
-                phase: RootCapturePhase::Removed,
-                ..plan.clone()
-            };
-            Ok(())
-        })
-    }
 }
 
 /// Whether a project folder with no recorded slot holds anything: missing
@@ -5034,13 +4784,12 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         {
             return Err(LeaseError::UnknownAccounting);
         }
-        // A policy-5 ledger never carries an in-ledger journal: the journal of
-        // a recorded deletion lives in its custody directory.
-        if ledger.capacity_policy == Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
-            && slot.capture.is_some()
-        {
-            return Err(LeaseError::UnknownAccounting);
-        }
+        // A policy-5 ledger may still carry a *legacy* in-ledger journal for a
+        // record whose custody could not be staged, while other deletions
+        // publish custody records. That transitional shape is fenced exactly
+        // like the custody-only one — a predecessor refuses the policy and the
+        // `custody` field before any effect — and it is never replayed from the
+        // ledger: the record is migrated or kept pending, never reinterpreted.
     }
     Ok(())
 }
