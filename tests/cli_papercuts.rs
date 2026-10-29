@@ -250,6 +250,30 @@ fn an_explicit_pool_outside_the_task_scratch_root_refuses() {
     assert!(stderr.contains("OXIDE_POOL is"), "{stderr}");
     assert!(!pasted.exists() && !scratch.path().join("pasted-pool").exists());
 
+    // The same annotation on an EXISTING ordinary directory (Found::Unknown,
+    // not Found::Absent) must still get the hint, not the generic open error
+    // the path otherwise reaches.
+    let annotated = scratch.path().join("existing (from OXIDE_POOL)");
+    fs::create_dir_all(&annotated).unwrap();
+    fs::write(annotated.join("keep.txt"), "keep").unwrap();
+    let output = private_env(scratch.path(), &bin, &annotated)
+        .current_dir(&manifest.parent().unwrap())
+        .arg("check")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("pasted from `oxide status`"),
+        "an existing non-pool path lost the annotation hint: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot open the pool"),
+        "the generic open error ran before the annotation hint: {stderr}"
+    );
+    assert_eq!(fs::read(annotated.join("keep.txt")).unwrap(), b"keep");
+    assert!(!annotated.join("oxide-managed").exists());
+
     // A path that exists but holds no Oxide pool is also named, with the
     // open refusal's own cause, and nothing is created inside it.
     let empty = scratch.path().join("empty-pool");

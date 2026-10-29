@@ -1051,8 +1051,9 @@ explicit `recover` unless they adopt it.
   strictly inside the caller's canonical `OXIDE_TASK_SCRATCH_ROOT` opts in
   (proof fixtures), and a value ending in a `status` display annotation
   (`<path> (from …)`) refuses with a hint that the annotation is not part of
-  the path. An existing pool at that path and the config-file path are
-  unchanged.
+  the path, for an absent path and for an existing directory that holds no
+  Oxide pool alike. An existing valid pool at a normal path and the
+  config-file path are unchanged.
 - Slot headroom (oxide#118, oxide#177): up to 256 slots per pool and twelve
   per project identity, with compatible reuse first and the oldest eligible
   idle whole slot replaced under count or byte pressure
@@ -3659,8 +3660,10 @@ oxide#102.
   silently (oxide#182). Creation at that explicit path is opt-in through
   `OXIDE_POOL_CREATE=1` or a path strictly inside the caller's canonical
   `OXIDE_TASK_SCRATCH_ROOT`; a value pasted from `oxide status` with its
-  trailing ` (from …)` annotation refuses with a hint. The config-file path
-  and the built-in default keep creating the pool on first use.
+  trailing ` (from …)` annotation refuses with a hint for every pool state
+  (an absent path and an existing directory that holds no Oxide pool alike),
+  before any generic open error. The config-file path and the built-in
+  default keep creating the pool on first use.
 - **Storage roots.** The config, cache and state roots come from
   `longhorn-storage-layout` (git tag `v0.4.1`, commit `5caf1e2c`,
   `platform-native-v1`, leaf `oxide`; oxide#103). Each root is resolved

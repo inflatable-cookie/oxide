@@ -1766,12 +1766,18 @@ impl Store {
     pub fn open_or_create() -> Result<Self, String> {
         let settings = settings()?;
         let path = settings.pool.clone();
+        let source = settings.pool_source;
         config::refuse_unsafe_pool_path(&path)?;
+        // A pasted `oxide status` annotation is not part of a path, so it
+        // refuses for every pool state: an absent path and an existing
+        // ordinary directory both get the hint instead of the generic open
+        // error (oxide#182).
+        config::pool_annotation_refused(&path, source)?;
         match config::inspect(&path) {
             Found::Absent => {
                 config::pool_creation_allowed(
                     &path,
-                    settings.pool_source,
+                    source,
                     std::env::var_os("OXIDE_POOL_CREATE").as_deref(),
                     std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").as_deref(),
                 )?;

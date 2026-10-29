@@ -735,6 +735,29 @@ pub fn settings(facts: &Facts) -> Result<Settings, String> {
     })
 }
 
+/// Why an explicit `OXIDE_POOL` value that ends in an `oxide status` display
+/// annotation is unusable, whatever the selected path holds (oxide#182). The
+/// suffix is not part of a path, so an absent pool and an existing ordinary
+/// directory both refuse with the same hint. Another source, or a value
+/// without that suffix, is `Ok(())` here; the ordinary rules still apply.
+pub fn pool_annotation_refused(pool: &Path, source: Source) -> Result<(), String> {
+    if !matches!(source, Source::Environment("OXIDE_POOL")) {
+        return Ok(());
+    }
+    let Some(annotation) = pasted_annotation(pool) else {
+        return Ok(());
+    };
+    let target = pool.display().to_string();
+    let bare = target
+        .strip_suffix(&annotation)
+        .unwrap_or(&target)
+        .trim_end();
+    Err(format!(
+        "OXIDE_POOL is {:?}, which looks pasted from `oxide status`; the trailing {annotation:?} is a display annotation, not part of the path. Set OXIDE_POOL to {bare:?}",
+        target
+    ))
+}
+
 /// Whether an absent pool may be created (oxide#182).
 ///
 /// The built-in default and a config-file pool path create on first use as
@@ -754,17 +777,7 @@ pub fn pool_creation_allowed(
     if !matches!(source, Source::Environment("OXIDE_POOL")) {
         return Ok(());
     }
-    if let Some(annotation) = pasted_annotation(pool) {
-        let target = pool.display().to_string();
-        let bare = target
-            .strip_suffix(&annotation)
-            .unwrap_or(&target)
-            .trim_end();
-        return Err(format!(
-            "OXIDE_POOL is {:?}, which looks pasted from `oxide status`; the trailing {annotation:?} is a display annotation, not part of the path. Set OXIDE_POOL to {bare:?}",
-            target
-        ));
-    }
+    pool_annotation_refused(pool, source)?;
     if opt_in == Some(std::ffi::OsStr::new("1")) {
         return Ok(());
     }
@@ -1465,6 +1478,34 @@ mod tests {
             pool_creation_allowed(ordinary, explicit, Some(std::ffi::OsStr::new("1")), None)
                 .is_ok()
         );
+    }
+
+    /// oxide#182: a pasted `oxide status` suffix is not a path, so the hint
+    /// applies whatever the path holds. The store calls this before its
+    /// generic open error, which covers an existing ordinary directory
+    /// (`Found::Unknown`) as well as an absent one (`Found::Absent`).
+    #[test]
+    fn a_pasted_status_annotation_refuses_for_every_pool_state() {
+        let pasted = Path::new("/tmp/existing (from OXIDE_POOL)");
+        let explicit = Source::Environment("OXIDE_POOL");
+        let error = pool_annotation_refused(pasted, explicit)
+            .expect_err("a pasted annotation was accepted");
+        assert!(error.contains("pasted from `oxide status`"), "{error}");
+        assert!(
+            error.contains("Set OXIDE_POOL to \"/tmp/existing\""),
+            "{error}"
+        );
+        assert!(pool_annotation_refused(pasted, Source::File).is_ok());
+        assert!(pool_annotation_refused(pasted, Source::Default).is_ok());
+        // Only the exact status shape is an annotation.
+        assert!(pool_annotation_refused(Path::new("/tmp/existing"), explicit).is_ok());
+        assert!(pool_annotation_refused(Path::new("/tmp/existing (fast)"), explicit).is_ok());
+        assert!(pool_annotation_refused(Path::new("/tmp/x (from )"), explicit).is_ok());
+        // The absent-pool rule keeps the same hint through its own entry.
+        let absent = Path::new("/tmp/absent (from OXIDE_POOL)");
+        let error = pool_creation_allowed(absent, explicit, None, None)
+            .expect_err("the absent-pool rule lost the hint");
+        assert!(error.contains("pasted from `oxide status`"), "{error}");
     }
 
     #[test]
