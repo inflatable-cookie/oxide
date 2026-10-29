@@ -116,15 +116,24 @@ pub(crate) const SLOT_CEILING_FENCE: &str = "oxide.slots/256";
 /// The ledger byte limit an older installed binary reads: its own
 /// `MAX_LEDGER_BYTES` at the legacy 2 MiB ceiling (oxide#177).
 const PREDECESSOR_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
-/// The largest amount one mutating command can add to the ledger before the
-/// next admission gate: the maximal journal a *writer* can construct (about
-/// 640 KB — observed names are single `NAME_MAX` components and the description
-/// is the writer's fixed text, even though the reader also accepts the fuller
+/// The largest amount one **ordinary admission** can add to the ledger before
+/// the next gate: the maximal journal a writer can construct (about 640 KB —
+/// observed names are single `NAME_MAX` components and the description is the
+/// writer's fixed text, even though the reader also accepts the fuller
 /// `PATH_MAX` form the ledger cap covers), a full refresh of up to 256 closed
 /// size records (about 256 KB) and one slot row (about 16 KB). 1 MiB is a
 /// conservative ceiling for that sum, so a ledger at or above
-/// `PREDECESSOR_LEDGER_BYTES - MAX_LEDGER_GROWTH` (1 MiB) must make the
-/// version-7 control fence durable before its next write.
+/// `PREDECESSOR_LEDGER_BYTES - MAX_LEDGER_GROWTH` (1 MiB) makes the version-7
+/// control fence durable before an ordinary mutation.
+///
+/// **Recovery is not covered.** `Pool::open`'s `reconcile_evicting` can create
+/// and leave a journal for every pending `Evicting` record whose deletion
+/// fails, because `remove_owned_slot` starts a journal without
+/// `retire_idle_slot`'s guard and the loop continues past a blocked record (up
+/// to `MAX_SLOTS` journals in one open). One command's growth is therefore not
+/// bounded by this constant for inherited or pending-deletion states; bounding
+/// it (a recovery journal limit, an unconditional prefix fence, or another
+/// rule) is an open design question recorded in local-lease (oxide#177).
 const MAX_LEDGER_GROWTH: u64 = 1024 * 1024;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
@@ -5129,11 +5138,15 @@ impl Store {
     /// The older installed binary reads at most 2 MiB, so a pool that stays
     /// below 128 slots can still hold a valid journaled ledger it could not
     /// read — and a ledger-only refusal is not the hand-off this contract
-    /// promises. One command adds at most one journal (the library refuses a
-    /// second while one is outstanding), a full record refresh and one row;
-    /// `MAX_LEDGER_GROWTH` bounds that sum, so a ledger at or above the
-    /// threshold here cannot cross 2 MiB without this fence. The fence is
-    /// forward-only, so its version survives every later `save`.
+    /// promises. An ordinary admission adds at most one journal (the library
+    /// refuses a second while one is outstanding), a full record refresh and
+    /// one row; `MAX_LEDGER_GROWTH` bounds that sum, so a ledger at or above
+    /// the threshold here cannot cross 2 MiB during an ordinary mutation.
+    /// **Recovery is not covered:** `Pool::open`'s reconciliation can leave a
+    /// journal for each failing pending `Evicting` record in one open, so this
+    /// ordering is established for ordinary mutations only; that gap is the
+    /// open design question recorded above and in local-lease (oxide#177). The
+    /// fence is forward-only, so its version survives every later `save`.
     fn fence_ledger_for_predecessor_read(&self) -> Result<(), String> {
         let bytes = oxide_storage::lease::managed::ledger_file_bytes(&self.pool)
             .map_err(|error| lease_error("cannot read the pool ledger", &error))?;

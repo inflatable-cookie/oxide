@@ -63,15 +63,26 @@ pub const LEGACY_MAX_SLOTS: usize = 128;
 /// journal count. No count rule is added and the cap does not grow for
 /// multi-journal states.
 ///
-/// The measured **writer-reachable** maxima, the states this writer can
-/// produce, are reported separately and are what the cap must cover for this
-/// writer: the raised-ceiling representation at `MAX_SLOTS` with every bounded
-/// field and numeric field at its maximum is 4,213,726 bytes all-idle, and
-/// 5,624,335 bytes with this writer's maximal single `DeletionJournal` —
-/// 2,764,273 bytes below the cap. `retire_idle_slot` refuses while
-/// reconciliation is blocked or any journal is outstanding, so this binary
-/// starts at most one journal and only preserves inherited ones. A maximal
-/// journal is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture records and
+/// The measured states this writer reaches on its **ordinary eviction path**
+/// from a fresh pool are reported separately: the raised-ceiling
+/// representation at `MAX_SLOTS` with every bounded field and numeric field at
+/// its maximum is 4,213,726 bytes all-idle, and 5,624,335 bytes with this
+/// writer's maximal single `DeletionJournal` — 2,764,273 bytes below the cap.
+/// Ordinary evictions go through `retire_idle_slot`, which refuses while
+/// reconciliation is blocked or any journal is outstanding, so an admission
+/// starts at most one journal. **Recovery is a second journal path, not a
+/// preserve-only path**: every `Pool::open` runs `reconcile_evicting`, and
+/// `remove_owned_slot` creates and persists a fresh `SlotCaptureJournal` for an
+/// `Evicting` record that has none (and after a recoverable inherited journal
+/// is rolled back and cleared) without the `retire_idle_slot` guard; a failed
+/// deletion deliberately keeps that journal, and the loop continues past a
+/// blocked record, so one open can leave a journal for every failing pending
+/// deletion, up to `MAX_SLOTS`. A write above this cap is refused, so a durable
+/// ledger still never exceeds it, but the 5,624,335-byte state is the maximal
+/// ordinary-path state, not a bound on recovery. The per-command growth the
+/// size-based control fence assumes is therefore not established for recovery;
+/// that is an open design question (see `MAX_LEDGER_GROWTH`). A maximal journal
+/// is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture records and
 /// `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a chain of at
 /// most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the enforced
 /// journal-name bounds: a name field of at most `PATH_MAX` (1024) bytes in

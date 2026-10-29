@@ -2423,7 +2423,7 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     );
     // Reported evidence for the oxide#177 accounting-cost gate.
     println!(
-        "maximal writer-reachable 256-slot ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
+        "measured ordinary-path writer-reachable 256-slot ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
         stored.len()
     );
     assert_eq!(
@@ -2576,14 +2576,16 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
     })
 }
 
-/// The maximal ledger this writer can reach (oxide#177): the raised-ceiling
-/// representation at 256 slots with every field at its cap, where the one slot
-/// a pool can durably leave `Evicting` carries a maximal deletion journal. The
-/// library refuses a second deletion while a journal is outstanding, so one is
-/// the writer-reachable maximum. `MAX_LEDGER_BYTES` is the *worst-valid byte
-/// bound* — a larger ledger is corrupt and refused, and the reader accepts any
-/// otherwise-valid ledger at or below it, including multi-journal states. This
-/// fixture measures the writer-reachable state that bound must cover.
+/// The maximal ledger this writer reaches on its **ordinary eviction path**
+/// (oxide#177): the raised-ceiling representation at 256 slots with every field
+/// at its cap, where the one slot a pool can durably leave `Evicting` carries a
+/// maximal deletion journal. `retire_idle_slot` refuses a second deletion while
+/// a journal is outstanding, so an admission starts one. `MAX_LEDGER_BYTES` is
+/// the *worst-valid byte bound* — a larger ledger is corrupt and refused, and
+/// the reader accepts any otherwise-valid ledger at or below it. Recovery can
+/// leave more journals (see
+/// `recovery_creates_a_journal_for_a_second_pending_deletion`), so this figure
+/// is the maximal ordinary-path state, not a bound on recovery.
 #[test]
 fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-journal-ledger");
@@ -2672,13 +2674,89 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(journal.foreign[0].found.len(), 1024);
     assert_eq!(journal.foreign[0].expected_mode, u32::MAX);
     println!(
-        "maximal writer-reachable 256-slot journaled ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
+        "measured ordinary-path writer-reachable 256-slot journaled ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
         stored.len()
     );
     // A passive snapshot reads the journals without reconciling them.
     let snapshot = super::pool::snapshot_injected(&pool).expect("the journaled ledger reads");
     assert_eq!(snapshot.slots.len(), super::MAX_SLOTS);
     assert_eq!(snapshot.evicting_slot_ids.len(), 1);
+}
+
+/// Recovery is a second journal path (oxide#177): `Pool::open` reconciles
+/// every `Evicting` record, and `remove_owned_slot` creates and persists a fresh
+/// `SlotCaptureJournal` for one that has none (or after a recoverable journal is
+/// rolled back and cleared), without `retire_idle_slot`'s single-journal guard;
+/// the loop continues past a blocked record and a failed deletion keeps its
+/// journal. One open can therefore leave a journal per failing pending
+/// deletion, which is why the per-command growth the size-based control fence
+/// assumes is not established for recovery (see `MAX_LEDGER_GROWTH`).
+#[test]
+fn recovery_creates_a_journal_for_a_second_pending_deletion() {
+    let fixture = Fixture::new("recovery-journal");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first =
+        lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a")).expect("a");
+    let second =
+        lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")).expect("b");
+    release_injected(&pool, &first.lease_id).expect("release a");
+    release_injected(&pool, &second.lease_id).expect("release b");
+    let first_id: u64 = first.slot_id.parse().expect("slot id");
+    let second_id: u64 = second.slot_id.parse().expect("slot id");
+    let first_path = pool.join("payload/slots").join(&first.slot_id);
+    let second_path = pool.join("payload/slots").join(&second.slot_id);
+
+    // Slot A: an unclassifiable journal, so reconciliation blocks and keeps it.
+    super::pool::mark_evicting_for_test(&pool, first_id).expect("recorded deletion");
+    fs::remove_dir_all(&first_path).expect("the recorded root is absent");
+    super::pool::write_capture_record_injected(
+        &pool,
+        first_id,
+        super::pool::DeletionJournal {
+            root: crate::owned_delete::RootCapturePlan {
+                private: format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, 31),
+                phase: crate::owned_delete::RootCapturePhase::Planned,
+                device: 1,
+                inode: 2,
+                parent_device: 1,
+                parent_inode: 3,
+                mode: 0o040700,
+            },
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("journal");
+
+    // Slot B: `Evicting` with no journal, and a tree the deletion cannot
+    // finish (a directory with no search bit), so recovery starts a journal and
+    // keeps it when the deletion refuses.
+    super::pool::mark_evicting_for_test(&pool, second_id).expect("recorded deletion");
+    let blocked = second_path.join("blocked");
+    fs::create_dir(&blocked).expect("blocked directory");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("no search bit");
+
+    // One open reconciles them: A stays blocked and B gains a fresh journal.
+    let _ = status_injected(&pool);
+    assert!(
+        super::pool::capture_record_injected(&pool, first_id).is_some(),
+        "the blocked journal is retained"
+    );
+    assert!(
+        super::pool::capture_record_injected(&pool, second_id).is_some(),
+        "recovery created a second journal"
+    );
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(
+        snapshot.evicting_slot_ids.len(),
+        2,
+        "both pending deletions are retained: {:?}",
+        snapshot.evicting_slot_ids
+    );
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore for cleanup");
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 
 /// A journaled deletion that cannot be classified keeps the pool blocked:

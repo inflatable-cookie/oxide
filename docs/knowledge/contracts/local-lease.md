@@ -575,11 +575,21 @@ captures, chains of 64 capture private names, name fields at `PATH_MAX` 1024
 bytes in `NAME_MAX` 255-byte components, `expected_mode` at the unrestricted
 u32 maximum, maximal sixfold escapes) it measures 5,624,335 bytes. The writer
 refuses an over-bound journal object per object and puts it back without
-deleting it; the reader refuses a ledger that carries one. This head's writer
-starts at most one journal: `retire_idle_slot` is the only path that starts a
-deletion and it refuses while reconciliation is blocked or any journal is
-outstanding, so the guard covers `evict_idle_slot` too, and every open
-reconciles all `Evicting` records before admitting anything.
+deleting it; the reader refuses a ledger that carries one. Ordinary evictions go
+through `retire_idle_slot`, which refuses while reconciliation is blocked or any
+journal is outstanding (so the guard covers `evict_idle_slot` too), and every
+open reconciles all `Evicting` records before admitting anything.
+
+**Recovery is a second journal path, not a preserve-only path.** Every
+`Pool::open` runs `reconcile_evicting`. For an `Evicting` record with no
+journal, `reconcile_slot_capture` returns `Resume` and `remove_owned_slot`
+creates and persists a fresh `SlotCaptureJournal` through `begin`, without the
+`retire_idle_slot` guard; a recoverable inherited journal is rolled back,
+cleared and restarted the same way. A failed deletion deliberately keeps that
+journal, and the loop continues past a blocked record, so one open can leave a
+journal for every failing pending deletion, up to `MAX_SLOTS`. The size-based
+control fence's per-command growth assumption therefore does not cover recovery
+(see the fence paragraph and `MAX_LEDGER_GROWTH`).
 
 **Worst-valid byte bound (oxide#177; Supervisor ruling 49081d79).**
 `MAX_LEDGER_BYTES` *is* the worst-valid byte bound: the read and write paths
@@ -589,15 +599,14 @@ that carries more than one `Evicting` journal (each slot's journal is validated
 independently and no journal count is bounded). No count rule is added and the
 cap does not grow for multi-journal states.
 
-The measured *writer-reachable* maxima — the states this writer can produce —
-are reported separately and are what the cap covers for this writer: the
-all-idle figure above, and 5,624,335 bytes with this writer's maximal single
-journal, leaving **2,764,273 bytes headroom** under the cap. This writer starts
-at most one journal (`retire_idle_slot` refuses while reconciliation is blocked
-or any journal is outstanding) and only preserves inherited ones; an inherited
-predecessor ledger was capped at that binary's own 2 MiB write plus the records
-this binary adds. The journal name fields keep their enforced `PATH_MAX` 1024
-bytes / `NAME_MAX` 255-byte component bounds at writer and reader. Control
+The measured *ordinary-path writer-reachable* maxima are reported separately:
+the all-idle figure above, and 5,624,335 bytes with this writer's maximal single
+journal, leaving **2,764,273 bytes headroom** under the cap. Recovery of pending
+deletions can leave more journals in one open (above), bounded only by
+`MAX_SLOTS` and by this cap itself — a write above 8 MiB is refused — so the
+5,624,335-byte state is the maximal ordinary-path state, not a bound on
+recovery. The journal name fields keep their enforced `PATH_MAX` 1024 bytes /
+`NAME_MAX` 255-byte component bounds at writer and reader. Control
 state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
 tickets, 128 clean marks, 16 recoveries, 16 flushes, per-object compact
@@ -632,13 +641,20 @@ can first add the 129th slot also makes a forward-only **version-7** control
 fence durable first (`oxide.slots/256`): an older binary with version ≤ 6 then
 hands off to a receipt-matching successor instead of refusing a ledger this
 one is about to fence. The same fence has a second, size-based trigger at the
-mutating-command gate: the predecessor binary reads at most 2 MiB, and one
-command can add at most one journal plus a full record refresh plus one row,
-which `MAX_LEDGER_GROWTH` (1 MiB) bounds. A ledger at or above 1 MiB therefore
-makes the version-7 fence durable before its next write, so a journaled ledger
-that stays below 128 slots cannot pass the older binary's read limit while
-still at version 5. A pool below both triggers keeps version 5, which an older
-binary still reads directly. A completed legacy `Evicting`
+mutating-command gate: the predecessor binary reads at most 2 MiB, and an
+**ordinary admission** can add at most one journal plus a full record refresh
+plus one row, which `MAX_LEDGER_GROWTH` (1 MiB) bounds. A ledger at or above
+1 MiB therefore makes the version-7 fence durable before its next write, so a
+journaled ledger that stays below 128 slots cannot pass the older binary's read
+limit while still at version 5. **Recovery is not covered by that growth
+bound:** one open can start and leave a journal for each failing pending
+`Evicting` record (up to `MAX_SLOTS`), so a recovery command at version 5 could
+push a ledger below the 1 MiB threshold past the predecessor's 2 MiB read limit
+and the older binary would refuse it instead of handing off. Bounding recovery
+growth — a recovery journal limit per command, an unconditional prefix fence
+before opens that can reconcile, or another rule — is an open design question
+referred to the Oxide Supervisor. A pool below both triggers keeps version 5,
+which an older binary still reads directly until a recovery writes more. A completed legacy `Evicting`
 reconciliation may still finish in the legacy representation. Before a revised write, every
 stored field is validated against the raised caps; an oversized legacy field
 refuses with the original file, ownership and quarantine bytes untouched,
