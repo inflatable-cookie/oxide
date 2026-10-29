@@ -126,6 +126,9 @@ pub const MAX_HOLDER_BYTES: usize = 128;
 pub const MAX_PATH_BYTES: usize = 1024;
 /// Finite lease-id text.
 pub const MAX_LEASE_ID_BYTES: usize = 160;
+/// The most slot IDs a bounded capacity refusal names before it counts the
+/// rest (oxide#186). Keeps one refusal line bounded at the 256-slot ceiling.
+pub const MAX_REFUSAL_SLOTS: usize = 8;
 /// Cooperative inventory bounds for pool accounting (oxide#108), separate
 /// from the inventory tool's defaults. Sized for real build caches: the
 /// entry bound still admits one 60k-entry Cargo build directory (Farmyard's
@@ -187,6 +190,23 @@ pub enum SlotOccupancy {
     Abandoned,
 }
 
+/// One slot an admission walked but could not measure completely, bound to the
+/// exact generation that walk covered (oxide#186).
+///
+/// It carries no size: the conservative charge stays in the admission's memory
+/// and is never persisted. The front door records only the incomplete outcome,
+/// as the oxide#128 diagnostic fact that makes default status say
+/// `not measured (walk incomplete)` until a later complete walk records the
+/// slot normally. Nothing derives a record, an eviction or any authority from
+/// it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnmeasuredSlot {
+    pub slot_id: String,
+    pub incarnation: String,
+    /// The ledger's recorded slot directory; `None` is the legacy `<id>`.
+    pub dir: Option<String>,
+}
+
 /// Why a command refused. Mapped to a small exit set by [`LeaseError::exit_code`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LeaseError {
@@ -204,6 +224,23 @@ pub enum LeaseError {
     /// A bounded accounting walk that admission, reuse or eviction needed
     /// did not complete. Same reason and exit code as `UnknownAccounting`.
     AccountingIncomplete(Box<AccountingScan>),
+    /// Capacity could not admit this admission because the slots a partial
+    /// walk left unmeasured are charged conservatively and are never evicted on
+    /// that charge (oxide#186). A bounded capacity refusal: exit code 3, the
+    /// same capacity class as [`LeaseError::Full`], and never
+    /// `unknown_accounting`, because no shared authority is unknown. It names
+    /// at most [`MAX_REFUSAL_SLOTS`] slots and counts the rest, so one refusal
+    /// line stays bounded at the slot ceiling.
+    CapacityCharged {
+        /// The conservative pool figure and its budget for a byte-pressure
+        /// refusal, or `None` when the refusal is that a requested idle-slot
+        /// count replacement could not be honoured — a count decision, never a
+        /// byte one, which has no honest byte figure to print.
+        measured: Option<u64>,
+        limit: Option<u64>,
+        /// Every slot this admission charged conservatively, in slot order.
+        unmeasured: Vec<UnmeasuredSlot>,
+    },
     /// A one-use admission whose measured slice is still full after restore
     /// (design §6.9): the measured union (or `None` when it could not be
     /// measured) and the byte bound. Exit code 3, beside `Full` and
@@ -233,6 +270,7 @@ impl LeaseError {
             | Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(_)
+            | Self::CapacityCharged { .. }
             | Self::OneUseBudget { .. }
             | Self::LedgerExhausted => 3,
             Self::UnsafePath(_) | Self::BackingMismatch => 4,
@@ -249,6 +287,7 @@ impl LeaseError {
             Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(_) => "unknown_accounting",
+            Self::CapacityCharged { .. } => "full",
             Self::OneUseBudget { .. } => "one_use_budget",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
@@ -290,6 +329,33 @@ impl std::fmt::Display for LeaseError {
             },
             Self::AccountingIncomplete(scan) => {
                 write!(formatter, "owned accounting is incomplete: {scan}")
+            }
+            Self::CapacityCharged {
+                measured,
+                limit,
+                unmeasured,
+            } => {
+                let named: Vec<&str> = unmeasured
+                    .iter()
+                    .take(MAX_REFUSAL_SLOTS)
+                    .map(|slot| slot.slot_id.as_str())
+                    .collect();
+                match (measured, limit) {
+                    (Some(measured), Some(limit)) => write!(
+                        formatter,
+                        "pool cap cannot admit a new slot: {measured} of {limit} bytes charged; unmeasured slot(s) {}",
+                        named.join(", ")
+                    )?,
+                    _ => write!(
+                        formatter,
+                        "cannot admit a new slot: unmeasured slot(s) {}",
+                        named.join(", ")
+                    )?,
+                }
+                if let Some(more) = unmeasured.len().checked_sub(named.len()).filter(|n| *n > 0) {
+                    write!(formatter, " and {more} more")?;
+                }
+                formatter.write_str(" are kept and never evicted on a partial walk")
             }
             Self::HolderConflict => {
                 formatter.write_str("holder is already bound to a different lease")
@@ -574,6 +640,11 @@ pub struct Leased {
     /// nothing; `Some` for every new-slot admission and every one-use
     /// admission, including one whose slice was empty (`NotNeeded`).
     pub slice: Option<SliceReport>,
+    /// Slots this admission could not measure completely and charged
+    /// conservatively instead (oxide#186). Empty when every walk completed.
+    /// Their charge is not reported: only the incomplete outcome is, so a
+    /// caller can record it as the oxide#128 diagnostic fact.
+    pub unmeasured: Vec<UnmeasuredSlot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

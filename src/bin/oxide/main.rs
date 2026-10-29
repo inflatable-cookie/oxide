@@ -2771,6 +2771,23 @@ mod tests {
         assert!(!line.contains("MiB") && !line.contains("bytes"), "{line}");
     }
 
+    /// A slot whose last walk stopped partial is rendered as
+    /// `not measured (walk incomplete)` and never with a figure (oxide#186).
+    #[test]
+    fn an_incomplete_walk_slot_line_says_not_measured() {
+        let mut slot = view("7", None, "/work/tmp/repo");
+        slot.size = store::SlotSize::NotMeasured(store::INCOMPLETE_WALK.to_owned());
+        let line = slot_line(&slot, "idle", "/work/tmp/repo");
+        assert!(
+            line.contains("not measured (walk incomplete)"),
+            "the status line does not report the incomplete walk: {line}"
+        );
+        assert!(
+            !line.contains("MiB"),
+            "the status line claimed a size: {line}"
+        );
+    }
+
     /// Equal slot numbers in two pools stay distinct by label and place;
     /// a legacy slot shows its checkout's name and legacy path. A nested
     /// recorded directory is always shown as recorded, never as a sibling

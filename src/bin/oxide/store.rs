@@ -34,7 +34,7 @@ use oxide_storage::lease::managed::{
 use oxide_storage::lease::{
     AccountingScan, AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair,
     MemberSet, OneUseSlice, PoolStatus, Profile as LeaseProfile, RestoreOutcome, ReuseMeasurement,
-    SliceAdmission, SliceReport, SlotLayout, SlotOccupancy, VictimPolicy,
+    SliceAdmission, SliceReport, SlotLayout, SlotOccupancy, UnmeasuredSlot, VictimPolicy,
     BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
 use oxide_storage::volume::Binding;
@@ -807,19 +807,28 @@ pub(crate) fn age_text(seconds: u64) -> String {
     }
 }
 
-/// A recorded observation's provenance. Only the reuse walk the library
-/// already makes during an acquiring command is recorded: nothing fabricates
-/// an admission measurement or adds a walk to obtain one.
+/// A recorded observation's provenance. Only walks the library already makes
+/// during an acquiring command are recorded: nothing fabricates an admission
+/// measurement or adds a walk to obtain one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObservationSource {
+    /// The reuse walk measured this slot generation completely.
     LeaseReuse,
+    /// An admission walked this slot generation and stopped partial, so it was
+    /// charged conservatively and kept (oxide#186). The fact carries **no**
+    /// size: `allocated_bytes` is written as 0 and is never read for this
+    /// source, which reads as `not measured (walk incomplete)`. A later
+    /// complete walk of the same generation records it normally, either as a
+    /// ledger record at release or as a reuse fact.
+    AdmissionWalkIncomplete,
 }
 
 impl ObservationSource {
     fn label(self) -> &'static str {
         match self {
             Self::LeaseReuse => "measured by the reuse walk when leased",
+            Self::AdmissionWalkIncomplete => "walked by an admission without completing",
         }
     }
 }
@@ -827,6 +836,9 @@ impl ObservationSource {
 /// The diagnostic sidecar's schema. It is not part of the pool, ledger,
 /// registration or receipt formats and grants no accounting authority.
 const OBSERVATIONS_SCHEMA: &str = "oxide.status-observations/1";
+/// One slot's size phrase when the last walk of its generation stopped partial
+/// (oxide#186). It never carries a figure.
+pub(crate) const INCOMPLETE_WALK: &str = "not measured (walk incomplete)";
 const OBSERVATIONS_NAME: &str = "status-observations.json";
 const OBSERVATIONS_TEMP: &str = "status-observations.json.tmp";
 /// The sidecar's whole-file bound and retained observation count. The count
@@ -846,6 +858,9 @@ pub struct Observation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dir: Option<String>,
     measured_at_ms: u64,
+    /// The measured unique allocated bytes. For
+    /// [`ObservationSource::AdmissionWalkIncomplete`] this is written as 0 and
+    /// read by nothing: an incomplete walk has no size.
     allocated_bytes: u64,
     source: ObservationSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4285,7 +4300,7 @@ impl Store {
             .iter()
             .position(|entry| entry.id == record)
             .ok_or("Oxide slot record disappeared")?;
-        let (grant, measured) = match outcome {
+        let (grant, measured, unmeasured) = match outcome {
             Ok(leased) => {
                 if let Some(note) = &leased.admission_note {
                     eprintln!("oxide: warning: {note}");
@@ -4293,7 +4308,7 @@ impl Store {
                 if let Some(report) = &leased.slice {
                     Self::report_slice(class, report);
                 }
-                (leased.grant, leased.measured)
+                (leased.grant, leased.measured, leased.unmeasured)
             }
             Err(error) => {
                 state.settle_idle(index);
@@ -4328,6 +4343,17 @@ impl Store {
                             "one-use workspace admission refused: {unknown_rows} of this pool's ledger slots have no owning record, so the one-use slice cannot be bounded; nothing was evicted"
                         ))
                     }
+                    // The refusal names the slots a partial walk charged
+                    // conservatively and keeps; record the incomplete outcome
+                    // so status shows `not measured (walk incomplete)` for
+                    // them too (oxide#186). Diagnostic only: nothing here
+                    // changes the refusal, its reason or its exit code.
+                    LeaseError::CapacityCharged {
+                        ref unmeasured, ..
+                    } => {
+                        self.record_incomplete_walks(None, unmeasured);
+                        Err(lease_error("cannot lease a slot", &error))
+                    }
                     error => Err(lease_error("cannot lease a slot", &error)),
                 };
             }
@@ -4350,6 +4376,10 @@ impl Store {
                 lease_id: Some(grant.lease_id.clone()),
             });
         }
+        // A slot this admission could not measure completely is kept and
+        // charged conservatively; record that incomplete outcome so default
+        // status says `not measured (walk incomplete)` for it (oxide#186).
+        self.record_incomplete_walks(Some(&grant.store_id), &unmeasured);
         let prior = match (grant.reused_slot, recorded) {
             (false, _) => Prior::Fresh,
             (true, Some(origin)) => Prior::Known(origin),
@@ -5445,6 +5475,12 @@ fn recorded_size(
         .iter()
         .find(|observation| observation.matches(store_id, slot))
     {
+        // The last walk of this generation stopped partial: say so and never
+        // report a size (oxide#186). A current ledger record supersedes this
+        // fact before it is reached.
+        Some(observation) if observation.source == ObservationSource::AdmissionWalkIncomplete => {
+            SlotSize::NotMeasured(INCOMPLETE_WALK.to_owned())
+        }
         Some(observation) => SlotSize::Recorded {
             allocated_bytes: observation.allocated_bytes,
             age: if observation.measured_at_ms > now_ms {
@@ -5498,6 +5534,38 @@ pub(crate) fn read_observations_for_tests(
 }
 
 impl Store {
+    /// Record that an admission's walk of each of these slot generations
+    /// stopped partial, so default status reports `not measured (walk
+    /// incomplete)` for them (oxide#186). No size is written and nothing is
+    /// derived from the fact. A refusal has no grant, so it passes `None` and
+    /// the store identity comes from the pool's own recorded snapshot.
+    /// Diagnostic only: every failure is ignored, and admission, ownership and
+    /// exit status never change.
+    fn record_incomplete_walks(&self, store_id: Option<&str>, slots: &[UnmeasuredSlot]) {
+        if slots.is_empty() {
+            return;
+        }
+        let store_id = match store_id {
+            Some(store_id) => store_id.to_owned(),
+            None => match snapshot(&self.pool) {
+                Ok(recorded) => recorded.store_id.clone(),
+                Err(_) => return,
+            },
+        };
+        for slot in slots {
+            let _ = self.record_observation(Observation {
+                store_id: store_id.clone(),
+                slot_id: slot.slot_id.clone(),
+                incarnation: slot.incarnation.clone(),
+                dir: slot.dir.clone(),
+                measured_at_ms: process::now_ms(),
+                allocated_bytes: 0,
+                source: ObservationSource::AdmissionWalkIncomplete,
+                lease_id: None,
+            });
+        }
+    }
+
     /// Persist one complete measurement as a diagnostic observation. Never
     /// called by a read: only an acquiring command that already made the
     /// reuse walk records it. Failure is diagnostic only, so callers ignore
@@ -9017,6 +9085,110 @@ pub(crate) mod tests {
         }
     }
 
+    /// A slot whose last walk stopped partial is reported as
+    /// `not measured (walk incomplete)` and never with a figure; a later
+    /// complete walk of the same generation replaces that fact (oxide#186).
+    #[test]
+    fn an_incomplete_admission_walk_reads_as_not_measured() {
+        let slot = ledger_slot("1", "7", Some("oxide-abcd/quick-1"));
+        let incomplete = Observation {
+            store_id: "a".repeat(32),
+            slot_id: slot.slot_id.clone(),
+            incarnation: slot.incarnation.clone(),
+            dir: slot.dir.clone(),
+            measured_at_ms: 10_000,
+            allocated_bytes: 0,
+            source: ObservationSource::AdmissionWalkIncomplete,
+            lease_id: None,
+        };
+        let document = Observations {
+            schema: OBSERVATIONS_SCHEMA.to_owned(),
+            observations: vec![incomplete],
+        };
+        let recorded = recorded_size(&Ok(Some(document.clone())), &"a".repeat(32), &slot, 15_000);
+        assert_eq!(recorded, SlotSize::NotMeasured(INCOMPLETE_WALK.to_owned()));
+        assert_eq!(recorded.describe(), "not measured (walk incomplete)");
+        assert!(
+            !recorded.describe().contains("bytes") && !recorded.describe().contains('B'),
+            "an incomplete walk claimed a size"
+        );
+        // Another generation, directory or store is not this slot's fact.
+        for other in [
+            ledger_slot("1", "8", Some("oxide-abcd/quick-1")),
+            ledger_slot("1", "7", Some("oxide-abcd/quick-2")),
+            ledger_slot("2", "7", Some("oxide-abcd/quick-1")),
+        ] {
+            assert!(
+                matches!(
+                    recorded_size(&Ok(Some(document.clone())), &"a".repeat(32), &other, 15_000),
+                    SlotSize::NotMeasured(ref reason)
+                        if reason.starts_with("not measured (no recorded observation")
+                ),
+                "another generation borrowed the incomplete fact"
+            );
+        }
+    }
+
+    /// The incomplete fact is written from the admission's own report, bound to
+    /// the walked generation, and a later reuse measurement of the same
+    /// generation replaces it (oxide#186).
+    #[test]
+    fn recording_an_incomplete_walk_says_not_measured_until_a_complete_walk() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-incomplete-walk-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store {
+            control: root.clone(),
+            payload: root.join("payload"),
+            pool: root.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: None,
+            recorded_budget: 1 << 30,
+            max_active: 1,
+            sibling: None,
+        };
+        let slot = ledger_slot("1", "1", Some("oxide-abcd/quick-1"));
+        let store_id = "a".repeat(32);
+        store.record_incomplete_walks(
+            Some(&store_id),
+            &[UnmeasuredSlot {
+                slot_id: slot.slot_id.clone(),
+                incarnation: slot.incarnation.clone(),
+                dir: slot.dir.clone(),
+            }],
+        );
+        let document = read_observations_for_tests(&root).unwrap().unwrap();
+        assert_eq!(document.len(), 1);
+        assert_eq!(
+            document[0].source,
+            ObservationSource::AdmissionWalkIncomplete
+        );
+        assert_eq!(document[0].allocated_bytes, 0, "a walk wrote a size");
+        assert_eq!(document[0].slot_id, slot.slot_id);
+        assert_eq!(document[0].incarnation, slot.incarnation);
+        assert_eq!(document[0].dir, slot.dir);
+        assert_eq!(document[0].lease_id, None);
+        let recorded = recorded_size(&read_observations(&root), &store_id, &slot, 5);
+        assert_eq!(recorded.describe(), "not measured (walk incomplete)");
+        // A complete walk of the same generation records it normally.
+        store
+            .record_observation(observation(&slot, 20))
+            .expect("record the complete walk");
+        let recorded = recorded_size(&read_observations(&root), &store_id, &slot, 25);
+        assert!(
+            matches!(recorded, SlotSize::Recorded { .. }),
+            "a complete walk did not supersede the incomplete fact: {recorded:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A recorded fact is bound to exactly one slot generation: a different
     /// incarnation or recorded directory is not a size, and a future clock
     /// is an unknown age rather than a fresh observation.
@@ -10129,6 +10301,69 @@ pub(crate) mod tests {
         });
         let error = store.save(&unfenced).unwrap_err();
         assert!(error.contains("without the one-use fence"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A refused count replacement never becomes a thirteenth project slot.
+    /// At `PROJECT_SLOT_CAP` the front door asks the library to retire one
+    /// named idle slot; when the library refuses that candidate (here because
+    /// its recorded root no longer resolves) the command fails with the
+    /// bounded reason and the pool keeps exactly its capped slot count. The
+    /// library-side refusal for a slot whose own accounting walk was partial
+    /// (`a_named_count_replacement_refuses_rather_than_exceeding_the_project_
+    /// cap`) reaches the same front-door path.
+    #[test]
+    fn a_refused_count_replacement_never_adds_a_thirteenth_project_slot() {
+        let (root, store, key) = class_fixture("cap-refused-replacement");
+        let mut normal = Vec::new();
+        while normal.len() < PROJECT_SLOT_CAP {
+            normal.push(lease_as(&store, &key, WorkspaceAdmission::NORMAL, false).expect("normal"));
+        }
+        // Free one record and its lock so it becomes the cap's replacement
+        // candidate, then make the recorded slot root unresolvable.
+        let victim = normal.pop().expect("a released slot");
+        let victim_slot = victim.slot_id.clone();
+        store.release(victim, None).unwrap();
+        let view = store.ledger().unwrap();
+        let dir = view
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == victim_slot)
+            .and_then(|slot| slot.dir.clone())
+            .expect("the victim's recorded directory");
+        let slot_root = store.payload.join("slots").join(&dir);
+        fs::remove_dir_all(&slot_root).unwrap();
+        fs::write(&slot_root, b"not a directory").unwrap();
+
+        let (ticket, _file) = store.register_ticket().unwrap();
+        let outcome = store.attempt(
+            ticket,
+            &key,
+            Profile::Quick,
+            16,
+            WorkspaceAdmission::NORMAL,
+            false,
+            None,
+        );
+        store.remove_ticket(ticket).unwrap();
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("a refused replacement admitted or waited instead"),
+        };
+        assert!(
+            error.contains("cannot lease a slot"),
+            "the refusal is not the bounded capacity shape: {error}"
+        );
+        let view = store.ledger().unwrap();
+        assert_eq!(
+            view.slots.len(),
+            PROJECT_SLOT_CAP,
+            "the refused replacement still added a slot"
+        );
+        assert!(view.slots.iter().any(|slot| slot.slot_id == victim_slot));
+        for held in normal {
+            drop(held);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

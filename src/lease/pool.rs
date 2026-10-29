@@ -11,12 +11,12 @@ use super::{
     remove_tree_owned_checked, unexpected_entry, AccountingCoverage, AccountingGap,
     AccountingGapKind, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased,
     LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact,
-    RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
+    RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus, UnmeasuredSlot,
     ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
     CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
     LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION,
-    RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
+    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_REFUSAL_SLOTS, MAX_SLOTS,
+    PREVIOUS_CAPACITY_POLICY_VERSION, RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{
@@ -29,6 +29,7 @@ use crate::owned_delete::{
 };
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -64,8 +65,10 @@ pub struct LeaseRequest {
     /// A front-door **count** replacement, never byte pressure: retire this
     /// idle whole slot as part of this admission, before the new slot is
     /// allocated. Count pressure is authorised separately from the recorded
-    /// byte figure — a complete pool figure or a removable pool's bound-only
-    /// unknown both allow it — while a recorded byte-pressure admission takes
+    /// byte figure — a complete pool figure, a removable pool's bound-only
+    /// unknown, or an internal pool's conservative charge for a slot whose
+    /// walk stopped short (oxide#186), all allow it — while a recorded
+    /// byte-pressure admission takes
     /// the ordinary LRU path instead. The front door chooses the victim by
     /// recorded rank; the library rechecks its identity, ownership, occupancy
     /// and accounting under the pool lock.
@@ -585,6 +588,13 @@ pub(super) struct Pool {
     reconciliation_unresolved: bool,
     /// Why this open admitted a new slot without a complete walk, if it did.
     admission_note: Option<String>,
+    /// Slots this admission could not measure completely, with the
+    /// conservative charge it used instead (oxide#186), keyed by slot ID. The
+    /// charge is kept for the rest of this admission, so a repeated pool figure
+    /// reuses it rather than walking the slot again, and no eviction may select
+    /// the slot. It is cleared at the start of every admission: a later one
+    /// measures the slot again and may evict it normally.
+    unmeasured: BTreeMap<u64, u64>,
     /// The caller's registered free-space reserve for a removable payload.
     /// Read only by the unknown-size admission route; never a cap input.
     reserve: Option<u64>,
@@ -1078,22 +1088,32 @@ pub(super) fn pending_charge_injected(
     pool: &Path,
     slot_id: u64,
 ) -> Result<(u64, u64, u64), LeaseError> {
-    let opened = Pool::open(pool)?;
+    let mut opened = Pool::open(pool)?;
     let index = opened
         .ledger
         .slots
         .iter()
         .position(|slot| slot.id == slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
-    let largest = opened
-        .ledger
-        .slots
-        .iter()
-        .filter_map(|slot| slot.recorded.as_ref())
-        .map(|record| record.unique_bytes)
-        .max()
-        .unwrap_or(0);
+    let largest = opened.largest_recorded_slot();
     Ok((opened.slot_figure(index, &mut Vec::new())?, largest, 0))
+}
+
+/// Test-only: one admission plus the conservative charges it used for slots a
+/// partial walk left unmeasured (oxide#186), in slot order. Nothing is
+/// persisted: this reads the admission's own in-memory figure.
+#[cfg(test)]
+pub(super) fn lease_with_charges_injected(
+    request: LeaseRequest,
+) -> Result<(Leased, Vec<(u64, u64)>), LeaseError> {
+    let mut opened = Pool::open(&request.pool)?;
+    let leased = opened.lease(&request)?;
+    let charges = opened
+        .unmeasured
+        .iter()
+        .map(|(id, charge)| (*id, *charge))
+        .collect();
+    Ok((leased, charges))
 }
 
 impl Pool {
@@ -1156,6 +1176,7 @@ impl Pool {
             reconciliation_blocked: false,
             reconciliation_unresolved: false,
             admission_note: None,
+            unmeasured: BTreeMap::new(),
             reserve: None,
         };
         if trace_release {
@@ -1202,6 +1223,7 @@ impl Pool {
             reconciliation_blocked: pending,
             reconciliation_unresolved: false,
             admission_note: None,
+            unmeasured: BTreeMap::new(),
             reserve: None,
         })
     }
@@ -1308,6 +1330,11 @@ impl Pool {
     }
 
     fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
+        // Per-admission accounting state. A slot a partial walk leaves
+        // unmeasured is charged conservatively only for this admission
+        // (oxide#186), so the next admission measures it again and may evict
+        // it normally.
+        self.unmeasured.clear();
         // A journaled deletion whose recorded root is at neither of its names
         // leaves the ledger uncertain: no new lease is admitted until it is
         // resolved (oxide#175 capture recovery, oxide#177 single-journal
@@ -1336,6 +1363,7 @@ impl Pool {
                     measured: None,
                     admission_note: None,
                     slice: None,
+                    unmeasured: Vec::new(),
                 });
             }
             if existing.state == SlotPersistState::Held {
@@ -1415,6 +1443,7 @@ impl Pool {
                 measured: None,
                 admission_note: self.admission_note.take(),
                 slice: Some(report),
+                unmeasured: self.unmeasured_slots(),
             });
         }
         if let Some((idle, incarnation)) = candidate {
@@ -1448,6 +1477,7 @@ impl Pool {
             measured: None,
             admission_note: self.admission_note.take(),
             slice: slice_report,
+            unmeasured: self.unmeasured_slots(),
         })
     }
 
@@ -1493,6 +1523,7 @@ impl Pool {
             }),
             admission_note: None,
             slice: None,
+            unmeasured: Vec::new(),
         })
     }
 
@@ -1875,7 +1906,12 @@ impl Pool {
         if self.ledger.slots.len() >= MAX_SLOTS {
             self.evict_idle_until(MAX_SLOTS - 1, plan)?;
             if self.ledger.slots.len() >= MAX_SLOTS {
-                return Err(LeaseError::LedgerExhausted);
+                // A slot this admission could not measure is kept, so the only
+                // idle slot may have been excluded from the victim set and the
+                // ceiling cannot be met (oxide#186). That is a bounded capacity
+                // refusal naming the slot, never the unnamed count refusal;
+                // with every slot measured the shipped refusal stands.
+                return Err(self.count_selection_refusal());
             }
         }
         // New-slot admission compares the pool's own recorded bytes with its
@@ -1892,9 +1928,16 @@ impl Pool {
         match self.pressure() {
             Ok(used) => {
                 if used >= self.budget {
+                    // A conservative charge that already exhausts the budget
+                    // cannot be helped by evicting anything, so nothing is
+                    // deleted (oxide#186).
+                    if self.unmeasured_charge_exhausts_budget() {
+                        return Err(self.capacity_refusal(used));
+                    }
                     self.evict_idle_until_under_cap(plan)?;
-                    if self.pressure()? >= self.budget {
-                        return Err(LeaseError::Full);
+                    let used = self.pressure()?;
+                    if used >= self.budget {
+                        return Err(self.capacity_refusal(used));
                     }
                 }
             }
@@ -2211,6 +2254,16 @@ impl Pool {
         // unknown for bound gaps only. An internal or mixed incompleteness
         // still refuses before anything is deleted.
         self.pressure_known_or_bounded_removable()?;
+        // The named slot is a candidate like any other: a partial walk proves
+        // nothing about its bytes, so it is kept even when it is the slot this
+        // replacement names (oxide#186). Substituting an unrelated slot would
+        // delete storage the caller did not choose, and admitting without the
+        // replacement would break the project cap the caller asked to keep, so
+        // only this admission refuses, naming the slot. The value decides, not
+        // the name.
+        if self.unmeasured.contains_key(&id) {
+            return Err(self.count_selection_refusal());
+        }
         let Some((incarnation, project, profile)) = self
             .slot(id)
             .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
@@ -2267,10 +2320,16 @@ impl Pool {
         // make room for an admission.
         if bound_gaps_only(scan) {
             let mut pending = 0_u64;
-            for (index, slot) in self.ledger.slots.iter().enumerate() {
-                if slot.state == SlotPersistState::Evicting {
-                    pending = pending.saturating_add(self.slot_figure(index, &mut Vec::new())?);
-                }
+            let evicting: Vec<usize> = self
+                .ledger
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.state == SlotPersistState::Evicting)
+                .map(|(index, _)| index)
+                .collect();
+            for index in evicting {
+                pending = pending.saturating_add(self.slot_figure(index, &mut Vec::new())?);
             }
             if pending >= self.budget {
                 return Err(LeaseError::Full);
@@ -2328,7 +2387,9 @@ impl Pool {
     /// Both backings use the recorded sum — `pool_scope()` plus one figure
     /// per ledger slot, where a held slot is always walked fresh, a current
     /// idle record is trusted, and a missing or invalid record is walked once
-    /// and published. A shared removable volume's other occupants (caches,
+    /// and published (or, on an internal pool, charged conservatively when
+    /// that walk stops short: oxide#186). A shared removable volume's other
+    /// occupants (caches,
     /// scratch, another tool's files) are **not** this pool's usage and can
     /// never push it over its cap, so they are not part of this figure; the
     /// volume's free space is a reserve signal, handled separately.
@@ -2341,6 +2402,10 @@ impl Pool {
     /// **or** when a removable pool's pool figure is genuinely unknown for
     /// bound gaps only. An internal pool, a mixed or non-bound gap set, or any
     /// other accounting failure still refuses before anything is deleted.
+    ///
+    /// A slot charged conservatively for a partial walk (oxide#186) is not a
+    /// refusal here either: count pressure only ever selects a verified idle
+    /// whole slot, and an unmeasured slot is never a candidate.
     fn pressure_known_or_bounded_removable(&mut self) -> Result<(), LeaseError> {
         match self.pressure() {
             Ok(_) => Ok(()),
@@ -2360,9 +2425,11 @@ impl Pool {
     /// is current, and only the exact slots that need one otherwise.
     ///
     /// Completed walks are published in **one** revised write before the
-    /// caller decides anything, so progress survives a refusal. Any slot that
-    /// stays unmeasured keeps today's refusal: its figure is never zero and
-    /// never free space.
+    /// caller decides anything, so progress survives a refusal. A slot whose
+    /// own walk is partial at admission is not something the whole pool can
+    /// fail on: an idle slot on an internal pool is charged conservatively
+    /// into [`Pool::unmeasured`] (oxide#186) and published nowhere, so its
+    /// number is never zero, never free space and never a record.
     fn recorded_total(&mut self) -> Result<u64, LeaseError> {
         let mut total = self.pool_scope().require_complete()?;
         let mut pending: Vec<(u64, RecordedSize)> = Vec::new();
@@ -2386,8 +2453,19 @@ impl Pool {
     /// One slot's contribution. The index is re-read after the walk, and the
     /// completion recheck refuses to publish a figure for a generation that
     /// changed while it was measured.
+    ///
+    /// An **idle** slot on an internal pool whose walk stopped partial with an
+    /// observed figure is charged conservatively instead of refusing: max(the
+    /// bytes observed before it stopped, its current-generation record if any,
+    /// the largest recorded slot), at least one byte and never the whole
+    /// budget. It is kept, marked unmeasured for this admission and never
+    /// evicted on that charge. Everything else keeps its refusal: the slot a
+    /// reuse would take (its own walk is a separate requirement), a held
+    /// slot's live figure, a root that could not even be opened, a removable
+    /// pool (whose documented unknown-size reserve route owns its bounded
+    /// walks) and every shared ledger, backing or fence failure.
     fn slot_figure(
-        &self,
+        &mut self,
         index: usize,
         pending: &mut Vec<(u64, RecordedSize)>,
     ) -> Result<u64, LeaseError> {
@@ -2398,14 +2476,7 @@ impl Pool {
             // These pools have no per-slot byte ceiling. The pathname-based
             // inventory does not pin the root, so it supplies no observation
             // for an isolated eviction. Use the largest recorded slot instead.
-            let largest = self
-                .ledger
-                .slots
-                .iter()
-                .filter_map(|slot| slot.recorded.as_ref())
-                .map(|record| record.unique_bytes)
-                .max()
-                .unwrap_or(0);
+            let largest = self.largest_recorded_slot();
             let recorded = slot
                 .recorded
                 .as_ref()
@@ -2421,6 +2492,19 @@ impl Pool {
                 .recorded
                 .as_ref()
                 .is_some_and(|record| record.for_lease == last_lease_id);
+        let recorded = slot
+            .recorded
+            .as_ref()
+            .filter(|record| record.for_lease == last_lease_id)
+            .map_or(0, |record| record.unique_bytes);
+        // A slot this admission already charged keeps that figure: the walk is
+        // not repeated, so one slow slot costs one bounded walk, not one per
+        // pressure decision.
+        let cached = if idle {
+            self.unmeasured.get(&id).copied()
+        } else {
+            None
+        };
         let Some(path) = self.recorded_slot_root(id)? else {
             // A missing or non-directory recorded root has no observation. The
             // scope pass counts it exactly as the whole-payload walk counted
@@ -2428,26 +2512,123 @@ impl Pool {
             return Ok(0);
         };
         if current {
-            return Ok(slot
-                .recorded
-                .as_ref()
-                .map_or(0, |record| record.unique_bytes));
+            return Ok(recorded);
+        }
+        if let Some(charge) = cached {
+            return Ok(charge);
         }
         let sizes = self.inventory_slot_with(&path, self.pressure_limits())?;
-        let unique = sizes.require_complete()?;
+        let Some(observed) = sizes.unique else {
+            // The walk could not open or classify the slot root itself. That is
+            // a root-identity failure, never a size this admission may charge.
+            return Err(LeaseError::AccountingIncomplete(Box::new(sizes.scan)));
+        };
+        if sizes.scan.coverage != AccountingCoverage::Complete {
+            if idle && !self.is_removable() {
+                let charge = self.conservative_charge(recorded, observed);
+                self.unmeasured.insert(id, charge);
+                return Ok(charge);
+            }
+            return Err(LeaseError::AccountingIncomplete(Box::new(sizes.scan)));
+        }
         if idle {
             pending.push((
                 id,
                 RecordedSize {
                     for_lease: last_lease_id,
-                    unique_bytes: unique,
+                    unique_bytes: observed,
                     logical_bytes: sizes.logical.unwrap_or(0),
                     entries: sizes.scan.entries_visited,
                     at_ms: now_ms(),
                 },
             ));
         }
-        Ok(unique)
+        Ok(observed)
+    }
+
+    /// The largest closed per-slot observation in the ledger, or 0 when none is
+    /// recorded. These budget-only pools have no per-slot byte ceiling, so the
+    /// largest peer observation is the conservative stand-in for a slot whose
+    /// own figure is unknown (oxide#175, oxide#186).
+    fn largest_recorded_slot(&self) -> u64 {
+        self.ledger
+            .slots
+            .iter()
+            .filter_map(|slot| slot.recorded.as_ref())
+            .map(|record| record.unique_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The conservative charge one unmeasured slot carries for this admission:
+    /// the maximum of the bytes its own walk observed before it stopped, its
+    /// last recorded size for the same generation, and the largest recorded
+    /// slot in the pool. It is never zero, so an unmeasured slot can never be
+    /// read as free space, and never the pool's whole budget, so one slow slot
+    /// cannot refuse every unrelated admission by itself.
+    fn conservative_charge(&self, recorded: u64, observed: u64) -> u64 {
+        observed
+            .max(recorded)
+            .max(self.largest_recorded_slot())
+            .max(UNMEASURED_MIN_CHARGE_BYTES)
+    }
+
+    /// The capacity refusal after eviction could not bring the pool under
+    /// budget. With no unmeasured slot it is the shipped [`LeaseError::Full`];
+    /// otherwise a bounded capacity reason names the slots a partial walk
+    /// charged conservatively, at most [`MAX_REFUSAL_SLOTS`] IDs and a count.
+    fn capacity_refusal(&self, measured: u64) -> LeaseError {
+        if self.unmeasured.is_empty() {
+            return LeaseError::Full;
+        }
+        LeaseError::CapacityCharged {
+            measured: Some(measured),
+            limit: Some(self.budget),
+            unmeasured: self.unmeasured_slots(),
+        }
+    }
+
+    /// The refusal when a **count** decision cannot be honoured because the
+    /// slot it needs is one a partial walk left unmeasured: the pool-wide slot
+    /// ceiling with no verified victim left, or a named project-cap
+    /// replacement whose victim cannot be deleted (oxide#186). It is a bounded
+    /// capacity reason naming the slot and carries no byte figures, because a
+    /// count decision has none; the slot is kept and nothing is allocated.
+    /// [`LeaseError::LedgerExhausted`] stands when every slot was measured.
+    fn count_selection_refusal(&self) -> LeaseError {
+        if self.unmeasured.is_empty() {
+            return LeaseError::LedgerExhausted;
+        }
+        LeaseError::CapacityCharged {
+            measured: None,
+            limit: None,
+            unmeasured: self.unmeasured_slots(),
+        }
+    }
+
+    /// The slots this admission charged conservatively, bound to the exact
+    /// generation the incomplete walk covered, in slot order. The charge is
+    /// deliberately not reported: a caller may record only the incomplete
+    /// outcome, never a size (oxide#186).
+    fn unmeasured_slots(&self) -> Vec<UnmeasuredSlot> {
+        self.unmeasured
+            .keys()
+            .filter_map(|id| self.slot(*id))
+            .map(|slot| UnmeasuredSlot {
+                slot_id: slot.id.to_string(),
+                incarnation: slot.incarnation.to_string(),
+                dir: slot.dir.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether one conservative charge alone already exhausts the budget. No
+    /// eviction can then bring the figure under it, so admission refuses before
+    /// deleting a verified idle slot for nothing.
+    fn unmeasured_charge_exhausts_budget(&self) -> bool {
+        self.unmeasured
+            .values()
+            .any(|charge| *charge >= self.budget)
     }
 
     /// The shallow scope pass over the payload root (oxide#146). It counts
@@ -2646,8 +2827,15 @@ impl Pool {
     /// victims. `Prefer` selects an evictable member first and otherwise the
     /// ordinary order with **every** verified one-use pair removed.
     fn evict_one_idle_with(&mut self, plan: &VictimPlan) -> Result<bool, LeaseError> {
-        let eligible =
-            |slot: &SlotRecord| slot.state == SlotPersistState::Idle && slot.lease_id.is_none();
+        // A slot this admission could not measure completely is never a victim:
+        // its conservative charge is a capacity figure, not custody, and a
+        // partial walk proves nothing about its bytes (oxide#186).
+        let unmeasured = &self.unmeasured;
+        let eligible = |slot: &SlotRecord| {
+            slot.state == SlotPersistState::Idle
+                && slot.lease_id.is_none()
+                && !unmeasured.contains_key(&slot.id)
+        };
         let oldest = |predicate: &dyn Fn(&SlotRecord) -> bool| {
             self.ledger
                 .slots
@@ -3984,6 +4172,12 @@ impl Sizes {
     }
 }
 
+/// The smallest charge one unmeasured slot carries (oxide#186). A partial walk
+/// is never free space, so the charge is positive even when the slot holds
+/// nothing observable yet and no peer has a record; it distinguishes "not
+/// measured" from "measured empty".
+const UNMEASURED_MIN_CHARGE_BYTES: u64 = 1;
+
 /// A removable payload walk longer than this is cut short, so a pool too large
 /// to measure reaches the unknown-size reserve/floor route instead of timing
 /// out mid-walk: a 127-slot USB pool cannot be walked within the 60 s bound.
@@ -4797,8 +4991,34 @@ pub(super) fn volume_pool_for_test(
         reconciliation_blocked: false,
         reconciliation_unresolved: false,
         admission_note: None,
+        unmeasured: BTreeMap::new(),
         reserve,
     })
+}
+
+/// Test-only: one revised write that fills the whole slot table with **held**
+/// slots, so an admission at the ceiling has no evictable idle victim. Returns
+/// the last slot's ID and lease ID, which a caller can release to create the
+/// only idle slot (oxide#186 ceiling fixtures). No payload is written.
+#[cfg(test)]
+pub(super) fn fill_held_slot_table_for_test(pool: &Path) -> Result<(u64, String), LeaseError> {
+    let mut opened = Pool::open(pool)?;
+    for id in 1..=MAX_SLOTS as u64 {
+        add_idle_slot_for_test(&mut opened, id, id, 0, 0)?;
+        let slot = opened.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
+        slot.state = SlotPersistState::Held;
+        slot.holder = format!("holder-{id}");
+        slot.lease_id = Some(slot.last_lease_id.clone());
+        slot.recorded = None;
+    }
+    opened.persist_revised()?;
+    let last = opened
+        .ledger
+        .slots
+        .last()
+        .map(|slot| (slot.id, slot.last_lease_id.clone()))
+        .ok_or(LeaseError::UnknownAccounting)?;
+    Ok(last)
 }
 
 /// Test-only: give this pool an idle whole slot with a closed observation.
