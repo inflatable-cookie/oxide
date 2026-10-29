@@ -87,8 +87,13 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --
 # crash-between-fences state (control v9, policy-3 ledger), the final state
 # (control v9, policy-5 ledger) and a ledger-only probe (predecessor control v8
 # over a policy-5 ledger with custody), each with byte-identical control/ledger,
-# custody and slot roots, while this binary resumes the intermediate state
-# without deleting; a real byte-pressure eviction publishes its private custody
+# custody and slot roots. This binary then resumes the intermediate state: its
+# own leasing command legitimately rewrites its record state (last use, next
+# use, origin), so the resume oracle requires the version-9 fences to be
+# retained and the recorded slot set and every slot root to be unchanged (never
+# byte identity), and the ledger to publish policy 5 — a pure counterfactual
+# fails on a fence rollback or a deletion. A real byte-pressure eviction
+# publishes its private custody
 # directory, 0600 lock and per-deletion journal before the payload effect
 # (debug-only pause); a killed fixture process leaves the pending record,
 # custody and payload for exclusive replay by the next command; and a busy

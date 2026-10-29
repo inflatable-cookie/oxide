@@ -26,8 +26,13 @@ move deletion out of the lock:
   crash-between-fences state (control version 9, ledger still the predecessor's
   policy 3), the **final** state (version 9 + policy 5), and a **ledger-only**
   probe whose control is rewritten to the predecessor's own version 8 so only
-  its ledger parser can refuse a policy-5 ledger carrying `custody`. The
-  exported base tree is asserted not to carry either fence.
+  its ledger parser can refuse a policy-5 ledger carrying `custody`. This
+  binary then resumes the intermediate state: its own leasing command
+  legitimately rewrites its record state (last use, next use, origin), so the
+  oracle requires the version-9 fences to be retained and the recorded slot set
+  and every slot root to be unchanged (never byte identity), and the ledger to
+  publish policy 5. The exported base tree is asserted not to carry either
+  fence.
 - `custody-and-journal-at-pause`: a real byte-pressure eviction pauses at the
   durable root plan (debug-only seam inside the supervisor layout) and the
   proof reads the private custody directory, its `0600` lock and journal, the
@@ -272,8 +277,10 @@ def plan_document() -> dict:
                 "oracle": "the merge-base binary exits nonzero on the "
                 "intermediate (control v9, policy-3 ledger), final (control v9, "
                 "policy-5 ledger) and ledger-only (control v8, policy-5 ledger "
-                "with custody) states before any effect; control and ledger "
-                "bytes, custody bytes and every slot root are unchanged",
+                "with custody) states before any effect, with control/ledger "
+                "bytes, custody bytes and slot roots unchanged; this binary "
+                "resumes the intermediate state with the version-9 fences "
+                "retained, policy 5 published and no slot or payload deleted",
             },
             {
                 "name": "custody-and-journal-at-pause",
@@ -365,6 +372,71 @@ def identity(path: str) -> tuple[int, int, bool]:
     return (metadata.st_dev, metadata.st_ino, stat.S_ISDIR(metadata.st_mode))
 
 
+CONTROL_FENCE_FIELDS = {
+    "recorded_accounting": "oxide.accounting/1",
+    "eviction_accounting": "oxide.eviction-accounting/1",
+    "slot_ceiling": "oxide.slots/256",
+    "deletion_custody": "oxide.deletion-custody/1",
+}
+
+
+def fence_state_verdict(payload: bytes, version: int = 9) -> tuple[bool, str]:
+    """Whether a control document still carries the current forward fences.
+
+    Pure: parses bytes only. It fails on any version rollback and on a missing,
+    unknown or non-string fence, so the corrected resume oracle cannot silently
+    accept a fence regression.
+    """
+    try:
+        document = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        return (False, f"the control state is not JSON ({error})")
+    if not isinstance(document, dict):
+        return (False, "the control state is not a JSON object")
+    if document.get("version") != version:
+        return (
+            False,
+            f"the control version is {document.get('version')!r}, not {version}",
+        )
+    for name, value in CONTROL_FENCE_FIELDS.items():
+        if document.get(name) != value:
+            return (False, f"the {name} fence is {document.get(name)!r}, not {value!r}")
+    return (True, "version-9 control state with every forward fence retained")
+
+
+def resume_oracle(
+    state_payload: bytes,
+    roots_before: list[tuple[int, int, bool]],
+    roots_after: list[tuple[int, int, bool]],
+    slots_before: int,
+    slots_after: int,
+) -> tuple[bool, str]:
+    """The fence-resume facts: no rollback and no slot or payload deletion.
+
+    A candidate leasing command legitimately rewrites its own record state
+    (last use, next use, compile origin), so byte identity is not the oracle.
+    What must hold is that the control document keeps the version-9 fences and
+    that the recorded slot set and every slot root are unchanged and still
+    directories. Pure: compares the given bytes and identities only.
+    """
+    ok, reason = fence_state_verdict(state_payload)
+    if not ok:
+        return (False, reason)
+    if slots_after != slots_before:
+        return (
+            False,
+            f"the resume changed the ledger slot count {slots_before} -> {slots_after}",
+        )
+    if len(roots_before) != len(roots_after):
+        return (False, "the resume changed the recorded slot root set")
+    for before, after in zip(roots_before, roots_after):
+        if before != after:
+            return (False, "the resume changed a slot root identity")
+        if not after[2]:
+            return (False, "the resume removed a slot root")
+    return (True, "no fence rollback and no slot or payload deleted")
+
+
 def custody_entries(pool: str) -> list[str]:
     root = os.path.join(pool, "oxide-managed", "deletions")
     try:
@@ -426,6 +498,53 @@ def self_check() -> None:
         len(nonce) == 32
         and all(character in "0123456789abcdef" for character in nonce),
         "the nonce oracle changed",
+    )
+    # The fence-resume oracle must fail on a rollback or a deletion and accept
+    # only the retained version-9 fences. This pure control uses no fixture.
+    control_document = {"version": 9, **CONTROL_FENCE_FIELDS}
+    control_bytes = json.dumps(control_document).encode()
+    expect(
+        fence_state_verdict(control_bytes)[0],
+        "the fence oracle rejected a version-9 control document",
+    )
+    rollback = dict(control_document)
+    rollback["version"] = PREDECESSOR_CONTROL_VERSION
+    expect(
+        not fence_state_verdict(json.dumps(rollback).encode())[0],
+        "the fence oracle accepted a version rollback",
+    )
+    missing = dict(control_document)
+    missing.pop("deletion_custody")
+    expect(
+        not fence_state_verdict(json.dumps(missing).encode())[0],
+        "the fence oracle accepted a document without the custody fence",
+    )
+    wrong = dict(control_document)
+    wrong["deletion_custody"] = "oxide.deletion-custody/2"
+    expect(
+        not fence_state_verdict(json.dumps(wrong).encode())[0],
+        "the fence oracle accepted an unknown custody fence",
+    )
+    roots = [(16777229, 1234, True)]
+    expect(
+        resume_oracle(control_bytes, roots, roots, 1, 1)[0],
+        "the resume oracle rejected an unchanged fenced state",
+    )
+    expect(
+        not resume_oracle(json.dumps(rollback).encode(), roots, roots, 1, 1)[0],
+        "the resume oracle accepted a fence rollback",
+    )
+    expect(
+        not resume_oracle(control_bytes, roots, [(16777229, 1235, True)], 1, 1)[0],
+        "the resume oracle accepted a replaced slot root",
+    )
+    expect(
+        not resume_oracle(control_bytes, roots, [(16777229, 1234, False)], 1, 1)[0],
+        "the resume oracle accepted a deleted slot root",
+    )
+    expect(
+        not resume_oracle(control_bytes, roots, roots, 1, 2)[0],
+        "the resume oracle accepted a changed slot count",
     )
     expect(FROZEN_RUSTFLAGS == "-C strip=symbols", "the frozen rustc flag changed")
     # Hostile-parent control: neither the staged build nor a fixture child may
@@ -972,8 +1091,12 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
         )
 
         # Resume: the crash-between-fences state is recoverable by this binary
-        # without deleting anything. The locked open upgrades the ledger fence
-        # and leaves the control bytes and every slot root alone.
+        # without deleting anything. The locked open upgrades the ledger fence;
+        # the candidate's own leasing command legitimately rewrites its record
+        # state (last use, next use, origin), so the facts this step requires
+        # are that the control document keeps the version-9 fences and that the
+        # recorded slot set and every slot root are unchanged — never byte
+        # identity of the control document.
         write_private_atomic(ledger_path, json.dumps(intermediate).encode())
         resume_code, resume_output = check(candidate, workspace, env, "fence-resume")
         expect(
@@ -986,16 +1109,18 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
             resumed.get("capacity_policy") == 5,
             f"the resumed ledger did not publish policy 5: {resumed}",
         )
-        expect(
-            len(resumed.get("slots", [])) == len(document["slots"]),
-            "the resume deleted or added a slot",
+        resume_ok, resume_reason = resume_oracle(
+            read_bytes(state_path),
+            identities,
+            [identity(path) for path in roots],
+            len(document["slots"]),
+            len(resumed.get("slots", [])),
         )
-        expect(read_bytes(state_path) == control, "the resume rewrote the control state")
         expect(
-            [identity(path) for path in roots] == identities
-            and all(os.path.isdir(path) for path in roots),
-            "the resume changed a slot root",
+            resume_ok,
+            f"the resumed fence state failed its oracle: {resume_reason}",
         )
+        say(f"resume oracle: {resume_reason}")
 
         # Ledger-only probe: a real paused deletion, killed mid-deletion, so the
         # record, custody directory, journal and payload all exist. Its control
@@ -1052,6 +1177,9 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
                 "intermediate_exit": intermediate_exit,
                 "final_exit": final_exit,
                 "resume_exit": resume_code,
+                "resume_fence_retained": True,
+                "resume_no_deletion": True,
+                "resume_oracle": resume_reason,
                 "ledger_only_exit": code,
                 "intermediate_control_and_ledger_unchanged": True,
                 "final_control_and_ledger_unchanged": True,
