@@ -2919,18 +2919,22 @@ impl Pool {
     ///
     /// 1. reads every record and identity first, so a vanished record refuses
     ///    before any directory exists;
-    /// 2. copies every journal byte-exactly into its own durable custody
-    ///    directory and takes its lock — **no ledger state changes yet**;
-    /// 3. mutates every record in memory only after all staging succeeded;
-    /// 4. publishes the policy-5 fence and every custody reference in one
+    /// 2. copies each journal byte-exactly into its own durable custody
+    ///    directory and takes its lock — **no ledger state changes yet** — with
+    ///    a local staging failure keeping only that record;
+    /// 3. mutates the staged records in memory;
+    /// 4. publishes the policy-5 fence and those custody references in one
     ///    atomic, synced replacement; and
-    /// 5. restores the previous in-memory ledger on any failure.
+    /// 5. restores the previous in-memory ledger on any publish failure.
     ///
+    /// One record's object-local staging failure therefore never blocks another
+    /// legacy record's replay, and the failed record keeps its legacy journal,
+    /// its charge and its payload (per-object isolation, oxide#175 ruling B).
     /// A crash before step 4 leaves the legacy ledger intact plus orphan
     /// custody directories, which are never deletion authority; the next open
-    /// retries. A journal that cannot be staged keeps its record and charge,
-    /// so the caller applies per-object isolation. Uncertain journals are
-    /// migrated as they stand and never reinterpreted.
+    /// retries. Shared authority failures — a foreign control directory, a
+    /// mismatched backing or a failed ledger publish — stay global. Uncertain
+    /// journals are migrated as they stand and never reinterpreted.
     fn migrate_legacy_deletions(
         &mut self,
         ids: &[u64],
@@ -2953,10 +2957,10 @@ impl Pool {
                 Ok(lock) => {
                     staged.insert(id, lock);
                 }
-                // A local staging failure publishes nothing: every legacy
-                // record keeps its journal and charge. Shared authority
-                // failures (a foreign control directory or a mismatched
-                // backing) stay global.
+                // A local staging failure keeps this record only: its legacy
+                // journal, charge and payload stay, and the other records
+                // still migrate. Shared authority failures (a foreign control
+                // directory or a mismatched backing) stay global.
                 Err(LeaseError::UnsafePath(message)) => {
                     drop(staged);
                     return Err(LeaseError::UnsafePath(message));
@@ -2965,20 +2969,25 @@ impl Pool {
                     drop(staged);
                     return Err(LeaseError::BackingMismatch);
                 }
-                Err(_) => {
-                    drop(staged);
-                    return Err(LeaseError::UnknownAccounting);
-                }
+                // Object-local: this record stays legacy and keeps its
+                // journal and charge; the staged records still publish.
+                Err(_) => {}
             }
         }
-        // Every directory exists: now change the in-memory ledger, and only
-        // this one atomic write makes the migration durable.
-        for id in ids {
-            let Some(record) = staged.get(id).map(CustodyLock::record) else {
+        if staged.is_empty() {
+            // Nothing could be staged: publish no revision at all, so every
+            // record keeps exactly the legacy representation it had.
+            return Ok(staged);
+        }
+        // The staged directories exist: change only those records in memory,
+        // and one atomic write makes the whole set durable.
+        let staged_ids: Vec<u64> = staged.keys().copied().collect();
+        for id in staged_ids {
+            let Some(record) = staged.get(&id).map(CustodyLock::record) else {
                 self.ledger = snapshot;
                 return Err(LeaseError::UnknownAccounting);
             };
-            let Some(slot) = self.slot_mut(*id) else {
+            let Some(slot) = self.slot_mut(id) else {
                 self.ledger = snapshot;
                 return Err(LeaseError::UnknownAccounting);
             };
@@ -4790,6 +4799,16 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         // like the custody-only one — a predecessor refuses the policy and the
         // `custody` field before any effect — and it is never replayed from the
         // ledger: the record is migrated or kept pending, never reinterpreted.
+        //
+        // One **record** never carries both journals: the migration moves the
+        // legacy journal into custody and clears it in the same write, so a
+        // record with both is a state no writer produces. Accepting it would
+        // let a custody file that says `removed` drop the record while an
+        // unresolved or foreign legacy capture still named work to keep, so it
+        // is a ledger-integrity refusal before any effect.
+        if slot.capture.is_some() && slot.custody.is_some() {
+            return Err(LeaseError::UnknownAccounting);
+        }
     }
     Ok(())
 }

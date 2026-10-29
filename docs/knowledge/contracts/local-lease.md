@@ -453,24 +453,34 @@ is the foundation slice 2 moves out of the lock:
   unlink, mode repair, the oxide#175 ordering/completeness rules and every
   oxide#155 replay outcome are unchanged; only the storage moved. Legacy
   in-ledger journals are copied byte-exactly into fresh custody directories on
-  the next open (never reinterpreted) and **every migration is published in one
-  atomic, validated ledger revision**: a predecessor may leave several valid
-  journals under the 8 MiB bound, one-record-at-a-time migration would make the
-  first policy-5 write invalidate the others, and a failure would leave a mixed
-  in-memory ledger. Staging happens before any ledger change; a failed staging,
-  or a publish that failed before its rename, changes nothing durably and
-  restores the in-memory ledger (orphan custody directories are never deletion
-  authority), and the next open retries.
+  the next open (never reinterpreted) and **the migrations staged by one open
+  are published together in one atomic, validated ledger revision**: a
+  predecessor may leave several valid journals under the 8 MiB bound, a
+  one-record-at-a-time *publish* would interleave invalid flags, and a failure
+  would leave a mixed in-memory ledger. Staging is **per record**: one record
+  whose custody cannot be created keeps only itself — its legacy journal, its
+  conservative charge and its payload — while every other record staged by the
+  same open is still published and replayed, so an object-local staging
+  failure never blocks an independent legacy deletion. A failed publish (before
+  its rename) changes nothing durably and restores the in-memory ledger
+  (orphan custody directories are never deletion authority), and the next open
+  retries; a foreign control directory, a mismatched backing or a failed ledger
+  publish stays global.
   A policy-5 ledger may keep a record's **legacy** in-ledger journal while its
   custody cannot be staged, so a failed migration for one object never blocks
-  the others: other admissions, releases, explicit evictions and count/byte
-  pressure deletions proceed under the same policy-5 fence, every new deletion
-  still uses the custody representation (private lock and per-deletion
-  journal), and the unstaged record alone keeps its journal, its conservative
-  charge and its payload. That transitional shape is fenced exactly like the
-  custody-only one — a predecessor refuses the policy *and* the `custody`
-  field before any effect — and the unstaged journal is never replayed from the
-  ledger: it is migrated or kept pending, never reinterpreted.
+  other work: admissions, releases, explicit evictions and count/byte pressure
+  deletions proceed under the same policy-5 fence, every new deletion still
+  uses the custody representation (private lock and per-deletion journal), and
+  the unstaged record alone keeps its journal, its charge and its payload. That
+  transitional shape is fenced exactly like the custody-only one — a
+  predecessor refuses the policy *and* the `custody` field before any effect —
+  and the unstaged journal is never replayed from the ledger: it is migrated or
+  kept pending, never reinterpreted. **One record never carries both**: a slot
+  with a `capture` and a `custody` reference at once is a ledger-integrity
+  refusal before any effect, because a custody file that says `removed` would
+  otherwise drop the record while its legacy capture still named unresolved or
+  foreign work. Separate legacy and custody records in one policy-5 ledger stay
+  valid.
   The ledger replacement is a temp write, `fsync`, `rename`, then a parent
   `fsync` (`persist_private_file`). A failure **before** the rename changes
   nothing durably. A failure **after** the rename leaves the durable outcome
