@@ -581,19 +581,24 @@ deletion and it refuses while reconciliation is blocked or any journal is
 outstanding, so the guard covers `evict_idle_slot` too, and every open
 reconciles all `Evicting` records before admitting anything.
 
-**Open bound question (oxide#177).** The reader validates each `Evicting`
-slot's journal independently and bounds no journal *count*, so an accepted
-ledger may carry more than one. A predecessor binary (whose `retire_idle_slot`
-had no single-journal guard, and whose own ledger was capped at 2 MiB) could
-write several; this head only preserves inherited journals and cannot add one
-while any exists, so the maximal *writer-reachable* ledger is the measured
-5,624,335-byte single-journal state, and an inherited predecessor ledger is
-bounded by that binary's own 2 MiB write cap plus the closed records this
-binary adds. The maximal *reader-accepted* multi-journal representation, and
-any enforced count bound for pre-existing pools, are an open design question
-referred to the Oxide Supervisor: a count refusal would be a different rule
-for pre-existing pools, and three reader-maximal journals already exceed
-8 MiB. This head does not invent that bound. Control state is bounded
+**Worst-valid byte bound (oxide#177; Supervisor ruling 49081d79).**
+`MAX_LEDGER_BYTES` *is* the worst-valid byte bound: the read and write paths
+refuse a larger ledger, so a larger valid document is impossible by definition
+and any otherwise-valid ledger at or below 8 MiB is accepted, including one
+that carries more than one `Evicting` journal (each slot's journal is validated
+independently and no journal count is bounded). No count rule is added and the
+cap does not grow for multi-journal states.
+
+The measured *writer-reachable* maxima — the states this writer can produce —
+are reported separately and are what the cap covers for this writer: the
+all-idle figure above, and 5,624,335 bytes with this writer's maximal single
+journal, leaving **2,764,273 bytes headroom** under the cap. This writer starts
+at most one journal (`retire_idle_slot` refuses while reconciliation is blocked
+or any journal is outstanding) and only preserves inherited ones; an inherited
+predecessor ledger was capped at that binary's own 2 MiB write plus the records
+this binary adds. The journal name fields keep their enforced `PATH_MAX` 1024
+bytes / `NAME_MAX` 255-byte component bounds at writer and reader. Control
+state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
 tickets, 128 clean marks, 16 recoveries, 16 flushes, per-object compact
 ceilings (record 40 KiB, recovery 9 KiB, holder 5 KiB, lost 8 KiB, flush
@@ -710,9 +715,9 @@ current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The maximal
 writer-reachable ledger serialization — the measured one-journal `Evicting`
-state, 5,624,335 bytes against the 8 MiB acceptance cap (the reader-accepted
-multi-journal maximum is the open question above) — escaped round-trip and
-oversized-field refusals are unit tests in `effigy test rust`, as is a
+state, 5,624,335 bytes with 2,764,273 bytes headroom under the 8 MiB
+worst-valid byte bound — escaped round-trip and oversized-field refusals are
+unit tests in `effigy test rust`, as is a
 fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
 trip with a journal (bounded read via the passive snapshot, ranked ordering,
 the actual atomic write and its read-back; the ceiling is generous for the

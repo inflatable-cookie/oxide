@@ -2407,22 +2407,23 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         "next_rank": u64::MAX,
         "slots": slots,
     });
-    let input = serde_json::to_vec(&ledger).expect("worst valid ledger");
+    let input = serde_json::to_vec(&ledger).expect("maximal all-idle ledger");
     let stored = super::pool::write_ledger_bytes_injected(&pool, &input)
-        .expect("the worst valid ledger is accepted");
+        .expect("the maximal all-idle ledger is accepted");
+    let headroom = MAX_LEDGER_BYTES - stored.len() as u64;
     assert!(
-        stored.len() as u64 <= MAX_LEDGER_BYTES,
-        "worst valid ledger {} exceeds {MAX_LEDGER_BYTES}",
+        headroom > 0,
+        "the writer-reachable all-idle maximum {} does not fit {MAX_LEDGER_BYTES}",
         stored.len()
     );
     assert!(
         stored.len() > 3_800_000,
-        "fixture is not near the byte cap: {}",
+        "fixture is not substantial: {}",
         stored.len()
     );
     // Reported evidence for the oxide#177 accounting-cost gate.
     println!(
-        "worst valid 256-slot ledger: {} bytes of the {MAX_LEDGER_BYTES}-byte cap",
+        "maximal writer-reachable 256-slot ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
         stored.len()
     );
     assert_eq!(
@@ -2579,9 +2580,10 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
 /// representation at 256 slots with every field at its cap, where the one slot
 /// a pool can durably leave `Evicting` carries a maximal deletion journal. The
 /// library refuses a second deletion while a journal is outstanding, so one is
-/// the writer-reachable maximum. The reader also accepts multi-journal states
-/// (an open bound question, see `MAX_LEDGER_BYTES`); this fixture measures the
-/// writer-reachable state, which is what the acceptance cap must cover.
+/// the writer-reachable maximum. `MAX_LEDGER_BYTES` is the *worst-valid byte
+/// bound* — a larger ledger is corrupt and refused, and the reader accepts any
+/// otherwise-valid ledger at or below it, including multi-journal states. This
+/// fixture measures the writer-reachable state that bound must cover.
 #[test]
 fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-journal-ledger");
@@ -2624,7 +2626,8 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
         });
         if index == 0 {
             // A recorded deletion holds no size observation and may carry the
-            // journal; one is the reachable worst (see `MAX_LEDGER_BYTES`).
+            // journal; one is this writer's reachable maximum (see
+            // `MAX_LEDGER_BYTES`).
             slot["state"] = serde_json::json!("evicting");
             slot.as_object_mut().expect("object").remove("recorded");
             slot["capture"] = maximal_journal_json(0);
@@ -2641,13 +2644,18 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
         "next_rank": u64::MAX,
         "slots": slots,
     });
-    let input = serde_json::to_vec(&ledger).expect("worst valid journaled ledger");
+    let input = serde_json::to_vec(&ledger).expect("maximal writer-reachable journaled ledger");
     let stored = super::pool::write_ledger_bytes_injected(&pool, &input)
-        .expect("the worst valid journaled ledger is accepted");
+        .expect("the maximal writer-reachable journaled ledger is accepted");
+    let headroom = MAX_LEDGER_BYTES - stored.len() as u64;
     assert!(
-        stored.len() as u64 <= MAX_LEDGER_BYTES,
-        "worst valid journaled ledger {} exceeds {MAX_LEDGER_BYTES}",
+        headroom > 0,
+        "the writer-reachable journaled maximum {} does not fit {MAX_LEDGER_BYTES}",
         stored.len()
+    );
+    assert!(
+        headroom >= 2 * 1024 * 1024,
+        "the writer-reachable maximum leaves only {headroom} bytes of headroom"
     );
     assert!(
         stored.len() > 4_500_000,
@@ -2664,7 +2672,7 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(journal.foreign[0].found.len(), 1024);
     assert_eq!(journal.foreign[0].expected_mode, u32::MAX);
     println!(
-        "worst valid 256-slot journaled ledger: {} bytes of the {MAX_LEDGER_BYTES}-byte cap",
+        "maximal writer-reachable 256-slot journaled ledger: {} bytes, {headroom} bytes below the {MAX_LEDGER_BYTES}-byte worst-valid cap",
         stored.len()
     );
     // A passive snapshot reads the journals without reconciling them.
@@ -2675,8 +2683,9 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
 
 /// A journaled deletion that cannot be classified keeps the pool blocked:
 /// every new lease is refused with `unknown_accounting`, so no second eviction
-/// (and no second journal) can be started while one is outstanding. That is the
-/// invariant `MAX_LEDGER_BYTES`'s journal bound relies on.
+/// (and no second journal) can be started while one is outstanding. This is the
+/// writer's single-journal guard (oxide#177); the reader's worst-valid byte
+/// bound is the cap itself, not a journal count.
 #[test]
 fn a_blocked_journaled_deletion_refuses_every_new_lease() {
     let fixture = Fixture::new("blocked-journal");
