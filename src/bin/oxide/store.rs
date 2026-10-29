@@ -4723,6 +4723,9 @@ impl Store {
         if Self::mark_slot_ceiling(&mut state) {
             changed = true;
         }
+        if Self::mark_deletion_custody(&mut state) {
+            changed = true;
+        }
         if !changed {
             return Ok(());
         }
@@ -4736,6 +4739,16 @@ impl Store {
             return false;
         }
         state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        true
+    }
+
+    /// Mark the caller's in-memory state with the deletion-custody fence
+    /// (oxide#181). Returns whether it changed, so a caller saves once.
+    fn mark_deletion_custody(state: &mut State) -> bool {
+        if state.deletion_custody.as_deref() == Some(DELETION_CUSTODY_FENCE) {
+            return false;
+        }
+        state.deletion_custody = Some(DELETION_CUSTODY_FENCE.to_owned());
         true
     }
 
@@ -4788,10 +4801,15 @@ impl Store {
         let recorded = fenced.recorded_accounting.is_some();
         let one_use = fenced.one_use_workspaces.is_some();
         let slot_ceiling = fenced.slot_ceiling.is_some();
+        let deletion_custody = fenced.deletion_custody.is_some();
         let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
-        fenced.version = if slot_ceiling {
+        fenced.version = if deletion_custody {
+            // Version 9 is the deletion-custody fence (oxide#181) and the
+            // hand-off trigger that must precede the ledger's policy-5 write.
+            DELETION_CUSTODY_STATE_VERSION
+        } else if slot_ceiling {
             // Version 8 is the raised-ceiling fence (oxide#177) and the
             // hand-off trigger that must precede the ledger's policy-4 write.
             SLOT_CEILING_STATE_VERSION
@@ -9338,7 +9356,12 @@ pub(crate) mod tests {
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         state["version"] = serde_json::json!(RECORDED_ACCOUNTING_STATE_VERSION);
         state["recorded_accounting"] = serde_json::json!(RECORDED_ACCOUNTING_FENCE);
-        for field in ["slot_ceiling", "eviction_accounting", "one_use_workspaces"] {
+        for field in [
+            "slot_ceiling",
+            "eviction_accounting",
+            "one_use_workspaces",
+            "deletion_custody",
+        ] {
             state.as_object_mut().expect("object").remove(field);
         }
         write_raw_state(store, &serde_json::to_vec(&state).unwrap());
@@ -9694,7 +9717,7 @@ pub(crate) mod tests {
         state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
         state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
 
-        state.version = STATE_VERSION;
+        state.version = SLOT_CEILING_STATE_VERSION;
         assert!(
             validate_state(&state, false).is_err(),
             "version 8 without the raised fence was accepted"
@@ -9734,7 +9757,7 @@ pub(crate) mod tests {
 
         // An unknown raised-ceiling fence, or a version-8 document without
         // it, is a state no writer produces.
-        state.version = STATE_VERSION;
+        state.version = SLOT_CEILING_STATE_VERSION;
         state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
         state.slot_ceiling = Some("oxide.slots/128".to_owned());
         assert!(
@@ -9747,6 +9770,39 @@ pub(crate) mod tests {
         assert!(
             validate_state(&state, false).is_ok(),
             "a one-use pool at the raised ceiling must keep every fence"
+        );
+
+        // Version 9 is the deletion-custody fence (oxide#181): the document
+        // always carries it, a smaller one never does, and an unknown value or
+        // a version-9 document without the fence is a state no writer
+        // produces.
+        state.one_use_workspaces = None;
+        state.version = DELETION_CUSTODY_STATE_VERSION;
+        assert!(
+            validate_state(&state, false).is_err(),
+            "version 9 without the deletion-custody fence was accepted"
+        );
+        state.deletion_custody = Some(DELETION_CUSTODY_FENCE.to_owned());
+        assert!(
+            validate_state(&state, false).is_ok(),
+            "the deletion-custody version must keep every earlier fence"
+        );
+        state.deletion_custody = Some("oxide.deletion-custody/2".to_owned());
+        assert!(
+            validate_state(&state, false).is_err(),
+            "an unknown deletion-custody fence was accepted"
+        );
+        state.deletion_custody = None;
+        state.version = SLOT_CEILING_STATE_VERSION;
+        assert!(
+            validate_state(&state, false).is_ok(),
+            "a version-8 document must not require the deletion-custody fence"
+        );
+        state.version = STATE_VERSION;
+        state.deletion_custody = Some(DELETION_CUSTODY_FENCE.to_owned());
+        assert!(
+            validate_state(&state, false).is_ok(),
+            "the current version must carry the deletion-custody fence"
         );
     }
 
@@ -9781,8 +9837,8 @@ pub(crate) mod tests {
         assert!(!text.contains("\"class\""), "{text}");
         assert!(!text.contains("class_reason"), "{text}");
         assert!(
-            text.contains("\"version\":8"),
-            "a normal admission did not carry the raised-ceiling version: {text}"
+            text.contains(&format!("\"version\":{STATE_VERSION}")),
+            "a normal admission did not carry the current fence version: {text}"
         );
         assert_eq!(
             store.load().unwrap().one_use_workspaces,

@@ -1456,6 +1456,8 @@ struct ControlState {
     #[serde(default)]
     slot_ceiling: Option<String>,
     #[serde(default)]
+    deletion_custody: Option<String>,
+    #[serde(default)]
     one_use_workspaces: Option<String>,
     #[serde(default)]
     records: Vec<ControlRecord>,
@@ -1522,6 +1524,15 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
         || (state.version == 8
             && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
             && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
+            && state.one_use_workspaces.is_none()
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0))
+        || (state.version == 9
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
+            && state.deletion_custody.as_deref() == Some("oxide.deletion-custody/1")
             && state.one_use_workspaces.is_none()
             && state
                 .records

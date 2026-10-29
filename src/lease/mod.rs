@@ -12,6 +12,7 @@
 
 mod backing;
 pub mod control;
+mod custody;
 mod pool;
 pub mod seed;
 mod slice;
@@ -111,6 +112,16 @@ pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 /// write, so an older installed binary hands off before it opens such a
 /// ledger instead of meeting the refusal.
 pub const CAPACITY_POLICY_VERSION: u32 = 3;
+/// Version 5 is the deletion-custody fence (oxide#181): the ledger records a
+/// per-deletion `custody` reference (private control directory and stable
+/// verified lock file identity) and keeps the deletion journal in that
+/// directory instead of in the ledger. An older binary's policy check refuses
+/// it and its strict parse refuses the `custody` field, both before any
+/// effect. It is written by every revised ledger write of this binary, so a
+/// pool this binary mutates is never left readable by an older binary. The
+/// front door's version-9 `oxide.deletion-custody/1` control fence is durable
+/// first.
+pub const DELETION_CUSTODY_CAPACITY_POLICY_VERSION: u32 = 5;
 /// Version 2 recorded only idle sizes and remains readable.
 pub const PREVIOUS_CAPACITY_POLICY_VERSION: u32 = 2;
 /// The raised-ceiling fence value (oxide#177): more than [`LEGACY_MAX_SLOTS`]
@@ -860,11 +871,16 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
 /// the fence before it reconciles a recorded deletion. `src/bin/oxide/store.rs`
 /// owns the same values; its constants alias these so the two writers cannot
 /// drift.
-pub const CONTROL_FENCE_VERSION: u32 = 8;
+pub const CONTROL_FENCE_VERSION: u32 = 9;
 pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
 pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
 pub const CONTROL_ONE_USE_FENCE: &str = "oxide.one-use/1";
+/// The deletion-custody fence (oxide#181). Every ledger write that can publish
+/// a per-deletion custody record carries `capacity_policy: 5`, which an older
+/// binary refuses; this control fence is durable first so the older binary
+/// hands off instead of refusing a pool this binary just fenced.
+pub const CONTROL_DELETION_CUSTODY_FENCE: &str = "oxide.deletion-custody/1";
 /// The control version that must carry [`CONTROL_ONE_USE_FENCE`].
 const CONTROL_ONE_USE_VERSION: u64 = 6;
 /// Raise a front-door control state to the current fence version before a

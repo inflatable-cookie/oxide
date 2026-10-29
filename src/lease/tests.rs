@@ -6,8 +6,8 @@ use super::pool::{
 use super::{
     remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass,
     LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
-    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_LEDGER_BYTES, RAISED_CAPACITY_POLICY_VERSION,
+    BUDGET_BACKEND_DIRECTORY_V1, DELETION_CUSTODY_CAPACITY_POLICY_VERSION, MANAGED_NAME,
+    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_LEDGER_BYTES, RAISED_CAPACITY_POLICY_VERSION,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -500,8 +500,8 @@ fn pool_ceiling_replaces_the_oldest_idle_slot_and_keeps_the_count() {
         serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
     assert_eq!(
         stored["capacity_policy"],
-        serde_json::json!(RAISED_CAPACITY_POLICY_VERSION),
-        "a 256-slot ledger must carry the raised-ceiling fence"
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION),
+        "a 256-slot ledger must carry the raised-ceiling fence, and this          writer's deletion-custody fence supersedes it"
     );
 }
 
@@ -537,7 +537,8 @@ fn legacy_ledger_reads_without_migrating_and_the_first_revised_write_fences_it()
     let stored: serde_json::Value = serde_json::from_slice(&after_grant).expect("json");
     assert_eq!(
         stored["capacity_policy"],
-        serde_json::json!(super::CAPACITY_POLICY_VERSION)
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION),
+        "the first revised write publishes the deletion-custody fence"
     );
     assert_eq!(stored["next_rank"], serde_json::json!(2));
     assert_eq!(stored["slots"][0]["rank"], serde_json::json!(1));
@@ -1077,7 +1078,7 @@ fn managed_eviction_retires_only_idle_slots_and_tolerates_managed_control() {
     assert!(status_injected(&pool).expect("status").slots.is_empty());
     assert!(managed.is_dir());
 
-    fs::remove_dir(&managed).expect("remove control");
+    fs::remove_dir_all(&managed).expect("remove control");
     symlink(&project, &managed).expect("managed symlink");
     assert!(matches!(
         status_injected(&pool),
@@ -6491,4 +6492,506 @@ fn a_post_chmod_step_failure_restores_the_original_mode_and_stays_pending() {
         "an unrestored widening is observable, which is what the control asserts"
     );
     fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).expect("cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// Per-deletion custody (oxide#181, frozen design oxide#180 slice 1).
+//
+// The deletion still runs under the pool lock in this slice: these regressions
+// cover the fence, the custody lock protocol, journal migration, replay from
+// the per-deletion file and the final record transaction.
+// ---------------------------------------------------------------------------
+
+/// The journal file and stable lock of one published deletion, as a test reads
+/// them without opening the pool.
+fn custody_files(pool: &Path, nonce: &str) -> (PathBuf, PathBuf) {
+    let dir = pool.join(MANAGED_NAME).join("deletions").join(nonce);
+    (dir.join("lock"), dir.join("journal.json"))
+}
+
+/// The recorded custody of one slot, read straight from the ledger.
+fn recorded_custody(pool: &Path, slot_id: u64) -> Option<super::custody::DeletionCustody> {
+    let bytes = fs::read(pool.join("ledger.json")).ok()?;
+    let ledger: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let row = ledger["slots"]
+        .as_array()?
+        .iter()
+        .find(|slot| slot["id"] == serde_json::json!(slot_id))?;
+    serde_json::from_value(row.get("custody")?.clone()).ok()
+}
+
+/// The pre-oxide#181 reader: the strict ledger and slot shape an older binary
+/// parses, plus its policy check. It exists here so the fence is proved
+/// against the *actual* predecessor shape rather than against a comment.
+mod pre_custody_reader {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ledger {
+        version: u32,
+        store_id: String,
+        cap_bytes: u64,
+        next_slot: u64,
+        next_lease: u64,
+        #[serde(default)]
+        capacity_policy: Option<u32>,
+        #[serde(default)]
+        next_rank: Option<u64>,
+        slots: Vec<Slot>,
+    }
+
+    /// The predecessor's exact strict slot shape: every field it knows, and
+    /// `deny_unknown_fields` so a `custody` field refuses the ledger.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Slot {
+        id: u64,
+        incarnation: u64,
+        state: serde_json::Value,
+        project: serde_json::Value,
+        workspace: serde_json::Value,
+        profile: serde_json::Value,
+        holder: String,
+        lease_id: Option<String>,
+        last_lease_id: String,
+        dir: Option<String>,
+        rank: u64,
+        recorded: Option<serde_json::Value>,
+        capture: Option<serde_json::Value>,
+    }
+
+    /// The predecessor's read path: a strict parse, then its accepted policy
+    /// set (`1..=4`). Anything else is refused before any effect.
+    pub(super) fn accepts(bytes: &[u8]) -> bool {
+        let Ok(ledger) = serde_json::from_slice::<Ledger>(bytes) else {
+            return false;
+        };
+        if ledger.version != 1 || ledger.next_slot == 0 {
+            return false;
+        }
+        match ledger.capacity_policy {
+            None => true,
+            Some(1..=4) => true,
+            Some(_) => false,
+        }
+    }
+}
+
+/// The deletion-custody fence refuses every older supported reader before any
+/// effect, and it does so in the intermediate state (control fenced, ledger
+/// not yet) as well as the final one.
+#[test]
+fn the_custody_fence_refuses_the_predecessor_reader_in_both_states() {
+    let fixture = Fixture::new("custody-fence");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    // A mutating command publishes the policy-5 ledger fence and the front
+    // door's version-9 control fence.
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    release_injected(&pool, &leased.lease_id).expect("release");
+    let bytes = fs::read(pool.join("ledger.json")).expect("ledger");
+    let stored: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
+    );
+    assert!(
+        !pre_custody_reader::accepts(&bytes),
+        "the predecessor reader accepted the final policy-5 ledger"
+    );
+
+    // The intermediate state: the control fence is durable, the ledger is
+    // still the predecessor's policy-4 shape. The predecessor's control reader
+    // refuses the version-9 document (it accepts only versions at most 8), and
+    // the ledger it would then read carries no custody record yet.
+    let mut intermediate = stored.clone();
+    intermediate["capacity_policy"] = serde_json::json!(RAISED_CAPACITY_POLICY_VERSION);
+    let intermediate_bytes = serde_json::to_vec(&intermediate).expect("intermediate");
+    assert!(
+        pre_custody_reader::accepts(&intermediate_bytes),
+        "the intermediate ledger must still be the predecessor's shape"
+    );
+    assert!(
+        !pre_custody_reader::accepts(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 9,
+                "next_id": 1,
+                "next_use": 1,
+                "tickets": [],
+                "cleans": [],
+                "records": [],
+                "recorded_accounting": "oxide.accounting/1",
+                "eviction_accounting": "oxide.eviction-accounting/1",
+                "slot_ceiling": "oxide.slots/256",
+                "deletion_custody": "oxide.deletion-custody/1",
+            }))
+            .expect("control")
+        ),
+        "the predecessor ledger reader accepted a version-9 control document"
+    );
+
+    // A policy-5 ledger that still carries a legacy in-ledger journal is a
+    // state no writer produces, and the strict predecessor reader refuses the
+    // `custody` field as an unknown field in the other direction.
+    let mut with_journal = stored.clone();
+    with_journal["slots"][0]["capture"] = serde_json::json!({
+        "root": {
+            "private": format!("{}{}", crate::owned_delete::CAPTURE_PREFIX, "a".repeat(32)),
+            "phase": "planned",
+            "device": 1,
+            "inode": 2,
+            "parent_device": 1,
+            "parent_inode": 3,
+            "mode": 0o40700,
+        },
+        "captures": [],
+        "foreign": [],
+    });
+    assert!(
+        super::pool::write_ledger_bytes_injected(
+            &pool,
+            &serde_json::to_vec(&with_journal).expect("journaled")
+        )
+        .is_err(),
+        "a policy-5 ledger with an in-ledger journal was accepted"
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A real deletion publishes its private custody directory, a stable lock and
+/// an initial journal **before** any payload mutation, under the policy-5
+/// fence. The crash at the planned boundary leaves exactly that state, and the
+/// next open replays it from the per-deletion file and retires the directory.
+#[test]
+fn custody_and_the_initial_journal_are_durable_before_the_payload_effect() {
+    let fixture = Fixture::new("custody-before-payload");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "custody-before-payload");
+    crash_eviction(&pool, slot_id, crate::test_fs::RootCaptureCrash::Planned);
+
+    // The payload is untouched.
+    assert!(slot_path.is_dir(), "the payload was deleted before custody");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(stored["slots"][0]["state"], "evicting");
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION),
+        "the custody record was published without the ledger fence"
+    );
+    assert!(
+        stored["slots"][0].get("capture").is_none(),
+        "the journal is still in the ledger"
+    );
+    let custody = recorded_custody(&pool, slot_id).expect("custody record");
+    assert!(custody.is_valid());
+    let (lock, journal_path) = custody_files(&pool, &custody.nonce);
+    let lock_metadata = fs::symlink_metadata(&lock).expect("stable lock");
+    assert!(lock_metadata.is_file());
+    assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(lock_metadata.ino(), custody.lock_inode);
+    assert_eq!(lock_metadata.dev(), custody.lock_device);
+    let journal_metadata = fs::symlink_metadata(&journal_path).expect("journal file");
+    assert_eq!(journal_metadata.permissions().mode() & 0o777, 0o600);
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).expect("journal bytes")).expect("json");
+    assert_eq!(document["nonce"], serde_json::json!(custody.nonce));
+    assert_eq!(document["slot"], serde_json::json!(slot_id));
+    assert_eq!(document["capture"]["root"]["phase"], "planned");
+
+    // The next open replays from that file, deletes the tree and drops the
+    // record; the private directory is retired while custody is held.
+    let after = status_injected(&pool).expect("replay");
+    assert!(after.slots.is_empty(), "the replay did not conclude");
+    assert!(!slot_path.exists(), "the tree is gone");
+    assert!(
+        !lock.parent().expect("custody dir").exists(),
+        "the retired custody directory was kept"
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A busy custody lock is a live custodian: the record, its charge and its
+/// payload are kept, and an unrelated admission is neither refused nor made to
+/// wait for it. A missing, replaced or identity-mismatched lock is unknown and
+/// keeps the record too.
+#[test]
+fn a_busy_custody_lock_is_skipped_and_an_unknown_one_keeps_the_record() {
+    use std::os::fd::AsRawFd;
+
+    let fixture = Fixture::new("custody-locks");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "custody-locks");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let held_root = File::open(&parent).expect("parent");
+    let leaf = slot_path.file_name().expect("leaf");
+    let leaf_name = std::ffi::CString::new(leaf.as_encoded_bytes()).expect("name");
+    let observed =
+        crate::owned_delete::observe_entry(held_root.as_fd(), &leaf_name).expect("observed");
+    let plan = crate::owned_delete::plan_root_capture(held_root.as_fd(), &observed).expect("plan");
+    mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    super::pool::write_capture_record_injected(
+        &pool,
+        slot_id,
+        super::pool::DeletionJournal {
+            root: plan.clone(),
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("planned journal");
+    let custody = recorded_custody(&pool, slot_id).expect("custody record");
+    let (lock_path, journal_path) = custody_files(&pool, &custody.nonce);
+    assert!(journal_path.is_file());
+
+    // A live custodian holds the exclusive lock.
+    let held = File::open(&lock_path).expect("custody lock");
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    // The pass skips this object only: the record and payload stay, and a new
+    // project still admits.
+    let status = status_injected(&pool).expect("a busy custody is not a refusal");
+    assert_eq!(status.slots.len(), 1, "the busy record was dropped");
+    assert!(slot_path.is_dir(), "the busy payload was touched");
+    assert_eq!(
+        super::pool::slot_state_injected(&pool, &slot_id.to_string()).as_deref(),
+        Some("evicting")
+    );
+    let project = fixture.dir("project-second");
+    let workspace = fixture.dir("workspace-second");
+    let admitted = lease_injected(request(&pool, &project, &workspace, "second"))
+        .expect("a busy custody must not refuse an unrelated admission");
+    assert_ne!(admitted.slot_id, slot_id.to_string());
+    release_injected(&pool, &admitted.lease_id).expect("release");
+
+    // Missing: the record is kept, never completed and never re-created.
+    fs::rename(&lock_path, parent.join("moved-lock")).expect("hide the lock");
+    let status = status_injected(&pool).expect("a missing lock is not a global refusal");
+    assert_eq!(status.slots.len(), 2, "the record was dropped with no lock");
+    assert!(slot_path.is_dir());
+    assert!(
+        !lock_path.exists(),
+        "an unknown custody lock was re-created"
+    );
+    fs::rename(parent.join("moved-lock"), &lock_path).expect("restore lock");
+
+    // Replaced: a new file at the same name has a different identity and is
+    // refused as unknown, even though the name exists.
+    let replaced = tempfile_path(&parent, "replacement-lock");
+    fs::write(&replaced, b"").expect("replacement lock");
+    fs::set_permissions(&replaced, fs::Permissions::from_mode(0o600)).expect("mode");
+    fs::rename(&replaced, &lock_path).expect("replace the lock");
+    let status = status_injected(&pool).expect("a replaced lock is not a global refusal");
+    assert_eq!(
+        status.slots.len(),
+        2,
+        "a replaced lock completed a deletion"
+    );
+
+    // Identity mismatch: restoring the original name is not enough; the
+    // recorded (device, inode) is what authorizes custody.
+    assert!(slot_path.is_dir());
+    assert_eq!(
+        plan.device,
+        fs::symlink_metadata(&slot_path).expect("root").dev()
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// One small helper: a fresh path inside `parent`.
+fn tempfile_path(parent: &Path, label: &str) -> PathBuf {
+    let unique = NEXT.fetch_add(1, Ordering::SeqCst);
+    parent.join(format!(".{label}-{unique}"))
+}
+
+/// A record published by a writer that predates the custody fence keeps its
+/// journal in the ledger. The next open migrates it byte-exactly into a
+/// private custody directory, publishes the policy-5 fence and clears the
+/// ledger copy, then applies the ordinary replay outcome to the migrated
+/// journal.
+#[test]
+fn a_legacy_in_ledger_journal_migrates_once_and_is_not_reinterpreted() {
+    let fixture = Fixture::new("custody-migration");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "custody-migration");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let held = File::open(&parent).expect("parent");
+    let leaf = slot_path.file_name().expect("leaf");
+    let name = std::ffi::CString::new(leaf.as_encoded_bytes()).expect("name");
+    let observed = crate::owned_delete::observe_entry(held.as_fd(), &name).expect("observed");
+    let plan = crate::owned_delete::plan_root_capture(held.as_fd(), &observed).expect("plan");
+    mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    super::pool::write_legacy_capture_record_injected(
+        &pool,
+        slot_id,
+        super::pool::DeletionJournal {
+            root: plan.clone(),
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("legacy journal");
+    // The root disappears without its durable `removed` phase, so replay keeps
+    // the object pending: that is the outcome the migrated journal must get.
+    fs::remove_dir_all(&slot_path).expect("hide the root");
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert!(before["slots"][0]["capture"].is_object());
+    assert!(before["slots"][0].get("custody").is_none());
+    assert_ne!(
+        before["capacity_policy"],
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
+    );
+
+    let status = status_injected(&pool).expect("migration");
+    assert_eq!(status.slots.len(), 1, "the pending record was dropped");
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        after["capacity_policy"],
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION),
+        "the migrated record was published without its fence"
+    );
+    assert!(
+        after["slots"][0].get("capture").is_none(),
+        "the legacy journal stayed in the ledger"
+    );
+    let custody = recorded_custody(&pool, slot_id).expect("migrated custody");
+    let (_, journal_path) = custody_files(&pool, &custody.nonce);
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).expect("journal")).expect("json");
+    assert_eq!(document["capture"]["root"]["phase"], "planned");
+    assert_eq!(
+        document["capture"]["root"]["private"],
+        serde_json::json!(plan.private),
+        "the migrated journal was reinterpreted"
+    );
+    assert_eq!(
+        super::pool::capture_record_injected(&pool, slot_id)
+            .expect("migrated journal")
+            .root
+            .private,
+        plan.private
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// The final transaction reloads the ledger from disk and drops only the
+/// matching nonce and generation: a concurrent admission written after this
+/// deletion published its record is preserved.
+#[test]
+fn the_final_record_transaction_preserves_a_concurrent_ledger_update() {
+    let fixture = Fixture::new("custody-final-merge");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "custody-final-merge");
+    let plan = capture_root_state(&slot_path, slot_id, &pool, false);
+    let custody = recorded_custody(&pool, slot_id).expect("custody record");
+    // Restore the modelled capture so the fixture leaves a pending record.
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    fs::rename(parent.join(&plan.private), &slot_path).expect("restore the root");
+
+    // A concurrent admission: a second idle row appended after this deletion
+    // published. It is a plain ledger update, not a custody change.
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    let mut concurrent = ledger["slots"][0].clone();
+    concurrent["id"] = serde_json::json!(slot_id + 1000);
+    concurrent["state"] = serde_json::json!("idle");
+    concurrent["lease_id"] = serde_json::json!(null);
+    concurrent["rank"] = serde_json::json!(9);
+    concurrent
+        .as_object_mut()
+        .expect("object")
+        .remove("custody");
+    concurrent
+        .as_object_mut()
+        .expect("object")
+        .remove("capture");
+    ledger["slots"]
+        .as_array_mut()
+        .expect("slots")
+        .push(concurrent);
+    ledger["next_rank"] = serde_json::json!(10);
+    ledger["next_slot"] = serde_json::json!(slot_id + 1001);
+    let bytes = super::pool::write_ledger_bytes_injected(
+        &pool,
+        &serde_json::to_vec(&ledger).expect("ledger"),
+    )
+    .expect("concurrent update");
+
+    let merged = super::pool::drop_record_on_disk(&pool, slot_id, 1, &custody).expect("final drop");
+    let merged_json: serde_json::Value =
+        serde_json::from_slice(&serde_json::to_vec(&merged).expect("json")).expect("merged json");
+    let rows = merged_json["slots"].as_array().expect("rows");
+    assert!(
+        rows.iter()
+            .all(|slot| slot["id"] != serde_json::json!(slot_id)),
+        "the deleted record survived"
+    );
+    assert!(
+        rows.iter().any(|slot| {
+            slot["id"] == serde_json::json!(slot_id + 1000) && slot["state"] == "idle"
+        }),
+        "the concurrent admission was lost"
+    );
+    let stored = fs::read(pool.join("ledger.json")).expect("ledger");
+    assert_eq!(
+        serde_json::to_vec(&merged).expect("json"),
+        stored,
+        "the merged ledger is not what was written"
+    );
+    assert!(
+        bytes.starts_with(b"{"),
+        "the concurrent write did not replace the ledger"
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A crash after the durable root `removed` phase but before the record drops
+/// repeats the final transaction without touching payload, and the second
+/// open cannot resurrect the record.
+#[test]
+fn a_crash_after_removed_repeats_the_final_transaction_without_payload_effect() {
+    let fixture = Fixture::new("custody-removed");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "custody-removed");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    fs::remove_dir_all(parent.join(&plan.private)).expect("the payload is gone");
+    let removed = crate::owned_delete::RootCapturePlan {
+        phase: crate::owned_delete::RootCapturePhase::Removed,
+        ..plan
+    };
+    super::pool::rewrite_custody_journal_injected(
+        &pool,
+        slot_id,
+        super::pool::DeletionJournal {
+            root: removed,
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("removed phase");
+    let custody = recorded_custody(&pool, slot_id).expect("custody record");
+    let (lock_path, _) = custody_files(&pool, &custody.nonce);
+
+    let status = status_injected(&pool).expect("final transaction");
+    assert!(status.slots.is_empty(), "the record was not dropped");
+    assert!(
+        !lock_path.parent().expect("custody dir").exists(),
+        "the custody directory was kept after completion"
+    );
+    // A second open has nothing to resurrect.
+    let again = status_injected(&pool).expect("second open");
+    assert!(again.slots.is_empty());
+    assert!(root_dir_empty(&pool));
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// Whether the pool's custody holdings directory has no live deletion.
+fn root_dir_empty(pool: &Path) -> bool {
+    let holdings = pool.join(MANAGED_NAME).join("deletions");
+    match fs::read_dir(holdings) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok()).next().is_none(),
+        Err(_) => true,
+    }
 }

@@ -417,6 +417,57 @@ each requires its own activation and exact-head evidence. The diagnostic is
 not a pass. These proposed selectors and limits require source-fit review and
 an approved implementation brief; no native run is authorized by this design.
 
+### Implemented slice 1: deletion custody and the journal migration (oxide#181)
+
+Slice 1 of that design is implemented (Queue brief oxide#181, frozen design
+oxide#180, amendments A1–A3 in decision 5f9744d0). Deletion still runs **under
+the pool lock** in this slice: there is no out-of-lock payload effect and no
+worker thread, so admissions still wait for a whole-slot deletion. What ships
+is the foundation slice 2 moves out of the lock:
+
+- **Fence.** The front door's control state reaches version 9 with the
+  forward-only `oxide.deletion-custody/1` fence, and every revised ledger write
+  publishes `capacity_policy: 5`. Both are durable before the first custody
+  record; the control fence is first (fence first) and a crash between the two
+  resumes the upgrade without deleting anything. A predecessor refuses both the
+  version-9 document and the policy-5 ledger before any effect.
+- **Custody.** Each `Evicting` record names a private `0700` directory
+  `<pool>/oxide-managed/deletions/<nonce>` holding a stable `0600` `lock` file
+  (its `(device, inode)` recorded in the ledger as `custody`) and the
+  per-deletion `journal.json`. Directory, lock and initial journal are durable
+  before the record that references them. The deleter claims the exclusive
+  `flock` nonblocking while holding the pool lock — lock order is always pool
+  lock then custody, and no pool-lock holder waits on custody. A busy lock is a
+  live custodian and the record is skipped; a missing, replaced or
+  identity-mismatched lock is unknown and keeps the record; the claimant
+  rechecks the exact nonce, generation, file identity and backing after
+  acquiring. The lock is `O_CLOEXEC`, so it is never inherited by a child.
+- **Journal.** The oxide#155 capture journal moved out of the ledger into that
+  bounded (4 MiB), atomically replaced and synced file, bound to the nonce,
+  store, backend, slot, incarnation and recorded root. Capture, verification,
+  unlink, mode repair, the oxide#175 ordering/completeness rules and every
+  oxide#155 replay outcome are unchanged; only the storage moved. A legacy
+  in-ledger journal is copied byte-exactly into a fresh custody directory on
+  the next open (never reinterpreted) and the ledger copy is cleared in the
+  same atomic replacement that publishes the policy-5 fence.
+- **Final record removal.** While still holding custody, the final transaction
+  reloads the ledger from disk and drops only the matching id, incarnation and
+  custody nonce (preserving every concurrent update), syncs it, then removes
+  the private directory. A crash after the durable root `removed` phase repeats
+  that transaction without touching payload.
+- **Per-object failure.** A busy, unknown or undeletable object keeps its
+  record, charge and custody and does not refuse an unrelated admission; only
+  backing, ledger or fence integrity is global. The oxide#177 single-journal
+  guard is retired: journals no longer share the ledger's byte bound, so
+  several pending deletions can coexist.
+
+Status adds no new mutation: it reports pending deletions as before, and a
+locked open still reconciles a recorded deletion exactly as oxide#155/#177 did
+(the design's "status takes no custody" rule is a slice-2 change). The
+selectors are `effigy rust:deletion-custody`, its uncounted
+`:diagnostic` twin and the pure `effigy proof:deletion-custody:test`. This
+slice does not qualify the deferred deletion itself.
+
 Current pools are budget-only (`directory-budget-v1`, `apfs-volume-v1`):
 the budget is a soft admission figure with no OS ceiling, and current
 budget, watchdog and removable behaviour is owned by
@@ -793,53 +844,56 @@ cleanup.
 
 **Permanent fences.** A legacy ledger (no `capacity_policy`/`next_rank`, rank
 0) and a version-1 control state stay readable and are never migrated by
-`status`. The first revised grant, release or recovery, or an explicit
-eviction, installs the library ledger's `capacity_policy: 2` fence (the
-recorded-accounting representation, oxide#146) and rank sequence atomically
-with that mutation; the Store-controlled mutation's own recorded-accounting
-control fence is already durable first (see
-[recorded per-slot accounting](#recorded-per-slot-accounting-oxide146-implemented-native-held)).
-A slot table above the legacy 128 carries `capacity_policy: 4` (oxide#177),
-written forward-only, in the same atomic replacement that first records the
-129th slot. An older binary's policy check accepts only 1–3 (1 and 2 from
-oxide#146, 3 from oxide#175), so it refuses a `4` ledger with
-`unknown_accounting` (exit 3) before any mutation; a ledger above 128 slots
-without the fence is a state no writer produces and refuses too. A pool that
-stays at or below 128 slots never carries `4`, so its ledger stays readable by
-an older binary. The ledger alone cannot order that switch against the
-[#122 hand-off](workflow.md#installed-binary-hand-off-oxide122), which reads
-control state rather than the ledger, so the mutating-command admission gate
-makes a forward-only **version-8** control fence durable as the command's
-first write (the oxide#177 `oxide.slots/256` fence, beside the oxide#175
-eviction-accounting and oxide#146 recorded-accounting fences; Oxide Supervisor
-ruling 4c9984a1, fence first). The gate runs under the admission lock and
-before any locked `Pool::open` (which reconciles recorded deletions, can start
-a recovery journal and writes the ledger), so every such effect — ordinary
-eviction, recovery, journal start and ledger write — is preceded by the
-durable fence. A locked `Pool::open` also raises the same fence itself, under
-the pool lock, before its first reconciliation: pre-Store entries
-(`Store::open_at`, `Store::open_removable` and `recover-interrupted`'s ledger
-read) and a direct library open therefore cannot start a journal before it.
-That library path writes only the version and the three fence fields, taking
-the admission lock non-blocking and refusing rather than reconciling under
-contention; an absent control state (a library fixture) and passive
-`status`/snapshot readers are never fenced. A present but non-string or
-non-matching fence value (explicit JSON `null` included), a version/fence combination no front door writer
-produces (including a version-6 document without its one-use fence), or an
-unsupported version such as 0, refuses without repair: only a fence field
+`status`. The first revised grant, release, recovery or explicit eviction
+installs the library ledger's `capacity_policy: 5` fence — the
+[deletion-custody](#implemented-slice-1-deletion-custody-and-the-journal-migration-oxide181)
+representation, oxide#181 — and the rank sequence atomically with that
+mutation, upgrading the older readable policies 1–4. Policy 4 remains the
+raised-ceiling floor for a table above the legacy 128 (oxide#177), and a
+policy-5 ledger above that ceiling is also accepted; both are written
+forward-only. An older binary's policy check accepts only 1–4 (1 and 2 from
+oxide#146, 3 from oxide#175, 4 from oxide#177), so it refuses a `5` ledger with
+`unknown_accounting` (exit 3) before any mutation, and its strict slot parse
+refuses the `custody` field too. A ledger above 128 slots without policies 4 or
+5 is a state no writer produces and refuses. This binary therefore never
+leaves a pool it mutates readable by a predecessor. The ledger alone cannot
+order that switch against the [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122),
+which reads control state rather than the ledger, so the mutating-command
+admission gate makes a forward-only **version-9** control fence durable as the
+command's first write (the oxide#181 `oxide.deletion-custody/1` fence, beside
+the oxide#177 `oxide.slots/256`, oxide#175 eviction-accounting and oxide#146
+recorded-accounting fences; Oxide Supervisor ruling 4c9984a1, fence first).
+Version 8 (raised ceiling) and 7 (eviction accounting) remain readable
+predecessors and every later document keeps their fences. The gate runs under
+the admission lock and before any locked `Pool::open` (which reconciles
+recorded deletions, can start a custody journal and writes the ledger), so
+every such effect — ordinary eviction, replay, journal start and ledger write —
+is preceded by the durable fence. A locked `Pool::open` also raises the same
+fence itself, under the pool lock, before its first reconciliation: pre-Store
+entries (`Store::open_at`, `Store::open_removable` and `recover-interrupted`'s
+ledger read) and a direct library open therefore cannot start a custody
+journal before it. That library path writes only the version and the four
+fence fields, taking the admission lock non-blocking and refusing rather than
+reconciling under contention; an absent control state (a library fixture) and
+passive `status`/snapshot readers are never fenced. A present but non-string or
+non-matching fence value (explicit JSON `null` included), a version/fence
+combination no front door writer produces (including a version-6 document
+without its one-use fence, or a version-9 document without the custody fence),
+or an unsupported version such as 0, refuses without repair: only a fence field
 genuinely absent from an older document is inserted. The fence path and the
 front door's `Store::load` share one parse-and-validate function
 (`lease::control::parse_state`), so a structurally malformed document (for
-example a non-array `records` field) is refused identically by both. An older binary with version ≤ 7 then hands off to a
-receipt-matching successor or refuses before it reads the ledger, so no
-predecessor ledger-size argument is needed. An already-version-8 control is
-not rewritten; a failed fence write refuses the command with no ledger or
-journal write. Passive `status` and snapshot readers never take this gate and
-never fence, so only a pool this binary never mutates stays at version 5. A completed legacy `Evicting`
-reconciliation may still finish in the legacy representation. Before a revised write, every
-stored field is validated against the raised caps; an oversized legacy field
-refuses with the original file, ownership and quarantine bytes untouched,
-never truncated or dropped.
+example a non-array `records` field) is refused identically by both. An older
+binary with version ≤ 8 then hands off to a receipt-matching successor or
+refuses before it reads the ledger, so no predecessor ledger-size argument is
+needed. An already-current control is not rewritten; a failed fence write
+refuses the command with no ledger or journal write. Passive `status` and
+snapshot readers never take this gate and never fence, so only a pool this
+binary never mutates stays at version 5. A completed legacy `Evicting`
+reconciliation may still finish in the legacy representation. Before a revised
+write, every stored field is validated against the raised caps; an oversized
+legacy field refuses with the original file, ownership and quarantine bytes
+untouched, never truncated or dropped.
 
 **Hand-off trigger.** The numeric `version` of a control `state.json` (the
 internal pool's and the removable pool's) and of `removable.json` is also the
@@ -1331,7 +1385,7 @@ reply as a size.
 | Front-door release order | `store.rs` `release` (`:1622`), `unshare` (`:1640`), `discard_scratch` (`:1674`), `flush_before_idle` (`:1689`) |
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
-| Control state fence | `store.rs` `STATE_VERSION`: 8 is the raised-ceiling fence (oxide#177), 7 the eviction-accounting fence (oxide#175), 6 the [one-use workspaces](one-use-workspaces.md) fence, 5 the recorded-accounting fence; an owned-outputs successor alone is version 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, `EVICTION_ACCOUNTING_FENCE`, `SLOT_CEILING_FENCE`, hand-off trigger in `handoff.rs`) |
+| Control state fence | `store.rs` `STATE_VERSION`: 9 is the deletion-custody fence (oxide#181), 8 the raised-ceiling fence (oxide#177), 7 the eviction-accounting fence (oxide#175), 6 the [one-use workspaces](one-use-workspaces.md) fence, 5 the recorded-accounting fence; an owned-outputs successor alone is version 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, `EVICTION_ACCOUNTING_FENCE`, `SLOT_CEILING_FENCE`, `DELETION_CUSTODY_FENCE`, hand-off trigger in `handoff.rs`) |
 | Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
@@ -1370,13 +1424,17 @@ decision mocks where a real path exists:
    zero stays a measured zero; an incomplete walk refuses with its gap kinds.
 7. **Serialization.** Worst-valid 256-slot ledger round-trips under
    `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
-8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2`, `3` and
-   `4` ledgers; held IDs preserved; the admission gate writes control version
-   8 (recorded, eviction-accounting and raised-ceiling fences) as every
-   mutating command's first write, and a locked `Pool::open` raises it before
-   its recovery, journal start or ledger write, so a pool this binary mutates
-   never feeds a predecessor a ledger it cannot represent or a control version
-   it cannot read; an
+8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2`, `3`, `4`
+   and `5` ledgers; held IDs preserved; the admission gate writes control
+   version 9 (recorded, eviction-accounting, raised-ceiling and
+   deletion-custody fences) as every mutating command's first write, and a
+   locked `Pool::open` raises it before its replay, journal start or ledger
+   write, so a pool this binary mutates never feeds a predecessor a ledger it
+   cannot represent or a control version it cannot read; a predecessor's
+   refusal of policy 5 and of the `custody` field is proved against its own
+   strict shape
+   (`lease::tests::the_custody_fence_refuses_the_predecessor_reader_in_both_states`);
+   an
    owned-outputs-only state derives version 4 (proved on `save` directly, not
    through a path that takes admission), a v4 control still hands off, a v5
    document without the recorded fence or with an unknown fence value refuses,

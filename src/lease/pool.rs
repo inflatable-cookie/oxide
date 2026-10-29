@@ -1,6 +1,7 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
 use super::backing::BackingPaths;
+use super::custody::{Claim, CustodyIdentity, CustodyLock, DeletionCustody};
 use super::slice::{
     AdmissionClass, MemberPair, MemberSet, OneUseSlice, RestoreOutcome, SliceAdmission,
     SliceReport, VictimPolicy,
@@ -13,8 +14,8 @@ use super::{
     LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact,
     RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
     ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
-    CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
-    LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
+    CAPACITY_POLICY_VERSION, CONFIG_NAME, DELETION_CUSTODY_CAPACITY_POLICY_VERSION, LEASE_VERSION,
+    LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION,
     RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
@@ -263,7 +264,7 @@ struct VolumeConfig {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Ledger {
+pub(super) struct Ledger {
     version: u32,
     store_id: String,
     cap_bytes: u64,
@@ -310,6 +311,13 @@ struct SlotRecord {
     /// the observed object. Only an `Evicting` record may carry one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     capture: Option<DeletionJournal>,
+    /// The per-deletion custody of a recorded whole-slot deletion (oxide#181):
+    /// the private control directory's nonce and the identity of the stable
+    /// lock file published with it. Only an `Evicting` record may carry one,
+    /// and only under the `capacity_policy: 5` ledger fence. The journal itself
+    /// lives in that directory, never in the ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custody: Option<DeletionCustody>,
 }
 
 /// One closed size observation. It is a measurement at a closing transition,
@@ -343,7 +351,7 @@ pub(super) struct DeletionJournal {
 }
 
 impl DeletionJournal {
-    fn is_valid(&self) -> bool {
+    pub(super) fn is_valid(&self) -> bool {
         self.root.is_valid()
             && self.captures.len() <= MAX_OUTSTANDING_CAPTURES
             && self.captures.iter().all(CaptureRecord::is_valid)
@@ -355,10 +363,10 @@ impl DeletionJournal {
 /// Most captures one deletion may have recorded and not yet removed. A
 /// whole-tree recursion holds at most one capture per level plus the entry it
 /// is finishing, and a deeper tree is refused before it is captured.
-const MAX_OUTSTANDING_CAPTURES: usize = 96;
+pub(super) const MAX_OUTSTANDING_CAPTURES: usize = 96;
 /// Most mismatched captures one deletion may record. A refusal already keeps
 /// the deletion pending; the cap only bounds the ledger.
-const MAX_FOREIGN_CAPTURES: usize = 32;
+pub(super) const MAX_FOREIGN_CAPTURES: usize = 32;
 
 fn is_zero_rank(rank: &u64) -> bool {
     *rank == 0
@@ -1031,16 +1039,79 @@ pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), Le
     }
     slot.state = SlotPersistState::Evicting;
     slot.capture = None;
+    slot.custody = None;
     opened.persist()
 }
 
-/// The journaled root capture recorded for one slot, read straight from the
-/// ledger so a test can inspect a modelled crash state without opening (and
-/// therefore reconciling) the pool.
-/// Write a modelled crash state's journal straight into the ledger, without
-/// opening (and therefore reconciling) the pool.
+/// The identity facts one fixture record's custody is bound to.
+#[cfg(test)]
+fn fixture_custody_identity(pool: &Path, slot: &SlotRecord) -> Result<CustodyIdentity, LeaseError> {
+    let config = read_config(pool)?;
+    Ok(CustodyIdentity {
+        store_id: config.store_id,
+        backend: config.backend,
+        slot: slot.id,
+        incarnation: slot.incarnation,
+        root: slot.dir.clone().unwrap_or_else(|| slot.id.to_string()),
+    })
+}
+
+/// Publish the `capacity_policy: 5` fence an in-test ledger needs to carry a
+/// custody record, without touching any other field.
+#[cfg(test)]
+fn fence_ledger_for_custody(ledger: &mut Ledger) {
+    if ledger.capacity_policy.is_none() {
+        let next = ledger
+            .slots
+            .iter()
+            .map(|slot| slot.rank)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        ledger.next_rank = Some(next.max(1));
+    }
+    ledger.capacity_policy = Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION);
+}
+
+/// Write a modelled crash state's journal straight into its per-deletion
+/// custody directory, without opening (and therefore reconciling) the pool.
+/// The record is published with the custody reference and the policy-5 fence
+/// in the same atomic write, exactly as the product does.
 #[cfg(test)]
 pub(super) fn write_capture_record_injected(
+    pool: &Path,
+    slot_id: u64,
+    journal: super::pool::DeletionJournal,
+) -> Result<(), LeaseError> {
+    let mut ledger = read_ledger(pool)?;
+    let slot = ledger
+        .slots
+        .iter()
+        .find(|slot| slot.id == slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if slot.state != SlotPersistState::Evicting {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let identity = fixture_custody_identity(pool, slot)?;
+    let custody = super::custody::create(pool, &identity, Some(&journal))?;
+    let record = custody.record();
+    drop(custody);
+    let slot = ledger
+        .slots
+        .iter_mut()
+        .find(|slot| slot.id == slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    slot.capture = None;
+    slot.custody = Some(record);
+    fence_ledger_for_custody(&mut ledger);
+    write_ledger(pool, &ledger)
+}
+
+/// Write a modelled **legacy** crash state's journal straight into the ledger,
+/// without opening (and therefore reconciling) the pool. Used by migration
+/// regressions: the journal form a writer predating the custody fence left.
+#[cfg(test)]
+pub(super) fn write_legacy_capture_record_injected(
     pool: &Path,
     slot_id: u64,
     journal: super::pool::DeletionJournal,
@@ -1051,21 +1122,52 @@ pub(super) fn write_capture_record_injected(
         .iter_mut()
         .find(|slot| slot.id == slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
-    if slot.state != SlotPersistState::Evicting {
+    if slot.state != SlotPersistState::Evicting || slot.custody.is_some() {
         return Err(LeaseError::UnknownAccounting);
     }
     slot.capture = Some(journal);
+    // A legacy in-ledger journal is readable only below the custody fence.
+    if ledger.capacity_policy == Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION) {
+        ledger.capacity_policy = Some(RAISED_CAPACITY_POLICY_VERSION);
+    }
     write_ledger(pool, &ledger)
 }
 
+/// Rewrite one published custody journal in place, claiming its lock exactly
+/// as a claimant does. Used by tests to model a later crash boundary.
 #[cfg(test)]
-pub(super) fn capture_record_injected(pool: &Path, slot_id: u64) -> Option<DeletionJournal> {
-    read_ledger(pool)
-        .ok()?
+pub(super) fn rewrite_custody_journal_injected(
+    pool: &Path,
+    slot_id: u64,
+    journal: DeletionJournal,
+) -> Result<(), LeaseError> {
+    let ledger = read_ledger(pool)?;
+    let slot = ledger
         .slots
         .iter()
         .find(|slot| slot.id == slot_id)
-        .and_then(|slot| slot.capture.clone())
+        .ok_or(LeaseError::UnknownAccounting)?;
+    let custody = slot.custody.clone().ok_or(LeaseError::UnknownAccounting)?;
+    let identity = fixture_custody_identity(pool, slot)?;
+    match super::custody::claim(pool, &custody, &identity)? {
+        Claim::Claimed(mut lock) => lock.replace_journal(Some(journal)).map_err(LeaseError::Io),
+        Claim::Busy | Claim::Unknown => Err(LeaseError::UnknownAccounting),
+    }
+}
+
+/// The recorded deletion journal of one slot, read without opening (and
+/// therefore reconciling) the pool: the custody file when the record is
+/// published under custody, the legacy in-ledger journal otherwise.
+#[cfg(test)]
+pub(super) fn capture_record_injected(pool: &Path, slot_id: u64) -> Option<DeletionJournal> {
+    let ledger = read_ledger(pool).ok()?;
+    let slot = ledger.slots.iter().find(|slot| slot.id == slot_id)?;
+    if let Some(capture) = &slot.capture {
+        return Some(capture.clone());
+    }
+    let custody = slot.custody.as_ref()?;
+    let identity = fixture_custody_identity(pool, slot).ok()?;
+    super::custody::peek(pool, custody, &identity).ok()
 }
 
 #[cfg(test)]
@@ -1226,7 +1328,9 @@ impl Pool {
     /// written below that count: a pool at or under 128 slots keeps a fence
     /// an older binary still reads.
     fn raise_capacity_policy_if_needed(&mut self) {
-        if self.ledger.slots.len() > LEGACY_MAX_SLOTS {
+        if self.ledger.slots.len() > LEGACY_MAX_SLOTS
+            && self.ledger.capacity_policy != Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
+        {
             self.ledger.capacity_policy = Some(RAISED_CAPACITY_POLICY_VERSION);
         }
     }
@@ -1245,22 +1349,24 @@ impl Pool {
                 .unwrap_or(0)
                 .checked_add(1)
                 .ok_or(LeaseError::LedgerExhausted)?;
-            self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+            self.ledger.capacity_policy = Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION);
             self.ledger.next_rank = Some(next.max(1));
         }
-        // A version-1 fence (oxide#118) stays readable and is upgraded by this
-        // revised write, atomically with whatever needed it. The step is
-        // one-way: an older binary refuses a version-2 ledger before any
-        // mutation, which is why the front door writes its control fence first.
-        if self.ledger.capacity_policy == Some(LEGACY_CAPACITY_POLICY_VERSION)
-            || self.ledger.capacity_policy == Some(PREVIOUS_CAPACITY_POLICY_VERSION)
-        {
-            self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
-        }
-        if !matches!(
+        // Every ledger revision of this binary publishes the deletion-custody
+        // fence (oxide#181), upgrading the older readable policies in the same
+        // atomic replacement. The step is one-way: an older binary refuses a
+        // policy-5 ledger and a `custody` field before any effect, which is why
+        // the front door's version-9 control fence is durable first.
+        if matches!(
             self.ledger.capacity_policy,
-            Some(CAPACITY_POLICY_VERSION) | Some(RAISED_CAPACITY_POLICY_VERSION)
+            Some(LEGACY_CAPACITY_POLICY_VERSION)
+                | Some(PREVIOUS_CAPACITY_POLICY_VERSION)
+                | Some(CAPACITY_POLICY_VERSION)
+                | Some(RAISED_CAPACITY_POLICY_VERSION)
         ) {
+            self.ledger.capacity_policy = Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION);
+        }
+        if self.ledger.capacity_policy != Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION) {
             return Err(LeaseError::UnknownAccounting);
         }
         Ok(())
@@ -1948,6 +2054,7 @@ impl Pool {
             rank: 0,
             recorded: None,
             capture: None,
+            custody: None,
         });
         self.ledger.next_slot = slot_id.checked_add(1).ok_or(LeaseError::LedgerExhausted)?;
         self.stamp_rank(slot_id)?;
@@ -2473,7 +2580,7 @@ impl Pool {
                     };
                 };
                 isolated.push(relative.clone());
-                if let Some(journal) = &slot.capture {
+                if let Some(journal) = self.stored_journal(slot) {
                     let mut private = relative;
                     private.set_file_name(&journal.root.private);
                     isolated.push(private);
@@ -2662,16 +2769,11 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
-        // One durable deletion journal at a time (oxide#177). An eviction is
-        // the only path that starts a journal, and this check covers every
-        // entry point, including the explicit `evict_idle_slot` that does not
-        // pass through `lease()`'s blocked-reconciliation refusal: a second
-        // deletion would interleave two journals and grow the ledger past its
-        // derived bound. The pending record and its journal are kept, and a
-        // later open retries reconciliation.
-        if self.reconciliation_blocked
-            || self.ledger.slots.iter().any(|slot| slot.capture.is_some())
-        {
+        // Per-object failure (oxide#175 ruling B): a pending deletion of
+        // another slot no longer refuses this one. Only a journaled root that
+        // is at neither of its names leaves the ledger unclassifiable, and that
+        // refusal is already what `lease()` returns.
+        if self.reconciliation_unresolved {
             return Err(LeaseError::UnknownAccounting);
         }
         // Every durable idle deletion, including the explicit
@@ -2681,16 +2783,116 @@ impl Pool {
         self.ensure_capacity_policy()?;
         self.next_rank()?;
         let path = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
+        // Custody first (oxide#181): the private directory, its stable lock
+        // file and the initial journal are durable before the record that
+        // references them, and before any payload mutation. The lock is
+        // claimed nonblocking here, while this open holds the pool lock.
+        let identity = self.custody_identity(id)?;
+        let mut custody = super::custody::create(&self.root, &identity, None)?;
         {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
             slot.state = SlotPersistState::Evicting;
+            // The legacy in-ledger journal is never written again; every
+            // capture of this deletion goes to the custody directory.
+            slot.capture = None;
+            slot.custody = Some(custody.record());
             // Keep the last closed observation to charge a blocked eviction.
         }
+        // One atomic, synced replacement publishes the policy-5 ledger fence
+        // and the `Evicting` record with its custody reference.
         self.persist_revised()?;
-        self.remove_owned_slot(id, &path, None)?;
-        self.ledger.slots.retain(|slot| slot.id != id);
-        self.persist_revised()?;
+        // The claimant rechecks the exact nonce, generation, control-file
+        // identity and backing under the pool lock after acquiring custody.
+        if !custody.matches(&self.custody_identity(id)?) {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        crate::proof::deletion_pause("journal-created");
+        if let Err(error) = self.remove_owned_slot(&path, None, &mut custody) {
+            // The record, its charge and its custody stay; the next open
+            // replays them.
+            return Err(error);
+        }
+        self.drop_deletion_record(id, incarnation, &custody.record())?;
+        custody.retire();
         Ok(())
+    }
+
+    /// The exact identities one record's deletion custody is bound to.
+    fn custody_identity(&self, id: u64) -> Result<CustodyIdentity, LeaseError> {
+        let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+        Ok(CustodyIdentity {
+            store_id: self.config.store_id.clone(),
+            backend: self.config.backend.clone(),
+            slot: slot.id,
+            incarnation: slot.incarnation,
+            root: slot.dir.clone().unwrap_or_else(|| slot.id.to_string()),
+        })
+    }
+
+    /// Drop one completed deletion's ledger record while custody is still held.
+    ///
+    /// The current ledger is reloaded from disk (the pool lock is held for the
+    /// whole slice-1 deletion), and only the record matching this exact nonce
+    /// and generation is removed, so every concurrent update in the bytes read
+    /// is preserved. The atomic, synced replacement is the deletion's last
+    /// durable step; a crash after it cannot resurrect the record.
+    fn drop_deletion_record(
+        &mut self,
+        id: u64,
+        incarnation: u64,
+        custody: &DeletionCustody,
+    ) -> Result<(), LeaseError> {
+        self.ledger = drop_record_on_disk(&self.root, id, incarnation, custody)?;
+        Ok(())
+    }
+
+    /// Read one record's journal without taking custody: read-only accounting
+    /// and the reconciliation preflight use this, and it never creates or
+    /// repairs anything.
+    fn stored_journal(&self, slot: &SlotRecord) -> Option<DeletionJournal> {
+        match &slot.custody {
+            Some(custody) => match self.custody_identity(slot.id) {
+                Ok(identity) => super::custody::peek(&self.root, custody, &identity).ok(),
+                Err(_) => None,
+            },
+            None => slot.capture.clone(),
+        }
+    }
+
+    /// Migrate one record published by an older writer: its journal lives in
+    /// the ledger. The journal is copied byte-exactly into a fresh custody
+    /// directory, then one atomic replacement carries the policy-5 fence, the
+    /// `custody` reference and the cleared in-ledger journal. An uncertain
+    /// journal is migrated as it stands, never reinterpreted.
+    fn migrate_legacy_deletion(&mut self, id: u64) -> Result<Option<CustodyLock>, LeaseError> {
+        let Some(slot) = self.slot(id) else {
+            return Err(LeaseError::UnknownAccounting);
+        };
+        if slot.state != SlotPersistState::Evicting
+            || slot.lease_id.is_some()
+            || slot.custody.is_some()
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let capture = slot.capture.clone();
+        let identity = self.custody_identity(id)?;
+        let custody = super::custody::create(&self.root, &identity, capture.as_ref())?;
+        {
+            let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
+            if slot.state != SlotPersistState::Evicting
+                || slot.lease_id.is_some()
+                || slot.custody.is_some()
+            {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            slot.custody = Some(custody.record());
+            slot.capture = None;
+        }
+        self.persist_revised()?;
+        if !custody.matches(&self.custody_identity(id)?) {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        Ok(Some(custody))
     }
 
     fn validate_idle_slot_scope(
@@ -2724,66 +2926,125 @@ impl Pool {
         Ok(path)
     }
 
+    /// Reconcile every recorded deletion, one object at a time.
+    ///
+    /// Custody is claimed nonblocking under the pool lock: a busy lock is a
+    /// live custodian and this pass skips that object, while a missing,
+    /// replaced or unverifiable lock keeps its record and charge. A per-object
+    /// failure never refuses an unrelated admission; only a backing, ledger or
+    /// fence integrity failure is global.
     fn reconcile_evicting(&mut self) -> Result<(), LeaseError> {
-        let evicting: Vec<u64> = self
+        let evicting: Vec<(u64, u64)> = self
             .ledger
             .slots
             .iter()
             .filter(|slot| slot.state == SlotPersistState::Evicting)
-            .map(|slot| slot.id)
+            .map(|slot| (slot.id, slot.incarnation))
             .collect();
-        for id in evicting {
-            let path = self.slot_path(id)?;
-            let removed = self
-                .slot(id)
-                .and_then(|slot| slot.capture.as_ref())
-                .is_some_and(|journal| journal.root.phase == RootCapturePhase::Removed);
-            let held_root = if removed {
-                None
-            } else if let Some(root) = self.pending_root_ready(id, &path) {
-                Some(root)
-            } else {
-                if self.recorded_root_is_untracked(id, &path) {
+        for (id, incarnation) in evicting {
+            match self.reconcile_one(id, incarnation) {
+                Ok(()) => {}
+                Err(LeaseError::UnknownAccounting) => {
+                    self.reconciliation_blocked = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile one recorded deletion: verify and claim its custody, apply the
+    /// #155 replay outcomes, delete the tree through the custody journal, then
+    /// drop only its matching record while custody is still held.
+    fn reconcile_one(&mut self, id: u64, incarnation: u64) -> Result<(), LeaseError> {
+        let path = self.slot_path(id)?;
+        let (published, current) = {
+            let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+            (slot.custody.clone(), slot.incarnation)
+        };
+        if current != incarnation {
+            // A concurrent open replaced this generation: not this pass's
+            // object.
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let mut custody = match published {
+            Some(custody) => {
+                let identity = self.custody_identity(id)?;
+                match super::custody::claim(&self.root, &custody, &identity)? {
+                    // A live custodian holds the lock: skip this object only.
+                    Claim::Busy => return Ok(()),
+                    Claim::Unknown => return Err(LeaseError::UnknownAccounting),
+                    Claim::Claimed(lock) => lock,
+                }
+            }
+            // A record published before the custody fence is migrated first:
+            // its in-ledger journal is copied byte-exactly and never
+            // reinterpreted.
+            None => match self.migrate_legacy_deletion(id)? {
+                Some(lock) => lock,
+                None => return Err(LeaseError::UnknownAccounting),
+            },
+        };
+        // The claimant rechecks the exact nonce, generation, control-file
+        // identity and backing under the pool lock after acquiring custody.
+        if !custody.matches(&self.custody_identity(id)?) {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let journal = custody.journal().cloned();
+        // A durably recorded root removal is the only positive completion
+        // proof. A crash after it repeats this final transaction without
+        // touching payload.
+        if journal
+            .as_ref()
+            .is_some_and(|journal| journal.root.phase == RootCapturePhase::Removed)
+        {
+            self.drop_deletion_record(id, incarnation, &custody.record())?;
+            custody.retire();
+            return Ok(());
+        }
+        let held_root = match self.pending_root_ready(&path, journal.as_ref()) {
+            Some(root) => root,
+            None => {
+                if self.recorded_root_is_untracked(&path, journal.as_ref()) {
                     self.reconciliation_unresolved = true;
                 }
-                self.reconciliation_blocked = true;
-                continue;
-            };
-            let expected = match held_root.as_ref() {
-                Some(root) => match descriptor_identity(root.as_fd()) {
-                    Ok(identity) => Some(identity),
-                    Err(_) => {
-                        self.reconciliation_blocked = true;
-                        continue;
-                    }
-                },
-                None => None,
-            };
-            // A journaled root capture is reconciled first: the recorded path
-            // may be absent because the tree is under its private name, and
-            // deleting by the recorded path alone would conclude a deletion
-            // that never finished while the captured bytes stayed behind.
-            match self.reconcile_slot_capture(id, &path) {
-                Ok(CaptureDisposition::Resume) => {}
-                Ok(CaptureDisposition::Concluded) => {
-                    self.ledger.slots.retain(|slot| slot.id != id);
-                    self.persist()?;
-                    continue;
-                }
-                Ok(CaptureDisposition::Blocked) | Err(_) => {
-                    self.reconciliation_blocked = true;
-                    continue;
-                }
+                return Err(LeaseError::UnknownAccounting);
             }
-            let removal = self.remove_owned_slot(id, &path, expected);
-            drop(held_root);
-            if removal.is_err() {
-                self.reconciliation_blocked = true;
-                continue;
+        };
+        let expected = match descriptor_identity(held_root.as_fd()) {
+            Ok(identity) => identity,
+            Err(_) => return Err(LeaseError::UnknownAccounting),
+        };
+        // A journaled root capture is reconciled first: the recorded path may
+        // be absent because the tree is under its private name, and deleting by
+        // the recorded path alone would conclude a deletion that never finished
+        // while the captured bytes stayed behind.
+        match self.reconcile_slot_capture(&path, journal.as_ref(), &mut custody) {
+            Ok(CaptureDisposition::Resume) => {}
+            Ok(CaptureDisposition::Concluded) => {
+                drop(held_root);
+                self.drop_deletion_record(id, incarnation, &custody.record())?;
+                custody.retire();
+                return Ok(());
             }
-            self.ledger.slots.retain(|slot| slot.id != id);
-            self.persist()?;
+            Ok(CaptureDisposition::Blocked) => {
+                drop(held_root);
+                return Err(LeaseError::UnknownAccounting);
+            }
+            Err(error) => return Err(error),
         }
+        drop(held_root);
+        if self
+            .remove_owned_slot(&path, Some(expected), &mut custody)
+            .is_err()
+        {
+            // Per-object failure (oxide#175 ruling B): the record, its charge,
+            // its custody and its journal stay, and the next open retries the
+            // object. It never refuses an unrelated admission.
+            return Err(LeaseError::UnknownAccounting);
+        }
+        self.drop_deletion_record(id, incarnation, &custody.record())?;
+        custody.retire();
         Ok(())
     }
 
@@ -2791,8 +3052,8 @@ impl Pool {
     /// private recorded name cannot be reconciled; it stays pending and no new
     /// lease is admitted. A root that is still present (a collision or an
     /// unjournaled pending tree) is charged conservatively instead.
-    fn recorded_root_is_untracked(&self, id: u64, path: &Path) -> bool {
-        let Some(journal) = self.slot(id).and_then(|slot| slot.capture.as_ref()) else {
+    fn recorded_root_is_untracked(&self, path: &Path, journal: Option<&DeletionJournal>) -> bool {
+        let Some(journal) = journal else {
             return false;
         };
         let private = path
@@ -2805,14 +3066,17 @@ impl Pool {
     /// An uncertain or partially inventoried pending root is isolated before
     /// a new capture or deletion. Existing journaled modes may be restored
     /// through the verified descriptors used for the preflight.
-    fn pending_root_ready(&self, id: u64, path: &Path) -> Option<OwnedFd> {
-        let slot = self.slot(id)?;
+    fn pending_root_ready(
+        &self,
+        path: &Path,
+        journal: Option<&DeletionJournal>,
+    ) -> Option<OwnedFd> {
         if self.checked_slot_scope(path).is_err() {
             return None;
         }
         let parent = super::open_verified_directory(path.parent()?).ok()?;
         let original = std::ffi::CString::new(path.file_name()?.as_bytes()).ok()?;
-        let candidates = if let Some(journal) = &slot.capture {
+        let candidates = if let Some(journal) = journal {
             match reconcile_root_capture(parent.as_fd(), &original, &journal.root) {
                 RootCaptureState::Original => vec![original],
                 RootCaptureState::Private => {
@@ -2829,12 +3093,12 @@ impl Pool {
             {
                 return None;
             }
-            if let Some(journal) = &slot.capture {
+            if let Some(journal) = journal {
                 if facts.device != journal.root.device || facts.inode != journal.root.inode {
                     return None;
                 }
             }
-            let (root, mut mode_guard) = if let Some(journal) = &slot.capture {
+            let (root, mut mode_guard) = if let Some(journal) = journal {
                 let (root, guard) = crate::owned_delete::open_verified_step(
                     parent.as_fd(),
                     &candidate,
@@ -2860,7 +3124,7 @@ impl Pool {
                 limits.max_depth,
                 &mut remaining,
                 deadline,
-                slot.capture.as_ref(),
+                journal,
                 &[],
             ) {
                 return None;
@@ -2885,10 +3149,11 @@ impl Pool {
     /// back and retried, or kept pending.
     fn reconcile_slot_capture(
         &mut self,
-        id: u64,
         path: &Path,
+        journal: Option<&DeletionJournal>,
+        custody: &mut CustodyLock,
     ) -> Result<CaptureDisposition, LeaseError> {
-        let Some(journal) = self.slot(id).and_then(|slot| slot.capture.clone()) else {
+        let Some(journal) = journal else {
             return Ok(CaptureDisposition::Resume);
         };
         self.checked_slot_scope(path)?;
@@ -2900,7 +3165,7 @@ impl Pool {
         // A durably recorded root removal is the only positive completion
         // proof. Two absent names without it may be a move, never completion.
         if journal.root.phase == RootCapturePhase::Removed {
-            self.record_slot_capture(id, None).map_err(LeaseError::Io)?;
+            custody.replace_journal(None).map_err(LeaseError::Io)?;
             return Ok(CaptureDisposition::Concluded);
         }
         // A recorded mismatch keeps the deletion pending: replay never removes
@@ -2918,7 +3183,7 @@ impl Pool {
                     && root_facts.mode & 0o077 == 0
                     && journal.root.mode & 0o077 == 0;
                 let concluded =
-                    match rollback_captures(parent.as_fd(), &private, &journal, private_root) {
+                    match rollback_captures(parent.as_fd(), &private, journal, private_root) {
                         Ok(concluded) => concluded,
                         Err(_) => return Ok(CaptureDisposition::Blocked),
                     };
@@ -2927,7 +3192,8 @@ impl Pool {
                     updated
                         .captures
                         .retain(|record| !concluded.contains(record));
-                    self.record_slot_capture(id, Some(updated))
+                    custody
+                        .replace_journal(Some(updated))
                         .map_err(LeaseError::Io)?;
                 }
                 if restore_root_capture(parent.as_fd(), &name, &journal.root).is_err() {
@@ -2935,7 +3201,7 @@ impl Pool {
                 }
             }
             RootCaptureState::Original => {
-                if rollback_captures(parent.as_fd(), &name, &journal, false).is_err() {
+                if rollback_captures(parent.as_fd(), &name, journal, false).is_err() {
                     return Ok(CaptureDisposition::Blocked);
                 }
             }
@@ -2946,34 +3212,10 @@ impl Pool {
         if foreign {
             return Ok(CaptureDisposition::Blocked);
         }
-        self.record_slot_capture(id, None).map_err(LeaseError::Io)?;
+        // Retained replay outcomes stay in the per-deletion file; a clean
+        // rollback clears it so the next attempt plans a fresh capture.
+        custody.replace_journal(None).map_err(LeaseError::Io)?;
         Ok(CaptureDisposition::Resume)
-    }
-
-    /// Write one slot's deletion journal durably. The ledger replacement is
-    /// atomic and synced, so a crash after this returns leaves exactly this
-    /// journal.
-    fn record_slot_capture(
-        &mut self,
-        id: u64,
-        capture: Option<DeletionJournal>,
-    ) -> Result<(), String> {
-        if let Some(journal) = &capture {
-            if !journal.is_valid() {
-                return Err("the capture journal is not one a writer produces".to_owned());
-            }
-        }
-        {
-            let slot = self.slot_mut(id).ok_or("the recorded slot disappeared")?;
-            if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
-                return Err("a capture journal belongs to a recorded deletion".to_owned());
-            }
-            if slot.capture == capture {
-                return Ok(());
-            }
-            slot.capture = capture;
-        }
-        self.persist().map_err(|error| error.to_string())
     }
 
     /// The recorded slot's path is inside this pool's verified `slots` root.
@@ -2989,9 +3231,9 @@ impl Pool {
 
     fn remove_owned_slot(
         &mut self,
-        id: u64,
         path: &Path,
         expected: Option<(u64, u64)>,
+        custody: &mut CustodyLock,
     ) -> Result<(), LeaseError> {
         let slots_root = self.checked_slot_scope(path)?;
         match fs::symlink_metadata(path) {
@@ -3010,11 +3252,16 @@ impl Pool {
             Ok(_) => {}
         }
         canonical_existing_dir(path, true)?;
-        // The slot's own ledger record is the journal for its root capture: a
-        // crash at any point in the deletion leaves either the recorded path or
-        // the recorded private name findable by the next open.
-        let mut journal = SlotCaptureJournal { pool: self, id };
-        remove_tree_owned_checked(&slots_root, path, Some(&mut journal), expected)
+        // The per-deletion custody journal is the record for this root
+        // capture: a crash at any point in the deletion leaves either the
+        // recorded path or the recorded private name findable by the next
+        // open, and the journal file is durable before each rename.
+        remove_tree_owned_checked(
+            &slots_root,
+            path,
+            Some(custody as &mut dyn RootCaptureJournal),
+            expected,
+        )
     }
 
     /// The bounds the next walk may use: this open's limits, with the
@@ -3667,164 +3914,6 @@ enum CaptureDisposition {
     Blocked,
 }
 
-/// The lease's journal for one slot deletion. The `Evicting` slot record
-/// carries the root plan, the outstanding captures and the foreign captures,
-/// written with the same atomic, synced replacement as every other ledger write
-/// before each capture acts and after each removal completes.
-struct SlotCaptureJournal<'a> {
-    pool: &'a mut Pool,
-    id: u64,
-}
-
-impl SlotCaptureJournal<'_> {
-    fn update<T>(
-        &mut self,
-        change: impl FnOnce(&mut DeletionJournal) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let (outcome, changed) = {
-            let slot = self
-                .pool
-                .slot_mut(self.id)
-                .ok_or("the recorded slot disappeared")?;
-            if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
-                return Err("a capture journal belongs to a recorded deletion".to_owned());
-            }
-            let journal = slot
-                .capture
-                .as_mut()
-                .ok_or("the recorded deletion has no journal")?;
-            let before = journal.clone();
-            let outcome = change(journal)?;
-            if !journal.is_valid() {
-                *journal = before;
-                return Err("the capture journal would not be one a writer produces".to_owned());
-            }
-            (outcome, *journal != before)
-        };
-        if changed {
-            self.pool.persist().map_err(|error| error.to_string())?;
-        }
-        Ok(outcome)
-    }
-}
-
-impl SlotCaptureJournal<'_> {
-    /// Open the journal for this generation's first capture. The plan is
-    /// durable before the exclusive rename, so a crash can never leave the tree
-    /// under a private name the ledger does not name.
-    fn begin(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        let journal = DeletionJournal {
-            root: plan.clone(),
-            captures: Vec::new(),
-            foreign: Vec::new(),
-        };
-        if !journal.is_valid() {
-            return Err("the capture journal is not one a writer produces".to_owned());
-        }
-        {
-            let slot = self
-                .pool
-                .slot_mut(self.id)
-                .ok_or("the recorded slot disappeared")?;
-            if slot.state != SlotPersistState::Evicting || slot.lease_id.is_some() {
-                return Err("a capture journal belongs to a recorded deletion".to_owned());
-            }
-            if slot.capture.is_some() {
-                return Err("the recorded deletion already has a journal".to_owned());
-            }
-            slot.capture = Some(journal);
-        }
-        self.pool.persist().map_err(|error| error.to_string())
-    }
-}
-
-impl RootCaptureJournal for SlotCaptureJournal<'_> {
-    fn planned(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        if self
-            .pool
-            .slot(self.id)
-            .is_some_and(|slot| slot.capture.is_none())
-        {
-            return self.begin(plan);
-        }
-        self.update(|journal| {
-            journal.root = plan.clone();
-            Ok(())
-        })
-    }
-
-    fn captured(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        self.update(|journal| {
-            journal.root = RootCapturePlan {
-                phase: RootCapturePhase::Captured,
-                ..plan.clone()
-            };
-            Ok(())
-        })
-    }
-
-    fn record_captured(&mut self, record: &CaptureRecord) -> Result<(), String> {
-        self.update(|journal| {
-            if journal
-                .captures
-                .iter()
-                .any(|existing| existing.private == record.private)
-            {
-                return Err("a capture record already names this private name".to_owned());
-            }
-            if journal.captures.len() >= MAX_OUTSTANDING_CAPTURES {
-                return Err(
-                    "the deletion has more outstanding captures than it may record".to_owned(),
-                );
-            }
-            journal.captures.push(record.clone());
-            Ok(())
-        })
-    }
-
-    fn record_removed(&mut self, record: &CaptureRecord) -> Result<(), String> {
-        self.update(|journal| {
-            let position = journal
-                .captures
-                .iter()
-                .position(|existing| {
-                    existing.private == record.private && existing.path == record.path
-                })
-                .ok_or("the recorded capture is not the one this deletion recorded")?;
-            journal.captures.remove(position);
-            Ok(())
-        })
-    }
-
-    fn record_foreign(&mut self, capture: &ForeignCapture) -> Result<(), String> {
-        self.update(|journal| {
-            if let Some(existing) = journal
-                .foreign
-                .iter_mut()
-                .find(|existing| existing.private == capture.private)
-            {
-                *existing = capture.clone();
-                return Ok(());
-            }
-            if journal.foreign.len() >= MAX_FOREIGN_CAPTURES {
-                return Err("the deletion has more foreign captures than it may record".to_owned());
-            }
-            journal.foreign.push(capture.clone());
-            Ok(())
-        })
-    }
-
-    fn record_root_removed(&mut self, plan: &RootCapturePlan) -> Result<(), String> {
-        self.update(|journal| {
-            journal.root = RootCapturePlan {
-                phase: RootCapturePhase::Removed,
-                ..plan.clone()
-            };
-            Ok(())
-        })
-    }
-}
-
 /// Whether a project folder with no recorded slot holds anything: missing
 /// is free, an empty owned directory (Finder metadata aside) is free, and
 /// anything else is occupied.
@@ -4449,6 +4538,45 @@ fn write_config(pool: &Path, config: &PoolConfig) -> Result<(), LeaseError> {
     persist_private_file(&pool.join(CONFIG_NAME), &bytes)
 }
 
+/// The final transaction of one completed deletion: reload the current ledger
+/// from disk, drop only the matching record and replace the ledger atomically.
+/// Every concurrent update in the bytes read is preserved. The caller still
+/// holds that deletion's custody.
+pub(super) fn drop_record_on_disk(
+    pool: &Path,
+    id: u64,
+    incarnation: u64,
+    custody: &DeletionCustody,
+) -> Result<Ledger, LeaseError> {
+    let mut current = read_ledger(pool)?;
+    if !drop_matching_record(&mut current, id, incarnation, custody) {
+        // The record changed under this deletion: it is not ours to drop.
+        return Err(LeaseError::UnknownAccounting);
+    }
+    write_ledger(pool, &current)?;
+    Ok(current)
+}
+
+/// Remove exactly one completed deletion's record from a freshly read ledger.
+/// The match is the recorded id, incarnation and custody nonce, so a
+/// concurrent replacement of the same slot or of any other record keeps its
+/// update. Returns whether the record was dropped.
+fn drop_matching_record(
+    ledger: &mut Ledger,
+    id: u64,
+    incarnation: u64,
+    custody: &DeletionCustody,
+) -> bool {
+    let before = ledger.slots.len();
+    ledger.slots.retain(|slot| {
+        !(slot.id == id
+            && slot.incarnation == incarnation
+            && slot.state == SlotPersistState::Evicting
+            && slot.custody.as_ref() == Some(custody))
+    });
+    before != ledger.slots.len()
+}
+
 fn write_ledger(pool: &Path, ledger: &Ledger) -> Result<(), LeaseError> {
     let bytes = serde_json::to_vec(ledger).map_err(|error| LeaseError::Io(error.to_string()))?;
     persist_private_file(&pool.join(LEDGER_NAME), &bytes)
@@ -4464,7 +4592,10 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         return Err(LeaseError::LedgerExhausted);
     }
     if ledger.slots.len() > LEGACY_MAX_SLOTS
-        && ledger.capacity_policy != Some(RAISED_CAPACITY_POLICY_VERSION)
+        && !matches!(
+            ledger.capacity_policy,
+            Some(RAISED_CAPACITY_POLICY_VERSION) | Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
+        )
     {
         return Err(LeaseError::UnknownAccounting);
     }
@@ -4484,6 +4615,7 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
                     | PREVIOUS_CAPACITY_POLICY_VERSION
                     | CAPACITY_POLICY_VERSION
                     | RAISED_CAPACITY_POLICY_VERSION
+                    | DELETION_CUSTODY_CAPACITY_POLICY_VERSION
             ) || next == 0
             {
                 return Err(LeaseError::UnknownAccounting);
@@ -4513,7 +4645,9 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
                 || (slot.state == SlotPersistState::Evicting
                     && !matches!(
                         ledger.capacity_policy,
-                        Some(CAPACITY_POLICY_VERSION) | Some(RAISED_CAPACITY_POLICY_VERSION)
+                        Some(CAPACITY_POLICY_VERSION)
+                            | Some(RAISED_CAPACITY_POLICY_VERSION)
+                            | Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
                     )))
         {
             return Err(LeaseError::UnknownAccounting);
@@ -4523,6 +4657,23 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         if slot.capture.is_some()
             && (slot.state != SlotPersistState::Evicting
                 || !slot.capture.as_ref().is_some_and(DeletionJournal::is_valid))
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        // A custody reference belongs to a recorded deletion, in the exact
+        // shape this writer publishes, and only under the policy-5 fence.
+        if slot.custody.is_some()
+            && (slot.state != SlotPersistState::Evicting
+                || slot.lease_id.is_some()
+                || ledger.capacity_policy != Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
+                || !slot.custody.as_ref().is_some_and(DeletionCustody::is_valid))
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        // A policy-5 ledger never carries an in-ledger journal: the journal of
+        // a recorded deletion lives in its custody directory.
+        if ledger.capacity_policy == Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION)
+            && slot.capture.is_some()
         {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -4773,6 +4924,7 @@ pub(super) fn add_idle_slot_for_test(
             at_ms: 1,
         }),
         capture: None,
+        custody: None,
     });
     pool.ledger.next_slot = id + 1;
     pool.ledger.next_rank = Some(rank + 1);
@@ -5549,6 +5701,7 @@ mod recorded_ledger_tests {
                 rank,
                 recorded: recorded.then(|| record("v1.a.1.1.1").expect("record")),
                 capture: None,
+                custody: None,
             }],
         }
     }
@@ -5613,7 +5766,7 @@ mod recorded_ledger_tests {
         .is_ok());
         // An unknown fence value refuses, and a legacy ledger holding a record
         // refuses too.
-        assert!(validate_ledger_read(&ledger(Some(5), 1, SlotPersistState::Idle, false)).is_err());
+        assert!(validate_ledger_read(&ledger(Some(6), 1, SlotPersistState::Idle, false)).is_err());
         assert!(validate_ledger_read(&ledger(None, 0, SlotPersistState::Idle, true)).is_err());
     }
 

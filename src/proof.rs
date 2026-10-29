@@ -28,3 +28,34 @@ pub fn evidence() -> Option<PathBuf> {
     }
     Some(evidence)
 }
+
+/// Debug-only deterministic pause for the deletion-custody protocol
+/// (oxide#181). With `OXIDE_TEST_DELETION_PAUSE=<point>:<gate>` a deletion at
+/// `point` publishes `<gate>.<point>-<pid>` and waits (at most 120 s) until
+/// `<gate>` exists. It arms only inside the shared supervisor's own layout
+/// ([`evidence`]), so an ordinary debug command never pauses, and it is absent
+/// from release builds.
+pub fn deletion_pause(point: &str) {
+    #[cfg(debug_assertions)]
+    {
+        if evidence().is_none() {
+            return;
+        }
+        let Some(gate) = std::env::var("OXIDE_TEST_DELETION_PAUSE")
+            .ok()
+            .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
+        else {
+            return;
+        };
+        let marker = format!("{gate}.{point}-{}", std::process::id());
+        let staged = format!("{gate}.staging-{point}-{}", std::process::id());
+        if std::fs::write(&staged, point.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&staged, &marker);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !std::path::Path::new(&gate).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let _ = point;
+}

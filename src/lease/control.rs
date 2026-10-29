@@ -25,6 +25,12 @@ pub const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 /// permanent version-2 fence is actually written.
 pub const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 
+/// Version 9 carries the deletion-custody fence (oxide#181): the library
+/// ledger's `capacity_policy: 5` and its per-deletion custody record are
+/// unreadable to an older binary, so this control fence must be durable
+/// **before** the first locked pool open, ledger write or recorded deletion
+/// can publish them. It is written by the admission gate on the first
+/// mutating command and by the library's own locked open, fence first.
 /// Version 8 carries the raised-ceiling fence (oxide#177): the library
 /// ledger's `capacity_policy: 4` refuses an older binary, so this control
 /// fence must be durable **before** the first locked pool open or ledger
@@ -45,11 +51,15 @@ pub const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Version 4 (the profile-member owned-outputs fence, oxide#133), version 3
 /// (the whole-target registry transaction, oxide#129) and version 2
 /// (oxide#128) remain readable until a forward fence upgrades them.
-pub const STATE_VERSION: u32 = 8;
+pub const STATE_VERSION: u32 = 9;
 /// Version 7 is the eviction-accounting fence (oxide#175).
 pub const EVICTION_ACCOUNTING_STATE_VERSION: u32 = 7;
-/// Version 8 is the raised-ceiling fence (oxide#177).
-pub const SLOT_CEILING_STATE_VERSION: u32 = super::CONTROL_FENCE_VERSION;
+/// Version 8 is the raised-ceiling fence (oxide#177). It is frozen at 8: a
+/// version-9 document also carries this fence, so the requirement is "at
+/// least version 8", not "exactly the current version".
+pub const SLOT_CEILING_STATE_VERSION: u32 = 8;
+/// Version 9 is the deletion-custody fence (oxide#181).
+pub const DELETION_CUSTODY_STATE_VERSION: u32 = super::CONTROL_FENCE_VERSION;
 /// Version 6 carries the one-use fence. A version-7 or version-8 document may
 /// also carry it, so presence requires at least this version and version 6
 /// requires the fence itself.
@@ -78,10 +88,15 @@ pub const ONE_USE_FENCE: &str = super::CONTROL_ONE_USE_FENCE;
 /// later, and a version-7 or version-8 document always carries it.
 pub const EVICTION_ACCOUNTING_FENCE: &str = super::CONTROL_EVICTION_ACCOUNTING_FENCE;
 /// The raised-ceiling fence value (oxide#177); see
-/// [`State::slot_ceiling`]. A document carrying it is always at version 8,
+/// [`State::slot_ceiling`]. A document carrying it is at version 8 or later,
 /// and a version-8 document always carries it. The library's fence writer and
 /// this store use one value.
 pub const SLOT_CEILING_FENCE: &str = super::CONTROL_SLOT_CEILING_FENCE;
+/// The deletion-custody fence value (oxide#181); see
+/// [`State::deletion_custody`]. A document carrying it is always at version
+/// 9, and a version-9 document always carries it. The library's fence writer
+/// and this store use one value.
+pub const DELETION_CUSTODY_FENCE: &str = super::CONTROL_DELETION_CUSTODY_FENCE;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
 pub const MAX_IDENTITY_BYTES: usize = 64;
@@ -385,6 +400,14 @@ pub struct State {
     /// refusing a pool this one just raised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_ceiling: Option<String>,
+    /// Forward-only deletion-custody fence (oxide#181), set durably before the
+    /// first locked pool open or ledger write that can publish a per-deletion
+    /// custody record and never cleared. The library ledger's
+    /// `capacity_policy: 5` and its `custody` record are unreadable to an
+    /// older binary, so an older binary hands off to a receipt-matching
+    /// successor instead of refusing a pool this one just fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_custody: Option<String>,
 }
 
 /// The durable initialization record shared by both pools of a pair.
@@ -429,6 +452,7 @@ impl Default for State {
             one_use_workspaces: None,
             eviction_accounting: None,
             slot_ceiling: None,
+            deletion_custody: None,
         }
     }
 }
@@ -555,6 +579,7 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
             | ONE_USE_STATE_VERSION
             | EVICTION_ACCOUNTING_STATE_VERSION
             | SLOT_CEILING_STATE_VERSION
+            | DELETION_CUSTODY_STATE_VERSION
     ) {
         return Err("Oxide state has an unsupported version".to_owned());
     }
@@ -628,6 +653,24 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
         }
         Some(fence) if fence == SLOT_CEILING_FENCE => {
             if state.version < SLOT_CEILING_STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
+        Some(_) => {
+            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
+        }
+    }
+    // The deletion-custody fence and version 9 are equivalent (oxide#181): a
+    // version-9 document always carries it and a smaller pool never does. An
+    // unknown fence value refuses rather than being guessed at.
+    match state.deletion_custody.as_deref() {
+        None => {
+            if state.version >= DELETION_CUSTODY_STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
+        Some(fence) if fence == DELETION_CUSTODY_FENCE => {
+            if state.version < DELETION_CUSTODY_STATE_VERSION {
                 return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
             }
         }
@@ -852,6 +895,8 @@ fn reject_non_string_fences(bytes: &[u8]) -> Result<(), String> {
         #[serde(default)]
         slot_ceiling: RawFence,
         #[serde(default)]
+        deletion_custody: RawFence,
+        #[serde(default)]
         owned_outputs: RawFence,
     }
     let Ok(document) = serde_json::from_slice::<RawDocument>(bytes) else {
@@ -862,6 +907,7 @@ fn reject_non_string_fences(bytes: &[u8]) -> Result<(), String> {
         ("one_use_workspaces", document.one_use_workspaces),
         ("eviction_accounting", document.eviction_accounting),
         ("slot_ceiling", document.slot_ceiling),
+        ("deletion_custody", document.deletion_custody),
         ("owned_outputs", document.owned_outputs),
     ] {
         if field.present && !field.string {
@@ -894,7 +940,8 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
         | RECORDED_ACCOUNTING_STATE_VERSION
         | ONE_USE_STATE_VERSION
         | EVICTION_ACCOUNTING_STATE_VERSION
-        | SLOT_CEILING_STATE_VERSION => false,
+        | SLOT_CEILING_STATE_VERSION
+        | DELETION_CUSTODY_STATE_VERSION => false,
         _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
     };
     if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
@@ -922,6 +969,9 @@ pub fn fenced_state(mut state: State) -> Result<State, String> {
     }
     if state.slot_ceiling.is_none() {
         state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+    }
+    if state.deletion_custody.is_none() {
+        state.deletion_custody = Some(DELETION_CUSTODY_FENCE.to_owned());
     }
     state.version = STATE_VERSION;
     validate_state(&state, false)?;

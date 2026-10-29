@@ -461,8 +461,13 @@ impl Rig {
         }
         if version == 6 {
             state["one_use_workspaces"] = serde_json::json!(super::super::CONTROL_ONE_USE_FENCE);
-        } else if version >= super::super::CONTROL_FENCE_VERSION {
+        }
+        if version >= 8 {
             state["slot_ceiling"] = serde_json::json!(super::super::CONTROL_SLOT_CEILING_FENCE);
+        }
+        if version >= super::super::control::DELETION_CUSTODY_STATE_VERSION {
+            state["deletion_custody"] =
+                serde_json::json!(super::super::CONTROL_DELETION_CUSTODY_FENCE);
         }
         let path = control.join("state.json");
         fs::write(&path, serde_json::to_vec(&state).expect("control json")).expect("control state");

@@ -1518,10 +1518,10 @@ necessary.
   parsed as a bounded `serde_json::Value`, and only a numeric `u32` `version`
   above this binary's `STATE_VERSION` or `REGISTRATION_VERSION` triggers,
   whatever other fields the document carries. (The admission gate writes
-  control version 8 with the raised-ceiling fence as every mutating command's
-  first durable effect, so an older binary hands off or refuses before it can
-  meet a `capacity_policy: 4` ledger; a pool this binary never mutates stays
-  at version 5.) A missing pool or file, an IO or
+  control version 9 with the deletion-custody fence as every mutating
+  command's first durable effect, so an older binary hands off or refuses
+  before it can meet a `capacity_policy: 5` ledger; a pool this binary never
+  mutates stays at version 5.) A missing pool or file, an IO or
   permission error, an oversized document, a non-object, and a missing, non-numeric,
   negative or wider-than-`u32` version are not proof of a newer format: those
   keep the existing errors and never execute anything. Plain passthrough
@@ -3887,13 +3887,15 @@ Rules:
   complete pool figure or a removable pool's bound-only unknown; and
   **recorded byte** pressure, when the attributable pool sum — never the
   shared volume's total — is at or above the budget. A ledger whose slot
-  table exceeds 128 carries the forward-only `capacity_policy: 4` fence; every
-  mutating command's admission gate makes the version-8 `oxide.slots/256`
-  control fence durable as its first write, before any locked pool open or
-  ledger write, and a locked `Pool::open` raises the same fence itself under
-  the pool lock before reconciliation, so pre-Store entries and direct library
-  opens cannot journal first. An older binary meets version 8 and hands off or
-  refuses before reading a policy-4 ledger or a multi-journal recovery ledger. It remeasures
+  table exceeds 128 carries the forward-only `capacity_policy: 4` fence, and
+  every revised write publishes the deletion-custody policy 5; every mutating
+  command's admission gate makes the version-9
+  `oxide.deletion-custody/1` control fence durable as its first write, before
+  any locked pool open or ledger write, and a locked `Pool::open` raises the
+  same fence itself under the pool lock before reconciliation, so pre-Store
+  entries and direct library opens cannot journal first. An older binary meets
+  version 9 and hands off or refuses before reading a policy-5 ledger or a
+  pending-custody record. It remeasures
   after each deletion and refuses `Full` when only held slots remain. A
   removable pool whose own size is unknown takes the reserve/floor route
   instead of a byte-cap comparison. Held, uncertain, foreign and unmeasurable
@@ -3917,10 +3919,11 @@ Rules:
   for unbudgeted commands. Reconciliation runs under the pool lock, so a very
   large eviction can delay another admission until the lock is released.
   Before writing this new ledger shape, the mutating front door publishes the
-  version-8 control fence (recorded accounting, eviction accounting and the
-  raised ceiling) as its first write; the library uses capacity-policy
-  version 3 or, above 128 slots, version 4, so older readers refuse or hand
-  off before interpreting an `Evicting` size or a raised slot table.
+  version-9 control fence (recorded accounting, eviction accounting, the
+  raised ceiling and deletion custody) as its first write; the library uses
+  capacity policy 5, never below the raised-ceiling policy 4, so older readers
+  refuse or hand off before interpreting an `Evicting` size, a custody record
+  or a raised slot table.
 - **Watchdog.** Only on a directory pool, only while Oxide supervises a
   leased Cargo group (build and `run` build, `test` execution, building
   passthrough). It samples `statfs` `f_bavail` of the payload directory
