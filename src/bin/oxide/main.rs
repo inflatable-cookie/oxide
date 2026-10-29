@@ -194,10 +194,16 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
     let class = cli::classify(command);
     // `oxide <cmd> --help` / `-h` is Cargo's help, before any budget, hand-off
     // check, pool open, adoption, workspace lookup or lease (oxide#182). It
-    // runs exactly `cargo <cmd> --help`; `clean` forwards too, so its own
-    // planning and workspace discovery never run for a help request. Help
-    // after `--` belongs to the program and keeps the owned path.
-    if matches!(class, Class::Modelled | Class::Building | Class::Clean) && cli::cargo_help(rest) {
+    // runs exactly `cargo <cmd> --help`. `clean`, `init` and `new` forward
+    // too, so neither clean's own planning and workspace discovery nor the
+    // hand-off check that reads pool control state can run for a help
+    // request. Help after `--` belongs to the program and keeps the owned
+    // path.
+    if matches!(
+        class,
+        Class::Modelled | Class::Building | Class::Clean | Class::Init | Class::New
+    ) && cli::cargo_help(rest)
+    {
         return Err(exec_cargo(&[first.clone(), OsString::from("--help")]));
     }
     // The budget prefix is Oxide's on leased commands only (oxide#140). Any

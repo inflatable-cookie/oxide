@@ -617,12 +617,13 @@ root. A new Cargo release needs this check before it joins the table.
 
 Help is Cargo's and needs no storage (oxide#182): `oxide <cmd> --help` or
 `-h` replaces Oxide with exactly `cargo <cmd> --help` for every leased
-command, the building built-ins and `clean` (so `clean` also runs no
-workspace discovery or planning for a help request), and `oxide help <cmd>`
-is the existing plain passthrough to `cargo help <cmd>`. Neither opens a
-pool, takes a lease, reserves a slot, waits for admission or runs the
-pre-effect hand-off check. Help after `--` belongs to the program
-(`oxide run -- --help`), not to Cargo.
+command, the building built-ins, `clean`, `init` and `new`, and `oxide help
+<cmd>` is the existing plain passthrough to `cargo help <cmd>`. None opens a
+pool, takes a lease, reserves a slot, waits for admission, runs the
+pre-effect hand-off check (which reads pool control state), clean's own
+workspace discovery and planning, or adoption's guidance/readiness work.
+Help after `--` belongs to the program (`oxide run -- --help`), not to
+Cargo.
 
 1. Resolve the workspace (`cargo locate-project --workspace`), identity,
    profile, strategy and toolchain.

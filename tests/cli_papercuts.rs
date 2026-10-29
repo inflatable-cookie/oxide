@@ -619,3 +619,77 @@ fn init_readiness_names_the_selected_pool() {
     );
     assert!(app.join("AGENTS.md").is_file(), "init wrote no guidance");
 }
+
+/// oxide#182, second review: `init` and `new` help must run before the
+/// pre-effect hand-off check, which reads pool control state. The pool's
+/// recorded state version is raised so that check would refuse; a non-help
+/// command (`status`) proves the planted state is live and refused, then both
+/// help requests forward exactly Cargo's help and change nothing.
+#[test]
+fn init_and_new_help_skip_the_handoff_check() {
+    let scratch = Scratch::new();
+    let app = scratch.path().join("app");
+    let manifest = app.join("Cargo.toml");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(app.join("src/lib.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    let (bin, log) = fake_cargo(scratch.path(), &manifest);
+    let pool = scratch.path().join("fixture-pool");
+    created_pool(&scratch, &bin, &manifest, &pool);
+
+    // Plant a newer control state. Any command past the early help branch
+    // reaches the hand-off check and refuses with its pinned line.
+    let state = pool.join("oxide-managed/state.json");
+    let mut document: Value = fs::read(&state)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    document["version"] = json!(99);
+    write_private(&state, serde_json::to_vec(&document).unwrap().as_slice());
+    let refused = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&app)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(75),
+        "the planted newer state did not reach the hand-off check: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("oxide was upgraded during this command; re-run."),
+        "the hand-off control printed another refusal"
+    );
+
+    let before = tree_snapshot(&pool);
+    for command in ["init", "new"] {
+        let _ = fs::remove_file(&log);
+        let output = private_env(scratch.path(), &bin, &pool)
+            .current_dir(&app)
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "oxide {command} --help ran the hand-off check: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            format!("{command} --help\n"),
+            "oxide {command} --help did not forward exactly Cargo's help"
+        );
+        assert_eq!(
+            tree_snapshot(&pool),
+            before,
+            "oxide {command} --help changed pool state"
+        );
+    }
+    assert!(!app.join("AGENTS.md").exists(), "help wrote guidance");
+}
