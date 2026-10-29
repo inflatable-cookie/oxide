@@ -2882,6 +2882,57 @@ fn an_unreadable_control_state_refuses_before_recovery() {
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 
+/// A control document at the fence version that carries a present-but-invalid
+/// fence value is corrupt, not an older document to upgrade. The fence writer
+/// refuses and repairs nothing, so no recovery journal starts (oxide#177,
+/// Supervisor ruling 4c9984a1).
+#[test]
+fn an_invalid_control_fence_value_refuses_before_recovery() {
+    let fixture = Fixture::new("invalid-control-fence");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "invalid-control-fence");
+    // The slot is `Evicting` with its root ready: a reconciling open rewrites
+    // the ledger, so byte identity proves no reconciliation ran.
+    super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    let control = pool.join(MANAGED_NAME);
+    fs::create_dir_all(&control).expect("control dir");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("control mode");
+    let state = control.join("state.json");
+    fs::write(
+        &state,
+        br#"{"version":8,"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":42,"records":[],"cleans":[]}"#,
+    )
+    .expect("control state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).expect("state mode");
+    let state_before = fs::read(&state).expect("state");
+    let ledger_path = pool.join("ledger.json");
+    let ledger_before = fs::read(&ledger_path).expect("ledger");
+
+    let result = lease_injected(request(
+        &pool,
+        &fixture.dir("other-project"),
+        &fixture.dir("other-workspace"),
+        "other",
+    ));
+    assert!(result.is_err(), "an invalid control fence admitted a lease");
+    assert_eq!(
+        fs::read(&state).expect("state"),
+        state_before,
+        "the fence writer repaired a corrupt control state"
+    );
+    assert_eq!(
+        fs::read(&ledger_path).expect("ledger"),
+        ledger_before,
+        "recovery ran under an invalid control fence"
+    );
+    let ledger: serde_json::Value = serde_json::from_slice(&ledger_before).expect("ledger json");
+    assert_eq!(ledger["slots"][0]["state"], "evicting");
+    assert!(
+        ledger["slots"][0].get("capture").is_none(),
+        "a recovery journal was started"
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
 /// A journaled deletion that cannot be classified keeps the pool blocked:
 /// every new lease is refused with `unknown_accounting`, so no second eviction
 /// (and no second journal) can be started while one is outstanding. This is the

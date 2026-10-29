@@ -868,10 +868,14 @@ pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
 /// document stays within it.
 const CONTROL_STATE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-const CONTROL_FENCES: [(&str, &str); 3] = [
-    ("recorded_accounting", CONTROL_RECORDED_ACCOUNTING_FENCE),
-    ("eviction_accounting", CONTROL_EVICTION_ACCOUNTING_FENCE),
-    ("slot_ceiling", CONTROL_SLOT_CEILING_FENCE),
+/// Each fence field, its value and the lowest control version that must
+/// carry it. A field absent below that version is a genuine older document
+/// to upgrade; a field present below it, or absent at or above it, is a
+/// combination no front door writer produces.
+const CONTROL_FENCES: [(&str, &str, u64); 3] = [
+    ("recorded_accounting", CONTROL_RECORDED_ACCOUNTING_FENCE, 5),
+    ("eviction_accounting", CONTROL_EVICTION_ACCOUNTING_FENCE, 7),
+    ("slot_ceiling", CONTROL_SLOT_CEILING_FENCE, 8),
 ];
 
 /// Raise a front-door control state to the current fence version before a
@@ -881,8 +885,11 @@ const CONTROL_FENCES: [(&str, &str); 3] = [
 /// pool has never been used by the front door (`oxide-managed/state.json` is
 /// its document), so a library fixture has nothing to fence. A state already
 /// at the fence version with every fence is not rewritten. A newer version, an
-/// unknown fence value or a non-numeric version refuses: this binary never
-/// downgrades a document a successor wrote. The admission lock is taken
+/// unknown fence value, a present non-string fence, a version/fence
+/// combination no writer produces or a non-numeric version refuses: this
+/// binary never downgrades or silently repairs a document a successor wrote.
+/// Only a field genuinely absent from an older document is inserted. The
+/// admission lock is taken
 /// non-blocking because the front door's order is admission then pool; if
 /// another writer holds it, the open refuses instead of reconciling under an
 /// unfenced control. Passive snapshots never call this.
@@ -921,21 +928,14 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
     }
     let mut value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
-    let version = value
-        .get("version")
-        .and_then(|value| value.as_u64())
-        .ok_or(LeaseError::UnknownAccounting)?;
-    if version > u64::from(CONTROL_FENCE_VERSION) {
-        return Err(LeaseError::UnknownAccounting);
-    }
+    // `control_state_is_fenced` just returned `Ok(false)`: every present
+    // fence is canonical and every absent one belongs to an older version, so
+    // inserting only the absent fields and advancing the version produces the
+    // document the front door writes. A malformed document already refused.
     let object = value.as_object_mut().ok_or(LeaseError::UnknownAccounting)?;
-    for (name, fence) in CONTROL_FENCES {
-        match object.get(name).and_then(|value| value.as_str()) {
-            Some(existing) if existing == fence => {}
-            Some(_) => return Err(LeaseError::UnknownAccounting),
-            None => {
-                object.insert(name.to_owned(), serde_json::Value::String(fence.to_owned()));
-            }
+    for (name, fence, _) in CONTROL_FENCES {
+        if object.get(name).is_none() {
+            object.insert(name.to_owned(), serde_json::Value::String(fence.to_owned()));
         }
     }
     object.insert(
@@ -954,17 +954,39 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
 fn control_state_is_fenced(bytes: &[u8]) -> Result<bool, LeaseError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| LeaseError::UnknownAccounting)?;
-    let version = value
+    control_fence_state(&value)
+}
+
+/// Classify one control document for the fence. `Ok(true)` is a document at
+/// the fence version with every fence; `Ok(false)` is a legitimate older
+/// document whose forward fields are only ever genuinely absent; anything else
+/// refuses. A present non-string or non-matching fence is corrupt, not an
+/// older document, so it is never repaired.
+fn control_fence_state(value: &serde_json::Value) -> Result<bool, LeaseError> {
+    let object = value.as_object().ok_or(LeaseError::UnknownAccounting)?;
+    let version = object
         .get("version")
         .and_then(|value| value.as_u64())
         .ok_or(LeaseError::UnknownAccounting)?;
     if version > u64::from(CONTROL_FENCE_VERSION) {
         return Err(LeaseError::UnknownAccounting);
     }
-    Ok(version == u64::from(CONTROL_FENCE_VERSION)
-        && CONTROL_FENCES
-            .iter()
-            .all(|(name, fence)| value.get(*name).and_then(|value| value.as_str()) == Some(*fence)))
+    for (name, fence, minimum) in CONTROL_FENCES {
+        match object.get(name) {
+            Some(serde_json::Value::String(existing)) if existing == fence => {
+                if version < minimum {
+                    return Err(LeaseError::UnknownAccounting);
+                }
+            }
+            Some(_) => return Err(LeaseError::UnknownAccounting),
+            None => {
+                if version >= minimum {
+                    return Err(LeaseError::UnknownAccounting);
+                }
+            }
+        }
+    }
+    Ok(version == u64::from(CONTROL_FENCE_VERSION))
 }
 
 fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
