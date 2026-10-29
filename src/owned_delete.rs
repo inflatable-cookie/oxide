@@ -474,6 +474,24 @@ impl RootCapturePlan {
     }
 }
 
+/// The longest full path a journaled name field may carry (`PATH_MAX`).
+const MAX_JOURNAL_PATH_BYTES: usize = 1024;
+/// The longest single name component a journaled name field may carry
+/// (`NAME_MAX`).
+const MAX_JOURNAL_NAME_BYTES: usize = 255;
+/// Whether a journaled name is within the enforced path and name bounds: at
+/// most `PATH_MAX` bytes in total and at most `NAME_MAX` bytes in every
+/// `/`-separated component. The writer refuses a record that fails this, and a
+/// reader refuses a ledger that carries one, so the ledger's journal bound
+/// stays finite (oxide#177).
+fn bounded_journal_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_JOURNAL_PATH_BYTES
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part.len() <= MAX_JOURNAL_NAME_BYTES)
+}
+
 /// One outstanding capture below the root: a verified object moved to a private
 /// name inside the tree, recorded durably before it is removed so a replay can
 /// find it again (oxide#155).
@@ -514,10 +532,11 @@ impl CaptureRecord {
             && private[CAPTURE_PREFIX.len()..]
                 .iter()
                 .all(u8::is_ascii_hexdigit)
-            && !self.original.is_empty()
+            && bounded_journal_name(&self.original)
             && self.path.len() <= MAX_CAPTURE_DEPTH
             && self.path.iter().all(|name| {
                 name.len() > CAPTURE_PREFIX.len()
+                    && name.len() <= CAPTURE_PREFIX.len() + 2 * CAPTURE_TAG_BYTES
                     && name.starts_with(CAPTURE_PREFIX)
                     && name[CAPTURE_PREFIX.len()..]
                         .bytes()
@@ -555,13 +574,22 @@ impl ForeignCapture {
     pub fn is_valid(&self) -> bool {
         let private = self.private.as_bytes();
         private.len() > CAPTURE_PREFIX.len()
+            && private.len() <= CAPTURE_PREFIX.len() + 2 * CAPTURE_TAG_BYTES
             && private.starts_with(CAPTURE_PREFIX.as_bytes())
             && private[CAPTURE_PREFIX.len()..]
                 .iter()
                 .all(u8::is_ascii_hexdigit)
-            && !self.original.is_empty()
-            && !self.found.is_empty()
+            && bounded_journal_name(&self.original)
+            && bounded_journal_name(&self.found)
             && self.path.len() <= MAX_CAPTURE_DEPTH
+            && self.path.iter().all(|name| {
+                name.len() > CAPTURE_PREFIX.len()
+                    && name.len() <= CAPTURE_PREFIX.len() + 2 * CAPTURE_TAG_BYTES
+                    && name.starts_with(CAPTURE_PREFIX)
+                    && name[CAPTURE_PREFIX.len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            })
     }
 }
 
@@ -1328,6 +1356,17 @@ fn drain_finder_metadata(
                 found,
                 restored: false,
             };
+            if !foreign.is_valid() {
+                // An over-bound name is refused per object and nothing is
+                // deleted: the capture is put back and the deletion stays
+                // pending (oxide#177).
+                let restored = put_back(dir, &capture).is_ok();
+                return Err(Rmdir::Unproven {
+                    reason: format!(
+                        "a mismatched capture is outside the journal's bounded names; put back: {restored}"
+                    ),
+                });
+            }
             if let Err(reason) = context.record_foreign(&foreign) {
                 // Without the record the put-back is still the conservative
                 // action; the caller stops pending either way.
@@ -1378,6 +1417,14 @@ fn drain_finder_metadata(
             inode: entry.inode,
             mode: u32::from(libc::S_IFREG),
         };
+        if !record.is_valid() {
+            // Refuse per object before recording or deleting anything: the
+            // capture goes back and the deletion stays pending (oxide#177).
+            let _ = put_back(dir, &capture);
+            return Err(Rmdir::Unproven {
+                reason: "the captured entry is outside the journal's bounded names".to_owned(),
+            });
+        }
         if let Err(reason) = context.record_captured(&record) {
             let _ = put_back(dir, &capture);
             return Err(Rmdir::Unproven {

@@ -57,23 +57,21 @@ pub const LEGACY_MAX_SLOTS: usize = 128;
 /// Finite ledger file size including the atomic temp. The worst valid ledger
 /// is the raised-ceiling representation at `MAX_SLOTS` with every bounded
 /// field at its ceiling and every numeric field at its full 20-digit width,
-/// plus the deletion journals an `Evicting` record can durably hold. One
+/// plus the one deletion journal an `Evicting` record can durably hold. A
 /// maximal journal is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture
 /// records and `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a
-/// chain of at most `MAX_CAPTURE_DEPTH` (64) capture names of at most
-/// `CAPTURE_PREFIX + 2*CAPTURE_TAG_BYTES` (47) bytes and an observed original
-/// name of at most `NAME_MAX` (255) bytes, escaped sixfold by compact JSON.
-/// At most two journals can be reachable: an eviction is one
-/// `retire_idle_slot` inside one admission and a failed deletion aborts that
-/// admission's eviction loop, every open reconciles all `Evicting` records
-/// before admitting anything (a journal that cannot finish sets
-/// `reconciliation_blocked` and every lease is refused until it does, and one
-/// that can finish is removed), and a removable pool's single lost-slot
-/// eviction before its loop aborts can add at most one more. The 8 MiB cap is
-/// derived from the measured two-journal worst valid ledger (the unit proof
-/// reports both exact figures) and still covers six maximal journals, so even
-/// an unexpected co-occurrence is representable; a hand-crafted ledger beyond
-/// the cap refuses rather than truncating.
+/// chain of at most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the
+/// enforced journal-name bounds: a name field of at most `PATH_MAX` (1024)
+/// bytes in `NAME_MAX` (255)-byte components, escaped sixfold by compact JSON.
+/// The writer refuses such an over-bound object per object without deleting it,
+/// and the reader refuses a ledger that carries one. At most one journal is
+/// reachable: `retire_idle_slot` is the only path that starts a deletion and it
+/// refuses while reconciliation is blocked or any journal is outstanding, and
+/// every open reconciles all `Evicting` records before admitting anything. The
+/// 8 MiB cap is derived from the measured one-journal worst valid ledger (the
+/// unit proof reports both exact figures) and still covers several maximal
+/// journals, so an unexpected co-occurrence is representable; a hand-crafted
+/// ledger beyond the cap refuses rather than truncating.
 pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 /// Permanent capacity-policy fence in the library ledger (oxide#118). Its
 /// presence tells an older binary that this ledger uses ranked idle

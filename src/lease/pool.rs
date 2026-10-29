@@ -5234,6 +5234,96 @@ mod recorded_ledger_tests {
         assert!(validate_ledger_read(&at_ceiling).is_ok());
     }
 
+    /// Journal name fields are bounded for the reader as well as the writer
+    /// (oxide#177): a name over `PATH_MAX`, a component over `NAME_MAX`, a
+    /// capture private name longer than its writer form and an over-long
+    /// mismatched-capture description all refuse, and the writer refuses such
+    /// an object per object without deleting it.
+    #[test]
+    fn journaled_names_are_bounded_on_read() {
+        use crate::owned_delete::{
+            CaptureRecord, ForeignCapture, RootCapturePhase, RootCapturePlan,
+        };
+
+        let private = format!("{}{}", crate::owned_delete::CAPTURE_PREFIX, "a".repeat(32));
+        let root = RootCapturePlan {
+            private: private.clone(),
+            phase: RootCapturePhase::Captured,
+            device: 1,
+            inode: 2,
+            parent_device: 1,
+            parent_inode: 3,
+            mode: 0o040777,
+        };
+        assert!(root.is_valid());
+        let capture = |original: String| CaptureRecord {
+            path: vec![private.clone()],
+            private: private.clone(),
+            original,
+            device: 1,
+            inode: 2,
+            mode: 0o100777,
+        };
+        let foreign = |original: String, found: String| ForeignCapture {
+            path: vec![private.clone()],
+            private: private.clone(),
+            original,
+            expected_device: 1,
+            expected_inode: 2,
+            expected_mode: 0o100777,
+            found,
+            restored: false,
+        };
+        let journal = |captures, foreign| super::DeletionJournal {
+            root: root.clone(),
+            captures,
+            foreign,
+        };
+        let mut accepted = ledger(None, 0, SlotPersistState::Evicting, false);
+        accepted.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+        accepted.next_rank = Some(1);
+        accepted.slots[0].capture = Some(journal(
+            vec![capture("observed name".to_owned())],
+            vec![foreign(
+                "observed name".to_owned(),
+                "regular file".to_owned(),
+            )],
+        ));
+        assert!(validate_ledger_read(&accepted).is_ok());
+
+        // PATH_MAX bytes with one component over NAME_MAX; more than PATH_MAX
+        // in NAME_MAX components; a component one byte over NAME_MAX.
+        let over_name = "x".repeat(1024);
+        let over_path = vec!["a".repeat(255); 5].join("/");
+        let over_component = format!("{}/{}", "a".repeat(256), "b");
+        assert!(over_path.len() > 1024 && over_component.len() <= 1024);
+        for original in [over_name.clone(), over_path.clone(), over_component.clone()] {
+            assert!(!capture(original).is_valid());
+        }
+        for bad in [
+            foreign(over_name.clone(), "regular file".to_owned()),
+            foreign("observed name".to_owned(), over_name.clone()),
+            foreign("observed name".to_owned(), over_path.clone()),
+        ] {
+            assert!(!bad.is_valid());
+        }
+        let mut long_private = capture("observed name".to_owned());
+        long_private.private = format!("{}{}", crate::owned_delete::CAPTURE_PREFIX, "a".repeat(48));
+        assert!(!long_private.is_valid());
+        let mut long_foreign_private =
+            foreign("observed name".to_owned(), "regular file".to_owned());
+        long_foreign_private.private =
+            format!("{}{}", crate::owned_delete::CAPTURE_PREFIX, "a".repeat(48));
+        assert!(!long_foreign_private.is_valid());
+
+        // The whole journal refuses on read with any over-bound member.
+        let mut refused = ledger(None, 0, SlotPersistState::Evicting, false);
+        refused.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+        refused.next_rank = Some(1);
+        refused.slots[0].capture = Some(journal(vec![capture(over_name)], Vec::new()));
+        assert!(validate_ledger_read(&refused).is_err());
+    }
+
     /// A root-capture record belongs to a recorded deletion and nowhere else,
     /// and only in the shape the seam writes: a ledger holding any other
     /// placement or a near-miss name is a state no writer produces and refuses

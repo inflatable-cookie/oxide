@@ -3916,8 +3916,11 @@ Rules:
   both. The reserve and
   margin have no override.
 - **Slot headroom proof (oxide#118, oxide#177).** `effigy rust:slot-headroom`
-  under the qualified shared proof supervisor stages `oxide` offline with
-  1.97.1 and proves the permanent ledger/control fences, a legacy read
+  under the qualified shared proof supervisor (with `--root-parent /private/tmp`,
+  the owner-accepted internal-placement exception bd357a4c, because its
+  fixtures create a genuine internal directory-budget pool that the product
+  correctly refuses on an external volume) stages `oxide` offline with 1.97.1
+  and proves the permanent ledger/control fences, a legacy read
   without migration, rank exhaustion before any transition, a 256-slot pool
   whose 257th and 258th admissions replace the rank-LRU idle whole slot
   without churn, the twelve-slot project cap with a specific held-slot wait

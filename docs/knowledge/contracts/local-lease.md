@@ -564,20 +564,23 @@ cap: paths 1024 bytes, holder 128, lease ID 160, slot directory component 80.
 A compact JSON ledger with every field at its ceiling, escaped sixfold and with
 20-digit integers, is proven by unit tests to fit the cap and round-trip. The
 all-idle worst-valid 256-slot ledger (every numeric field at its full 20-digit
-width and every string at its cap) measures 3,968,466 bytes. The bound also
-covers the deletion journal (oxide#155), which is the other durable state a
-slot record can hold: an `Evicting` slot may carry a `DeletionJournal` with up
-to 96 outstanding capture records and 32 mismatched captures, each with a chain
-of up to 64 capture names (47 bytes each) and an observed original name of up
-to `NAME_MAX` 255 bytes, escaped sixfold. At most **one** such journal is
-reachable: `retire_idle_slot` is the only path that starts a deletion, and it
-refuses while reconciliation is blocked or any journal is outstanding, so that
-guard covers every entry point including the explicit `evict_idle_slot` that
-does not pass through `lease()`; every open reconciles all `Evicting` records
-before admitting anything, and a journal that cannot finish keeps the pool
-blocked until it does (one that can finish is removed). The measured
-one-journal worst-valid ledger is 4,597,762 bytes, and the 8 MiB cap still
-covers six maximal journals, so even an unexpected co-occurrence is
+width, including `cap_bytes`, and every string at its cap) measures 3,968,478
+bytes. The bound also covers the deletion journal (oxide#155), which is the
+other durable state a slot record can hold: an `Evicting` slot may carry a
+`DeletionJournal` with up to 96 outstanding capture records and 32 mismatched
+captures, each with a chain of up to 64 capture private names, and every
+journal name field is bounded: at most `PATH_MAX` 1024 bytes in total and at
+most `NAME_MAX` 255 bytes per `/`-separated component, escaped sixfold. The
+writer refuses an over-bound object per object and puts it back without
+deleting it; the reader refuses a ledger that carries one. At most **one**
+such journal is reachable: `retire_idle_slot` is the only path that starts a
+deletion, and it refuses while reconciliation is blocked or any journal is
+outstanding, so that guard covers every entry point including the explicit
+`evict_idle_slot` that does not pass through `lease()`; every open reconciles
+all `Evicting` records before admitting anything, and a journal that cannot
+finish keeps the pool blocked until it does (one that can finish is removed).
+The measured one-journal worst-valid ledger is 5,378,767 bytes, and the 8 MiB
+cap still covers two more maximal journals, so an unexpected co-occurrence is
 representable; a hand-crafted ledger beyond the cap refuses rather than
 truncating. Control state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
@@ -679,7 +682,10 @@ one cold fallback, with sharing off after the first refusal and the existing
 discard/unshare before reacquisition.
 
 **Proof and evidence.** `effigy rust:slot-headroom` under the qualified shared
-supervisor covers the fences, no-migration reads, rank exhaustion, a 256-slot
+supervisor (with `--root-parent /private/tmp`, the owner-accepted
+internal-placement exception bd357a4c, because its fixtures create a genuine
+internal directory-budget pool that the product correctly refuses on an
+external volume) covers the fences, no-migration reads, rank exhaustion, a 256-slot
 pool's 257th and 258th replacements, the twelve-slot project cap with a specific
 held-slot wait and one LRU idle replacement, compatible reuse, no eviction
 below both ceilings, byte-pressure LRU with a held slot excluded, and a
@@ -692,7 +698,7 @@ current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The worst-valid
 ledger/control serialization — including the reachable one-journal
-`Evicting` state, 4,597,762 bytes against the 8 MiB cap — escaped round-trip
+`Evicting` state, 5,378,767 bytes against the 8 MiB cap — escaped round-trip
 and oversized-field refusals are unit tests in `effigy test rust`, as is a
 fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
 trip with a journal (bounded read via the passive snapshot, ranked ordering,

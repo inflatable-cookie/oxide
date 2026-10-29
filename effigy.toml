@@ -952,11 +952,14 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # oxide#177's accounting-cost gate: no inventory walk at admission, no
 # whole-payload walk on release or default status at 256. Tiny owned fixtures
 # only: no live pool, real drive or large inventory; representation worst cases
-# and the 128- vs 256-slot ledger cost ceiling are unit tests. 300 s and
+# and the 128- vs 256-slot ledger cost ceiling are unit tests. The fixtures
+# create a genuine internal directory-budget pool, which the product correctly
+# refuses on an external volume, so the recipe declares the owner-accepted
+# internal root (decision bd357a4c) inside one monitored owned root. 300 s and
 # 512 MiB monitored scratch.
 [tasks."rust:slot-headroom"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
 
 # Opt-in uncounted collection for oxide#177: the same fixed script, guard and
 # limits with `--diagnostic`. It records reached/completed/failed/skipped
@@ -966,7 +969,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # proof child. It is never a counted native PASS, closure or activation.
 [tasks."rust:slot-headroom:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py --diagnostic"
 
 # Pure apparatus check of the diagnostic collection, through the script's
 # existing `--self-check` mode only: it stages nothing, starts no child,

@@ -2353,7 +2353,9 @@ fn labelled_slot_eviction_and_malformed_dir() {
 fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-ledger");
     let pool = fx.dir("pool");
-    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    // The supported budget is a u64, so its widest decimal form is 20 digits;
+    // the config records the same value so the pair still matches.
+    create_injected(&pool, u64::MAX).expect("init");
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(pool.join("config.json")).expect("config")).expect("json");
     let path = format!("/{}", "\u{1}".repeat(1023));
@@ -2396,7 +2398,7 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
     let ledger = serde_json::json!({
         "version": 1,
         "store_id": config["store_id"],
-        "cap_bytes": 64 * 1024 * 1024,
+        "cap_bytes": u64::MAX,
         "next_slot": u64::MAX,
         "next_lease": u64::MAX,
         "capacity_policy": RAISED_CAPACITY_POLICY_VERSION,
@@ -2440,7 +2442,7 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         serde_json::json!({
             "version": 1,
             "store_id": config["store_id"],
-            "cap_bytes": 64 * 1024 * 1024,
+            "cap_bytes": config["cap_bytes"],
             "next_slot": 2,
             "next_lease": 1_000_000,
             "capacity_policy": super::CAPACITY_POLICY_VERSION,
@@ -2512,9 +2514,12 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
     };
     let chain: Vec<String> = (0..64).map(&name).collect();
     assert!(chain.iter().all(|item| item.len() <= 47));
-    // A 255-byte name is the filesystem's NAME_MAX; control bytes are valid
-    // UTF-8 and compact JSON escapes each as six characters.
-    let original = "\u{1}".repeat(255);
+    // The longest bounded journal name: PATH_MAX bytes as NAME_MAX components,
+    // all control bytes so compact JSON's sixfold escape is maximal.
+    let component = "\u{1}".repeat(255);
+    let original = format!("{component}/{component}/{component}/{component}");
+    assert_eq!(original.len(), 1023);
+    let found = original.clone();
     let captures: Vec<serde_json::Value> = (0..96)
         .map(|index| {
             serde_json::json!({
@@ -2523,7 +2528,9 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
                 "original": original,
                 "device": u64::MAX,
                 "inode": u64::MAX,
-                "mode": 0o100644,
+                // The largest valid capture mode: symbolic link bits plus every
+                // permission bit.
+                "mode": 0o120777,
             })
         })
         .collect();
@@ -2535,9 +2542,8 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
                 "original": original,
                 "expected_device": u64::MAX,
                 "expected_inode": u64::MAX,
-                "expected_mode": 0o100644,
-                // `describe_entry`'s fixed form, the longest writer text here.
-                "found": "regular file device 18446744073709551615 inode 18446744073709551615 mode 100644 owner 501",
+                "expected_mode": 0o120777,
+                "found": found,
                 "restored": false,
             })
         })
@@ -2545,12 +2551,15 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
     serde_json::json!({
         "root": {
             "private": name(0),
-            "phase": "planned",
+            // The longest phase name the enum can carry.
+            "phase": "captured",
             "device": u64::MAX,
             "inode": u64::MAX,
             "parent_device": u64::MAX,
             "parent_inode": u64::MAX,
-            "mode": 0o040700,
+            // The largest valid directory mode (type bits plus every
+            // permission bit); JSON prints it in decimal.
+            "mode": 0o040777,
         },
         "captures": captures,
         "foreign": foreign,
@@ -2567,7 +2576,9 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
 fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-journal-ledger");
     let pool = fx.dir("pool");
-    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    // The supported budget is a u64, so its widest decimal form is 20 digits;
+    // the config records the same value so the pair still matches.
+    create_injected(&pool, u64::MAX).expect("init");
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(pool.join("config.json")).expect("config")).expect("json");
     let path = format!("/{}", "\u{1}".repeat(1023));
@@ -2611,7 +2622,7 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let ledger = serde_json::json!({
         "version": 1,
         "store_id": config["store_id"],
-        "cap_bytes": 64 * 1024 * 1024,
+        "cap_bytes": u64::MAX,
         "next_slot": u64::MAX,
         "next_lease": u64::MAX,
         "capacity_policy": RAISED_CAPACITY_POLICY_VERSION,
@@ -2637,7 +2648,8 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(journal.captures.len(), 96);
     assert_eq!(journal.foreign.len(), 32);
     assert_eq!(journal.captures[0].path.len(), 64);
-    assert_eq!(journal.captures[0].original.chars().count(), 255);
+    assert_eq!(journal.captures[0].original.len(), 1023);
+    assert_eq!(journal.foreign[0].found.len(), 1023);
     println!(
         "worst valid 256-slot journaled ledger: {} bytes of the {MAX_LEDGER_BYTES}-byte cap",
         stored.len()

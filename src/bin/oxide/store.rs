@@ -117,10 +117,12 @@ pub(crate) const SLOT_CEILING_FENCE: &str = "oxide.slots/256";
 /// `MAX_LEDGER_BYTES` at the legacy 2 MiB ceiling (oxide#177).
 const PREDECESSOR_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
 /// The largest amount one mutating command can add to the ledger before the
-/// next admission gate: one maximal deletion journal (about 640 KB by the
-/// library's capture bounds), a full refresh of up to 256 closed size records
-/// (about 256 KB) and one slot row (about 16 KB). 1 MiB is a conservative
-/// ceiling for that sum, so a ledger at or above
+/// next admission gate: the maximal journal a *writer* can construct (about
+/// 640 KB — observed names are single `NAME_MAX` components and the description
+/// is the writer's fixed text, even though the reader also accepts the fuller
+/// `PATH_MAX` form the ledger cap covers), a full refresh of up to 256 closed
+/// size records (about 256 KB) and one slot row (about 16 KB). 1 MiB is a
+/// conservative ceiling for that sum, so a ledger at or above
 /// `PREDECESSOR_LEDGER_BYTES - MAX_LEDGER_GROWTH` (1 MiB) must make the
 /// version-7 control fence durable before its next write.
 const MAX_LEDGER_GROWTH: u64 = 1024 * 1024;
