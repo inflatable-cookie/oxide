@@ -1575,8 +1575,8 @@ or global Cargo configuration is involved.
   removes that pool and `status` lists it as `legacy pool`. Its ordinary
   detach and deletion are a separate Tom-approved planner step after fresh
   positive idleness.
-- **Selectors.** `rust:compile`, `rust:compile-linux`, `rust:format` and
-  `test rust` call `oxide`. With the default `quick` profile, check and test
+- **Selectors.** `rust:compile`, `rust:compile-release` (oxide#187),
+  `rust:compile-linux`, `rust:format` and `test rust` call `oxide`. With the default `quick` profile, check and test
   use line tables rather than `dev`'s full debug info. Focused proof, profile
   and install selectors call Cargo, because they test or build Oxide itself.
 - **Escapes.** There are no `:cargo` sibling selectors (removed oxide#153

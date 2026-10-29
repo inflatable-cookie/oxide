@@ -46,11 +46,17 @@ fn same_context(a: &SeedProducer, b: &SeedProducer) -> bool {
 /// the shared proof supervisor's own layout): `OXIDE_TEST_SEED_LIMIT` forces
 /// one declared plan bound so the native proof can show each cap skips without
 /// donor mutation.
+#[cfg(debug_assertions)]
 fn proof_limit() -> Option<String> {
     if oxide_storage::proof::evidence().is_none() {
         return None;
     }
     std::env::var("OXIDE_TEST_SEED_LIMIT").ok()
+}
+
+#[cfg(not(debug_assertions))]
+fn proof_limit() -> Option<String> {
+    None
 }
 
 pub(crate) fn select(
