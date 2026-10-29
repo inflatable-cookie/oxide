@@ -92,9 +92,13 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --
 # use, origin), so the resume oracle requires the version-9 fences to be
 # retained, the recorded slot identity tuples (id, incarnation and recorded
 # directory) and every slot root to be unchanged (never byte identity, and a
-# same-count substituted record fails), and the ledger to publish policy 5 —
-# pure counterfactuals fail on a fence rollback, a substitution or a deletion.
-# A real byte-pressure eviction publishes its private custody
+# same-count substituted record fails), and the ledger to publish policy 5. A
+# second untouched fixture slot holds a bounded planted payload whose recursive
+# snapshot (nested files and directories with kind, mode, inode and content
+# digest) must be exactly unchanged; pure counterfactuals fail on a fence
+# rollback, a record substitution, a changed sentinel snapshot or an unlinked
+# nested file or directory. A real byte-pressure eviction publishes its private
+# custody
 # directory, 0600 lock and per-deletion journal before the payload effect
 # (debug-only pause); a killed fixture process leaves the pending record,
 # custody and payload for exclusive replay by the next command; and a busy

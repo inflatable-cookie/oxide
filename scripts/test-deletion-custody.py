@@ -32,8 +32,11 @@ move deletion out of the lock:
   oracle requires the version-9 fences to be retained, the recorded slot
   identity tuples (id, incarnation and recorded directory) and every slot root
   to be unchanged (never byte identity, and a same-count substituted record
-  fails), and the ledger to publish policy 5. The exported base tree is asserted
-  not to carry either fence.
+  fails), and the ledger to publish policy 5. A second, untouched fixture slot
+  holds a bounded planted payload; its recursive snapshot — every nested file
+  and directory with kind, mode, inode and file content digest — must be exactly
+  unchanged, and a pure counterfactual fails on an unlinked nested file or
+  directory. The exported base tree is asserted not to carry either fence.
 - `custody-and-journal-at-pause`: a real byte-pressure eviction pauses at the
   durable root plan (debug-only seam inside the supervisor layout) and the
   proof reads the private custody directory, its `0600` lock and journal, the
@@ -282,8 +285,8 @@ def plan_document() -> dict:
                 "bytes, custody bytes and slot roots unchanged; this binary "
                 "resumes the intermediate state with the version-9 fences "
                 "retained, the recorded slot identity tuples and every slot "
-                "root unchanged, policy 5 published and no slot or payload "
-                "deleted",
+                "root unchanged, the untouched sentinel slot's bounded nested "
+                "payload snapshot exactly unchanged, and policy 5 published",
             },
             {
                 "name": "custody-and-journal-at-pause",
@@ -414,15 +417,16 @@ def resume_oracle(
     roots_before: list[tuple[int, int, bool]],
     roots_after: list[tuple[int, int, bool]],
 ) -> tuple[bool, str]:
-    """The fence-resume facts: no rollback, no substitution, no deletion.
+    """The fence-resume facts: no rollback, no substitution, no root change.
 
     A candidate leasing command legitimately rewrites its own record state
     (last use, next use, compile origin), so byte identity is not the oracle.
-    What must hold is that the control document keeps the version-9 fences, that
-    the recorded slot identity tuples — id, incarnation and recorded directory —
-    are unchanged (a same-count substituted record fails), and that every slot
-    root is still the same directory. Pure: compares the given bytes and
-    identities only.
+    What this oracle observes is exactly: the control document keeps the
+    version-9 fences, the recorded slot identity tuples — id, incarnation and
+    recorded directory — are unchanged (a same-count substituted record fails),
+    and every recorded slot root is still the same directory. Payload contents
+    are outside this oracle and are covered by payload_unchanged over an
+    untouched sentinel slot's bounded snapshot.
     """
     ok, reason = fence_state_verdict(state_payload)
     if not ok:
@@ -447,7 +451,7 @@ def resume_oracle(
             return (False, "the resume removed a slot root")
     return (
         True,
-        "no fence rollback, no slot identity substitution and no slot or payload deleted",
+        "no fence rollback, no slot identity substitution and no recorded slot root changed",
     )
 
 
@@ -597,6 +601,76 @@ def self_check() -> None:
     expect(
         not ledger_slot_identities({"slots": [{"id": 1, "incarnation": 2, "dir": 7}]})[0],
         "the ledger slot identity reader accepted a non-string directory",
+    )
+    # The sentinel payload oracle must fail on an unlinked nested file or
+    # directory, on changed content and on an unexpected addition. Pure: it
+    # compares in-memory snapshots and touches no fixture.
+    sentinel = [
+        {"path": ".", "kind": "dir", "mode": 0o700, "device": 1, "inode": 10},
+        {"path": "nested", "kind": "dir", "mode": 0o700, "device": 1, "inode": 11},
+        {"path": "nested/deeper", "kind": "dir", "mode": 0o700, "device": 1, "inode": 12},
+        {
+            "path": "nested/deeper/blob.bin",
+            "kind": "file",
+            "mode": 0o600,
+            "device": 1,
+            "inode": 13,
+            "size": 4,
+            "sha256": "a" * 64,
+        },
+        {
+            "path": "nested/inner.txt",
+            "kind": "file",
+            "mode": 0o600,
+            "device": 1,
+            "inode": 14,
+            "size": 4,
+            "sha256": "b" * 64,
+        },
+        {
+            "path": "top.txt",
+            "kind": "file",
+            "mode": 0o600,
+            "device": 1,
+            "inode": 15,
+            "size": 4,
+            "sha256": "c" * 64,
+        },
+    ]
+    expect(
+        payload_unchanged(sentinel, list(sentinel))[0],
+        "the payload oracle rejected an exactly unchanged snapshot",
+    )
+    without_nested_file = [entry for entry in sentinel if entry["path"] != "nested/inner.txt"]
+    expect(
+        not payload_unchanged(sentinel, without_nested_file)[0],
+        "the payload oracle accepted an unlinked nested file",
+    )
+    without_nested_directory = [
+        entry for entry in sentinel if not entry["path"].startswith("nested/deeper")
+    ]
+    expect(
+        not payload_unchanged(sentinel, without_nested_directory)[0],
+        "the payload oracle accepted an unlinked nested directory",
+    )
+    changed_content = [dict(entry) for entry in sentinel]
+    changed_content[3]["sha256"] = "d" * 64
+    expect(
+        not payload_unchanged(sentinel, changed_content)[0],
+        "the payload oracle accepted changed file content",
+    )
+    changed_root = [dict(entry) for entry in sentinel]
+    changed_root[0]["inode"] = 99
+    expect(
+        not payload_unchanged(sentinel, changed_root)[0],
+        "the payload oracle accepted a replaced sentinel root",
+    )
+    unexpected = sentinel + [
+        {"path": "extra", "kind": "file", "mode": 0o600, "device": 1, "inode": 16, "size": 1, "sha256": "e" * 64}
+    ]
+    expect(
+        not payload_unchanged(sentinel, unexpected)[0],
+        "the payload oracle accepted an unexpected added entry",
     )
     expect(FROZEN_RUSTFLAGS == "-C strip=symbols", "the frozen rustc flag changed")
     # Hostile-parent control: neither the staged build nor a fixture child may
@@ -939,6 +1013,103 @@ def ledger_slot_roots(
     return (True, "", [row[1] for row in rows])
 
 
+MAX_SENTINEL_ENTRIES = 64
+MAX_SENTINEL_DEPTH = 6
+
+
+def payload_snapshot(
+    root: str,
+    max_entries: int = MAX_SENTINEL_ENTRIES,
+    max_depth: int = MAX_SENTINEL_DEPTH,
+) -> tuple[bool, str, list[dict]]:
+    """Bounded recursive snapshot of one planted payload tree.
+
+    Every visited entry records its relative path, kind, mode, device, inode and
+    — for a regular file — its size and content digest. It never follows a
+    symlink and refuses an entry or depth bound instead of returning a partial
+    snapshot, so a caller can only claim what it actually observed.
+    """
+    entries: list[dict] = []
+    try:
+        metadata = os.lstat(root)
+        if not stat.S_ISDIR(metadata.st_mode):
+            return (False, "the planted payload root is not a directory", [])
+        entries.append(
+            {
+                "path": ".",
+                "kind": "dir",
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+            }
+        )
+
+        def walk(path: str, relative: str, depth: int) -> None:
+            if depth > max_depth:
+                raise ValueError("the payload snapshot exceeded its depth bound")
+            for name in sorted(os.listdir(path)):
+                if len(entries) >= max_entries:
+                    raise ValueError("the payload snapshot exceeded its entry bound")
+                child = os.path.join(path, name)
+                metadata = os.lstat(child)
+                child_relative = f"{relative}/{name}" if relative else name
+                if stat.S_ISDIR(metadata.st_mode):
+                    kind = "dir"
+                elif stat.S_ISREG(metadata.st_mode):
+                    kind = "file"
+                else:
+                    kind = "other"
+                record = {
+                    "path": child_relative,
+                    "kind": kind,
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                }
+                if kind == "file":
+                    record["size"] = metadata.st_size
+                    record["sha256"] = sha256_file(child)
+                entries.append(record)
+                if kind == "dir":
+                    walk(child, child_relative, depth + 1)
+
+        walk(root, "", 0)
+    except (OSError, ValueError) as error:
+        return (False, f"the payload snapshot failed ({error})", [])
+    return (True, "", entries)
+
+
+def payload_unchanged(
+    before: list[dict], after: list[dict]
+) -> tuple[bool, str]:
+    """Whether a bounded payload snapshot is exactly unchanged.
+
+    Pure: compares the snapshot structures only. It fails on any removed entry
+    (a nested file or a whole nested directory), any added entry, any changed
+    kind, mode or inode, and any changed file size or content digest.
+    """
+    if before == after:
+        return (True, "the planted payload snapshot is exactly unchanged")
+    before_paths = {entry["path"]: entry for entry in before}
+    after_paths = {entry["path"]: entry for entry in after}
+    removed = sorted(set(before_paths) - set(after_paths))
+    if removed:
+        return (
+            False,
+            f"the planted payload snapshot lost {len(removed)} entry/entries, first {removed[0]!r}",
+        )
+    added = sorted(set(after_paths) - set(before_paths))
+    if added:
+        return (
+            False,
+            f"the planted payload snapshot gained {len(added)} entry/entries, first {added[0]!r}",
+        )
+    for path in sorted(before_paths):
+        if before_paths[path] != after_paths[path]:
+            return (False, f"the planted payload snapshot changed entry {path!r}")
+    return (True, "the planted payload snapshot is exactly unchanged")
+
+
 def seed_two_measured_idle_slots(root: str, subject: str) -> tuple[str, dict, dict, dict]:
     """Two idle slots whose closed observations include a 5 MiB planted file.
 
@@ -1135,6 +1306,42 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
     def body() -> None:
         fence_root = private_dir(os.path.join(refusal_root, "fence"))
         pool, env, workspace = seed_one_idle_slot(fence_root, candidate)
+        seeded = {slot["id"] for slot in ledger(pool)["slots"]}
+        sentinel_workspace = create_project(fence_root, "b")
+        code, output = check(candidate, sentinel_workspace, env, "fence-seed-b")
+        expect(
+            code == 0,
+            f"seeding the sentinel slot exited {code}: {output[-3000:]}",
+        )
+        seeded_document = ledger(pool)
+        sentinel_slots = [
+            slot for slot in seeded_document["slots"] if slot["id"] not in seeded
+        ]
+        expect(
+            len(sentinel_slots) == 1,
+            f"expected one sentinel slot, found {sentinel_slots}",
+        )
+        sentinel_slot = sentinel_slots[0]
+        expect(
+            sentinel_slot["state"] == "idle",
+            "the sentinel slot is not idle",
+        )
+        sentinel_root = private_dir(
+            os.path.join(slot_directory(pool, sentinel_slot), "build", "sentinel")
+        )
+        write_private(os.path.join(sentinel_root, "top.txt"), "sentinel-top\n")
+        private_dir(os.path.join(sentinel_root, "nested"))
+        write_private(
+            os.path.join(sentinel_root, "nested", "inner.txt"), "sentinel-inner\n"
+        )
+        private_dir(os.path.join(sentinel_root, "nested", "deeper"))
+        write_bytes(os.path.join(sentinel_root, "nested", "deeper", "blob.bin"), 4096)
+        sentinel_ok, sentinel_reason, sentinel_before = payload_snapshot(sentinel_root)
+        expect(sentinel_ok, sentinel_reason)
+        expect(
+            len(sentinel_before) >= 6,
+            f"the sentinel snapshot is too small: {sentinel_before}",
+        )
         state_path = os.path.join(pool, "oxide-managed", "state.json")
         ledger_path = os.path.join(pool, "ledger.json")
         control = read_bytes(state_path)
@@ -1227,7 +1434,15 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
             resume_ok,
             f"the resumed fence state failed its oracle: {resume_reason}",
         )
+        payload_ok, payload_reason, sentinel_after = payload_snapshot(sentinel_root)
+        expect(payload_ok, payload_reason)
+        unchanged, payload_reason = payload_unchanged(sentinel_before, sentinel_after)
+        expect(
+            unchanged,
+            f"the resumed fence state changed the sentinel payload: {payload_reason}",
+        )
         say(f"resume oracle: {resume_reason}")
+        say(f"sentinel oracle: {payload_reason}")
 
         # Ledger-only probe: a real paused deletion, killed mid-deletion, so the
         # record, custody directory, journal and payload all exist. Its control
@@ -1286,9 +1501,11 @@ def prove_old_binary(refusal_root: str, candidate: str, base: str) -> None:
                 "resume_exit": resume_code,
                 "resume_fence_retained": True,
                 "resume_slot_identities_unchanged": True,
-                "resume_payload_unchanged": True,
-                "resume_no_deletion": True,
+                "resume_slot_roots_unchanged": True,
+                "resume_sentinel_snapshot_unchanged": True,
+                "resume_sentinel_entries": len(sentinel_before),
                 "resume_oracle": resume_reason,
+                "resume_payload_oracle": payload_reason,
                 "ledger_only_exit": code,
                 "intermediate_control_and_ledger_unchanged": True,
                 "final_control_and_ledger_unchanged": True,
