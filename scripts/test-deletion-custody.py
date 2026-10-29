@@ -812,7 +812,7 @@ def prove_pause(pause_root: str, candidate: str) -> None:
 
 def prove_kill_and_replay(kill_root: str, candidate: str) -> None:
     def body() -> None:
-        pool, env, _workspaces, oldest = seed_two_measured_idle_slots(kill_root, candidate)
+        pool, env, workspaces, oldest = seed_two_measured_idle_slots(kill_root, candidate)
         oldest_path = slot_directory(pool, oldest)
         gate = os.path.join(kill_root, "pause-gate")
         child = begin_paused_admission(candidate, kill_root, pool, env, gate)
@@ -827,20 +827,11 @@ def prove_kill_and_replay(kill_root: str, candidate: str) -> None:
         expect(os.path.isdir(oldest_path), "the killed deletion touched the payload")
         expect(os.path.isdir(directory), "the killed deletion removed its custody")
         expect(pending_slot(pool)["id"] == oldest["id"], "the pending record changed")
-        # The next command claims custody exclusively and replays.
-        status = subprocess.run(
-            [candidate, "status"],
-            cwd=os.path.join(kill_root, "projects", "a"),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=work_left(),
-        )
-        say(f"replay status: exit {status.returncode}")
-        expect(
-            status.returncode == 0,
-            f"the replay failed: {(status.stdout + status.stderr)[-3000:]}",
-        )
+        # The next leasing command claims custody exclusively and replays.
+        # (`status` is a passive observer: it reports the pending record and
+        # never reconciles or deletes.)
+        code, output = check(candidate, workspaces["a"], env, "replay")
+        expect(code == 0, f"the replay failed: {output[-3000:]}")
         expect(
             all(row["id"] != oldest["id"] for row in slots(pool)),
             "the replay did not drop the matching record",
@@ -851,7 +842,7 @@ def prove_kill_and_replay(kill_root: str, candidate: str) -> None:
             {
                 "case": "killed-mid-deletion-then-replay",
                 "killed_slot": oldest["id"],
-                "replay_exit": status.returncode,
+                "replay_exit": code,
                 "record_dropped": True,
                 "payload_deleted": True,
             }
@@ -910,26 +901,17 @@ def prove_busy_skip(busy_root: str, candidate: str) -> None:
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             os.close(lock)
-        # With the lock released, a later command finishes the deletion.
-        status = subprocess.run(
-            [candidate, "status"],
-            cwd=os.path.join(busy_root, "projects", "a"),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=work_left(),
-        )
-        expect(
-            status.returncode == 0,
-            f"the release replay failed: {(status.stdout + status.stderr)[-3000:]}",
-        )
+        # With the lock released, a later leasing command finishes the
+        # deletion. (`status` is a passive observer and never reconciles.)
+        code, output = check(candidate, workspaces["a"], env, "release-replay")
         rows = slots(pool)
         expect(
             all(row["id"] != oldest["id"] for row in rows),
             "the released custody was not replayed: "
-            f"status={(status.stdout + status.stderr)[-1500:]!r} "
+            f"check={(output[-1500:])!r} "
             f"slots={json.dumps(rows)[-2500:]} custody={custody_entries(pool)}",
         )
+        expect(code == 0, f"the release replay exited {code}: {output[-3000:]}")
         expect(not os.path.exists(oldest_path), "the released replay kept the payload")
         say("released custody replayed by a later command")
 
