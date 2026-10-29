@@ -200,6 +200,7 @@ import textwrap
 import time
 import types
 import urllib.parse
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location(
@@ -548,6 +549,20 @@ def ledger_bytes(pool: str) -> bytes:
 
 def control_bytes(pool: str) -> bytes:
     return read_bytes(os.path.join(pool, "oxide-managed", "state.json"))
+
+
+def donor_control_bytes(pool: str, slot: str) -> bytes:
+    """The full donor record and its raw origin, excluding recipient changes.
+
+    Canonicalize only the record's JSON framing: every donor field participates
+    in equality, including fields record_figure does not project.
+    """
+    record_id = read_json(catalog_path(pool, slot))["record_id"]
+    records = json.loads(control_bytes(pool))["records"]
+    donor = [record for record in records if record["id"] == record_id]
+    expect(len(donor) == 1, f"slot {slot} has no unique donor control record")
+    origin = read_bytes(os.path.join(pool, "oxide-managed", "origins", f"{record_id}.json"))
+    return json.dumps(donor[0], sort_keys=True, separators=(",", ":")).encode() + b"\n" + origin
 
 
 def slot_tree(pool: str, slot: str) -> dict[str, str]:
@@ -2544,12 +2559,14 @@ def case_15(proof: Proof) -> None:
     case = Case(proof, "15")
     _donor, recipient, donor_slot, _ = cfg_donor_recipient(case)
     before = record_donor_figure(case.pool, donor_slot)
+    control = donor_control_bytes(case.pool, donor_slot)
     code, _out, err = case.command(recipient, ["build"], "no-donor-writes", env=case.env())
     expect(seeded(err), "the recipient did not seed")
     expect(slot_tree(case.pool, donor_slot) == before["tree"], "the donor tree changed")
     expect(read_bytes(catalog_path(case.pool, donor_slot)) == before["catalog"], "the donor catalog changed")
     expect(record_figure(case.pool, donor_slot) == before["figure"], "the donor's ledger row changed")
-    print("case 15: the donor tree, catalog and ledger row are unchanged", flush=True)
+    expect(donor_control_bytes(case.pool, donor_slot) == control, "the donor's control record or origin changed")
+    print("case 15: the donor tree, catalog, ledger row, full control record and origin are unchanged", flush=True)
 
 
 def removable_seeds_dir(pool: str) -> str:
@@ -2596,7 +2613,8 @@ def case_16(proof: Proof) -> None:
     expect(os.stat(os.path.join(artifacts, cloned[0])).st_dev == device, "the seeded bytes are not on the image")
     code, stdout, stderr = case.command(recipient, ["run"], "removable recipient run", env=case.env())
     expect(stdout.strip() == CFG_IF_OUTPUT, f"the removable program printed {stdout.strip()!r}")
-    disposition = detach_owned_image(proof, reason="case 16 completed")
+    expect(COLLECTION is not None, "case 16 has no collection custody record")
+    disposition = finalize_owned_image(proof, COLLECTION)
     if not detach_is_clean(disposition):
         if COLLECTION is not None:
             COLLECTION.detached = disposition
@@ -2833,6 +2851,27 @@ def case_21(proof: Proof) -> None:
     catalog = read_json(catalog_path(case.pool, donor_slot))
     offered = sorted(package["name"] for package in catalog["packages"])
     expect(offered == ["cfg-if"], f"the plan offered {offered}, not only the registry cfg-if")
+    # The library derives its exact plan from these selected catalog units.
+    # Check paths as well as package labels: both crates emit libcfg_if-*.
+    plan_files = {
+        file["path"]
+        for package in catalog["packages"]
+        for unit in package["units"]
+        for file in unit["files"]
+    }
+    build = os.path.join(slot_leaf(case.pool, donor_slot), "build")
+    local_units = glob.glob(os.path.join(build, "debug", ".fingerprint", "local-cfg-*"))
+    expect(len(local_units) == 1, f"no unique workspace unit: {local_units}")
+    local_hash = os.path.basename(local_units[0]).removeprefix("local-cfg-")
+    workspace_artifacts = [
+        os.path.relpath(path, build)
+        for path in glob.glob(os.path.join(build, "debug", "deps", f"libcfg_if-{local_hash}.*"))
+    ]
+    expect(bool(workspace_artifacts), "the workspace cfg_if emitted no artifact")
+    dep_info = read_bytes(os.path.join(build, "debug", "deps", f"cfg_if-{local_hash}.d"))
+    expect(os.path.join(root, "local-cfg", "src", "lib.rs").encode() in dep_info, "the workspace artifact's dep-info does not name its source")
+    expect(plan_files.isdisjoint(workspace_artifacts), f"workspace artifact in seed plan: {workspace_artifacts}")
+    expect(any(path.startswith("debug/deps/libcfg_if-") for path in plan_files), "no positive registry artifact in the plan")
     recipient = case.checkout("recipient", workspace)
     write_tree(os.path.join(recipient, "app"), app)
     write_tree(os.path.join(recipient, "local-cfg"), local)
@@ -2840,6 +2879,8 @@ def case_21(proof: Proof) -> None:
         handle.write(lock_text(packages))
     code, stdout, err = case.command(recipient, ["run"], "collision recipient", env=case.env())
     expect(seeded(err), "the collision fixture did not seed")
+    attempt = read_json(attempt_path(case.pool, slot_of(err)))
+    expect(attempt["files"] == len(plan_files), "the seed receipt does not match the catalog-derived plan")
     expect(stdout.strip() == CFG_IF_OUTPUT, f"the recipient printed {stdout.strip()!r}")
     # v1 does not offer the Git/build-script seedctl package at all.
     other = Case(proof, "21")
@@ -3000,14 +3041,68 @@ def expect_ambiguous_catalog(catalog: dict) -> None:
     )
 
 
+def expect_held_seed_observation(attempt: dict, row: dict, store_id: str) -> None:
+    observation = attempt["observation"]
+    expect(attempt["state"] == "seeded", "the complete walk's attempt is not seeded")
+    expect(observation is not None and observation["gap"] is None, "no complete observed-while-held fact")
+    for key in ("store_id", "slot_id", "incarnation", "lease_id"):
+        expect(observation[key] == attempt[key], f"the observation has a different {key}")
+    expect(attempt["store_id"] == store_id, "the observation belongs to another store")
+    expect(str(row["id"]) == attempt["slot_id"] and str(row["incarnation"]) == attempt["incarnation"], "the observation belongs to another generation")
+    expect(row["state"] == "held" and row["lease_id"] == attempt["lease_id"], "the observed generation is not held")
+    expect(row.get("recorded") is None, "a held observation became a closed record")
+    expect(observation["entries"] > 0 and observation["logical_bytes"] > 0, "the seed walk observed no cloned bytes")
+    expect(all(observation["limits"][key] > 0 for key in ("max_entries", "max_depth", "max_elapsed_ms")), "the observation has no walk bounds")
+
+
+def expect_gap_eviction(stderr: str, slot: str, use_delta: int) -> None:
+    # This diagnostic is emitted only by ordinary admission's Prior::Unknown
+    # branch, before Store::discard's journaled whole-slot eviction. It proves
+    # that the reset generation survived release without a trusted origin and
+    # was presented to that gate, rather than silently removed by seeding.
+    line = f"oxide: freshness gate cannot vouch for slot {slot} (the slot has no trusted build record); evicting it and building cold"
+    expect(stderr.splitlines().count(line) == 1, f"no ordinary untrusted-origin eviction for reset slot {slot}: {stderr[-2000:]}")
+    # With no competing command, State::touch advances once per grant, once
+    # for each of the two releases (abandoned + final), and once for spawning
+    # the sole final Cargo. Discard does not touch. Deleted grants still count.
+    grants = use_delta - 3
+    expect(1 <= grants <= 9, f"the cold fallback exceeded the ordinary nine-grant bound: {grants}")
+    expect(grants == 3, f"expected seed, untrusted retry and cold grants, got {grants}")
+
+
 def case_24(proof: Proof) -> None:
     case = Case(proof, "24")
-    _donor, recipient, _slot, _ = cfg_donor_recipient(case)
-    code, _out, err = case.command(recipient, ["build"], "complete walk", env=case.env())
+    _donor, recipient, donor_slot, _ = cfg_donor_recipient(case)
+    # Hold the recipient's real Cargo writer so the walk fact can be checked
+    # before release, rather than conflated with its later closed accounting.
+    write_tree(recipient, {"build.rs": GATED_BUILD})
+    gate = os.path.join(case.root, "complete-walk-gate")
+    child = perm.start_child(proof, [proof.binary, "build"], recipient, case.env(extra={"OXIDE_SEED_GATE": gate}))
+    try:
+        wait_for(gate + ".started", "the complete-walk recipient")
+        attempts = [read_json(path) for path in glob.glob(os.path.join(seeds_dir(case.pool), "*.attempt.json"))]
+        published = [attempt for attempt in attempts if attempt["state"] == "seeded"]
+        expect(len(published) == 1, f"no unique held seed attempt: {attempts}")
+        attempt = published[0]
+        slot = attempt["slot_id"]
+        ledger = json.loads(ledger_bytes(case.pool))
+        row = next(row for row in ledger["slots"] if str(row["id"]) == slot)
+        expect_held_seed_observation(attempt, row, ledger["store_id"])
+        last = last_seed(case.pool)
+        expect(last is not None and all(last[key] == attempt[key] for key in ("store_id", "slot_id", "incarnation", "lease_id")), "the last-seed sidecar does not bind the observed generation")
+        code, status, _err = case.command(recipient, ["status"], "held seed status", env=case.env())
+        expect(f"recorded seed: slot {slot}, from slot {donor_slot}," in status, f"status omitted the normal recorded seed line: {status}")
+    finally:
+        stop_gate(gate)
+        code, _out, err = perm.finish_child(proof, child, "complete walk")
+        expect(code == 0, "the complete-walk recipient failed")
     expect(seeded(err), "the complete walk did not publish")
-    slot = slot_of(err)
-    expect(attempt_state(case.pool, slot) == "seeded", "the complete walk's attempt is not seeded")
-    expect(last_seed(case.pool) is not None, "the complete walk wrote no last-seed sidecar")
+    expect(slot_of(err) == slot, "Cargo completed in a different generation")
+    row = next(row for row in json.loads(ledger_bytes(case.pool))["slots"] if str(row["id"]) == slot)
+    closed = row.get("recorded")
+    expect(row["state"] == "idle" and row.get("lease_id") is None, "the completed recipient did not release")
+    expect(str(row["incarnation"]) == attempt["incarnation"] and row["last_lease_id"] == attempt["lease_id"], "the closed record is for another generation")
+    expect(closed is not None and closed["for_lease"] == attempt["lease_id"] and closed["entries"] > 0 and closed["logical_bytes"] > 0, "release did not write the later closed record")
     gaps = {
         "foreign-owner": "ownership",
         "unreadable": "unreadable",
@@ -3019,20 +3114,23 @@ def case_24(proof: Proof) -> None:
         other = Case(proof, "24")
         _d, recipient2, _donor_slot, _ = cfg_donor_recipient(other, prefix=f"{gap}-")
         env = other.env(extra={"OXIDE_TEST_SEED_WALK": gap})
-        code, _out, err = other.command(recipient2, ["build"], f"walk {label}", env=env)
+        before_use = json.loads(control_bytes(other.pool))["next_use"]
+        code, out, err = other.command(recipient2, ["build", "--message-format=json"], f"walk {label}", env=env)
         expect(not seeded(err), f"the {label} injection published a seed")
         expect("seeding skipped: recipient walk incomplete" in err, f"no abandon line for {label}: {err[-1500:]}")
         expect(last_seed(other.pool) is None, f"the {label} injection wrote a last-seed sidecar")
-        rows = json.loads(ledger_bytes(other.pool).decode())["slots"]
-        abandoned = [
-            str(row["id"])
-            for row in rows
-            if row["state"] == "idle" and str(row["id"]) != str(_donor_slot)
-        ]
-        expect(len(abandoned) >= 1, f"the {label} injection retained no untrusted generation")
-        expect(any(attempt_state(other.pool, slot) == "reset" for slot in abandoned), f"no reset attempt for {label}")
-        expect(slot_of(err) not in abandoned, f"the {label} injection built in the untrusted slot")
-    print("case 24: the complete walk published; every injected walk gap abandoned and built cold", flush=True)
+        attempts = [read_json(path) for path in glob.glob(os.path.join(seeds_dir(other.pool), "*.attempt.json"))]
+        reset = [attempt for attempt in attempts if attempt["state"] == "reset"]
+        expect(len(reset) == 1, f"no unique reset attempt for {label}: {attempts}")
+        abandoned = reset[0]["slot_id"]
+        after = json.loads(control_bytes(other.pool))
+        expect_gap_eviction(err, abandoned, after["next_use"] - before_use)
+        expect(not leaf_exists(other.pool, abandoned), f"the untrusted {label} leaf survived ordinary eviction")
+        rows = json.loads(ledger_bytes(other.pool))["slots"]
+        expect(all(str(row["id"]) != abandoned for row in rows), f"the {label} ledger retained the evicted generation")
+        expect(slot_of(err) not in (abandoned, str(_donor_slot)), f"the {label} injection reused a retained generation")
+        expect(artifact_fresh(out, "cfg-if") is False, f"the {label} fallback did not build cfg-if cold")
+    print("case 24: held observation, status and later closed record checked; each gap used ordinary untrusted eviction and three of nine grants", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3371,6 +3469,23 @@ def self_test() -> None:
         expect(seed_summary(seed_line + "\n" + profile_line) == seed_line, "the seed oracle reads the ordinary profile summary")
         must_fail("no seed summary", lambda: seed_summary(profile_line))
 
+        observation = {
+            "store_id": "s", "slot_id": "2", "incarnation": "1", "lease_id": "l",
+            "gap": None, "entries": 8, "logical_bytes": 42,
+            "limits": {"max_entries": 2_000_000, "max_depth": 64, "max_elapsed_ms": 60_000},
+        }
+        attempt = {key: observation[key] for key in ("store_id", "slot_id", "incarnation", "lease_id")}
+        attempt.update(state="seeded", observation=observation)
+        held = {"id": 2, "incarnation": 1, "lease_id": "l", "state": "held", "recorded": None}
+        expect_held_seed_observation(attempt, held, "s")
+        must_fail("a walk gap published", lambda: expect_held_seed_observation(dict(attempt, observation=dict(observation, gap="unreadable")), held, "s"))
+        must_fail("a different observed generation", lambda: expect_held_seed_observation(dict(attempt, observation=dict(observation, lease_id="other")), held, "s"))
+        must_fail("held observation treated as closed", lambda: expect_held_seed_observation(attempt, dict(held, recorded={"for_lease": "l"}), "s"))
+        eviction = "oxide: freshness gate cannot vouch for slot 2 (the slot has no trusted build record); evicting it and building cold"
+        expect_gap_eviction(eviction, "2", 6)
+        must_fail("a different slot was evicted", lambda: expect_gap_eviction(eviction, "3", 6))
+        must_fail("an extra grant allowance", lambda: expect_gap_eviction(eviction, "2", 13))
+
         # Attempt, ledger row and slot-leaf oracles on one synthetic pool.
         pool = os.path.join(base, "pool")
         seeds = os.path.join(pool, "oxide-managed", "seeds")
@@ -3390,6 +3505,23 @@ def self_test() -> None:
         expect(slot_leaf(pool, "7") == leaf_root, "slot_leaf() drifted")
         expect(leaf_exists(pool, "7") and not leaf_exists(pool, "8"), "leaf_exists() drifted")
         expect("file" in slot_tree(pool, "7"), "slot_tree() drifted")
+        with open(catalog_path(pool, "7"), "w", encoding="utf-8") as handle:
+            json.dump({"record_id": 7, "packages": []}, handle)
+        origins = os.path.join(pool, "oxide-managed", "origins")
+        os.makedirs(origins)
+        with open(os.path.join(origins, "7.json"), "wb") as handle:
+            handle.write(b'{"mark":3,"origin":{"affine":"/donor"}}')
+        state_path = os.path.join(pool, "oxide-managed", "state.json")
+        donor_record = {"id": 7, "last_used": 3, "checkout": "/donor", "phase": "idle"}
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump({"next_id": 9, "records": [donor_record, {"id": 8}]}, handle)
+        donor_control = donor_control_bytes(pool, "7")
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump({"next_id": 10, "records": [donor_record, {"id": 8, "phase": "running"}]}, handle)
+        expect(donor_control_bytes(pool, "7") == donor_control, "recipient-only control changes tainted donor equality")
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump({"records": [dict(donor_record, checkout="/changed")]}, handle)
+        expect(donor_control_bytes(pool, "7") != donor_control, "a donor control field outside the ledger projection was ignored")
 
         flags = {"CARGO_ENCODED_RUSTFLAGS": "x"}
         freeze_compiler_flags(flags)
@@ -3650,6 +3782,37 @@ def self_test() -> None:
             finalize_owned_image(fake_proof, failed) == fake_proof.image["detached"],
             "a completed detach was not kept on a subsequent failed collection",
         )
+
+        # Replay the actual case-16 body after an earlier diagnostic failure.
+        # Only the native operations are faked; its completion/finalizer and
+        # the shared collection run for real. No image, child or device exists.
+        backing = os.path.join(base, "interleaved.sparseimage")
+        with open(backing, "wb") as handle:
+            handle.write(b"retained backing")
+        interleaved = perm.Collection()
+        fake_proof.image.update(backing=backing, detached=None)
+        fake_case = types.SimpleNamespace(
+            pool=pool, env=lambda: {}, checkout=lambda *_args: "/synthetic-checkout",
+            command=lambda _cwd, _args, label, **_kwargs: (
+                0, "registered removable pool" if label == "register removable" else CFG_IF_OUTPUT, ""
+            ),
+        )
+        replacements = {
+            "COLLECTION": interleaved, "Case": lambda *_args: fake_case,
+            "attach_owned_image": lambda _proof: _proof.image,
+            "summary": lambda _err: "apfs-volume-v1", "slot_of": lambda _err: "1",
+            "seeded": lambda _err: True,
+        }
+        with patch.dict(globals(), replacements), patch.object(perm, "owners_honored"), patch.object(runner, "labelled_slot", return_value="/Volumes/o169-synthetic/slot"), patch.object(os, "stat", return_value=types.SimpleNamespace(st_dev=7)), patch.object(os.path, "isfile", return_value=True), patch.object(os, "listdir", return_value=["libcfg_if-synthetic.rmeta"]), patch.dict(globals(), {"detach_owned_image": lambda *_args, **_kwargs: fail("case 16 bypassed retention")}):
+            perm.collect_cases(
+                [("earlier", (), lambda: fail("earlier oracle failure")), ("16", (), lambda: case_16(fake_proof))],
+                diagnostic=True, work_left=lambda: 100, note=lambda _text: None, record=interleaved,
+            )
+        expect(interleaved.outcomes["earlier"]["result"] == "failed" and len(interleaved.failures) == 1, "case 16 erased or replaced the earlier failure")
+        expect(interleaved.outcomes["16"]["result"] == "aborted", "case 16 did not abort on refused image custody")
+        expect(fake_proof.image["detached"].startswith("retained:"), "case 16 did not retain after an earlier failure")
+        expect(read_bytes(backing) == b"retained backing", "case 16 removed the backing after an earlier failure")
+        expect(read_json(custody)["detached"] == fake_proof.image["detached"], "case 16 did not record retained custody")
 
         # The receipt's timing projection is observational and follows the
         # reached cases only.

@@ -2150,13 +2150,18 @@ the selected-volume rule.
     makes the command skip seeding while Cargo still runs normally;
 15. no donor writes: donor tree content digest, its catalog, ledger bytes and
     control bytes are identical before and after a seed, and its rank, use mark
-    and recorded figure are unchanged;
+    and recorded figure are unchanged. Compare the donor's full control record
+    (canonical JSON) and raw origin sidecar, excluding recipient changes to the
+    shared state document;
 16. removable path: one owned 128 MiB APFS image (`hdiutil attach -owners on`)
     registered as a removable pool seeds a tiny `cfg-if` workspace (literal
     directory `cfg-if-<hash>`, normalized unit `lib-cfg_if`, artifact
     `deps/libcfg_if-<hex>.rmeta`) across two
     of its slots and detaches ordinarily, proving the same-volume predicate and
-    that the recipient's bytes are on the image;
+    that the recipient's bytes are on the image. Case completion uses the same
+    collection retention gate as final cleanup: an earlier diagnostic failure
+    retains the image and aborts, even when the removable case itself succeeded.
+    The pure apparatus replays that interleaving through the case body;
 17. registry tamper controls: the cached `.crate` replaced with a different
     archive (checksum mismatch), the extracted tree with one extra file, one
     altered file, one symlink and one missing file each make the package
@@ -2183,7 +2188,10 @@ the selected-volume rule.
     `cfg-if` must leave the plan containing only the verified registry
     artifact: the workspace/path package is ineligible in v1, the proof
     asserts its artifact path is absent from the plan and that the recipient
-    still builds and runs correctly. The Git/build-script seedctl package is a
+    still builds and runs correctly. The workspace fingerprint's actual hash
+    identifies its emitted `libcfg_if` paths, and its dep-info must name the
+    workspace source; those paths are absent from the selected catalog's exact
+    file manifest, whose count must match the seed receipt. The Git/build-script seedctl package is a
     second negative control (no catalog, no seed), not a per-unit positive.
 22. **competing library acquire between selection and the pin (no seed, no
     block).** With a debug-only pause ordered between call 1 and call 2, a
@@ -2227,7 +2235,16 @@ the selected-volume rule.
     eviction), and the command completing as an **ordinary cold build in a
     normally admitted slot** with the ordinary grant bound and no extra or
     reserved grant. The controls are non-vacuous: the same
-    fixture with no injection publishes normally.
+    fixture with no injection publishes normally. A gated Cargo build exposes
+    the successful attempt's generation-bound observation while its ledger row
+    is held with no closed record; status shows the recorded seed, and release
+    subsequently writes the closed record for that lease. For each gap the
+    ordinary `Prior::Unknown` diagnostic must name the reset attempt's slot and
+    its missing trusted build record, followed by removal of that whole leaf
+    and ledger row and a cold `cfg-if` build in another slot. The isolated
+    control's durable use-counter delta accounts for the three ordinary grants
+    (seed, unknown retry, cold fallback), two releases and one Cargo spawn;
+    deleted grants remain included in that count and the nine-grant bound.
 
 ### 16.3 Runner, bounds, clocks and activation
 
