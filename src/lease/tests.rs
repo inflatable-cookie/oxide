@@ -7339,3 +7339,138 @@ fn a_replaced_lock_name_after_acquisition_keeps_the_record() {
     );
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
+
+/// A legacy journal whose custody cannot be staged keeps **only** its own
+/// record: the migration publishes nothing, the ledger stays valid at the
+/// predecessor fence, and an unrelated admission and release still write it.
+/// The next open retries the migration and both records stay isolated.
+#[test]
+fn a_failed_legacy_staging_does_not_block_an_unrelated_admission() {
+    let fixture = Fixture::new("legacy-staging-failure");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let first = lease_injected(request(
+        &pool,
+        &fixture.dir("project-a"),
+        &fixture.dir("workspace-a"),
+        "a",
+    ))
+    .expect("a");
+    let second = lease_injected(request(
+        &pool,
+        &fixture.dir("project-b"),
+        &fixture.dir("workspace-b"),
+        "b",
+    ))
+    .expect("b");
+    release_injected(&pool, &first.lease_id).expect("release a");
+    release_injected(&pool, &second.lease_id).expect("release b");
+    let first_id: u64 = first.slot_id.parse().expect("slot id");
+    let second_id: u64 = second.slot_id.parse().expect("slot id");
+    let first_path = pool.join("payload/slots").join(&first.slot_id);
+    let second_path = pool.join("payload/slots").join(&second.slot_id);
+
+    // A valid predecessor ledger with two in-ledger journals, written without
+    // opening the pool so neither is reconciled on its own.
+    let mut legacy_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    for row in legacy_json["slots"].as_array_mut().expect("slots") {
+        let seed = if row["id"] == serde_json::json!(first_id) {
+            31_u32
+        } else {
+            32_u32
+        };
+        assert!(
+            row["id"] == serde_json::json!(first_id) || row["id"] == serde_json::json!(second_id),
+            "unexpected fixture slot"
+        );
+        row["state"] = serde_json::json!("evicting");
+        row["lease_id"] = serde_json::json!(null);
+        row["capture"] = serde_json::json!({
+            "root": {
+                "private": format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, seed),
+                "phase": "planned",
+                "device": 1,
+                "inode": seed,
+                "parent_device": 1,
+                "parent_inode": 2,
+                "mode": 0o040700,
+            },
+            "captures": [],
+            "foreign": [],
+        });
+    }
+    legacy_json["capacity_policy"] = serde_json::json!(RAISED_CAPACITY_POLICY_VERSION);
+    super::pool::write_ledger_bytes_injected(
+        &pool,
+        &serde_json::to_vec(&legacy_json).expect("legacy json"),
+    )
+    .expect("the two-journal predecessor ledger is accepted");
+
+    // One staging attempt fails while the rest of the pool is healthy.
+    let _armed = super::pool::fail_next_custody_create_injected();
+    let granted = lease_injected(request(
+        &pool,
+        &fixture.dir("project-c"),
+        &fixture.dir("workspace-c"),
+        "c",
+    ))
+    .expect("a failed legacy staging must not block an unrelated admission");
+
+    // The admission's own revised write kept the predecessor's fence and both
+    // legacy journals: nothing was published in a mixed representation.
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(RAISED_CAPACITY_POLICY_VERSION),
+        "an unrelated write published the custody fence over a legacy journal"
+    );
+    for id in [first_id, second_id] {
+        let row = stored["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["id"] == serde_json::json!(id))
+            .expect("recorded slot");
+        assert_eq!(row["state"], "evicting");
+        assert!(row.get("capture").is_some(), "the legacy journal was lost");
+        assert!(
+            row.get("custody").is_none(),
+            "a custody record was published"
+        );
+    }
+    assert!(
+        first_path.is_dir() && second_path.is_dir(),
+        "the unrelated admission deleted a pending payload"
+    );
+
+    // Another unrelated revised write also proceeds; its open retries the
+    // staging in one revision, and both records stay isolated.
+    release_injected(&pool, &granted.lease_id).expect("unrelated release");
+    status_injected(&pool).expect("status after the retried migration");
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        migrated["capacity_policy"],
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION),
+        "the retried migration did not publish the custody fence"
+    );
+    for id in [first_id, second_id] {
+        let row = migrated["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["id"] == serde_json::json!(id))
+            .expect("recorded slot");
+        assert_eq!(row["state"], "evicting");
+        assert!(
+            row.get("capture").is_none(),
+            "an in-ledger journal survived"
+        );
+        assert!(row["custody"].is_object(), "the record was not migrated");
+    }
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(snapshot.evicting_slot_ids.len(), 2);
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}

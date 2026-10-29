@@ -1134,6 +1134,13 @@ pub(super) fn write_legacy_capture_record_injected(
 
 /// Create one deletion's private custody exactly as `retire_idle_slot` does,
 /// and return the held lock. Used by the two-descriptor creator regression.
+/// Arm one custody staging failure. Used by the per-object regression that a
+/// legacy journal which cannot be staged keeps only its own record.
+#[cfg(test)]
+pub(super) fn fail_next_custody_create_injected() -> impl Drop {
+    crate::test_fs::fail_next_custody_create()
+}
+
 #[cfg(test)]
 pub(super) fn create_custody_injected(
     pool: &Path,
@@ -1388,25 +1395,40 @@ impl Pool {
                 .unwrap_or(0)
                 .checked_add(1)
                 .ok_or(LeaseError::LedgerExhausted)?;
-            self.ledger.capacity_policy = Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION);
+            self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
             self.ledger.next_rank = Some(next.max(1));
         }
-        // Every ledger revision of this binary publishes the deletion-custody
-        // fence (oxide#181), upgrading the older readable policies in the same
-        // atomic replacement. The step is one-way: an older binary refuses a
-        // policy-5 ledger and a `custody` field before any effect, which is why
-        // the front door's version-9 control fence is durable first.
+        // The predecessor's readable policies upgrade to the recorded-accounting
+        // shape in the same atomic replacement.
         if matches!(
             self.ledger.capacity_policy,
-            Some(LEGACY_CAPACITY_POLICY_VERSION)
-                | Some(PREVIOUS_CAPACITY_POLICY_VERSION)
-                | Some(CAPACITY_POLICY_VERSION)
-                | Some(RAISED_CAPACITY_POLICY_VERSION)
+            Some(LEGACY_CAPACITY_POLICY_VERSION) | Some(PREVIOUS_CAPACITY_POLICY_VERSION)
         ) {
-            self.ledger.capacity_policy = Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION);
+            self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
         }
+        // A legacy in-ledger journal this open could not stage keeps the
+        // predecessor's fence. Policy 5 is invalid while a `capture` remains,
+        // so an unrelated write proceeds under policy 3 or 4 (the exact shape
+        // the predecessor wrote, which it can still read) instead of blocking.
+        // The record itself stays isolated and the next open retries the
+        // migration (oxide#175 ruling B, oxide#181 per-object isolation).
+        if self.ledger.slots.iter().any(|slot| slot.capture.is_some()) {
+            if !matches!(
+                self.ledger.capacity_policy,
+                Some(CAPACITY_POLICY_VERSION) | Some(RAISED_CAPACITY_POLICY_VERSION)
+            ) {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            return Ok(());
+        }
+        // With no legacy journal left, every ledger revision publishes the
+        // deletion-custody fence (oxide#181), upgrading the older readable
+        // policies in the same atomic replacement. The step is one-way: an
+        // older binary refuses a policy-5 ledger and a `custody` field before
+        // any effect, which is why the front door's version-9 control fence is
+        // durable first.
         if self.ledger.capacity_policy != Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION) {
-            return Err(LeaseError::UnknownAccounting);
+            self.ledger.capacity_policy = Some(DELETION_CUSTODY_CAPACITY_POLICY_VERSION);
         }
         Ok(())
     }
@@ -2808,6 +2830,14 @@ impl Pool {
         // another slot — blocked, unclassifiable or missing its root — never
         // refuses this eligible slot's deletion. The pending record keeps its
         // own charge and custody, and this open's coverage stays unknown.
+        // A ledger that still carries an unstaged legacy journal cannot also
+        // publish a custody record: the two representations require different
+        // fences. Keep this deletion (a per-object failure), start nothing, and
+        // let the next open retry the migration; an unrelated admission with
+        // spare capacity is unaffected.
+        if self.ledger.slots.iter().any(|slot| slot.capture.is_some()) {
+            return Err(LeaseError::UnknownAccounting);
+        }
         // Every durable idle deletion, including the explicit
         // `evict_idle_slot` path, checks the rank sequence before its first
         // transition: an exhausted or missing-headroom sequence refuses

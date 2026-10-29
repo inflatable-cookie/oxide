@@ -460,17 +460,22 @@ is the foundation slice 2 moves out of the lock:
   in-memory ledger. Staging happens before any ledger change, a failed staging
   or publish publishes nothing and restores the in-memory ledger (orphan
   custody directories are never deletion authority), and the next open
-  retries.
+  retries. While a legacy journal remains, a revised write keeps the
+  predecessor fence (policy 3 or 4) instead of publishing policy 5, because a
+  policy-5 ledger may not carry a `capture`; unrelated admissions, releases and
+  other writes therefore proceed, and no new deletion is started until the
+  journal is migrated (a per-object refusal, not a global one).
 - **Final record removal.** While still holding custody, the final transaction
   reloads the ledger from disk and drops only the matching id, incarnation and
   custody nonce (preserving every concurrent update), syncs it, then removes
   the private directory. A crash after the durable root `removed` phase repeats
   that transaction without touching payload.
 - **Per-object failure.** A busy, unknown or undeletable object — including a
-  journaled root that is at neither its original nor its private name — keeps
-  its record, conservative charge, custody and journal, and does not refuse an
-  unrelated admission or another eligible idle slot's explicit deletion; only
-  backing, ledger or fence integrity is global. The oxide#177 single-journal
+  journaled root that is at neither its original nor its private name, and a
+  legacy record whose custody cannot be staged — keeps its record, conservative
+  charge, custody and journal, and does not refuse an unrelated admission,
+  release or another eligible idle slot's explicit deletion; only backing,
+  ledger or fence integrity is global. The oxide#177 single-journal
   guard is retired: journals no longer share the ledger's byte bound, so
   several pending deletions can coexist.
 

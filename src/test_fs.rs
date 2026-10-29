@@ -754,3 +754,34 @@ pub(crate) fn run_after_custody_lock() {
         action();
     }
 }
+
+thread_local! {
+    static CUSTODY_CREATE_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm one custody staging failure. A test uses this to model a legacy journal
+/// whose custody directory cannot be created while the rest of the pool is
+/// healthy (oxide#181, per-object isolation).
+#[must_use = "dropping the guard ends the armed failure"]
+pub(crate) struct CustodyCreateFailureGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn fail_next_custody_create() -> CustodyCreateFailureGuard {
+    CUSTODY_CREATE_FAILURE.with(|cell| cell.set(true));
+    CustodyCreateFailureGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for CustodyCreateFailureGuard {
+    fn drop(&mut self) {
+        CUSTODY_CREATE_FAILURE.with(|cell| cell.set(false));
+    }
+}
+
+/// Consume the armed staging failure, if any. One-shot: the first `create`
+/// after arming fails and every later one proceeds.
+pub(crate) fn take_custody_create_failure() -> bool {
+    CUSTODY_CREATE_FAILURE.with(|cell| cell.replace(false))
+}

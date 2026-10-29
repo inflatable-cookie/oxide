@@ -368,6 +368,14 @@ pub(super) fn create(
     identity: &CustodyIdentity,
     journal: Option<&DeletionJournal>,
 ) -> Result<CustodyLock, LeaseError> {
+    // Test-only: one injected staging failure, used to prove that a legacy
+    // record whose custody cannot be created keeps only itself.
+    #[cfg(test)]
+    if crate::test_fs::take_custody_create_failure() {
+        return Err(LeaseError::Io(
+            "test: injected custody staging failure".to_owned(),
+        ));
+    }
     let lines = CustodyIdentityLines::of(identity);
     let control = pool.join(MANAGED_NAME);
     ensure_private_dir(&control)?;
