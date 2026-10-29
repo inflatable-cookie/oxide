@@ -7099,3 +7099,243 @@ fn root_dir_empty(pool: &Path) -> bool {
         Err(_) => true,
     }
 }
+
+/// Several otherwise-valid in-ledger journals (which the #177 reader accepts
+/// under its 8 MiB bound) are staged and published by **one** atomic ledger
+/// revision. A failed publish leaves the legacy ledger and every payload
+/// intact, and the next open retries; the unrelated admission then proceeds
+/// with both migrated records still isolated and charged.
+#[test]
+fn two_legacy_journals_migrate_in_one_revision_and_survive_a_failed_publish() {
+    let fixture = Fixture::new("legacy-two");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let first = lease_injected(request(
+        &pool,
+        &fixture.dir("project-a"),
+        &fixture.dir("workspace-a"),
+        "a",
+    ))
+    .expect("a");
+    let second = lease_injected(request(
+        &pool,
+        &fixture.dir("project-b"),
+        &fixture.dir("workspace-b"),
+        "b",
+    ))
+    .expect("b");
+    release_injected(&pool, &first.lease_id).expect("release a");
+    release_injected(&pool, &second.lease_id).expect("release b");
+    let first_id: u64 = first.slot_id.parse().expect("slot id");
+    let second_id: u64 = second.slot_id.parse().expect("slot id");
+    let first_path = pool.join("payload/slots").join(&first.slot_id);
+    let second_path = pool.join("payload/slots").join(&second.slot_id);
+
+    // Two valid legacy journals in one ledger, written directly so no open
+    // reconciles them one at a time. Their identities do not match the live
+    // roots, so replay keeps both objects pending after the migration.
+    let mut legacy_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    for row in legacy_json["slots"].as_array_mut().expect("slots") {
+        let seed = if row["id"] == serde_json::json!(first_id) {
+            21_u32
+        } else {
+            22_u32
+        };
+        assert!(
+            row["id"] == serde_json::json!(first_id) || row["id"] == serde_json::json!(second_id),
+            "unexpected fixture slot"
+        );
+        row["state"] = serde_json::json!("evicting");
+        row["lease_id"] = serde_json::json!(null);
+        row["capture"] = serde_json::json!({
+            "root": {
+                "private": format!("{}{:032x}", crate::owned_delete::CAPTURE_PREFIX, seed),
+                "phase": "planned",
+                "device": 1,
+                "inode": seed,
+                "parent_device": 1,
+                "parent_inode": 2,
+                "mode": 0o040700,
+            },
+            "captures": [],
+            "foreign": [],
+        });
+    }
+    legacy_json["capacity_policy"] = serde_json::json!(RAISED_CAPACITY_POLICY_VERSION);
+    super::pool::write_ledger_bytes_injected(
+        &pool,
+        &serde_json::to_vec(&legacy_json).expect("legacy json"),
+    )
+    .expect("the two-journal predecessor ledger is accepted");
+    let legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        legacy["capacity_policy"],
+        serde_json::json!(RAISED_CAPACITY_POLICY_VERSION),
+        "the two-journal predecessor state must stay below the custody fence"
+    );
+    assert!(legacy["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .all(|slot| {
+            slot["state"] == "evicting"
+                && slot.get("capture").is_some()
+                && slot.get("custody").is_none()
+        }));
+    let ledger_before = fs::read(pool.join("ledger.json")).expect("ledger");
+
+    // Staging both custody directories succeeds; the single atomic publish
+    // cannot write because the pool root refuses a new temp file for its
+    // owner. Nothing durable may change.
+    fs::create_dir_all(pool.join(MANAGED_NAME)).expect("control dir");
+    fs::set_permissions(pool.join(MANAGED_NAME), fs::Permissions::from_mode(0o700))
+        .expect("control mode");
+    let root_mode = fs::symlink_metadata(&pool)
+        .expect("pool metadata")
+        .permissions()
+        .mode()
+        & 0o7777;
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o500)).expect("read-only pool root");
+    let failed = lease_injected(request(
+        &pool,
+        &fixture.dir("project-c"),
+        &fixture.dir("workspace-c"),
+        "c",
+    ));
+    assert!(
+        failed.is_err(),
+        "a failed migration admitted a lease: {failed:?}"
+    );
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("ledger"),
+        ledger_before,
+        "a failed migration publish changed the durable ledger"
+    );
+    assert!(
+        first_path.is_dir() && second_path.is_dir(),
+        "a failed migration publish deleted a payload"
+    );
+    fs::set_permissions(&pool, fs::Permissions::from_mode(root_mode)).expect("restore pool root");
+
+    // The next open stages both journals and publishes them in one revision;
+    // the unrelated admission proceeds and both records stay isolated.
+    let granted = lease_injected(request(
+        &pool,
+        &fixture.dir("project-d"),
+        &fixture.dir("workspace-d"),
+        "d",
+    ))
+    .expect("an unrelated admission after the retried migration");
+    release_injected(&pool, &granted.lease_id).expect("release");
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert_eq!(
+        migrated["capacity_policy"],
+        serde_json::json!(DELETION_CUSTODY_CAPACITY_POLICY_VERSION),
+        "the retried migration did not publish the custody fence"
+    );
+    for id in [first_id, second_id] {
+        let row = migrated["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["id"] == serde_json::json!(id))
+            .expect("recorded slot");
+        assert_eq!(row["state"], "evicting", "the record left the ledger");
+        assert!(
+            row.get("capture").is_none(),
+            "an in-ledger journal survived the migration"
+        );
+        assert!(
+            row["custody"].is_object(),
+            "a legacy record was left without custody"
+        );
+        assert!(
+            super::pool::capture_record_injected(&pool, id).is_some(),
+            "the per-deletion journal was not published"
+        );
+    }
+    assert!(
+        first_path.is_dir() && second_path.is_dir(),
+        "the migrated pending payloads were deleted"
+    );
+    let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
+    assert_eq!(
+        snapshot.evicting_slot_ids.len(),
+        2,
+        "both migrated records must stay isolated and charged"
+    );
+    status_injected(&pool).expect("status after the migration");
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// A claim that acquires the exclusive lock and then finds the published `lock`
+/// name replaced by another object is unknown custody: the record keeps its
+/// charge and journal, and the deletion is not concluded by the held (now
+/// unlinked) inode. Restoring the name lets the next open finish it.
+#[test]
+fn a_replaced_lock_name_after_acquisition_keeps_the_record() {
+    let fixture = Fixture::new("custody-name-swap");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "custody-name-swap");
+    let parent = slot_path.parent().expect("slot parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    fs::remove_dir_all(parent.join(&plan.private)).expect("the payload is gone");
+    super::pool::rewrite_custody_journal_injected(
+        &pool,
+        slot_id,
+        super::pool::DeletionJournal {
+            root: crate::owned_delete::RootCapturePlan {
+                phase: crate::owned_delete::RootCapturePhase::Removed,
+                ..plan
+            },
+            captures: Vec::new(),
+            foreign: Vec::new(),
+        },
+    )
+    .expect("removed phase");
+    let custody = recorded_custody(&pool, slot_id).expect("custody record");
+    let (lock_path, _) = custody_files(&pool, &custody.nonce);
+    let moved = parent.join(format!("moved-lock-{}", custody.lock_inode));
+    let swap = {
+        let lock_path = lock_path.clone();
+        let moved = moved.clone();
+        move || {
+            fs::rename(&lock_path, &moved).expect("move the held lock name");
+            fs::write(&lock_path, b"").expect("replacement lock");
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                .expect("replacement mode");
+        }
+    };
+    let _armed = crate::test_fs::after_custody_lock(swap);
+    let status = status_injected(&pool).expect("status with a replaced lock name");
+    assert_eq!(
+        status.slots.len(),
+        1,
+        "a replaced lock name concluded the deletion"
+    );
+    assert_eq!(
+        super::pool::slot_state_injected(&pool, &slot_id.to_string()).as_deref(),
+        Some("evicting"),
+        "the record was dropped by a claim that did not hold the published name"
+    );
+    assert!(
+        custody_files(&pool, &custody.nonce).1.is_file(),
+        "the record lost its journal"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&moved).expect("moved lock").ino(),
+        custody.lock_inode,
+        "the held descriptor no longer names the recorded inode"
+    );
+    // Restoring the published name lets the next open finish the deletion.
+    fs::remove_file(&lock_path).expect("remove the replacement");
+    fs::rename(&moved, &lock_path).expect("restore the held lock name");
+    let after = status_injected(&pool).expect("status after restore");
+    assert!(
+        after.slots.is_empty(),
+        "the restored record did not conclude"
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}

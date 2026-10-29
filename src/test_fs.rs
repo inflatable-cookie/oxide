@@ -711,3 +711,46 @@ pub(crate) fn faulted_readdir(listed: u64) -> Option<libc::c_int> {
         Some(armed.1)
     })
 }
+
+thread_local! {
+    static AFTER_CUSTODY_LOCK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside the custody claim, immediately after the
+/// exclusive `flock` succeeds and before the claimant rechecks that the lock
+/// name still resolves to the descriptor it holds. This is how a test replaces
+/// the lock name in exactly that window (oxide#181).
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct AfterCustodyLockGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn after_custody_lock(action: impl FnOnce() + 'static) -> AfterCustodyLockGuard {
+    AFTER_CUSTODY_LOCK.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping after-custody-lock injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    AfterCustodyLockGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for AfterCustodyLockGuard {
+    fn drop(&mut self) {
+        AFTER_CUSTODY_LOCK.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed post-lock action, if any. Called once by the claimant after
+/// its exclusive lock succeeds; a no-op everywhere else.
+pub(crate) fn run_after_custody_lock() {
+    let action = AFTER_CUSTODY_LOCK.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}

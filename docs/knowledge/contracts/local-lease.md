@@ -435,21 +435,32 @@ is the foundation slice 2 moves out of the lock:
   `<pool>/oxide-managed/deletions/<nonce>` holding a stable `0600` `lock` file
   (its `(device, inode)` recorded in the ledger as `custody`) and the
   per-deletion `journal.json`. Directory, lock and initial journal are durable
-  before the record that references them. The deleter claims the exclusive
-  `flock` nonblocking while holding the pool lock — lock order is always pool
-  lock then custody, and no pool-lock holder waits on custody. A busy lock is a
-  live custodian and the record is skipped; a missing, replaced or
-  identity-mismatched lock is unknown and keeps the record; the claimant
-  rechecks the exact nonce, generation, file identity and backing after
-  acquiring. The lock is `O_CLOEXEC`, so it is never inherited by a child.
+  before the record that references them. The creator takes the exclusive
+  `flock` before it writes the journal or hands out the custody, so nothing is
+  published or replayed under a lock the process does not hold. The claimant
+  takes the lock nonblocking while holding the pool lock — lock order is always
+  pool lock then custody, and no pool-lock holder waits on custody. After
+  acquiring it rechecks the exact nonce, generation, backing, held descriptor
+  and **that the published `lock` name still resolves (descriptor-relative,
+  no-follow) to that descriptor and the recorded identity**; a rename or
+  replacement in that window is unknown custody and keeps the record. A busy
+  lock is a live custodian and the record is skipped; a missing, replaced or
+  identity-mismatched lock is unknown and keeps the record. The lock is
+  `O_CLOEXEC`, so it is never inherited by a child.
 - **Journal.** The oxide#155 capture journal moved out of the ledger into that
   bounded (4 MiB), atomically replaced and synced file, bound to the nonce,
   store, backend, slot, incarnation and recorded root. Capture, verification,
   unlink, mode repair, the oxide#175 ordering/completeness rules and every
-  oxide#155 replay outcome are unchanged; only the storage moved. A legacy
-  in-ledger journal is copied byte-exactly into a fresh custody directory on
-  the next open (never reinterpreted) and the ledger copy is cleared in the
-  same atomic replacement that publishes the policy-5 fence.
+  oxide#155 replay outcome are unchanged; only the storage moved. Legacy
+  in-ledger journals are copied byte-exactly into fresh custody directories on
+  the next open (never reinterpreted) and **every migration is published in one
+  atomic, validated ledger revision**: a predecessor may leave several valid
+  journals under the 8 MiB bound, one-record-at-a-time migration would make the
+  first policy-5 write invalidate the others, and a failure would leave a mixed
+  in-memory ledger. Staging happens before any ledger change, a failed staging
+  or publish publishes nothing and restores the in-memory ledger (orphan
+  custody directories are never deletion authority), and the next open
+  retries.
 - **Final record removal.** While still holding custody, the final transaction
   reloads the ledger from disk and drops only the matching id, incarnation and
   custody nonce (preserving every concurrent update), syncs it, then removes

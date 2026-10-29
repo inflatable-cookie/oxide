@@ -30,6 +30,7 @@ use crate::owned_delete::{
 };
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -1158,9 +1159,8 @@ pub(super) fn migrate_legacy_locked_injected(
     slot_id: u64,
 ) -> Result<super::custody::CustodyLock, LeaseError> {
     let mut opened = Pool::open_passive(pool, ACCOUNTING_MAX_ELAPSED_MS)?;
-    opened
-        .migrate_legacy_deletion(slot_id)?
-        .ok_or(LeaseError::UnknownAccounting)
+    let mut staged = opened.migrate_legacy_deletions(&[slot_id])?;
+    staged.remove(&slot_id).ok_or(LeaseError::UnknownAccounting)
 }
 
 /// Rewrite one published custody journal in place, claiming its lock exactly
@@ -2891,40 +2891,90 @@ impl Pool {
         }
     }
 
-    /// Migrate one record published by an older writer: its journal lives in
-    /// the ledger. The journal is copied byte-exactly into a fresh custody
-    /// directory, then one atomic replacement carries the policy-5 fence, the
-    /// `custody` reference and the cleared in-ledger journal. An uncertain
-    /// journal is migrated as it stands, never reinterpreted.
-    fn migrate_legacy_deletion(&mut self, id: u64) -> Result<Option<CustodyLock>, LeaseError> {
-        let Some(slot) = self.slot(id) else {
-            return Err(LeaseError::UnknownAccounting);
-        };
-        if slot.state != SlotPersistState::Evicting
-            || slot.lease_id.is_some()
-            || slot.custody.is_some()
-        {
-            return Err(LeaseError::UnknownAccounting);
-        }
-        let capture = slot.capture.clone();
-        let identity = self.custody_identity(id)?;
-        let custody = super::custody::create(&self.root, &identity, capture.as_ref())?;
-        {
-            let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
+    /// Migrate every legacy in-ledger journal in **one** validated atomic
+    /// ledger revision, while holding each deletion's custody (oxide#181).
+    ///
+    /// A predecessor may leave several otherwise-valid in-ledger journals under
+    /// the 8 MiB bound (oxide#177), and a policy-5 ledger may not carry any. A
+    /// one-record-at-a-time migration would make the first write invalidate
+    /// every other legacy journal, and a per-object failure could leave a mixed
+    /// in-memory ledger that blocks unrelated writes. This method therefore:
+    ///
+    /// 1. reads every record and identity first, so a vanished record refuses
+    ///    before any directory exists;
+    /// 2. copies every journal byte-exactly into its own durable custody
+    ///    directory and takes its lock — **no ledger state changes yet**;
+    /// 3. mutates every record in memory only after all staging succeeded;
+    /// 4. publishes the policy-5 fence and every custody reference in one
+    ///    atomic, synced replacement; and
+    /// 5. restores the previous in-memory ledger on any failure.
+    ///
+    /// A crash before step 4 leaves the legacy ledger intact plus orphan
+    /// custody directories, which are never deletion authority; the next open
+    /// retries. A journal that cannot be staged keeps its record and charge,
+    /// so the caller applies per-object isolation. Uncertain journals are
+    /// migrated as they stand and never reinterpreted.
+    fn migrate_legacy_deletions(
+        &mut self,
+        ids: &[u64],
+    ) -> Result<HashMap<u64, CustodyLock>, LeaseError> {
+        let snapshot = self.ledger.clone();
+        let mut work = Vec::with_capacity(ids.len());
+        for id in ids {
+            let slot = self.slot(*id).ok_or(LeaseError::UnknownAccounting)?;
             if slot.state != SlotPersistState::Evicting
                 || slot.lease_id.is_some()
                 || slot.custody.is_some()
             {
                 return Err(LeaseError::UnknownAccounting);
             }
-            slot.custody = Some(custody.record());
+            work.push((*id, slot.capture.clone(), self.custody_identity(*id)?));
+        }
+        let mut staged = HashMap::with_capacity(work.len());
+        for (id, capture, identity) in work {
+            match super::custody::create(&self.root, &identity, capture.as_ref()) {
+                Ok(lock) => {
+                    staged.insert(id, lock);
+                }
+                // A local staging failure publishes nothing: every legacy
+                // record keeps its journal and charge. Shared authority
+                // failures (a foreign control directory or a mismatched
+                // backing) stay global.
+                Err(LeaseError::UnsafePath(message)) => {
+                    drop(staged);
+                    return Err(LeaseError::UnsafePath(message));
+                }
+                Err(LeaseError::BackingMismatch) => {
+                    drop(staged);
+                    return Err(LeaseError::BackingMismatch);
+                }
+                Err(_) => {
+                    drop(staged);
+                    return Err(LeaseError::UnknownAccounting);
+                }
+            }
+        }
+        // Every directory exists: now change the in-memory ledger, and only
+        // this one atomic write makes the migration durable.
+        for id in ids {
+            let Some(record) = staged.get(id).map(CustodyLock::record) else {
+                self.ledger = snapshot;
+                return Err(LeaseError::UnknownAccounting);
+            };
+            let Some(slot) = self.slot_mut(*id) else {
+                self.ledger = snapshot;
+                return Err(LeaseError::UnknownAccounting);
+            };
+            slot.custody = Some(record);
             slot.capture = None;
         }
-        self.persist_revised()?;
-        if !custody.matches(&self.custody_identity(id)?) {
-            return Err(LeaseError::UnknownAccounting);
+        if let Err(error) = self.persist_revised() {
+            // Nothing durable changed, so the legacy ledger is the truth again
+            // and no later write inherits a mixed representation.
+            self.ledger = snapshot;
+            return Err(error);
         }
-        Ok(Some(custody))
+        Ok(staged)
     }
 
     fn validate_idle_slot_scope(
@@ -2973,8 +3023,32 @@ impl Pool {
             .filter(|slot| slot.state == SlotPersistState::Evicting)
             .map(|slot| (slot.id, slot.incarnation))
             .collect();
+        // Every legacy in-ledger journal is staged and published in one
+        // validated revision, so several valid predecessor journals never make
+        // each other invalid (oxide#181).
+        let legacy: Vec<u64> = self
+            .ledger
+            .slots
+            .iter()
+            .filter(|slot| slot.state == SlotPersistState::Evicting && slot.custody.is_none())
+            .map(|slot| slot.id)
+            .collect();
+        let mut staged = if legacy.is_empty() {
+            HashMap::new()
+        } else {
+            match self.migrate_legacy_deletions(&legacy) {
+                Ok(staged) => staged,
+                Err(LeaseError::UnknownAccounting) => {
+                    // Nothing was published: every legacy record keeps its
+                    // journal and charge, and the next open retries.
+                    self.reconciliation_blocked = true;
+                    HashMap::new()
+                }
+                Err(error) => return Err(error),
+            }
+        };
         for (id, incarnation) in evicting {
-            match self.reconcile_one(id, incarnation) {
+            match self.reconcile_one(id, incarnation, staged.remove(&id)) {
                 Ok(()) => {}
                 Err(LeaseError::UnknownAccounting) => {
                     self.reconciliation_blocked = true;
@@ -2988,7 +3062,12 @@ impl Pool {
     /// Reconcile one recorded deletion: verify and claim its custody, apply the
     /// #155 replay outcomes, delete the tree through the custody journal, then
     /// drop only its matching record while custody is still held.
-    fn reconcile_one(&mut self, id: u64, incarnation: u64) -> Result<(), LeaseError> {
+    fn reconcile_one(
+        &mut self,
+        id: u64,
+        incarnation: u64,
+        staged: Option<CustodyLock>,
+    ) -> Result<(), LeaseError> {
         let path = self.slot_path(id)?;
         let (published, current) = {
             let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
@@ -2999,21 +3078,24 @@ impl Pool {
             // object.
             return Err(LeaseError::UnknownAccounting);
         }
-        let mut custody = match published {
-            Some(custody) => {
-                let identity = self.custody_identity(id)?;
-                match super::custody::claim(&self.root, &custody, &identity)? {
-                    // A live custodian holds the lock: skip this object only.
-                    Claim::Busy => return Ok(()),
-                    Claim::Unknown => return Err(LeaseError::UnknownAccounting),
-                    Claim::Claimed(lock) => lock,
+        let mut custody = match staged {
+            // A record the one staged legacy revision published in this open:
+            // this process already holds its exclusive lock, so it is never
+            // re-claimed (a second descriptor of the same file would look
+            // busy to this process).
+            Some(lock) => lock,
+            None => match published {
+                Some(custody) => {
+                    let identity = self.custody_identity(id)?;
+                    match super::custody::claim(&self.root, &custody, &identity)? {
+                        // A live custodian holds the lock: skip this object only.
+                        Claim::Busy => return Ok(()),
+                        Claim::Unknown => return Err(LeaseError::UnknownAccounting),
+                        Claim::Claimed(lock) => lock,
+                    }
                 }
-            }
-            // A record published before the custody fence is migrated first:
-            // its in-ledger journal is copied byte-exactly and never
-            // reinterpreted.
-            None => match self.migrate_legacy_deletion(id)? {
-                Some(lock) => lock,
+                // No custody and no staged migration: the record keeps its
+                // journal and charge, and the next open retries.
                 None => return Err(LeaseError::UnknownAccounting),
             },
         };

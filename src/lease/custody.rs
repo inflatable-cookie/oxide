@@ -39,12 +39,13 @@ use super::{
     MANAGED_NAME, MAX_PATH_BYTES,
 };
 use crate::owned_delete::{
-    CaptureRecord, ForeignCapture, RootCaptureJournal, RootCapturePhase, RootCapturePlan,
+    descriptor_identity, observe_entry, CaptureRecord, ForeignCapture, RootCaptureJournal,
+    RootCapturePhase, RootCapturePlan,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -500,6 +501,10 @@ pub(super) fn claim(
         Ok(false) => return Ok(Claim::Busy),
         Err(_) => return Ok(Claim::Unknown),
     }
+    // Debug-only seam: a test can replace the lock name in exactly the window
+    // between the successful flock and the name recheck below.
+    #[cfg(test)]
+    crate::test_fs::run_after_custody_lock();
     claim_file(
         &custody.nonce,
         &dir,
@@ -543,6 +548,15 @@ fn claim_file(
     {
         return Ok(Claim::Unknown);
     }
+    // The published name must still resolve to the descriptor this process
+    // holds. A rename or replacement between the open and this recheck (or
+    // between the flock and it) leaves the held inode unlinked while the name
+    // holds an unknown object: that is unknown custody, and the record keeps
+    // its charge. The lookup is descriptor-relative and no-follow, so it
+    // cannot be redirected by a replaced parent or a symlink.
+    if !lock_name_is_held(dir, dir_device, dir_inode, &held, (lock_device, lock_inode)) {
+        return Ok(Claim::Unknown);
+    }
     let journal_path = dir.join(JOURNAL_FILE);
     let bytes = match read_private_file_bounded(&journal_path, MAX_JOURNAL_BYTES) {
         Ok(bytes) => bytes,
@@ -573,6 +587,36 @@ fn claim_file(
         },
         journal: document.capture,
     }))
+}
+
+/// Whether `dir` is still the verified directory `dir_device`/`dir_inode` and
+/// its `lock` name still names exactly the held descriptor and the recorded
+/// identity. Every check is descriptor-relative and no-follow.
+fn lock_name_is_held(
+    dir: &Path,
+    dir_device: u64,
+    dir_inode: u64,
+    held: &fs::Metadata,
+    recorded: (u64, u64),
+) -> bool {
+    let Ok(parent) = super::open_verified_directory(dir) else {
+        return false;
+    };
+    if descriptor_identity(parent.as_fd()).ok() != Some((dir_device, dir_inode)) {
+        return false;
+    }
+    let Ok(name) = std::ffi::CString::new(LOCK_FILE) else {
+        return false;
+    };
+    let Ok(facts) = observe_entry(parent.as_fd(), &name) else {
+        return false;
+    };
+    let held_identity = (held.dev(), held.ino());
+    facts.file_type() == libc::S_IFREG
+        && facts.uid == current_uid()
+        && facts.mode_bits() & 0o077 == 0
+        && (facts.device, facts.inode) == recorded
+        && held_identity == recorded
 }
 
 impl CustodyIdentityLines {
