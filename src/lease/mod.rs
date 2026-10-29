@@ -57,8 +57,11 @@ pub const MAX_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
 /// presence tells an older binary that this ledger uses ranked idle
 /// replacement; the fence is never removed. Version 2 (oxide#146) adds the
 /// closed per-slot size record, so a version-2 ledger also refuses an older
-/// binary's `deny_unknown_fields` parse.
-pub const CAPACITY_POLICY_VERSION: u32 = 2;
+/// binary's `deny_unknown_fields` parse. Version 3 retains the closed size
+/// across an eviction so older readers refuse the changed state semantics.
+pub const CAPACITY_POLICY_VERSION: u32 = 3;
+/// Version 2 recorded only idle sizes and remains readable.
+pub const PREVIOUS_CAPACITY_POLICY_VERSION: u32 = 2;
 /// The version-1 fence (oxide#118) stays readable and is upgraded by the next
 /// revised write; a version-1 ledger never carries a record.
 pub const LEGACY_CAPACITY_POLICY_VERSION: u32 = 1;
@@ -313,6 +316,8 @@ pub struct VolumeDescription {
     pub payload_dir: String,
     /// Recorded slot deletions an open would reconcile. Read, not run.
     pub evicting_slots: usize,
+    /// IDs of the pending deletions, in ledger order.
+    pub evicting_slot_ids: Vec<String>,
 }
 
 /// Status of one slot. No payload or secret content.
@@ -824,6 +829,15 @@ fn remove_tree_owned(
     path: &Path,
     journal: Option<&mut dyn RootCaptureJournal>,
 ) -> Result<(), LeaseError> {
+    remove_tree_owned_checked(root, path, journal, None)
+}
+
+fn remove_tree_owned_checked(
+    root: &Path,
+    path: &Path,
+    journal: Option<&mut dyn RootCaptureJournal>,
+    expected_root: Option<(u64, u64)>,
+) -> Result<(), LeaseError> {
     let name = path.file_name().ok_or(LeaseError::UnknownAccounting)?;
     let parent_path = path.parent().ok_or(LeaseError::UnknownAccounting)?;
     // Containment is decided once, from the real path, while the tree is still
@@ -844,7 +858,15 @@ fn remove_tree_owned(
         chain: Vec::new(),
         journal,
     };
-    remove_tree_owned_at(root, parent.as_fd(), &name, path, &mut context, true)
+    remove_tree_owned_at(
+        root,
+        parent.as_fd(),
+        &name,
+        path,
+        &mut context,
+        true,
+        expected_root,
+    )
 }
 
 /// Put a captured entry back under its observed name and return the caller's
@@ -948,6 +970,7 @@ fn remove_tree_owned_at(
     path: &Path,
     context: &mut CaptureContext<'_>,
     root_level: bool,
+    expected_root: Option<(u64, u64)>,
 ) -> Result<(), LeaseError> {
     // A private capture name is never ordinary content: it is either a recorded
     // capture (replay reconciles it) or an unrecorded one, which is kept.
@@ -963,6 +986,13 @@ fn remove_tree_owned_at(
     // that private name, so nothing a racer does to the original name can
     // redirect a delete.
     let observed = observe_entry(parent, name).map_err(io_error)?;
+    if root_level
+        && expected_root.is_some_and(|expected| expected != (observed.device, observed.inode))
+    {
+        return Err(LeaseError::UnsafePath(
+            "pending root changed after its completeness preflight",
+        ));
+    }
     if observed.file_type() == libc::S_IFLNK {
         if observed.uid != current_uid() {
             return Err(LeaseError::UnsafePath(
@@ -1096,6 +1126,20 @@ fn remove_tree_owned_at(
                 ))
             }
             Err(error) => return Err(io_error(error)),
+        }
+        #[cfg(debug_assertions)]
+        if context.has_journal()
+            && !record.path.is_empty()
+            && std::env::var("OXIDE_TEST_CAPTURE_UNLINK_STOP")
+                .is_ok_and(|value| value == record.original)
+        {
+            if let Some(evidence) = crate::proof::evidence() {
+                std::fs::write(evidence.join("capture-unlink-stop"), &record.original)
+                    .map_err(io_error)?;
+                // Model process loss, not a recoverable error: stack unwinding
+                // would put the captured root back before the next open.
+                std::process::exit(86);
+            }
         }
         if let Err(reason) = context.record_removed(&record) {
             return Err(LeaseError::Io(format!(
@@ -1299,9 +1343,15 @@ fn remove_tree_owned_at(
         let entry =
             std::ffi::CString::new(entry.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
         let entry_path = path.join(std::ffi::OsStr::from_bytes(entry.as_bytes()));
-        if let Err(error) =
-            remove_tree_owned_at(root, child.as_fd(), &entry, &entry_path, context, false)
-        {
+        if let Err(error) = remove_tree_owned_at(
+            root,
+            child.as_fd(),
+            &entry,
+            &entry_path,
+            context,
+            false,
+            None,
+        ) {
             // Restore the owner's own mode, then leave the captured directory
             // under its original name where the racer has not taken it. The
             // nested records stay: an aborted root keeps their uncertainty.
