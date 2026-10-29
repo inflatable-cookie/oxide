@@ -10086,13 +10086,15 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A pool with one idle slot made `Evicting` without a journal, its build
-    /// tree holding a no-search-bit directory so the next locked open's
-    /// recovery starts a journal and keeps it when the deletion refuses, and a
-    /// version-5 control state (the recorded-accounting fence without the
-    /// raised fence). Returns the fixture root, the store, the key and the
-    /// blocked directory.
-    fn pending_deletion_fixture(label: &str) -> (PathBuf, Store, SlotKey, PathBuf) {
+    /// A pool with one idle slot made `Evicting` without a journal, its
+    /// recorded slot root renamed aside so the recovery preflight finds it
+    /// absent: the next locked open keeps the record and starts no journal,
+    /// and renaming it back lets the following open journal and conclude. The
+    /// fixture carries a version-5 control state (the recorded-accounting fence
+    /// without the raised fence). Nothing in it is unreadable, so the shared
+    /// supervisor's scratch measurement can always walk it. Returns the fixture
+    /// root, the store, the key, the recorded slot root and the hidden path.
+    fn pending_deletion_fixture(label: &str) -> (PathBuf, Store, SlotKey, PathBuf, PathBuf) {
         let (root, store, key) = class_fixture(label);
         let held = lease(&store, &key, None).expect("a slot");
         let build = held.build_dir.clone();
@@ -10113,13 +10115,20 @@ pub(crate) mod tests {
         slot.as_object_mut().expect("object").remove("recorded");
         fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
 
-        // A directory with no search bit keeps the recovery journal.
-        let blocked = build.join("blocked");
-        fs::create_dir(&blocked).unwrap();
-        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Move the recorded root aside: the preflight then finds it absent,
+        // which keeps the `Evicting` record and starts no journal.
+        let slot_root = build.parent().expect("the slot root").to_path_buf();
+        let hidden = slot_root.with_file_name(format!(
+            "{}.pending",
+            slot_root
+                .file_name()
+                .expect("the slot leaf")
+                .to_string_lossy()
+        ));
+        fs::rename(&slot_root, &hidden).expect("hide the pending slot root");
 
         downgrade_control_to_recorded_accounting(&store);
-        (root, store, key, blocked)
+        (root, store, key, slot_root, hidden)
     }
 
     /// Rewrite a pool's control state as version 5 with only the
@@ -10245,7 +10254,8 @@ pub(crate) mod tests {
     /// journal (after the root becomes ready) runs under that durable fence.
     #[test]
     fn a_pending_deletion_is_fenced_version_eight_before_its_recovery_journal() {
-        let (root, store, key, blocked) = pending_deletion_fixture("fence-before-recovery");
+        let (root, store, key, slot_root, hidden) =
+            pending_deletion_fixture("fence-before-recovery");
         let ledger_path = store.pool.join("ledger.json");
         let before: serde_json::Value =
             serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
@@ -10293,12 +10303,12 @@ pub(crate) mod tests {
         assert_eq!(pending["state"], "evicting");
         assert!(
             pending.get("capture").is_none(),
-            "recovery journaled a blocked root"
+            "recovery journaled an absent root"
         );
 
         // The fence is already durable, so the open that can journal (once the
-        // root is ready) is preceded by it.
-        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        // recorded root is back) is preceded by it.
+        fs::rename(&hidden, &slot_root).expect("restore the pending slot root");
         // The open that can now start and finish the recovery journal runs
         // under the version-8 control the first command already made durable.
         let view = store.ledger().expect("the recovery open");
@@ -10314,7 +10324,8 @@ pub(crate) mod tests {
     /// byte-identical: the fence is the command's first durable effect.
     #[test]
     fn a_failed_fence_write_leaves_the_ledger_and_journals_byte_identical() {
-        let (root, store, _key, blocked) = pending_deletion_fixture("fence-write-failure");
+        let (root, store, _key, _slot_root, hidden) =
+            pending_deletion_fixture("fence-write-failure");
         let ledger_path = store.pool.join("ledger.json");
         let state_path = store.control.join("state.json");
         let ledger_bytes = fs::read(&ledger_path).unwrap();
@@ -10339,7 +10350,7 @@ pub(crate) mod tests {
             "a failed fence write changed the control state"
         );
         assert!(
-            blocked.is_dir(),
+            hidden.is_dir(),
             "a failed fence write touched the pending slot"
         );
         let ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
@@ -10347,7 +10358,6 @@ pub(crate) mod tests {
             ledger["slots"][0].get("capture").is_none(),
             "a failed fence write started a recovery journal"
         );
-        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

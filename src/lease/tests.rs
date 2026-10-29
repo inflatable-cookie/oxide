@@ -2831,6 +2831,57 @@ fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 
+/// A control-state lookup that fails for any reason other than absence must
+/// refuse the open before any reconciliation (oxide#177, fence first). Only
+/// `NotFound` means "a library fixture with nothing to fence"; every other
+/// metadata failure refuses, so recovery never runs unfenced (Supervisor
+/// ruling 4c9984a1). A regular file where the control directory belongs makes
+/// `oxide-managed/state.json` fail with ENOTDIR without leaving an
+/// unsearchable directory in the monitored scratch root.
+#[test]
+fn an_unreadable_control_state_refuses_before_recovery() {
+    let fixture = Fixture::new("unreadable-control");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "unreadable-control");
+    // The slot is `Evicting` with its root ready: a reconciling open deletes
+    // it and rewrites the ledger, so byte identity proves no reconciliation
+    // ran.
+    super::pool::mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    let control = pool.join(MANAGED_NAME);
+    if control.is_dir() {
+        fs::remove_dir_all(&control).expect("control dir");
+    }
+    fs::write(&control, b"not a control directory").expect("control placeholder");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).expect("control mode");
+
+    let ledger_path = pool.join("ledger.json");
+    let before = fs::read(&ledger_path).expect("ledger");
+    let result = lease_injected(request(
+        &pool,
+        &fixture.dir("other-project"),
+        &fixture.dir("other-workspace"),
+        "other",
+    ));
+    assert!(
+        result.is_err(),
+        "an unreadable control state admitted a lease"
+    );
+    assert_eq!(
+        fs::read(&ledger_path).expect("ledger"),
+        before,
+        "recovery ran although the control state could not be inspected"
+    );
+    let ledger: serde_json::Value = serde_json::from_slice(&before).expect("ledger json");
+    assert_eq!(
+        ledger["slots"][0]["state"], "evicting",
+        "the pending record was dropped"
+    );
+    assert!(
+        ledger["slots"][0].get("capture").is_none(),
+        "a recovery journal was started"
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
 /// A journaled deletion that cannot be classified keeps the pool blocked:
 /// every new lease is refused with `unknown_accounting`, so no second eviction
 /// (and no second journal) can be started while one is outstanding. This is the

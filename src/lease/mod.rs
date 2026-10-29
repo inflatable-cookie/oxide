@@ -889,8 +889,13 @@ const CONTROL_FENCES: [(&str, &str); 3] = [
 pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
     let control = pool.join(MANAGED_NAME);
     let path = control.join("state.json");
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return Ok(());
+    // Only an absent control state means "a library fixture with nothing to
+    // fence". Any other metadata failure is a refusal: a state this binary
+    // cannot inspect must never let recovery run unfenced.
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(error)),
     };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
