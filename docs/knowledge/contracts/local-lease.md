@@ -692,8 +692,9 @@ pool's 257th and 258th replacements, the twelve-slot project cap with a specific
 held-slot wait and one LRU idle replacement, compatible reuse, no eviction
 below both ceilings, byte-pressure LRU with a held slot excluded, and a
 foreign payload-entry refusal. It also drives a project replacement whose
-payload walk is incomplete (a depth-bound gap) and checks that the victim
-survives and membership is unchanged; every fixture child stays in the
+payload walk is incomplete (a depth-bound gap, with the victim deliberately
+left unrecorded because recorded accounting trusts a current idle record) and
+checks that the victim survives and membership is unchanged; every fixture child stays in the
 qualified supervisor's session and the script starts no session or group of
 its own, so the runner owns closure on any fault. With every slot's record
 current it also checks oxide#177's accounting-cost gate: a new-slot admission
@@ -1499,7 +1500,7 @@ symlinks. These limits are separate from its observed reuse result.
 - Paths ≤ 1024 bytes, absolute, canonical, no symlinks
 - Status output default 65536 bytes (minimum 64)
 - Finite slots 256 (a ledger above 128 carries `capacity_policy: 3`) and a
-  4 MiB ledger; new slots refuse at exhaustion rather than dropping active state
+  8 MiB ledger; new slots refuse at exhaustion rather than dropping active state
 - Init refuses a declared cap that differs from the image size; pre-rule pools
   refuse as mismatched backing without migration
 

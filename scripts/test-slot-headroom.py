@@ -412,15 +412,28 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     run(proof, ["status"], "legacy-status", app, env)
     expect(open(ledger_path, "rb").read() == before, "a read-only status migrated the legacy ledger")
     legacy_state = dict(state)
+    # A genuinely legacy document carries none of the forward fences; keeping
+    # the recorded-accounting or raised-ceiling fence would test a shape no
+    # legacy binary wrote.
+    for fence in ("recorded_accounting", "one_use_workspaces", "slot_ceiling"):
+        legacy_state.pop(fence, None)
     legacy_state["version"] = 1
     write_json(state_path, legacy_state)
+    before_state = open(state_path, "rb").read()
     run(proof, ["status"], "legacy-state-status", app, env)
+    expect(open(state_path, "rb").read() == before_state,
+           "a read-only status migrated the legacy control state")
     expect(read_json(state_path)["version"] == 1, "a read-only status migrated the legacy control state")
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "legacy-first-write", app, env)
     fenced = read_json(ledger_path)
-    expect(fenced.get("capacity_policy") == 2 and read_json(state_path)["version"] == 5,
+    fenced_state = read_json(state_path)
+    expect(fenced.get("capacity_policy") == 2 and fenced_state["version"] == 5,
            "the first revised mutation did not install both fences")
-    RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True})
+    # The small fences pool is below both raised-ceiling triggers (128 slots,
+    # 1 MiB), so the recorded-accounting version is all it gains.
+    expect("slot_ceiling" not in fenced_state,
+           f"a small pool acquired the raised-ceiling fence: {fenced_state}")
+    RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True, "raised_fence": False})
 
     # Counter exhaustion refuses before any transition.
     exhausted = read_json(ledger_path)
@@ -702,9 +715,25 @@ def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
     victim = slot_dir(pool, str(victim_record["id"]))
     run(proof, ["clean"], "project-cap-clean", app, env)
 
+    # Recorded accounting trusts a current idle measurement (oxide#146), so a
+    # current record would mean no walk at all and the depth-gap oracle below
+    # would never run. The victim is made unrecorded exactly as a legacy pool or
+    # a release whose walk did not complete leaves it, and the replacement then
+    # has to walk it before deciding.
+    ledger_path = os.path.join(pool, "ledger.json")
+    unrecorded = read_json(ledger_path)
+    for record in unrecorded["slots"]:
+        if record["id"] == victim_record["id"]:
+            record.pop("recorded", None)
+    write_json(ledger_path, unrecorded)
+    victim_record = next(
+        record for record in unrecorded["slots"] if record["id"] == victim_record["id"]
+    )
+    expect("recorded" not in victim_record, "the depth-gap victim still carries a current record")
+
     # A victim whose tree exceeds the accounting depth bound must refuse the
-    # replacement before deleting anything: the empty payload walk is not
-    # complete, so no idle slot is removed.
+    # replacement before deleting anything: the payload walk over the
+    # unrecorded victim is not complete, so no idle slot is removed.
     deep = os.path.join(victim, "build", "deep")
     current = deep
     for _ in range(70):
@@ -1157,7 +1186,7 @@ def main() -> None:
                 },
                 "coverage_gaps": [
                     "worst-valid 256-slot ledger and 512-record control-state serialization/round-trip and oversized-field refusal are unit tests, not native fixtures",
-                    "the 128-slot vs 256-slot ledger read/rank/write cost is a unit measurement with a fixed 50 ms ceiling, not a native fixture",
+                    "the 128-slot vs 256-slot ledger read/rank/write cost is a unit measurement with a fixed 1000 ms ceiling, not a native fixture",
                     "the thirteen-grant freshness bound is a bounded loop inspection, not separately induced natively",
                 ],
             }
