@@ -32,6 +32,7 @@ Every native-proof authoring or correction brief declares HIGH complexity, appli
 
 - The ordinary Rust selectors run through the installed `oxide` ([dogfooding](docs/knowledge/contracts/workflow.md#dogfooding-in-oxides-repository)). If `oxide` itself is broken, the outage escape is Effigy's machine-wide per-program `oxide` fallback (`force = true` during the outage), or `cargo` by hand, and report the failure as a dogfood finding.
 - `effigy rust:compile` runs `oxide check --workspace --all-targets --locked`.
+- `effigy rust:compile-release` runs `oxide check --release --workspace --bins --locked` (oxide#187). Run it with `rust:compile` for any change to unconditional code, since debug-only proof items reached from it pass the debug selectors and break the release build.
 - `effigy rust:format` runs `oxide fmt --all -- --check`, a Cargo passthrough.
 - `effigy rust:compile-linux` runs `oxide check --locked --offline --target x86_64-unknown-linux-gnu` against the already-installed target. It checks compilation only: no target installation, linking or Linux runtime validation.
 - `effigy oxide:install` builds `oxide` from a commit on pushed main and installs it at `~/.local/bin/oxide` with a hash receipt; it refuses any existing `oxide`. `effigy oxide:reinstall` replaces only the receipt-matching binary. Only the planner runs them, after a reviewed merge. `effigy dogfood:scripts:test` proves the installer's refusals and the account-home proof's image-custody decisions on synthetic fixtures; it never builds, installs or mounts.

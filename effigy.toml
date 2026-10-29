@@ -12,6 +12,9 @@ minimum_effigy_version = "0.14.0"
 # (oxide#077). It never installs a target, links or runs anything, so it is
 # not Linux runtime validation.
 "rust:compile-linux" = "oxide check --locked --offline --target x86_64-unknown-linux-gnu"
+# Release-profile compile of the binaries (oxide#187). Debug-only proof items
+# reached from unconditional code fail here, which the debug selectors miss.
+"rust:compile-release" = "oxide check --release --workspace --bins --locked"
 # Duplicate packages in the normal dependency closure for every target
 # (oxide#103: exactly one sha2). Reads the lock; builds nothing.
 "rust:tree-duplicates" = "oxide tree --locked --offline -e normal -d --target all"
