@@ -814,6 +814,65 @@ fn now_ms() -> u64 {
         })
 }
 
+/// One fence field's raw presence and type. `Option<String>` folds an
+/// explicit JSON `null` into `None`, indistinguishable from an absent key, so
+/// this small raw schema keeps the difference: `present` is true whenever the
+/// key exists, and `string` only when its value is a JSON string.
+#[derive(Default)]
+struct RawFence {
+    present: bool,
+    string: bool,
+}
+
+impl<'de> Deserialize<'de> for RawFence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self {
+            present: true,
+            string: value.is_string(),
+        })
+    }
+}
+
+/// Refuse a present fence that is not a JSON string, including explicit
+/// `null`. A document this pass cannot read is left to the typed parse, which
+/// reports the same malformed input.
+fn reject_non_string_fences(bytes: &[u8]) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct RawDocument {
+        #[serde(default)]
+        recorded_accounting: RawFence,
+        #[serde(default)]
+        one_use_workspaces: RawFence,
+        #[serde(default)]
+        eviction_accounting: RawFence,
+        #[serde(default)]
+        slot_ceiling: RawFence,
+        #[serde(default)]
+        owned_outputs: RawFence,
+    }
+    let Ok(document) = serde_json::from_slice::<RawDocument>(bytes) else {
+        return Ok(());
+    };
+    for (name, field) in [
+        ("recorded_accounting", document.recorded_accounting),
+        ("one_use_workspaces", document.one_use_workspaces),
+        ("eviction_accounting", document.eviction_accounting),
+        ("slot_ceiling", document.slot_ceiling),
+        ("owned_outputs", document.owned_outputs),
+    ] {
+        if field.present && !field.string {
+            return Err(format!(
+                "Oxide state is invalid: a present {name} fence is not a string"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse and validate one control document exactly as the front door's
 /// `Store::load` does: byte caps, the presence-aware class pass, the typed
 /// parse (which denies unknown fields and requires the typed shape), the
@@ -824,6 +883,7 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
         return Err("Oxide state exceeds its byte limit".to_owned());
     }
     reject_class_fields_before_six(bytes)?;
+    reject_non_string_fences(bytes)?;
     let state: State = serde_json::from_slice(bytes)
         .map_err(|error| format!("Oxide state is invalid: {error}"))?;
     let legacy = match state.version {

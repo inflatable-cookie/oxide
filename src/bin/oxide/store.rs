@@ -8694,12 +8694,21 @@ pub(crate) mod tests {
             .expect("a repeated fence is a no-op");
         let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(after, fenced, "a repeated fence rewrote the state");
-        // Version 7 without the fence, and an unknown fence, both refuse.
+        // Genuine absence at version 8 refuses, and an explicit JSON null is a
+        // present non-string field that the shared parser refuses too.
         let mut unfenced = fenced.clone();
-        unfenced["recorded_accounting"] = serde_json::Value::Null;
+        unfenced
+            .as_object_mut()
+            .expect("object")
+            .remove("recorded_accounting");
         write_private(&path, &serde_json::to_vec(&unfenced).unwrap());
         let error = store.load().unwrap_err();
         assert!(error.contains("unsupported version"), "{error}");
+        let mut nulled = fenced.clone();
+        nulled["recorded_accounting"] = serde_json::Value::Null;
+        write_private(&path, &serde_json::to_vec(&nulled).unwrap());
+        let error = store.load().unwrap_err();
+        assert!(error.contains("not a string"), "{error}");
         let mut unknown = fenced.clone();
         unknown["recorded_accounting"] = serde_json::json!("oxide.accounting/9");
         write_private(&path, &serde_json::to_vec(&unknown).unwrap());
@@ -9616,24 +9625,49 @@ pub(crate) mod tests {
         store.release(held, None).expect("idle slot");
         let path = store.control.join("state.json");
         let valid: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        let mut malformed = valid.clone();
+        // Each invalid case is a complete document with only the named field
+        // wrong, so it cannot be rejected for a missing scalar first.
+        let complete_v8 = json!({
+            "version": 8,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "records": [],
+            "cleans": [],
+            "recorded_accounting": "oxide.accounting/1",
+            "eviction_accounting": "oxide.eviction-accounting/1",
+            "slot_ceiling": "oxide.slots/256",
+        });
+        let mut malformed = complete_v8.clone();
         malformed["records"] = json!(42);
-        let mut unsupported = valid.clone();
-        unsupported["version"] = json!(0);
-        let mut missing_one_use = valid.clone();
-        missing_one_use["version"] = json!(6);
-        missing_one_use
-            .as_object_mut()
-            .unwrap()
-            .remove("one_use_workspaces");
-        let mut non_string = valid.clone();
+        let unsupported = json!({
+            "version": 0,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "records": [],
+            "cleans": [],
+        });
+        let missing_one_use = json!({
+            "version": 6,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "records": [],
+            "cleans": [],
+            "recorded_accounting": "oxide.accounting/1",
+        });
+        let mut non_string = complete_v8.clone();
         non_string["slot_ceiling"] = json!(42);
+        let mut null_fence = complete_v8.clone();
+        null_fence["slot_ceiling"] = serde_json::Value::Null;
         for (label, document) in [
             ("valid", valid),
             ("malformed records", malformed),
             ("unsupported version", unsupported),
             ("version 6 without one use", missing_one_use),
             ("non-string ceiling", non_string),
+            ("null ceiling", null_fence),
         ] {
             let bytes = serde_json::to_vec(&document).unwrap();
             fs::write(&path, &bytes).unwrap();

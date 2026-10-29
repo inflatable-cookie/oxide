@@ -2890,7 +2890,7 @@ fn an_unreadable_control_state_refuses_before_recovery() {
 fn an_invalid_control_fence_value_refuses_before_recovery() {
     let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
         "invalid-control-fence",
-        br#"{"version":8,"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":42,"records":[],"cleans":[]}"#,
+        br#"{"version":8,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[],"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":42}"#,
     );
     assert_control_refusal(
         &fixture,
@@ -2909,7 +2909,7 @@ fn an_invalid_control_fence_value_refuses_before_recovery() {
 fn an_unsupported_control_version_refuses_before_recovery() {
     let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
         "unsupported-control-version",
-        br#"{"version":0,"records":[],"cleans":[]}"#,
+        br#"{"version":0,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[]}"#,
     );
     assert_control_refusal(
         &fixture,
@@ -2929,7 +2929,7 @@ fn an_unsupported_control_version_refuses_before_recovery() {
 fn a_version_six_control_without_its_one_use_fence_refuses_before_recovery() {
     let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
         "missing-one-use-fence",
-        br#"{"version":6,"recorded_accounting":"oxide.accounting/1","records":[],"cleans":[]}"#,
+        br#"{"version":6,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[],"recorded_accounting":"oxide.accounting/1"}"#,
     );
     assert_control_refusal(
         &fixture,
@@ -2949,7 +2949,7 @@ fn a_version_six_control_without_its_one_use_fence_refuses_before_recovery() {
 fn a_malformed_records_field_refuses_before_recovery() {
     let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
         "malformed-records",
-        br#"{"version":5,"recorded_accounting":"oxide.accounting/1","next_id":1,"next_use":1,"tickets":[],"records":42,"cleans":[]}"#,
+        br#"{"version":5,"next_id":1,"next_use":1,"tickets":[],"records":42,"cleans":[],"recorded_accounting":"oxide.accounting/1"}"#,
     );
     assert_control_refusal(
         &fixture,
@@ -2958,6 +2958,26 @@ fn a_malformed_records_field_refuses_before_recovery() {
         &state_before,
         &ledger_before,
         "a malformed records field admitted a lease",
+    );
+    fs::remove_dir_all(&fixture.path).expect("cleanup");
+}
+
+/// An explicit JSON `null` on a fence is a present non-string value, not an
+/// absent field: a complete version-5 document otherwise valid must refuse
+/// rather than have the fence inserted (oxide#177).
+#[test]
+fn an_explicit_null_fence_refuses_before_recovery() {
+    let (fixture, pool, state, state_before, ledger_before) = control_refusal_fixture(
+        "null-fence",
+        br#"{"version":5,"next_id":1,"next_use":1,"tickets":[],"records":[],"cleans":[],"recorded_accounting":"oxide.accounting/1","slot_ceiling":null}"#,
+    );
+    assert_control_refusal(
+        &fixture,
+        &pool,
+        &state,
+        &state_before,
+        &ledger_before,
+        "an explicit null fence admitted a lease",
     );
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }

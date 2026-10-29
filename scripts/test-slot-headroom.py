@@ -1190,7 +1190,7 @@ def main() -> None:
                     "scratch_budget_mib": 512,
                 },
                 "coverage_gaps": [
-                    "the 8 MiB MAX_LEDGER_BYTES is the worst-valid byte bound (a larger ledger is corrupt and refused); the measured writer-reachable 256-slot maxima are 4,213,726 bytes all-idle and 5,624,335 bytes with one maximal journal (2,764,273 bytes headroom), and the maximal serialization, 512-record control-state round-trip and oversized-field refusals are unit tests, not native fixtures",
+                    "the 8 MiB MAX_LEDGER_BYTES is the worst-valid byte bound (a larger ledger is corrupt and refused); the measured writer-reachable 256-slot maxima are 4,213,726 bytes all-idle and 5,625,456 bytes with one maximal journal on an Evicting record that retains its closed observation (2,763,152 bytes headroom), and the maximal serialization, 512-record control-state round-trip and oversized-field refusals are unit tests, not native fixtures",
                     "the 128-slot vs 256-slot ledger read/rank/write cost is a unit measurement with a fixed 1000 ms ceiling, not a native fixture",
                     "the thirteen-grant freshness bound is a bounded loop inspection, not separately induced natively",
                 ],

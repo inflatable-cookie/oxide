@@ -670,7 +670,7 @@ That library path writes only the version and the three fence fields, taking
 the admission lock non-blocking and refusing rather than reconciling under
 contention; an absent control state (a library fixture) and passive
 `status`/snapshot readers are never fenced. A present but non-string or
-non-matching fence value, a version/fence combination no front door writer
+non-matching fence value (explicit JSON `null` included), a version/fence combination no front door writer
 produces (including a version-6 document without its one-use fence), or an
 unsupported version such as 0, refuses without repair: only a fence field
 genuinely absent from an older document is inserted. The fence path and the
@@ -1177,7 +1177,7 @@ reply as a size.
 | Front-door release order | `store.rs` `release` (`:1622`), `unshare` (`:1640`), `discard_scratch` (`:1674`), `flush_before_idle` (`:1689`) |
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
-| Control state fence | `store.rs` `STATE_VERSION` (`:89`, 7 is the raised-ceiling fence, 6 the [one-use workspaces](one-use-workspaces.md) fence); the recorded-accounting gate writes `RECORDED_ACCOUNTING_STATE_VERSION` 5, and an owned-outputs successor alone is `PREVIOUS_STATE_VERSION` 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, `SLOT_CEILING_FENCE`, hand-off trigger in `handoff.rs`) |
+| Control state fence | `store.rs` `STATE_VERSION`: 8 is the raised-ceiling fence (oxide#177), 7 the eviction-accounting fence (oxide#175), 6 the [one-use workspaces](one-use-workspaces.md) fence, 5 the recorded-accounting fence; an owned-outputs successor alone is version 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, `EVICTION_ACCOUNTING_FENCE`, `SLOT_CEILING_FENCE`, hand-off trigger in `handoff.rs`) |
 | Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
