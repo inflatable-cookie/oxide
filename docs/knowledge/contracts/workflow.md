@@ -3617,7 +3617,15 @@ oxide#102.
   and names its cause (`entry_limit`, `depth_limit`, `elapsed_deadline`,
   `unreadable_entry`, `missing_metadata`, a mount boundary or a root
   failure), entries visited, elapsed time and bounds; its bytes are never
-  used and never make a slot evictable. The bounds are finite: a larger pool
+  used and never make a slot evictable. The one exception is an admission's
+  walk of an idle slot with no current record on the internal directory pool:
+  that slot is charged conservatively (the maximum of the bytes observed so
+  far, its last record and the largest recorded slot, never zero and never the
+  whole budget) and kept — never evicted, reused or adopted on that walk, and
+  no record — while only an admission whose pool capacity genuinely cannot fit
+  refuses, with a bounded reason naming it (oxide#186). Every other
+  incomplete walk, including a held slot's, the payload scope pass and a
+  removable pool's, still refuses. The bounds are finite: a larger pool
   refuses until idle slots are evicted or cleaned. A `NotFound` bound to a
   non-root path the same walk enumerated at a deferred `read_dir`, `file_type`
   or no-follow metadata call is reported separately as `vanished xN`, not as

@@ -7,7 +7,7 @@ use super::{
     remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass,
     LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
     BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_LEDGER_BYTES, RAISED_CAPACITY_POLICY_VERSION,
+    MAX_LEDGER_BYTES, MAX_REFUSAL_SLOTS, RAISED_CAPACITY_POLICY_VERSION,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -3826,6 +3826,300 @@ fn a_stale_record_is_never_current_and_is_remeasured_instead() {
     let b = b.expect("admission");
     assert!(!b.reused_slot);
     assert_eq!(walks, vec![slot_path], "the stale slot was not remeasured");
+}
+
+#[test]
+fn a_bounded_capacity_refusal_names_at_most_eight_slots() {
+    let named: Vec<String> = (1..=MAX_REFUSAL_SLOTS).map(|id| id.to_string()).collect();
+    let error = LeaseError::CapacityCharged {
+        measured: 4096,
+        limit: 2048,
+        slots: named,
+        omitted: 120,
+    };
+    assert_eq!(error.reason(), "full");
+    assert_eq!(error.exit_code(), 3);
+    let text = error.to_string();
+    assert!(
+        text.contains("unmeasured slot(s) 1, 2, 3, 4, 5, 6, 7, 8 and 120 more"),
+        "{text}"
+    );
+    assert!(text.contains("never evicted on a partial walk"), "{text}");
+    assert!(text.len() < 400, "the refusal is not bounded: {text}");
+}
+
+/// One released idle slot with a current record on a fresh pool: the oxide#186
+/// fixtures take its record away (or leave it) to control which slots an
+/// admission must walk.
+fn released_idle_slot(
+    fixture: &Fixture,
+    label: &str,
+    cap: u64,
+) -> (PathBuf, u64, PathBuf, PathBuf) {
+    let pool = fixture.dir(&format!("{label}-pool"));
+    create_injected(&pool, cap).expect("init");
+    let workspace = fixture.dir(&format!("{label}-workspace"));
+    let project = fixture.dir(&format!("{label}-project"));
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    release_injected(&pool, &leased.lease_id).expect("release");
+    let slot_id = leased.slot_id.parse::<u64>().expect("slot id");
+    let slot_path = pool.join("payload/slots").join(&leased.slot_id);
+    (pool, slot_id, slot_path, workspace)
+}
+
+/// Run one admission under the debug walk delay on `delayed`, so that walk
+/// stops at its elapsed bound.
+fn elapsed_admission(
+    fixture: &Fixture,
+    delayed: &Path,
+    body: impl FnOnce() -> Result<(super::LeaseGrant, Vec<(u64, u64)>), LeaseError>,
+) -> Result<(super::LeaseGrant, Vec<(u64, u64)>), LeaseError> {
+    crate::inventory::walk_observer::with_mutations(
+        fixture.path(),
+        serde_json::json!([{
+            "path": delayed, "action": "delay_before_read_dir", "delay_ms": 300
+        }])
+        .to_string(),
+        || with_accounting_limits(2_000_000, 64, 100, body),
+    )
+}
+
+#[test]
+fn an_unrecorded_slot_whose_admission_walk_elapses_is_charged_and_kept() {
+    let fx = Fixture::new("unmeasured-elapsed");
+    let (pool, slot_id, slot_path, workspace) =
+        released_idle_slot(&fx, "elapsed", 64 * 1024 * 1024);
+    super::pool::drop_record_for_test(&pool, slot_id).expect("drop the record");
+    let before = snapshot_tree(&slot_path);
+    // The delay fires when the slot's own walk lists its root, so that walk
+    // stops at its 100 ms bound having observed nothing. The scope pass
+    // hard-stops at a recorded slot root and never reads it, so it stays
+    // complete: only this one slot is unmeasured.
+    let (admitted, charges) = elapsed_admission(&fx, &slot_path, || {
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &fx.dir("other-project"),
+            &workspace,
+            "other",
+        ))
+    })
+    .expect("a partial slot walk no longer refuses the admission");
+    assert!(!admitted.reused_slot);
+    assert_ne!(admitted.slot_id, slot_id.to_string());
+    assert_eq!(
+        charges,
+        vec![(slot_id, 1)],
+        "the unmeasured slot is charged, never read as free space"
+    );
+    assert_eq!(
+        snapshot_tree(&slot_path),
+        before,
+        "the unmeasured slot was touched"
+    );
+    assert!(slot_path.is_dir());
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(
+        recorded_of(&view, &slot_id.to_string()).is_none(),
+        "a partial walk published a record"
+    );
+    assert_eq!(
+        recorded_of(&view, &admitted.slot_id),
+        None,
+        "the new slot was never measured"
+    );
+    let measured = status_injected(&pool).expect("status");
+    assert!(measured
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == slot_id.to_string() && slot.state == SlotOccupancy::Idle));
+}
+
+#[test]
+fn a_partial_slot_walk_is_charged_the_bytes_it_observed() {
+    let fx = Fixture::new("unmeasured-observed");
+    let (pool, slot_id, slot_path, workspace) =
+        released_idle_slot(&fx, "observed", 64 * 1024 * 1024);
+    let blob = slot_path.join("build").join("blob");
+    fs::write(&blob, vec![b'o'; 128 * 1024]).expect("blob");
+    let nested = slot_path.join("build").join("nested");
+    fs::create_dir(&nested).expect("nested dir");
+    fs::write(nested.join("payload"), b"unscanned").expect("nested payload");
+    let observed = fs::symlink_metadata(&blob).expect("blob metadata").blocks() * 512;
+    assert!(observed > 1);
+    super::pool::drop_record_for_test(&pool, slot_id).expect("drop the record");
+    let before = snapshot_tree(&slot_path);
+    // A depth bound of one reaches the slot's own files and stops at the nested
+    // directory: the walk is partial with the bytes it saw.
+    let (admitted, charges) = with_accounting_limits(2_000_000, 1, 60_000, || {
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &fx.dir("other-project"),
+            &workspace,
+            "other",
+        ))
+    })
+    .expect("a bounded slot walk no longer refuses the admission");
+    assert!(!admitted.reused_slot);
+    assert_eq!(
+        charges,
+        vec![(slot_id, observed)],
+        "the charge is the bytes the partial walk observed"
+    );
+    assert_eq!(
+        snapshot_tree(&slot_path),
+        before,
+        "the unmeasured slot was touched"
+    );
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(recorded_of(&view, &slot_id.to_string()).is_none());
+}
+
+#[test]
+fn byte_pressure_evicts_a_verified_idle_slot_never_the_unmeasured_one() {
+    let fx = Fixture::new("unmeasured-pressure");
+    let cap = 1024 * 1024;
+    let (pool, unmeasured, unmeasured_path, workspace) = released_idle_slot(&fx, "pressure", cap);
+    // A second idle slot whose closed record is current: the only verified
+    // candidate, and it is newer than the slot the walk cannot measure.
+    let recorded = lease_injected(request(
+        &pool,
+        &fx.dir("recorded-project"),
+        &workspace,
+        "recorded",
+    ))
+    .expect("recorded slot");
+    let blob = recorded.env.cargo_build_build_dir.join("blob");
+    fs::write(&blob, vec![b'r'; 700 * 1024]).expect("blob");
+    release_injected(&pool, &recorded.lease_id).expect("release");
+    let recorded_bytes = fs::symlink_metadata(&blob).expect("blob metadata").blocks() * 512;
+    assert!(recorded_bytes < cap);
+    super::pool::drop_record_for_test(&pool, unmeasured).expect("drop the record");
+    let recorded_path = pool.join("payload/slots").join(&recorded.slot_id);
+    let unmeasured_before = snapshot_tree(&unmeasured_path);
+    let (admitted, charges) = elapsed_admission(&fx, &unmeasured_path, || {
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &fx.dir("other-project"),
+            &workspace,
+            "other",
+        ))
+    })
+    .expect("byte pressure evicts the verified candidate and admits");
+    assert_eq!(
+        charges,
+        vec![(unmeasured, recorded_bytes)],
+        "the charge is the largest recorded slot"
+    );
+    assert!(!admitted.reused_slot);
+    assert_ne!(admitted.slot_id, unmeasured.to_string());
+    assert!(
+        unmeasured_path.is_dir(),
+        "the unmeasured slot was evicted on a partial walk"
+    );
+    assert_eq!(snapshot_tree(&unmeasured_path), unmeasured_before);
+    assert!(
+        !recorded_path.exists(),
+        "the verified idle slot was not the victim"
+    );
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
+}
+
+#[test]
+fn a_conservative_charge_that_cannot_fit_refuses_only_that_admission() {
+    let fx = Fixture::new("unmeasured-refusal");
+    let cap = 1024 * 1024;
+    let (pool, unmeasured, unmeasured_path, workspace) = released_idle_slot(&fx, "refusal", cap);
+    // An over-cap slot is a legal soft-cap state, and its closed record is the
+    // conservative stand-in the unmeasured slot is charged with. Evicting it
+    // could not bring the figure under the cap, so it must not be deleted.
+    let over = lease_injected(request(&pool, &fx.dir("over-project"), &workspace, "over"))
+        .expect("over-cap slot");
+    fs::write(
+        over.env.cargo_build_build_dir.join("blob"),
+        vec![b'x'; 1536 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &over.lease_id).expect("release");
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    let (recorded_bytes, current) = recorded_of(&view, &over.slot_id).expect("the over-cap record");
+    assert!(current);
+    assert!(recorded_bytes >= cap);
+    super::pool::drop_record_for_test(&pool, unmeasured).expect("drop the record");
+    let over_path = pool.join("payload/slots").join(&over.slot_id);
+    let unmeasured_before = snapshot_tree(&unmeasured_path);
+    let over_before = snapshot_tree(&over_path);
+    let refused = elapsed_admission(&fx, &unmeasured_path, || {
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &fx.dir("other-project"),
+            &workspace,
+            "other",
+        ))
+    })
+    .expect_err("a charge that cannot fit refuses this admission");
+    match &refused {
+        LeaseError::CapacityCharged {
+            measured,
+            limit,
+            slots,
+            omitted,
+        } => {
+            assert_eq!(*limit, cap);
+            assert!(
+                *measured >= cap,
+                "the refusal does not report the charged figure: {measured}"
+            );
+            assert_eq!(slots, &vec![unmeasured.to_string()]);
+            assert_eq!(*omitted, 0);
+            let text = refused.to_string();
+            assert!(
+                text.contains(&format!("slot(s) {unmeasured}")),
+                "the refusal does not name the unmeasured slot: {text}"
+            );
+            assert!(text.len() < 400, "the refusal is not bounded: {text}");
+        }
+        other => panic!("expected a bounded capacity refusal, got {other:?}"),
+    }
+    assert_eq!(refused.reason(), "full");
+    assert_eq!(refused.exit_code(), 3);
+    assert_eq!(
+        snapshot_tree(&unmeasured_path),
+        unmeasured_before,
+        "the unmeasured slot was touched"
+    );
+    assert!(
+        over_path.is_dir(),
+        "a verified idle slot was deleted for a charge that cannot fit"
+    );
+    assert_eq!(snapshot_tree(&over_path), over_before);
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
+}
+
+#[test]
+fn a_corrupt_ledger_still_refuses_globally_even_where_a_walk_was_partial() {
+    let fx = Fixture::new("unmeasured-corrupt");
+    let (pool, slot_id, slot_path, workspace) =
+        released_idle_slot(&fx, "corrupt", 64 * 1024 * 1024);
+    super::pool::drop_record_for_test(&pool, slot_id).expect("drop the record");
+    let before = snapshot_tree(&slot_path);
+    let stored = fs::read(pool.join("ledger.json")).expect("stored ledger");
+    fs::write(pool.join("ledger.json"), b"{ not a ledger").expect("corrupt ledger");
+    let refused = elapsed_admission(&fx, &slot_path, || {
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &fx.dir("other-project"),
+            &workspace,
+            "other",
+        ))
+    });
+    fs::write(pool.join("ledger.json"), &stored).expect("restore the ledger");
+    assert!(
+        matches!(refused, Err(LeaseError::UnknownAccounting)),
+        "a corrupt ledger was not refused globally: {refused:?}"
+    );
+    assert_eq!(snapshot_tree(&slot_path), before);
 }
 
 #[test]

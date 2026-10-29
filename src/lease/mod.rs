@@ -126,6 +126,9 @@ pub const MAX_HOLDER_BYTES: usize = 128;
 pub const MAX_PATH_BYTES: usize = 1024;
 /// Finite lease-id text.
 pub const MAX_LEASE_ID_BYTES: usize = 160;
+/// The most slot IDs a bounded capacity refusal names before it counts the
+/// rest (oxide#186). Keeps one refusal line bounded at the 256-slot ceiling.
+pub const MAX_REFUSAL_SLOTS: usize = 8;
 /// Cooperative inventory bounds for pool accounting (oxide#108), separate
 /// from the inventory tool's defaults. Sized for real build caches: the
 /// entry bound still admits one 60k-entry Cargo build directory (Farmyard's
@@ -204,6 +207,18 @@ pub enum LeaseError {
     /// A bounded accounting walk that admission, reuse or eviction needed
     /// did not complete. Same reason and exit code as `UnknownAccounting`.
     AccountingIncomplete(Box<AccountingScan>),
+    /// Byte capacity could not admit this admission because the slots a
+    /// partial walk left unmeasured are charged conservatively and are never
+    /// evicted on that charge (oxide#186). A bounded capacity refusal naming
+    /// them: at most [`MAX_REFUSAL_SLOTS`] IDs, then a count. Exit code 3, the
+    /// same capacity class as [`LeaseError::Full`], and never
+    /// `unknown_accounting`: no shared authority is unknown.
+    CapacityCharged {
+        measured: u64,
+        limit: u64,
+        slots: Vec<String>,
+        omitted: usize,
+    },
     /// A one-use admission whose measured slice is still full after restore
     /// (design §6.9): the measured union (or `None` when it could not be
     /// measured) and the byte bound. Exit code 3, beside `Full` and
@@ -233,6 +248,7 @@ impl LeaseError {
             | Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(_)
+            | Self::CapacityCharged { .. }
             | Self::OneUseBudget { .. }
             | Self::LedgerExhausted => 3,
             Self::UnsafePath(_) | Self::BackingMismatch => 4,
@@ -249,6 +265,7 @@ impl LeaseError {
             Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(_) => "unknown_accounting",
+            Self::CapacityCharged { .. } => "full",
             Self::OneUseBudget { .. } => "one_use_budget",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
@@ -290,6 +307,22 @@ impl std::fmt::Display for LeaseError {
             },
             Self::AccountingIncomplete(scan) => {
                 write!(formatter, "owned accounting is incomplete: {scan}")
+            }
+            Self::CapacityCharged {
+                measured,
+                limit,
+                slots,
+                omitted,
+            } => {
+                write!(
+                    formatter,
+                    "pool cap cannot admit a new slot: {measured} of {limit} bytes charged; unmeasured slot(s) {}",
+                    slots.join(", ")
+                )?;
+                if *omitted > 0 {
+                    write!(formatter, " and {omitted} more")?;
+                }
+                formatter.write_str(" are kept and never evicted on a partial walk")
             }
             Self::HolderConflict => {
                 formatter.write_str("holder is already bound to a different lease")

@@ -449,6 +449,27 @@ that root is outside this accounting guarantee: the byte budget is soft and
 may overshoot the charge. The existing registered reserve and running-build
 reserve watchdog remain the free-space protection.
 
+**An unmeasured idle slot at admission is charged, not refused (oxide#186).**
+When an admission walks an idle slot that has no current record and that walk
+stops partial — an elapsed deadline, an entry, depth or mount bound, an
+unreadable entry — the slot is charged
+`max(the bytes it observed before it stopped, its current-generation record if
+any, the largest recorded slot in the pool)`, at least one byte and never the
+whole budget. It is **kept**: the charge lives only in that admission, no
+record is published, and the slot is never a victim, never reused and never
+adopted on that walk. The admission continues under the charge and refuses only
+itself, with a bounded capacity reason that names the slot (`full`, at most
+eight IDs then a count), when the pool genuinely cannot fit; a charge that
+alone exhausts the budget refuses before deleting anything. This removes a
+refusal and narrows eviction eligibility: it adds **no** deletion path or
+authority. Everything shared still refuses globally — the ledger, config,
+backing and fence, the pool scope pass, a slot root that cannot even be
+opened, a held slot's live figure, the reuse candidate's own required-complete
+walk, and a removable pool's bounded walks (its unknown-size reserve route is
+unchanged). `status` keeps showing such a slot as not measured, the ledger
+total stays a stated lower bound over it, and the next release or admission
+walk records it normally.
+
 **A command's child temporary directory is inside its slot (oxide#136).**
 `<slot>/scratch` is an ordinary owned entry of the slot tree, so the same
 unique-allocated `(device, inode)` union counts it once with the rest of the
@@ -476,7 +497,7 @@ defaults, which are unchanged. The callers:
 | --- | --- |
 | The matching idle slot's own walk before reuse | Must be complete, or the lease refuses |
 | The one slot a release or recovery closes (oxide#146) | Best effort: an incomplete walk publishes no record and never fails the release |
-| A slot with no current record, and every held slot, at admission | Must be complete, or the lease refuses (`unknown_accounting`) |
+| A slot with no current record, and every held slot, at admission | An idle slot on the internal directory pool that stops partial is charged conservatively for that admission and kept, never a victim (oxide#186); a held slot's live figure, a removable pool's bounded walks and a root that cannot be opened must be complete, or the lease refuses (`unknown_accounting`) |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
 
 Admission itself no longer walks the payload: it sums the closed per-slot
@@ -1039,8 +1060,10 @@ lock in the same open that uses it:
    is false.
 
 Anything else is **not current**: never zero, never free space. A slot whose
-record is not current is walked before its number is used, and an incomplete
-walk keeps today's `unknown_accounting` refusal exactly.
+record is not current is walked before its number is used; an idle slot on the
+internal directory pool whose walk stops partial is charged conservatively for
+that admission and kept (oxide#186), and every other incomplete walk keeps
+today's `unknown_accounting` refusal exactly.
 
 The one deliberate relaxation, restated because it is the whole point: a
 current record is trusted even though a same-UID process could have changed
@@ -1105,8 +1128,11 @@ recorded_total() = pool_scope() + Σ slot_bytes(slot)      over the ledger
 
 slot_bytes: Held                    -> fresh bounded slot walk (required complete)
             Idle + current record   -> record.unique_allocated_bytes  (no walk)
-            Idle + missing/invalid  -> one bounded slot walk (required complete),
-                                       published before the decision
+            Idle + missing/invalid  -> one bounded slot walk; complete: published
+                                       before the decision; partial on the internal
+                                       directory pool: charged conservatively for
+                                       this admission, never a record or a victim
+                                       (oxide#186)
             Evicting / blocked      -> unknown -> refuse (today's rules)
 ```
 
@@ -1152,17 +1178,22 @@ the proof oracles) so "zero inventory walks" stays a checkable claim.
 One cumulative `ACCOUNTING_MAX_ELAPSED_MS` (60 s) deadline covers every walk of
 one admission, via the existing `walk_limits`/`deadline` mechanism `measure`
 already uses, so a legacy 256-slot pool cannot turn one admission into 256
-fresh minutes. Slots the deadline leaves unmeasured stay unrecorded and the
-admission refuses `unknown_accounting` naming `elapsed_deadline` — today's
-refusal for the same pool, arrived at by slot walks instead of one union walk.
+fresh minutes. Slots the deadline leaves unmeasured stay unrecorded and are
+charged conservatively for that admission (oxide#186); a walk that must still
+be complete — a held slot's live figure or the scope pass — refuses
+`unknown_accounting` naming `elapsed_deadline`, today's refusal for that walk
+arrived at by slot walks instead of one union walk.
 
 Byte pressure then follows today's rules unchanged (`budget` from
 `LeaseRequest.budget_bytes` else the recorded cap): under budget, admit; at or
 over, evict the least-recently-used **eligible** idle whole slot, remeasure,
-and refuse `Full` when only held / retired / uncertain slots remain. One
-deletion must reduce the figure by at least the victim's recorded bytes; a
+and refuse `Full` when only held / retired / uncertain slots remain, or the
+bounded capacity reason naming the unmeasured slots when one was charged
+conservatively (oxide#186). One deletion must reduce the figure by at least
+the victim's recorded bytes; a
 non-reduction refuses `unknown_accounting` instead of looping. Held, foreign,
-symlinked, uncertain and unmeasurable slots are never candidates, and nothing
+symlinked, uncertain and unmeasurable slots — including one this admission
+charged conservatively — are never candidates, and nothing
 here deletes held or unknown storage, active scratch, outputs or evidence.
 
 **Hard links.** A slot's own walk unions `(device, inode)`, so a link pair
@@ -1240,7 +1271,10 @@ The two are labelled separately and never summed into one number: the #128
 sidecar stays ineligible for a pool total, and the ledger total never borrows a
 sidecar fact. Only the ledger total carries admission meaning, and even it is a
 recorded observation — not free space, not a writer- or volume-closure claim.
-An `unrecorded` slot makes the total a stated lower bound. Default status never
+An `unrecorded` slot makes the total a stated lower bound. That includes a slot
+whose admission walk stopped partial: it is charged conservatively for that
+admission only, publishes no record (oxide#186) and keeps its existing
+`not measured` per-slot line. Default status never
 publishes, refreshes, reconciles or creates a lock, and a snapshot may still
 straddle a concurrent replacement and says so.
 
