@@ -919,10 +919,16 @@ def prove_busy_skip(busy_root: str, candidate: str) -> None:
             text=True,
             timeout=work_left(),
         )
-        expect(status.returncode == 0, f"the release replay failed: {status.stderr[-3000:]}")
         expect(
-            all(row["id"] != oldest["id"] for row in slots(pool)),
-            "the released custody was not replayed",
+            status.returncode == 0,
+            f"the release replay failed: {(status.stdout + status.stderr)[-3000:]}",
+        )
+        rows = slots(pool)
+        expect(
+            all(row["id"] != oldest["id"] for row in rows),
+            "the released custody was not replayed: "
+            f"status={(status.stdout + status.stderr)[-1500:]!r} "
+            f"slots={json.dumps(rows)[-2500:]} custody={custody_entries(pool)}",
         )
         expect(not os.path.exists(oldest_path), "the released replay kept the payload")
         say("released custody replayed by a later command")
