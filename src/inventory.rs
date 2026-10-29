@@ -2518,7 +2518,7 @@ mod tests {
         fixture.file("debug/deps/ok.rlib", 10);
         let locked = fixture.path().join("debug/incremental");
         fixture.file("debug/incremental/hidden.o", 10);
-        let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
+        let denied = crate::test_fs::InjectedErrorGuard::read_dir(&locked);
         let report = inventory_directory(fixture.path(), InventoryLimits::default()).unwrap();
         assert_eq!(denied.hits(), 1);
         assert!(!report.coverage.complete);
