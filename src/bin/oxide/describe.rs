@@ -58,6 +58,8 @@ struct Removable {
     /// count, never a refusal, so `available` is unaffected. `null` when the
     /// config and ledger were not read.
     pending_reconciliation_slots: Option<usize>,
+    /// Recorded slot IDs; unknown when the ledger could not be read.
+    pending_reconciliation_slot_ids: Option<Vec<String>>,
     unavailable_reason: Option<&'static str>,
     unavailable_detail: Option<String>,
     payload: Option<String>,
@@ -160,6 +162,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 reserve_bytes: None,
                 available: false,
                 pending_reconciliation_slots: None,
+                pending_reconciliation_slot_ids: None,
                 unavailable_reason: Some(Reason::MetadataUnknown.tag()),
                 unavailable_detail: Some(detail),
                 payload: None,
@@ -171,9 +174,11 @@ fn describe(configured: &Path) -> Result<Description, String> {
             let control = control.ok_or("the registered control directory is missing")?;
             let outcome = availability(&registration, &control);
             let available = outcome.is_ok();
-            let (pending, reason, detail) = match outcome {
-                Ok(pending) => (Some(pending), None, None),
-                Err(Unavailable { reason, detail }) => (None, Some(reason.tag()), Some(detail)),
+            let (pending, pending_ids, reason, detail) = match outcome {
+                Ok((count, ids)) => (Some(count), Some(ids), None, None),
+                Err(Unavailable { reason, detail }) => {
+                    (None, None, Some(reason.tag()), Some(detail))
+                }
             };
             let removable = Removable {
                 mount_point: Some(lossy(&registration.mount_point)),
@@ -182,6 +187,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 reserve_bytes: Some(registration.reserve_bytes),
                 available,
                 pending_reconciliation_slots: pending,
+                pending_reconciliation_slot_ids: pending_ids,
                 unavailable_reason: reason,
                 unavailable_detail: detail,
                 payload: Some(lossy(
@@ -209,7 +215,10 @@ fn describe(configured: &Path) -> Result<Description, String> {
 /// still differ, so this is a snapshot, not a promise. On success it returns
 /// the pending reconciliation count: a build's open reconciles those records
 /// and selects the drive anyway, so they never refuse.
-fn availability(registration: &Registration, control: &Path) -> Result<usize, Unavailable> {
+fn availability(
+    registration: &Registration,
+    control: &Path,
+) -> Result<(usize, Vec<String>), Unavailable> {
     let binding = probe_volume(registration)?;
     let description = probe_control(control, registration)?;
     probe_payload(&binding)?;
@@ -329,8 +338,11 @@ fn probe_payload(binding: &Binding) -> Result<(), Unavailable> {
 
 /// Recorded slot deletions awaiting reconciliation at the next build's open.
 /// Reported beside `available`, never a reason to refuse.
-fn pending(description: &VolumeDescription) -> usize {
-    description.evicting_slots
+fn pending(description: &VolumeDescription) -> (usize, Vec<String>) {
+    (
+        description.evicting_slots,
+        description.evicting_slot_ids.clone(),
+    )
 }
 
 /// `diskutil <args>` as JSON through `plutil`, each process bounded by
@@ -482,6 +494,7 @@ mod tests {
             reserve_bytes: None,
             available: false,
             pending_reconciliation_slots: None,
+            pending_reconciliation_slot_ids: None,
             unavailable_reason: Some(Reason::MetadataUnknown.tag()),
             unavailable_detail: Some("bad \"json\"\\\n".to_owned()),
             payload: None,
@@ -626,6 +639,7 @@ mod tests {
             reserve_bytes: Some(20 * 1024 * 1024 * 1024),
             available: false,
             pending_reconciliation_slots: None,
+            pending_reconciliation_slot_ids: None,
             unavailable_reason: Some(Reason::Absent.tag()),
             unavailable_detail: None,
             payload: Some("/Volumes/Builds/oxide-pool".to_owned()),
@@ -672,10 +686,12 @@ mod tests {
             volume_uuid: "uuid".to_owned(),
             payload_dir: removable::PAYLOAD_DIR.to_owned(),
             evicting_slots: 0,
+            evicting_slot_ids: Vec::new(),
         };
-        assert_eq!(pending(&description), 0);
+        assert_eq!(pending(&description), (0, vec![]));
         description.evicting_slots = 2;
-        assert_eq!(pending(&description), 2);
+        description.evicting_slot_ids = vec!["1".into(), "2".into()];
+        assert_eq!(pending(&description), (2, vec!["1".into(), "2".into()]));
     }
 
     /// The JSON reports the count as a number, `0` when no record is pending.
@@ -688,6 +704,7 @@ mod tests {
             reserve_bytes: Some(20 * 1024 * 1024 * 1024),
             available: true,
             pending_reconciliation_slots: Some(3),
+            pending_reconciliation_slot_ids: Some(vec!["1".into(), "2".into(), "3".into()]),
             unavailable_reason: None,
             unavailable_detail: None,
             payload: Some("/Volumes/Builds/oxide-pool".to_owned()),
@@ -696,9 +713,14 @@ mod tests {
         let json: serde_json::Value = serde_json::to_value(&removable).unwrap();
         assert_eq!(json["available"], true);
         assert_eq!(json["pending_reconciliation_slots"], 3);
+        assert_eq!(
+            json["pending_reconciliation_slot_ids"],
+            serde_json::json!(["1", "2", "3"])
+        );
         assert!(json["unavailable_reason"].is_null());
         let none = Removable {
             pending_reconciliation_slots: Some(0),
+            pending_reconciliation_slot_ids: Some(vec![]),
             ..removable
         };
         let json: serde_json::Value = serde_json::to_value(&none).unwrap();

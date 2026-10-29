@@ -439,7 +439,7 @@ pub fn inventory_directory(
 ) -> Result<InventoryReport, InventoryError> {
     #[cfg(debug_assertions)]
     walk_observer::record(root);
-    inventory_with(root, limits, &[])
+    inventory_with(root, limits, &[], &[])
 }
 
 /// Walk `root` but skip the subtrees named by `stops`, which are paths
@@ -464,13 +464,28 @@ pub fn scope_directory(
 ) -> Result<InventoryReport, InventoryError> {
     #[cfg(debug_assertions)]
     walk_observer::record_scope(root);
-    inventory_with(root, limits, stops)
+    inventory_with(root, limits, stops, &[])
+}
+
+/// Exclude exact pending names before metadata lookup. This is only for
+/// admission accounting that separately charges each isolated name; it is
+/// never evidence of ownership or authority to mutate the excluded tree.
+pub(crate) fn scope_directory_isolating(
+    root: &Path,
+    stops: &[PathBuf],
+    isolated: &[PathBuf],
+    limits: InventoryLimits,
+) -> Result<InventoryReport, InventoryError> {
+    #[cfg(debug_assertions)]
+    walk_observer::record_scope(root);
+    inventory_with(root, limits, stops, isolated)
 }
 
 fn inventory_with(
     root: &Path,
     limits: InventoryLimits,
     stops: &[PathBuf],
+    isolated: &[PathBuf],
 ) -> Result<InventoryReport, InventoryError> {
     limits.validate()?;
     let canonical = fs::canonicalize(root).map_err(|error| match error.kind() {
@@ -497,6 +512,7 @@ fn inventory_with(
     let root_inode = root_metadata.ino();
     let started = Instant::now();
     let mut walker = Walker::new(&canonical, root_device, root_inode, limits, started, stops);
+    walker.isolated = isolated;
     walker.run()?;
     walker.verify_root()?;
     let filesystem_free = probe_filesystem_free(&canonical, root_device);
@@ -709,6 +725,7 @@ struct Walker<'a> {
     root: &'a Path,
     /// Relative paths whose subtrees belong to another owner: hard stops.
     stops: &'a [PathBuf],
+    isolated: &'a [PathBuf],
     stopped: u64,
     limits: InventoryLimits,
     started: Instant,
@@ -766,6 +783,7 @@ impl<'a> Walker<'a> {
         Self {
             root,
             stops,
+            isolated: &[],
             stopped: 0,
             limits,
             started,
@@ -895,6 +913,11 @@ impl<'a> Walker<'a> {
                 };
                 self.entries_visited += 1;
                 let path = entry.path();
+                let relative = path.strip_prefix(self.root).unwrap_or(&path);
+                if self.isolated.iter().any(|name| name == relative) {
+                    self.stopped += 1;
+                    continue;
+                }
                 let file_type_result = self
                     .test_hook_error(&path, WalkPoint::BeforeFileType)
                     .map_or_else(|| entry.file_type(), Err);
@@ -909,7 +932,6 @@ impl<'a> Walker<'a> {
                         continue;
                     }
                 };
-                let relative = path.strip_prefix(self.root).unwrap_or(&path);
                 // A hard stop owns its subtree elsewhere: neither descend nor
                 // count it, so the caller's other accounting is the only one.
                 if file_type.is_dir() && self.stops.iter().any(|stop| stop == relative) {
@@ -2496,7 +2518,7 @@ mod tests {
         fixture.file("debug/deps/ok.rlib", 10);
         let locked = fixture.path().join("debug/incremental");
         fixture.file("debug/incremental/hidden.o", 10);
-        let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
+        let denied = crate::test_fs::InjectedErrorGuard::read_dir(&locked);
         let report = inventory_directory(fixture.path(), InventoryLimits::default()).unwrap();
         assert_eq!(denied.hits(), 1);
         assert!(!report.coverage.complete);

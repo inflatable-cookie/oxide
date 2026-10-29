@@ -535,7 +535,10 @@ fn legacy_ledger_reads_without_migrating_and_the_first_revised_write_fences_it()
         .expect("first revised grant");
     let after_grant = fs::read(pool.join("ledger.json")).expect("fenced ledger");
     let stored: serde_json::Value = serde_json::from_slice(&after_grant).expect("json");
-    assert_eq!(stored["capacity_policy"], serde_json::json!(2));
+    assert_eq!(
+        stored["capacity_policy"],
+        serde_json::json!(super::CAPACITY_POLICY_VERSION)
+    );
     assert_eq!(stored["next_rank"], serde_json::json!(2));
     assert_eq!(stored["slots"][0]["rank"], serde_json::json!(1));
     status_injected(&pool).expect("fenced ledger reads");
@@ -954,15 +957,14 @@ fn unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_releas
         held_status.lease_id.as_deref(),
         Some(held.lease_id.as_str())
     );
-    assert!(matches!(
-        lease_injected(request(
-            &pool,
-            &fx.dir("blocked-project"),
-            &workspace,
-            "blocked-holder"
-        )),
-        Err(LeaseError::UnknownAccounting)
-    ));
+    let other = lease_injected(request(
+        &pool,
+        &fx.dir("blocked-project"),
+        &workspace,
+        "blocked-holder",
+    ))
+    .expect("unrelated slot is admitted");
+    assert_ne!(other.slot_id, idle.slot_id);
     release_injected(&pool, &held.lease_id).expect("unrelated held lease closes");
     assert_eq!(
         fs::read(&sentinel).expect("root symlink target is untouched"),
@@ -1541,7 +1543,7 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     let locked = grant.env.cargo_build_build_dir.join("locked");
     fs::create_dir(&locked).expect("locked dir");
     managed::release(&pool, &grant.lease_id).expect("release");
-    let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
+    let denied = crate::test_fs::InjectedErrorGuard::read_dir(&locked);
     let reuse = managed::lease(request(&pool, &project, &workspace, "b"));
     // Over the tiny budget the recorded idle slot is byte pressure. The
     // accepted stale-idle policy trusts a current record, so a new-slot
@@ -1962,7 +1964,7 @@ fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
         lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
     let slots = denied.join("payload").join("slots");
     let denied_slot_root = slots.join(&denied_grant.slot_id);
-    let denied_lookup = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&denied_slot_root);
+    let denied_lookup = crate::test_fs::InjectedErrorGuard::symlink_metadata(&denied_slot_root);
     let from_status = status_injected(&denied).map(|_| ());
     let from_view = ledger_injected(&denied).map(|_| ());
     assert_eq!(denied_lookup.hits(), 2);
@@ -2027,6 +2029,72 @@ fn ledger_view_refuses_a_foreign_pool_entry_like_status() {
     assert_eq!(ledger_injected(&pool).map(|_| ()), Err(expected));
 }
 
+/// A ledger writer renames `ledger.tmp-*` onto `ledger.json` between the
+/// pool's listing and its lookup, and Finder can remove its metadata the same
+/// way. The lookup then finds the name gone: the entry is neither foreign nor
+/// a symlink, so the open proceeds.
+#[test]
+fn entry_renamed_away_during_pool_open_does_not_fail_the_open() {
+    let fx = Fixture::new("view-renamed-entry");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    for name in ["ledger.tmp-0123abcd", ".DS_Store"] {
+        let entry = pool.join(name);
+        fs::write(&entry, b"{}").expect("listed entry");
+        let vanished = crate::test_fs::InjectedErrorGuard::not_found_symlink_metadata(&entry);
+        assert_eq!(ledger_injected(&pool).map(|_| ()), Ok(()), "{name}");
+        assert_eq!(vanished.hits(), 1, "{name} lookup must be exercised");
+        drop(vanished);
+        fs::remove_file(&entry).expect("cleanup listed entry");
+    }
+}
+
+/// Only a vanished entry is skipped. A `ledger.tmp-*` symlink still refuses,
+/// and any other lookup error on a listed temp still refuses as I/O.
+#[test]
+fn ledger_temp_refusals_survive_the_vanished_entry_rule() {
+    let fx = Fixture::new("view-temp-refusals");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let target = fx.path().join("elsewhere");
+    fs::write(&target, b"{}").expect("symlink target");
+    let link = pool.join("ledger.tmp-0123abcd");
+    symlink(&target, &link).expect("temp symlink");
+    assert_eq!(
+        ledger_injected(&pool).map(|_| ()),
+        Err(LeaseError::UnsafePath("symlinks are refused"))
+    );
+    fs::remove_file(&link).expect("remove temp symlink");
+
+    let temp = pool.join("ledger.tmp-0123abcd");
+    fs::write(&temp, b"{}").expect("temp file");
+    let denied = crate::test_fs::InjectedErrorGuard::symlink_metadata(&temp);
+    assert_eq!(
+        ledger_injected(&pool).map(|_| ()),
+        Err(LeaseError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()
+        ))
+    );
+    assert_eq!(denied.hits(), 1, "the temp lookup must be exercised");
+}
+
+/// An unknown name refuses from the listing alone, before any lookup, so a
+/// vanished-entry lookup armed on it is never reached.
+#[test]
+fn unknown_entry_refuses_before_any_lookup_during_pool_open() {
+    let fx = Fixture::new("view-unknown-lookup");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let stray = pool.join("stray");
+    fs::write(&stray, b"foreign").expect("stray");
+    let vanished = crate::test_fs::InjectedErrorGuard::not_found_symlink_metadata(&stray);
+    assert_eq!(
+        ledger_injected(&pool).map(|_| ()),
+        Err(unexpected("pool directory", "stray"))
+    );
+    assert_eq!(vanished.hits(), 0, "an unknown name is refused unlooked-up");
+}
+
 const VOLUME_UUID: &str = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
 
 const VOLUME_CONFIG: &str = r#"{"version":1,"backend":"apfs-volume-v1","store_id":"store","cap_bytes":1000,"image_bytes":0,"volume":{"mount_point":"/Volumes/Builds","volume_uuid":"A6AC3ED7-33EA-46B4-8082-7254CF291ED2","payload_dir":"oxide-pool"}}"#;
@@ -2088,7 +2156,7 @@ fn volume_description_reports_unreadable_control_metadata_as_io() {
     let control = control_fixture(&fixture, VOLUME_CONFIG, LEDGER_WITH_EVICTING);
     let before = snapshot_tree(&control);
     for name in ["config.json", "ledger.json"] {
-        let denied = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&control.join(name));
+        let denied = crate::test_fs::InjectedErrorGuard::symlink_metadata(&control.join(name));
         assert_eq!(
             managed::describe_volume(&control),
             Err(LeaseError::Io(
@@ -2693,7 +2761,7 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
 /// before the open, so this recovery path is preceded by the hand-off fence
 /// (oxide#177, fence first).
 #[test]
-fn recovery_creates_a_journal_for_a_second_pending_deletion() {
+fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     let fixture = Fixture::new("recovery-journal");
     let pool = fixture.dir("pool");
     create_injected(&pool, 8 * 1024 * 1024).expect("init");
@@ -2732,22 +2800,24 @@ fn recovery_creates_a_journal_for_a_second_pending_deletion() {
     .expect("journal");
 
     // Slot B: `Evicting` with no journal, and a tree the deletion cannot
-    // finish (a directory with no search bit), so recovery starts a journal and
-    // keeps it when the deletion refuses.
+    // finish (a directory with no search bit), so recovery refuses before its
+    // preflight and keeps the record without starting a journal (oxide#175).
     super::pool::mark_evicting_for_test(&pool, second_id).expect("recorded deletion");
     let blocked = second_path.join("blocked");
     fs::create_dir(&blocked).expect("blocked directory");
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("no search bit");
 
-    // One open reconciles them: A stays blocked and B gains a fresh journal.
+    // One open reconciles them: A stays blocked with its journal, and B stays
+    // pending with no journal, so recovery never starts a second one
+    // (oxide#177's single-journal writer guard, kept by the fence-first run).
     let _ = status_injected(&pool);
     assert!(
         super::pool::capture_record_injected(&pool, first_id).is_some(),
         "the blocked journal is retained"
     );
     assert!(
-        super::pool::capture_record_injected(&pool, second_id).is_some(),
-        "recovery created a second journal"
+        super::pool::capture_record_injected(&pool, second_id).is_none(),
+        "recovery started a second journal"
     );
     let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
     assert_eq!(
@@ -4698,11 +4768,9 @@ fn a_refused_eviction_after_the_root_capture_recovers_on_the_next_open() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
-/// A captured private name that vanishes during the live run is never success:
-/// the drain stops, the recorded capture is retained, and the next pool open
-/// stays pending instead of declaring completion.
+/// A vanished capture remains uncertain when the live run restored its root.
 #[test]
-fn a_captured_private_name_that_vanishes_is_pending_and_never_completes() {
+fn a_vanished_capture_under_a_restored_root_remains_pending() {
     let fixture = Fixture::new("live-vanish");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "live-vanish");
     let parent = slot_path.parent().expect("slot parent").to_path_buf();
@@ -4724,12 +4792,94 @@ fn a_captured_private_name_that_vanishes_is_pending_and_never_completes() {
     );
 
     let after = status_injected(&pool).expect("status");
-    assert_eq!(
-        after.slots.len(),
-        1,
-        "a vanished capture is never completion"
-    );
+    assert_eq!(after.slots.len(), 1);
     assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
+/// The incident journal has a root, build/debug/deps captures, and one
+/// unlinked file whose removal has not yet been dropped from the journal.
+#[test]
+fn replay_concludes_an_unlinked_file_in_the_2255_capture_shape() {
+    let fixture = Fixture::new("nested-file-2255");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "nested-file-2255");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let mut directory = parent.join(&plan.private);
+    let mut chain = Vec::new();
+    let mut records = Vec::new();
+    for name in [
+        "build",
+        "debug",
+        "deps",
+        "arrow_schema-8fafd6ba14ed7d09.arrow_schema.ec65cfc77a09ada8-cgu.13.rcgu.o",
+    ] {
+        let leaf = directory.join(name);
+        if name.ends_with(".o") {
+            fs::write(&leaf, b"fixture").expect("file");
+        } else if !leaf.exists() {
+            fs::create_dir(&leaf).expect("directory");
+        }
+        let mode = if name == "build" {
+            0o700
+        } else if name.ends_with(".o") {
+            0o644
+        } else {
+            0o755
+        };
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(mode)).expect("incident mode");
+        let held = File::open(&directory).expect("directory descriptor");
+        let original = std::ffi::CString::new(name).expect("name");
+        let capture = crate::owned_delete::capture_entry(held.as_fd(), &original).expect("capture");
+        let facts =
+            crate::owned_delete::observe_entry(held.as_fd(), &capture.private).expect("facts");
+        let private = String::from_utf8(capture.private.as_bytes().to_vec()).expect("private name");
+        records.push(crate::owned_delete::CaptureRecord {
+            path: chain.clone(),
+            private: private.clone(),
+            original: name.to_owned(),
+            device: facts.device,
+            inode: facts.inode,
+            mode: facts.mode as u32,
+        });
+        directory.push(&private);
+        chain.push(private);
+    }
+    fs::remove_file(&directory).expect("modelled unlink");
+    write_journal(&pool, slot_id, plan, true, records, Vec::new());
+    let after = status_injected(&pool).expect("replay");
+    assert!(after.slots.is_empty());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}
+
+/// A missing captured directory is never treated as an unlinked file.
+#[test]
+fn an_absent_nested_directory_stays_pending() {
+    let fixture = Fixture::new("absent-captured-directory");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "absent-captured-directory");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(captured.join("nested")).expect("nested directory");
+    let held = File::open(&captured).expect("captured root descriptor");
+    let name = std::ffi::CString::new("nested").expect("name");
+    let entry = crate::owned_delete::capture_entry(held.as_fd(), &name).expect("capture");
+    let facts = crate::owned_delete::observe_entry(held.as_fd(), &entry.private).expect("facts");
+    let private = String::from_utf8(entry.private.as_bytes().to_vec()).expect("private name");
+    let record = crate::owned_delete::CaptureRecord {
+        path: Vec::new(),
+        private: private.clone(),
+        original: "nested".to_owned(),
+        device: facts.device,
+        inode: facts.inode,
+        mode: facts.mode as u32,
+    };
+    fs::remove_dir(captured.join(&private)).expect("modelled missing directory");
+    write_journal(&pool, slot_id, plan, true, vec![record], Vec::new());
+    let after = status_injected(&pool).expect("status");
+    assert_eq!(after.slots.len(), 1);
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
+    assert!(captured.is_dir());
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
 }
 
@@ -4783,6 +4933,326 @@ fn a_nested_put_back_collision_keeps_both_names_and_the_record() {
     );
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
     fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
+}
+
+/// A blocked deletion keeps its own slot and its closed size, while a
+/// different project can obtain a fresh slot under the remaining budget.
+#[test]
+fn blocked_eviction_is_charged_but_does_not_block_other_admissions() {
+    let fixture = Fixture::new("blocked-isolation");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-isolation");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(&slot_path).expect("collision");
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    let granted =
+        lease_injected(request(&pool, &project, &workspace, "other")).expect("unrelated admission");
+    assert_ne!(granted.slot_id, slot_id.to_string());
+    assert!(captured.is_dir());
+    assert!(slot_path.is_dir());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
+/// The retained recorded charge prevents another allocation when it exhausts
+/// the budget; the blocked slot must stay intact and cannot become a victim.
+#[test]
+fn blocked_eviction_charge_prevents_over_budget_admission() {
+    let fixture = Fixture::new("blocked-charge");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-charge");
+    let parent = slot_path.parent().expect("parent").to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    fs::create_dir(&slot_path).expect("collision");
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    let mut req = request(&pool, &project, &workspace, "other");
+    req.budget_bytes = Some(1);
+    assert!(matches!(lease_injected(req), Err(LeaseError::Full)));
+    assert!(captured.is_dir());
+    assert!(slot_path.is_dir());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+}
+
+/// A pending root without a capture journal cannot be distinguished from a
+/// replacement when its contents are unreadable. It is isolated and charged,
+/// while an independent unreadable subtree remains an accounting error.
+#[test]
+fn an_unjournaled_inaccessible_eviction_is_a_conservative_refusal() {
+    for unrelated in [false, true] {
+        let fixture = Fixture::new(if unrelated {
+            "pending-other-gap"
+        } else {
+            "pending-gap"
+        });
+        let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+        mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+        // The non-private root is refused before a capture journal is made.
+        // The inventory hook supplies a deterministic unreadable subtree even
+        // on volumes whose mount ignores ordinary owner permissions.
+        fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o755))
+            .expect("non-private slot");
+        let blocked = slot_path.join("blocked");
+        fs::create_dir(&blocked).expect("blocked directory");
+        let mut faults = vec![serde_json::json!({
+            "path": blocked, "action": "permission_denied_before_read_dir"
+        })];
+        if unrelated {
+            let other = pool.join("payload/slots/unrelated");
+            fs::create_dir(&other).expect("unrelated directory");
+            faults.push(serde_json::json!({
+                "path": other, "action": "permission_denied_before_read_dir"
+            }));
+        }
+        let project = fixture.dir("other-project");
+        let workspace = fixture.dir("other-workspace");
+        let result = crate::inventory::walk_observer::with_mutations(
+            fixture.path(),
+            serde_json::Value::Array(faults).to_string(),
+            || lease_injected(request(&pool, &project, &workspace, "other")),
+        );
+        if unrelated {
+            assert!(
+                matches!(result, Err(LeaseError::AccountingIncomplete(_))),
+                "{result:?}"
+            );
+        } else {
+            assert!(result.is_ok(), "unrelated admission: {result:?}");
+        }
+        assert!(slot_path.is_dir(), "pending root was removed");
+    }
+}
+
+/// A pending unjournaled root that exhausts the scope walk's entry bound is
+/// charged by the largest recorded or observed size without changing it.
+#[test]
+fn an_unjournaled_eviction_over_the_entry_bound_admits_other_work() {
+    fn snapshot(path: &Path, base: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+        let mut children: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        children.sort();
+        for child in children {
+            let metadata = fs::symlink_metadata(&child).unwrap();
+            let content = if metadata.is_file() {
+                fs::read(&child).unwrap()
+            } else {
+                Vec::new()
+            };
+            entries.push((
+                child.strip_prefix(base).unwrap().to_path_buf(),
+                metadata.mode(),
+                content,
+            ));
+            if metadata.is_dir() {
+                snapshot(&child, base, entries);
+            }
+        }
+    }
+    let fixture = Fixture::new("pending-entry-bound");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+    mark_evicting_for_test(&pool, slot_id).expect("recorded deletion");
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o755)).expect("non-private slot");
+    for index in 0..40 {
+        fs::write(slot_path.join(format!("entry-{index}")), b"x").expect("fixture entry");
+    }
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    let mut before = Vec::new();
+    let root_mode = fs::symlink_metadata(&slot_path).unwrap().mode();
+    snapshot(&slot_path, &slot_path, &mut before);
+    let mutation = serde_json::json!([{
+        "path": slot_path, "action": "remove_before_file_type"
+    }]);
+    crate::inventory::walk_observer::with_mutations(fixture.path(), mutation.to_string(), || {
+        with_accounting_limits(20, 64, 60_000, || {
+            let (charge, largest, observed) =
+                super::pool::pending_charge_injected(&pool, slot_id).unwrap();
+            assert_eq!(charge, largest.max(observed));
+            let result = lease_injected(request(&pool, &project, &workspace, "other"));
+            assert!(result.is_ok(), "unrelated admission: {result:?}");
+        });
+    });
+    let mut after = Vec::new();
+    snapshot(&slot_path, &slot_path, &mut after);
+    assert_eq!(before, after);
+    assert_eq!(fs::symlink_metadata(&slot_path).unwrap().mode(), root_mode);
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}
+
+#[test]
+fn a_changed_pending_root_is_not_journaled_or_deleted() {
+    let fixture = Fixture::new("changed-pending-root");
+    let root = fixture.dir("root");
+    let slot = root.join("slot");
+    fs::create_dir(&slot).unwrap();
+    let actual = fs::symlink_metadata(&slot).unwrap();
+    fs::write(slot.join("keep"), b"unchanged").unwrap();
+    let expected = (actual.dev(), actual.ino().wrapping_add(1));
+    let result = super::remove_tree_owned_checked(&root, &slot, None, Some(expected));
+    assert!(matches!(
+        result,
+        Err(LeaseError::UnsafePath(
+            "pending root changed after its completeness preflight"
+        ))
+    ));
+    assert_eq!(fs::read(slot.join("keep")).unwrap(), b"unchanged");
+}
+
+#[test]
+fn a_private_pending_tree_over_the_entry_bound_is_not_journaled() {
+    let fixture = Fixture::new("private-pending-bound");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+    mark_evicting_for_test(&pool, slot_id).unwrap();
+    for index in 0..40 {
+        fs::write(slot_path.join(format!("entry-{index}")), b"unchanged").unwrap();
+    }
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    with_accounting_limits(20, 64, 60_000, || {
+        let result = lease_injected(request(&pool, &project, &workspace, "other"));
+        assert!(result.is_ok(), "unrelated admission: {result:?}");
+    });
+    assert_eq!(fs::read(slot_path.join("entry-39")).unwrap(), b"unchanged");
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
+}
+
+#[test]
+fn a_journaled_search_only_root_over_the_bound_restores_mode_and_stays_pending() {
+    let fixture = Fixture::new("journaled-search-only-bound");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
+    let parent = slot_path.parent().unwrap().to_path_buf();
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    let captured = parent.join(&plan.private);
+    for index in 0..40 {
+        fs::write(captured.join(format!("entry-{index}")), b"unchanged").unwrap();
+    }
+    fs::set_permissions(&captured, fs::Permissions::from_mode(0o100)).unwrap();
+    write_journal(
+        &pool,
+        slot_id,
+        crate::owned_delete::RootCapturePlan {
+            mode: u32::from(plan.mode & u32::from(libc::S_IFMT)) | 0o100,
+            ..plan
+        },
+        true,
+        Vec::new(),
+        Vec::new(),
+    );
+    let before = fs::read(pool.join("ledger.json")).unwrap();
+    let widened = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&widened);
+    let hook = crate::test_fs::after_step_chmod(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+    });
+    let status = with_accounting_limits(20, 64, 60_000, || status_injected(&pool)).unwrap();
+    drop(hook);
+    assert_eq!(
+        widened.load(Ordering::Relaxed),
+        1,
+        "root was widened for preflight"
+    );
+    assert_eq!(status.slots.len(), 1);
+    assert_eq!(mode_of(&captured), 0o100);
+    assert!(!slot_path.exists());
+    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
+    assert_eq!(before, fs::read(pool.join("ledger.json")).unwrap());
+    fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(fs::read(captured.join("entry-39")).unwrap(), b"unchanged");
+}
+
+/// A replacement at the recorded name stays untouched while the recorded
+/// pending root remains isolated; replacement sizing is outside this charge.
+#[test]
+fn blocked_capture_collision_stays_untouched() {
+    let fixture = Fixture::new("blocked-collision-bytes");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "blocked-collision-bytes");
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    fs::create_dir(&slot_path).expect("collision");
+    fs::write(slot_path.join("foreign"), vec![1_u8; 9 * 1024 * 1024]).expect("foreign bytes");
+    let project = fixture.dir("other-project");
+    let workspace = fixture.dir("other-workspace");
+    let result = lease_injected(request(&pool, &project, &workspace, "other"));
+    assert!(result.is_ok(), "unrelated admission: {result:?}");
+    assert!(slot_path.join("foreign").is_file());
+    assert!(slot_path
+        .parent()
+        .expect("parent")
+        .join(plan.private)
+        .is_dir());
+}
+
+/// A competing admission waits for the pool lock while eviction is in flight,
+/// then succeeds after the first holder finishes.
+#[test]
+fn a_competing_admission_waits_for_an_inflight_eviction() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    if let Some(pool) = std::env::var_os("OXIDE_175_CHILD_POOL") {
+        let project = PathBuf::from(std::env::var_os("OXIDE_175_CHILD_PROJECT").expect("project"));
+        let workspace =
+            PathBuf::from(std::env::var_os("OXIDE_175_CHILD_WORKSPACE").expect("workspace"));
+        let ready = PathBuf::from(std::env::var_os("OXIDE_175_CHILD_READY").expect("ready"));
+        fs::write(ready, b"ready").expect("child ready");
+        lease_injected(request(Path::new(&pool), &project, &workspace, "second"))
+            .expect("second process admits after the eviction");
+        return;
+    }
+    let fixture = Fixture::new("concurrent-eviction");
+    let (pool, _, _) = idle_slot_for_eviction(&fixture, "concurrent-eviction");
+    let first_project = fixture.dir("first-project");
+    let second_project = fixture.dir("second-project");
+    let workspace = fixture.dir("shared-workspace");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let mut first_request = request(&pool, &first_project, &workspace, "first");
+    first_request.budget_bytes = Some(1);
+    let first = thread::spawn(move || {
+        let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "metadata", false);
+        let _pause = crate::test_fs::before_unlink_at(1, move || {
+            entered_tx.send(()).expect("pause reached");
+            resume_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("pause released");
+        });
+        lease_injected(first_request)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("eviction paused");
+    let ready = fixture.path().join("second-ready");
+    let mut second = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "lease::tests::a_competing_admission_waits_for_an_inflight_eviction",
+        ])
+        .env("OXIDE_175_CHILD_POOL", &pool)
+        .env("OXIDE_175_CHILD_PROJECT", &second_project)
+        .env("OXIDE_175_CHILD_WORKSPACE", &workspace)
+        .env("OXIDE_175_CHILD_READY", &ready)
+        .spawn()
+        .expect("start second process");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let started = ready.exists();
+    thread::sleep(Duration::from_millis(250));
+    let waiting = second.try_wait().expect("second process status").is_none();
+    resume_tx.send(()).expect("resume eviction");
+    let first_result = first.join().expect("first worker");
+    let second_result = second.wait().expect("second process exit");
+    assert!(
+        started && waiting,
+        "second process did not wait for the pool lock"
+    );
+    assert!(
+        second_result.success(),
+        "second process exit: {second_result}"
+    );
+    assert!(first_result.is_ok(), "first admission: {first_result:?}");
 }
 
 /// A panic after the product widened the captured root's mode restores the
@@ -4860,7 +5330,7 @@ fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
     let captured = parent.join(&plan.private);
     // A search-only nested directory, captured, holding one captured child.
     fs::create_dir(captured.join("nested")).expect("nested directory");
-    fs::write(captured.join("nested").join("inner"), b"x").expect("inner");
+    fs::create_dir(captured.join("nested").join("inner")).expect("inner");
     let held = File::open(&captured).expect("captured root descriptor");
     let nested = std::ffi::CString::new("nested").expect("name");
     let outer = crate::owned_delete::capture_entry(held.as_fd(), &nested).expect("nested capture");
@@ -4894,7 +5364,7 @@ fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
     ];
     // The descendant vanishes, so the rollback cannot resolve it, and the owner
     // left the ancestor search-only.
-    fs::remove_file(nested_dir.join(child.private.to_string_lossy().as_ref()))
+    fs::remove_dir(nested_dir.join(child.private.to_string_lossy().as_ref()))
         .expect("descendant removed");
     write_journal(&pool, slot_id, plan, true, records, Vec::new());
     // The owner left the ancestor search-only, so the replay has to widen it

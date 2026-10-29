@@ -16,7 +16,7 @@ a specific held-slot wait, the honest all-held refusal and one LRU idle
 replacement after affinity is dropped; ordinary compatible reuse and no
 eviction below both ceilings; byte-pressure LRU with a held slot excluded; and
 a foreign payload entry refusal, and a native crossing of the legacy 128-slot
-ceiling that must write `capacity_policy: 3`. The worst-valid 256-slot ledger
+ceiling that must write `capacity_policy: 4`. The worst-valid 256-slot ledger
 and 512-record control-state serialization/round-trip and oversized-field
 refusals are unit tests in `effigy test rust`, not native fixtures.
 
@@ -393,8 +393,10 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(slot["rank"] == 2 and slot["state"] == "idle", f"release did not stamp the idle rank: {slot}")
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    expect(state["version"] == 5, f"the first mutation did not install the recorded-accounting control fence: {state}")
-    RESULTS.append({"case": "fences-installed", "ledger_policy": 2, "state_version": 5})
+    expect(state["version"] == 8, f"the first mutation did not install the version-8 control fences: {state}")
+    expect(state.get("slot_ceiling") == "oxide.slots/256", f"the raised-ceiling fence is missing: {state}")
+    expect(state.get("eviction_accounting") == "oxide.eviction-accounting/1", f"the eviction-accounting fence is missing: {state}")
+    RESULTS.append({"case": "fences-installed", "ledger_policy": 2, "state_version": 8})
 
     # A legacy representation (no fence, rank 0) still reads for status and
     # is not migrated by the observer.
@@ -415,7 +417,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     # A genuinely legacy document carries none of the forward fences; keeping
     # the recorded-accounting or raised-ceiling fence would test a shape no
     # legacy binary wrote.
-    for fence in ("recorded_accounting", "one_use_workspaces", "slot_ceiling"):
+    for fence in ("recorded_accounting", "one_use_workspaces", "eviction_accounting", "slot_ceiling"):
         legacy_state.pop(fence, None)
     legacy_state["version"] = 1
     write_json(state_path, legacy_state)
@@ -427,13 +429,15 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "legacy-first-write", app, env)
     fenced = read_json(ledger_path)
     fenced_state = read_json(state_path)
-    expect(fenced.get("capacity_policy") == 2 and fenced_state["version"] == 5,
-           "the first revised mutation did not install both fences")
-    # The small fences pool is below both raised-ceiling triggers (128 slots,
-    # 1 MiB), so the recorded-accounting version is all it gains.
-    expect("slot_ceiling" not in fenced_state,
-           f"a small pool acquired the raised-ceiling fence: {fenced_state}")
-    RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True, "raised_fence": False})
+    expect(fenced.get("capacity_policy") == 2 and fenced_state["version"] == 8,
+           "the first revised mutation did not install the version-8 control fences")
+    # Fence first: even this one-slot pool gains the raised-ceiling and
+    # eviction-accounting fences before its first ledger write.
+    expect(fenced_state.get("slot_ceiling") == "oxide.slots/256",
+           f"the first revised mutation did not fence the raised ceiling: {fenced_state}")
+    expect(fenced_state.get("eviction_accounting") == "oxide.eviction-accounting/1",
+           f"the first revised mutation did not fence eviction accounting: {fenced_state}")
+    RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True, "raised_fence": True})
 
     # Counter exhaustion refuses before any transition.
     exhausted = read_json(ledger_path)
@@ -512,18 +516,18 @@ def prove_raised_fence(proof: Proof, pool: str, env: dict, workdir: str) -> None
     expect(len(after["slots"]) == 129, f"the 129th slot was not recorded: {len(after['slots'])}")
     expect(any(record["id"] == 129 for record in after["slots"]), "the 129th slot was not allocated")
     expect(
-        after.get("capacity_policy") == 3,
+        after.get("capacity_policy") == 4,
         f"crossing the legacy 128-slot ceiling did not raise the ledger fence: {after.get('capacity_policy')}",
     )
     state = read_json(os.path.join(pool, "oxide-managed", "state.json"))
     expect(
-        state["version"] == 7 and state.get("slot_ceiling") == "oxide.slots/256",
+        state["version"] == 8 and state.get("slot_ceiling") == "oxide.slots/256",
         f"the 129th slot did not make the raised-ceiling control fence durable: {state}",
     )
     RESULTS.append({
         "case": "raised-fence-at-129-slots",
         "policy_before": 2,
-        "policy_after": 3,
+        "policy_after": 4,
         "state_version": state["version"],
         "slots": 129,
     })
@@ -578,15 +582,16 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     ledger["next_rank"] = rank
     # A slot table above the legacy 128 must carry the raised-ceiling fence,
     # which is what an older binary refuses.
-    ledger["capacity_policy"] = 3
+    ledger["capacity_policy"] = 4
     write_json(ledger_path, ledger)
     # The product makes the matching control fence durable before it first
     # records the 129th slot (proved by the raised-fence case), so the fixture
     # models the same consistent pair instead of a state no writer produces.
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    state["version"] = 7
+    state["version"] = 8
     state["slot_ceiling"] = "oxide.slots/256"
+    state["eviction_accounting"] = "oxide.eviction-accounting/1"
     write_json(state_path, state)
 
     # Default status at the 256-slot ceiling is recorded-only: it walks
@@ -642,10 +647,10 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     expect(len(after["slots"]) == 256, f"pool count {len(after['slots'])} is not 256")
     expect(all(record["id"] != 1 for record in after["slots"]), "the evicted record remains")
     expect(any(record["id"] == 257 for record in after["slots"]), "the 257th slot was not allocated")
-    expect(after.get("capacity_policy") == 3, "the 257th slot did not raise the ledger fence")
+    expect(after.get("capacity_policy") == 4, "the 257th slot did not raise the ledger fence")
     state = read_json(state_path)
     expect(
-        state["version"] == 7 and state.get("slot_ceiling") == "oxide.slots/256",
+        state["version"] == 8 and state.get("slot_ceiling") == "oxide.slots/256",
         f"an ordinary release dropped the raised-ceiling control fence: {state}",
     )
     RESULTS.append({

@@ -1794,6 +1794,17 @@ pub fn names_of(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
     }
 }
 
+/// A complete listing under an entry cap, or an error without a partial list.
+pub(crate) fn names_of_bounded(dir: BorrowedFd<'_>, max: usize) -> io::Result<Vec<OsString>> {
+    match list_names(dir, max)? {
+        Names::Listed(names) => Ok(names
+            .into_iter()
+            .map(|name| OsString::from_vec(name.into_bytes()))
+            .collect()),
+        Names::TooMany(_) => Err(io::Error::other("directory listing exceeded its bound")),
+    }
+}
+
 /// The `(device, inode)` identity of a held descriptor.
 pub fn descriptor_identity(fd: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };

@@ -282,6 +282,19 @@ entry ownership are verified. The target is never followed or removed.
 Deletion never touches project or workspace paths. A deletion restores owner read, write and search on each owned real directory it removes, so read-only directories a build or test left inside a slot (such as Effigy's `.effigy/state/objects/<hash>` under a slot's child scratch) cannot leave a recorded deletion unfinishable; foreign directories and symlinks still refuse, and a symlink is unlinked as a leaf, never followed. A lost delete is
 reconciled only for the recorded evicting slot path.
 
+An incomplete or unverifiable pending eviction remains isolated from reuse,
+adoption and deletion. For an existing journal, recorded directory modes are
+restored through identity-verified descriptors around the completeness
+preflight; a failed preflight retains the journal and deletes nothing. An
+unjournaled root receives no mode change or capture before a complete
+preflight. Its admission charge is the maximum of its recorded
+size and the largest recorded slot (these budget-only pools have no per-slot
+byte ceiling). No observed-byte term is used: pathname inventory does not hold
+a no-follow root for a descriptor-relative walk. Arbitrary replacement of
+that root is outside this accounting guarantee: the byte budget is soft and
+may overshoot the charge. The existing registered reserve and running-build
+reserve watchdog remain the free-space protection.
+
 **A command's child temporary directory is inside its slot (oxide#136).**
 `<slot>/scratch` is an ordinary owned entry of the slot tree, so the same
 unique-allocated `(device, inode)` union counts it once with the rest of the
@@ -585,10 +598,11 @@ open reconciles all `Evicting` records before admitting anything.
 journal, `reconcile_slot_capture` returns `Resume` and `remove_owned_slot`
 creates and persists a fresh `SlotCaptureJournal` through `begin`, without the
 `retire_idle_slot` guard; a recoverable inherited journal is rolled back,
-cleared and restarted the same way. A failed deletion deliberately keeps that
-journal, and the loop continues past a blocked record, so one open can leave a
-journal for every failing pending deletion, up to `MAX_SLOTS`. The front
-door's admission gate makes the version-7 control fence durable before any
+cleared and restarted the same way. The journal is started only after
+`pending_root_ready` completes its bounded preflight, so a blocked or
+partially inventoried tree keeps its record and starts no journal; a failed
+deletion that did start one keeps it and is retried on the next open. The front
+door's admission gate makes the version-8 control fence durable before any
 locked open (see the fence paragraph), so recovery, journal starts and ledger
 writes are all preceded by the hand-off fence.
 
@@ -602,11 +616,10 @@ cap does not grow for multi-journal states.
 
 The measured *ordinary-path writer-reachable* maxima are reported separately:
 the all-idle figure above, and 5,624,335 bytes with this writer's maximal single
-journal, leaving **2,764,273 bytes headroom** under the cap. Recovery of pending
-deletions can leave more journals in one open (above), bounded only by
-`MAX_SLOTS` and by this cap itself — a write above 8 MiB is refused — so the
-5,624,335-byte state is the maximal ordinary-path state, not a bound on
-recovery. The journal name fields keep their enforced `PATH_MAX` 1024 bytes /
+journal, leaving **2,764,273 bytes headroom** under the cap. An earlier write can still
+have left more than one journal in a pool, and the reader accepts any
+otherwise-valid ledger at or below this cap — a write above 8 MiB is refused —
+so the 5,624,335-byte state is what this writer reaches on its ordinary path. The journal name fields keep their enforced `PATH_MAX` 1024 bytes /
 `NAME_MAX` 255-byte component bounds at writer and reader. Control
 state is bounded
 separately: 512 records (one per slot with the previous 2× headroom), 128 wait
@@ -629,27 +642,29 @@ recorded-accounting representation, oxide#146) and rank sequence atomically
 with that mutation; the Store-controlled mutation's own recorded-accounting
 control fence is already durable first (see
 [recorded per-slot accounting](#recorded-per-slot-accounting-oxide146-implemented-native-held)).
-A slot table above the legacy 128 carries `capacity_policy: 3` (oxide#177),
+A slot table above the legacy 128 carries `capacity_policy: 4` (oxide#177),
 written forward-only, in the same atomic replacement that first records the
-129th slot. An older binary's policy check accepts only 1 and 2, so it refuses
-a `3` ledger with `unknown_accounting` (exit 3) before any mutation; a ledger
-above 128 slots without the fence is a state no writer produces and refuses
-too. A pool that stays at or below 128 slots never carries `3`, so its ledger
-stays readable by an older binary. The ledger alone cannot order that switch
-against the [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122),
-which reads control state rather than the ledger, so the mutating-command
-admission gate makes a forward-only **version-7** control fence durable as the
-command's first write (`oxide.slots/256`, Oxide Supervisor ruling 4c9984a1,
-fence first). The gate runs under the admission lock and before any locked
-`Pool::open` (which reconciles recorded deletions, can start a recovery
-journal and writes the ledger), so every such effect — ordinary eviction,
-recovery, journal start and ledger write — is preceded by the durable fence. An
-older binary with version ≤ 6 then hands off to a receipt-matching successor
-or refuses before it reads the ledger, so no predecessor ledger-size argument
-is needed. An already-version-7 control is not rewritten; a failed fence write
-refuses the command with no ledger or journal write. Passive `status` and
-snapshot readers never take this gate and never fence, so only a pool this
-binary never mutates stays at version 5. A completed legacy `Evicting`
+129th slot. An older binary's policy check accepts only 1–3 (1 and 2 from
+oxide#146, 3 from oxide#175), so it refuses a `4` ledger with
+`unknown_accounting` (exit 3) before any mutation; a ledger above 128 slots
+without the fence is a state no writer produces and refuses too. A pool that
+stays at or below 128 slots never carries `4`, so its ledger stays readable by
+an older binary. The ledger alone cannot order that switch against the
+[#122 hand-off](workflow.md#installed-binary-hand-off-oxide122), which reads
+control state rather than the ledger, so the mutating-command admission gate
+makes a forward-only **version-8** control fence durable as the command's
+first write (the oxide#177 `oxide.slots/256` fence, beside the oxide#175
+eviction-accounting and oxide#146 recorded-accounting fences; Oxide Supervisor
+ruling 4c9984a1, fence first). The gate runs under the admission lock and
+before any locked `Pool::open` (which reconciles recorded deletions, can start
+a recovery journal and writes the ledger), so every such effect — ordinary
+eviction, recovery, journal start and ledger write — is preceded by the
+durable fence. An older binary with version ≤ 7 then hands off to a
+receipt-matching successor or refuses before it reads the ledger, so no
+predecessor ledger-size argument is needed. An already-version-8 control is
+not rewritten; a failed fence write refuses the command with no ledger or
+journal write. Passive `status` and snapshot readers never take this gate and
+never fence, so only a pool this binary never mutates stays at version 5. A completed legacy `Evicting`
 reconciliation may still finish in the legacy representation. Before a revised write, every
 stored field is validated against the raised caps; an oversized legacy field
 refuses with the original file, ownership and quarantine bytes untouched,
@@ -755,12 +770,11 @@ trust of a recorded idle slot until its generation changes.
 
 **What shipped.** `SlotRecord.recorded` carries one closed observation, the
 `capacity_policy` fence is now **2** (version 1 stays readable and is upgraded
-by the next revised write; oxide#177 adds the raised-ceiling policy 3 above
-128 slots), and the front door's control `STATE_VERSION` is **5** with the
-`oxide.accounting/1` fence written durably by the first mutating command's
-admission gate, before any library write can fence the ledger (oxide#177 adds
-the version-7 `oxide.slots/256` fence for a pool that reaches the legacy
-ceiling). `Pool::recorded_total()` replaces the whole-payload admission walk
+by the next revised write; oxide#177 adds the raised-ceiling policy 4 above
+128 slots, and oxide#175's eviction accounting is policy 3), and the front
+door's control `STATE_VERSION` is **8**, carrying the recorded-accounting,
+eviction-accounting and raised-ceiling fences written durably by the first
+mutating command's admission gate, before any locked open or library write. `Pool::recorded_total()` replaces the whole-payload admission walk
 with `pool_scope()` (a new `inventory::scope_directory` entry point with a
 ledger-membership hard stop, observed on its own debug-only
 `OXIDE_TEST_SCOPE_LOG`) plus one figure per slot, and `Pool::pressure()` is
@@ -1109,10 +1123,10 @@ ledger; an owned-outputs-only save still derives version 4. Phase B therefore wr
 recorded ledger write, so an installed version-4 binary hands off to a
 receipt-matching successor instead of refusing the pool it was just handed.
 The raised-ceiling fence (oxide#177) repeats that ordering for `capacity_policy:
-3`: the version-7 `oxide.slots/256` control fence is made durable by the
-admission that holds this pool's lock at the legacy 128-slot membership, before
-that same admission can record the 129th slot, and a later ordinary save keeps
-version 7 because the fence is part of the document. A
+4`: the admission gate writes control version 8 (with the `oxide.slots/256`
+fence) as the command's first write, before the locked open and before that
+same admission can record the 129th slot, and a later ordinary save keeps
+version 8 because the fences are part of the document. A
 crash between the two writes leaves control 5 with a v1 ledger, which is a
 normal state for the new binary and a hand-off for the older one; the reverse
 order would strand it. The old binary's own refusal remains the honest
@@ -1184,15 +1198,16 @@ decision mocks where a real path exists:
    zero stays a measured zero; an incomplete walk refuses with its gap kinds.
 7. **Serialization.** Worst-valid 256-slot ledger round-trips under
    `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
-8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2` and `3`
-   ledgers; held IDs preserved; the recorded-accounting control fence is
-   version 5 written by the admission gate before the ledger fence, and a pool
-   at the legacy 128-slot membership additionally writes the version-7
-   `oxide.slots/256` fence before its admission can record the 129th slot; an
+8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2`, `3` and
+   `4` ledgers; held IDs preserved; the admission gate writes control version
+   8 (recorded, eviction-accounting and raised-ceiling fences) as every
+   mutating command's first write, before any locked open, recovery journal or
+   ledger write, so a pool this binary mutates never feeds a predecessor a
+   ledger it cannot represent or a control version it cannot read; an
    owned-outputs-only state derives version 4 (proved on `save` directly, not
    through a path that takes admission), a v4 control still hands off, a v5
    document without the recorded fence or with an unknown fence value refuses,
-   and version 7 requires the raised-ceiling fence; old-binary refusal is
+   and version 8 requires the raised-ceiling fence; old-binary refusal is
    exercised as a ledger parse/validation refusal, not a mutation.
 9. **Removable combination.** The cap uses pool bytes only, so a volume whose
    unrelated used bytes exceed the cap still admits with no eviction while the
@@ -1525,7 +1540,7 @@ symlinks. These limits are separate from its observed reuse result.
 - Holder ≤ 128 printable ASCII bytes without `/`
 - Paths ≤ 1024 bytes, absolute, canonical, no symlinks
 - Status output default 65536 bytes (minimum 64)
-- Finite slots 256 (a ledger above 128 carries `capacity_policy: 3`) and a
+- Finite slots 256 (a ledger above 128 carries `capacity_policy: 4`) and a
   8 MiB ledger; new slots refuse at exhaustion rather than dropping active state
 - Init refuses a declared cap that differs from the image size; pre-rule pools
   refuse as mismatched backing without migration

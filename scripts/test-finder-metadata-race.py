@@ -23,8 +23,8 @@ their custody records only inside `OXIDE_PROOF_EVIDENCE`.
 directory-budget pool, which the product correctly refuses on an external
 volume. It stays inside the same monitored 512 MiB owned root.
 
-Stages this HEAD's debug `oxide` offline with the pinned 1.97.1 toolchain
-through plain Cargo, then drives the debug-only race injection
+Stages this HEAD's and the pinned pre-change commit's debug `oxide` offline
+with the pinned 1.97.1 toolchain through plain Cargo, then drives the debug-only race injection
 (`OXIDE_TEST_FINDER_RACE`, absent from release builds, armed only under the
 supervisor's exported layout) at exactly the boundary the product documents —
 after the caller's listing, before the removal:
@@ -32,6 +32,17 @@ after the caller's listing, before the removal:
 - `lease_control`: two admissions under a 1 MiB budget; the second evicts the
   first project's idle whole slot with no race armed. The slot *leaf* is gone
   and no deletion is pending. Fixture premise.
+- `lease_unlinked_file`: stop immediately after a nested `filler` unlink,
+  verify its journal record remains, admit an unrelated build while a
+  fixture collision blocks recovery, remove that collision, and check that
+  the next admission removes the victim.
+- `lease_old_counterfactual`: the pinned old binary creates a raced eviction;
+  its verified root is moved to its recorded private name with a fixture-owned
+  replacement at the observed name. The old binary refuses an unrelated check
+  with `unknown_accounting`. The test upgrades only the ledger fence and restores
+  the old idle size observation, then the candidate admits the same check while
+  keeping both the captured root and replacement. The two binary hashes are
+  printed; this fixture-only ledger migration is not a product migration.
 - `lease_metadata`: the same eviction raced with `.DS_Store`/`._*`. The
   eviction completes and the evidence records the firing.
 - `lease_foreign`: raced with an ordinary file. The admission refuses, the slot
@@ -74,9 +85,9 @@ after the caller's listing, before the removal:
 
 Limits, stated rather than implied: `oxide clean` is deliberately unchanged (it
 removes exactly its enumerated plan, so new content is left and counted) and has
-no case here. No run of this script has passed: its fit is UNMEASURED, and its
-uncounted diagnostic and both counted author and independent reviewer natives
-each need their own owner activation.
+no case here. No run of this script has passed: its fit is UNMEASURED. The
+uncounted diagnostic and counted author native each need owner activation;
+the independent reviewer native is waived for oxide#175.
 
 Diagnostic safety (`--diagnostic`): only a *recoverable oracle* failure is
 recorded and followed by the next independent case. An unknown writer, device,
@@ -99,15 +110,18 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    override and handed to staging and every fixture child with
    `RUSTUP_TOOLCHAIN=1.97.1` and `RUSTUP_AUTO_INSTALL=0`; fixture crates have
    no dependencies and every fixture Cargo call is unlocked, so no lock is
-   generated for a `--locked` call; only the staging call is `--locked` and it
-   uses this repository's own committed lock.
+   generated for a `--locked` call; both offline staging calls are `--locked`
+   and use the lock committed in their respective source trees.
 2. account-home control: `OXIDE_TEST_HOME_FROM_ENV=1` in `case_env`.
 3. environment isolation: `case_env` drops every inherited `OXIDE_*`, `XDG_*`,
    `CARGO_*`, `GIT_*`, `RUSTUP_*`, `RUSTC*` and `RUSTFLAGS` before setting only
    the fixture's explicit values, then re-adds the supervisor's own
    `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_DEADLINE_NS`,
    `OXIDE_PROOF_EVIDENCE` (required for the hook guard) and, per case,
-   `OXIDE_TEST_FINDER_RACE`.
+   `OXIDE_TEST_FINDER_RACE`, or the scoped `OXIDE_TEST_CAPTURE_UNLINK_STOP`
+   for the nested-file case. That case uses the existing debug-only
+   `OXIDE_TEST_BUDGET_BYTES` to admit below a larger temporary budget while
+   the captured slot is blocked.
 4. automatic adoption: `workspace()` makes a real private Git repository whose
    `.gitignore` covers `target`, so the first conversion is eligible; each
    prune case then asserts the adopted owned root, the checkout's member link
@@ -158,10 +172,12 @@ import secrets
 import shutil
 import stat
 import subprocess
+import tarfile
 import time
 
 MIB = 1024 * 1024
 BUILDER = "1.97.1"
+BASE_COMMIT = "d5f5e4d5f3793d770a4241405dc3f33f200df7cc"
 POOL_BUDGET = 1 * MIB
 IMAGE_MIB = 128
 RESERVE = "16MiB"
@@ -247,6 +263,8 @@ CRATE = {
 GITIGNORE = "/target\n"
 CASES = (
     "lease_control",
+    "lease_unlinked_file",
+    "lease_old_counterfactual",
     "lease_metadata",
     "lease_foreign",
     "lease_link",
@@ -263,6 +281,8 @@ CASES = (
 # bound is exercised; `None` is the unraced premise control.
 RACES = {
     "lease_control": None,
+    "lease_unlinked_file": None,
+    "lease_old_counterfactual": None,
     "lease_metadata": "*:metadata",
     "lease_foreign": "*:foreign",
     "lease_link": "*:link",
@@ -451,8 +471,8 @@ def git(env: dict, cwd: str, *args: str):
     )
 
 
-def stage(root: str) -> str:
-    stage_dir = os.path.join(root, "stage")
+def stage(root: str, source: str, label: str) -> str:
+    stage_dir = os.path.join(root, f"stage-{label}")
     env = scrubbed(os.environ)
     env.update(toolchain_env())
     env.update(
@@ -468,7 +488,7 @@ def stage(root: str) -> str:
             "CARGO_PROFILE_DEV_CODEGEN_UNITS": "16",
         }
     )
-    log = os.path.join(root, "stage.log")
+    log = os.path.join(root, f"stage-{label}.log")
     try:
         handle = open(log, "w", encoding="utf-8")
     except OSError as error:
@@ -477,7 +497,7 @@ def stage(root: str) -> str:
         try:
             build = subprocess.run(
                 ["cargo", "build", "-j", "4", "--locked", "--offline", "--bin", "oxide"],
-                cwd=REPO,
+                cwd=source,
                 env=env,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -501,7 +521,7 @@ def stage(root: str) -> str:
     built = os.path.join(stage_dir, "target", "debug", "oxide")
     if not os.path.isfile(built):
         fail(f"staging produced no binary at {built}")
-    subject = os.path.join(root, "oxide")
+    subject = os.path.join(root, f"oxide-{label}")
     try:
         shutil.copy2(built, subject)
         os.chmod(subject, 0o755)
@@ -510,6 +530,44 @@ def stage(root: str) -> str:
     except OSError as error:
         unknown(f"cannot publish the staged binary at {subject}: {error}")
     return subject
+
+
+
+def base_source(root: str) -> str:
+    """Extract the immutable pre-change tree into this proof's scratch."""
+    archive = os.path.join(root, "base.tar")
+    source = os.path.join(root, "base-source")
+    os.mkdir(source, 0o700)
+    with open(archive, "wb") as output:
+        try:
+            result = subprocess.run(
+                ["git", "archive", "--format=tar", BASE_COMMIT],
+                cwd=REPO, stdout=output, stderr=subprocess.PIPE, timeout=work_left(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            unknown(f"base source archive could not be closed: {error}")
+    if result.returncode:
+        fail(f"base source archive failed: {result.stderr[-1000:]!r}")
+    with tarfile.open(archive, "r:") as bundle:
+        for member in bundle:
+            name = member.name.rstrip("/") if member.isdir() else member.name
+            components = name.split("/")
+            if (member.name.startswith("/") or any(part in ("", ".", "..") for part in components)
+                    or not (member.isdir() or member.isfile())):
+                unknown(f"unsafe base archive entry: {member.name!r}")
+            target = os.path.join(source, *components)
+            if member.isdir():
+                os.makedirs(target, mode=0o700, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+                content = bundle.extractfile(member)
+                if content is None:
+                    unknown(f"unreadable base archive entry: {member.name!r}")
+                with content, open(target, "xb") as destination:
+                    shutil.copyfileobj(content, destination)
+                os.chmod(target, member.mode & 0o777)
+    os.unlink(archive)
+    return source
 
 
 def case_root(root: str, case: str) -> str:
@@ -552,11 +610,13 @@ def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
     return env, base
 
 
-def workspace(env: dict, base: str, name: str) -> str:
+def workspace(env: dict, base: str, name: str, package: str = "app") -> str:
     """A tiny private Git checkout whose ignore rule covers `target`."""
     path = os.path.join(base, "workspaces", name)
     os.makedirs(os.path.join(path, "src"), exist_ok=True)
     for relative, contents in CRATE.items():
+        if relative == "Cargo.toml" and package != "app":
+            contents = contents.replace('name = "app"', f'name = "{package}"', 1)
         with open(os.path.join(path, relative), "w", encoding="utf-8") as handle:
             handle.write(contents)
     with open(os.path.join(path, ".gitignore"), "w", encoding="utf-8") as handle:
@@ -683,6 +743,17 @@ def selected_members(document: dict, root_path: str) -> list:
     )
 
 
+
+def verified_capture_name(value: object) -> str:
+    """A journal name is a private leaf, never a path outside the fixture."""
+    prefix = ".oxide-capture-"
+    if (not isinstance(value, str) or not value.startswith(prefix)
+            or len(value) != len(prefix) + 32
+            or any(char not in "0123456789abcdef" for char in value[len(prefix):])):
+        unknown(f"invalid private capture name: {value!r}")
+    return value
+
+
 def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
     env, base = case_env(root, case, race)
     mark = evidence_mark()
@@ -695,7 +766,88 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
             f"{case}: the first admission left {len(before)} slot leaves, expected one: {sorted(before)}"
         )
     victim = next(iter(before))
-    second = run([oxide, "check"], cwd=workspace(env, base, "b"), env=env)
+    second_env = dict(env)
+    if case == "lease_unlinked_file":
+        second_env["OXIDE_TEST_CAPTURE_UNLINK_STOP"] = "filler"
+    second = run([oxide, "check"], cwd=workspace(env, base, "b"), env=second_env)
+    if case == "lease_unlinked_file":
+        marker = os.path.join(evidence_dir(), "capture-unlink-stop")
+        if second.returncode == 0 or not os.path.isfile(marker):
+            fail(f"{case}: nested unlink stop did not fire: {second.stderr[-1500:]}")
+        with open(os.path.join(env["OXIDE_POOL"], "ledger.json"), encoding="utf-8") as handle:
+            ledger = json.load(handle)
+        slots = [slot for slot in ledger.get("slots", []) if slot.get("capture")]
+        entries = slots[0]["capture"].get("captures", []) if len(slots) == 1 else []
+        files = [entry for entry in entries if entry.get("original") == "filler" and entry.get("path")]
+        if len(files) != 1 or not stat.S_ISREG(files[0].get("mode", 0)):
+            fail(f"{case}: missing nested file capture in ledger")
+        private_root = os.path.join(os.path.dirname(victim), verified_capture_name(slots[0]["capture"]["root"]["private"]))
+        if not os.path.isdir(private_root) or os.path.exists(victim):
+            fail(f"{case}: private root or absent original is not as recorded")
+        root_record = slots[0]["capture"]["root"]
+        root_stat = os.lstat(private_root)
+        if (not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid()
+                or root_stat.st_mode & 0o077 or root_stat.st_dev != root_record["device"]
+                or root_stat.st_ino != root_record["inode"]):
+            fail(f"{case}: private root identity or permissions do not match")
+        parent = private_root
+        chain = []
+        for raw_name in files[0]["path"]:
+            name = verified_capture_name(raw_name)
+            matches = [entry for entry in entries if entry.get("path") == chain
+                       and entry.get("private") == name]
+            if len(matches) != 1:
+                fail(f"{case}: capture ancestry is incomplete")
+            ancestor = matches[0]
+            parent = os.path.join(parent, name)
+            facts = os.lstat(parent)
+            if (not stat.S_ISDIR(facts.st_mode) or facts.st_dev != ancestor["device"]
+                    or facts.st_ino != ancestor["inode"]):
+                fail(f"{case}: captured ancestor identity does not match")
+            chain.append(name)
+        for name in (verified_capture_name(files[0]["private"]), files[0]["original"]):
+            try:
+                os.lstat(os.path.join(parent, name))
+            except FileNotFoundError:
+                continue
+            fail(f"{case}: unlinked file name {name!r} is present")
+        # A fixture-owned collision blocks put-back while the unrelated build
+        # is admitted. Give it enough budget for the recorded blocked charge.
+        os.mkdir(victim)
+        roomy = dict(env)
+        roomy["OXIDE_TEST_BUDGET_BYTES"] = str(64 * MIB)
+        checkout = workspace(env, base, "c")
+        other = run([oxide, "check"], cwd=checkout, env=roomy)
+        if other.returncode or not os.path.isdir(private_root):
+            fail(f"{case}: unrelated admission did not keep the blocked capture: {other.stderr[-1500:]}")
+        with open(os.path.join(env["OXIDE_POOL"], "ledger.json"), encoding="utf-8") as handle:
+            after = json.load(handle)
+        pending = [row for row in after.get("slots", []) if row.get("id") == slots[0]["id"]]
+        if len(pending) != 1 or pending[0].get("state") != "evicting":
+            fail(f"{case}: the blocked slot was reused or removed")
+        recorded = pending[0].get("recorded") or {}
+        if recorded.get("unique_bytes", 0) <= 0:
+            fail(f"{case}: the blocked slot has no positive recorded charge")
+        tight = dict(env)
+        tight["OXIDE_TEST_BUDGET_BYTES"] = "1"
+        # A different package identity cannot reuse checkout c's warm slot:
+        # this request must need a new slot and encounter the capacity check.
+        refused = run(
+            [oxide, "check"], cwd=workspace(env, base, "d", "capacity-control"), env=tight
+        )
+        if refused.returncode == 0 or "unknown_accounting" in refused.stderr:
+            fail(f"{case}: exhausted budget did not refuse on capacity: {refused.stderr[-1500:]}")
+        if "pool cap cannot admit a new slot" not in refused.stderr:
+            fail(f"{case}: the capacity refusal was not reported: {refused.stderr[-1500:]}")
+        if not os.path.isdir(private_root) or not os.path.isdir(victim):
+            fail(f"{case}: budget pressure removed a blocked slot or replacement")
+        os.rmdir(victim)
+        replay = run([oxide, "check"], cwd=checkout, env=roomy)
+        if replay.returncode:
+            fail(f"{case}: subsequent replay failed: {replay.stderr[-1500:]}")
+        if os.path.exists(private_root) or victim in slot_leaves(env["OXIDE_POOL"]):
+            fail(f"{case}: victim was not removed by replay")
+        return f"{case}: admitted unrelated work while blocked; next admission completed eviction"
     after = slot_leaves(env["OXIDE_POOL"])
     status = run([oxide, "status"], cwd=base, env=env)
     pending = "recorded deletion pending reconciliation" in status.stdout
@@ -734,6 +886,105 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
         {"lease_foreign": "Foreign", "lease_link": "Link", "lease_exhaust": "Metadata"}[case],
     )
     return f"{case}: pending, victim {victim}, exit {second.returncode}"
+
+
+def upgraded_counterfactual_ledger(ledger: dict, slot_id: int, closed: dict) -> dict:
+    """Model only the new fence and retained idle observation, not the tree."""
+    result = json.loads(json.dumps(ledger))
+    matches = [slot for slot in result.get("slots", []) if slot.get("id") == slot_id]
+    if (result.get("capacity_policy") != 2 or len(matches) != 1
+            or matches[0].get("state") != "evicting"
+            or matches[0].get("recorded") is not None
+            or not matches[0].get("capture")
+            or closed.get("for_lease") != matches[0].get("last_lease_id")
+            or closed.get("unique_bytes", 0) <= 0):
+        fail("old counterfactual is not the expected fenced, blocked fixture")
+    result["capacity_policy"] = 3
+    matches[0]["recorded"] = closed
+    return result
+
+
+def old_counterfactual(oxide: str, old_oxide: str, root: str) -> str:
+    """Execute the immutable old binary and candidate against one blocked tree."""
+    case = "lease_old_counterfactual"
+    env, base = case_env(root, case, None)
+    first = run([old_oxide, "check"], cwd=workspace(env, base, "a"), env=env)
+    if first.returncode:
+        fail(f"{case}: old fixture setup failed: {first.stderr[-1500:]}")
+    ledger_path = os.path.join(env["OXIDE_POOL"], "ledger.json")
+    with open(ledger_path, encoding="utf-8") as handle:
+        idle = json.load(handle)
+    slots = idle.get("slots", [])
+    if len(slots) != 1 or slots[0].get("state") != "idle":
+        fail(f"{case}: expected one idle old-code slot")
+    closed, slot_id = slots[0].get("recorded"), slots[0]["id"]
+    if not isinstance(closed, dict) or closed.get("unique_bytes", 0) <= 0:
+        fail(f"{case}: old idle size observation is absent")
+    mark = evidence_mark()
+    race_env = dict(env)
+    race_env["OXIDE_TEST_FINDER_RACE"] = "*:foreign"
+    trigger = run([old_oxide, "check"], cwd=workspace(env, base, "b"), env=race_env)
+    if trigger.returncode == 0:
+        fail(f"{case}: old eviction unexpectedly succeeded")
+    require_fired(case, mark, "Foreign")
+    with open(ledger_path, encoding="utf-8") as handle:
+        failed = json.load(handle)
+    rows = [slot for slot in failed.get("slots", []) if slot.get("id") == slot_id]
+    leaves = [path for path in slot_leaves(env["OXIDE_POOL"]) if path.endswith(f"-{slot_id}")]
+    if len(rows) != 1 or not rows[0].get("capture") or len(leaves) != 1:
+        fail(f"{case}: old eviction did not leave the expected journal and slot")
+    victim = leaves[0]
+    root_record = rows[0]["capture"]["root"]
+    private_root = os.path.join(os.path.dirname(victim), verified_capture_name(root_record["private"]))
+    root_stat = os.lstat(victim)
+    if (not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_dev != root_record["device"]
+            or root_stat.st_ino != root_record["inode"] or os.path.lexists(private_root)):
+        fail(f"{case}: the recorded root cannot be safely put into a blocked fixture")
+    # The old run restored its own recorded root after the raced refusal.
+    # Model a crash with that exact root at its recorded private name and a
+    # different fixture-owned object occupying the observed name.
+    os.rename(victim, private_root)
+    os.mkdir(victim, 0o700)
+    replacement = os.lstat(victim)
+
+    def require_same_roots():
+        private = os.lstat(private_root)
+        current = os.lstat(victim)
+        if (not stat.S_ISDIR(private.st_mode) or private.st_uid != os.getuid()
+                or private.st_mode & 0o077
+                or (private.st_dev, private.st_ino) != (root_stat.st_dev, root_stat.st_ino)
+                or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != (replacement.st_dev, replacement.st_ino)):
+            fail(f"{case}: the captured root or replacement identity changed")
+        if not any(os.path.basename(p) == "foreign.txt" for p in tree_files(private_root)):
+            fail(f"{case}: the raced foreign entry did not survive")
+
+    require_same_roots()
+    checkout = workspace(env, base, "c")
+    roomy = dict(env)
+    roomy["OXIDE_TEST_BUDGET_BYTES"] = str(64 * MIB)
+    previous = run([old_oxide, "check"], cwd=checkout, env=roomy)
+    if previous.returncode == 0 or "unknown_accounting" not in previous.stderr:
+        fail(f"{case}: actual old code did not refuse unknown_accounting: {previous.stderr[-1500:]}")
+    with open(ledger_path, encoding="utf-8") as handle:
+        blocked = json.load(handle)
+    upgraded = upgraded_counterfactual_ledger(blocked, slot_id, closed)
+    require_same_roots()
+    # The old format deliberately clears an Evicting size. Restore the exact
+    # preceding idle observation under the new version fence; no payload,
+    # captured journal, or requested command changes between the two runs.
+    temporary = os.path.join(env["OXIDE_POOL"], "counterfactual-ledger.tmp")
+    with open(temporary, "x", encoding="utf-8") as handle:
+        os.chmod(temporary, 0o600)
+        json.dump(upgraded, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, ledger_path)
+    current = run([oxide, "check"], cwd=checkout, env=roomy)
+    if current.returncode:
+        fail(f"{case}: candidate refused the same admission: {current.stderr[-1500:]}")
+    require_same_roots()
+    return f"{case}: old {BASE_COMMIT} refused unknown_accounting; candidate admitted with blocked tree kept"
 
 
 class ImageCustody:
@@ -1298,6 +1549,34 @@ def self_check() -> int:
                 problems.append(f"{case}: current layout is {size} bytes ({path})")
                 break
         print(f"  {case:<26} worst temp path {worst} bytes of {SOCKET_PATH_BUDGET}")
+    # The old-format control changes exactly its format fence and the saved
+    # idle size: it cannot accidentally turn a different state into the case.
+    if verified_capture_name(".oxide-capture-" + "a" * 32) != ".oxide-capture-" + "a" * 32:
+        problems.append("a valid private capture leaf was refused")
+    for unsafe in ("../outside", ".oxide-capture-" + "a" * 32 + "/child", None):
+        try:
+            verified_capture_name(unsafe)
+        except Unknown:
+            pass
+        else:
+            problems.append("a private capture path escape was accepted")
+    old_fixture = {"capacity_policy": 2, "slots": [{
+        "id": 1, "state": "evicting", "last_lease_id": "lease",
+        "capture": {"root": "unchanged"},
+    }]}
+    old_copy = json.loads(json.dumps(old_fixture))
+    saved = {"for_lease": "lease", "unique_bytes": 42}
+    upgraded = upgraded_counterfactual_ledger(old_fixture, 1, saved)
+    if (old_fixture != old_copy or upgraded["capacity_policy"] != 3
+            or upgraded["slots"][0].get("capture") != old_copy["slots"][0]["capture"]
+            or upgraded["slots"][0].get("recorded") != saved):
+        problems.append("old counterfactual migration changed more than the fence and size")
+    try:
+        upgraded_counterfactual_ledger(old_fixture, 1, {"for_lease": "wrong", "unique_bytes": 42})
+    except Recoverable:
+        pass
+    else:
+        problems.append("old counterfactual accepted a different lease's size")
     if set(PRUNE_SLUGS) - set(CASES):
         problems.append(f"slugs declared for unknown cases: {sorted(set(PRUNE_SLUGS) - set(CASES))}")
     if {case for case in CASES if case.startswith("prune_")} != set(PRUNE_SLUGS):
@@ -1551,13 +1830,26 @@ def main(argv: list) -> int:
         root = scratch_root()
         evidence_dir()
         work_left()
-        oxide = stage(root)
+        oxide = stage(root, REPO, "candidate")
+        source = base_source(root)
+        old_oxide = stage(root, source, "base")
+        shutil.rmtree(source)
+        def digest(path):
+            value = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    value.update(chunk)
+            return value.hexdigest()
+        candidate_digest, old_digest = digest(oxide), digest(old_oxide)
+        if candidate_digest == old_digest:
+            fail("candidate and base binaries are identical")
+        print(f"base {BASE_COMMIT} sha256 {old_digest}; candidate sha256 {candidate_digest}", flush=True)
     except (Unknown, Recoverable) as error:
         state["first_fault"] = f"setup: {type(error).__name__}: {error}"
         if isinstance(error, Unknown):
             state["abort"] = state["first_fault"]
         return finish(1)
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, tarfile.TarError, subprocess.TimeoutExpired) as error:
         # Setup or staging raised outside the classified paths: its closure is
         # unknown, so it is recorded as an abort, never as an oracle failure.
         state["first_fault"] = f"setup: {type(error).__name__}: {error}"
@@ -1570,7 +1862,9 @@ def main(argv: list) -> int:
         state["reached"].append(case)
         try:
             line = (
-                lease_case(oxide, root, case, RACES[case])
+                old_counterfactual(oxide, old_oxide, root)
+                if case == "lease_old_counterfactual"
+                else lease_case(oxide, root, case, RACES[case])
                 if case.startswith("lease_")
                 else prune_case(oxide, root, case, RACES[case])
             )

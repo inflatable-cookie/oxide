@@ -49,6 +49,20 @@ minimum_effigy_version = "0.14.0"
 run = "python3 scripts/bounded-test.py oxide test --workspace --all-targets --locked"
 default = false
 
+# Merge-base identity for the seeding qualification hold (oxide#176). The two
+# tests in tests/cold_seed_default_off.rs need a staged merge-base oxide, so
+# they are #[ignore] in the unit suite. This selector reuses the #104 stage_at
+# helper, exports OXIDE_SEED_BASELINE_BINARY, and runs that target with
+# --ignored. Default baseline is git merge-base HEAD origin/main; override
+# with OXIDE_SEED_BASELINE_COMMIT. 300 s / 512 MiB owned scratch. The
+# explicit internal root is the owner-accepted exception (decision bd357a4c)
+# because the tiny-build fixture creates a genuine directory-budget pool,
+# which the product refuses on an external volume. Not a native proof and
+# not an alias for full QA.
+[tasks."rust:seed-default-off"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
+
 # Installed-binary hand-off (oxide#122): one author proof, one fixed script
 # and the whole command under the qualified shared supervisor, within the
 # approved 120 s / 64 MiB bounds. Inside that scratch it stages this HEAD's

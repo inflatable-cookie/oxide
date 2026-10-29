@@ -1442,6 +1442,41 @@ fn seed_skips_an_unknown_or_missing_control_state() {
 }
 
 #[test]
+fn donor_control_accepts_only_the_known_normal_version_seven_shape() {
+    let rig = Rig::new("control-seven");
+    let donor = make_donor(&rig, "a");
+    let path = rig.control().join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("state")).expect("json");
+    state["version"] = serde_json::json!(7);
+    state["eviction_accounting"] = serde_json::json!("oxide.eviction-accounting/1");
+    let write = |value: &serde_json::Value| {
+        fs::write(&path, serde_json::to_vec(value).expect("json")).expect("write")
+    };
+    write(&state);
+    assert!(matches!(
+        donor_control(&rig.pool, donor.record_id),
+        DonorControl::Eligible
+    ));
+    state["records"][0]["class"] = serde_json::Value::Null;
+    write(&state);
+    assert!(matches!(
+        donor_control(&rig.pool, donor.record_id),
+        DonorControl::Unknown
+    ));
+    state["records"][0]
+        .as_object_mut()
+        .expect("record")
+        .remove("class");
+    state["eviction_accounting"] = serde_json::json!("unknown");
+    write(&state);
+    assert!(matches!(
+        donor_control(&rig.pool, donor.record_id),
+        DonorControl::Unknown
+    ));
+}
+
+#[test]
 fn seed_skips_a_plan_naming_a_unit_the_catalog_lacks() {
     reset_hooks();
     let rig = Rig::new("unit-missing");

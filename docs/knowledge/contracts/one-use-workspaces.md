@@ -1439,7 +1439,7 @@ deliberate:
   clone of the same repository no longer competes with its normal checkouts for
   the cap;
 - `MAX_SLOTS = 256` still bounds every slot, one-use included, and a slot
-  table above the legacy 128 carries `capacity_policy: 3` (oxide#177).
+  table above the legacy 128 carries `capacity_policy: 4` (oxide#177).
 
 ### 5.4 Sharing is class-matched
 

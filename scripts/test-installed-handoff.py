@@ -47,18 +47,19 @@ NOTICE = "oxide: handing off to the installed binary (state is newer than this o
 REFUSAL = "oxide: oxide was upgraded during this command; re-run.\n"
 # Control-state versions this proof models. Hand-off triggers only on a numeric
 # version GREATER than the running binary's, so "newer than self" is 8.
-# Version 5 is the recorded per-slot accounting fence (oxide#146) and is what a
-# normal small pool's first command writes. Version 7 is the newest this tree
-# writes: the raised-ceiling fence (oxide#177), which advances a pool only once
-# its ledger can hold more than the legacy 128 slots. The staged subject's
-# capability probe reports 7.
+# Version 5 is the recorded per-slot accounting fence (oxide#146). Version 7
+# is the eviction-accounting fence (oxide#175). Version 8 is the newest this
+# tree writes: the raised-ceiling fence (oxide#177), which the admission gate
+# installs on every mutating command. The staged subject's capability probe
+# reports 8.
 RECORDED_ACCOUNTING_STATE_VERSION = 5
-SLOT_CEILING_STATE_VERSION = 7
+EVICTION_ACCOUNTING_STATE_VERSION = 7
+SLOT_CEILING_STATE_VERSION = 8
 STATE_VERSION = SLOT_CEILING_STATE_VERSION
 NEWER_STATE_VERSION = STATE_VERSION + 1
-# What the product writes for this proof's small fixture pool (version 7 is
-# reserved for a pool whose ledger reached the legacy slot ceiling).
-WITNESS_STATE_VERSION = RECORDED_ACCOUNTING_STATE_VERSION
+# What the product writes for this proof's small fixture pool: the admission
+# gate fences every mutating command at the newest version.
+WITNESS_STATE_VERSION = SLOT_CEILING_STATE_VERSION
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
@@ -107,6 +108,7 @@ def write(path: str, contents: str, mode: int) -> None:
 
 
 RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
+EVICTION_ACCOUNTING_FENCE = "oxide.eviction-accounting/1"
 SLOT_CEILING_FENCE = "oxide.slots/256"
 
 
@@ -125,6 +127,8 @@ def current_state(version: int = STATE_VERSION) -> str:
     # the old-binary side this proof keeps readable.
     if version >= RECORDED_ACCOUNTING_STATE_VERSION:
         document["recorded_accounting"] = RECORDED_ACCOUNTING_FENCE
+    if version >= EVICTION_ACCOUNTING_STATE_VERSION:
+        document["eviction_accounting"] = EVICTION_ACCOUNTING_FENCE
     if version >= SLOT_CEILING_STATE_VERSION:
         document["slot_ceiling"] = SLOT_CEILING_FENCE
     return json.dumps(document)

@@ -130,8 +130,8 @@ pub const SEED_MAX_PLAN_BYTES: u64 = 384 * 1024 * 1024;
 /// The seed's cooperative work deadline (clone plus digest verify): 5 s, a
 /// ceiling a caller may lower but never raise (§8.1).
 pub const SEED_WORK_BUDGET_MS: u64 = 5_000;
-/// The front door's control-state version this module can classify. Any other
-/// value is unknown custody, never a guess.
+/// Legacy front-door version this module can classify; version 7 is accepted
+/// only with its exact eviction fence and no one-use fields.
 const CONTROL_STATE_VERSION: u32 = 5;
 /// The control state's whole-file bound, matching the front door's own
 /// (32 MiB since oxide#177's 512-record, 256-slot ceiling).
@@ -1452,14 +1452,33 @@ enum DonorControl {
 struct ControlState {
     version: u32,
     #[serde(default)]
+    eviction_accounting: Option<String>,
+    #[serde(default)]
+    slot_ceiling: Option<String>,
+    #[serde(default)]
+    one_use_workspaces: Option<String>,
+    #[serde(default)]
     records: Vec<ControlRecord>,
     #[serde(default)]
     cleans: Vec<ControlClean>,
 }
 
+#[derive(Default)]
+struct Present(bool);
+
+impl<'de> Deserialize<'de> for Present {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| Self(true))
+    }
+}
+
 #[derive(Deserialize)]
 struct ControlRecord {
     id: u64,
+    #[serde(default)]
+    class: Present,
+    #[serde(default)]
+    class_reason: Present,
     #[serde(default)]
     phase: String,
     #[serde(default)]
@@ -1492,7 +1511,23 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
     let Ok(state) = serde_json::from_slice::<ControlState>(&bytes) else {
         return DonorControl::Unknown;
     };
-    if state.version != CONTROL_STATE_VERSION {
+    let supported = state.version == CONTROL_STATE_VERSION
+        || (state.version == 7
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.one_use_workspaces.is_none()
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0))
+        || (state.version == 8
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
+            && state.one_use_workspaces.is_none()
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0));
+    if !supported {
         return DonorControl::Unknown;
     }
     let Some(record) = state.records.iter().find(|record| record.id == record_id) else {

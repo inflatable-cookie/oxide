@@ -2562,7 +2562,7 @@ mod tests {
         };
         assert!(matches!(cold.prior, freshness::Prior::Fresh));
         assert!(!cold.build_dir.join("partial").exists());
-        assert!(grants.remaining < 8);
+        assert!(grants.remaining < (store::PROJECT_SLOT_CAP + 1) as u8);
         assert!(!grants.share);
         drop(binding);
         store.release(cold, None).unwrap();

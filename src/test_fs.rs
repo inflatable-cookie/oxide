@@ -16,6 +16,7 @@ enum Operation {
 struct Injection {
     id: u64,
     operation: Operation,
+    kind: io::ErrorKind,
     path: PathBuf,
     hits: usize,
 }
@@ -25,23 +26,33 @@ thread_local! {
     static ACTIVE: RefCell<Option<Injection>> = const { RefCell::new(None) };
 }
 
-/// Injects `PermissionDenied` at one operation on one canonical fixture path.
-#[must_use = "dropping the guard ends the PermissionDenied injection scope"]
-pub(crate) struct PermissionDeniedGuard {
+/// Injects one error kind at one operation on one canonical fixture path.
+#[must_use = "dropping the guard ends the injection scope"]
+pub(crate) struct InjectedErrorGuard {
     id: u64,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-impl PermissionDeniedGuard {
+impl InjectedErrorGuard {
     pub(crate) fn read_dir(path: &Path) -> Self {
-        Self::arm(Operation::ReadDir, path)
+        Self::arm(Operation::ReadDir, io::ErrorKind::PermissionDenied, path)
     }
 
     pub(crate) fn symlink_metadata(path: &Path) -> Self {
-        Self::arm(Operation::SymlinkMetadata, path)
+        Self::arm(
+            Operation::SymlinkMetadata,
+            io::ErrorKind::PermissionDenied,
+            path,
+        )
     }
 
-    fn arm(operation: Operation, path: &Path) -> Self {
+    /// An `lstat` that finds the entry already renamed away or removed, as a
+    /// concurrent ledger rename does between a listing and its lookup.
+    pub(crate) fn not_found_symlink_metadata(path: &Path) -> Self {
+        Self::arm(Operation::SymlinkMetadata, io::ErrorKind::NotFound, path)
+    }
+
+    fn arm(operation: Operation, kind: io::ErrorKind, path: &Path) -> Self {
         let path = fs::canonicalize(path).expect("injected fixture path must exist");
         let id = NEXT_ID.with(|next_id| {
             let id = next_id.get();
@@ -54,6 +65,7 @@ impl PermissionDeniedGuard {
             *active = Some(Injection {
                 id,
                 operation,
+                kind,
                 path,
                 hits: 0,
             });
@@ -77,7 +89,7 @@ impl PermissionDeniedGuard {
     }
 }
 
-impl Drop for PermissionDeniedGuard {
+impl Drop for InjectedErrorGuard {
     fn drop(&mut self) {
         ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
@@ -99,7 +111,7 @@ fn injected_error(operation: Operation, path: &Path) -> Option<io::Error> {
             return None;
         }
         injection.hits = injection.hits.saturating_add(1);
-        Some(io::Error::from(io::ErrorKind::PermissionDenied))
+        Some(io::Error::from(injection.kind))
     })
 }
 
