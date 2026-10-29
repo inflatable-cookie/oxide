@@ -615,6 +615,14 @@ pub fn registration(internal: &Store) -> Result<Option<Registration>, String> {
     read_registration(internal.control())
 }
 
+/// The registration recorded under one internal pool's control directory,
+/// read without opening the pool, taking its lock or reconciling anything.
+/// `oxide init` readiness uses it to name the pool a build would select
+/// (oxide#182); an absent control directory is `None`.
+pub fn registration_at(pool: &Path) -> Result<Option<Registration>, String> {
+    read_registration(&pool.join(oxide_storage::lease::MANAGED_NAME))
+}
+
 /// Read an existing private registration without creating or migrating it.
 pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, String> {
     let Some(directory) = store::open_control_directory(control)? else {

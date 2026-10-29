@@ -546,6 +546,7 @@ class Runner:
                 "HOME": self.home,
                 "OXIDE_TEST_HOME_FROM_ENV": "1",
                 "OXIDE_POOL": self.pool,
+                "OXIDE_POOL_CREATE": "1",
                 "CARGO_HOME": self.cargo_home,
                 "PATH": self.bin + os.pathsep + env.get("PATH", ""),
                 "CARGO_NET_OFFLINE": "true",

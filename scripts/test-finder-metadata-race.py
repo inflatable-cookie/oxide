@@ -594,6 +594,7 @@ def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
             "TEMP": temp,
             "OXIDE_TEST_HOME_FROM_ENV": "1",
             "OXIDE_POOL": os.path.join(base, "pool"),
+            "OXIDE_POOL_CREATE": "1",
             "OXIDE_POOL_CAP": str(POOL_BUDGET),
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",

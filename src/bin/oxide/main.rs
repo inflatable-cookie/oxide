@@ -114,7 +114,11 @@ create an Oxide config file.
 A whole-target clean refuses entries Cargo does not create in target/ unless
 --include-foreign is given; --dry-run prints every path it would remove.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE sets the host-wide active-build
-limit (1–32), ahead of [pool] max_active in the user config. The automatic
+limit (1–32), ahead of [pool] max_active in the user config. An absent pool
+named by OXIDE_POOL refuses instead of being created silently; set
+OXIDE_POOL_CREATE=1 (or place the path inside OXIDE_TASK_SCRATCH_ROOT) to
+create one there. The config file and the default pool still create on first
+use. The automatic
 macOS default is min(4, max(2, floor(physical cores/4))); other platforms and
 unavailable core counts use 2.
 Leased builds bypass any inherited rustc wrapper (such as sccache);
@@ -189,6 +193,20 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         _ => {}
     }
     let class = cli::classify(command);
+    // `oxide <cmd> --help` / `-h` is Cargo's help, before any budget, hand-off
+    // check, pool open, adoption, workspace lookup or lease (oxide#182). It
+    // runs exactly `cargo <cmd> --help`. `clean`, `init` and `new` forward
+    // too, so neither clean's own planning and workspace discovery nor the
+    // hand-off check that reads pool control state can run for a help
+    // request. Help after `--` belongs to the program and keeps the owned
+    // path.
+    if matches!(
+        class,
+        Class::Modelled | Class::Building | Class::Clean | Class::Init | Class::New
+    ) && cli::cargo_help(rest)
+    {
+        return Err(exec_cargo(&[first.clone(), OsString::from("--help")]));
+    }
     // The budget prefix is Oxide's on leased commands only (oxide#140). Any
     // other class refuses a reserved name by name instead of forwarding it.
     let leased = matches!(class, Class::Modelled | Class::Building | Class::Exec);

@@ -1715,12 +1715,30 @@ struct PlanReport {
     /// Every member this checkout's receipt places, with its live state.
     /// Reading it never grants ownership of a real or foreign directory.
     members: Vec<MemberPlanView>,
+    /// Set only for a committed whole-target checkout that `adopt` migrates:
+    /// exactly the members that migration would link, classified by the same
+    /// reader `adopt` uses (oxide#182).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migration_members: Option<Vec<String>>,
+    /// The root marker upgrade the migration would make, when it needs one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    marker_upgrade: Option<MarkerUpgradeView>,
     cooperative_holders: Vec<String>,
     next_generation: u64,
     /// Set only for a guarded one-use workspace: one line stating that final
     /// outputs are local and no owned root is selected (design §4.5).
     #[serde(skip_serializing_if = "Option::is_none")]
     one_use: Option<&'static str>,
+}
+
+/// The root marker upgrade one layout migration would make. The plan never
+/// reserves the nonce; it only says the migration will.
+#[derive(Serialize)]
+struct MarkerUpgradeView {
+    from: &'static str,
+    to: &'static str,
+    /// `reserve`: `adopt` reserves one fresh 128-bit nonce for the upgrade.
+    nonce: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1804,6 +1822,8 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         },
+        migration_members: None,
+        marker_upgrade: None,
         cooperative_holders: holders,
         next_generation,
         one_use: None,
@@ -1882,6 +1902,16 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
     };
     match (&target, target.link_root()) {
         (_, Some(root)) if root == selected.root.as_path() => {
+            // A committed whole-target receipt that `adopt` would migrate is
+            // reported as that migration, not as a relink (oxide#182). Only an
+            // owned link to the selected root qualifies; a dangling link or a
+            // link elsewhere keeps the refusals below.
+            if receipt.layout() == LayoutKind::WholeTarget
+                && matches!(&target, TargetState::OwnedLink(root) if root == &selected.root)
+            {
+                plan_layout_migration(context, &mut report, &selected);
+                return Ok(report);
+            }
             let wanted = match &usable {
                 Ok(registration) => {
                     external_spec(registration, &context.workspace).selected(next_generation)
@@ -1910,6 +1940,62 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
             Ok(report)
         }
     }
+}
+
+/// Report the explicit whole-target-to-profile migration `adopt` performs,
+/// effect-free: the members it would link (the same classification `adopt`
+/// uses), the root marker upgrade where the root still carries a root/1
+/// marker, and no data move. Nothing is written, no nonce is reserved and no
+/// pool is opened; a root, marker or member set `adopt` would refuse is
+/// reported as a refusal with its reason.
+fn plan_layout_migration(context: &Context, report: &mut PlanReport, selected: &Selected) {
+    let root = selected.root.as_path();
+    let members = match migration_members(root) {
+        Ok(members) => members,
+        Err(reason) => {
+            report.action = "refuse";
+            report.reason = Some(format!(
+                "the layout migration cannot classify the members of {}: {reason}; `oxide outputs adopt` would refuse",
+                root.display()
+            ));
+            return;
+        }
+    };
+    match read_marker(root) {
+        Ok(marker) => {
+            if let Err(reason) = check_marker(&marker, &context.workspace, &context.checkout_id) {
+                report.action = "refuse";
+                report.reason = Some(format!(
+                    "the root marker {} cannot be verified: {reason}; `oxide outputs adopt` would refuse",
+                    root.display()
+                ));
+                return;
+            }
+            if marker.is_legacy() {
+                report.marker_upgrade = Some(MarkerUpgradeView {
+                    from: LEGACY_MARKER_VERSION,
+                    to: MARKER_VERSION,
+                    nonce: "reserve",
+                });
+            }
+        }
+        Err(reason) => {
+            report.action = "refuse";
+            report.reason = Some(format!(
+                "the root marker {} cannot be read: {reason}; `oxide outputs adopt` would refuse",
+                root.display()
+            ));
+            return;
+        }
+    }
+    // The migration keeps this root (the marker and payload are upgraded in
+    // place), so the plan's proposed placement is the selected root at the
+    // next generation, never a different root.
+    let mut keeps = selected.clone();
+    keeps.generation = report.next_generation;
+    report.proposed_root = Some(keeps.view());
+    report.action = "migrate";
+    report.migration_members = Some(members);
 }
 
 fn status_command() -> Result<u8, String> {
@@ -9591,6 +9677,56 @@ mod tests {
             replay_migration(&context, &control, migrated.clone()).unwrap(),
             migrated
         );
+    }
+
+    /// oxide#182: `oxide outputs plan` on a committed whole-target checkout
+    /// that `adopt` would migrate reports that migration — the action, the
+    /// members `adopt` classifies, and the root/1→root/2 marker upgrade with
+    /// its reserved nonce where the root still carries a root/1 marker —
+    /// instead of a relink or noop. The plan stays effect-free: no receipt
+    /// byte, marker byte or nonce changes.
+    ///
+    /// Counterfactual: without the migration arm the same fixture reports
+    /// `noop` (the old whole-target plan), so the assertion is non-vacuous.
+    #[test]
+    fn a_plan_reports_the_whole_target_layout_migration() {
+        let (fixture, legacy) = legacy_checkout();
+        register(&fixture, DriveMode::Permanent);
+        let context = fixture.context();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        let before = receipt_proof(&fixture);
+        let marker_before = fs::read(root.join(MARKER)).unwrap();
+
+        let report = plan_report(&context).unwrap();
+        assert_eq!(report.action, "migrate");
+        assert!(!report.data_move);
+        assert_eq!(report.layout, "whole-target");
+        assert_eq!(
+            report.migration_members.as_deref(),
+            Some(&["debug".to_owned(), "release".to_owned()][..])
+        );
+        // The migration keeps this root: the proposed placement is the same
+        // root at the next generation, never a relink elsewhere.
+        let proposed = report.proposed_root.as_ref().expect("no proposed root");
+        assert_eq!(proposed.root, root);
+        assert_eq!(proposed.generation, report.next_generation);
+        // A root/2 marker already carries its nonce, so nothing is upgraded.
+        assert!(report.marker_upgrade.is_none());
+        assert_eq!(receipt_proof(&fixture), before);
+        assert_eq!(fs::read(root.join(MARKER)).unwrap(), marker_before);
+
+        // A source-shaped root/1 marker is upgraded by `adopt`: the plan names
+        // the versions and the reserved nonce, and still reserves nothing.
+        make_root_one_marker(&fixture, &legacy);
+        let marker_one = fs::read(root.join(MARKER)).unwrap();
+        let report = plan_report(&context).unwrap();
+        assert_eq!(report.action, "migrate");
+        let upgrade = report.marker_upgrade.expect("no marker upgrade reported");
+        assert_eq!(upgrade.from, LEGACY_MARKER_VERSION);
+        assert_eq!(upgrade.to, MARKER_VERSION);
+        assert_eq!(upgrade.nonce, "reserve");
+        assert_eq!(fs::read(root.join(MARKER)).unwrap(), marker_one);
+        assert_eq!(receipt_proof(&fixture), before);
     }
 
     /// oxide#163: a version-1 document that is not committed, carries a

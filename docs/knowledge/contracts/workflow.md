@@ -624,6 +624,16 @@ root. A new Cargo release needs this check before it joins the table.
 
 ## What one command does (local executor)
 
+Help is Cargo's and needs no storage (oxide#182): `oxide <cmd> --help` or
+`-h` replaces Oxide with exactly `cargo <cmd> --help` for every leased
+command, the building built-ins, `clean`, `init` and `new`, and `oxide help
+<cmd>` is the existing plain passthrough to `cargo help <cmd>`. None opens a
+pool, takes a lease, reserves a slot, waits for admission, runs the
+pre-effect hand-off check (which reads pool control state), clean's own
+workspace discovery and planning, or adoption's guidance/readiness work.
+Help after `--` belongs to the program (`oxide run -- --help`), not to
+Cargo.
+
 1. Resolve the workspace (`cargo locate-project --workspace`), identity,
    profile, strategy and toolchain.
 2. Lease a slot from the host pool. Prefer this checkout's last slot, then any
@@ -1063,7 +1073,16 @@ explicit `recover` unless they adopt it.
   every platform. Its soft budget is checked at admission; a running build
   may grow past it while real free space holds. Only whole idle slots are
   evicted. The APFS sparse-image backend is retired (oxide#102).
-- The first command creates the pool automatically ([W-1](#open-decisions)).
+- The first command creates the pool automatically ([W-1](#open-decisions))
+  for the built-in default and a config-file path. An absent pool named by
+  `OXIDE_POOL` is an explicit path and refuses instead of being created
+  silently, naming the path (oxide#182); `OXIDE_POOL_CREATE=1` or a path
+  strictly inside the caller's canonical `OXIDE_TASK_SCRATCH_ROOT` opts in
+  (proof fixtures), and a value ending in a `status` display annotation
+  (`<path> (from …)`) refuses with a hint that the annotation is not part of
+  the path, for an absent path and for an existing directory that holds no
+  Oxide pool alike. An existing valid pool at a normal path and the
+  config-file path are unchanged.
 - Slot headroom (oxide#118, oxide#177): up to 256 slots per pool and twelve
   per project identity, with compatible reuse first and the oldest eligible
   idle whole slot replaced under count or byte pressure
@@ -1407,9 +1426,17 @@ to an Oxide-adopted Rust project:
    workspace itself (see [placement](#placement-of-the-guidance-block)).
    Re-running is idempotent and never touches text outside the markers.
 4. Print readiness: the workspace and guidance root, covered paths, any
-   retained older block, resolved toolchain, inferred project identity, pool
-   path (not measured) and any Effigy Rust selectors that still call plain
-   `cargo`. Oxide reports those; it does not edit them.
+   retained older block, resolved toolchain, inferred project identity, the
+   pool a build would select and the configured internal pool (both not
+   measured), and any Effigy Rust selectors that still call plain `cargo`.
+   The selected line agrees with `status`'s recorded selection without
+   opening the pool, taking its lock or verifying the volume (oxide#182):
+   `selected pool: removable <mount> (registered, mode: …; the next build
+   verifies the volume)` when the registration's mount point is present, or
+   `selected pool: internal <path> (the registered removable pool <mount> is
+   absent; …)` / `(no removable volume registered)`, followed by
+   `configured internal pool: <path> …`. Oxide reports those; it does not
+   edit them.
 
 `oxide new <path>` is `cargo new` followed by steps 3 and 4. Neither command
 creates an Oxide config file or changes `Cargo.toml` beyond what Cargo itself
@@ -3679,6 +3706,14 @@ oxide#102.
   whole number of `KB`, `MB`, `GB`, `TB` (decimal) or `KiB`, `MiB`, `GiB`,
   `TiB`, from 1 MiB to 16 TiB; anything else refuses before any effect.
   `OXIDE_POOL_BACKEND` is retired: unset or `directory-budget` only.
+  An absent pool named by `OXIDE_POOL` refuses instead of being created
+  silently (oxide#182). Creation at that explicit path is opt-in through
+  `OXIDE_POOL_CREATE=1` or a path strictly inside the caller's canonical
+  `OXIDE_TASK_SCRATCH_ROOT`; a value pasted from `oxide status` with its
+  trailing ` (from …)` annotation refuses with a hint for every pool state
+  (an absent path and an existing directory that holds no Oxide pool alike),
+  before any generic open error. The config-file path and the built-in
+  default keep creating the pool on first use.
 - **Storage roots.** The config, cache and state roots come from
   `longhorn-storage-layout` (git tag `v0.4.1`, commit `5caf1e2c`,
   `platform-native-v1`, leaf `oxide`; oxide#103). Each root is resolved
@@ -4443,8 +4478,16 @@ migration and consumer adoption remain separate gates.
   slot as unknown custody. A program on the internal disk is never stopped
   for host free space. Unconverted checkouts keep `exec` after release.
 - **Explicit commands.** `oxide outputs plan` is effect-free bounded JSON
-  (`oxide.outputs.plan/1`, always `data_move: false`, with cooperative
-  holders in either pool and the next generation). `adopt` converts only a missing or empty
+  (`oxide.outputs.plan/2`, always `data_move: false`, with cooperative
+  holders in either pool and the next generation). On a committed
+  whole-target checkout whose owned link selects its recorded root — the one
+  shape `adopt` migrates — it reports `action: migrate`, the exact member set
+  the migration classifies (the same reader `adopt` uses, including members
+  the root does not hold yet), the proposed placement as that same root at
+  the next generation, and, while the root still carries a root/1 marker,
+  `marker_upgrade` with `oxide.outputs.root/1` → `oxide.outputs.root/2` and
+  `nonce: reserve` (oxide#182). The plan reserves no nonce, writes no
+  receipt or marker and opens no pool. `adopt` converts only a missing or empty
   real target; a nonempty real target and a foreign symlink refuse without
   mutation, and an owned correct link is a no-op. `detach` restores a real
   empty `<checkout>/target` directory and keeps every root in either drive

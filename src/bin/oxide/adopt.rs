@@ -532,20 +532,95 @@ fn print_readiness(workspace: &Path, placement: &Placement, guidance: &Guidance)
     }
     println!("  identity: {}", Identity::infer(workspace).describe());
     match store::settings() {
-        Err(error) => println!("  pool: unknown ({error})"),
-        Ok(settings) => println!("  pool: {}", pool_state(&settings.pool)),
+        Err(error) => {
+            println!("  selected pool: unknown ({error})");
+            println!("  configured internal pool: unknown ({error})");
+        }
+        Ok(settings) => {
+            let (selected, configured) = readiness_pool_lines(&settings);
+            println!("  selected pool: {selected}");
+            println!("  configured internal pool: {configured}");
+        }
     }
     report_effigy(workspace);
 }
 
-/// Pool facts from the path alone. Opening a pool takes its lock and
-/// reconciles its ledger, so readiness never does; `oxide status` measures.
-fn pool_state(path: &Path) -> String {
-    match config::inspect(path) {
-        Found::Absent => format!(
-            "{} not created; the first building oxide command creates it",
+/// The pool a build would select, and the configured internal pool, as
+/// readiness can know them without opening either (oxide#182). The selection
+/// is the same recorded fact `oxide status` prints: the registration's
+/// mount point is present or absent right now, and the next build is what
+/// verifies identity, reserve and write access. Reading the registration
+/// takes no pool lock and reconciles nothing.
+fn readiness_pool_lines(settings: &config::Settings) -> (String, String) {
+    let configured = pool_state(settings);
+    let selected = match config::inspect(&settings.pool) {
+        // A retired image pool is not a pool a build can select; say so
+        // instead of claiming the configured path is the internal pool.
+        Found::LegacyImage => format!("unknown ({configured})"),
+        Found::Absent => selected_pool_line(&settings.pool, &Ok(None)),
+        Found::Directory | Found::Unknown => selected_pool_line(
+            &settings.pool,
+            &crate::removable::registration_at(&settings.pool),
+        ),
+    };
+    (selected, configured)
+}
+
+/// One line naming the pool the next build would use, from the recorded
+/// registration alone.
+fn selected_pool_line(
+    path: &Path,
+    registration: &Result<Option<crate::removable::Registration>, String>,
+) -> String {
+    match registration {
+        Err(error) => format!("unknown (cannot read the removable registration: {error})"),
+        Ok(None) => format!(
+            "internal {} (no removable volume registered)",
             path.display()
         ),
+        Ok(Some(registration)) => {
+            let mount = registration.mount_point.display();
+            if fs::symlink_metadata(&registration.mount_point).is_ok() {
+                format!(
+                    "removable {mount} (registered, mode: {}; the next build verifies the volume)",
+                    registration.mode
+                )
+            } else {
+                format!(
+                    "internal {} (the registered removable pool {mount} is absent; the next build uses the internal pool until the volume returns)",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+/// Pool facts from the path and the resolved settings. Opening a pool takes
+/// its lock and reconciles its ledger, so readiness never does; `oxide status`
+/// measures. Creation policy is the effect-free rule a build applies
+/// (oxide#182), so readiness never promises a pool an explicit `OXIDE_POOL`
+/// would refuse to create.
+fn pool_state(settings: &config::Settings) -> String {
+    let path = settings.pool.as_path();
+    match config::inspect(path) {
+        Found::Absent => {
+            let creates = config::pool_creation_allowed(
+                path,
+                settings.pool_source,
+                std::env::var_os("OXIDE_POOL_CREATE").as_deref(),
+                std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").as_deref(),
+            );
+            match creates {
+                Ok(()) => format!(
+                    "{} not created; the first building oxide command creates it",
+                    path.display()
+                ),
+                Err(reason) => format!(
+                    "{} not created; the first building oxide command refuses: {reason}",
+                    path.display()
+                ),
+            }
+        }
         Found::LegacyImage => format!("{} is a retired image pool; not read", path.display()),
         Found::Directory | Found::Unknown => {
             format!(
@@ -906,6 +981,58 @@ Managed by `oxide init`; edits between these markers are replaced.
             apply_block(Some(inline.as_bytes()), OUTSIDE).unwrap(),
             format!("{inline}\n{OUTSIDE}").into_bytes()
         );
+    }
+
+    #[test]
+    fn readiness_names_the_pool_a_build_would_use() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let present = base.join(format!("readiness-mount-{}", std::process::id()));
+        fs::create_dir_all(&present).unwrap();
+        let absent = base.join(format!("readiness-absent-{}", std::process::id()));
+        let pool = base.join("readiness-pool");
+        let registration = |mount: PathBuf| crate::removable::Registration {
+            version: 2,
+            mount_point: mount,
+            volume_uuid: "11111111-2222-3333-4444-555555555555".to_owned(),
+            container_uuid: "66666666-7777-8888-9999-000000000000".to_owned(),
+            reserve_bytes: 1,
+            cap_bytes: 1 << 30,
+            quota_bytes: None,
+            capacity_bytes: None,
+            registered_ms: 1,
+            mode: crate::removable::DriveMode::Permanent,
+        };
+        let unregistered = selected_pool_line(&pool, &Ok(None));
+        assert!(unregistered.contains("internal"), "{unregistered}");
+        assert!(
+            unregistered.contains(&pool.display().to_string()),
+            "{unregistered}"
+        );
+        assert!(
+            unregistered.contains("no removable volume registered"),
+            "{unregistered}"
+        );
+        // The same recorded fact `status` prints: present means the removable
+        // pool is the recorded selection, absent means the internal pool.
+        let selected = selected_pool_line(&pool, &Ok(Some(registration(present.clone()))));
+        assert!(selected.starts_with("removable "), "{selected}");
+        assert!(selected.contains("registered"), "{selected}");
+        assert!(
+            selected.contains(&present.display().to_string()),
+            "{selected}"
+        );
+        let fallback = selected_pool_line(&pool, &Ok(Some(registration(absent.clone()))));
+        assert!(fallback.contains("internal"), "{fallback}");
+        assert!(fallback.contains("absent"), "{fallback}");
+        assert!(
+            fallback.contains(&absent.display().to_string()),
+            "{fallback}"
+        );
+        let unreadable = selected_pool_line(&pool, &Err("broken".to_owned()));
+        assert!(unreadable.contains("unknown") && unreadable.contains("broken"));
+        fs::remove_dir_all(&present).unwrap();
     }
 
     #[test]

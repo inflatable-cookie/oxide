@@ -735,6 +735,112 @@ pub fn settings(facts: &Facts) -> Result<Settings, String> {
     })
 }
 
+/// Why an explicit `OXIDE_POOL` value that ends in an `oxide status` display
+/// annotation is unusable, whatever the selected path holds (oxide#182). The
+/// suffix is not part of a path, so an absent pool and an existing ordinary
+/// directory both refuse with the same hint. Another source, or a value
+/// without that suffix, is `Ok(())` here; the ordinary rules still apply.
+pub fn pool_annotation_refused(pool: &Path, source: Source) -> Result<(), String> {
+    if !matches!(source, Source::Environment("OXIDE_POOL")) {
+        return Ok(());
+    }
+    let Some(annotation) = pasted_annotation(pool) else {
+        return Ok(());
+    };
+    let target = pool.display().to_string();
+    let bare = target
+        .strip_suffix(&annotation)
+        .unwrap_or(&target)
+        .trim_end();
+    Err(format!(
+        "OXIDE_POOL is {:?}, which looks pasted from `oxide status`; the trailing {annotation:?} is a display annotation, not part of the path. Set OXIDE_POOL to {bare:?}",
+        target
+    ))
+}
+
+/// Whether an absent pool may be created (oxide#182).
+///
+/// The built-in default and a config-file pool path create on first use as
+/// before. A pool named by `OXIDE_POOL` is an explicit path, so with no pool
+/// there Oxide refuses instead of creating one silently, naming the path; two
+/// opt-ins allow creation: `OXIDE_POOL_CREATE=1`, and a path strictly inside
+/// the caller's canonical `OXIDE_TASK_SCRATCH_ROOT` (so proof fixtures keep
+/// their implicit creation). A value that ends in a `status` display
+/// annotation (`<path> (from …)`) always refuses with a hint, because that
+/// annotation is not part of a path. Existing pools never reach this rule.
+pub fn pool_creation_allowed(
+    pool: &Path,
+    source: Source,
+    opt_in: Option<&std::ffi::OsStr>,
+    scratch: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    if !matches!(source, Source::Environment("OXIDE_POOL")) {
+        return Ok(());
+    }
+    pool_annotation_refused(pool, source)?;
+    if opt_in == Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
+    if scratch.is_some_and(|root| strictly_inside_scratch(pool, Path::new(root))) {
+        return Ok(());
+    }
+    Err(format!(
+        "OXIDE_POOL names {}, which holds no Oxide pool; Oxide does not create a pool at an explicit path implicitly. Set OXIDE_POOL_CREATE=1 to create it there, or point OXIDE_POOL at an existing pool. The config file and the built-in default pool are unchanged",
+        pool.display()
+    ))
+}
+
+/// The ` (from …)` suffix `oxide status` prints after a pool path, if the
+/// value carries it. The pool path itself never ends with this shape.
+fn pasted_annotation(pool: &Path) -> Option<String> {
+    let text = pool.to_string_lossy().into_owned();
+    if !text.ends_with(')') {
+        return None;
+    }
+    let at = text.rfind(" (from ")?;
+    let inner = &text[at + " (from ".len()..text.len() - 1];
+    if inner.is_empty() || inner.contains(['(', ')']) {
+        return None;
+    }
+    Some(text[at..].to_owned())
+}
+
+/// Whether `pool` is strictly inside the canonical `scratch` directory. The
+/// pool usually does not exist yet, so its deepest existing ancestor is
+/// canonicalized and the missing tail is appended unchanged; no directory is
+/// created and no link is followed beyond what the filesystem already has.
+fn strictly_inside_scratch(pool: &Path, scratch: &Path) -> bool {
+    let Ok(scratch) = fs::canonicalize(scratch) else {
+        return false;
+    };
+    let Some(pool) = resolve_through_existing_ancestor(pool) else {
+        return false;
+    };
+    pool != scratch && pool.starts_with(&scratch)
+}
+
+fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match fs::canonicalize(&existing) {
+            Ok(mut canonical) => {
+                for part in tail.iter().rev() {
+                    canonical.push(part);
+                }
+                return Some(canonical);
+            }
+            Err(_) => {
+                let name = existing.file_name()?.to_os_string();
+                tail.push(name);
+                if !existing.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 fn resolve_active_build_limit(
     facts: &Facts,
     config_value: Option<i64>,
@@ -1306,6 +1412,100 @@ mod tests {
             all.push((name, OsString::from(value)));
         }
         all
+    }
+
+    /// oxide#182: an absent pool named by `OXIDE_POOL` refuses instead of
+    /// being created silently, names the path, and honours exactly two
+    /// opt-ins; a config-file or default pool path is unchanged. The
+    /// counterfactual is the old unconditional `create_pool` call: it returns
+    /// `Ok(())` for every case below.
+    #[test]
+    fn an_explicit_pool_is_not_created_silently() {
+        let (scratch, _) = supervisor();
+        let pool = scratch.join("run.fixture/pool");
+        let explicit = Source::Environment("OXIDE_POOL");
+        let refuse = pool_creation_allowed(&pool, explicit, None, None);
+        let error = refuse.expect_err("an outside explicit pool was accepted");
+        assert!(
+            error.contains(&pool.display().to_string()),
+            "the refusal did not name the path: {error}"
+        );
+        assert!(error.contains("OXIDE_POOL_CREATE=1"), "{error}");
+        assert!(error.contains("existing pool"), "{error}");
+
+        // The config file and the built-in default are unchanged.
+        assert!(pool_creation_allowed(&pool, Source::File, None, None).is_ok());
+        assert!(pool_creation_allowed(&pool, Source::Default, None, None).is_ok());
+
+        // A path strictly inside the task scratch root (whose tail need not
+        // exist yet) is the fixture opt-in; the root itself and a path
+        // outside it are not.
+        let scratch_text = scratch.as_os_str();
+        let inside = pool_creation_allowed(&pool, explicit, None, Some(scratch_text));
+        assert!(inside.is_ok(), "{inside:?}");
+        assert!(pool_creation_allowed(&scratch, explicit, None, Some(scratch_text)).is_err());
+        let outside = scratch
+            .parent()
+            .expect("supervisor root")
+            .join("evidence/pool");
+        let outside_pool = pool_creation_allowed(&outside, explicit, None, Some(scratch_text));
+        assert!(outside_pool.is_err(), "a sibling path was accepted");
+
+        // `OXIDE_POOL_CREATE=1` is the explicit opt-in; another value is not.
+        let opted_in =
+            pool_creation_allowed(&pool, explicit, Some(std::ffi::OsStr::new("1")), None);
+        assert!(opted_in.is_ok(), "{opted_in:?}");
+        assert!(
+            pool_creation_allowed(&pool, explicit, Some(std::ffi::OsStr::new("true")), None)
+                .is_err()
+        );
+
+        // A value pasted from `oxide status` refuses with a hint, even with
+        // the opt-in set, and names the bare path it should be.
+        let pasted = Path::new("/tmp/build-pool (from OXIDE_POOL)");
+        let error = pool_creation_allowed(
+            pasted,
+            explicit,
+            Some(std::ffi::OsStr::new("1")),
+            Some(scratch_text),
+        )
+        .expect_err("a pasted status line was accepted");
+        assert!(error.contains("pasted from `oxide status`"), "{error}");
+        assert!(error.contains("/tmp/build-pool\""), "{error}");
+        // A path that merely ends in a parenthesis is not an annotation.
+        let ordinary = Path::new("/tmp/build-pool (fast)");
+        assert!(
+            pool_creation_allowed(ordinary, explicit, Some(std::ffi::OsStr::new("1")), None)
+                .is_ok()
+        );
+    }
+
+    /// oxide#182: a pasted `oxide status` suffix is not a path, so the hint
+    /// applies whatever the path holds. The store calls this before its
+    /// generic open error, which covers an existing ordinary directory
+    /// (`Found::Unknown`) as well as an absent one (`Found::Absent`).
+    #[test]
+    fn a_pasted_status_annotation_refuses_for_every_pool_state() {
+        let pasted = Path::new("/tmp/existing (from OXIDE_POOL)");
+        let explicit = Source::Environment("OXIDE_POOL");
+        let error = pool_annotation_refused(pasted, explicit)
+            .expect_err("a pasted annotation was accepted");
+        assert!(error.contains("pasted from `oxide status`"), "{error}");
+        assert!(
+            error.contains("Set OXIDE_POOL to \"/tmp/existing\""),
+            "{error}"
+        );
+        assert!(pool_annotation_refused(pasted, Source::File).is_ok());
+        assert!(pool_annotation_refused(pasted, Source::Default).is_ok());
+        // Only the exact status shape is an annotation.
+        assert!(pool_annotation_refused(Path::new("/tmp/existing"), explicit).is_ok());
+        assert!(pool_annotation_refused(Path::new("/tmp/existing (fast)"), explicit).is_ok());
+        assert!(pool_annotation_refused(Path::new("/tmp/x (from )"), explicit).is_ok());
+        // The absent-pool rule keeps the same hint through its own entry.
+        let absent = Path::new("/tmp/absent (from OXIDE_POOL)");
+        let error = pool_creation_allowed(absent, explicit, None, None)
+            .expect_err("the absent-pool rule lost the hint");
+        assert!(error.contains("pasted from `oxide status`"), "{error}");
     }
 
     #[test]
