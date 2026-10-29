@@ -102,7 +102,7 @@ def positively_absent(path: str) -> bool:
 class Proof(layout.Proof):
     def __init__(self, root: str):
         super().__init__(root)
-        self.image = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "permanent-outputs.sparseimage")
+        self.image = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "volume.sparseimage")
         self.devices = []
         self.detach_confirmed = False
         self.detach_attempted = False
@@ -524,11 +524,11 @@ def attach_image(
 ) -> str:
     """Attach this proof's OWNED sparse image. `owners` is an optional
     `hdiutil attach -owners on` request used only by a proof that needs
-    filesystem ownership honored on its private image; `image_name` selects a
-    image filename is fixed for this proof; the backing is retained in evidence
-    unless an ordinary detach positively removes the mount and devices."""
-    expect(image_name == "volume.sparseimage", "unexpected image name")
-    image = proof.image
+    filesystem ownership honored on its private image; `root` and `image_name`
+    select its backing. Callers choose an evidence directory when the backing
+    must survive supervisor scratch cleanup."""
+    image = os.path.join(root, image_name)
+    proof.image = image
     proof.detach_confirmed = False
     proof.detach_attempted = False
     proof.mount = None
@@ -705,7 +705,7 @@ def run(proof: Proof, repo: str) -> None:
         "a refused adopt created the local root",
     )
 
-    mounted = attach_image(proof, root, name)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
     code, stdout, stderr = proof.oxide(
         [
@@ -912,7 +912,7 @@ def run(proof: Proof, repo: str) -> None:
     proof.phase("after fallback")
 
     # 6. Redocking relinks without copying or deleting either root.
-    mounted = attach_image(proof, root, name)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"re-attached at {mounted}, not {mount}")
     before_redock = read_json(receipt_path(pool, app))
     report = plan(proof, app, "plan after redocking")
@@ -1344,7 +1344,7 @@ def run(proof: Proof, repo: str) -> None:
         is not None,
         f"no removal stop during the program phase: {stderr}",
     )
-    expect(attach_image(proof, root, name) == mount, "the drive re-attached elsewhere")
+    expect(attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name) == mount, "the drive re-attached elsewhere")
     code, _, stderr = proof.oxide(["check"], "redock after the program-phase removal", app)
     expect(code == 0 and link_target(link) == external_root, stderr)
     proof.phase("after the split selection, run custody and removal cases")
@@ -1643,7 +1643,7 @@ def detach_run(proof: Proof, repo: str) -> None:
     code, _, stderr = proof.oxide(["build"], "unregistered build keeps a real target", maker)
     expect(code == 0 and not auto_notices(stderr), stderr)
 
-    mounted = attach_image(proof, root, name)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
     code, stdout, stderr = proof.oxide(
         [
@@ -1900,7 +1900,7 @@ def auto_run(proof: Proof, repo: str) -> None:
     expect(code == 0 and not auto_notices(stderr), stderr)
     expect(not os.path.islink(os.path.join(maker, "target")), "unregistered build linked target")
 
-    mounted = attach_image(proof, root, name)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
     code, stdout, stderr = proof.oxide(
         [
@@ -2066,7 +2066,7 @@ def auto_run(proof: Proof, repo: str) -> None:
     expect(code == 0 and not auto_notices(stderr), stderr)
     expect(not os.path.islink(os.path.join(gone, "target")), "absent drive linked its target")
     expect(not os.path.exists(receipt_file(pool, gone)), "absent drive wrote a receipt")
-    mounted = attach_image(proof, root, name)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"re-attached at {mounted}, not {mount}")
     proof.phase("after absent drive")
 
@@ -2356,7 +2356,7 @@ def ignore_run(proof: Proof, repo: str) -> None:
     code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
     expect(code == 0, stderr)
 
-    mounted = attach_image(proof, root, name)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
     code, stdout, stderr = proof.oxide(
         [
@@ -3958,9 +3958,31 @@ def exec_self_test() -> None:
             f"{body_map[case]} calls helpers that do not exist at runtime: {unbound}",
         )
 
+    # The shared attachment helper respects each caller's directory and image
+    # name, including the profile proof's isolated-image control.
+    from unittest.mock import patch
+    from types import SimpleNamespace
+    fake_attach = SimpleNamespace(image=None, mount=None, devices=[], detach_confirmed=False,
+                                  detach_attempted=False)
+    commands = []
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        payload = plistlib.dumps({"system-entities": [
+            {"mount-point": "/Volumes/fake", "dev-entry": "/dev/disk-test"}
+        ]})
+        return SimpleNamespace(returncode=0, stdout=payload, stderr=b"")
+    fake_attach.run = fake_run
+    with patch("os.path.exists", return_value=False):
+        attach_image(fake_attach, "/evidence/owned-image", "fake", owners=True,
+                     image_name="isolated.sparseimage")
+    expected_image = "/evidence/owned-image/isolated.sparseimage"
+    expect(fake_attach.image == expected_image, "attachment lost caller's image path")
+    expect(commands[0][-1] == expected_image and commands[1][-1] == expected_image,
+           "creation and attachment disagree with caller's image path")
+    expect("-owners" in commands[1], "attachment lost its owners option")
+
     # The shared helper must retain the backing if detach reports success but
     # either the mount or a recorded device survives.
-    from unittest.mock import patch
     fake = object.__new__(Proof)
     fake.mount, fake.devices, fake.image = "/mount", ["/dev/disk-test"], "/evidence/image"
     fake.detach_confirmed = False
@@ -4897,7 +4919,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     # Premise 6: this proof's own image is attached with filesystem owners on
     # and observed read-only; the product registration that follows is the
     # second control (it refuses an ignore-ownership mount).
-    mounted = attach_image(proof, root, name, owners=True)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name, owners=True)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
     owners_honored(proof, mount, "exec-inference attach")
     code, stdout, stderr = proof.oxide(
@@ -6022,7 +6044,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         force_detach(proof, proof.image, mount, volume_uuid)
 
         def reattach() -> None:
-            mounted_now = attach_image(proof, root, name, owners=True)
+            mounted_now = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name, owners=True)
             expect(
                 mounted_now == mount,
                 f"24: the scratch volume re-attached at {mounted_now}, not {mount}",
@@ -6349,7 +6371,7 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
     maker = fresh_checkout(proof, root, "pool-maker")
     code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
     expect(code == 0, stderr)
-    mounted = attach_image(proof, root, name, owners=True)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name, owners=True)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
     owners_honored(proof, mount, "auto-ineligible image")
     code, stdout, stderr = proof.oxide(

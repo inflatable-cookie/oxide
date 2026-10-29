@@ -123,6 +123,9 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 120 --
 # single owned 128 MiB image under the unchanged 600 s / 512 MiB / reserve /
 # custody / cleanup rules; ordinary builds, tests and proofs keep the
 # selected-volume default.
+[tasks."proof:profile-outputs:test"]
+run = "python3 scripts/test-profile-outputs.py --self-check"
+
 [tasks."rust:profile-outputs"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
