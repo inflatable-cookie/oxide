@@ -702,6 +702,22 @@ run = "python3 scripts/test-oxide-removable-pool.py"
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py"
 
+# The uncounted keep-going twin of the main mode: the same guard, root and
+# limits with `--diagnostic` appended. It records reached/completed/failed/
+# dependent-skipped/unexecuted cases and the latched first fault in one
+# bounded `qualified: false` receipt beside the guard's, continues only into
+# dependency-independent cases, and aborts (retaining the image and its
+# custody record) on any writer, mount, device, resource or deadline outcome
+# it cannot classify. It is never a counted native PASS.
+[tasks."rust:oxide-removable-removal:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --diagnostic"
+
+# `--plan` prints both modes' fixed case tables, the allocation and the nine
+# premise dispositions with no effect at all.
+[tasks."proof:removable-removal:plan"]
+run = "python3 scripts/test-oxide-removable-removal.py --plan"
+
 # Boot-session closure (oxide#161): the removable-removal proof's focused
 # mode. A restart ends every process, so a quarantined lost slot whose holder
 # started before the current boot session is positively closed. Stages this
@@ -731,13 +747,16 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure --diagnostic"
 
-# The pure apparatus check of the boot-closure mode (oxide#161): no child,
+# The pure apparatus check for both modes (oxide#161, oxide#191): no child,
 # pool, image, device or supervisor, and no gate credit. It pins the two
 # defects the first exact-head review found before a native activation (the
 # diagnostic receipt's `json` dependency and a boot-closure child handed only
-# the override instead of the full fixture environment), plus the argument
-# dispatch and the product's own deletion line the candidate marker quotes.
-# It runs before the uncounted diagnostic and is not native evidence.
+# the override instead of the full fixture environment), the deletion oracle's
+# slot leaf, the owners-on attach and mount observation every mode shares, the
+# nine premise dispositions with the actual fixture environment checked against
+# hostile inherited values, the main mode's case map and its keep-going/skip/
+# abort driver, the argument dispatch and the product lines the markers quote.
+# It runs before the uncounted diagnostics and is not native evidence.
 [tasks."rust:oxide-removable-boot-closure:test"]
 run = "python3 scripts/test-oxide-removable-removal.py --self-check"
 
@@ -808,21 +827,43 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-oxide-exec.py"
 # payload and every slot, readiness walks nothing (oxide#182), held and
 # killed-holder `recover-interrupted` refuse without a walk, a waiting build
 # walks nothing and the recovered cold build walks only the slot it re-leased
-# and the one it released. 300 s and 512 MiB owned scratch including cleanup,
-# sampled at phase boundaries; the byte-pressure eviction case is retired to
-# `rust:recorded-slot-accounting` and `rust:holding-delete`. Not a benchmark
-# and not full QA.
+# and the one it released. `--root-parent /private/tmp` is the owner-accepted
+# internal-placement exception (decision bd357a4c): the fixture's pool is a
+# genuine internal directory-budget pool and the product refuses one on an
+# external volume. Everything the proof creates lives inside that monitored
+# root, and the script stops 30 s before the guard deadline. 300 s and 512 MiB
+# monitored scratch including cleanup; the byte-pressure eviction case is
+# retired to `rust:recorded-slot-accounting` and `rust:holding-delete`. Not a
+# benchmark and not full QA.
 [tasks."rust:front-door-accounting"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py python3 scripts/test-front-door-accounting.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py"
+
+# The uncounted keep-going twin (oxide#191): the same guard, root and limits
+# with `--diagnostic` appended. It records reached/completed/failed/
+# dependent-skipped/unexecuted cases and the latched first fault in one
+# bounded `qualified: false` receipt beside the guard's, continues only into
+# dependency-independent cases, and aborts on any outcome it cannot classify.
+# It is never a counted native PASS.
+[tasks."rust:front-door-accounting:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py --diagnostic"
 
 # The pure apparatus check of the front-door script: walk and scope root
 # mapping, the exact ordered walk oracles (a whole-payload admission walk is
 # refused), the product summary/provenance and measure lines, the readiness
-# needle bound to its source sentence, and the argument dispatch. No child,
-# pool, image, scratch or supervisor.
+# needle bound to its source sentence, the nine premise dispositions with the
+# actual fixture/staging environments checked against hostile inherited
+# values, the case map, the keep-going/skip/abort driver, the bounded
+# unqualified receipt, and the argument dispatch. No child, pool, image,
+# scratch or supervisor.
 [tasks."proof:front-door:test"]
 run = "python3 scripts/test-front-door-accounting.py --self-check"
+
+# `--plan` prints the case table, the allocation and the nine premise
+# dispositions with no effect at all.
+[tasks."proof:front-door:plan"]
+run = "python3 scripts/test-front-door-accounting.py --plan"
 
 # Finder metadata (oxide#105): a short fixed script under heavy admission
 # (deadline checked before each child, 20 GiB reserve sampled every 250 ms

@@ -45,11 +45,27 @@ hard link is counted once) and the holding deletion under it in
 not cover: readiness, held and killed-holder refusals, the waiting build and
 the recovered cold build.
 
-The walk counts show routing only, not a resource gate. Bounds: 20 GiB host
-reserve and owned scratch (512 MiB) sampled at phase boundaries only, 300 s
-including cleanup under `scripts/bounded-test.py`. `--self-check` is the pure
-apparatus check: no child, pool, image or scratch. Not a benchmark and not
-full QA. Scratch is removed only after positive completion.
+The walk counts show routing only, not a resource gate. The scratch is one
+fresh directory inside the qualified supervisor's `OXIDE_TASK_SCRATCH_ROOT`
+(the selector passes `--root-parent /private/tmp`, the owner-accepted
+internal-placement exception `bd357a4c`, because the fixture's pool is a
+genuine internal `directory-budget` pool that the product refuses on an
+external volume), so the supervisor's continuous reserve watchdog, scratch
+budget and closure census cover the actual work. The script stops 30 s before
+the guard's exported deadline, and its own phase samples are observations,
+not gates. Bounds: 300 s and 512 MiB monitored scratch under
+`scripts/bounded-test.py`.
+
+`--diagnostic` is the uncounted keep-going collection: it records reached,
+completed, failed, dependent-skipped and unexecuted cases and the latched
+first fault in a bounded `qualified: false` receipt beside the guard's,
+continues only into dependency-independent cases, and aborts on an outcome it
+cannot classify (an unclassified child, writer, mount, resource or deadline
+outcome). It is never a counted PASS. `--plan` prints the case table, the
+allocation and the nine premise dispositions without any effect.
+`--self-check` is the pure apparatus check: no child, pool, image or scratch.
+Not a benchmark and not full QA. Scratch is removed only after positive
+completion.
 """
 from __future__ import annotations
 
@@ -68,6 +84,7 @@ BUILDER = "1.97.1"
 SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 PROOF_SECONDS = 300
+SHUTDOWN_MARGIN_S = 30
 MIB = 1024 * 1024
 BIG_ENTRIES = 200_000
 STARTED = time.monotonic()
@@ -75,7 +92,60 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PEAK = {"bytes": 0, "phase": "none"}
 # The product's own readiness line since oxide#182: it reads no pool state.
 READINESS_NEEDLE = "use not measured (readiness reads no pool state)"
-USAGE = "usage: test-front-door-accounting.py [--self-check]"
+# One fixed compiler-flag value for staging and every fixture child (premise 7).
+FROZEN_RUSTFLAGS = ""
+# The uncounted collection's one bounded receipt.
+DIAGNOSTIC_RECEIPT = "front-door.diagnostic"
+DIAGNOSTIC_RECEIPT_BYTES = 16 * 1024
+DIAGNOSTIC_RECEIPT_EXCERPT = 600
+USAGE = ("usage: test-front-door-accounting.py "
+         "[--diagnostic | --plan | --self-check]")
+
+# The nine-item proof-authoring premise checklist, traced through the actual
+# child environments below and bound by `--self-check`. `--plan` prints it.
+PREMISE_CHECKLIST = (
+    (
+        "private HOME and rustup",
+        "applicable: `staging_environment` and `fixture_environment` capture the invoking "
+        "RUSTUP_HOME (or HOME/.rustup) before the private HOME exists, pass it to staging and every "
+        "child with RUSTUP_TOOLCHAIN=1.97.1 and RUSTUP_AUTO_INSTALL=0, and keep HOME/CARGO_HOME "
+        "private; staging is the only --locked call, against this repository's committed lock, and "
+        "the dependency-free fixtures make their own lock offline",
+    ),
+    (
+        "account-home control",
+        "applicable: `fixture_environment` sets OXIDE_TEST_HOME_FROM_ENV=1 beside the private HOME",
+    ),
+    (
+        "environment isolation",
+        "applicable: both environment builders drop every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key and "
+        "CARGO, CARGO_INCREMENTAL, RUSTUP_TOOLCHAIN, RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS before setting "
+        "only the fixture's own controls",
+    ),
+    (
+        "automatic adoption",
+        "not applicable: no permanent-drive mode, no Git repository in any fixture and no outputs "
+        "conversion; every checkout keeps its target local",
+    ),
+    ("Cargo external argv", "not applicable: no external Cargo subcommand runs in this proof"),
+    ("owned images", "not applicable: no disk image, mount or removable media"),
+    (
+        "compiler flags",
+        "applicable: RUSTFLAGS is the fixed FROZEN_RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS is removed for "
+        "staging and every child; the staged binary must carry its walk observer",
+    ),
+    (
+        "temporary storage",
+        "applicable: the scratch is one fresh directory inside the qualified supervisor's "
+        "OXIDE_TASK_SCRATCH_ROOT under --root-parent /private/tmp (the owner-accepted "
+        "internal-placement exception bd357a4c), and TMPDIR/TMP/TEMP name one owned directory inside it",
+    ),
+    (
+        "macOS mktemp",
+        "applicable: tempfile.mkdtemp with a template inside OXIDE_TASK_SCRATCH_ROOT; the executable "
+        "fixture inherits that TMPDIR",
+    ),
+)
 
 HOLD_TEST = """use std::path::PathBuf;
 use std::time::Duration;
@@ -98,14 +168,43 @@ fn optional_hold() {
 """
 
 
+class OracleFailure(RuntimeError):
+    """A product expectation that did not hold: recoverable in a diagnostic."""
+
+
+class UnknownOutcome(RuntimeError):
+    """An outcome this proof cannot classify: never continued past."""
+
+
+DEADLINE = {"at": STARTED + PROOF_SECONDS}
+
+
 def fail(message: str) -> None:
-    raise RuntimeError(message)
+    """A product expectation that did not hold: recoverable in a diagnostic."""
+    raise OracleFailure(message)
+
+
+def need(message: str) -> None:
+    """An outcome this proof cannot classify: never continued past."""
+    raise UnknownOutcome(message)
+
+
+def work_deadline() -> float:
+    """The guard's exported deadline less its cleanup margin, when present."""
+    guard = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
+    if guard:
+        try:
+            left = int(guard) / 1e9 - time.monotonic() - SHUTDOWN_MARGIN_S
+        except ValueError:
+            need(f"OXIDE_PROOF_DEADLINE_NS {guard!r} is not an integer")
+        DEADLINE["at"] = min(DEADLINE["at"], time.monotonic() + max(1.0, left))
+    return DEADLINE["at"]
 
 
 def remaining() -> float:
-    left = PROOF_SECONDS - (time.monotonic() - STARTED)
+    left = DEADLINE["at"] - time.monotonic()
     if left <= 0:
-        fail(f"proof exceeded {PROOF_SECONDS} s")
+        need(f"proof exceeded its {PROOF_SECONDS} s guard window")
     return left
 
 
@@ -118,7 +217,7 @@ def reserve(path: str, phase: str) -> None:
     free = stat.f_bavail * stat.f_frsize
     say(f"reserve {phase}: host free {free // MIB} MiB")
     if free < HOST_RESERVE_BYTES:
-        fail(f"host free {free} is below the 20 GiB reserve at {phase}")
+        need(f"host free {free} is below the 20 GiB reserve at {phase}")
 
 
 def tree_bytes(root: str) -> int:
@@ -139,7 +238,7 @@ def owned(parent: str, phase: str) -> int:
         PEAK.update(bytes=used, phase=phase)
     say(f"owned scratch {phase}: {used // MIB} MiB")
     if used > SCRATCH_LIMIT_BYTES:
-        fail(f"owned scratch {used} exceeds 512 MiB at {phase}")
+        need(f"owned scratch {used} exceeds 512 MiB at {phase}")
     return used
 
 
@@ -149,6 +248,84 @@ def sha256(path: str) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def invoking_rustup() -> str:
+    """The invoking toolchain home, resolved before any private HOME exists."""
+    return os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+
+
+def staging_environment() -> dict:
+    """Staging uses the invoking Cargo home (this repository's committed lock,
+    offline) with the fixed compiler flags and no wrapper."""
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("CARGO_BUILD_", "CARGO_TARGET_", "OXIDE_", "XDG_", "RUSTC"))
+        and name
+        not in (
+            "CARGO",
+            "CARGO_INCREMENTAL",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+        )
+    }
+    env.update(
+        {
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "RUSTC_WRAPPER": "",
+            "RUSTFLAGS": FROZEN_RUSTFLAGS,
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_NET_OFFLINE": "true",
+        }
+    )
+    return env
+
+
+def fixture_environment(parent: str) -> dict:
+    """The one environment every fixture child gets: a private HOME, CARGO_HOME
+    and TMPDIR/TMP/TEMP inside this run's scratch, the invoking rustup home,
+    the pinned toolchain, the fixed compiler flags and only this proof's own
+    controls. Every inherited OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key and every
+    encoded compiler-flag value is dropped first."""
+    home = os.path.join(parent, "home")
+    cargo_home = os.path.join(parent, "cargo-home")
+    tmp = os.path.join(parent, "tmp")
+    for path in (home, cargo_home, tmp, os.path.join(parent, "walks")):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("OXIDE_", "XDG_", "CARGO_", "SCCACHE_", "RUSTC"))
+        and name
+        not in (
+            "CARGO",
+            "CARGO_INCREMENTAL",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+        )
+    }
+    env.update(
+        {
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
+            "HOME": home,
+            "CARGO_HOME": cargo_home,
+            "RUSTUP_HOME": invoking_rustup(),
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "RUSTC_WRAPPER": "",
+            "RUSTFLAGS": FROZEN_RUSTFLAGS,
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TERM_COLOR": "never",
+            "TMPDIR": tmp,
+            "TMP": tmp,
+            "TEMP": tmp,
+        }
+    )
+    return env
 
 
 def stage(parent: str, env: dict) -> str:
@@ -163,13 +340,13 @@ def stage(parent: str, env: dict) -> str:
     with open(log) as handle:
         text = handle.read()
     if build.returncode:
-        fail(f"staging exit {build.returncode}: {text[-2000:]}")
+        need(f"staging exit {build.returncode}: {text[-2000:]}")
     out = os.path.join(parent, "bin", "oxide")
     os.makedirs(os.path.dirname(out))
     shutil.copy2(os.path.join(target, "debug", "oxide"), out)
     with open(out, "rb") as handle:
         if b"OXIDE_TEST_WALK_LOG" not in handle.read():
-            fail("the staged debug binary has no walk observer")
+            need("the staged debug binary has no walk observer")
     say(f"staged {out}: sha256 {sha256(out)}")
     owned(parent, "after staging")
     shutil.rmtree(target)
@@ -573,6 +750,177 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
             killed.wait()
 
 
+# --------------------------------------------------------------------------
+# The fixed case map and its driver. Each case is one named premise; a case
+# takes `(proof, checkouts, state)` and shares only what an earlier case
+# established. The counted run is fail-fast; the diagnostic records a
+# recoverable oracle failure and continues only into dependency-independent
+# cases, and aborts on any outcome it cannot classify.
+
+
+def case_slots(proof: Proof, checkouts: dict, state: dict) -> None:
+    app_slot, big_slot = prove_slots(proof, checkouts["app"], checkouts["big"])
+    state.update(app_slot=app_slot, big_slot=big_slot)
+    owned(proof.parent, "after two new slots")
+    reserve(proof.parent, "after two new slots")
+
+
+def case_status(proof: Proof, checkouts: dict, state: dict) -> None:
+    recorded_status(proof, checkouts["app"], "after two new slots")
+    status(proof, checkouts["app"], "after two new slots", [state["app_slot"], state["big_slot"]])
+
+
+def case_readiness(proof: Proof, checkouts: dict, state: dict) -> None:
+    prove_readiness(proof)
+    owned(proof.parent, "after readiness")
+    reserve(proof.parent, "after readiness")
+
+
+def case_reuse(proof: Proof, checkouts: dict, state: dict) -> None:
+    prove_reuse(proof, checkouts["app"], state["app_slot"], state["big_slot"])
+    owned(proof.parent, "after reuse")
+    reserve(proof.parent, "after reuse")
+
+
+def case_recovery(proof: Proof, checkouts: dict, state: dict) -> None:
+    kept = prove_recovery(proof, checkouts["app"], state["app_slot"])
+    if kept not in proof.slots() or kept == state["big_slot"]:
+        fail(f"the recovered cold slot {kept} is not a new slot in {sorted(proof.slots())}")
+    state["kept_slot"] = kept
+    owned(proof.parent, "after recovery")
+    reserve(proof.parent, "after recovery")
+    recorded_status(proof, checkouts["app"], "after recovery")
+    status(proof, checkouts["app"], "after recovery", list(proof.slots()))
+
+
+CASES = (
+    ("slots", (), "two new slots: no admission walk, one payload scope pass, a release walk"),
+    ("status", ("slots",), "recorded status walks nothing; --measure walks the payload then every slot"),
+    ("readiness", ("slots",), "oxide new readiness walks nothing and reads no pool state"),
+    ("reuse", ("slots",), "the 200,000-entry idle slot, then ordinary reuse walks its target twice"),
+    ("recovery", ("reuse",), "a live holder refusal and its woken build, then the killed holder's recovery"),
+)
+
+BODIES = {
+    "slots": case_slots,
+    "status": case_status,
+    "readiness": case_readiness,
+    "reuse": case_reuse,
+    "recovery": case_recovery,
+}
+
+
+def diagnostic_outcome() -> dict:
+    return {
+        "version": "oxide.front-door-accounting-diagnostic/1",
+        "mode": "diagnostic",
+        "qualified": False,
+        "claims": "diagnostic case coverage only; never a counted native PASS, "
+                  "closure, census or resource claim",
+        "cases": [case for case, _, _ in CASES],
+        "purposes": {case: purpose for case, _, purpose in CASES},
+        "dependencies": {case: list(deps) for case, deps, _ in CASES},
+        "source": None,
+        "root": None,
+        "limits": {
+            "seconds": PROOF_SECONDS,
+            "shutdown_margin_s": SHUTDOWN_MARGIN_S,
+            "scratch_mib": SCRATCH_LIMIT_BYTES // MIB,
+            "fixture_entries": BIG_ENTRIES,
+        },
+        "reached": [],
+        "completed": [],
+        "failed": [],
+        "skipped": [],
+        "unexecuted": [],
+        "first_fault": None,
+        "aborted": None,
+    }
+
+
+def run_cases(diagnostic: bool, proof: Proof, checkouts: dict, state: dict, outcome: dict,
+              bodies: dict | None = None) -> dict:
+    """Run the fixed case map; return the same `outcome` document."""
+    bodies = BODIES if bodies is None else bodies
+    for case, deps, _ in CASES:
+        missing = [dep for dep in deps if dep not in outcome["completed"]]
+        if diagnostic and missing:
+            outcome["skipped"].append([case, missing])
+            print(f"front-door {case}: skipped (dependency {', '.join(missing)} did not complete)",
+                  flush=True)
+            continue
+        outcome["reached"].append(case)
+        try:
+            bodies[case](proof, checkouts, state)
+        except OracleFailure as failure:
+            outcome["failed"].append([case, str(failure)[:DIAGNOSTIC_RECEIPT_EXCERPT]])
+            outcome["first_fault"] = outcome["first_fault"] or f"{case}: {failure}"
+            print(f"front-door {case}: FAILED {failure}", file=sys.stderr, flush=True)
+            if not diagnostic:
+                raise
+            continue
+        except UnknownOutcome as failure:
+            outcome["aborted"] = f"{case}: {failure}"
+            outcome["unexecuted"] = [name for name, _, _ in CASES if name not in outcome["reached"]]
+            print(f"front-door {case}: ABORTED {failure}", file=sys.stderr, flush=True)
+            raise
+        outcome["completed"].append(case)
+        print(f"front-door {case}: completed", flush=True)
+    outcome["unexecuted"] = [case for case, _, _ in CASES if case not in outcome["reached"]]
+    return outcome
+
+
+def diagnostic_receipt(outcome: dict) -> str:
+    """Write ONE bounded, uniquely named, explicitly unqualified receipt."""
+    recorded = {
+        **outcome,
+        "failed": [[case, message[:DIAGNOSTIC_RECEIPT_EXCERPT]] for case, message in outcome["failed"][:8]],
+    }
+    body = json.dumps(recorded, indent=1) + "\n"
+    if len(body.encode()) > DIAGNOSTIC_RECEIPT_BYTES:
+        recorded = {
+            "version": recorded["version"],
+            "mode": "diagnostic",
+            "qualified": False,
+            "incomplete": True,
+            "reason": f"the bounded receipt exceeded {DIAGNOSTIC_RECEIPT_BYTES} bytes",
+            "completed": recorded["completed"],
+            "failed_cases": [case for case, _ in recorded["failed"]],
+        }
+        body = json.dumps(recorded, indent=1) + "\n"
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    if not os.path.isdir(evidence):
+        raise RuntimeError(f"no evidence directory for the diagnostic receipt: {evidence!r}")
+    name = f"{DIAGNOSTIC_RECEIPT}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.json"
+    path = os.path.join(evidence, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    return path
+
+
+def plan() -> int:
+    """Print the fixed case table, allocation and premise dispositions. No effect."""
+    print("front-door accounting proof plan (effect-free)")
+    print(f"candidate: this HEAD's debug oxide, staged offline with {BUILDER} from {REPO}")
+    print("selector: python3 scripts/bounded-test.py --root-parent /private/tmp "
+          "--limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py")
+    print("allocation: one internal directory-budget pool with two slots, one idle slot of more than "
+          f"{BIG_ENTRIES:,} entries and one 8 MiB hard-linked file, two fixture checkouts and one "
+          "`oxide new` crate, all inside one owned scratch inside OXIDE_TASK_SCRATCH_ROOT "
+          "(measured staging peak 283 MiB of the 512 MiB monitored budget)")
+    print(f"limits: {PROOF_SECONDS} s wall including cleanup, stop {SHUTDOWN_MARGIN_S} s before the guard "
+          f"deadline, {SCRATCH_LIMIT_BYTES // MIB} MiB monitored scratch, one Cargo call at a time")
+    print("cases:")
+    for case, deps, purpose in CASES:
+        print(f"  {case}: {purpose} (after {', '.join(deps) or 'nothing'})")
+    print("premise checklist:")
+    for item, disposition in PREMISE_CHECKLIST:
+        print(f"  {item}: {disposition}")
+    print("modes: --diagnostic (uncounted keep-going collection), --plan (this), "
+          "--self-check (pure apparatus); the counted run takes no argument")
+    return 0
+
+
 def self_check() -> int:
     """Pure apparatus check: no child, pool, image, scratch or supervisor."""
     root = tempfile.mkdtemp(prefix="front-door-self-check.")
@@ -646,15 +994,160 @@ def self_check() -> int:
         # The product's own readiness sentence is a source string, not a guess.
         with open(os.path.join(REPO, "src", "bin", "oxide", "adopt.rs"), encoding="utf-8") as handle:
             expect_true(READINESS_NEEDLE in handle.read(), "adopt.rs lost the readiness sentence")
+        # The premise checklist is complete, and its environment claims are
+        # checked against the builders with hostile inherited values in place:
+        # the private HOME and toolchain, the account-home control, the fixed
+        # compiler flags, the owned temporary storage and the isolation scrub.
+        expect_true(len(PREMISE_CHECKLIST) == 9, f"premise checklist has {len(PREMISE_CHECKLIST)} items")
+        names = [item for item, _ in PREMISE_CHECKLIST]
+        expect_true(len(set(names)) == 9, f"duplicate premise names {names}")
+        for item, disposition in PREMISE_CHECKLIST:
+            expect_true(disposition.strip() != "", f"premise {item} has no disposition")
+        holder = dict(os.environ)
+        try:
+            os.environ.update(
+                {
+                    "OXIDE_POOL": "/fixture/host-pool",
+                    "OXIDE_CONFIG": "/fixture/host-config",
+                    "OXIDE_TEST_HOME_FROM_ENV": "0",
+                    "XDG_CONFIG_HOME": "/fixture/xdg",
+                    "RUSTFLAGS": "-Ctarget-cpu=native",
+                    "CARGO_ENCODED_RUSTFLAGS": "-Ctarget-cpu=native",
+                    "RUSTUP_TOOLCHAIN": "nightly",
+                    "SCCACHE_DIR": "/fixture/sccache",
+                }
+            )
+            fixture_root = os.path.join(root, "fixture")
+            env = fixture_environment(fixture_root)
+            expect_true(env["OXIDE_TEST_HOME_FROM_ENV"] == "1", "account-home control was not set")
+            expect_true(env["HOME"] == os.path.join(fixture_root, "home"), "HOME is not private")
+            expect_true(env["CARGO_HOME"] == os.path.join(fixture_root, "cargo-home"),
+                        "CARGO_HOME is not private")
+            expect_true(env["RUSTUP_HOME"] == invoking_rustup(), "the invoking rustup home was not kept")
+            expect_true(env["RUSTUP_TOOLCHAIN"] == BUILDER, "the toolchain is not pinned")
+            expect_true(env["RUSTUP_AUTO_INSTALL"] == "0", "auto-install is not disabled")
+            expect_true(env["RUSTFLAGS"] == FROZEN_RUSTFLAGS, f"flags not frozen: {env['RUSTFLAGS']!r}")
+            expect_true("CARGO_ENCODED_RUSTFLAGS" not in env, "encoded flags were inherited")
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                expect_true(env[name] == os.path.join(fixture_root, "tmp"),
+                            f"{name} is not the owned temporary directory")
+            for name in ("OXIDE_POOL", "OXIDE_CONFIG", "XDG_CONFIG_HOME", "SCCACHE_DIR"):
+                expect_true(name not in env, f"inherited {name} was copied into the fixture")
+            staging = staging_environment()
+            expect_true(staging["RUSTFLAGS"] == FROZEN_RUSTFLAGS
+                        and "CARGO_ENCODED_RUSTFLAGS" not in staging, "staging flags are not frozen")
+            expect_true(staging["RUSTUP_TOOLCHAIN"] == BUILDER
+                        and staging["RUSTUP_AUTO_INSTALL"] == "0", "staging toolchain is not pinned")
+            expect_true("OXIDE_POOL" not in staging and "XDG_CONFIG_HOME" not in staging,
+                        "staging environment is not isolated")
+        finally:
+            os.environ.clear()
+            os.environ.update(holder)
+        # The case map: every case has a body and a purpose, and every
+        # dependency names an earlier case, so the diagnostic can skip only
+        # dependents of what did not complete.
+        expect_true(len(CASES) == 5, f"case table {CASES}")
+        seen = []
+        for case, deps, purpose in CASES:
+            expect_true(purpose.strip() != "", f"case {case} has no purpose")
+            expect_true(case not in seen, f"duplicate case {case}")
+            for dep in deps:
+                expect_true(dep in seen, f"case {case} depends on {dep}, which is not earlier")
+            expect_true(case in BODIES, f"case {case} has no body")
+            seen.append(case)
+        expect_true(set(BODIES) == set(seen), f"bodies {sorted(BODIES)} vs cases {seen}")
+
+        calls = []
+
+        def stub_ok(proof, checkouts, state):
+            calls.append("ok")
+
+        def stub_fail(proof, checkouts, state):
+            calls.append("fail")
+            fail("stub failure")
+
+        def stub_abort(proof, checkouts, state):
+            calls.append("abort")
+            need("stub unknown outcome")
+
+        def stubs(**overrides) -> dict:
+            bodies = {case: stub_ok for case, _, _ in CASES}
+            bodies.update(overrides)
+            return bodies
+
+        # A recoverable failure in the first case skips its dependents and runs
+        # nothing that a missing premise could satisfy.
+        outcome = diagnostic_outcome()
+        run_cases(True, None, {}, {}, outcome, stubs(slots=stub_fail))
+        expect_true(outcome["completed"] == [], f"a failed case was completed: {outcome['completed']}")
+        expect_true([case for case, _ in outcome["failed"]] == ["slots"], f"failed {outcome['failed']}")
+        expect_true(
+            outcome["skipped"] == [["status", ["slots"]], ["readiness", ["slots"]],
+                                   ["reuse", ["slots"]], ["recovery", ["reuse"]]],
+            f"skipped {outcome['skipped']}",
+        )
+        expect_true(calls == ["fail"], f"calls {calls}")
+        # An independent case still runs after another case's recoverable
+        # failure, and the first fault is latched.
+        calls.clear()
+        outcome = diagnostic_outcome()
+        run_cases(True, None, {}, {}, outcome, stubs(status=stub_fail))
+        expect_true(outcome["completed"] == ["slots", "readiness", "reuse", "recovery"],
+                    f"completed {outcome['completed']}")
+        expect_true([case for case, _ in outcome["failed"]] == ["status"], f"failed {outcome['failed']}")
+        expect_true(outcome["first_fault"] == "status: stub failure", f"first fault {outcome['first_fault']}")
+        # An unknown outcome aborts and leaves the rest unexecuted.
+        outcome = diagnostic_outcome()
+        try:
+            run_cases(True, None, {}, {}, outcome, stubs(status=stub_abort))
+        except UnknownOutcome:
+            pass
+        else:
+            fail("an unknown outcome did not abort the collection")
+        expect_true(outcome["aborted"] == "status: stub unknown outcome", f"aborted {outcome['aborted']}")
+        expect_true(outcome["unexecuted"] == ["readiness", "reuse", "recovery"],
+                    f"unexecuted {outcome['unexecuted']}")
+        # The receipt is bounded, unique, explicitly unqualified and refused
+        # without an evidence directory.
+        holder = dict(os.environ)
+        os.environ["OXIDE_PROOF_EVIDENCE"] = root
+        try:
+            outcome = diagnostic_outcome()
+            outcome["failed"] = [["slots", "x" * 4000]]
+            path = diagnostic_receipt(outcome)
+            with open(path, "rb") as handle:
+                body = handle.read()
+            receipt = json.loads(body)
+            expect_true(receipt["qualified"] is False and receipt["mode"] == "diagnostic",
+                        f"receipt {receipt.get('mode')}/{receipt.get('qualified')}")
+            expect_true(len(body) <= DIAGNOSTIC_RECEIPT_BYTES, f"receipt {len(body)} bytes")
+            path = diagnostic_receipt({**diagnostic_outcome(), "huge": "z" * DIAGNOSTIC_RECEIPT_BYTES})
+            with open(path, "rb") as handle:
+                body = handle.read()
+            expect_true(json.loads(body).get("incomplete") is True
+                        and len(body) <= DIAGNOSTIC_RECEIPT_BYTES, f"oversized receipt {len(body)} bytes")
+            os.environ["OXIDE_PROOF_EVIDENCE"] = os.path.join(root, "missing-evidence")
+            try:
+                diagnostic_receipt(diagnostic_outcome())
+            except RuntimeError as error:
+                expect_true("no evidence directory" in str(error), str(error))
+            else:
+                fail("the diagnostic receipt was written without an evidence directory")
+        finally:
+            os.environ.clear()
+            os.environ.update(holder)
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    # Only no arguments or `--self-check` select a mode.
     expect_true(mode_from_args([]) == "run", "no-argument mode")
+    expect_true(mode_from_args(["--diagnostic"]) == "diagnostic", "diagnostic mode")
+    expect_true(mode_from_args(["--plan"]) == "plan", "plan mode")
     expect_true(mode_from_args(["--self-check"]) == "self-check", "self-check mode")
-    for refused in (["--bogus"], ["--self-check", "--self-check"], ["run"]):
+    for refused in (["--bogus"], ["--diagnostic", "--plan"], ["--self-check", "--self-check"], ["run"]):
         expect_true(mode_from_args(refused) is None, f"{refused} selected a mode")
     print("front-door self-check ok: walk/scope root mapping, exact ordered walk oracles, "
-          "summary and provenance parsing, measure line, readiness needle, dispatch")
+          "summary and provenance parsing, measure line, readiness needle, "
+          "premise checklist and fixture environment (private home, rustup, flags, temp, isolation), "
+          "case map, keep-going/skip/abort driver, bounded unqualified receipt, dispatch")
     return 0
 
 
@@ -666,6 +1159,10 @@ def expect_true(condition: bool, message: str = "expectation") -> None:
 def mode_from_args(arguments: list) -> str | None:
     if not arguments:
         return "run"
+    if arguments == ["--diagnostic"]:
+        return "diagnostic"
+    if arguments == ["--plan"]:
+        return "plan"
     if arguments == ["--self-check"]:
         return "self-check"
     return None
@@ -679,71 +1176,70 @@ def main() -> int:
         return 2
     if mode == "self-check":
         return self_check()
+    if mode == "plan":
+        return plan()
+    diagnostic = mode == "diagnostic"
     if sys.platform != "darwin":
-        fail("the front-door accounting proof requires macOS")
+        need("the front-door accounting proof requires macOS")
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+    if not (scratch and os.path.isdir(scratch) and os.path.realpath(scratch) == scratch):
+        need(f"OXIDE_TASK_SCRATCH_ROOT {scratch!r} is not a canonical directory")
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        if os.environ.get(name) != scratch:
+            need(f"{name} is not the guard's scratch")
+    if not (os.path.isdir(os.environ.get("OXIDE_PROOF_EVIDENCE", "")) and "OXIDE_PROOF_DEADLINE_NS" in os.environ):
+        need("not under the qualified shared guard")
+    work_deadline()
     if subprocess.run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True,
                       text=True, timeout=30).stdout.strip():
-        fail("the checkout is not clean, so HEAD does not name its source")
+        need("the checkout is not clean, so HEAD does not name its source")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
                           text=True, timeout=30).stdout.strip()
-    reserve("/private/tmp", "admission")
-    made = subprocess.run(["mktemp", "-d", "/private/tmp/oxide-front-door.XXXXXX"],
-                          capture_output=True, text=True, timeout=30)
-    if made.returncode:
-        fail("mktemp failed")
-    parent = os.path.realpath(made.stdout.strip())
+    reserve(scratch, "admission")
+    parent = os.path.realpath(tempfile.mkdtemp(prefix="front-door.", dir=scratch))
     os.chmod(parent, 0o700)
-    say(f"source {head}, scratch {parent}")
+    say(f"source {head}, scratch {parent} inside the guard's known shared root")
+    outcome = diagnostic_outcome()
     try:
-        stage_env = {name: value for name, value in os.environ.items()
-                     if not name.startswith(("CARGO_BUILD_", "CARGO_TARGET_", "RUSTC", "SCCACHE", "OXIDE_"))
-                     and name not in ("CARGO", "CARGO_INCREMENTAL", "RUSTUP_TOOLCHAIN")}
-        stage_env.update({"RUSTUP_TOOLCHAIN": BUILDER, "RUSTC_WRAPPER": "", "CARGO_PROFILE_DEV_DEBUG": "0",
-                          "CARGO_NET_OFFLINE": "true"})
-        oxide = stage(parent, stage_env)
+        oxide = stage(parent, staging_environment())
         reserve(parent, "after staging")
-
-        home = os.path.join(parent, "home")
-        for path in (home, os.path.join(parent, "cargo-home"), os.path.join(parent, "tmp"),
-                     os.path.join(parent, "walks")):
-            os.makedirs(path, mode=0o700)
-        env = {name: value for name, value in stage_env.items()
-               if not name.startswith("CARGO_") and name not in ("RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER")}
-        env.update({"OXIDE_TEST_HOME_FROM_ENV": "1", "HOME": home, "CARGO_HOME": os.path.join(parent, "cargo-home"),
-                    "RUSTUP_HOME": os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup"),
-                    "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never",
-                    "TMPDIR": os.path.join(parent, "tmp")})
-        proof = Proof(parent, oxide, env)
+        proof = Proof(parent, oxide, fixture_environment(parent))
         checkouts = {}
         for name in ("app", "big"):
             checkouts[name] = os.path.join(parent, "checkouts", name)
             write_fixture(checkouts[name], name)
-        app_slot, big_slot = prove_slots(proof, checkouts["app"], checkouts["big"])
-        recorded_status(proof, checkouts["app"], "after two new slots")
-        status(proof, checkouts["app"], "after two new slots", [app_slot, big_slot])
-        prove_readiness(proof)
-        owned(parent, "after readiness")
-        reserve(parent, "after readiness")
-        prove_reuse(proof, checkouts["app"], app_slot, big_slot)
-        owned(parent, "after reuse")
-        reserve(parent, "after reuse")
-        kept_slot = prove_recovery(proof, checkouts["app"], app_slot)
-        if kept_slot not in proof.slots() or kept_slot == big_slot:
-            fail(f"the recovered cold slot {kept_slot} is not a new slot in {sorted(proof.slots())}")
-        owned(parent, "after recovery")
-        reserve(parent, "after recovery")
-        recorded_status(proof, checkouts["app"], "after recovery")
-        status(proof, checkouts["app"], "after recovery", list(proof.slots()))
-        reserve(parent, "after recovery status")
+        if diagnostic:
+            outcome.update(source=head, root=parent)
+            try:
+                run_cases(True, proof, checkouts, {}, outcome)
+            finally:
+                path = diagnostic_receipt(outcome)
+                print(f"front-door diagnostic receipt {path}")
+        else:
+            run_cases(False, proof, checkouts, {}, outcome)
     except Exception:
         print(f"front-door accounting proof retained its owned scratch at {parent}", file=sys.stderr)
         raise
     shutil.rmtree(parent)
     elapsed = time.monotonic() - STARTED
-    if elapsed > PROOF_SECONDS:
-        fail(f"front-door accounting proof took {elapsed:.0f} s, over {PROOF_SECONDS} s")
-    print(f"oxide front-door accounting proof held: source {head}, {elapsed:.0f} s including cleanup, "
-          f"peak owned scratch sampled {PEAK['bytes'] // MIB} MiB ({PEAK['phase']}), scratch removed")
+    if elapsed > PROOF_SECONDS + SHUTDOWN_MARGIN_S:
+        need(f"front-door accounting proof took {elapsed:.0f} s, over its guard window")
+    if diagnostic or outcome["failed"]:
+        line = (
+            f"front-door diagnostic collected (UNCOUNTED, never a PASS): "
+            f"{len(outcome['completed'])}/{len(CASES)} cases completed, failed "
+            f"{[case for case, _ in outcome['failed']]}, skipped "
+            f"{[case for case, _ in outcome['skipped']]}, unexecuted {outcome['unexecuted']}; "
+            f"{elapsed:.0f} s including cleanup, sampled peak owned scratch "
+            f"{PEAK['bytes'] // MIB} MiB ({PEAK['phase']}), scratch removed"
+        )
+    else:
+        line = (
+            f"oxide front-door accounting proof held: source {head}, {elapsed:.0f} s including "
+            f"cleanup, peak owned scratch sampled {PEAK['bytes'] // MIB} MiB ({PEAK['phase']}), "
+            f"scratch removed"
+        )
+    print(line)
     return 0
 
 

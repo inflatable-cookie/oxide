@@ -91,6 +91,12 @@ expect, fail, summary, MIB = runner.expect, runner.fail, runner.summary, runner.
 
 CANDIDATE_MARKER = b"lost with the removable volume; deleted whole when the volume returns"
 WAIT_SECONDS = 60
+# One fixed compiler-flag value for every fixture child (premise 7). Staging
+# refuses an inherited RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS in the process
+# environment, so it builds with the same empty flag set.
+FROZEN_RUSTFLAGS = ""
+# One excerpt bound for a recorded case failure in the diagnostic receipt.
+RECEIPT_EXCERPT = 400
 
 # The boot-session closure mode (oxide#161): a marker only a candidate with
 # the boot fact carries, the ONE debug-only override that names a boot time,
@@ -345,13 +351,23 @@ def private_environment(root: str) -> dict:
     cargo_home = os.path.join(root, "cargo-home")
     gate = os.path.join(root, "gate")
     for path in (home, cargo_home, gate):
-        os.makedirs(path, mode=0o700)
+        os.makedirs(path, mode=0o700, exist_ok=True)
     env = dict(os.environ)
     real_rustup = env.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    # Premise 3 and 7: every inherited OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key,
+    # every Cargo target/build override and every encoded compiler flag is
+    # dropped before this fixture's own controls and the one frozen flag value
+    # are set. Nothing of the host's pool, account or flag provenance leaks in.
     for key in list(env):
         if key in ("OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS"):
             continue
-        if key.startswith(("SCCACHE_", "OXIDE_", "XDG_")) or key in ("CARGO", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTUP_TOOLCHAIN", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
+        if key.startswith(("SCCACHE_", "OXIDE_", "XDG_", "CARGO_BUILD_", "CARGO_TARGET_", "RUSTC")) or key in (
+            "CARGO",
+            "CARGO_INCREMENTAL",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTFLAGS",
+            "RUSTUP_TOOLCHAIN",
+        ):
             env.pop(key)
     tmp = os.environ["TMPDIR"]
     env.update(
@@ -362,12 +378,14 @@ def private_environment(root: str) -> dict:
             "OXIDE_TEST_HOME_FROM_ENV": "1",
             "CARGO_HOME": cargo_home,
             "RUSTUP_HOME": real_rustup,
+            "RUSTUP_TOOLCHAIN": runner.BUILDER,
             "CARGO_NET_OFFLINE": "true",
             "CARGO_TERM_COLOR": "never",
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
             "CARGO_BUILD_RUSTC_WRAPPER": "",
             "RUSTUP_AUTO_INSTALL": "0",
+            "RUSTFLAGS": FROZEN_RUSTFLAGS,
             "FIXTURE_GATE": gate,
             "OXIDE_TASK_SCRATCH_ROOT": tmp,
             "TMPDIR": tmp,
@@ -378,160 +396,347 @@ def private_environment(root: str) -> dict:
     return env
 
 
-def run(proof: Proof, repo: str) -> None:
-    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
-    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
-    expect(not dirty, f"candidate checkout is not clean: {dirty}")
-    name = "OxRm" + secrets.token_hex(4)
-    mount = f"/Volumes/{name}"
-    print(f"removal proof {os.getpid()} source {source} ({layout.source_facts(repo)}) volume {name}")
-    expect(not os.path.lexists(mount), f"{mount} already exists; never touched")
-    proof.phase("start")
-    root = proof.root
-    candidate = layout.stage_at(proof, repo, "oxide-candidate")
-    print(f"staged candidate sha256 {layout.sha256(candidate)}")
-    with open(candidate, "rb") as handle:
-        expect(CANDIDATE_MARKER in handle.read(), "candidate binary lacks the #098 lost-volume text")
-    proof.binary = candidate
-    proof.phase("after staging")
+def diagnostic_outcome() -> dict:
+    """The main-mode diagnostic's one bounded document."""
+    return {
+        "version": "oxide.removal.diagnostic/1",
+        "mode": "diagnostic",
+        "qualified": False,
+        "claims": "diagnostic case coverage only; never a counted native PASS, "
+                  "closure, census or resource claim",
+        "cases": [case for case, _, _ in Removal.CASES],
+        "purposes": {case: purpose for case, _, purpose in Removal.CASES},
+        "dependencies": {case: list(deps) for case, deps, _ in Removal.CASES},
+        "source": None,
+        "root": None,
+        "mount": None,
+        "device": None,
+        "volume_uuid": None,
+        "limits": {"seconds": 300, "scratch_mib": 512, "image_mib": 128},
+        "reached": [],
+        "completed": [],
+        "failed": [],
+        "skipped": [],
+        "unexecuted": [],
+        "first_fault": None,
+        "aborted": None,
+        "unclosed": [],
+    }
 
-    env = private_environment(root)
-    gate = env["FIXTURE_GATE"]
-    proof.env = env
-    app = write_tree(os.path.join(root, "app"), APP)
-    held = write_tree(os.path.join(root, "held"), held_fixture("held"))
-    kept = write_tree(os.path.join(root, "kept"), held_fixture("kept"))
 
-    image = os.path.join(root, "volume.sparseimage")
-    created = proof.run(["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name, "-type", "SPARSE", image], timeout=60)
-    expect(created.returncode == 0, f"image creation failed: {created.stderr!r}")
-    volume = Volume(proof, image, mount)
-    volume.attach()
-    code, stdout, _ = proof.oxide(["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB"], "register", app)
-    expect(code == 0 and "registered removable pool" in stdout, "registration failed")
-    slots = os.path.join(mount, "oxide-pool", "slots")
+class Removal:
+    """The three surprise-removal cases over one owned image, pool and
+    candidate. Each case is one named premise; `state` carries only what an
+    earlier case established. A case that cannot classify an outcome raises
+    [`UnknownOutcome`] and the collection stops; a product expectation that
+    did not hold raises [`OracleFailure`] and a diagnostic continues into the
+    cases whose declared dependencies completed."""
 
-    # Idle removal: a flushed idle slot is kept warm across forced removal.
-    code, _, stderr = proof.oxide(["build"], "removable cold app", app)
-    line = summary(stderr)
-    expect(code == 0 and "apfs-volume-v1" in line and "slot 1 cold" in line, f"removable not selected: {line}")
-    expect("flushed the removable volume before releasing slot 1" in stderr, "no flush before release")
-    on_volume = [entry for entry in os.listdir(mount) if not entry.startswith(".")]
-    expect(on_volume == ["oxide-pool"], f"volume holds more than the pool: {os.listdir(mount)}")
-    app_binary = os.path.join(app, "target", "debug", "app")
-    expect(os.path.isfile(app_binary), "default output is not checkout-local while docked")
-    app_slot = runner.labelled_slot(slots, 1)
-    proof.phase("after idle build")
-    volume.force_detach("idle removal")
-    ran = proof.run([app_binary], cwd=app, timeout=30)
-    expect(ran.returncode == 0 and b"fixture app ok" in ran.stdout, "checkout-local binary does not run after removal")
-    code, _, stderr = proof.oxide(["build"], "fallback app (idle removal)", app)
-    line = summary(stderr)
-    expect(code == 0 and "directory-budget-v1" in line and "removable volume not used" in stderr, f"no internal fallback: {line}")
-    volume.no_spill("after fallback build")
-    volume.attach()
-    code, _, stderr = proof.oxide(["build"], "removable app after re-attach", app)
-    line = summary(stderr)
-    expect(code == 0 and "apfs-volume-v1" in line and "slot 1 warm" in line, f"idle slot not kept warm: {line}")
-    expect(os.path.isdir(app_slot), "idle slot directory gone")
-    proof.phase("after idle removal")
-
-    # Held removal: the running build fails cleanly and its slot is lost.
-    child = proof.start(["build"], held, env)
-    wait_for(os.path.join(gate, "held", "started"), "held build")
-    with open(os.path.join(gate, "held", "started"), encoding="utf-8") as handle:
-        out_dir = handle.read()
-    expect(out_dir.startswith(slots + "/"), f"build script OUT_DIR {out_dir} is not on the volume")
-    code, stdout, _ = proof.oxide(["status"], "status, build held", app)
-    expect(code == 0 and re.search(r"  slot 2 .*held", stdout) is not None, "held slot not shown held")
-    volume.force_detach("held removal")
-    with open(os.path.join(gate, "held", "go"), "w", encoding="utf-8") as handle:
-        handle.write("go")
-    started = time.monotonic()
-    code, _, stderr = proof.finish(child, "held build after removal", WAIT_SECONDS)
-    print(f"held build exited {time.monotonic() - started:.1f} s after release")
-    expect(code != 0, "the build survived the removal")
-    expect("slot 2 is lost with the removable volume; deleted whole when the volume returns" in stderr, "lost-volume not recorded")
-    expect("slot 2 was lost with the removable volume" in stderr, "no lost-volume summary line")
-    expect(re.search(rf"removable volume {re.escape(mount)} is gone; stopped Cargo group \d+: TERM", stderr) is not None, "no removal stop")
-    report_path = os.path.join(gate, "held", "report")
-    if os.path.exists(report_path):
-        with open(report_path, encoding="utf-8") as handle:
-            report = handle.read()
-        print(f"build script after removal:\n{report}")
-        expect("write None" not in report and "create None" not in report, f"a late write succeeded: {report}")
-    else:
-        print("build script was stopped before its late writes")
-    late_writes(out_dir, "held removal")
-    volume.no_spill("after held build")
-    expect(not os.path.lexists(out_dir), "the slot's OUT_DIR exists after removal")
-    code, stdout, _ = proof.oxide(["status"], "status, volume gone", app)
-    expect(
-        code == 0
-        and re.search(
-            r"slot 2 retired and held, never reused \(lost with the removable volume; deleted whole when the volume returns\)",
-            stdout,
-        )
-        is not None,
-        "status does not show the lost slot",
+    CASES = (
+        (
+            "idle",
+            (),
+            "an idle flushed slot survives forced removal and re-attach warm, with an internal "
+            "fallback build and a running checkout-local binary between",
+        ),
+        (
+            "held",
+            ("idle",),
+            "a blocked build fails cleanly on removal, keeps its lost slot recorded, refuses late "
+            "writes and lets build/run/test fall back",
+        ),
+        (
+            "held-delete",
+            ("held",),
+            "after re-attach the next admission deletes the lost slot whole and keeps the idle one",
+        ),
+        (
+            "quarantine",
+            ("held-delete",),
+            "a wrapper-allowed build is quarantined on removal and kept with its bytes after re-attach",
+        ),
     )
-    proof.phase("after held removal")
 
-    # The next commands fall back; run and test use checkout-local outputs.
-    code, _, stderr = proof.oxide(["build"], "fallback held", held)
-    expect(code == 0 and "directory-budget-v1" in summary(stderr), "held fallback build failed")
-    code, stdout, stderr = proof.oxide(["run"], "fallback run held", held)
-    expect(code == 0 and "fixture held ok" in stdout and "directory-budget-v1" in summary(stderr), "run after fallback failed")
-    expect(os.path.isfile(os.path.join(held, "target", "debug", "held")), "fallback output is not checkout-local")
-    code, stdout, stderr = proof.oxide(["test"], "fallback test held", held)
-    expect(code == 0 and "test works ... ok" in stdout and "directory-budget-v1" in summary(stderr), "test after fallback failed")
-    volume.no_spill("after fallback run/test")
+    def __init__(self, proof: Proof, repo: str):
+        self.proof = proof
+        self.state = {}
+        name = "OxRm" + secrets.token_hex(4)
+        self.mount = f"/Volumes/{name}"
+        self.source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+        print(f"removal proof {os.getpid()} source {self.source} ({layout.source_facts(repo)}) volume {name}")
+        need(not os.path.lexists(self.mount), f"{self.mount} already exists; never touched")
+        proof.phase("start")
+        candidate = layout.stage_at(proof, repo, "oxide-candidate")
+        print(f"staged candidate sha256 {layout.sha256(candidate)}")
+        with open(candidate, "rb") as handle:
+            oracle(CANDIDATE_MARKER in handle.read(), "candidate binary lacks the #098 lost-volume text")
+        proof.binary = candidate
+        proof.phase("after staging")
+        self.env = private_environment(proof.root)
+        proof.env = self.env
+        self.gate = self.env["FIXTURE_GATE"]
+        self.app = write_tree(os.path.join(proof.root, "app"), APP)
+        self.held = write_tree(os.path.join(proof.root, "held"), held_fixture("held"))
+        self.kept = write_tree(os.path.join(proof.root, "kept"), held_fixture("kept"))
+        self.image = os.path.join(proof.root, "volume.sparseimage")
+        created = proof.run(
+            ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name,
+             "-type", "SPARSE", self.image],
+            timeout=60,
+        )
+        need(created.returncode == 0, f"image creation failed: {created.stderr!r}")
+        self.volume = Volume(proof, self.image, self.mount)
+        self.volume.attach()
+        code, stdout, _ = proof.oxide(
+            ["pool", "register-removable", self.mount, "--reserve", "16MiB", "--cap", "64MiB"],
+            "register",
+            self.app,
+        )
+        oracle(code == 0 and "registered removable pool" in stdout, "registration failed")
+        self.slots = os.path.join(self.mount, "oxide-pool", "slots")
+        proof.phase("after registration")
 
-    # Re-attach: the lost slot is deleted whole, the idle one kept.
-    volume.attach()
-    parts = os.path.relpath(out_dir, slots).split(os.sep)
-    lost_slot = os.path.join(slots, parts[0], parts[1])
-    print(f"lost slot directory {lost_slot} present after re-attach: {os.path.isdir(lost_slot)}")
-    code, _, stderr = proof.oxide(["build"], "removable held after re-attach", held)
-    line = summary(stderr)
-    expect(code == 0 and "apfs-volume-v1" in line and "slot 2" not in line, f"rebuild after re-attach: {line}")
-    expect(re.search(r"deleted slot 2 held when the removable volume was lost \(Cargo group \d+ empty\)", stderr) is not None, "lost slot not deleted")
-    expect(not os.path.exists(lost_slot), f"lost slot {lost_slot} still on the volume")
-    expect(os.path.isdir(app_slot), "idle slot deleted with the lost one")
-    code, stdout, _ = proof.oxide(["status"], "status after re-attach", app)
-    expect(code == 0 and "lost with the removable volume" not in stdout, "status still shows a lost slot")
-    proof.phase("after held re-attach")
+    def case_idle(self) -> None:
+        proof, state = self.proof, self.state
+        code, _, stderr = proof.oxide(["build"], "removable cold app", self.app)
+        line = summary(stderr)
+        oracle(code == 0 and "apfs-volume-v1" in line and "slot 1 cold" in line,
+               f"removable not selected: {line}")
+        oracle("flushed the removable volume before releasing slot 1" in stderr, "no flush before release")
+        on_volume = [entry for entry in os.listdir(self.mount) if not entry.startswith(".")]
+        oracle(on_volume == ["oxide-pool"], f"volume holds more than the pool: {on_volume}")
+        app_binary = os.path.join(self.app, "target", "debug", "app")
+        oracle(os.path.isfile(app_binary), "default output is not checkout-local while docked")
+        app_slot = runner.labelled_slot(self.slots, 1)
+        self.volume.force_detach("idle removal")
+        ran = proof.run([app_binary], cwd=self.app, timeout=30)
+        oracle(ran.returncode == 0 and b"fixture app ok" in ran.stdout,
+               "checkout-local binary does not run after removal")
+        code, _, stderr = proof.oxide(["build"], "fallback app (idle removal)", self.app)
+        line = summary(stderr)
+        oracle(code == 0 and "directory-budget-v1" in line and "removable volume not used" in stderr,
+               f"no internal fallback: {line}")
+        self.volume.no_spill("after fallback build")
+        self.volume.attach()
+        code, _, stderr = proof.oxide(["build"], "removable app after re-attach", self.app)
+        line = summary(stderr)
+        oracle(code == 0 and "apfs-volume-v1" in line and "slot 1 warm" in line,
+               f"idle slot not kept warm: {line}")
+        oracle(os.path.isdir(app_slot), "idle slot directory gone")
+        state["app_slot"] = app_slot
 
-    # Quarantine: a wrapper allowed to run means closure is not positive.
-    wrapped = dict(env, OXIDE_ALLOW_RUSTC_WRAPPER="1")
-    child = proof.start(["build"], kept, wrapped)
-    wait_for(os.path.join(gate, "kept", "started"), "kept build")
-    with open(os.path.join(gate, "kept", "started"), encoding="utf-8") as handle:
-        kept_out = handle.read()
-    volume.force_detach("quarantine removal")
-    with open(os.path.join(gate, "kept", "go"), "w", encoding="utf-8") as handle:
-        handle.write("go")
-    code, _, stderr = proof.finish(child, "kept build after removal", WAIT_SECONDS)
-    expect(code != 0, "the kept build survived the removal")
-    late_writes(kept_out, "quarantine removal")
-    found = re.search(r"slot (\d+) is quarantined: lost with the removable volume and an inherited rustc wrapper was allowed", stderr)
-    expect(found is not None, "quarantine not recorded")
-    kept_id = found.group(1)
-    volume.attach()
-    parts = os.path.relpath(kept_out, slots).split(os.sep)
-    kept_slot = os.path.join(slots, parts[0], parts[1])
-    # A forced detach may not have persisted the slot's last writes; whatever
-    # is there must stay.
-    kept_present = os.path.isdir(kept_slot)
-    print(f"quarantined slot directory {kept_slot} present after re-attach: {kept_present}")
-    code, _, stderr = proof.oxide(["build"], "removable kept after re-attach", kept)
-    line = summary(stderr)
-    expect(code == 0 and "apfs-volume-v1" in line and f"slot {kept_id} " not in line, f"kept rebuild: {line}")
-    expect("deleted slot" not in stderr, "a quarantined slot was deleted")
-    expect(os.path.isdir(kept_slot) == kept_present, "quarantined slot directory changed")
-    code, stdout, _ = proof.oxide(["status"], "status with quarantine", app)
-    expect(code == 0 and re.search(rf"  slot {kept_id} .*quarantined: lost with the removable volume", stdout) is not None, "status does not show quarantine")
-    proof.phase("after quarantine")
+    def case_held(self) -> None:
+        proof, state = self.proof, self.state
+        child = proof.start(["build"], self.held, self.env)
+        try:
+            wait_for(os.path.join(self.gate, "held", "started"), "held build")
+            with open(os.path.join(self.gate, "held", "started"), encoding="utf-8") as handle:
+                out_dir = handle.read()
+            oracle(out_dir.startswith(self.slots + "/"),
+                   f"build script OUT_DIR {out_dir} is not on the volume")
+            code, stdout, _ = proof.oxide(["status"], "status, build held", self.app)
+            oracle(code == 0 and re.search(r"  slot 2 .*held", stdout) is not None,
+                   "held slot not shown held")
+            self.volume.force_detach("held removal")
+            with open(os.path.join(self.gate, "held", "go"), "w", encoding="utf-8") as handle:
+                handle.write("go")
+            started = time.monotonic()
+            code, _, stderr = proof.finish(child, "held build after removal", WAIT_SECONDS)
+            print(f"held build exited {time.monotonic() - started:.1f} s after release")
+            oracle(code != 0, "the build survived the removal")
+            oracle(
+                "slot 2 is lost with the removable volume; deleted whole when the volume returns" in stderr,
+                "lost-volume not recorded",
+            )
+            oracle("slot 2 was lost with the removable volume" in stderr, "no lost-volume summary line")
+            oracle(
+                re.search(rf"removable volume {re.escape(self.mount)} is gone; stopped Cargo group \d+: TERM",
+                          stderr) is not None,
+                "no removal stop",
+            )
+            report_path = os.path.join(self.gate, "held", "report")
+            if os.path.exists(report_path):
+                with open(report_path, encoding="utf-8") as handle:
+                    report = handle.read()
+                print(f"build script after removal:\n{report}")
+                oracle("write None" not in report and "create None" not in report,
+                       f"a late write succeeded: {report}")
+            else:
+                print("build script was stopped before its late writes")
+            late_writes(out_dir, "held removal")
+            self.volume.no_spill("after held build")
+            oracle(not os.path.lexists(out_dir), "the slot's OUT_DIR exists after removal")
+            code, stdout, _ = proof.oxide(["status"], "status, volume gone", self.app)
+            oracle(
+                code == 0
+                and re.search(
+                    r"slot 2 retired and held, never reused \(lost with the removable volume; "
+                    r"deleted whole when the volume returns\)",
+                    stdout,
+                )
+                is not None,
+                "status does not show the lost slot",
+            )
+            code, _, stderr = proof.oxide(["build"], "fallback held", self.held)
+            oracle(code == 0 and "directory-budget-v1" in summary(stderr), "held fallback build failed")
+            code, stdout, stderr = proof.oxide(["run"], "fallback run held", self.held)
+            oracle(code == 0 and "fixture held ok" in stdout and "directory-budget-v1" in summary(stderr),
+                   "run after fallback failed")
+            oracle(os.path.isfile(os.path.join(self.held, "target", "debug", "held")),
+                   "fallback output is not checkout-local")
+            code, stdout, stderr = proof.oxide(["test"], "fallback test held", self.held)
+            oracle(code == 0 and "test works ... ok" in stdout
+                   and "directory-budget-v1" in summary(stderr), "test after fallback failed")
+            self.volume.no_spill("after fallback run/test")
+            state["out_dir"] = out_dir
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+    def case_held_delete(self) -> None:
+        proof, state = self.proof, self.state
+        self.volume.attach()
+        need(bool(state.get("out_dir")), "the held case did not record its slot's OUT_DIR")
+        parts = os.path.relpath(state["out_dir"], self.slots).split(os.sep)
+        lost_slot = os.path.join(self.slots, parts[0], parts[1])
+        print(f"lost slot directory {lost_slot} present after re-attach: {os.path.isdir(lost_slot)}")
+        code, _, stderr = proof.oxide(["build"], "removable held after re-attach", self.held)
+        line = summary(stderr)
+        oracle(code == 0 and "apfs-volume-v1" in line and "slot 2" not in line,
+               f"rebuild after re-attach: {line}")
+        oracle(
+            re.search(r"deleted slot 2 held when the removable volume was lost \(Cargo group \d+ empty\)",
+                      stderr) is not None,
+            "lost slot not deleted",
+        )
+        oracle(not os.path.exists(lost_slot), f"lost slot {lost_slot} still on the volume")
+        oracle(os.path.isdir(state["app_slot"]), "idle slot deleted with the lost one")
+        code, stdout, _ = proof.oxide(["status"], "status after re-attach", self.app)
+        oracle(code == 0 and "lost with the removable volume" not in stdout,
+               "status still shows a lost slot")
+
+    def case_quarantine(self) -> None:
+        proof, state = self.proof, self.state
+        wrapped = dict(self.env, OXIDE_ALLOW_RUSTC_WRAPPER="1")
+        child = proof.start(["build"], self.kept, wrapped)
+        try:
+            wait_for(os.path.join(self.gate, "kept", "started"), "kept build")
+            with open(os.path.join(self.gate, "kept", "started"), encoding="utf-8") as handle:
+                kept_out = handle.read()
+            self.volume.force_detach("quarantine removal")
+            with open(os.path.join(self.gate, "kept", "go"), "w", encoding="utf-8") as handle:
+                handle.write("go")
+            code, _, stderr = proof.finish(child, "kept build after removal", WAIT_SECONDS)
+            oracle(code != 0, "the kept build survived the removal")
+            late_writes(kept_out, "quarantine removal")
+            found = re.search(
+                r"slot (\d+) is quarantined: lost with the removable volume and an inherited rustc wrapper was allowed",
+                stderr,
+            )
+            oracle(found is not None, "quarantine not recorded")
+            kept_id = found.group(1)
+            self.volume.attach()
+            parts = os.path.relpath(kept_out, self.slots).split(os.sep)
+            kept_slot = os.path.join(self.slots, parts[0], parts[1])
+            # A forced detach may not have persisted the slot's last writes;
+            # whatever is there must stay.
+            kept_present = os.path.isdir(kept_slot)
+            print(f"quarantined slot directory {kept_slot} present after re-attach: {kept_present}")
+            code, _, stderr = proof.oxide(["build"], "removable kept after re-attach", self.kept)
+            line = summary(stderr)
+            oracle(code == 0 and "apfs-volume-v1" in line and f"slot {kept_id} " not in line,
+                   f"kept rebuild: {line}")
+            oracle("deleted slot" not in stderr, "a quarantined slot was deleted")
+            oracle(os.path.isdir(kept_slot) == kept_present, "quarantined slot directory changed")
+            code, stdout, _ = proof.oxide(["status"], "status with quarantine", self.app)
+            oracle(
+                code == 0
+                and re.search(rf"  slot {kept_id} .*quarantined: lost with the removable volume", stdout)
+                is not None,
+                "status does not show quarantine",
+            )
+            state.update(kept_id=kept_id, kept_slot=kept_slot, kept_present=kept_present)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
+def collect(session: Removal, diagnostic: bool, outcome: dict, bodies: dict | None = None) -> dict:
+    """Run the fixed case map; dependents of a case that did not complete are
+    skipped in a diagnostic and never run against a missing premise."""
+    bodies = (
+        {
+            "idle": session.case_idle,
+            "held": session.case_held,
+            "held-delete": session.case_held_delete,
+            "quarantine": session.case_quarantine,
+        }
+        if bodies is None
+        else bodies
+    )
+    for case, deps, _ in Removal.CASES:
+        missing = [dep for dep in deps if dep not in outcome["completed"]]
+        if diagnostic and missing:
+            outcome["skipped"].append([case, missing])
+            print(f"{case}: skipped (dependency {', '.join(missing)} did not complete)")
+            continue
+        outcome["reached"].append(case)
+        try:
+            bodies[case]()
+        except OracleFailure as failure:
+            outcome["failed"].append([case, str(failure)[:RECEIPT_EXCERPT]])
+            outcome["first_fault"] = outcome["first_fault"] or f"{case}: {failure}"
+            print(f"{case}: FAILED {failure}", file=sys.stderr)
+            if not diagnostic:
+                raise
+            continue
+        except UnknownOutcome as failure:
+            outcome["aborted"] = f"{case}: {failure}"
+            outcome["unexecuted"] = [name for name, _, _ in Removal.CASES if name not in outcome["reached"]]
+            raise
+        except BaseException as failure:
+            outcome["aborted"] = f"{case}: unexpected {failure!r}"
+            outcome["unexecuted"] = [name for name, _, _ in Removal.CASES if name not in outcome["reached"]]
+            raise
+        outcome["completed"].append(case)
+        session.proof.phase(f"after {case}")
+    outcome["unexecuted"] = [name for name, _, _ in Removal.CASES if name not in outcome["reached"]]
+    return outcome
+
+
+def run(proof: Proof, repo: str, diagnostic: bool) -> dict:
+    """The main (ephemeral, surprise-removal) mode. Returns its outcome
+    document; the diagnostic receipt is written here, in every outcome."""
+    outcome = diagnostic_outcome()
+    session = None
+    try:
+        try:
+            session = Removal(proof, repo)
+        except OracleFailure as failure:
+            outcome["failed"].append(["setup", str(failure)[:RECEIPT_EXCERPT]])
+            outcome["first_fault"] = outcome["first_fault"] or f"setup: {failure}"
+            outcome["unexecuted"] = [case for case, _, _ in Removal.CASES]
+            if diagnostic:
+                print(f"setup: FAILED {failure}", file=sys.stderr)
+                return outcome
+            raise
+        outcome.update(
+            source=session.source,
+            root=proof.root,
+            mount=session.mount,
+            device=session.volume.device,
+            volume_uuid=session.volume.uuid,
+        )
+        collect(session, diagnostic, outcome)
+    finally:
+        if diagnostic:
+            outcome["unclosed"] = sorted(proof.unclosed)
+            outcome["mount"] = proof.mount
+            path = diagnostic_receipt(outcome)
+            print(f"removal diagnostic receipt {path}")
+    return outcome
 
 
 # --- Boot-session closure mode (oxide#161) --------------------------------
@@ -987,21 +1192,109 @@ def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
     return line
 
 
-USAGE = "usage: test-oxide-removable-removal.py [--boot-closure [--diagnostic]] | --self-check"
+# The nine-item proof-authoring premise checklist, traced through the actual
+# child environments and helpers and bound by `--self-check`. `--plan` prints
+# it. It covers both modes: the boot closure adds the debug boot-time override
+# and registers the same image in permanent mode.
+PREMISE_CHECKLIST = (
+    (
+        "private HOME and rustup",
+        "applicable: `private_environment` keeps the invoking RUSTUP_HOME, gives every child a "
+        "private HOME and CARGO_HOME, pins RUSTUP_TOOLCHAIN=1.97.1 and RUSTUP_AUTO_INSTALL=0; "
+        "`layout.stage_at` is the only --locked call, against this repository's committed lock, and "
+        "the dependency-free fixtures make their own lock offline",
+    ),
+    (
+        "account-home control",
+        "applicable: `private_environment` sets OXIDE_TEST_HOME_FROM_ENV=1 beside the private HOME, "
+        "and every boot-closure child starts from that same environment plus its own override",
+    ),
+    (
+        "environment isolation",
+        "applicable: `private_environment` drops every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key and "
+        "CARGO, CARGO_INCREMENTAL, RUSTUP_TOOLCHAIN, RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS before "
+        "setting only this fixture's controls",
+    ),
+    (
+        "automatic adoption",
+        "not applicable: the main mode is ephemeral and no fixture is a Git repository, so no "
+        "outputs conversion can happen; the boot-closure whole-target fixture is converted only by "
+        "its explicit `outputs adopt` case",
+    ),
+    (
+        "Cargo external argv",
+        "not applicable: no external Cargo subcommand runs; the boot closure's `oxide exec` tool is "
+        "a shell script, not a Cargo subcommand",
+    ),
+    (
+        "owned images",
+        "applicable: every attach and re-attach uses `hdiutil -owners on` and is observed read-only "
+        "in /sbin/mount as carrying no `noowners` flag; identity is positively bound before each "
+        "forced detach and cleanup is an ordinary detach that keeps unknown custody",
+    ),
+    (
+        "compiler flags",
+        "applicable: main() refuses an inherited RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, so staging "
+        "builds with neither; every fixture child gets RUSTFLAGS=FROZEN_RUSTFLAGS with no encoded "
+        "value",
+    ),
+    (
+        "temporary storage",
+        "applicable: the scratch is one fresh directory inside the qualified supervisor's "
+        "OXIDE_TASK_SCRATCH_ROOT under --root-parent /private/tmp (the owner-accepted "
+        "internal-placement exception bd357a4c), and TMPDIR/TMP/TEMP name that same directory",
+    ),
+    (
+        "macOS mktemp",
+        "applicable: tempfile.mkdtemp with a template inside OXIDE_TASK_SCRATCH_ROOT; every fixture "
+        "child inherits that TMPDIR",
+    ),
+)
+
+USAGE = ("usage: test-oxide-removable-removal.py "
+         "[--diagnostic | --plan | --boot-closure [--diagnostic]] | --self-check")
+
+
+def plan() -> int:
+    """Print both modes' fixed case tables, allocation and premise
+    dispositions. No child, pool, image or supervisor."""
+    print("removable-removal proof plan (effect-free)")
+    print(f"candidate: this HEAD's debug oxide, staged offline with {runner.BUILDER} from {HERE}")
+    print("selector (main): python3 scripts/bounded-test.py --root-parent /private/tmp "
+          "--limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py")
+    print("allocation: one owned 128 MiB scratch APFS image at a unique /Volumes/<name> and one "
+          "private budget-only internal directory pool, four fixture checkouts, inside one owned "
+          "scratch inside OXIDE_TASK_SCRATCH_ROOT (monitored peak 99.7 MiB of the 512 MiB budget)")
+    print("limits: 300 s wall including cleanup, 512 MiB monitored scratch, ordinary detach only")
+    print("cases (main mode):")
+    for case, deps, purpose in Removal.CASES:
+        print(f"  {case}: {purpose} (after {', '.join(deps) or 'nothing'})")
+    print("cases (boot-closure mode):")
+    for case, purpose in BOOT_CASES:
+        print(f"  {case}: {purpose} (independent)")
+    print("premise checklist:")
+    for item, disposition in PREMISE_CHECKLIST:
+        print(f"  {item}: {disposition}")
+    print("modes: --diagnostic (uncounted keep-going collection for the main mode), "
+          "--boot-closure [--diagnostic], --plan (this), --self-check (pure apparatus); "
+          "the counted main-mode run takes no argument")
+    return 0
 
 
 def mode_from_args(arguments: list) -> tuple | None:
-    """`(focused, diagnostic)` for a fixed argument list, or `None` when the
-    request is not one this script defines."""
+    """`(focused, diagnostic, plan)` for a fixed argument list, or `None` when
+    the request is not one this script defines."""
+    if arguments == ["--plan"]:
+        return (False, False, True)
     focused = "--boot-closure" in arguments
     diagnostic = "--diagnostic" in arguments
-    if (focused, diagnostic) not in ((False, False), (True, False), (True, True)):
+    if (focused, diagnostic) not in ((False, False), (False, True), (True, False), (True, True)):
         return None
-    if not focused and arguments:
+    if not focused and arguments not in ([], ["--diagnostic"]):
         return None
     if focused and sorted(arguments) != sorted(["--boot-closure"] + (["--diagnostic"] if diagnostic else [])):
         return None
-    return focused, diagnostic
+    return (focused, diagnostic, False)
 
 
 def self_check() -> int:
@@ -1210,22 +1503,170 @@ def self_check() -> int:
             print(f"owners observation refused {why}: {error}")
         else:
             expect(False, f"the owners observation accepted {why}")
+    # The main mode's case map: every case has a body and a purpose, and every
+    # dependency names an earlier case, so a diagnostic can skip only
+    # dependents of what did not complete.
+    expect(len(Removal.CASES) == 4, f"main case table {Removal.CASES}")
+    seen = []
+    for case, deps, purpose in Removal.CASES:
+        expect(purpose.strip() != "", f"case {case} has no purpose")
+        expect(case not in seen, f"duplicate case {case}")
+        for dep in deps:
+            expect(dep in seen, f"case {case} depends on {dep}, which is not earlier")
+        seen.append(case)
+
+    class PhaseRecorder:
+        def __init__(self):
+            self.phases = []
+
+        def phase(self, label):
+            self.phases.append(label)
+
+    class FakeSession:
+        def __init__(self):
+            self.proof = PhaseRecorder()
+
+        @staticmethod
+        def body(label, outcome):
+            def run_body():
+                if outcome == "fail":
+                    raise OracleFailure(f"{label} failed")
+                if outcome == "abort":
+                    raise UnknownOutcome(f"{label} unknown")
+                return []
+            return run_body
+
+    def stub_bodies(**outcomes):
+        calls = []
+
+        def make(case):
+            def run_body():
+                calls.append(case)
+                outcome = outcomes.get(case)
+                if outcome == "fail":
+                    raise OracleFailure(f"{case} failure")
+                if outcome == "abort":
+                    raise UnknownOutcome(f"{case} unknown")
+                return []
+            return run_body
+
+        return {case: make(case) for case, _, _ in Removal.CASES}, calls
+
+    # A recoverable failure in the first case skips every dependent and runs
+    # nothing a missing premise could satisfy.
+    session = FakeSession()
+    outcome = diagnostic_outcome()
+    bodies, calls = stub_bodies(idle="fail")
+    collect(session, True, outcome, bodies)
+    expect(outcome["completed"] == [], f"a failed case was completed: {outcome['completed']}")
+    expect([case for case, _ in outcome["failed"]] == ["idle"], f"failed {outcome['failed']}")
+    expect(
+        outcome["skipped"] == [["held", ["idle"]], ["held-delete", ["held"]], ["quarantine", ["held-delete"]]],
+        f"skipped {outcome['skipped']}",
+    )
+    expect(calls == ["idle"], f"calls {calls}")
+    # An independent case is still recorded as skipped by dependency only; a
+    # later independent case after a completed chain still runs.
+    session = FakeSession()
+    outcome = diagnostic_outcome()
+    bodies, calls = stub_bodies(held="fail")
+    collect(session, True, outcome, bodies)
+    expect(outcome["completed"] == ["idle"], f"completed {outcome['completed']}")
+    expect([case for case, _ in outcome["failed"]] == ["held"], f"failed {outcome['failed']}")
+    expect(outcome["skipped"] == [["held-delete", ["held"]], ["quarantine", ["held-delete"]]],
+           f"skipped {outcome['skipped']}")
+    expect(outcome["first_fault"] == "held: held failure", f"first fault {outcome['first_fault']}")
+    # An unknown outcome aborts and leaves the rest unexecuted.
+    session = FakeSession()
+    outcome = diagnostic_outcome()
+    bodies, _ = stub_bodies(held="abort")
+    try:
+        collect(session, True, outcome, bodies)
+    except UnknownOutcome:
+        pass
+    else:
+        expect(False, "an unknown outcome did not abort the collection")
+    expect(outcome["aborted"] == "held: held unknown", f"aborted {outcome['aborted']}")
+    expect(outcome["unexecuted"] == ["held-delete", "quarantine"], f"unexecuted {outcome['unexecuted']}")
+    # An unexpected exception aborts as unknown, never as a case pass.
+    session = FakeSession()
+    outcome = diagnostic_outcome()
+    bodies, _ = stub_bodies()
+
+    def explode():
+        raise KeyError("unexpected")
+
+    bodies["idle"] = explode
+    try:
+        collect(session, True, outcome, bodies)
+    except KeyError:
+        pass
+    else:
+        expect(False, "an unexpected exception did not abort the collection")
+    expect(outcome["aborted"] is not None and "unexpected" in outcome["aborted"],
+           f"aborted {outcome['aborted']}")
+    expect(outcome["unexecuted"] == ["held", "held-delete", "quarantine"],
+           f"unexecuted {outcome['unexecuted']}")
+    # The premise checklist is complete, and its environment claims are
+    # checked against `private_environment` with hostile inherited values.
+    expect(len(PREMISE_CHECKLIST) == 9, f"premise checklist has {len(PREMISE_CHECKLIST)} items")
+    names = [item for item, _ in PREMISE_CHECKLIST]
+    expect(len(set(names)) == 9, f"duplicate premise names {names}")
+    for item, disposition in PREMISE_CHECKLIST:
+        expect(disposition.strip() != "", f"premise {item} has no disposition")
+    holder = dict(os.environ)
+    fixture_root = os.path.join(root, "fixture-env")
+    os.makedirs(os.path.join(root, "scratch"), mode=0o700, exist_ok=True)
+    os.environ.update(
+        {
+            "TMPDIR": os.path.join(root, "scratch"),
+            "OXIDE_POOL": "/fixture/host-pool",
+            "OXIDE_CONFIG": "/fixture/host-config",
+            "OXIDE_TEST_HOME_FROM_ENV": "0",
+            "XDG_CONFIG_HOME": "/fixture/xdg",
+            "RUSTFLAGS": "-Ctarget-cpu=native",
+            "CARGO_ENCODED_RUSTFLAGS": "-Ctarget-cpu=native",
+            "RUSTUP_TOOLCHAIN": "nightly",
+            "SCCACHE_DIR": "/fixture/sccache",
+            "CARGO_BUILD_RUSTC_WRAPPER": "/fixture/wrapper",
+            "CARGO_TARGET_DIR": "/fixture/target",
+        }
+    )
+    try:
+        env = private_environment(fixture_root)
+        expect(env["OXIDE_TEST_HOME_FROM_ENV"] == "1", "account-home control was not set")
+        expect(env["HOME"] == os.path.join(fixture_root, "home"), "HOME is not private")
+        expect(env["CARGO_HOME"] == os.path.join(fixture_root, "cargo-home"), "CARGO_HOME is not private")
+        expect(env["RUSTUP_TOOLCHAIN"] == runner.BUILDER, "the toolchain is not pinned")
+        expect(env["RUSTUP_AUTO_INSTALL"] == "0", "auto-install is not disabled")
+        expect(env["RUSTFLAGS"] == FROZEN_RUSTFLAGS, f"flags not frozen: {env['RUSTFLAGS']!r}")
+        expect("CARGO_ENCODED_RUSTFLAGS" not in env, "encoded flags were inherited")
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            expect(env[name] == os.environ["TMPDIR"], f"{name} is not the guard's scratch")
+        expect(env["OXIDE_POOL"] == os.path.join(fixture_root, "pool"),
+               "the host pool path reached the fixture")
+        expect(env["OXIDE_POOL_CAP"] == "64MiB", "the fixture cap is not its own")
+        expect(env["CARGO_BUILD_RUSTC_WRAPPER"] == "", "an inherited wrapper reached the fixture")
+        for name in ("OXIDE_CONFIG", "XDG_CONFIG_HOME", "SCCACHE_DIR", "CARGO_TARGET_DIR"):
+            expect(name not in env, f"inherited {name} was copied into the fixture")
+        expect(env["RUSTUP_HOME"] == (holder.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")),
+               "the invoking rustup home was not kept")
+    finally:
+        os.environ.clear()
+        os.environ.update(holder)
     # Dispatch: only the documented argument lists select a mode.
-    expect(mode_from_args([]) == (False, False), "no-argument mode")
-    expect(mode_from_args(["--boot-closure"]) == (True, False), "focused mode")
-    expect(
-        mode_from_args(["--boot-closure", "--diagnostic"]) == (True, True),
-        "diagnostic mode",
-    )
-    expect(
-        mode_from_args(["--diagnostic", "--boot-closure"]) == (True, True),
-        "diagnostic mode, reversed",
-    )
+    expect(mode_from_args([]) == (False, False, False), "no-argument mode")
+    expect(mode_from_args(["--diagnostic"]) == (False, True, False), "main diagnostic mode")
+    expect(mode_from_args(["--plan"]) == (False, False, True), "plan mode")
+    expect(mode_from_args(["--boot-closure"]) == (True, False, False), "focused mode")
+    expect(mode_from_args(["--boot-closure", "--diagnostic"]) == (True, True, False), "boot diagnostic mode")
+    expect(mode_from_args(["--diagnostic", "--boot-closure"]) == (True, True, False), "boot diagnostic, reversed")
     for refused in (
-        ["--diagnostic"],
         ["--bogus"],
         ["--self-check", "--boot-closure"],
         ["--boot-closure", "--diagnostic", "--diagnostic"],
+        ["--diagnostic", "--plan"],
+        ["--plan", "--boot-closure"],
     ):
         expect(mode_from_args(refused) is None, f"{refused} selected a mode")
     # The candidate marker is the product's own deletion line, as documented.
@@ -1250,9 +1691,15 @@ def main() -> int:
     if mode is None:
         print(USAGE, file=sys.stderr)
         return 2
-    focused, diagnostic = mode
+    focused, diagnostic, plan_mode = mode
+    if plan_mode:
+        return plan()
     if sys.platform != "darwin":
         fail("the removal proof requires macOS")
+    # Premise 7: an inherited compiler-flag value must not reach staging or a
+    # fixture. Staging inherits this process environment, so refuse it here.
+    for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
+        expect(not os.environ.get(name), f"{name} is inherited; the candidate and fixtures would not share one frozen flag set")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
     expect(bool(scratch) and os.path.realpath(scratch) == scratch, f"OXIDE_TASK_SCRATCH_ROOT {scratch!r} is not canonical")
     for name in ("TMPDIR", "TMP", "TEMP"):
@@ -1264,11 +1711,12 @@ def main() -> int:
     signal.signal(signal.SIGALRM, layout.overdue)
     signal.setitimer(signal.ITIMER_REAL, layout.work_left())
     proof = Proof(root)
+    outcome = None
     try:
         if focused:
             boot_closure(proof, repo, diagnostic)
         else:
-            run(proof, repo)
+            outcome = run(proof, repo, diagnostic)
         proof.detach()
     except BaseException as failure:
         try:
@@ -1286,6 +1734,19 @@ def main() -> int:
         # diagnostic, its unqualified receipt.
         return 0
     elapsed = time.monotonic() - runner.STARTED
+    if diagnostic:
+        line = (
+            f"removal diagnostic collected (UNCOUNTED, never a PASS): "
+            f"{len(outcome['completed'])}/{len(Removal.CASES)} cases completed, failed "
+            f"{[case for case, _ in outcome['failed']]}, skipped "
+            f"{[case for case, _ in outcome['skipped']]}, unexecuted {outcome['unexecuted']}; "
+            f"{elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
+            f"host free minimum {proof.low // MIB} MiB; one owned 128 MiB scratch image, "
+            f"ordinary detach"
+        )
+        layout.record("result.txt", f"diagnostic (not a PASS)\n{line}\n")
+        print(line)
+        return 0
     line = (
         f"removal proof held: {elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
         f"host free minimum {proof.low // MIB} MiB; scratch closure and cleanup are the shared runner's"
