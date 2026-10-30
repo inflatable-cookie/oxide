@@ -81,8 +81,9 @@ certain census. The receipt is written in every outcome, including a failure
 before the first case ran. It is never a counted PASS. `--plan` prints the case table, the
 allocation and the nine premise dispositions without any effect.
 `--self-check` is the pure apparatus check: no child, pool, image or scratch.
-Not a benchmark and not full QA. Scratch is removed only after positive
-completion.
+Not a benchmark and not full QA. The script never removes its own run root: it stays
+inside the guard's owned root so the guard's post-leader census decides
+closure, and the guard's retention policy owns cleanup.
 """
 from __future__ import annotations
 
@@ -1222,8 +1223,9 @@ def plan() -> int:
           f"{LINK_STRAY_BYTES // MIB} MiB stray that the shallow scope pass charges and the second "
           "admission is budgeted against; all inside one owned scratch inside "
           "OXIDE_TASK_SCRATCH_ROOT (measured staging peak 283 MiB of the 512 MiB monitored budget)")
-    print(f"limits: {PROOF_SECONDS} s wall including cleanup, stop {SHUTDOWN_MARGIN_S} s before the guard "
-          f"deadline, {SCRATCH_LIMIT_BYTES // MIB} MiB monitored scratch, one Cargo call at a time")
+    print(f"limits: {PROOF_SECONDS} s wall under the guard (which owns closure and cleanup), stop "
+          f"{SHUTDOWN_MARGIN_S} s before its deadline, {SCRATCH_LIMIT_BYTES // MIB} MiB monitored "
+          "scratch, one Cargo call at a time")
     print("cases:")
     for case, deps, purpose in CASES:
         print(f"  {case}: {purpose} (after {', '.join(deps) or 'nothing'})")
@@ -1591,14 +1593,19 @@ def self_check() -> int:
         expect_true(receipt["failed"] == [] and receipt["unexecuted"] == outcome["unexecuted"],
                     f"receipt state {receipt.get('failed')} / {receipt.get('unexecuted')}")
 
-        # `run_proof` removes the scratch only after a completed collection;
-        # an aborted collection is retained for the guard's census. Both the
-        # order and the behaviour are pinned.
+        # `run_proof` NEVER removes its own run root: only the guard's
+        # post-leader census can establish that no child descendant is still
+        # writing, and the guard's retention policy owns cleanup. The rule is
+        # pinned structurally and behaviourally, on both the aborted and the
+        # successful path.
         run_source = inspect.getsource(run_proof)
         expect_true(
-            "run_cases(" in run_source
-            and run_source.index("run_cases(") < run_source.index("shutil.rmtree(parent)"),
-            "run_proof removes the scratch before the collection finishes",
+            "shutil.rmtree(parent)" not in run_source,
+            "run_proof removes its own run root before the guard's census",
+        )
+        expect_true(
+            "retained for the guard" in run_source,
+            "run_proof does not report that the scratch is retained",
         )
         expect_true(
             "retained its owned scratch" in run_source
@@ -1646,6 +1653,15 @@ def self_check() -> int:
                     fail("an aborted collection did not fail the run")
                 roots = [name for name in os.listdir(canonical) if name.startswith("front-door.")]
                 expect_true(len(roots) == 1, f"the aborted run's scratch was not retained: {roots}")
+                # The successful path retains its run root too: nothing is
+                # deleted before the guard's census.
+                globals()["run_cases"] = lambda *args: None
+                success = diagnostic_outcome()
+                code = run_proof(False, success)
+                expect_true(code == 0, f"a successful run returned {code}")
+                roots = [name for name in os.listdir(canonical) if name.startswith("front-door.")]
+                expect_true(len(roots) == 2,
+                            f"the successful run's scratch was not retained: {roots}")
                 expect_true(outcome["root"] is not None and outcome["root"].startswith(canonical),
                             f"the abort did not name its retained root: {outcome.get('root')!r}")
             finally:
@@ -2158,7 +2174,12 @@ def run_proof(diagnostic: bool, outcome: dict) -> int:
     except Exception:
         print(f"front-door accounting proof retained its owned scratch at {parent}", file=sys.stderr)
         raise
-    shutil.rmtree(parent)
+    # The run root is NEVER removed here. It sits inside the guard's owned
+    # root, and only the guard's post-leader census can establish that no
+    # child descendant is still writing; removing the pool, slots and logs
+    # before that verdict would destroy the evidence closure has to be judged
+    # on. The guard's own retention policy owns cleanup.
+    say(f"scratch {parent} retained for the guard's closure census")
     elapsed = time.monotonic() - STARTED
     if elapsed > PROOF_SECONDS + SHUTDOWN_MARGIN_S:
         need(f"front-door accounting proof took {elapsed:.0f} s, over its guard window")
@@ -2168,14 +2189,14 @@ def run_proof(diagnostic: bool, outcome: dict) -> int:
             f"{len(outcome['completed'])}/{len(CASES)} cases completed, failed "
             f"{[case for case, _ in outcome['failed']]}, skipped "
             f"{[case for case, _ in outcome['skipped']]}, unexecuted {outcome['unexecuted']}; "
-            f"{elapsed:.0f} s including cleanup, sampled peak owned scratch "
-            f"{PEAK['bytes'] // MIB} MiB ({PEAK['phase']}), scratch removed"
+            f"{elapsed:.0f} s of script time, sampled peak owned scratch "
+            f"{PEAK['bytes'] // MIB} MiB ({PEAK['phase']}), scratch retained for the guard"
         )
     else:
         line = (
-            f"oxide front-door accounting proof held: source {head}, {elapsed:.0f} s including "
-            f"cleanup, peak owned scratch sampled {PEAK['bytes'] // MIB} MiB ({PEAK['phase']}), "
-            f"scratch removed"
+            f"oxide front-door accounting proof held: source {head}, {elapsed:.0f} s of script "
+            f"time, peak owned scratch sampled {PEAK['bytes'] // MIB} MiB ({PEAK['phase']}), "
+            f"scratch retained for the guard"
         )
     print(line)
     return 0
