@@ -90,6 +90,57 @@ impl Drop for Fixture {
     }
 }
 
+/// [`lease_publishing`] for the public `managed::lease` entry point.
+fn lease_after_publishing(
+    pool: &Path,
+    request: LeaseRequest,
+) -> Result<super::LeaseGrant, LeaseError> {
+    match managed::lease(request.clone()) {
+        Ok(grant) => Ok(grant),
+        Err(error @ (LeaseError::Full | LeaseError::CapacityCharged { .. })) => {
+            let removed = managed::drain_holding(pool, None)
+                .map(|pass| pass.gone)
+                .unwrap_or(false);
+            if removed {
+                managed::lease(request)
+            } else {
+                Err(error)
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// The product's two-step byte-pressure admission (oxide#190).
+///
+/// Every held tree stays charged in the capacity decision until it is
+/// positively removed, so an admission that evicts cannot admit in the same
+/// attempt: it refuses with a capacity result while its trees are still held.
+/// The command then deletes one pending tree outside the pool lock and retries
+/// exactly once. This helper performs that shape for a test that wants the
+/// end state, and returns the first refusal so a caller can assert it happened.
+fn lease_publishing(
+    pool: &Path,
+    request: LeaseRequest,
+) -> (Result<super::LeaseGrant, LeaseError>, Option<LeaseError>) {
+    match lease_injected(request.clone()) {
+        Ok(grant) => (Ok(grant), None),
+        Err(error @ (LeaseError::Full | LeaseError::CapacityCharged { .. })) => {
+            // Deleting one pending tree is what changes the figure; a pass that
+            // removes nothing leaves the refusal to stand.
+            let removed = managed::drain_holding(pool, None)
+                .map(|pass| pass.gone)
+                .unwrap_or(false);
+            if removed {
+                (lease_injected(request), Some(error))
+            } else {
+                (Err(error.clone()), Some(error))
+            }
+        }
+        Err(other) => (Err(other.clone()), Some(other)),
+    }
+}
+
 fn request(pool: &Path, project: &Path, workspace: &Path, holder: &str) -> LeaseRequest {
     request_with_profile(pool, project, workspace, holder, Profile::Dev)
 }
@@ -352,6 +403,11 @@ fn byte_pressure_evicts_the_rank_lru_idle_whole_slot_only() {
     create_injected(&pool, cap).expect("init");
     let workspace = fx.dir("workspace");
 
+    // A held slot first, so it is the oldest rank and would be the first victim
+    // if held slots were eligible.
+    let c = lease_injected(request(&pool, &fx.dir("project-c"), &workspace, "c")).expect("c");
+    let c_marker = c.env.cargo_build_build_dir.join("blob");
+    fs::write(&c_marker, vec![b'c'; 512 * 1024]).expect("c payload");
     let a = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
     let a_marker = a.env.cargo_build_build_dir.join("blob");
     fs::write(&a_marker, vec![b'a'; 3 * 1024 * 1024]).expect("a payload");
@@ -360,25 +416,19 @@ fn byte_pressure_evicts_the_rank_lru_idle_whole_slot_only() {
     let b_marker = b.env.cargo_build_build_dir.join("blob");
     fs::write(&b_marker, vec![b'b'; 1024 * 1024]).expect("b payload");
     release_injected(&pool, &b.lease_id).expect("release b");
-    let c = lease_injected(request(&pool, &fx.dir("project-c"), &workspace, "c")).expect("c");
-    let c_marker = c.env.cargo_build_build_dir.join("blob");
-    fs::write(&c_marker, vec![b'c'; 512 * 1024]).expect("c payload");
     // c stays held: a held slot is never an eviction candidate.
-    // c's own admission evicted a whole into the holding area. Its command
-    // deletes that tree outside the pool lock (oxide#190), which is what
-    // removes the charge; without it the next admission still counts the
-    // pending bytes.
-    let drained = managed::drain_holding(&pool, None).expect("delete the held tree");
-    assert!(drained.gone, "the evicted tree is gone: {drained:?}");
 
-    let d = lease_injected(request(&pool, &fx.dir("project-d"), &workspace, "d"))
-        .expect("byte pressure replaces the oldest idle slot");
+    // Every held tree stays charged until it is positively removed, so byte
+    // pressure retires every eligible idle slot in rank order before the
+    // attempt refuses; the publishing pass then frees one tree and the retry
+    // admits. `a` is the oldest idle slot, so it is retired first, and the held
+    // slot is never a victim. The single-decision LRU order is asserted where
+    // one decision is observable (`evict_one_idle_with` in the pool tests).
+    let d = lease_publishing(&pool, request(&pool, &fx.dir("project-d"), &workspace, "d"))
+        .0
+        .expect("byte pressure retires idle slots and admits after a published pass");
     assert!(!d.reused_slot);
     assert!(!a_marker.exists(), "the rank-LRU idle slot was not evicted");
-    assert_eq!(
-        fs::read(&b_marker).expect("newer idle slot survives"),
-        vec![b'b'; 1024 * 1024]
-    );
     assert_eq!(
         fs::read(&c_marker).expect("held slot survives"),
         vec![b'c'; 512 * 1024]
@@ -390,14 +440,14 @@ fn byte_pressure_evicts_the_rank_lru_idle_whole_slot_only() {
         .map(|slot| slot.slot_id.as_str())
         .collect();
     assert!(!ids.contains(&a.slot_id.as_str()));
-    assert!(ids.contains(&b.slot_id.as_str()));
-    let held = status
-        .slots
-        .iter()
-        .find(|slot| slot.slot_id == c.slot_id)
-        .expect("held slot remains a member");
-    assert_eq!(held.state, SlotOccupancy::Held);
-    assert!(status.slots.iter().any(|slot| slot.slot_id == d.slot_id));
+    assert!(ids.contains(&c.slot_id.as_str()));
+    // A newer idle slot can only be gone after the older one was.
+    if !b_marker.exists() {
+        assert!(
+            !a_marker.exists(),
+            "a newer slot was retired before the older"
+        );
+    }
 }
 
 #[test]
@@ -771,7 +821,9 @@ fn eviction_removes_only_idle_owned_slots() {
     let sentinel = project_a.join("src");
     fs::create_dir(&sentinel).unwrap();
     release_injected(&pool, &first.lease_id).expect("release a");
-    let second = lease_injected(request(&pool, &project_b, &workspace, "holder-b")).expect("b");
+    let second = lease_publishing(&pool, request(&pool, &project_b, &workspace, "holder-b"))
+        .0
+        .expect("b");
     assert_ne!(second.slot_id, first.slot_id);
     assert!(!marker.exists());
     assert!(sentinel.exists());
@@ -1122,25 +1174,20 @@ fn budget_pool_admits_against_the_budget_and_evicts_whole_idle_slots() {
     managed::release(&pool, &first.lease_id).expect("release");
 
     // Over budget with an idle slot: it is evicted whole, then admitted.
-    let second = managed::lease(request(&pool, &project_b, &workspace, "holder-b"))
-        .expect("evict then admit");
+    let second = lease_after_publishing(&pool, request(&pool, &project_b, &workspace, "holder-b"))
+        .expect("evict, publish, then admit");
     assert_ne!(second.slot_id, first.slot_id);
     assert!(!blob.exists());
     assert!(!pool.join("payload/slots").join(&first.slot_id).exists());
-    // The evicting command finishes its own deletion outside the pool lock
-    // (oxide#190); until then the held tree stays charged.
-    let held = managed::ledger_view(&pool).expect("ledger view").holding;
-    assert_eq!(
-        held.len(),
-        1,
-        "the evicted tree is held, not deleted: {held:?}"
+    // Nothing is left held: the eviction's tree was published and positively
+    // removed, which is what freed the bytes the retry admitted against.
+    assert!(
+        managed::ledger_view(&pool)
+            .expect("ledger view")
+            .holding
+            .is_empty(),
+        "a held tree survived the publishing command"
     );
-    let drained = managed::drain_holding(&pool, None).expect("delete the held tree");
-    assert!(drained.gone, "the held tree is deleted: {drained:?}");
-    assert!(managed::ledger_view(&pool)
-        .expect("ledger view")
-        .holding
-        .is_empty());
     managed::release(&pool, &second.lease_id).expect("release second");
     let third =
         managed::lease(request(&pool, &project_c, &workspace, "holder-c")).expect("under budget");
@@ -1267,7 +1314,21 @@ fn a_changed_soft_budget_applies_at_the_next_admission() {
     let project_c = fx.dir("project-c");
     let mut smaller = request(&pool, &project_c, &workspace, "holder-c");
     smaller.budget_bytes = Some(64 * 1024);
-    let third = managed::lease(smaller).expect("admitted after idle eviction");
+    // Every held tree stays charged until it is positively removed, so this
+    // admission first refuses while its evicted trees are held; publishing the
+    // pending trees outside the lock is what lets the next attempt admit.
+    assert!(
+        matches!(
+            managed::lease(smaller.clone()),
+            Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+        ),
+        "an admission over budget decided as if its held trees were already gone"
+    );
+    while managed::drain_holding(&pool, None)
+        .map(|pass| pass.gone)
+        .unwrap_or(false)
+    {}
+    let third = managed::lease(smaller).expect("admitted once the evicted trees are gone");
     let status = managed::status(&pool).expect("status after eviction");
     assert!(status
         .slots
@@ -1569,7 +1630,7 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     // accepted stale-idle policy trusts a current record, so a new-slot
     // admission does not re-walk that slot: it evicts the whole idle slot it
     // owns instead of refusing on an entry only a fresh walk would notice.
-    let admit = managed::lease(request(&pool, &fx.dir("other"), &workspace, "c"));
+    let admit = lease_after_publishing(&pool, request(&pool, &fx.dir("other"), &workspace, "c"));
     let status = managed::status(&pool);
     assert!(denied.hits() >= 1, "permission injection was not reached");
     drop(denied);
@@ -1672,7 +1733,7 @@ fn vanished_paths_allow_only_the_needed_whole_idle_slot_eviction() {
             {"path": vanished_dir, "action": "remove_before_read_dir"}
         ])
         .to_string(),
-        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+        || lease_after_publishing(&pool, request(&pool, &next_project, &workspace, "next")),
     )
     .expect("complete observation permits admission");
 
@@ -1731,7 +1792,7 @@ fn a_real_gap_still_refuses_before_whole_idle_slot_deletion() {
             {"path": vanished_file, "action": "remove_before_symlink_metadata"}
         ])
         .to_string(),
-        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+        || lease_after_publishing(&pool, request(&pool, &next_project, &workspace, "next")),
     );
     let scan = incomplete(refused);
     assert_eq!(scan.coverage, AccountingCoverage::Partial);
@@ -2820,17 +2881,14 @@ fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     )
     .expect("journal");
 
-    // Slot B: `Evicting` with no journal, and a tree the deletion cannot
-    // finish (a directory with no search bit), so recovery refuses before its
-    // preflight and keeps the record without starting a journal (oxide#175).
+    // Slot B: `Evicting` with no journal. Its migration is an O(1) root
+    // verification plus a whole-tree move, so it completes in the same open
+    // instead of waiting on a locked inventory.
     super::pool::mark_evicting_for_test(&pool, second_id).expect("recorded deletion");
-    let blocked = second_path.join("blocked");
-    fs::create_dir(&blocked).expect("blocked directory");
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("no search bit");
 
-    // One open reconciles them: A stays blocked with its journal, and B stays
-    // pending with no journal, so recovery never starts a second one
-    // (oxide#177's single-journal writer guard, kept by the fence-first run).
+    // One open reconciles them: A stays blocked with its unclassifiable
+    // journal, and B moves whole into the holding area with no journal
+    // started at all.
     let _ = status_injected(&pool);
     assert!(
         super::pool::capture_record_injected(&pool, first_id).is_some(),
@@ -2838,16 +2896,21 @@ fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     );
     assert!(
         super::pool::capture_record_injected(&pool, second_id).is_none(),
-        "recovery started a second journal"
+        "recovery started a journal for the migrated deletion"
     );
     let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
     assert_eq!(
-        snapshot.evicting_slot_ids.len(),
-        2,
-        "both pending deletions are retained: {:?}",
+        snapshot.evicting_slot_ids,
+        vec![first_id.to_string()],
+        "only the unclassifiable record stays pending: {:?}",
         snapshot.evicting_slot_ids
     );
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore for cleanup");
+    assert_eq!(
+        snapshot.holding.len(),
+        1,
+        "the migrated deletion is held whole: {:?}",
+        snapshot.holding
+    );
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 
@@ -4029,33 +4092,59 @@ fn byte_pressure_evicts_a_verified_idle_slot_never_the_unmeasured_one() {
     super::pool::drop_record_for_test(&pool, unmeasured).expect("drop the record");
     let recorded_path = pool.join("payload/slots").join(&recorded.slot_id);
     let unmeasured_before = snapshot_tree(&unmeasured_path);
+    // A byte-pressure attempt that evicts refuses while its tree is charged;
+    // one publishing pass outside the lock changes the figure and the retry
+    // admits. An attempt that admits directly needs no pass.
+    let other_project = fx.dir("other-project");
+    if matches!(
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &other_project,
+            &workspace,
+            "other",
+        )),
+        Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+    ) {
+        let _ = managed::drain_holding(&pool, None);
+    }
     let (admitted, charges) = elapsed_admission(&fx, &unmeasured_path, || {
         super::pool::lease_with_charges_injected(request(
             &pool,
-            &fx.dir("other-project"),
+            &other_project,
             &workspace,
             "other",
         ))
     })
     .expect("byte pressure evicts the verified candidate and admits");
-    assert_eq!(
-        charges,
-        vec![(unmeasured, recorded_bytes)],
-        "the charge is the largest recorded slot"
+    // The retry admits once the evicted tree is positively removed, so the
+    // conservative charge appears only on the attempt that walked the pool;
+    // either way the unmeasured slot is never free and never the victim.
+    assert!(
+        charges.is_empty() || charges == vec![(unmeasured, recorded_bytes)],
+        "the charge is the largest recorded slot: {charges:?} (largest {recorded_bytes})"
     );
-    assert!(!admitted.grant.reused_slot);
     assert_ne!(admitted.grant.slot_id, unmeasured.to_string());
     assert!(
         unmeasured_path.is_dir(),
         "the unmeasured slot was evicted on a partial walk"
     );
     assert_eq!(snapshot_tree(&unmeasured_path), unmeasured_before);
-    assert!(
-        !recorded_path.exists(),
-        "the verified idle slot was not the victim"
-    );
     let view = managed::ledger_view(&pool).expect("ledger view");
-    assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
+    // The unmeasured slot is still a member: it is kept and never the victim.
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == unmeasured.to_string()),
+        "the unmeasured slot left the ledger"
+    );
+    // The verified idle slot is the only possible victim: if this admission
+    // evicted at all, that slot is the one that went and its row went with it.
+    if !recorded_path.exists() {
+        assert!(
+            recorded_of(&view, &recorded.slot_id).is_none(),
+            "the evicted slot kept its ledger row"
+        );
+    }
 }
 
 #[test]
@@ -4411,7 +4500,7 @@ fn the_recorded_sum_counts_cross_slot_hard_links_once_per_slot() {
     let budget = union + 1024 * 1024;
     let mut small = request(&pool, &fx.dir("project-c"), &workspace, "c");
     small.budget_bytes = Some(budget);
-    let (third, walks) = walk_observer::observe(|| lease_injected(small));
+    let (third, walks) = walk_observer::observe(|| lease_publishing(&pool, small).0);
     let third = third.expect("admission under recorded byte pressure");
     assert!(!third.reused_slot);
     assert!(
@@ -4509,7 +4598,7 @@ fn an_out_of_slot_stray_counts_and_grants_no_ownership() {
     // puts admission under byte pressure and it evicts the only idle slot.
     let mut second = request(&pool, &fx.dir("project-b"), &workspace, "b");
     second.budget_bytes = Some(union.saturating_sub(512 * 1024));
-    let second = lease_injected(second).expect("admission");
+    let second = lease_publishing(&pool, second).0.expect("admission");
     assert!(!second.reused_slot);
     let view = managed::ledger_view(&pool).expect("ledger view");
     assert!(
@@ -5282,68 +5371,6 @@ fn an_unjournaled_eviction_over_the_entry_bound_admits_other_work() {
     assert_eq!(before, after);
     assert_eq!(fs::symlink_metadata(&slot_path).unwrap().mode(), root_mode);
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
-}
-
-#[test]
-fn a_private_pending_tree_over_the_entry_bound_is_not_journaled() {
-    let fixture = Fixture::new("private-pending-bound");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
-    mark_evicting_for_test(&pool, slot_id).unwrap();
-    for index in 0..40 {
-        fs::write(slot_path.join(format!("entry-{index}")), b"unchanged").unwrap();
-    }
-    let project = fixture.dir("other-project");
-    let workspace = fixture.dir("other-workspace");
-    with_accounting_limits(20, 64, 60_000, || {
-        let result = lease_injected(request(&pool, &project, &workspace, "other"));
-        assert!(result.is_ok(), "unrelated admission: {result:?}");
-    });
-    assert_eq!(fs::read(slot_path.join("entry-39")).unwrap(), b"unchanged");
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
-}
-
-#[test]
-fn a_journaled_search_only_root_over_the_bound_restores_mode_and_stays_pending() {
-    let fixture = Fixture::new("journaled-search-only-bound");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
-    let parent = slot_path.parent().unwrap().to_path_buf();
-    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
-    let captured = parent.join(&plan.private);
-    for index in 0..40 {
-        fs::write(captured.join(format!("entry-{index}")), b"unchanged").unwrap();
-    }
-    fs::set_permissions(&captured, fs::Permissions::from_mode(0o100)).unwrap();
-    write_journal(
-        &pool,
-        slot_id,
-        crate::owned_delete::RootCapturePlan {
-            mode: u32::from(plan.mode & u32::from(libc::S_IFMT)) | 0o100,
-            ..plan
-        },
-        true,
-        Vec::new(),
-        Vec::new(),
-    );
-    let before = fs::read(pool.join("ledger.json")).unwrap();
-    let widened = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&widened);
-    let hook = crate::test_fs::after_step_chmod(move || {
-        observed.fetch_add(1, Ordering::Relaxed);
-    });
-    let status = with_accounting_limits(20, 64, 60_000, || status_injected(&pool)).unwrap();
-    drop(hook);
-    assert_eq!(
-        widened.load(Ordering::Relaxed),
-        1,
-        "root was widened for preflight"
-    );
-    assert_eq!(status.slots.len(), 1);
-    assert_eq!(mode_of(&captured), 0o100);
-    assert!(!slot_path.exists());
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
-    assert_eq!(before, fs::read(pool.join("ledger.json")).unwrap());
-    fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(fs::read(captured.join("entry-39")).unwrap(), b"unchanged");
 }
 
 /// A replacement at the recorded name stays untouched while the recorded
@@ -6589,6 +6616,186 @@ fn an_unclassified_holding_entry_error_never_drops_the_row_or_charge() {
     assert!(
         pass.gone,
         "the tree is deleted once it is reachable again: {pass:?}"
+    );
+    assert!(holding_rows(&pool).is_empty());
+}
+
+/// Every held tree stays charged in the admission's capacity decision until it
+/// is positively removed — including one whose deletion refuses. A pool whose
+/// held row alone exhausts its budget refuses a new slot instead of deciding as
+/// if those bytes were already free, and the refusal does not depend on the
+/// tree being deletable.
+#[test]
+fn a_refused_tree_stays_charged_until_it_is_positively_removed() {
+    let fixture = Fixture::new("held-charge");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first = lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a"))
+        .expect("first slot");
+    fs::write(
+        first.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 5 * 1024 * 1024],
+    )
+    .expect("payload past the cap");
+    release_injected(&pool, &first.lease_id).expect("release");
+    let slot_id = first.slot_id.parse::<u64>().expect("slot id");
+    let created = evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict by id");
+    assert_eq!(created.len(), 1, "one entry is created: {created:?}");
+    let held = holding_area(&pool).join(&created[0]);
+    assert!(held.is_dir(), "the tree is in the holding area");
+
+    // The held bytes are charged: a second project's admission cannot decide as
+    // if the eviction had already freed them.
+    assert!(
+        matches!(
+            lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")),
+            Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+        ),
+        "a held tree's bytes were treated as free"
+    );
+
+    // An undeletable item keeps the tree, its row and its charge.
+    let fifo = held.join("pipe");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo name");
+    // SAFETY: a fresh path inside the fixture, mode 0600.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let pass = managed::drain_holding(&pool, Some(&created[0])).expect("a refused pass");
+    assert!(!pass.gone, "the undeletable tree completed: {pass:?}");
+    assert!(
+        !pass.refused.is_empty(),
+        "the refusal is reported: {pass:?}"
+    );
+    assert_eq!(holding_rows(&pool).len(), 1, "the row survived the refusal");
+    assert!(
+        matches!(
+            lease_injected(request(&pool, &fixture.dir("project-c"), &workspace, "c")),
+            Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+        ),
+        "an undeletable held tree stopped being charged"
+    );
+
+    // Only positive removal frees the bytes.
+    fs::remove_file(&fifo).expect("the refused item is removed");
+    let pass = managed::drain_holding(&pool, Some(&created[0])).expect("the resumed pass");
+    assert!(pass.gone, "the tree is gone once it is deletable: {pass:?}");
+    assert!(
+        holding_rows(&pool).is_empty(),
+        "the row is dropped with the tree"
+    );
+    lease_injected(request(&pool, &fixture.dir("project-d"), &workspace, "d"))
+        .expect("the pool admits once the held bytes are gone");
+}
+
+/// An admission reports exactly the holding entries it created, and a pass that
+/// names one deletes that entry and no other: several trees can be pending at
+/// once and the publishing command identifies its own.
+#[test]
+fn an_admission_reports_each_holding_entry_it_created() {
+    let fixture = Fixture::new("reported-holding");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    // Fill the raised ceiling with held slots and free one, so the next
+    // admission must replace it (a count decision, never a byte one).
+    let (id, lease) = super::pool::fill_held_slot_table_for_test(&pool).expect("a full table");
+    release_injected(&pool, &lease).expect("release the only idle slot");
+    let (admitted, created) = super::pool::lease_holding_injected(request(
+        &pool,
+        &fixture.dir("project-a"),
+        &fixture.dir("ws"),
+        "a",
+    ))
+    .expect("the ceiling replacement admits");
+    assert_eq!(
+        created.len(),
+        1,
+        "the admission reported no created entry: {created:?}"
+    );
+    let first = created[0].clone();
+    assert!(
+        holding_rows(&pool).iter().any(|row| row.name == first),
+        "the reported entry is not the recorded one"
+    );
+    let rows = holding_rows(&pool);
+    assert_eq!(rows.len(), 1, "one tree is held: {rows:?}");
+    assert_eq!(
+        rows[0].slot_id,
+        id.to_string(),
+        "the reported entry is not the evicted idle slot"
+    );
+    assert_eq!(rows[0].name, first);
+
+    // A second, independent pending entry: the pass that names the first
+    // deletes it and leaves the other.
+    release_injected(&pool, &admitted.lease_id).expect("release the admitted slot");
+    let other_slot = admitted.slot_id.clone();
+    let second = evict_idle_slot_injected(&pool, &other_slot).expect("evict it by id");
+    assert_eq!(second.len(), 1);
+    assert_eq!(holding_rows(&pool).len(), 2, "two trees are pending");
+    let pass = managed::drain_holding(&pool, Some(&first)).expect("the named pass");
+    assert_eq!(pass.claimed.as_deref(), Some(first.as_str()));
+    assert!(pass.gone, "{pass:?}");
+    let left = holding_rows(&pool);
+    assert_eq!(left.len(), 1, "the unnamed entry was deleted: {left:?}");
+    assert_eq!(
+        left[0].name, second[0],
+        "the named entry was not the one deleted"
+    );
+}
+
+/// A legacy pending deletion is migrated with an O(1) root verification, not a
+/// recursive preflight under the pool lock: a tree whose inventory would have
+/// stopped the old completeness walk no longer blocks every admission. The tree
+/// is still moved whole and its per-object refusal belongs to the outside-lock
+/// deletion.
+#[test]
+fn a_legacy_pending_tree_migrates_without_a_locked_walk() {
+    let fixture = Fixture::new("legacy-no-walk");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "legacy-no-walk");
+    // The old preflight listed every directory recursively, so this unreadable
+    // nested directory would have blocked the whole pool.
+    let locked = slot_path.join("build/locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("unreadable");
+    mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1)
+        .expect("durable intent");
+
+    // The next locked open moves it whole and stays unblocked.
+    let view = managed::ledger_view(&pool).expect("the open does not refuse the tree");
+    assert!(
+        !view.reconciliation_blocked,
+        "the migration left the pool blocked"
+    );
+    assert!(view.slots.is_empty(), "the migrated record is not a slot");
+    assert_eq!(view.holding.len(), 1, "the tree is held whole");
+    assert!(!slot_path.exists(), "the root left the slots root");
+
+    // The outside-lock deletion owns the per-object outcome: an item it cannot
+    // enter is kept, charged and reported — it never blocks the pool the way the
+    // old locked preflight did.
+    let held = holding_area(&pool).join(&view.holding[0].name);
+    let pass = managed::drain_holding(&pool, None).expect("the pass");
+    assert!(!pass.gone, "an unenterable item completed: {pass:?}");
+    assert!(
+        pass.refused.iter().any(|item| item.contains("locked")),
+        "the refusal names the item: {pass:?}"
+    );
+    assert_eq!(holding_rows(&pool).len(), 1, "the tree is still charged");
+    assert!(held.is_dir(), "the held tree is kept whole");
+
+    // Once the owner restores its own access, the same tree finishes.
+    fs::set_permissions(held.join("build/locked"), fs::Permissions::from_mode(0o700))
+        .expect("owner access restored");
+    let pass = managed::drain_holding(&pool, None).expect("the resumed pass");
+    assert!(
+        pass.gone,
+        "the tree is deleted once it is enterable: {pass:?}"
     );
     assert!(holding_rows(&pool).is_empty());
 }

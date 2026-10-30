@@ -402,6 +402,11 @@ pub struct Lease {
     /// The library's reuse walk of this slot generation when it was leased;
     /// `None` for a new slot or a held replay.
     pub measured: Option<ReuseMeasurement>,
+    /// The holding entries **this admission created** by evicting idle slots
+    /// (oxide#190), in creation order. The command publishes exactly these
+    /// outside the pool lock, so its own eviction is identified rather than
+    /// guessed from a rotation.
+    pub created_holding: Vec<String>,
     lease_id: String,
     record: u64,
     _lock: File,
@@ -417,6 +422,18 @@ impl Lease {
     /// The library's lease identity, recorded in its ledger for this grant.
     pub fn lease_id(&self) -> &str {
         &self.lease_id
+    }
+
+    /// This generation's holding entry name, when this command evicts it
+    /// (oxide#190): the same derivation the library performs, from facts this
+    /// lease already holds.
+    pub fn holding_entry_name(&self) -> Option<String> {
+        oxide_storage::lease::managed::holding_entry_name(
+            &self.store_id,
+            &self.slot_id,
+            &self.incarnation,
+            &self.lease_id,
+        )
     }
 }
 
@@ -4337,7 +4354,7 @@ impl Store {
             .iter()
             .position(|entry| entry.id == record)
             .ok_or("Oxide slot record disappeared")?;
-        let (grant, measured, unmeasured) = match outcome {
+        let (grant, measured, unmeasured, created_holding) = match outcome {
             Ok(leased) => {
                 if let Some(note) = &leased.admission_note {
                     eprintln!("oxide: warning: {note}");
@@ -4345,7 +4362,12 @@ impl Store {
                 if let Some(report) = &leased.slice {
                     Self::report_slice(class, report);
                 }
-                (leased.grant, leased.measured, leased.unmeasured)
+                (
+                    leased.grant,
+                    leased.measured,
+                    leased.unmeasured,
+                    leased.holding,
+                )
             }
             Err(error) => {
                 state.settle_idle(index);
@@ -4432,6 +4454,7 @@ impl Store {
             prior,
             shared_from,
             measured,
+            created_holding,
             lease_id: grant.lease_id,
             record,
             _lock: lock,
@@ -11116,17 +11139,49 @@ pub(crate) mod tests {
             identity: key.identity.clone(),
             compatibility: "fresh-key".to_owned(),
         };
+        // The reclaim evicts the released member into the holding area, and a
+        // held tree stays charged until it is positively removed (oxide#190), so
+        // this first attempt refuses while its tree is still held. The front
+        // door publishes that tree outside the pool lock and retries; here the
+        // test publishes it the same way and the retry admits.
+        let (ticket, _file) = store.register_ticket().unwrap();
+        let first = store.attempt(
+            ticket,
+            &fresh,
+            Profile::Quick,
+            16,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+            None,
+        );
+        store.remove_ticket(ticket).unwrap();
+        assert!(
+            first.is_err(),
+            "an admission over its slice decided as if the held tree were gone"
+        );
+        loop {
+            let gone = oxide_storage::lease::managed::drain_holding(&store.pool, None)
+                .map(|pass| pass.gone)
+                .unwrap_or(false);
+            if !gone {
+                break;
+            }
+        }
         let admitted = lease_as(
             &store,
             &fresh,
             WorkspaceAdmission::one_use("a temporary workspace"),
             false,
         )
-        .expect("the fresh one-use admission admits");
+        .expect("the fresh one-use admission admits once the held tree is gone");
         assert_ne!(admitted.slot_id, member_slot);
         let slots = store.ledger().unwrap().slots;
         assert_eq!(slots.len(), 1, "the released member was not reclaimed");
         assert_eq!(slots[0].slot_id, admitted.slot_id);
+        assert!(
+            store.ledger().unwrap().holding.is_empty(),
+            "a held tree survived the published pass"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

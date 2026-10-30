@@ -670,6 +670,12 @@ pub struct Leased {
     /// Their charge is not reported: only the incomplete outcome is, so a
     /// caller can record it as the oxide#128 diagnostic fact.
     pub unmeasured: Vec<UnmeasuredSlot>,
+    /// The holding entries **this** admission created, in the order it created
+    /// them (oxide#190). A capacity or project-cap admission may evict more than
+    /// one idle slot, so the list is bounded and may hold several names. The
+    /// command that made them publishes exactly these, outside the pool lock, so
+    /// its own deletion is identified rather than guessed from a rotation.
+    pub holding: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

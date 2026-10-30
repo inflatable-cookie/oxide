@@ -629,7 +629,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // refuses the very admission that could delete it, so this command's pass
     // takes that entry (at most one, under a brief lock, deleted outside it)
     // and its own evicted tree is deleted the same way once the lease is held.
-    let mut holding_sweep = HoldingSweep::start(store.pool.clone());
+    let mut holding_sweep = HoldingSweep::start(store.pool.clone(), None);
     let lease = lease_with_gate(
         &store,
         &key,
@@ -643,14 +643,19 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let lease = match lease {
         Ok(inner) => Ok(inner),
         Err(error) => {
-            // One retry, only when this command's own pass finished a pending
-            // entry: the pool's accounting changed under it, so the refusal it
-            // just received may no longer hold. A pass that claimed nothing
-            // leaves the original refusal untouched.
-            let reclaimed = holding_sweep.finish();
-            if reclaimed.is_some() {
+            // A capacity refusal can be caused by holding bytes this command is
+            // able to free. The failed attempt's own evictions are not reported
+            // to it, so this pass takes one entry by rotation, outside the pool
+            // lock, and the admission is retried **once** — but only when the
+            // pass positively removed a tree, because that is the only thing
+            // that changed the pool's accounting. Nothing is retried on a pass
+            // that claimed nothing.
+            holding_sweep.finish();
+            let mut reclaim = HoldingSweep::start(store.pool.clone(), None);
+            let removed = reclaim.finish().is_some_and(|pass| pass.gone);
+            if removed {
                 eprintln!(
-                    "oxide: finished a pending slot deletion in the holding area; retrying the admission once"
+                    "oxide: deleted a held slot tree in the holding area; retrying the admission once"
                 );
                 lease_with_gate(
                     &store,
@@ -667,16 +672,12 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             }
         }
     };
-    let (mut held, mut gate) = match lease? {
+    let (mut held, mut gate, mut pending) = match lease? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
         Err(Stop::Cargo(code)) => return Ok(code),
         Err(Stop::Admission) => return Ok(stop_for_admission()),
     };
-    // The admission just taken may itself have evicted an idle slot, whose tree
-    // is already renamed into the holding area and recorded. This command owns
-    // its deletion from here, beside its own writer (oxide#190).
-    let mut holding_sweep = HoldingSweep::start(store.pool.clone());
     if budget::admission_expired() {
         let origin = held.prior.unchanged();
         store.release(held, origin)?;
@@ -742,7 +743,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
                     production = Some(prepared);
                 }
                 Ok(store::SeedRun::Abandoned) => {
-                    (held, gate, binding) = match abandon_seed_and_reacquire(
+                    (held, gate, binding, pending) = match abandon_seed_and_reacquire(
                         &store,
                         &key,
                         invocation.profile,
@@ -783,6 +784,16 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             }
         }
     }
+    // The lease this command finally holds may itself have evicted idle slots
+    // (including through the seeding re-acquire above), whose trees are already
+    // renamed into the holding area and recorded. The library reports exactly
+    // the entries it created and `discard` names the one it evicted by ID, so
+    // this command publishes its own eviction — named, never selected by
+    // rotation — beside its own writer (oxide#190). Several entries can be
+    // pending from one admission; the pass takes the first and a later command
+    // takes the rest.
+    pending.extend(held.created_holding.iter().cloned());
+    let mut holding_sweep = HoldingSweep::start(store.pool.clone(), pending.first().cloned());
     for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
     }
@@ -1472,11 +1483,11 @@ fn abandon_seed_and_reacquire(
     // binding received it (oxide#170 added this parameter; the cold re-bind
     // must not lose it).
     local_outputs: Option<&outputs::LocalOutputs<'_>>,
-) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding), Stop>, String> {
+) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding, Vec<String>), Stop>, String> {
     drop(binding);
     store.release(held, None)?;
     grants.share = false;
-    let (held, gate) = match lease_with_gate(
+    let (held, gate, pending) = match lease_with_gate(
         store, key, profile, admission, resolution, label, waits, grants,
     )? {
         Ok(leased) => leased,
@@ -1491,7 +1502,7 @@ fn abandon_seed_and_reacquire(
         derives_from_receipt,
         local_outputs,
     ) {
-        Ok(binding) => Ok(Ok((held, gate, binding))),
+        Ok(binding) => Ok(Ok((held, gate, binding, pending))),
         Err(reason) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
@@ -1513,10 +1524,12 @@ fn lease_with_gate(
     label: Option<&str>,
     waits: &mut store::WaitAccounting,
     grants: &mut LeaseGrants,
-) -> Result<Result<(store::Lease, Gate), Stop>, String> {
+) -> Result<Result<(store::Lease, Gate, Vec<String>), Stop>, String> {
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot. At most one grant per project slot plus one cold
-    // fallback (oxide#118, oxide#177).
+    // fallback (oxide#118, oxide#177). `pending` collects the holding entries
+    // this call evicted by ID, so the command publishes exactly those.
+    let mut pending: Vec<String> = Vec::new();
     while grants.remaining > 0 {
         let mut held = match store.acquire(key, profile, admission, grants.share, label, waits)? {
             Acquired::Lease(held) => held,
@@ -1529,7 +1542,7 @@ fn lease_with_gate(
         // that died before Cargo.
         let foreign = held.prior.foreign(&key.checkout);
         let reason = match refusal {
-            Ok(gate) => return Ok(Ok((held, gate))),
+            Ok(gate) => return Ok(Ok((held, gate, pending))),
             Err(Refusal::Unvouched(reason)) => reason,
             Err(Refusal::Lock { code, message }) => {
                 eprint!("{message}");
@@ -1560,7 +1573,9 @@ fn lease_with_gate(
                 "oxide: freshness gate cannot vouch for slot {} ({reason}); evicting it and building cold",
                 held.slot_id
             );
+            let entry = held.holding_entry_name();
             store.discard(held)?;
+            pending.extend(entry);
         }
     }
     Err("the freshness gate kept refusing slots".to_owned())
@@ -1775,12 +1790,17 @@ struct HoldingSweep {
 }
 
 impl HoldingSweep {
-    /// Start the pass for this command's pool. A pool with nothing pending
-    /// costs one short locked open that finds no entry.
-    fn start(pool: PathBuf) -> Self {
+    /// Start the pass for this command's pool.
+    ///
+    /// `prefer` names the holding entry this command itself just created. When
+    /// it is set, the pass claims exactly that entry — not whichever row a
+    /// rotation happens to select — so a publishing command always deletes its
+    /// own eviction. A pool with nothing of its own pending costs one short
+    /// locked open that finds no entry.
+    fn start(pool: PathBuf, prefer: Option<String>) -> Self {
         let worker = std::thread::Builder::new()
             .name("oxide-holding".to_owned())
-            .spawn(move || report_holding_pass(&pool))
+            .spawn(move || report_holding_pass(&pool, prefer.as_deref()))
             .ok();
         Self { worker }
     }
@@ -1839,9 +1859,12 @@ impl Drop for HoldingSweep {
 
 /// One pass: claim a pending holding entry and delete it outside the pool
 /// lock. Progress goes to stderr, bounded to one line per pass.
-fn report_holding_pass(pool: &Path) -> Option<oxide_storage::lease::HoldingDrain> {
+fn report_holding_pass(
+    pool: &Path,
+    prefer: Option<&str>,
+) -> Option<oxide_storage::lease::HoldingDrain> {
     let started = Instant::now();
-    match oxide_storage::lease::managed::drain_holding(pool, None) {
+    match oxide_storage::lease::managed::drain_holding(pool, prefer) {
         Ok(pass) => {
             let Some(name) = pass.claimed.clone() else {
                 return None;
@@ -2788,7 +2811,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let Ok((cold, _, binding)) = result else {
+        let Ok((cold, _, binding, _pending)) = result else {
             panic!("cold admission stopped")
         };
         assert!(matches!(cold.prior, freshness::Prior::Fresh));

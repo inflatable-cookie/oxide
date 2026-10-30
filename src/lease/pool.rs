@@ -688,14 +688,10 @@ pub(super) struct Pool {
     /// The caller's registered free-space reserve for a removable payload.
     /// Read only by the unknown-size admission route; never a cap input.
     reserve: Option<u64>,
-    /// Holding bytes this same admission created by evicting a slot. They are
-    /// charged everywhere else from the moment they are durable, but not
-    /// against the admission that just committed to freeing them: the command
-    /// deletes that tree outside the lock as soon as the lease is granted
-    /// (oxide#190). A pending entry this admission did not create stays
-    /// charged, so a pool over its budget with an unfinished deletion refuses
-    /// instead of exceeding it.
-    holding_in_flight: u64,
+    /// The holding entries this admission created, in creation order
+    /// (oxide#190). Reported to the caller so the command publishes exactly the
+    /// trees it evicted instead of selecting one by rotation.
+    created_holding: Vec<String>,
 }
 
 /// Entry points for the `oxide` front door. They open a budget-only
@@ -1008,8 +1004,23 @@ pub mod managed {
     /// whole into the payload's private holding area under this lock and
     /// deleted outside it (oxide#190), so the lock is held for one rename and
     /// one durable write.
-    pub fn evict_idle_slot(pool: &Path, slot_id: &str) -> Result<(), LeaseError> {
+    pub fn evict_idle_slot(pool: &Path, slot_id: &str) -> Result<Vec<String>, LeaseError> {
         Pool::open(pool)?.evict_idle(slot_id)
+    }
+
+    /// The holding entry name one generation derives, from facts a caller
+    /// already holds (`store_id`, slot, incarnation and the generation's lease
+    /// ID). A command that evicted a slot by ID therefore names the entry it
+    /// created instead of selecting one by rotation.
+    pub fn holding_entry_name(
+        store_id: &str,
+        slot_id: &str,
+        incarnation: &str,
+        lease_id: &str,
+    ) -> Option<String> {
+        let slot: u64 = slot_id.parse().ok()?;
+        let incarnation: u64 = incarnation.parse().ok()?;
+        super::derived_holding_name(store_id, slot, incarnation, lease_id)
     }
 
     /// Delete at most one pending holding entry outside the pool lock
@@ -1033,6 +1044,15 @@ pub(super) fn lease_injected(request: LeaseRequest) -> Result<LeaseGrant, LeaseE
     managed::lease(request)
 }
 
+/// Test-only: [`lease_injected`] with the holding entries that admission
+/// created (oxide#190), so a test can assert the publishing contract.
+#[cfg(test)]
+pub(super) fn lease_holding_injected(
+    request: LeaseRequest,
+) -> Result<(LeaseGrant, Vec<String>), LeaseError> {
+    managed::lease_measured(request).map(|leased| (leased.grant, leased.holding))
+}
+
 #[cfg(test)]
 pub(super) fn release_injected(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
     managed::release(pool, lease_id)
@@ -1044,7 +1064,10 @@ pub(super) fn recover_injected(pool: &Path, lease_id: &str) -> Result<ReleaseRec
 }
 
 #[cfg(test)]
-pub(super) fn evict_idle_slot_injected(pool: &Path, slot_id: &str) -> Result<(), LeaseError> {
+pub(super) fn evict_idle_slot_injected(
+    pool: &Path,
+    slot_id: &str,
+) -> Result<Vec<String>, LeaseError> {
     managed::evict_idle_slot(pool, slot_id)
 }
 
@@ -1387,7 +1410,7 @@ impl Pool {
             admission_note: None,
             unmeasured: BTreeMap::new(),
             reserve: None,
-            holding_in_flight: 0,
+            created_holding: Vec::new(),
         };
         // Holding rows and the trees they name are reconciled first, in the
         // same locked open: an entry a crash left before its row is adopted
@@ -1445,7 +1468,7 @@ impl Pool {
             admission_note: None,
             unmeasured: BTreeMap::new(),
             reserve: None,
-            holding_in_flight: 0,
+            created_holding: Vec::new(),
         })
     }
 
@@ -1551,6 +1574,13 @@ impl Pool {
     }
 
     fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
+        self.created_holding.clear();
+        let mut leased = self.lease_inner(request)?;
+        leased.holding = std::mem::take(&mut self.created_holding);
+        Ok(leased)
+    }
+
+    fn lease_inner(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
         // Per-admission accounting state. A slot a partial walk leaves
         // unmeasured is charged conservatively only for this admission
         // (oxide#186), so the next admission measures it again and may evict
@@ -1585,6 +1615,7 @@ impl Pool {
                     admission_note: None,
                     slice: None,
                     unmeasured: Vec::new(),
+                    holding: Vec::new(),
                 });
             }
             if existing.state == SlotPersistState::Held {
@@ -1665,6 +1696,7 @@ impl Pool {
                 admission_note: self.admission_note.take(),
                 slice: Some(report),
                 unmeasured: self.unmeasured_slots(),
+                holding: Vec::new(),
             });
         }
         if let Some((idle, incarnation)) = candidate {
@@ -1699,6 +1731,7 @@ impl Pool {
             admission_note: self.admission_note.take(),
             slice: slice_report,
             unmeasured: self.unmeasured_slots(),
+            holding: Vec::new(),
         })
     }
 
@@ -1745,6 +1778,7 @@ impl Pool {
             admission_note: None,
             slice: None,
             unmeasured: Vec::new(),
+            holding: Vec::new(),
         })
     }
 
@@ -2061,7 +2095,7 @@ impl Pool {
         }
     }
 
-    fn evict_idle(&mut self, slot_id: &str) -> Result<(), LeaseError> {
+    fn evict_idle(&mut self, slot_id: &str) -> Result<Vec<String>, LeaseError> {
         let id =
             slot_id
                 .parse::<u64>()
@@ -2077,7 +2111,8 @@ impl Pool {
         else {
             return Err(LeaseError::Busy);
         };
-        self.retire_idle_slot(id, incarnation, &project, profile)
+        self.retire_idle_slot(id, incarnation, &project, profile)?;
+        Ok(std::mem::take(&mut self.created_holding))
     }
 
     fn take_idle(
@@ -2620,8 +2655,12 @@ impl Pool {
     /// never push it over its cap, so they are not part of this figure; the
     /// volume's free space is a reserve signal, handled separately.
     fn pressure(&mut self) -> Result<u64, LeaseError> {
-        let total = self.recorded_total()?;
-        Ok(total.saturating_sub(self.holding_in_flight))
+        // Every recorded holding row is charged its bytes until it is
+        // positively removed: an eviction moves bytes, it never frees them
+        // before the tree is gone (oxide#190). A command that needs room must
+        // finish a pending deletion outside the lock and retry, never decide as
+        // if the bytes were already free.
+        self.recorded_total()
     }
 
     /// Count-limit preparation: a count replacement is count pressure, never a
@@ -3157,7 +3196,7 @@ impl Pool {
         // the intent names.
         self.record_hold_intent(id, identity)?;
         let row = self.hold_slot_tree(id, &path, Some(identity))?;
-        self.holding_in_flight = self.holding_in_flight.saturating_add(row.bytes);
+        self.created_holding.push(row.name.clone());
         self.ledger.slots.retain(|slot| slot.id != id);
         self.ledger.holding.push(row);
         self.persist_revised()?;
@@ -3222,7 +3261,7 @@ impl Pool {
             // next admission instead of being held and deleted.
             let ready = if removed {
                 None
-            } else if let Some(root) = self.pending_root_ready(id, &path) {
+            } else if let Some(root) = self.pending_root_verified(id, &path) {
                 Some(root)
             } else {
                 if self.recorded_root_is_untracked(id, &path) {
@@ -3304,10 +3343,20 @@ impl Pool {
             && private.is_none_or(|private| fs::symlink_metadata(private).is_err())
     }
 
-    /// An uncertain or partially inventoried pending root is isolated before
-    /// a new capture or deletion. Existing journaled modes may be restored
-    /// through the verified descriptors used for the preflight.
-    fn pending_root_ready(&self, id: u64, path: &Path) -> Option<OwnedFd> {
+    /// The pending root one legacy deletion is about to move, verified in O(1)
+    /// under the pool lock (oxide#190).
+    ///
+    /// This used to walk the whole pending tree recursively — a preflight #155
+    /// needed because its deletion captured and unlinked entry by entry. That
+    /// walk ran while `Pool::open` held the pool lock, so one large legacy
+    /// pending tree could stall every admission on the host. A whole-tree rename
+    /// needs no inventory: the root is opened without following a link, its
+    /// identity, owner, mode and device are verified (against the journal when
+    /// one exists), and the tree is moved whole. Per-object refusals belong to
+    /// the outside-lock deletion, which keeps anything it cannot delete. An
+    /// absent, replaced or unclassifiable root still refuses, so an uncertain
+    /// record is never reinterpreted.
+    fn pending_root_verified(&self, id: u64, path: &Path) -> Option<OwnedFd> {
         let slot = self.slot(id)?;
         if self.checked_slot_scope(path).is_err() {
             return None;
@@ -3350,21 +3399,6 @@ impl Pool {
                 (open_directory_at(parent.as_fd(), &candidate).ok()?, None)
             };
             if descriptor_identity(root.as_fd()).ok() != Some((facts.device, facts.inode)) {
-                return None;
-            }
-            let limits = self.pressure_limits();
-            let deadline = Instant::now() + Duration::from_millis(limits.max_elapsed_ms);
-            let mut remaining = limits.max_entries;
-            if !pending_tree_complete(
-                root.as_fd(),
-                facts.device,
-                0,
-                limits.max_depth,
-                &mut remaining,
-                deadline,
-                slot.capture.as_ref(),
-                &[],
-            ) {
                 return None;
             }
             if let Some(guard) = mode_guard.as_mut() {
@@ -4177,101 +4211,6 @@ fn folder_occupied(folder: &Path) -> Result<bool, LeaseError> {
         }
     }
     Ok(false)
-}
-
-/// Descriptor-relative completeness preflight. Existing journaled directory
-/// modes are restored through verified guards; no partial list is acted on.
-#[allow(clippy::too_many_arguments)]
-fn pending_tree_complete(
-    dir: BorrowedFd<'_>,
-    device: u64,
-    depth: usize,
-    max_depth: usize,
-    remaining: &mut u64,
-    deadline: Instant,
-    journal: Option<&DeletionJournal>,
-    chain: &[String],
-) -> bool {
-    if Instant::now() >= deadline || depth > max_depth {
-        return false;
-    }
-    let cap = usize::try_from(*remaining).unwrap_or(usize::MAX);
-    let Ok(names) = crate::owned_delete::names_of_bounded(dir, cap) else {
-        return false;
-    };
-    for name in names {
-        if Instant::now() >= deadline || *remaining == 0 {
-            return false;
-        }
-        *remaining -= 1;
-        let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
-            return false;
-        };
-        let Ok(facts) = crate::owned_delete::observe_entry(dir, &name) else {
-            return false;
-        };
-        if facts.device != device {
-            return false;
-        }
-        if facts.is_directory() {
-            let record = journal.and_then(|journal| {
-                journal.captures.iter().find(|record| {
-                    record.is_directory()
-                        && record.path == chain
-                        && (record.private.as_bytes() == name.to_bytes()
-                            || record.original.as_bytes() == name.to_bytes())
-                })
-            });
-            let mut next_chain = chain.to_vec();
-            let (child, mut mode_guard) = if let Some(record) = record {
-                if facts.device != record.device || facts.inode != record.inode {
-                    return false;
-                }
-                next_chain.push(record.private.clone());
-                let Ok((child, guard)) = crate::owned_delete::open_verified_step(
-                    dir,
-                    &name,
-                    record.device,
-                    record.inode,
-                    record.mode,
-                ) else {
-                    return false;
-                };
-                (child, Some(guard))
-            } else {
-                let Ok(child) = open_directory_at(dir, &name) else {
-                    return false;
-                };
-                (child, None)
-            };
-            if descriptor_identity(child.as_fd()).ok() != Some((facts.device, facts.inode))
-                || !pending_tree_complete(
-                    child.as_fd(),
-                    device,
-                    depth + 1,
-                    max_depth,
-                    remaining,
-                    deadline,
-                    if record.is_some() { journal } else { None },
-                    &next_chain,
-                )
-            {
-                return false;
-            }
-            if mode_guard
-                .as_mut()
-                .is_some_and(|guard| guard.restore().is_err())
-            {
-                return false;
-            }
-            if !crate::owned_delete::observe_entry(dir, &name).is_ok_and(|after| {
-                after.device == facts.device && after.inode == facts.inode && after.is_directory()
-            }) {
-                return false;
-            }
-        }
-    }
-    Instant::now() < deadline
 }
 
 struct Sizes {
@@ -6088,7 +6027,7 @@ pub(super) fn volume_pool_for_test(
         admission_note: None,
         unmeasured: BTreeMap::new(),
         reserve,
-        holding_in_flight: 0,
+        created_holding: Vec::new(),
     })
 }
 
@@ -6128,6 +6067,11 @@ pub(super) fn add_idle_slot_for_test(
 ) -> Result<PathBuf, LeaseError> {
     let slot_path = pool.slot_path_in(id, None)?;
     fs::create_dir_all(slot_path.join("build")).map_err(io_error)?;
+    // The product's slots are owner-only; a fixture slot must be too, or the
+    // idle-scope and holding checks correctly refuse it.
+    for path in [slot_path.join("build"), slot_path.clone()] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
+    }
     for index in 0..payload_files {
         fs::write(
             slot_path.join("build").join(format!("blob-{index}")),
@@ -6605,9 +6549,15 @@ mod removable_pool_path_tests {
                 record.unique_bytes = CAP / 3; // pool bytes now at the cap
             }
         }
+        // One eviction decision: a held tree's bytes stay charged until they
+        // are positively removed (oxide#190), so the pool-wide loop would keep
+        // retiring idle slots. This asserts the victim order of one decision.
         verified_facts::with(facts(10 * GIB), || {
-            pool.evict_idle_until_under_cap(&VictimPlan::any())
-                .expect("known-byte eviction");
+            assert!(
+                pool.evict_one_idle_with(&VictimPlan::any())
+                    .expect("known-byte eviction"),
+                "no victim was selected"
+            );
         });
         assert!(!older.exists(), "the rank-LRU idle slot was not evicted");
         assert!(

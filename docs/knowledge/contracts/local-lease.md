@@ -292,9 +292,11 @@ rename (the derived name and the verified identity) and the row swap after it.
 Nothing is written per entry — the tree is a private directory that becomes
 unreachable from every slot path the moment it is renamed, which is what made
 per-entry journaling unnecessary. The brief asked for one sync; the Oxide
-Supervisor accepted two on 2026-10-30 (decision `1e522ecc`) because the intent is
-what makes a crash between the rename and the row recoverable **by identity**
-rather than by a name, and both writes are O(1) rather than per entry. Any figure
+Supervisor accepted two on 2026-10-30 (decision `1e522ecc`) and clarified on the
+same day (decision `e0f63aa4`) that the authority is **O(1) durable transactions
+per eviction, not per-entry durability**, and that it does not waive the
+under-one-second lock interval. The intent is what makes a crash between the
+rename and the row recoverable **by identity** rather than by a name. Any figure
 quoted for the lock-held interval therefore covers the intent write, the rename
 and the row write together.
 
@@ -311,7 +313,13 @@ finishes. Nothing in any window is concluded from an absent name or from a name
 alone.
 
 **Recovery order and the legacy migration window.** `Pool::open` reconciles the
-holding area **before** it replays a recorded deletion. Adoption therefore
+holding area **before** it replays a recorded deletion, and the legacy replay
+verifies its pending root in **O(1)**: the root is opened without following a
+link and its identity, owner, mode and device are checked (against the journal
+when one exists) — the recursive inventory preflight #155 needed is gone, so one
+large legacy pending tree can no longer hold the pool lock across every admission
+on the host. Per-object refusals belong to the outside-lock deletion, which keeps
+anything it cannot delete and reports it. Adoption therefore
 covers every generation whose tree is already in the holding area, including a
 legacy `Evicting` row interrupted between its migration rename and the write
 that would have recorded the holding row: that row is adopted (its per-entry
@@ -366,9 +374,13 @@ mode gains the owner bits, exactly as the retired path did. An already-missing
 entry counts as done, so a pass is idempotent. When the entry directory is gone,
 one brief locked write drops its row.
 
-**Custody.** A claim takes an exclusive **non-blocking** `flock` on the holding
-entry's own directory descriptor, under a brief pool lock, and holds it for the
-whole deletion. A second command that finds it held claims nothing and deletes
+**Custody and publication.** The evicting admission reports exactly the holding
+entries it created, and a command that evicts a slot by ID names that entry
+through the same derivation, so a command always publishes **its own** eviction
+instead of selecting a row by rotation; the rotation remains only the takeover
+path for entries a command did not create. A claim takes an exclusive
+**non-blocking** `flock` on the holding entry's own directory descriptor, under a
+brief pool lock, and holds it for the whole deletion. A second command that finds it held claims nothing and deletes
 nothing: a live custodian is never waited for, and nothing infers custody from a
 PID, an age or a timeout. Each pass claims at most one entry, its own first and
 otherwise one starting from a rotating index derived from the pool's monotonic
@@ -377,18 +389,21 @@ being deleted by a later command. A deleted entry's descriptor is closed with
 its last name gone, so a later pass can never re-acquire it.
 
 **Accounting.** A holding row is charged its recorded bytes (the generation's
-closed observation, else the largest recorded slot, at least one byte) until it
-is gone. It is neither a slot nor a member: it counts toward neither the slot
-ceiling nor a project's slot cap, and the payload scope walk isolates the
-recorded entries so nothing is counted twice. An **unrecorded** entry in the
-holding area is never adopted and never deleted; it stays counted by the payload
-walk (so its bytes are charged rather than free) and is reported. An admission
-that itself evicts is not charged for the tree it just committed to freeing (the
-same command deletes it once the lease is granted); a pending entry it did not
-create stays charged, so a pool over its budget with an unfinished deletion
-refuses with a bounded capacity result instead of exceeding the budget. `oxide
-status` lists each held entry with its recorded bytes, its age and one presence
-check — no walk, no custody, no deletion.
+closed observation, else the largest recorded slot, at least one byte) in the
+admission capacity decision **until it is positively removed** — an eviction
+moves bytes, it never frees them early, and no admission decides as if a held
+tree were already gone. A holding row is neither a slot nor a member: it counts
+toward neither the slot ceiling nor a project's slot cap, and the payload scope
+walk isolates the recorded entries so nothing is counted twice. An **unrecorded**
+entry in the holding area is never adopted and never deleted; it stays counted by
+the payload walk (so its bytes are charged rather than free) and is reported. A
+command whose admission is refused because of such bytes finishes a pending
+deletion outside the pool lock and retries exactly once — only when that pass
+positively removed a tree, because that is the only thing that changes the
+figure; it never assumes the bytes are free. An undeletable tree therefore keeps
+its charge and its admission refuses with a bounded capacity result rather than
+exceeding the budget. `oxide status` lists each held entry with its recorded
+bytes, its age and one presence check — no walk, no custody, no deletion.
 
 **Per-object failure.** An entry the traversal cannot delete (permission,
 `EBUSY`, another owner, another device, a depth beyond the bound, an unknown
