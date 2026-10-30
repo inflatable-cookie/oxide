@@ -79,15 +79,16 @@ SLOT_BYTES = 20 * MIB
 # therefore plant one `PENDING_ENTRIES`-entry tree of `PENDING_ENTRY_BYTES`
 # (~16 MiB allocated) under a `PENDING_CAP` cap, which a later admission still
 # fits under once the tree is being deleted.
-PENDING_ENTRIES = 4000
+PENDING_ENTRIES = 20_000
 PENDING_ENTRY_BYTES = 1024
-PENDING_CAP = "20MiB"
-# Each 1 KiB entry occupies one filesystem block, so one recorded tree is about
-# `PENDING_ENTRIES * 4096` bytes (~15.6 MiB). TWO such idle trees exceed
-# `PENDING_CAP` (20 MiB) so the eviction admission must retire exactly one of
-# them, while that retried row's own charge still fits under the cap, so a later
-# warm-reuse admission needs no capacity decision and can proceed beside the
-# deletion. Both halves are asserted in the pure self-check.
+PENDING_CAP = "100MiB"
+# Each 1 KiB entry occupies one filesystem block, so one recorded tree of
+# `PENDING_ENTRIES` = 20,000 entries is about 78 MiB (the brief's >=20,000-entry
+# fixture). TWO such idle trees exceed `PENDING_CAP` (100 MiB) so the eviction
+# admission must retire exactly one of them, while that row's own charge still
+# fits under the cap, so a later warm-reuse admission needs no capacity decision
+# and can proceed beside the deletion. Both halves are asserted in the pure
+# self-check.
 PENDING_BLOCK_BYTES = 4096
 PENDING_TREES = 2
 STAGE_JOBS = 1
@@ -108,7 +109,12 @@ CONCURRENT_CUSTODY_S = 0.5
 # The interval between two entry-count samples of the held tree. A strictly
 # decreasing count between them is measured progress under the deleter's
 # custody: nobody else can claim the entry while it holds the flock.
-PROGRESS_INTERVAL_S = 0.3
+# Progress is measured by bounded sampling rather than one fixed sleep: a 78 MiB
+# tree on a fast internal volume can vanish inside a long interval. Sampling every
+# `PROGRESS_SAMPLE_S` stops at the first proven decrease, while most of the tree
+# is still there, which is also the point at which the competitor starts.
+PROGRESS_SAMPLE_S = 0.02
+PROGRESS_BUDGET_S = 60.0
 MAX_RECEIPT_BYTES = 64 * 1024
 SELECTOR = "rust:holding-delete"
 COMMAND = [
@@ -425,12 +431,18 @@ def plan_document() -> dict:
             "inlock_control_factor": INLOCK_CONTROL_FACTOR,
             "inlock_control_slack_s": INLOCK_CONTROL_SLACK_S,
             "concurrent_custody_s": CONCURRENT_CUSTODY_S,
-            "progress_interval_s": PROGRESS_INTERVAL_S,
+            "progress_sample_s": PROGRESS_SAMPLE_S,
+            "progress_budget_s": PROGRESS_BUDGET_S,
         },
-        "pending_row_premise": "two recorded trees exceed the cap (an eviction "
-        "is forced) while one recorded tree fits under it (its charged row "
-        "leaves room for the competitor's warm reuse); both halves are asserted "
-        "in the pure self-check",
+        "pending_row_premise": "two recorded trees of the brief's >=20,000 "
+        "entries exceed the cap (an eviction is forced) while one recorded tree "
+        "fits under it (its charged row leaves room for the competitor's warm "
+        "reuse); both halves are asserted in the pure self-check",
+        "progress_observation": f"bounded sampling every {PROGRESS_SAMPLE_S}s "
+        "until two consecutive samples strictly decrease, so the competitor starts "
+        "while most of the tree is still there; the case also requires the "
+        "estimated remaining deletion time to exceed the in-lock bound it "
+        "enforces, which is what makes that control falsifying",
         "observations": {
             "lock_held": "the product's debug-only OXIDE_TEST_HOLDING_LOCK_LOG "
             "line per eviction, armed only inside the supervisor's scratch root. "
@@ -569,8 +581,9 @@ def self_check() -> None:
         "the concurrent custody lead changed",
     )
     expect(
-        plan["limits"]["progress_interval_s"] == 0.3,
-        "the progress sampling interval changed",
+        plan["limits"]["progress_sample_s"] == 0.02
+        and plan["limits"]["progress_budget_s"] == 60.0,
+        "the bounded progress sampling changed",
     )
     expect(len(plan["cases"]) == 4, "the plan case count changed")
     expect(plan["disk"]["fixture_roots"] == 4, "the plan fixture count changed")
@@ -779,7 +792,11 @@ def self_check_oracles(scratch: str) -> None:
     # recorded trees must exceed the cap (so one eviction is forced) while a
     # single recorded tree stays under it (so its charged row still leaves room
     # for the competitor's warm reuse).
-    one_tree = PENDING_ENTRIES * PENDING_BLOCK_BYTES + PENDING_ENTRY_BYTES
+    expect(
+        PENDING_ENTRIES >= 20_000,
+        f"the pending fixture is below the brief's 20,000-entry size: {PENDING_ENTRIES}",
+    )
+    one_tree = PENDING_ENTRIES * PENDING_BLOCK_BYTES
     expect(
         one_tree * PENDING_TREES > parse_size(PENDING_CAP),
         f"the fixture never forces eviction: {one_tree} x {PENDING_TREES} <= {PENDING_CAP}",
@@ -814,6 +831,24 @@ def self_check_oracles(scratch: str) -> None:
     expect(
         "slot_state" in set(prove_concurrent_admission.__code__.co_names),
         "the concurrency case does not observe the competitor's admission in the ledger",
+    )
+    # Progress is measured by bounded sampling, and the in-lock control is
+    # falsifying by construction: the case must estimate how much deletion work
+    # remains and require it to exceed the bound it enforces.
+    for fn in (prove_concurrent_admission, prove_killed_deleter_takeover):
+        expect(
+            "observe_progress" in set(fn.__code__.co_names),
+            f"{fn.__name__} does not measure progress by bounded sampling",
+        )
+    concurrency_names = set(prove_concurrent_admission.__code__.co_names)
+    expect(
+        "max" in concurrency_names and "INLOCK_CONTROL_FACTOR" in concurrency_names,
+        "the concurrency case does not build the in-lock bound it enforces",
+    )
+    premise = "expected_" + "remaining_s"
+    expect(
+        premise in source,
+        "the concurrency case does not state the falsifying in-lock premise",
     )
     retired = "CONCURRENT" + "_CAP"
     expect(retired not in source, "a retired concurrency constant is still referenced")
@@ -1215,6 +1250,36 @@ def prove_refused_entry_kept(root: str, subject: str) -> dict:
     return held_facts
 
 
+def observe_progress(
+    held: str, budget_s: float = PROGRESS_BUDGET_S
+) -> tuple[list[tuple[float, int]], float]:
+    """Measure a deletion's progress by bounded sampling.
+
+    Returns as soon as two consecutive samples show a **strict** decrease, with the
+    samples taken so far and the observed entries/second. Sampling every
+    `PROGRESS_SAMPLE_S` (not one long sleep) is what makes this fit a tree that can
+    vanish quickly on a fast volume: the caller learns about the decrease while
+    most of the tree is still there. A tree that is already gone returns a final
+    zero sample and rate `0.0`, which the caller must treat as a failed premise; a
+    budget always ends the wait.
+    """
+    deadline = time.perf_counter() + budget_s
+    samples: list[tuple[float, int]] = []
+    while time.perf_counter() < deadline:
+        work_left()
+        count = entry_count(held) if tree_present(held) else 0
+        now = time.perf_counter()
+        samples.append((now, count))
+        if count == 0:
+            return samples, 0.0
+        if len(samples) >= 2 and samples[-1][1] < samples[-2][1]:
+            span = samples[-1][0] - samples[-2][0]
+            rate = (samples[-2][1] - samples[-1][1]) / max(span, 0.001)
+            return samples, rate
+        time.sleep(PROGRESS_SAMPLE_S)
+    return samples, 0.0
+
+
 def parse_size(text: str) -> int:
     """A size the fixture passes to `OXIDE_POOL_CAP` (`20MiB`, `512KiB`, `3G`)."""
     units = {"": 1, "B": 1, "K": 1024, "KB": 1024, "KIB": 1024}
@@ -1378,22 +1443,43 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         str(row["slot"]) == str(victim["id"]),
         "the oldest idle tree was not the victim",
     )
-    # Two samples while only the evicting command runs: measured progress under
-    # its own non-blocking custody, which no other pass can claim.
-    first_sample = (time.perf_counter(), entry_count(held))
-    time.sleep(PROGRESS_INTERVAL_S)
-    second_sample = (time.perf_counter(), entry_count(held))
+    # Progress under the evicting command's own non-blocking custody, measured by
+    # bounded sampling: it stops at the first proven decrease, while most of the
+    # tree is still there.
+    samples, progress_rate = observe_progress(held)
     expect(
-        0 < second_sample[1] < first_sample[1],
-        f"the deletion made no measurable progress "
-        f"({first_sample[1]} then {second_sample[1]} entries left)",
+        progress_rate > 0.0 and len(samples) >= 2,
+        f"the deletion made no measurable progress before it ended: {samples[-6:]}",
     )
-    remaining_before = second_sample[1]
-    progressed = first_sample[1] - second_sample[1]
-    progress_rate = progressed / max(second_sample[0] - first_sample[0], 0.001)
+    initial_entries = samples[0][1]
+    remaining_before = samples[-1][1]
+    expect(
+        0 < remaining_before < initial_entries,
+        f"the deletion's progress samples are not a strict decrease: {samples[-6:]}",
+    )
+    expect(
+        remaining_before * 2 >= initial_entries,
+        f"the deletion was already {initial_entries - remaining_before} of "
+        f"{initial_entries} entries in before the first sample: the window is too "
+        "short for the in-lock control to be discriminating",
+    )
+    progressed = initial_entries - remaining_before
+    observed_span = samples[-1][0] - samples[0][0]
     expect(
         evictor.poll() is None,
         "the evicting command finished before the competitor started; the case is vacuous",
+    )
+    # The falsifying premise of the in-lock control: enough deletion work must
+    # remain that an admission serialised behind the pool lock would exceed the
+    # bound we are about to enforce.
+    bound = max(
+        INLOCK_CONTROL_FACTOR * control_elapsed, control_elapsed + INLOCK_CONTROL_SLACK_S
+    )
+    expected_remaining_s = remaining_before / progress_rate
+    expect(
+        expected_remaining_s > bound,
+        f"only {expected_remaining_s:.2f}s of deletion remained against a "
+        f"{bound:.2f}s bound, so an in-lock deletion could not be distinguished",
     )
     # The competitor's admission, observed through the pool's own slot row: its
     # idle slot becomes held while the held tree is still being deleted.
@@ -1432,9 +1518,6 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         remaining_at_admission <= remaining_before,
         "the sampled progress is not monotonic",
     )
-    bound = max(
-        INLOCK_CONTROL_FACTOR * control_elapsed, control_elapsed + INLOCK_CONTROL_SLACK_S
-    )
     expect(
         admission_elapsed <= bound,
         f"the admission took {admission_elapsed:.2f}s while a deletion was in "
@@ -1459,9 +1542,12 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         "control_admission_s": round(control_elapsed, 3),
         "inlock_bound_s": round(bound, 3),
         "admission_during_deletion_s": round(admission_elapsed, 3),
-        "progress_samples": [first_sample[1], second_sample[1]],
+        "deletion_remaining_estimate_s": round(expected_remaining_s, 3),
+        "progress_samples": [count for _, count in samples],
+        "progress_sample_span_s": round(observed_span, 3),
         "progress_entries": progressed,
         "progress_entries_per_s": round(progress_rate, 1),
+        "initial_entries": initial_entries,
         "remaining_before": remaining_before,
         "remaining_at_admission": remaining_at_admission,
         "evictor_alive_at_admission": evictor_alive,
@@ -1482,17 +1568,11 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     # partly deleted tree survive, which is exactly the state a later command
     # resumes.
     evictor, row, held = start_eviction(root, subject, pool, env, victim, "killed")
-    deadline = time.perf_counter() + 30
-    first = entry_count(held)
-    while time.perf_counter() < deadline:
-        work_left()
-        time.sleep(0.02)
-        now = entry_count(held) if tree_present(held) else 0
-        if 0 < now < first:
-            break
-        first = max(now, 1)
-    else:
-        fail("the evicting command's deletion never made progress")
+    samples, rate = observe_progress(held)
+    expect(
+        rate > 0.0 and len(samples) >= 2,
+        f"the evicting command's deletion never made measurable progress: {samples[-6:]}",
+    )
     evictor.kill()
     reaped = discard(evictor, "killed-evictor")
     expect(reaped, "the killed evicting command could not be confirmed reaped")
