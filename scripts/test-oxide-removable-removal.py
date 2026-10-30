@@ -48,10 +48,19 @@ the product's own removal path: a blocked `oxide exec` tool loses the volume
 under the removal stop, and its release flush fails with the mount gone, so
 the lost record names the exec holder (an exec may start processes outside
 its group) and is quarantined. No state file is edited.
-`--diagnostic` (with `--boot-closure`) is the uncounted collection mode: it
-records a bounded `qualified: false` receipt of reached, completed and failed
-cases and stops on any outcome it cannot classify. `--self-check` is the pure
-apparatus check run before any activation: no child, pool, image or device.
+`--diagnostic` is the uncounted keep-going collection for either mode. The
+main mode's fixed case map is `idle` -> `held` -> `held-delete` ->
+`quarantine`, each case one named premise; the receipt records reached,
+completed, failed, dependent-skipped and unexecuted cases and the latched
+first fault as one bounded `qualified: false` document beside the guard's.
+Only a recoverable `oracle(...)` product expectation continues into
+dependency-independent cases. A timed-out or otherwise unclassifiable child,
+writer, mount, device or custody outcome aborts the collection and is
+recorded as `aborted` with the remaining cases `unexecuted`: this script can
+never conclude a descendant group's closure, only the guard's census can.
+`--plan` prints both modes' case tables, allocation and the nine premise
+dispositions with no effect. `--self-check` is the pure apparatus check run
+before any activation: no child, pool, image or device.
 It pins the full fixture environment every boot-closure child (`status`
 included) receives, the deletion oracle's slot-leaf resolution (the slot's
 own `<profile>-<id>` leaf, never the project-label folder a build or an
@@ -66,6 +75,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import contextlib
 import glob
 import hashlib
 import importlib.util
@@ -374,6 +384,27 @@ def late_writes(out_dir: str, label: str) -> None:
         print(f"{label}: late directory creation refused: {error}")
 
 
+@contextlib.contextmanager
+def staging_environment_scrubbed():
+    """The shared `layout.stage_at` helper builds from this process's
+    environment. Staging runs with every inherited OXIDE_/XDG_/CARGO_/
+    SCCACHE_/RUSTC* key removed and only the invoking Cargo home restored, set
+    explicitly, so this repository's committed lock resolves its offline
+    registry cache there and no unknown CARGO_* value reaches the candidate.
+    Everything is restored on exit, including on failure."""
+    saved = dict(os.environ)
+    invoking_cargo_home = saved.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    try:
+        for key in list(os.environ):
+            if key.startswith(("OXIDE_", "XDG_", "CARGO_", "SCCACHE_", "RUSTC")):
+                os.environ.pop(key, None)
+        os.environ["CARGO_HOME"] = invoking_cargo_home
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
 def private_environment(root: str) -> dict:
     """The private HOME, CARGO_HOME, gate and sanitized command environment
     every fixture child gets; nothing here may reach the operator's account,
@@ -392,7 +423,7 @@ def private_environment(root: str) -> dict:
     for key in list(env):
         if key in ("OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS"):
             continue
-        if key.startswith(("SCCACHE_", "OXIDE_", "XDG_", "CARGO_BUILD_", "CARGO_TARGET_", "RUSTC")) or key in (
+        if key.startswith(("SCCACHE_", "OXIDE_", "XDG_", "CARGO_", "RUSTC")) or key in (
             "CARGO",
             "CARGO_INCREMENTAL",
             "CARGO_ENCODED_RUSTFLAGS",
@@ -425,6 +456,22 @@ def private_environment(root: str) -> dict:
         }
     )
     return env
+
+
+def product_summary(stderr: str) -> str:
+    """The one product summary line. Its absence is a recoverable oracle
+    failure, not an unclassifiable writer, mount or custody outcome."""
+    lines = [line for line in stderr.splitlines() if " profile, " in line and " strategy, slot " in line]
+    oracle(len(lines) == 1, f"expected one summary line: {stderr[-600:]}")
+    return lines[0]
+
+
+def labelled_slot(slots: str, slot: int) -> str:
+    """oxide#104: a new slot is `slots/<project folder>/<profile>-<id>`. A
+    missing or duplicated label is a recoverable oracle failure."""
+    found = glob.glob(os.path.join(slots, "*", f"*-{slot}"))
+    oracle(len(found) == 1, f"slot {slot} not found once under {slots}: {found}")
+    return found[0]
 
 
 def diagnostic_outcome() -> dict:
@@ -497,7 +544,8 @@ class Removal:
         print(f"removal proof {os.getpid()} source {self.source} ({layout.source_facts(repo)}) volume {name}")
         need(not os.path.lexists(self.mount), f"{self.mount} already exists; never touched")
         proof.phase("start")
-        candidate = layout.stage_at(proof, repo, "oxide-candidate")
+        with staging_environment_scrubbed():
+            candidate = layout.stage_at(proof, repo, "oxide-candidate")
         print(f"staged candidate sha256 {layout.sha256(candidate)}")
         with open(candidate, "rb") as handle:
             oracle(CANDIDATE_MARKER in handle.read(), "candidate binary lacks the #098 lost-volume text")
@@ -530,7 +578,7 @@ class Removal:
     def case_idle(self) -> None:
         proof, state = self.proof, self.state
         code, _, stderr = proof.oxide(["build"], "removable cold app", self.app)
-        line = summary(stderr)
+        line = product_summary(stderr)
         oracle(code == 0 and "apfs-volume-v1" in line and "slot 1 cold" in line,
                f"removable not selected: {line}")
         oracle("flushed the removable volume before releasing slot 1" in stderr, "no flush before release")
@@ -538,19 +586,19 @@ class Removal:
         oracle(on_volume == ["oxide-pool"], f"volume holds more than the pool: {on_volume}")
         app_binary = os.path.join(self.app, "target", "debug", "app")
         oracle(os.path.isfile(app_binary), "default output is not checkout-local while docked")
-        app_slot = runner.labelled_slot(self.slots, 1)
+        app_slot = labelled_slot(self.slots, 1)
         self.volume.force_detach("idle removal")
         ran = proof.run([app_binary], cwd=self.app, timeout=30)
         oracle(ran.returncode == 0 and b"fixture app ok" in ran.stdout,
                "checkout-local binary does not run after removal")
         code, _, stderr = proof.oxide(["build"], "fallback app (idle removal)", self.app)
-        line = summary(stderr)
+        line = product_summary(stderr)
         oracle(code == 0 and "directory-budget-v1" in line and "removable volume not used" in stderr,
                f"no internal fallback: {line}")
         self.volume.no_spill("after fallback build")
         self.volume.attach()
         code, _, stderr = proof.oxide(["build"], "removable app after re-attach", self.app)
-        line = summary(stderr)
+        line = product_summary(stderr)
         oracle(code == 0 and "apfs-volume-v1" in line and "slot 1 warm" in line,
                f"idle slot not kept warm: {line}")
         oracle(os.path.isdir(app_slot), "idle slot directory gone")
@@ -609,15 +657,16 @@ class Removal:
                 "status does not show the lost slot",
             )
             code, _, stderr = proof.oxide(["build"], "fallback held", self.held)
-            oracle(code == 0 and "directory-budget-v1" in summary(stderr), "held fallback build failed")
+            oracle(code == 0 and "directory-budget-v1" in product_summary(stderr), "held fallback build failed")
             code, stdout, stderr = proof.oxide(["run"], "fallback run held", self.held)
-            oracle(code == 0 and "fixture held ok" in stdout and "directory-budget-v1" in summary(stderr),
+            oracle(code == 0 and "fixture held ok" in stdout
+                   and "directory-budget-v1" in product_summary(stderr),
                    "run after fallback failed")
             oracle(os.path.isfile(os.path.join(self.held, "target", "debug", "held")),
                    "fallback output is not checkout-local")
             code, stdout, stderr = proof.oxide(["test"], "fallback test held", self.held)
             oracle(code == 0 and "test works ... ok" in stdout
-                   and "directory-budget-v1" in summary(stderr), "test after fallback failed")
+                   and "directory-budget-v1" in product_summary(stderr), "test after fallback failed")
             self.volume.no_spill("after fallback run/test")
             state["out_dir"] = out_dir
         finally:
@@ -631,7 +680,7 @@ class Removal:
         lost_slot = os.path.join(self.slots, parts[0], parts[1])
         print(f"lost slot directory {lost_slot} present after re-attach: {os.path.isdir(lost_slot)}")
         code, _, stderr = proof.oxide(["build"], "removable held after re-attach", self.held)
-        line = summary(stderr)
+        line = product_summary(stderr)
         oracle(code == 0 and "apfs-volume-v1" in line and "slot 2" not in line,
                f"rebuild after re-attach: {line}")
         oracle(
@@ -673,7 +722,7 @@ class Removal:
             kept_present = os.path.isdir(kept_slot)
             print(f"quarantined slot directory {kept_slot} present after re-attach: {kept_present}")
             code, _, stderr = proof.oxide(["build"], "removable kept after re-attach", self.kept)
-            line = summary(stderr)
+            line = product_summary(stderr)
             oracle(code == 0 and "apfs-volume-v1" in line and f"slot {kept_id} " not in line,
                    f"kept rebuild: {line}")
             oracle("deleted slot" not in stderr, "a quarantined slot was deleted")
@@ -688,6 +737,15 @@ class Removal:
             state.update(kept_id=kept_id, kept_slot=kept_slot, kept_present=kept_present)
         finally:
             proof.reap(child)
+
+
+def record_abort(outcome: dict, case: str, failure) -> None:
+    """Record one abort truthfully: the fault, the aborted case and everything
+    that never ran. Undecided cases stay unexecuted, never skipped."""
+    detail = failure if isinstance(failure, str) else (str(failure) or repr(failure))
+    outcome["aborted"] = outcome["aborted"] or f"{case}: {detail}"
+    outcome["first_fault"] = outcome["first_fault"] or outcome["aborted"]
+    outcome["unexecuted"] = [name for name, _, _ in Removal.CASES if name not in outcome["reached"]]
 
 
 def collect(session: Removal, diagnostic: bool, outcome: dict, bodies: dict | None = None) -> dict:
@@ -720,12 +778,17 @@ def collect(session: Removal, diagnostic: bool, outcome: dict, bodies: dict | No
                 raise
             continue
         except UnknownOutcome as failure:
-            outcome["aborted"] = f"{case}: {failure}"
-            outcome["unexecuted"] = [name for name, _, _ in Removal.CASES if name not in outcome["reached"]]
+            record_abort(outcome, case, failure)
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            record_abort(outcome, case, "interrupted")
             raise
         except BaseException as failure:
-            outcome["aborted"] = f"{case}: unexpected {failure!r}"
-            outcome["unexecuted"] = [name for name, _, _ in Removal.CASES if name not in outcome["reached"]]
+            # A timed-out or otherwise unclassifiable child, writer, mount or
+            # device outcome aborts the collection; it is never a recoverable
+            # oracle failure and never a pass.
+            record_abort(outcome, case, failure)
+            print(f"{case}: ABORTED unexpected {failure!r}", file=sys.stderr)
             raise
         outcome["completed"].append(case)
         session.proof.phase(f"after {case}")
@@ -891,7 +954,8 @@ class BootClosure:
                 not os.environ.get(name),
                 f"{name} is inherited; the candidate's debug capability is not frozen",
             )
-        candidate = layout.stage_at(proof, repo, "oxide-boot-closure")
+        with staging_environment_scrubbed():
+            candidate = layout.stage_at(proof, repo, "oxide-boot-closure")
         print(f"staged candidate sha256 {layout.sha256(candidate)}")
         with open(candidate, "rb") as handle:
             need(BOOT_MARKER in handle.read(), "the candidate binary lacks the boot-session closure text")
@@ -1227,9 +1291,12 @@ PREMISE_CHECKLIST = (
     (
         "private HOME and rustup",
         "applicable: `private_environment` keeps the invoking RUSTUP_HOME, gives every child a "
-        "private HOME and CARGO_HOME, pins RUSTUP_TOOLCHAIN=1.97.1 and RUSTUP_AUTO_INSTALL=0; "
-        "`layout.stage_at` is the only --locked call, against this repository's committed lock, and "
-        "the dependency-free fixtures make their own lock offline",
+        "private HOME and CARGO_HOME, pins RUSTUP_TOOLCHAIN=1.97.1 and RUSTUP_AUTO_INSTALL=0; staging "
+        "runs inside `staging_environment_scrubbed`, which removes every inherited "
+        "OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key and restores only the invoking CARGO_HOME (set "
+        "explicitly, because this repository's committed lock resolves its offline registry cache "
+        "there); `layout.stage_at` is the only --locked call, and the dependency-free fixtures make "
+        "their own lock offline",
     ),
     (
         "account-home control",
@@ -1238,9 +1305,10 @@ PREMISE_CHECKLIST = (
     ),
     (
         "environment isolation",
-        "applicable: `private_environment` drops every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key and "
-        "CARGO, CARGO_INCREMENTAL, RUSTUP_TOOLCHAIN, RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS before "
-        "setting only this fixture's controls",
+        "applicable: `private_environment` drops every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key "
+        "(including all CARGO_* configuration and SCCACHE_* values) and re-adds only this fixture's "
+        "controls; `staging_environment_scrubbed` does the same for staging and restores only the "
+        "invoking CARGO_HOME",
     ),
     (
         "automatic adoption",
@@ -1261,9 +1329,9 @@ PREMISE_CHECKLIST = (
     ),
     (
         "compiler flags",
-        "applicable: main() refuses an inherited RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, so staging "
-        "builds with neither; every fixture child gets RUSTFLAGS=FROZEN_RUSTFLAGS with no encoded "
-        "value",
+        "applicable: main() refuses an inherited RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS and staging "
+        "runs in the scrubbed environment, so neither reaches it; every fixture child gets "
+        "RUSTFLAGS=FROZEN_RUSTFLAGS with no encoded value",
     ),
     (
         "temporary storage",
@@ -1717,6 +1785,43 @@ def self_check() -> int:
            f"aborted {outcome['aborted']}")
     expect(outcome["unexecuted"] == ["held", "held-delete", "quarantine"],
            f"unexecuted {outcome['unexecuted']}")
+    # A timed-out child is an unknown writer outcome: it aborts the collection,
+    # is never recorded as a recoverable failure, and the receipt keeps the
+    # abort and the unexecuted set.
+    session = FakeSession()
+    outcome = diagnostic_outcome()
+
+    def timed_out():
+        raise subprocess.TimeoutExpired("oxide build", 5)
+
+    bodies, _ = stub_bodies()
+    bodies["idle"] = timed_out
+    try:
+        collect(session, True, outcome, bodies)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        expect(False, "a timed-out child did not abort the collection")
+    expect(outcome["aborted"] is not None and "timed out" in outcome["aborted"],
+           f"aborted {outcome['aborted']}")
+    expect(outcome["failed"] == [], f"a timeout was recorded as a recoverable failure: {outcome['failed']}")
+    expect(outcome["completed"] == [], f"a timeout completed a case: {outcome['completed']}")
+    expect(outcome["unexecuted"] == ["held", "held-delete", "quarantine"],
+           f"unexecuted {outcome['unexecuted']}")
+    holder = dict(os.environ)
+    evidence = tempfile.mkdtemp(prefix="removal-diagnostic-check.")
+    os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
+    try:
+        with open(diagnostic_receipt(outcome, "removal.diagnostic"), encoding="utf-8") as handle:
+            receipt = json.load(handle)
+    finally:
+        os.environ.clear()
+        os.environ.update(holder)
+        shutil.rmtree(evidence, ignore_errors=True)
+    expect(receipt["qualified"] is False and receipt["aborted"] == outcome["aborted"],
+           f"receipt abort {receipt.get('aborted')!r}")
+    expect(receipt["unexecuted"] == outcome["unexecuted"], f"receipt unexecuted {receipt.get('unexecuted')}")
+    expect(receipt["failed"] == [], f"receipt failures {receipt.get('failed')}")
     # The premise checklist is complete, and its environment claims are
     # checked against `private_environment` with hostile inherited values.
     expect(len(PREMISE_CHECKLIST) == 9, f"premise checklist has {len(PREMISE_CHECKLIST)} items")
@@ -1740,6 +1845,10 @@ def self_check() -> int:
             "SCCACHE_DIR": "/fixture/sccache",
             "CARGO_BUILD_RUSTC_WRAPPER": "/fixture/wrapper",
             "CARGO_TARGET_DIR": "/fixture/target",
+            "CARGO_UNSTABLE_ALLOW_FEATURES": "fixture",
+            "CARGO_REGISTRIES_FIXTURE_INDEX": "/fixture/index",
+            "CARGO_BUILD_JOBS": "9",
+            "SCCACHE_BUCKET": "/fixture/bucket",
         }
     )
     try:
@@ -1757,8 +1866,61 @@ def self_check() -> int:
                "the host pool path reached the fixture")
         expect(env["OXIDE_POOL_CAP"] == "64MiB", "the fixture cap is not its own")
         expect(env["CARGO_BUILD_RUSTC_WRAPPER"] == "", "an inherited wrapper reached the fixture")
-        for name in ("OXIDE_CONFIG", "XDG_CONFIG_HOME", "SCCACHE_DIR", "CARGO_TARGET_DIR"):
+        for name in (
+            "OXIDE_CONFIG",
+            "XDG_CONFIG_HOME",
+            "SCCACHE_DIR",
+            "SCCACHE_BUCKET",
+            "CARGO_TARGET_DIR",
+            "CARGO_UNSTABLE_ALLOW_FEATURES",
+            "CARGO_REGISTRIES_FIXTURE_INDEX",
+            "CARGO_BUILD_JOBS",
+        ):
             expect(name not in env, f"inherited {name} was copied into the fixture")
+
+        # Staging runs in the scrubbed process environment: every inherited
+        # OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key is gone, only the invoking
+        # Cargo home is restored (explicitly), and the process environment is
+        # exactly restored afterwards, including when the body raises.
+        staging_root = os.path.join(root, "fixture-staging")
+        os.makedirs(os.path.join(staging_root, "home"), mode=0o700, exist_ok=True)
+        hostile = {
+            "OXIDE_POOL": "/fixture/host-pool",
+            "XDG_CONFIG_HOME": "/fixture/xdg",
+            "CARGO_UNSTABLE_ALLOW_FEATURES": "fixture",
+            "CARGO_REGISTRIES_FIXTURE_INDEX": "/fixture/index",
+            "CARGO_TARGET_DIR": "/fixture/target",
+            "SCCACHE_DIR": "/fixture/sccache",
+            "RUSTC_WRAPPER": "/fixture/wrapper",
+        }
+        os.environ.update(hostile)
+        os.environ["CARGO_HOME"] = "/fixture/invoking-cargo-home"
+        before = dict(os.environ)
+        seen = {}
+        with staging_environment_scrubbed():
+            seen = dict(os.environ)
+            raise_after = 1
+        expect(os.environ == before, "the staging scrub did not restore the process environment")
+        expect(seen.get("CARGO_HOME") == "/fixture/invoking-cargo-home",
+               "staging did not restore the invoking Cargo home explicitly")
+        for name in (
+            "OXIDE_POOL",
+            "XDG_CONFIG_HOME",
+            "CARGO_UNSTABLE_ALLOW_FEATURES",
+            "CARGO_REGISTRIES_FIXTURE_INDEX",
+            "CARGO_TARGET_DIR",
+            "SCCACHE_DIR",
+            "RUSTC_WRAPPER",
+        ):
+            expect(name not in seen, f"staging inherited {name}")
+        try:
+            with staging_environment_scrubbed():
+                raise RuntimeError("fixture body failure")
+        except RuntimeError:
+            pass
+        expect(os.environ == before, "the staging scrub did not restore after an exception")
+        os.environ.clear()
+        os.environ.update(holder)
         expect(env["RUSTUP_HOME"] == (holder.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")),
                "the invoking rustup home was not kept")
     finally:
@@ -1788,7 +1950,8 @@ def self_check() -> int:
     print(
         "boot-closure self-check ok: status/build child environments, deletion "
         "oracle slot leaf, diagnostic receipt (json, bounded, unqualified), "
-        "owners-on attach and mount observation, dispatch, marker"
+        "owners-on attach and mount observation, staging and fixture environment "
+        "scrub, timeout/abort driver semantics, dispatch, marker"
     )
     return 0
 

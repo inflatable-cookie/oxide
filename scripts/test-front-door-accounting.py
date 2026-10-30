@@ -60,8 +60,12 @@ not gates. Bounds: 300 s and 512 MiB monitored scratch under
 completed, failed, dependent-skipped and unexecuted cases and the latched
 first fault in a bounded `qualified: false` receipt beside the guard's,
 continues only into dependency-independent cases, and aborts on an outcome it
-cannot classify (an unclassified child, writer, mount, resource or deadline
-outcome). It is never a counted PASS. `--plan` prints the case table, the
+cannot classify. A child that does not finish in its bound is such an outcome:
+`communicate_bounded`/`wait_child`/`wait_for`/`wait_text`/`stage` signal and
+reap what they can and then raise `UnknownOutcome` (`uncertain_child`), never a
+recoverable `OracleFailure`, because this script cannot conclude a descendant
+group's closure — only the guard's census can. The receipt is written in every
+outcome, including a failure before the first case ran. It is never a counted PASS. `--plan` prints the case table, the
 allocation and the nine premise dispositions without any effect.
 `--self-check` is the pure apparatus check: no child, pool, image or scratch.
 Not a benchmark and not full QA. Scratch is removed only after positive
@@ -70,6 +74,7 @@ completion.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -109,8 +114,11 @@ PREMISE_CHECKLIST = (
         "applicable: `staging_environment` and `fixture_environment` capture the invoking "
         "RUSTUP_HOME (or HOME/.rustup) before the private HOME exists, pass it to staging and every "
         "child with RUSTUP_TOOLCHAIN=1.97.1 and RUSTUP_AUTO_INSTALL=0, and keep HOME/CARGO_HOME "
-        "private; staging is the only --locked call, against this repository's committed lock, and "
-        "the dependency-free fixtures make their own lock offline",
+        "private; staging keeps exactly one account directory, the invoking CARGO_HOME set "
+        "explicitly by `invoking_cargo_home()` (this repository's committed lock resolves its "
+        "offline registry cache there), and no other inherited CARGO_* value; staging is the only "
+        "--locked call, against that committed lock, and the dependency-free fixtures make their own "
+        "lock offline",
     ),
     (
         "account-home control",
@@ -118,9 +126,11 @@ PREMISE_CHECKLIST = (
     ),
     (
         "environment isolation",
-        "applicable: both environment builders drop every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key and "
-        "CARGO, CARGO_INCREMENTAL, RUSTUP_TOOLCHAIN, RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS before setting "
-        "only the fixture's own controls",
+        "applicable: both environment builders drop every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key, "
+        "CARGO, CARGO_INCREMENTAL, RUSTUP_TOOLCHAIN, RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS, then set "
+        "only the declared values (`staging_environment` re-adds the invoking CARGO_HOME, "
+        "`CARGO_NET_OFFLINE` and the fixed profile debug setting; `fixture_environment` re-adds its "
+        "private HOME/CARGO_HOME, the pinned toolchain and the frozen flags)",
     ),
     (
         "automatic adoption",
@@ -189,6 +199,35 @@ def need(message: str) -> None:
     raise UnknownOutcome(message)
 
 
+def uncertain_child(label: str, detail: str) -> None:
+    """A child that did not finish in its bound. Its own group's closure is
+    unknown to this script, so a diagnostic must abort rather than record a
+    recoverable oracle failure: only the guard's census can decide closure."""
+    raise UnknownOutcome(f"{label}: {detail}; its Cargo group's closure is unknown")
+
+
+def communicate_bounded(process, label: str, bound: float) -> tuple:
+    """Wait for a child; a timeout kills its leader, reaps it if it can and
+    always raises [`UnknownOutcome`], never an [`OracleFailure`]."""
+    try:
+        return process.communicate(timeout=bound)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.communicate(timeout=10)
+        except BaseException:
+            uncertain_child(label, "it did not finish and its leader was not reaped")
+        uncertain_child(label, f"it did not finish within {bound:.0f} s")
+
+
+def wait_child(process, label: str, seconds: float) -> int:
+    """Reap a child within a bound; a timeout is an unknown writer outcome."""
+    try:
+        return process.wait(timeout=min(seconds, remaining()))
+    except subprocess.TimeoutExpired:
+        uncertain_child(label, f"it did not exit within {seconds:.0f} s")
+
+
 def work_deadline() -> float:
     """The guard's exported deadline less its cleanup margin, when present."""
     guard = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
@@ -255,13 +294,24 @@ def invoking_rustup() -> str:
     return os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
 
 
+def invoking_cargo_home() -> str:
+    """The invoking Cargo home, resolved before any fixture HOME exists.
+
+    Staging deliberately keeps this one account directory — this repository's
+    committed lock resolves its registry cache there offline — and it is set
+    explicitly rather than inherited, so no unknown `CARGO_*` value reaches the
+    build. Every other inherited `CARGO_*` and `SCCACHE_*` value is dropped.
+    """
+    return os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+
+
 def staging_environment() -> dict:
-    """Staging uses the invoking Cargo home (this repository's committed lock,
-    offline) with the fixed compiler flags and no wrapper."""
+    """Staging: the invoking Cargo home (explicitly), this repository's
+    committed lock offline, the fixed compiler flags and no wrapper."""
     env = {
         name: value
         for name, value in os.environ.items()
-        if not name.startswith(("CARGO_BUILD_", "CARGO_TARGET_", "OXIDE_", "XDG_", "RUSTC"))
+        if not name.startswith(("CARGO_", "SCCACHE_", "OXIDE_", "XDG_", "RUSTC"))
         and name
         not in (
             "CARGO",
@@ -273,12 +323,13 @@ def staging_environment() -> dict:
     }
     env.update(
         {
+            "CARGO_HOME": invoking_cargo_home(),
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
             "RUSTUP_TOOLCHAIN": BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
             "RUSTC_WRAPPER": "",
             "RUSTFLAGS": FROZEN_RUSTFLAGS,
-            "CARGO_PROFILE_DEV_DEBUG": "0",
-            "CARGO_NET_OFFLINE": "true",
         }
     )
     return env
@@ -332,11 +383,14 @@ def stage(parent: str, env: dict) -> str:
     target = os.path.join(parent, "stage")
     log = os.path.join(parent, "stage.log")
     with open(log, "w") as handle:
-        build = subprocess.run(
-            ["cargo", "build", "--locked", "--offline", "--bin", "oxide"],
-            cwd=REPO, env={**env, "CARGO_TARGET_DIR": target, "CARGO_BUILD_BUILD_DIR": target},
-            stdout=handle, stderr=subprocess.STDOUT, timeout=remaining(),
-        )
+        try:
+            build = subprocess.run(
+                ["cargo", "build", "--locked", "--offline", "--bin", "oxide"],
+                cwd=REPO, env={**env, "CARGO_TARGET_DIR": target, "CARGO_BUILD_BUILD_DIR": target},
+                stdout=handle, stderr=subprocess.STDOUT, timeout=remaining(),
+            )
+        except subprocess.TimeoutExpired:
+            uncertain_child("staging", "the staged build did not finish in its bound")
     with open(log) as handle:
         text = handle.read()
     if build.returncode:
@@ -460,14 +514,10 @@ class Proof:
         return process, log
 
     def call(self, cwd: str, args: list, extra: dict | None = None) -> tuple:
+        bound = min(120.0, remaining())
         process, log = self.start(cwd, args, extra)
         started = time.monotonic()
-        try:
-            stdout, stderr = process.communicate(timeout=min(120, remaining()))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            fail(f"oxide {args} did not finish")
+        stdout, stderr = communicate_bounded(process, f"oxide {args}", bound)
         if "walk log" in stderr and "not written" in stderr:
             fail(f"oxide {args} could not write its walk log: {stderr[-800:]}")
         self.last_log = log
@@ -589,21 +639,29 @@ def prove_readiness(proof: Proof) -> None:
 
 
 def wait_for(path: str, process, label: str, seconds: float = 90) -> None:
+    """Wait for a fixture file. A child that exited without producing it is a
+    premise failure; a child that is still running when the wait expires is an
+    unknown writer outcome and aborts a diagnostic."""
     deadline = time.monotonic() + min(seconds, remaining())
     while not os.path.exists(path):
-        if process.poll() is not None or time.monotonic() > deadline:
-            fail(f"{label}: {'exited ' + str(process.returncode) if process.poll() is not None else 'timeout'}")
+        if process.poll() is not None:
+            fail(f"{label}: exited {process.returncode} without {path}")
+        if time.monotonic() > deadline:
+            uncertain_child(label, f"it did not produce {path} within {seconds:.0f} s")
         time.sleep(0.1)
 
 
 def wait_text(path: str, text: str, process, label: str, seconds: float = 60) -> None:
+    """Wait for a line in a child's own file, with the same classification."""
     deadline = time.monotonic() + min(seconds, remaining())
     while True:
         with open(path) as handle:
             if text in handle.read():
                 return
-        if process.poll() is not None or time.monotonic() > deadline:
-            fail(f"{label}: no {text!r}")
+        if process.poll() is not None:
+            fail(f"{label}: exited {process.returncode} without {text!r}")
+        if time.monotonic() > deadline:
+            uncertain_child(label, f"it printed no {text!r} within {seconds:.0f} s")
         time.sleep(0.1)
 
 
@@ -670,7 +728,7 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
         # warm: one walk at admission and one at release, nothing else.
         with open(release, "w"):
             pass
-        code = waiter.wait(timeout=min(120, remaining()))
+        code = wait_child(waiter, "the woken build", 120)
         waiter_err.close()
         with open(waiter_path) as handle:
             stderr = handle.read()
@@ -680,7 +738,7 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
             fail(f"the woken build did not take slot {app_slot} warm: {code} {stderr[-2000:]}")
         expect_roots("woken build", "walks", proof.walks(waiter_log),
                      [f"slots/{app_slot}", f"slots/{app_slot}"])
-        if holder.wait(timeout=min(60, remaining())):
+        if wait_child(holder, "the clean holder", 60):
             fail(f"the clean holder exited {holder.returncode}")
         expect_roots("holder", "walks", proof.walks(holder_log),
                      [f"slots/{app_slot}", f"slots/{app_slot}"])
@@ -707,7 +765,7 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
             fail(f"slot {app_slot} is not held by the killed holder: {held}")
         group = holder_group(proof, app)
         killed.send_signal(signal.SIGKILL)
-        killed.wait(timeout=30)
+        wait_child(killed, "the killed holder", 30)
         with open(killed_release, "w"):
             pass
         # The product only recovers on a positively empty Cargo group; observe
@@ -838,6 +896,15 @@ def diagnostic_outcome() -> dict:
     }
 
 
+def record_abort(outcome: dict, case: str, failure) -> None:
+    """Record one abort truthfully: the fault, the aborted case and everything
+    that never ran. Undecided cases stay unexecuted, never skipped."""
+    detail = failure if isinstance(failure, str) else (str(failure) or repr(failure))
+    outcome["aborted"] = outcome["aborted"] or f"{case}: {detail}"
+    outcome["first_fault"] = outcome["first_fault"] or outcome["aborted"]
+    outcome["unexecuted"] = [name for name, _, _ in CASES if name not in outcome["reached"]]
+
+
 def run_cases(diagnostic: bool, proof: Proof, checkouts: dict, state: dict, outcome: dict,
               bodies: dict | None = None) -> dict:
     """Run the fixed case map; return the same `outcome` document."""
@@ -860,9 +927,17 @@ def run_cases(diagnostic: bool, proof: Proof, checkouts: dict, state: dict, outc
                 raise
             continue
         except UnknownOutcome as failure:
-            outcome["aborted"] = f"{case}: {failure}"
-            outcome["unexecuted"] = [name for name, _, _ in CASES if name not in outcome["reached"]]
+            record_abort(outcome, case, failure)
             print(f"front-door {case}: ABORTED {failure}", file=sys.stderr, flush=True)
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            record_abort(outcome, case, "interrupted")
+            raise
+        except BaseException as failure:
+            # An unexpected exception is an outcome this collection cannot
+            # classify (never a recoverable oracle failure, never a pass).
+            record_abort(outcome, case, failure)
+            print(f"front-door {case}: ABORTED unexpected {failure!r}", file=sys.stderr, flush=True)
             raise
         outcome["completed"].append(case)
         print(f"front-door {case}: completed", flush=True)
@@ -1015,6 +1090,11 @@ def self_check() -> int:
                     "CARGO_ENCODED_RUSTFLAGS": "-Ctarget-cpu=native",
                     "RUSTUP_TOOLCHAIN": "nightly",
                     "SCCACHE_DIR": "/fixture/sccache",
+                    "SCCACHE_BUCKET": "/fixture/bucket",
+                    "CARGO_UNSTABLE_ALLOW_FEATURES": "fixture",
+                    "CARGO_REGISTRIES_FIXTURE_INDEX": "/fixture/index",
+                    "CARGO_TARGET_DIR": "/fixture/target",
+                    "CARGO_BUILD_JOBS": "9",
                 }
             )
             fixture_root = os.path.join(root, "fixture")
@@ -1040,9 +1120,130 @@ def self_check() -> int:
                         and staging["RUSTUP_AUTO_INSTALL"] == "0", "staging toolchain is not pinned")
             expect_true("OXIDE_POOL" not in staging and "XDG_CONFIG_HOME" not in staging,
                         "staging environment is not isolated")
+            # Staging keeps exactly the invoking Cargo home, set explicitly,
+            # and drops every other inherited CARGO_*/SCCACHE_* value.
+            expect_true(staging["CARGO_HOME"] == invoking_cargo_home(),
+                        "staging did not keep the invoking Cargo home explicitly")
+            for name in ("CARGO_UNSTABLE_ALLOW_FEATURES", "CARGO_REGISTRIES_FIXTURE_INDEX",
+                         "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "SCCACHE_DIR",
+                         "SCCACHE_BUCKET", "CARGO_INCREMENTAL"):
+                expect_true(name not in staging, f"staging inherited {name}")
+            declared = {"CARGO_HOME", "CARGO_NET_OFFLINE", "CARGO_PROFILE_DEV_DEBUG"}
+            inherited = {
+                name for name in os.environ
+                if name.startswith(("CARGO_", "SCCACHE_"))
+            } - declared
+            expect_true(not (inherited & set(staging)), f"staging copied {sorted(inherited & set(staging))}")
         finally:
             os.environ.clear()
             os.environ.update(holder)
+        # A child that does not finish in its bound is an unknown writer
+        # outcome, never a recoverable oracle failure: the script cannot
+        # conclude its group's closure, only the guard's census can.
+        class StubbornChild:
+            def __init__(self, reapable: bool):
+                self.reapable = reapable
+                self.killed = False
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired("oxide", timeout)
+                if not self.reapable:
+                    raise subprocess.TimeoutExpired("oxide", timeout)
+                return ("", "")
+
+            def kill(self):
+                self.killed = True
+
+        slow = StubbornChild(reapable=True)
+        try:
+            communicate_bounded(slow, "oxide build", 5)
+        except UnknownOutcome as error:
+            expect_true("closure is unknown" in str(error), str(error))
+            expect_true(slow.killed, "the timed-out child was not signalled")
+        except OracleFailure:
+            fail("a timed-out child was classified as a recoverable oracle failure")
+        else:
+            fail("a timed-out child did not abort")
+        unreapable = StubbornChild(reapable=False)
+        try:
+            communicate_bounded(unreapable, "oxide build", 5)
+        except UnknownOutcome as error:
+            expect_true("not reaped" in str(error), str(error))
+        except OracleFailure:
+            fail("an unreaped child was classified as a recoverable oracle failure")
+        else:
+            fail("an unreaped child did not abort")
+
+        class NeverExits:
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("oxide", timeout)
+
+        try:
+            wait_child(NeverExits(), "the holder", 1)
+        except UnknownOutcome:
+            pass
+        except OracleFailure:
+            fail("a child that never exits was classified as a recoverable oracle failure")
+        else:
+            fail("a child that never exits did not abort")
+        # The same classification is pinned at each waiting site, so a future
+        # edit cannot turn a timeout back into an oracle failure.
+        for function in (Proof.call, wait_for, wait_text, stage):
+            source = inspect.getsource(function)
+            expect_true("uncertain_child" in source or "communicate_bounded" in source,
+                        f"{function.__name__} has no unknown-outcome timeout path")
+        expect_true("communicate_bounded" in inspect.getsource(Proof.call),
+                    "Proof.call does not wait through communicate_bounded")
+
+        # A driver case that cannot classify its outcome aborts the
+        # collection, records the fault and leaves the rest unexecuted; it is
+        # never recorded as a recoverable failure or a pass.
+        def stub_timeout(proof, checkouts, state):
+            raise subprocess.TimeoutExpired("oxide build", 5)
+
+        def stub_unexpected(proof, checkouts, state):
+            raise KeyError("unexpected")
+
+        def stub_interrupt(proof, checkouts, state):
+            raise KeyboardInterrupt()
+
+        def stub_noop(proof, checkouts, state):
+            return None
+
+        for stub in (stub_timeout, stub_unexpected, stub_interrupt):
+            outcome = diagnostic_outcome()
+            bodies = {case: stub_noop for case, _, _ in CASES}
+            bodies["status"] = stub
+            try:
+                run_cases(True, None, {}, {}, outcome, bodies)
+            except (UnknownOutcome, KeyError, KeyboardInterrupt, subprocess.TimeoutExpired):
+                pass
+            else:
+                fail(f"{stub.__name__} did not abort the collection")
+            expect_true(outcome["aborted"] is not None, f"{stub.__name__} left no aborted fault")
+            expect_true([case for case, _ in outcome["failed"]] == [],
+                        f"{stub.__name__} was recorded as a recoverable failure: {outcome['failed']}")
+            expect_true(outcome["completed"] == ["slots"],
+                        f"{stub.__name__} completed a case it aborted: {outcome['completed']}")
+            expect_true(outcome["unexecuted"] == ["readiness", "reuse", "recovery"],
+                        f"{stub.__name__} unexecuted {outcome['unexecuted']}")
+            # The receipt keeps the abort and the unexecuted set.
+            holder = dict(os.environ)
+            os.environ["OXIDE_PROOF_EVIDENCE"] = root
+            try:
+                with open(diagnostic_receipt(outcome), encoding="utf-8") as handle:
+                    receipt = json.load(handle)
+            finally:
+                os.environ.clear()
+                os.environ.update(holder)
+            expect_true(receipt["qualified"] is False and receipt["aborted"] == outcome["aborted"],
+                        f"receipt abort {receipt.get('aborted')!r}")
+            expect_true(receipt["unexecuted"] == outcome["unexecuted"],
+                        f"receipt unexecuted {receipt.get('unexecuted')}")
+
         # The case map: every case has a body and a purpose, and every
         # dependency names an earlier case, so the diagnostic can skip only
         # dependents of what did not complete.
@@ -1146,7 +1347,8 @@ def self_check() -> int:
         expect_true(mode_from_args(refused) is None, f"{refused} selected a mode")
     print("front-door self-check ok: walk/scope root mapping, exact ordered walk oracles, "
           "summary and provenance parsing, measure line, readiness needle, "
-          "premise checklist and fixture environment (private home, rustup, flags, temp, isolation), "
+          "premise checklist and fixture/staging environments (private home, rustup, flags, temp, "
+          "isolation, drop of every inherited CARGO_/SCCACHE_ value), timeout classification, "
           "case map, keep-going/skip/abort driver, bounded unqualified receipt, dispatch")
     return 0
 
@@ -1168,17 +1370,9 @@ def mode_from_args(arguments: list) -> str | None:
     return None
 
 
-def main() -> int:
-    arguments = list(sys.argv[1:])
-    mode = mode_from_args(arguments)
-    if mode is None:
-        print(USAGE, file=sys.stderr)
-        return 2
-    if mode == "self-check":
-        return self_check()
-    if mode == "plan":
-        return plan()
-    diagnostic = mode == "diagnostic"
+def run_proof(diagnostic: bool, outcome: dict) -> int:
+    """The one counted or diagnostic run. Mutates `outcome` so the caller can
+    write one truthful receipt whatever path ends this run."""
     if sys.platform != "darwin":
         need("the front-door accounting proof requires macOS")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
@@ -1198,8 +1392,8 @@ def main() -> int:
     reserve(scratch, "admission")
     parent = os.path.realpath(tempfile.mkdtemp(prefix="front-door.", dir=scratch))
     os.chmod(parent, 0o700)
+    outcome.update(source=head, root=parent)
     say(f"source {head}, scratch {parent} inside the guard's known shared root")
-    outcome = diagnostic_outcome()
     try:
         oxide = stage(parent, staging_environment())
         reserve(parent, "after staging")
@@ -1208,15 +1402,7 @@ def main() -> int:
         for name in ("app", "big"):
             checkouts[name] = os.path.join(parent, "checkouts", name)
             write_fixture(checkouts[name], name)
-        if diagnostic:
-            outcome.update(source=head, root=parent)
-            try:
-                run_cases(True, proof, checkouts, {}, outcome)
-            finally:
-                path = diagnostic_receipt(outcome)
-                print(f"front-door diagnostic receipt {path}")
-        else:
-            run_cases(False, proof, checkouts, {}, outcome)
+        run_cases(diagnostic, proof, checkouts, {}, outcome)
     except Exception:
         print(f"front-door accounting proof retained its owned scratch at {parent}", file=sys.stderr)
         raise
@@ -1241,6 +1427,38 @@ def main() -> int:
         )
     print(line)
     return 0
+
+
+def main() -> int:
+    arguments = list(sys.argv[1:])
+    mode = mode_from_args(arguments)
+    if mode is None:
+        print(USAGE, file=sys.stderr)
+        return 2
+    if mode == "self-check":
+        return self_check()
+    if mode == "plan":
+        return plan()
+    diagnostic = mode == "diagnostic"
+    outcome = diagnostic_outcome()
+    try:
+        return run_proof(diagnostic, outcome)
+    except BaseException as failure:
+        if diagnostic:
+            record_abort(outcome, "run", failure)
+        raise
+    finally:
+        if diagnostic:
+            # ONE bounded, unqualified receipt in every outcome, including a
+            # failure before the first case ran. A receipt that cannot be
+            # written ends the diagnostic instead of reporting success.
+            try:
+                path = diagnostic_receipt(outcome)
+                print(f"front-door diagnostic receipt {path}")
+            except BaseException as error:
+                print(f"front-door diagnostic receipt not written: {error!r}", file=sys.stderr)
+                if sys.exc_info()[0] is None:
+                    raise
 
 
 if __name__ == "__main__":
