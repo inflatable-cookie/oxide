@@ -188,11 +188,50 @@ def held_fixture(name: str) -> dict:
     }
 
 
+# Every child this proof launches may be writing to the removable image, and
+# `Proof.reap`/the shared runner's `close` reap direct leaders only: neither
+# proves the Cargo group has no descendant left. So after ANY launch a failure
+# is an unknown writer outcome — the mount and its backing are retained for the
+# qualified guard's post-leader census instead of being detached here. A normal
+# successful collection still detaches ordinarily.
+WRITERS = {"launched": False}
+
+
+def note_writer_launch() -> None:
+    WRITERS["launched"] = True
+
+
+def cleanup_after_failure(proof) -> bool:
+    """Clean up a failed collection without presuming writer closure.
+
+    Returns True when the mount was retained for the guard. Nothing is
+    detached once a child was launched or one is unreaped; otherwise the
+    ordinary detach runs exactly as before.
+    """
+    if WRITERS["launched"] or proof.unclosed:
+        print(
+            "failure after a child launch: keeping the mount and backing for the "
+            "guard's post-leader census",
+            file=sys.stderr,
+        )
+        return True
+    try:
+        proof.detach()
+    except BaseException as error:
+        print(f"cleanup after failure: {error!r}", file=sys.stderr)
+    return False
+
+
 class Proof(layout.Proof):
     """The #104 runner plus one background child for the held build. The
     child stays in the supervisor's session and in `unclosed` until reaped."""
 
+    def run(self, command, *, cwd=None, env=None, timeout=120):
+        note_writer_launch()
+        return super().run(command, cwd=cwd, env=env, timeout=timeout)
+
     def start(self, args: list, cwd: str, env: dict) -> subprocess.Popen:
+        note_writer_launch()
         child = subprocess.Popen([self.binary, *args], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.unclosed.add(child.pid)
         return child
@@ -562,7 +601,7 @@ class Removal:
         need(not os.path.lexists(self.mount), f"{self.mount} already exists; never touched")
         proof.phase("start")
         with staging_environment_scrubbed():
-            candidate = layout.stage_at(proof, repo, "oxide-candidate")
+            candidate = layout.stage_at(proof, repo, "oxide-candidate", retain_stage_root=True)
         print(f"staged candidate sha256 {layout.sha256(candidate)}")
         with open(candidate, "rb") as handle:
             oracle(CANDIDATE_MARKER in handle.read(), "candidate binary lacks the #098 lost-volume text")
@@ -1043,7 +1082,7 @@ class BootClosure:
                 f"{name} is inherited; the candidate's debug capability is not frozen",
             )
         with staging_environment_scrubbed():
-            candidate = layout.stage_at(proof, repo, "oxide-boot-closure")
+            candidate = layout.stage_at(proof, repo, "oxide-boot-closure", retain_stage_root=True)
         print(f"staged candidate sha256 {layout.sha256(candidate)}")
         with open(candidate, "rb") as handle:
             need(BOOT_MARKER in handle.read(), "the candidate binary lacks the boot-session closure text")
@@ -2278,6 +2317,85 @@ def self_check() -> int:
     finally:
         os.environ.clear()
         os.environ.update(holder)
+    # The shared staging helper's narrowly scoped retention opt-in, exercised
+    # through the REAL `layout.stage_at` route with a fake staged build (no
+    # Cargo): the default removes the staged tree exactly as before, and the
+    # opt-in this proof passes keeps it for the guard's post-leader census.
+    class StageProof:
+        def __init__(self, root: str):
+            self.root = root
+
+        def run(self, command, *, cwd=None, env=None, timeout=None):
+            built = os.path.join(env["CARGO_TARGET_DIR"], "debug", "oxide")
+            os.makedirs(os.path.dirname(built), exist_ok=True)
+            with open(built, "wb") as handle:
+                handle.write(b"oxide")
+            line = json.dumps(
+                {"reason": "compiler-artifact", "target": {"name": "oxide"}, "executable": built}
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=(line + "\n").encode(), stderr=b"")
+
+    for retain, expect_tree in ((False, False), (True, True)):
+        helper_root = os.path.realpath(tempfile.mkdtemp(prefix="removal-stage-check."))
+        try:
+            copy = layout.stage_at(
+                StageProof(helper_root), "/fixture/source", "check", jobs=1,
+                retain_stage_root=retain,
+            )
+            expect(os.path.isfile(copy), f"stage_at did not copy {copy}")
+            tree = os.path.join(helper_root, "stage-check", "target", "debug", "oxide")
+            expect(
+                os.path.isfile(tree) is expect_tree,
+                f"stage_at retain_stage_root={retain} left the staged tree={os.path.isfile(tree)}",
+            )
+        finally:
+            shutil.rmtree(helper_root, ignore_errors=True)
+    # Every removal-mode staging call opts in, so both modes keep the tree.
+    source_text = open(os.path.abspath(__file__), encoding="utf-8").read()
+    staging_calls = [
+        line.strip()
+        for line in source_text.splitlines()
+        if line.strip().startswith("candidate = layout.stage_at(")
+    ]
+    expect(len(staging_calls) == 2, f"expected two removal-mode staging calls, saw {staging_calls}")
+    expect(
+        all("retain_stage_root=True" in line for line in staging_calls),
+        f"not every removal-mode staging call retains its tree: {staging_calls}",
+    )
+
+    # A failure after any writer launch keeps the mount and backing for the
+    # guard's post-leader census; only a child-free failure detaches, and a
+    # successful collection still detaches ordinarily (pinned below).
+    class CleanupProof:
+        def __init__(self, unclosed: tuple = ()):
+            self.unclosed = set(unclosed)
+            self.detached = False
+
+        def detach(self):
+            self.detached = True
+
+    WRITERS["launched"] = False
+    clean = CleanupProof()
+    expect(cleanup_after_failure(clean) is False and clean.detached,
+           "a child-free failure did not run the ordinary detach")
+    WRITERS["launched"] = True
+    dirty = CleanupProof()
+    expect(cleanup_after_failure(dirty) is True and not dirty.detached,
+           "a failure after a launch detached the mount")
+    WRITERS["launched"] = False
+    unreaped = CleanupProof(unclosed=(4242,))
+    expect(cleanup_after_failure(unreaped) is True and not unreaped.detached,
+           "a failure with an unreaped child detached the mount")
+    WRITERS["launched"] = False
+    main_source = open(os.path.abspath(__file__), encoding="utf-8").read()
+    handler = main_source[main_source.index("    except BaseException as failure:\n        retained = "):]
+    expect("cleanup_after_failure(proof)" in handler,
+           "main's failure path does not use the custody decision")
+    expect(
+        handler.index("cleanup_after_failure(proof)") < handler.index("layout.record("),
+        "main records the failure before deciding custody",
+    )
+
     # Dispatch: only the documented argument lists select a mode.
     expect(mode_from_args([]) == (False, False, False), "no-argument mode")
     expect(mode_from_args(["--diagnostic"]) == (False, True, False), "main diagnostic mode")
@@ -2344,11 +2462,8 @@ def main() -> int:
             outcome = run(proof, repo, diagnostic)
         proof.detach()
     except BaseException as failure:
-        try:
-            proof.detach()
-        except BaseException as error:
-            print(f"cleanup after failure: {error!r}", file=sys.stderr)
-        layout.record("result.txt", f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nmount: {proof.mount}\nroot: {root}\n")
+        retained = cleanup_after_failure(proof)
+        layout.record("result.txt", f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nmount: {proof.mount}\nbacking retained for the guard: {retained}\nroot: {root}\n")
         print(f"removal proof failed after {time.monotonic() - runner.STARTED:.0f} s; scratch {root} left to the runner", file=sys.stderr)
         raise
     finally:
