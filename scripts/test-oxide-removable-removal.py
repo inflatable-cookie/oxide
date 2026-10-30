@@ -9,7 +9,10 @@ staging; it adds no supervision of its own.
 
 Stages this HEAD's `oxide` offline with 1.97.1. Over a private HOME,
 CARGO_HOME and budget-only internal pool, one owned 128 MiB scratch APFS
-image at a unique `/Volumes/<name>` is registered as the removable pool.
+image at a unique `/Volumes/<name>` is attached with `hdiutil -owners on`
+(every attach and re-attach, observed read-only from `/sbin/mount` as
+carrying no `noowners` flag) and registered as the removable pool; the
+product's own registration would refuse an ignore-ownership mount.
 Surprise removal is `hdiutil detach -force` of that image's own device, bound
 by image path, device, mount and volume UUID immediately before, in three
 predeclared cases:
@@ -30,8 +33,9 @@ detach. Not a benchmark and not real-drive qualification.
 
 `--boot-closure` is the focused mode for oxide#161: a restart ends every
 process, so a quarantined lost slot whose holder started before the current
-boot session is positively closed. It stages the same candidate and uses the
-same owned image, and runs three independent cases over private checkouts:
+boot session is positively closed. It stages the same candidate, attaches
+the same owned image through the same owners-on attach and mount
+observation, and runs three independent cases over private checkouts:
 a quarantined `exec` slot whose override boot time follows its holder start
 is reported closed by `status`, an explicit `outputs adopt` of a whole-target
 fixture then migrates, and the next admission deletes the slot whole with
@@ -65,6 +69,7 @@ sys.dont_write_bytecode = True
 import glob
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import plistlib
@@ -218,19 +223,46 @@ def wait_for(path: str, label: str) -> None:
         time.sleep(0.05)
 
 
+def attach_options() -> list:
+    """Every attach and re-attach of this proof's own image requests
+    filesystem owners. The product judges the mounted root's own ownership and
+    mode and refuses an ignore-ownership mount (MNT_IGNORE_OWNERSHIP), so a
+    proof that attached without this could only ever test the refusal."""
+    return ["-owners", "on"]
+
+
+def owners_honored(proof, mount: str, label: str) -> None:
+    """Bounded read-only observation that the private image's mounted root
+    does not carry the ignore-ownership flag."""
+    result = proof.run(["/sbin/mount"], timeout=30)
+    expect(result.returncode == 0, f"{label}: mount listing failed: {result.stderr!r}")
+    line = next(
+        (
+            entry
+            for entry in result.stdout.decode(errors="replace").splitlines()
+            if f" on {mount} " in entry
+        ),
+        None,
+    )
+    expect(line is not None, f"{label}: {mount} is not in the mount listing")
+    expect(
+        "noowners" not in line,
+        f"{label}: {mount} was mounted with owners ignored (MNT_IGNORE_OWNERSHIP): {line}",
+    )
+    print(f"{label}: {mount} mounted with owners honored: {line.strip()}")
+
+
 class Volume:
     """The one owned scratch image: path, root device, mount and UUID."""
 
-    def __init__(self, proof: Proof, image: str, mount: str, owners: bool = False):
+    def __init__(self, proof: Proof, image: str, mount: str):
         self.proof, self.image, self.mount = proof, image, mount
-        self.owners = owners
         self.device = None
         self.uuid = None
 
     def attach(self) -> None:
         expect(not os.path.lexists(self.mount), f"{self.mount} exists before attach")
-        options = ["-owners", "on"] if self.owners else []
-        attached = self.proof.run(["/usr/bin/hdiutil", "attach", *options, "-nobrowse", "-noverify", "-plist", self.image], timeout=60)
+        attached = self.proof.run(["/usr/bin/hdiutil", "attach", *attach_options(), "-nobrowse", "-noverify", "-plist", self.image], timeout=60)
         expect(attached.returncode == 0, f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}")
         entities = plistlib.loads(attached.stdout)["system-entities"]
         mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
@@ -245,6 +277,7 @@ class Volume:
         info = plistlib.loads(self.proof.run(["/usr/sbin/diskutil", "info", "-plist", self.mount], timeout=30).stdout)
         expect(self.uuid is None or info["VolumeUUID"] == self.uuid, "re-attached volume UUID changed")
         self.uuid = info["VolumeUUID"]
+        owners_honored(self.proof, self.mount, "attach")
         print(f"attached {self.image} as {self.device} at {self.mount}, volume {self.uuid}")
 
     def bound(self) -> None:
@@ -652,7 +685,7 @@ class BootClosure:
         # `-owners on` on every attach: the product judges the mounted root's
         # own ownership and mode, and a mount that ignores ownership would
         # make that judgement meaningless.
-        self.volume = Volume(proof, image, self.mount, owners=True)
+        self.volume = Volume(proof, image, self.mount)
         self.volume.attach()
         code, stdout, stderr = proof.oxide(
             ["pool", "register-removable", self.mount, "--reserve", "16MiB", "--cap", "64MiB", "--mode", "permanent"],
@@ -970,8 +1003,8 @@ def self_check() -> int:
     and the full fixture environment every child (`status` included) receives
     — plus the deletion oracle's slot-leaf resolution (the slot's own leaf,
     never the project-label folder a build or an adopt also creates or
-    reuses), the dispatch, the product-message marker and the receipt
-    bound."""
+    reuses), the owners-on attach and mount observation every mode shares,
+    the dispatch, the product-message marker and the receipt bound."""
     fixture = {
         "OXIDE_POOL": "/fixture/pool",
         "HOME": "/fixture/home",
@@ -1134,6 +1167,41 @@ def self_check() -> int:
             os.environ.update(holder)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+    # Every attach requests filesystem owners, and the mount observation
+    # refuses an ignore-ownership mount. The real `/sbin/mount` listing is
+    # reproduced here so the observation cannot silently pass on any mount,
+    # and `Volume.attach` is pinned to that one option list, so the main mode
+    # and the focused boot-closure mode cannot diverge again.
+    expect(attach_options() == ["-owners", "on"], f"attach options {attach_options()}")
+    expect(
+        "*attach_options()" in inspect.getsource(Volume.attach),
+        "Volume.attach does not use the shared owners option list",
+    )
+
+    class MountListing:
+        def __init__(self, line: str):
+            self.line = line
+
+        def run(self, argv, cwd=None, env=None, timeout=None):
+            return subprocess.CompletedProcess(argv, 0, stdout=(self.line + "\n").encode(), stderr=b"")
+
+    honored = MountListing(
+        "/dev/disk4s1 on /Volumes/OxSelf (apfs, local, nodev, nosuid, journaled, noatime)"
+    )
+    owners_honored(honored, "/Volumes/OxSelf", "self-check")
+    for refused, why in (
+        (
+            "/dev/disk4s1 on /Volumes/OxSelf (apfs, local, nodev, nosuid, journaled, noatime, noowners)",
+            "an ignore-ownership mount",
+        ),
+        ("/dev/disk4s1 on /Volumes/Other (apfs, local, journaled)", "a mount listing without this image"),
+    ):
+        try:
+            owners_honored(MountListing(refused), "/Volumes/OxSelf", "self-check")
+        except RuntimeError as error:
+            print(f"owners observation refused {why}: {error}")
+        else:
+            expect(False, f"the owners observation accepted {why}")
     # Dispatch: only the documented argument lists select a mode.
     expect(mode_from_args([]) == (False, False), "no-argument mode")
     expect(mode_from_args(["--boot-closure"]) == (True, False), "focused mode")
@@ -1161,7 +1229,7 @@ def self_check() -> int:
     print(
         "boot-closure self-check ok: status/build child environments, deletion "
         "oracle slot leaf, diagnostic receipt (json, bounded, unqualified), "
-        "dispatch, marker"
+        "owners-on attach and mount observation, dispatch, marker"
     )
     return 0
 

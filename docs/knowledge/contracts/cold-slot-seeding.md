@@ -2303,6 +2303,13 @@ Elevated merge hold are unchanged.
   is traced through the case bodies and helpers in the script, not in plan
   text.
 
+**Run history.** A counted author native of `effigy rust:cold-slot-seeding`
+passed **24/24 cases at `cb7cd97`** (#169), after the case-21 canonical-source
+correction and the 600 s bound; that run's guard receipt holds its time,
+scratch and reserve figures. The earlier 480 s uncounted diagnostic at
+`86208d1` stays historical with no credit. A further native at a changed head
+still needs its own owner activation.
+
 ### 16.4 Fixed-script time and disk allocation (source-derived, UNMEASURED)
 
 The script runs three explicit phases and reports the monitored peak of each;
@@ -2361,8 +2368,9 @@ about 135 s), leaving 29 s at the top of the range. That is the arithmetic of a
 plausible accounting, **not** a demonstrated fit: the script prints the phase
 and case tables, and if the first required uncounted **diagnostic** run's
 projection or measurement exceeds 275 s it **stops and reports**. The
-diagnostic remains mandatory and fit remains UNMEASURED; no counted native is
-implied. If the
+diagnostic remains mandatory before a further counted native at a changed
+head; these allocation figures were never measured at the head that wrote
+them (the counted pass at `cb7cd97` is recorded in 16.3). If the
 required SQLite and offered-run cases cannot fit even so, the conflict returns
 to the Supervisor for a scoped bound amendment before freeze; this design does
 not substitute a cheaper fixture and does not treat the separate real-project

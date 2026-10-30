@@ -2,28 +2,46 @@
 
 Stages this clean HEAD's `oxide` offline with plain Cargo and 1.97.1 as a
 debug build, whose walk observer appends the root of every inventory walk to
-`OXIDE_TEST_WALK_LOG` (release builds have no observer). Each command gets
-its own log. A private HOME, CARGO_HOME and OXIDE_POOL keep the installed
-binary and every live pool out of it. One idle slot holds more than 200,000
-entries. Cases, in order:
+`OXIDE_TEST_WALK_LOG` and every shallow scope pass to
+`OXIDE_TEST_SCOPE_LOG` (release builds have no observer). Each command gets
+its own logs. A private HOME, CARGO_HOME and OXIDE_POOL keep the installed
+binary and every live pool out of it. One idle slot later holds more than
+200,000 entries. Cases, in order:
 
-- new slot: one whole-payload admission walk, summary "new slot";
-- ordinary reuse: exactly one walk, of the target slot, and the summary's
-  provenance label "slot N was X MiB when leased";
-- default `oxide status` walks nothing (recorded facts only);
-- `oxide status --measure` and `oxide new` readiness keep their full walks;
-- a live holder: `pool recover-interrupted` refuses with no walk; its oxide
-  killed while Cargo's group runs: the refusal names automatic recovery, a
-  build in the same checkout waits with no walk, then recovers once the
-  group is empty, evicts the untrusted slot and builds cold, walking only
-  the reuse target and the new-slot admission;
-- new-slot admission with eviction: four whole-payload walks, the idle slot
-  ahead in the ledger evicted whole, a slot whose 8 MiB file has four
-  hard-link names kept because it counts once, the new slot admitted.
+- new slot (twice): the admission makes no inventory walk at all — recorded
+  per-slot accounting (oxide#146) replaced the pre-#146 whole-payload
+  admission walk — and exactly one shallow payload scope pass; the release
+  then walks only the slot it closed, so the command's walk log is
+  `["slots/<new>"]`;
+- default `oxide status` walks nothing and makes no scope pass (recorded
+  facts only);
+- `oxide status --measure` walks the payload first and then every slot, with
+  complete accounting on this small pool;
+- `oxide new` readiness walks nothing and makes no scope pass: since
+  oxide#182 it reads no pool state at all ("use not measured");
+- ordinary reuse walks exactly its target slot at admission and again at
+  release, and prints the provenance label "slot N was X MiB when leased";
+- a live holder's `pool recover-interrupted` refuses with no walk, and so
+  does the same after its oxide is killed: the refusal names automatic
+  recovery, a build in the same checkout waits with no walk, then recovers
+  once the Cargo group is empty, walks the slot it is about to reuse, has
+  the freshness gate refuse it, evicts the untrusted slot through the
+  oxide#190 holding deletion, and builds a new slot cold, whose release walk
+  is the last walk of the command;
+- a final default `status` after recovery still walks nothing.
+
+Retired rather than duplicated: the byte-pressure eviction case and its
+hard-link control now live in `rust:recorded-slot-accounting` (case D drives
+byte pressure and evicts one owned idle whole slot; case E proves a cross-slot
+hard link is counted once) and the holding deletion under it in
+`rust:holding-delete`. This script keeps the routing facts those proofs do
+not cover: readiness, held and killed-holder refusals, the waiting build and
+the recovered cold build.
 
 The walk counts show routing only, not a resource gate. Bounds: 20 GiB host
 reserve and owned scratch (512 MiB) sampled at phase boundaries only, 300 s
-including cleanup under `scripts/bounded-test.py`. Not a benchmark and not
+including cleanup under `scripts/bounded-test.py`. `--self-check` is the pure
+apparatus check: no child, pool, image or scratch. Not a benchmark and not
 full QA. Scratch is removed only after positive completion.
 """
 from __future__ import annotations
@@ -36,6 +54,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 BUILDER = "1.97.1"
@@ -47,6 +66,9 @@ BIG_ENTRIES = 200_000
 STARTED = time.monotonic()
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PEAK = {"bytes": 0, "phase": "none"}
+# The product's own readiness line since oxide#182: it reads no pool state.
+READINESS_NEEDLE = "use not measured (readiness reads no pool state)"
+USAGE = "usage: test-front-door-accounting.py [--self-check]"
 
 HOLD_TEST = """use std::path::PathBuf;
 use std::time::Duration;
@@ -181,6 +203,31 @@ def entries(root: str) -> int:
     return sum(len(dirs) + len(files) for _, dirs, files in os.walk(root, followlinks=False))
 
 
+def relative_walk(payload: str, root: str) -> str:
+    """One recorded walk root, relative to the payload where it is inside it."""
+    root = os.path.realpath(root)
+    if root == payload:
+        return "payload"
+    if root.startswith(payload + "/"):
+        relative = root[len(payload) + 1:]
+        # A labelled slot root reads as its legacy `slots/<id>`.
+        labelled = re.fullmatch(r"slots/[^/]+/[a-z0-9_.-]+-(\d+)", relative)
+        return f"slots/{labelled.group(1)}" if labelled else relative
+    return root
+
+
+def read_roots(log: str, payload: str) -> list:
+    if not os.path.exists(log):
+        return []
+    with open(log, "rb") as handle:
+        return [relative_walk(payload, line.decode()) for line in handle.read().splitlines()]
+
+
+def expect_roots(label: str, kind: str, roots: list, expected: list) -> None:
+    if roots != expected:
+        fail(f"{label}: {kind} {roots}, expected {expected}")
+
+
 class Proof:
     def __init__(self, parent: str, oxide: str, env: dict):
         self.parent = parent
@@ -207,28 +254,17 @@ class Proof:
 
     def walks(self, log: str) -> list:
         """Walk roots in order, relative to the payload where inside it."""
-        if not os.path.exists(log):
-            return []
-        payload = self.payload()
-        roots = []
-        with open(log, "rb") as handle:
-            for line in handle.read().decode().splitlines():
-                root = os.path.realpath(line)
-                if root == payload:
-                    roots.append("payload")
-                elif root.startswith(payload + "/"):
-                    relative = root[len(payload) + 1:]
-                    # A labelled slot root reads as its legacy `slots/<id>`.
-                    labelled = re.fullmatch(r"slots/[^/]+/[a-z0-9_.-]+-(\d+)", relative)
-                    roots.append(f"slots/{labelled.group(1)}" if labelled else relative)
-                else:
-                    roots.append(root)
-        return roots
+        return read_roots(log, self.payload())
+
+    def scopes(self, log: str) -> list:
+        """Shallow scope passes in order, on the separate scope log."""
+        return read_roots(log + ".scope", self.payload())
 
     def start(self, cwd: str, args: list, extra: dict | None = None, stderr=subprocess.PIPE):
         log = self.log_path()
         process = subprocess.Popen([self.oxide, *args], cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
-                                   text=True, env={**self.env, "OXIDE_TEST_WALK_LOG": log, **(extra or {})})
+                                   text=True, env={**self.env, "OXIDE_TEST_WALK_LOG": log,
+                                                   "OXIDE_TEST_SCOPE_LOG": log + ".scope", **(extra or {})})
         return process, log
 
     def call(self, cwd: str, args: list, extra: dict | None = None) -> tuple:
@@ -242,7 +278,8 @@ class Proof:
             fail(f"oxide {args} did not finish")
         if "walk log" in stderr and "not written" in stderr:
             fail(f"oxide {args} could not write its walk log: {stderr[-800:]}")
-        return process.returncode, stdout, stderr, self.walks(log), time.monotonic() - started
+        return (process.returncode, stdout, stderr, self.walks(log), self.scopes(log),
+                time.monotonic() - started)
 
     def ledger(self) -> dict:
         with open(os.path.join(self.pool, "ledger.json")) as handle:
@@ -259,28 +296,31 @@ def summary(stderr: str, label: str) -> tuple:
     return match.group(1), match.group(2), match.group(3)
 
 
-def build(proof: Proof, cwd: str, label: str, expected_walks: list, extra: dict | None = None) -> tuple:
-    code, _, stderr, walks, elapsed = proof.call(cwd, ["build"], extra)
+def build(proof: Proof, cwd: str, label: str, expected_walks: list,
+          expected_scopes: list | None = None, extra: dict | None = None) -> tuple:
+    code, _, stderr, walks, scopes, elapsed = proof.call(cwd, ["build"], extra)
     if code:
         fail(f"{label}: exit {code}: {stderr[-2000:]}")
     slot, warmth, tail = summary(stderr, label)
     expected = [walk.format(slot=slot) for walk in expected_walks]
-    say(f"{label}: slot {slot} {warmth} in {elapsed:.1f} s, walks {walks}, summary tail: {tail}")
-    if walks != expected:
-        fail(f"{label}: walks {walks}, expected {expected}")
+    say(f"{label}: slot {slot} {warmth} in {elapsed:.1f} s, walks {walks}, scopes {scopes}, "
+        f"summary tail: {tail}")
+    expect_roots(label, "walks", walks, expected)
+    if expected_scopes is not None:
+        expect_roots(label, "scopes", scopes, [scope.format(slot=slot) for scope in expected_scopes])
     if "pool total: see oxide status" not in tail or "allocated of" in tail:
         fail(f"{label}: summary does not point to oxide status: {tail}")
     return slot, warmth, tail, stderr
 
 
 def recorded_status(proof: Proof, cwd: str, label: str) -> str:
-    """Default status reads recorded facts only: no walk, no reconcile."""
-    code, stdout, stderr, walks, elapsed = proof.call(cwd, ["status"])
+    """Default status reads recorded facts only: no walk, no scope, no reconcile."""
+    code, stdout, stderr, walks, scopes, elapsed = proof.call(cwd, ["status"])
     if code:
         fail(f"{label} recorded status exit {code}: {stderr[-1200:]}")
-    say(f"{label} recorded status in {elapsed:.1f} s: walks {walks}")
-    if walks:
-        fail(f"{label}: default status walked {walks}")
+    say(f"{label} recorded status in {elapsed:.1f} s: walks {walks}, scopes {scopes}")
+    if walks or scopes:
+        fail(f"{label}: default status walked {walks} or scoped {scopes}")
     if "slot sizes: recorded observations only" not in stdout:
         fail(f"{label}: default status did not report recorded sizes:\n{stdout}")
     if "slot accounting walk: " in stdout:
@@ -289,25 +329,32 @@ def recorded_status(proof: Proof, cwd: str, label: str) -> str:
 
 
 def status(proof: Proof, cwd: str, label: str, slots: list) -> str:
-    code, stdout, stderr, walks, elapsed = proof.call(cwd, ["status", "--measure"])
+    """`--measure` is the audit: the payload first, then every slot."""
+    code, stdout, stderr, walks, scopes, elapsed = proof.call(cwd, ["status", "--measure"])
     if code:
         fail(f"{label} status --measure exit {code}: {stderr[-1200:]}")
     line = next((line for line in stdout.splitlines() if line.startswith("  slot accounting walk: ")), "")
     counted = re.search(r"complete, (\d+) entries", line)
-    say(f"{label} status --measure in {elapsed:.1f} s: {line.strip()}; walks {walks}")
+    say(f"{label} status --measure in {elapsed:.1f} s: {line.strip()}; walks {walks}, scopes {scopes}")
     if not counted or "accounting walk: partial" in stdout or "accounting walk: unknown" in stdout:
         fail(f"{label}: status --measure accounting is not complete:\n{stdout}")
-    missing = [root for root in ["payload", *[f"slots/{slot}" for slot in slots]] if root not in walks]
-    if walks[:1] != ["payload"] or missing:
-        fail(f"{label}: status --measure did not walk the payload first and every slot: {walks}")
+    expect_roots(label, "walks", walks, ["payload", *[f"slots/{slot}" for slot in slots]])
     return stdout
 
 
-def prove_reuse(proof: Proof, app: str, big: str) -> tuple:
-    app_slot, warmth, tail, _ = build(proof, app, "new slot", ["payload"])
+def prove_slots(proof: Proof, app: str, big: str) -> tuple:
+    """Two new slots: no admission walk, one payload scope pass, a release walk."""
+    app_slot, warmth, tail, _ = build(proof, app, "new slot", ["slots/{slot}"], ["payload"])
     if warmth != "cold" or not tail.startswith("new slot, "):
         fail(f"new slot summary: {warmth} {tail}")
-    big_slot, _, _, _ = build(proof, big, "second new slot", ["payload"])
+    big_slot, warmth, tail, _ = build(proof, big, "second new slot", ["slots/{slot}"], ["payload"])
+    if warmth != "cold" or not tail.startswith("new slot, "):
+        fail(f"second new slot summary: {warmth} {tail}")
+    return app_slot, big_slot
+
+
+def prove_reuse(proof: Proof, app: str, app_slot: str, big_slot: str) -> None:
+    """Fill the idle slot, then prove ordinary reuse: its slot, twice."""
     started = time.monotonic()
     fill(os.path.join(proof.slot_dir(big_slot), "build"), BIG_ENTRIES)
     with open(os.path.join(proof.slot_dir(big_slot), "build", "big.bin"), "wb") as handle:
@@ -317,27 +364,35 @@ def prove_reuse(proof: Proof, app: str, big: str) -> tuple:
         f"written in {time.monotonic() - started:.1f} s")
     if count < BIG_ENTRIES:
         fail(f"payload has only {count} entries")
-    generation = proof.slots()[app_slot]
-    slot, warmth, tail, _ = build(proof, app, "ordinary reuse", ["slots/{slot}"])
+    generation = proof.slots()[big_slot]
+    before = proof.slots()[app_slot]
+    slot, warmth, tail, _ = build(proof, app, "ordinary reuse",
+                                  ["slots/{slot}", "slots/{slot}"])
     label = re.match(rf"slot {app_slot} was (\d+) MiB when leased, \d+ MiB budget, pool total: see oxide status", tail)
     if slot != app_slot or warmth != "warm" or not label:
         fail(f"reuse did not take slot {app_slot} warm with its provenance label: {slot} {warmth} {tail}")
     after = proof.slots()[app_slot]
-    if (after["id"], after["incarnation"]) != (generation["id"], generation["incarnation"]):
-        fail(f"reuse changed the slot generation: {generation} -> {after}")
-    recorded_status(proof, app, "after reuse")
-    status(proof, app, "after reuse", [app_slot, big_slot])
-    return app_slot, big_slot
+    if (after["id"], after["incarnation"]) != (before["id"], before["incarnation"]):
+        fail(f"reuse changed the slot generation: {before} -> {after}")
+    if proof.slots()[big_slot] != generation:
+        fail("the idle slot beside the reuse changed")
 
 
 def prove_readiness(proof: Proof) -> None:
-    code, stdout, stderr, walks, elapsed = proof.call(proof.parent, ["new", "readiness"])
-    line = next((line for line in stdout.splitlines() if line.startswith("  pool: ")), "")
-    say(f"readiness in {elapsed:.1f} s: {line.strip()}; walks {walks}")
-    if code or not re.search(r"cap \d+ MiB, \d+ of \d+ MiB used$", line):
-        fail(f"readiness: exit {code}, no full pool use line:\n{stdout}\n{stderr[-1200:]}")
-    if "payload" not in walks:
-        fail(f"readiness made no whole-payload walk: {walks}")
+    """Readiness (oxide#182) reads no pool state: no walk, no scope pass."""
+    code, stdout, stderr, walks, scopes, elapsed = proof.call(proof.parent, ["new", "readiness"])
+    lines = stdout.splitlines()
+    selected = next((line for line in lines if line.startswith("  selected pool: ")), "")
+    configured = next((line for line in lines if line.startswith("  configured internal pool: ")), "")
+    say(f"readiness in {elapsed:.1f} s: {configured.strip()}; walks {walks}, scopes {scopes}")
+    if code:
+        fail(f"readiness exit {code}:\n{stdout}\n{stderr[-1200:]}")
+    if not selected:
+        fail(f"readiness printed no selected pool line:\n{stdout[-1500:]}")
+    if READINESS_NEEDLE not in configured:
+        fail(f"readiness did not report reading no pool state:\n{stdout[-1500:]}")
+    if walks or scopes:
+        fail(f"readiness walked inventory {walks} or scoped {scopes}")
 
 
 def wait_for(path: str, process, label: str, seconds: float = 90) -> None:
@@ -370,15 +425,15 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
         record = proof.slots()[app_slot]
         if record["state"] != "held":
             fail(f"slot {app_slot} is not held: {record}")
-        code, _, stderr, walks, _ = proof.call(proof.parent, ["pool", "recover-interrupted", app_slot])
-        say(f"live holder: recover-interrupted exit {code}, walks {walks}: {stderr.strip()[-200:]}")
-        if code == 0 or "a live oxide command holds slot" not in stderr or walks:
+        code, _, stderr, walks, scopes, _ = proof.call(proof.parent, ["pool", "recover-interrupted", app_slot])
+        say(f"live holder: recover-interrupted exit {code}, walks {walks}, scopes {scopes}: {stderr.strip()[-200:]}")
+        if code == 0 or "a live oxide command holds slot" not in stderr or walks or scopes:
             fail("recover-interrupted did not refuse a live holder without walking")
         holder.send_signal(signal.SIGKILL)
         holder.wait(timeout=30)
-        code, _, stderr, walks, _ = proof.call(proof.parent, ["pool", "recover-interrupted", app_slot])
-        say(f"killed holder: recover-interrupted exit {code}, walks {walks}: {stderr.strip()[-200:]}")
-        if code == 0 or "recovered automatically by the next command" not in stderr or walks:
+        code, _, stderr, walks, scopes, _ = proof.call(proof.parent, ["pool", "recover-interrupted", app_slot])
+        say(f"killed holder: recover-interrupted exit {code}, walks {walks}, scopes {scopes}: {stderr.strip()[-200:]}")
+        if code == 0 or "recovered automatically by the next command" not in stderr or walks or scopes:
             fail("recover-interrupted did not defer to automatic recovery without walking")
         if proof.slots()[app_slot] != record:
             fail("a refused recovery changed the ledger")
@@ -388,9 +443,10 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
         wait_text(waiter_path, "waiting for another oxide command in this checkout", waiter, "waiter")
         time.sleep(1.0)
         waited = proof.walks(waiter_log)
-        say(f"waiting build: walks while waiting {waited}")
-        if waited:
-            fail(f"a waiting build walked: {waited}")
+        waited_scopes = proof.scopes(waiter_log)
+        say(f"waiting build: walks while waiting {waited}, scopes {waited_scopes}")
+        if waited or waited_scopes:
+            fail(f"a waiting build walked {waited} or scoped {waited_scopes}")
         with open(release, "w"):
             pass
         code = waiter.wait(timeout=min(120, remaining()))
@@ -404,8 +460,12 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
             fail(f"the build did not recover slot {app_slot}: {stderr[-2000:]}")
         if f"cannot vouch for slot {app_slot}" not in stderr or warmth != "cold" or not tail.startswith("new slot, "):
             fail(f"the untrusted recovered slot was not evicted for a cold build: {stderr[-2000:]}")
-        if walks != [f"slots/{app_slot}", "payload"] or app_slot in proof.slots():
-            fail(f"recovered build walks {walks}, ledger {sorted(proof.slots())}")
+        # The command re-leases the recovered slot (its own reuse walk), the
+        # freshness gate refuses it, and the new slot's release is the last
+        # walk. Nothing walks the payload or the idle slot beside it.
+        expect_roots("recovered build", "walks", walks, [f"slots/{app_slot}", f"slots/{slot}"])
+        if app_slot in proof.slots() or slot in ("", app_slot):
+            fail(f"recovered build ledger {sorted(proof.slots())}, slot {slot}")
         if proof.walks(holder_log) != [f"slots/{app_slot}"]:
             fail(f"the holder's lease walked {proof.walks(holder_log)}")
         return slot
@@ -419,40 +479,103 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
                 process.wait()
 
 
-def allocated(root: str) -> int:
-    return tree_bytes(root)
+def self_check() -> int:
+    """Pure apparatus check: no child, pool, image, scratch or supervisor."""
+    root = tempfile.mkdtemp(prefix="front-door-self-check.")
+    try:
+        proof = Proof.__new__(Proof)
+        proof.parent = root
+        proof.pool = os.path.join(root, "pool")
+        proof.dirs = {}
+        payload = os.path.join(root, "pool", "payload")
+        log = os.path.join(root, "walk.log")
+        scope = log + ".scope"
+        slot = os.path.join(payload, "slots", "app-1a2b", "quick-3")
+        with open(log, "w") as handle:
+            for line in (payload, payload + "/slots/1", slot, os.path.join(root, "outside")):
+                handle.write(line + "\n")
+        with open(scope, "w") as handle:
+            handle.write(payload + "\n")
+        # Walk/scope roots map to their documented names; the labelled slot
+        # root reads as its legacy `slots/<id>` and an outside root stays
+        # absolute.
+        expect_roots("self-check", "walks", proof.walks(log),
+                     ["payload", "slots/1", "slots/3", os.path.realpath(os.path.join(root, "outside"))])
+        expect_roots("self-check", "scopes", proof.scopes(log), ["payload"])
+        expect_roots("self-check", "absent logs", proof.walks(os.path.join(root, "missing")), [])
+        # The oracle compares exact ordered lists. A passing list must pass,
+        # and each wrong shape - the pre-#146 whole-payload admission walk, a
+        # missing release walk, a reordered list, a dropped duplicate - must
+        # fail rather than being accepted as close enough.
+        expect_roots("self-check", "walks", ["slots/1"], ["slots/1"])
+        expect_roots("self-check", "walks", [], [])
+        for bad, expected, why in (
+            (["payload"], ["slots/1"], "a whole-payload admission walk"),
+            (["slots/1"], ["payload", "slots/1"], "a missing release walk"),
+            (["slots/1", "slots/1"], ["slots/2", "slots/1"], "a reordered walk list"),
+            (["slots/1"], ["slots/1", "slots/1"], "a dropped duplicate walk"),
+        ):
+            try:
+                expect_roots("self-check", "walks", bad, expected)
+            except RuntimeError:
+                print(f"walk oracle refused {why}")
+            else:
+                fail(f"the oracle accepted {why}")
+        # The two product lines the oracles read, as the product prints them.
+        slot_id, warmth, tail = summary(
+            "oxide: quick profile, build strategy, slot 3 warm, 1.2s, slot 3 was 8 MiB when leased, "
+            "64 MiB budget, pool total: see oxide status (directory-budget-v1, budget-only), "
+            "temp: inherited /fixture/tmp\n",
+            "self-check",
+        )
+        expect_true((slot_id, warmth) == ("3", "warm"), f"{slot_id} {warmth}")
+        label = re.match(rf"slot 3 was (\d+) MiB when leased, \d+ MiB budget, pool total: see oxide status", tail)
+        expect_true(label is not None, f"the reuse provenance label was not parsed: {tail}")
+        expect_true(
+            re.search(r"complete, (\d+) entries", "  slot accounting walk: complete, 42 entries, 3 ms") is not None,
+            "the measure line was not parsed",
+        )
+        expect_true(
+            READINESS_NEEDLE
+            in "  configured internal pool: /fixture/pool, use not measured (readiness reads no pool state)",
+            "the readiness needle is not the product's line",
+        )
+        # The product's own readiness sentence is a source string, not a guess.
+        with open(os.path.join(REPO, "src", "bin", "oxide", "adopt.rs"), encoding="utf-8") as handle:
+            expect_true(READINESS_NEEDLE in handle.read(), "adopt.rs lost the readiness sentence")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    # Only no arguments or `--self-check` select a mode.
+    expect_true(mode_from_args([]) == "run", "no-argument mode")
+    expect_true(mode_from_args(["--self-check"]) == "self-check", "self-check mode")
+    for refused in (["--bogus"], ["--self-check", "--self-check"], ["run"]):
+        expect_true(mode_from_args(refused) is None, f"{refused} selected a mode")
+    print("front-door self-check ok: walk/scope root mapping, exact ordered walk oracles, "
+          "summary and provenance parsing, measure line, readiness needle, dispatch")
+    return 0
 
 
-def prove_eviction(proof: Proof, fresh: str, big_slot: str, kept_slot: str) -> None:
-    linked = os.path.join(proof.slot_dir(kept_slot), "build", "linked.bin")
-    with open(linked, "wb") as handle:
-        handle.write(b"\x02" * (8 * MIB))
-    for index in range(3):
-        os.link(linked, f"{linked}.{index}")
-    payload = allocated(os.path.join(proof.pool, "payload"))
-    big = allocated(proof.slot_dir(big_slot))
-    kept = allocated(proof.slot_dir(kept_slot))
-    budget = kept + 4 * MIB
-    say(f"eviction: payload {payload} B, idle slot {big_slot} {big} B, slot {kept_slot} {kept} B "
-        f"once per inode ({kept + 24 * MIB} B per name), soft budget {budget} B")
-    if not (payload >= budget and kept < budget <= kept + 24 * MIB):
-        fail("the budget does not separate eviction of one slot from once-per-inode accounting")
-    order = [record for record in proof.ledger()["slots"]]
-    if [str(record["id"]) for record in order][:2] != [big_slot, kept_slot]:
-        fail(f"ledger order is not idle slot {big_slot} then {kept_slot}: {order}")
-    slot, warmth, tail, _ = build(proof, fresh, "eviction admission", ["payload"] * 4,
-                                  {"OXIDE_TEST_BUDGET_BYTES": str(budget)})
-    left = proof.slots()
-    if os.path.lexists(proof.slot_dir(big_slot)) or big_slot in left:
-        fail(f"idle slot {big_slot} was not evicted whole")
-    if kept_slot not in left or not os.path.exists(f"{linked}.2"):
-        fail(f"slot {kept_slot} with hard links was evicted")
-    if warmth != "cold" or not tail.startswith("new slot, ") or slot not in left:
-        fail(f"no new slot was admitted: {slot} {warmth} {tail}")
-    say(f"eviction: idle slot {big_slot} evicted whole, slot {kept_slot} kept, new slot {slot} admitted")
+def expect_true(condition: bool, message: str = "expectation") -> None:
+    if not condition:
+        fail(message)
+
+
+def mode_from_args(arguments: list) -> str | None:
+    if not arguments:
+        return "run"
+    if arguments == ["--self-check"]:
+        return "self-check"
+    return None
 
 
 def main() -> int:
+    arguments = list(sys.argv[1:])
+    mode = mode_from_args(arguments)
+    if mode is None:
+        print(USAGE, file=sys.stderr)
+        return 2
+    if mode == "self-check":
+        return self_check()
     if sys.platform != "darwin":
         fail("the front-door accounting proof requires macOS")
     if subprocess.run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True,
@@ -489,20 +612,25 @@ def main() -> int:
                     "TMPDIR": os.path.join(parent, "tmp")})
         proof = Proof(parent, oxide, env)
         checkouts = {}
-        for name in ("app", "big", "fresh"):
+        for name in ("app", "big"):
             checkouts[name] = os.path.join(parent, "checkouts", name)
             write_fixture(checkouts[name], name)
-        app_slot, big_slot = prove_reuse(proof, checkouts["app"], checkouts["big"])
+        app_slot, big_slot = prove_slots(proof, checkouts["app"], checkouts["big"])
+        recorded_status(proof, checkouts["app"], "after two new slots")
+        status(proof, checkouts["app"], "after two new slots", [app_slot, big_slot])
+        prove_readiness(proof)
+        owned(parent, "after readiness")
+        reserve(parent, "after readiness")
+        prove_reuse(proof, checkouts["app"], app_slot, big_slot)
         owned(parent, "after reuse")
         reserve(parent, "after reuse")
-        prove_readiness(proof)
         kept_slot = prove_recovery(proof, checkouts["app"], app_slot)
+        if kept_slot not in proof.slots() or kept_slot == big_slot:
+            fail(f"the recovered cold slot {kept_slot} is not a new slot in {sorted(proof.slots())}")
         owned(parent, "after recovery")
         reserve(parent, "after recovery")
-        prove_eviction(proof, checkouts["fresh"], big_slot, kept_slot)
-        owned(parent, "after eviction")
-        status(proof, checkouts["fresh"], "final", sorted(proof.slots()))
-        reserve(parent, "after eviction")
+        recorded_status(proof, checkouts["app"], "after recovery")
+        reserve(parent, "after recovery status")
     except Exception:
         print(f"front-door accounting proof retained its owned scratch at {parent}", file=sys.stderr)
         raise

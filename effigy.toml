@@ -686,7 +686,10 @@ run = "python3 scripts/test-oxide-removable-pool.py"
 # Removable build volume, part 2 (oxide#098), under the qualified shared
 # supervisor (author runs used #109's; now #114's): 300 s absolute, 512 MiB monitored scratch (the scratch image's
 # backing file carries the mounted payload). Stages oxide offline with 1.97.1;
-# one owned 128 MiB scratch APFS image at a unique /Volumes/<name>, removed by
+# one owned 128 MiB scratch APFS image at a unique /Volumes/<name>, attached
+# with `hdiutil -owners on` on every attach and re-attach (observed read-only
+# from `/sbin/mount` as carrying no `noowners` flag, because the product
+# refuses an ignore-ownership mount root), removed by
 # `hdiutil detach -force` of its own positively bound device in three cases:
 # idle slot kept warm, held build fails cleanly and its lost slot is deleted
 # whole after re-attach, wrapper-allowed build quarantined. No internal spill,
@@ -794,16 +797,29 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-oxide-exec.py"
 
 # Front-door accounting routes (oxide#110): stages this clean HEAD's debug
 # `oxide` offline with 1.97.1; its walk observer logs every inventory walk
-# root. On one private directory pool with an idle slot of more than 200,000
-# entries, ordinary reuse walks only its target slot, status and readiness
-# keep full walks, waits and recovery walk nothing, and new-slot admission
-# keeps its whole-payload walks around eviction (hard links counted once).
-# 300 s and 512 MiB owned scratch including cleanup, under the old session
-# supervisor of `test rust`; reserve and scratch sampled at phase
-# boundaries only. Not a benchmark and not full QA.
+# root and every shallow scope pass. On one private directory pool with an
+# idle slot of more than 200,000 entries: a new-slot admission makes no
+# inventory walk (recorded accounting, oxide#146) and one payload scope pass,
+# the release walks only the closed slot, ordinary reuse walks exactly its
+# target slot, default status walks nothing, `status --measure` walks the
+# payload and every slot, readiness walks nothing (oxide#182), held and
+# killed-holder `recover-interrupted` refuse without a walk, a waiting build
+# walks nothing and the recovered cold build walks only the slot it re-leased
+# and the one it released. 300 s and 512 MiB owned scratch including cleanup,
+# sampled at phase boundaries; the byte-pressure eviction case is retired to
+# `rust:recorded-slot-accounting` and `rust:holding-delete`. Not a benchmark
+# and not full QA.
 [tasks."rust:front-door-accounting"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py python3 scripts/test-front-door-accounting.py"
+
+# The pure apparatus check of the front-door script: walk and scope root
+# mapping, the exact ordered walk oracles (a whole-payload admission walk is
+# refused), the product summary/provenance and measure lines, the readiness
+# needle bound to its source sentence, and the argument dispatch. No child,
+# pool, image, scratch or supervisor.
+[tasks."proof:front-door:test"]
+run = "python3 scripts/test-front-door-accounting.py --self-check"
 
 # Finder metadata (oxide#105): a short fixed script under heavy admission
 # (deadline checked before each child, 20 GiB reserve sampled every 250 ms
