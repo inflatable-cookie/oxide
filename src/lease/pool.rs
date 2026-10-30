@@ -3146,11 +3146,16 @@ impl Pool {
     ) -> Result<(), LeaseError> {
         // Debug proof observation (oxide#190): this whole function runs while
         // the pool lock is held, so its own elapsed time is the pool-lock-held
-        // part of one eviction — victim and rank checks, the identity-verified
-        // rename and the one durable write. It starts before the first check,
-        // so the figure a proof reads is the whole eviction transaction and not
-        // an inner fragment. Absent from release builds and armed only inside
-        // the supervisor's own scratch layout.
+        // part of one eviction's **rename transaction** — the rank policy and
+        // victim re-checks, the intent write, the identity-verified rename and
+        // the row write. It starts at this function's entry, so the figure is
+        // that whole interval and not an inner fragment. It is deliberately not
+        // the whole lock hold: the byte-pressure decision (`pressure` and its
+        // recorded-total walks, oxide#177/#186) and the victim selection run
+        // earlier in the same lock hold and belong to the accounting path, so a
+        // proof reading this figure claims nothing about them. Absent from
+        // release builds and armed only inside the supervisor's own scratch
+        // layout.
         #[cfg(debug_assertions)]
         let transaction = Instant::now();
         // A legacy #155 journal must still be resolved before anything moves
@@ -4900,8 +4905,11 @@ fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
 }
 
 /// Debug-only: append one eviction's pool-lock-held duration to
-/// `OXIDE_TEST_HOLDING_LOCK_LOG` (oxide#190). Armed only when the path is
-/// inside the supervisor's own `OXIDE_TASK_SCRATCH_ROOT`, so a release binary
+/// `OXIDE_TEST_HOLDING_LOCK_LOG` (oxide#190). The duration covers the rename
+/// transaction from victim validation to the row write, not the byte-pressure
+/// decision or the victim selection that precede it in the same lock hold.
+/// Armed only when the path is inside the supervisor's own
+/// `OXIDE_TASK_SCRATCH_ROOT`, so a release binary
 /// has no such control and an ordinary developer run writes nothing.
 #[cfg(debug_assertions)]
 fn record_eviction_lock_ms(pool: &Path, slot: u64, elapsed_ms: u128) {

@@ -25,7 +25,9 @@ Cases:
 
 - `evict-under-lock`: a 20,000-entry, ~20 MiB idle slot is evicted by another
   project's admission. The product's own debug-only observation records the
-  pool-lock-held duration of that eviction; it must be well under 1 s while
+  transaction from victim validation to the row write, under the pool lock (the
+  byte-pressure decision and victim selection happen earlier in the same lock
+  hold and are **not** in that figure); it must be well under 1 s while
   the tree is deleted outside the lock by the evicting command, which prints
   the deletion and leaves no holding row.
 - `refused-entry-kept`: an evicted tree holding an entry the traversal refuses
@@ -446,7 +448,10 @@ def plan_document() -> dict:
                 "name": "evict-under-lock",
                 "oracle": f"a {SLOT_ENTRIES}-entry idle slot is evicted by "
                 f"another project's admission; the product's own observation of "
-                f"the pool-lock-held part is under {LOCK_CEILING_MS} ms, the "
+                f"the transaction from victim validation to the row write, made "
+                f"under the pool lock, is under {LOCK_CEILING_MS} ms (the "
+                "byte-pressure decision and victim selection that precede it in "
+                "the same lock hold are not in that figure), the "
                 "tree is deleted outside the lock by that command, and no "
                 "holding row survives",
             },
@@ -548,10 +553,14 @@ def plan_document() -> dict:
         "observations": {
             "lock_held": "the product's debug-only OXIDE_TEST_HOLDING_LOCK_LOG "
             "line per eviction, armed only inside the supervisor's scratch root. "
-            "The figure is the whole eviction transaction under the pool lock "
-            "(victim and rank checks, the identity-verified rename and the one "
-            "durable ledger write), timed from the start of that transaction, "
-            "not an inner fragment of it",
+            "The figure is the eviction transaction from victim validation "
+            "through the identity-verified rename to the one durable ledger "
+            "write, as observed at the start of `retire_idle_slot` — not an "
+            "inner fragment of that transaction, and not the whole lock hold: "
+            "the byte-pressure decision (`pressure` and its recorded-total "
+            "walks) and the victim selection run earlier in the same lock hold "
+            "and belong to the accounting path (#177/#186), so this proof "
+            "measures the rename transaction and claims nothing about them",
             "throughput": "entries/second and MiB/second of the outside-lock "
             "traversal, measured from the deleted figures and elapsed time",
             "legacy_reference": "the retired per-entry journaled path is not "
@@ -706,6 +715,15 @@ def self_check() -> None:
     expect(
         "not a live comparison" in plan["observations"]["legacy_reference"],
         "the historical reference must be labelled, not claimed as live",
+    )
+    # The timer starts inside the eviction transaction, so the plan must not
+    # claim it covers the byte-pressure decision or the victim selection that
+    # precede it in the same lock hold.
+    expect(
+        "not the whole lock hold" in plan["observations"]["lock_held"]
+        and "byte-pressure decision" in plan["observations"]["lock_held"],
+        "the plan must state that the timed transaction excludes the "
+        "byte-pressure decision and victim selection",
     )
     expect(
         list(PREMISE_CHECKLIST) == [
@@ -2261,9 +2279,11 @@ def main(argv: list[str]) -> int:
         "faults": FAULTS,
         "deadline_left_s": deadline_remaining(),
         "elapsed_s": round(time.perf_counter() - started, 3),
-        "lock_metric": "the whole eviction transaction under the pool lock "
-        "(victim and rank checks, identity-verified rename, one durable ledger "
-        "write), from the product's debug-only observation",
+        "lock_metric": "the eviction transaction from victim validation through "
+        "the identity-verified rename to one durable ledger write, under the "
+        "pool lock, from the product's debug-only observation. The byte-pressure "
+        "decision and victim selection precede the timer in the same lock hold "
+        "and are not in this figure; this receipt claims nothing about them",
         "unmeasured": [
             "a real project's slot rate",
             "removable media",
