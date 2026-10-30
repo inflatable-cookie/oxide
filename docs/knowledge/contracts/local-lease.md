@@ -368,7 +368,14 @@ dropped when its entry is gone with `NotFound`. Any other `lstat` failure
 its charge are kept, the pool refuses rather than concluding, and a pass that
 cannot open a recorded entry keeps it, reports it and deletes nothing else. A
 holding entry is therefore never reported as deleted, and never stops being
-accounted, because an error could not be classified.
+accounted, because an error could not be classified. The one positive absence
+that finishes rows without deleting anything is the **holding area itself**: the
+area probe reads the payload first, a locked open holds the pool lock (so no
+other command can be creating it), and no tree can live in an area that does not
+exist — so each recorded row there is finished and stops being charged instead of
+keeping its charge forever because its directory vanished outside Oxide's
+control. An absent removable volume never reaches that conclusion, because the
+open that gets there has already resolved the payload.
 
 **Asynchronous delete, outside the lock.** The command that evicted the slot
 deletes that tree on a worker thread it owns while its own writer runs, and
@@ -378,9 +385,17 @@ descriptors only: `unlinkat`/`AT_REMOVEDIR` against a held parent, `O_NOFOLLOW`
 directories, never a path lookup, never a followed link (a symlink is unlinked
 as a leaf), never another device. An owned directory the owner left read-only
 or without its read bit is entered through a search-only descriptor and its own
-mode gains the owner bits, exactly as the retired path did. An already-missing
+mode gains the owner bits, exactly as the retired path did; the claimed tree's
+**own root** is repaired the same way before its children are touched, so a slot
+tree the owner left owner-no-write is still deleted whole instead of staying
+charged forever. Each listing batch opens the directory afresh (never a `dup`,
+which would share the offset and make the next batch read an empty directory),
+so a refused entry can never be mistaken for an empty one. An already-missing
 entry counts as done, so a pass is idempotent. When the entry directory is gone,
-one brief locked write drops its row.
+one brief locked write drops its row. A regression proves the device boundary
+both ways on one tree by injecting the device the traversal compares against: the
+foreign-device child directory is refused by name and kept while an ordinary file
+beside it is removed, and the same tree with its real device empties completely.
 
 **Progress does not depend on admission.** The refusal is re-evaluated for every
 positive removal, including one the *pre-admission* pass made after the refusal was
@@ -469,7 +484,10 @@ it keeps its record and starts no holding row. `Pool::open` never starts a new
 removal and its mode-widening guard are retired from the eviction path and
 deleted with their eviction-path regressions; the shared descriptor-relative
 owned-delete primitives (`owned_delete`) that `clean`, `prune` and the #155
-replay still use, and their own unit tests, are unchanged. `oxide clean` and the
+replay still use, and their own unit tests, are unchanged. The test-only seams
+that existed only for the retired per-entry path went with it — the per-entry
+unlink, permission-repair, child-reopen and root-capture crash hooks and their
+regressions — so no dead hook remains in `src/test_fs.rs`. `oxide clean` and the
 other owned-delete callers keep their own rules: the holding approach is not
 applied to them by this change, because a workspace target tree can contain
 bytes whose ownership and writer closure are not a private slot's.

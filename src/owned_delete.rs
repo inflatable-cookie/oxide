@@ -1431,8 +1431,6 @@ fn drain_finder_metadata(
                 reason: format!("the captured entry could not be recorded ({reason})"),
             });
         }
-        #[cfg(test)]
-        crate::test_fs::run_before_unlink();
         // Only the private name this process created is removed.
         let status = unsafe { libc::unlinkat(dir.as_raw_fd(), capture.private.as_ptr(), 0) };
         if status == 0 {
@@ -1791,17 +1789,6 @@ pub fn names_of(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
         Names::TooMany(count) => Err(io::Error::other(format!(
             "directory entry count {count} exceeded its bound"
         ))),
-    }
-}
-
-/// A complete listing under an entry cap, or an error without a partial list.
-pub(crate) fn names_of_bounded(dir: BorrowedFd<'_>, max: usize) -> io::Result<Vec<OsString>> {
-    match list_names(dir, max)? {
-        Names::Listed(names) => Ok(names
-            .into_iter()
-            .map(|name| OsString::from_vec(name.into_bytes()))
-            .collect()),
-        Names::TooMany(_) => Err(io::Error::other("directory listing exceeded its bound")),
     }
 }
 

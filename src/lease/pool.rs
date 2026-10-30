@@ -4376,14 +4376,12 @@ fn holding_entry(record: &HoldingRecord, present: Option<bool>) -> super::Holdin
 /// (oxide#190).
 pub(super) struct HoldingClaim {
     name: String,
-    slot: u64,
     tree: OwnedFd,
     /// The holding area's own descriptor, for removing the entry directory
     /// itself once its contents are gone.
     area: OwnedFd,
     identity: (u64, u64),
     trusted: bool,
-    recorded_bytes: u64,
 }
 
 /// What one deletion pass did.
@@ -4407,14 +4405,6 @@ impl HoldingDrain {
     fn nothing() -> Self {
         Self::default()
     }
-}
-
-/// Bounds one holding deletion pass. The traversal stops bounded and leaves
-/// the entry in place; the next command resumes it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HoldingLimits {
-    max_entries: u64,
-    max_elapsed_ms: u64,
 }
 
 /// The bounds one async deletion uses. They match the accounting bounds: a
@@ -4735,6 +4725,18 @@ impl Pool {
             }
         }
         let Some(holding) = self.open_holding_area(false)? else {
+            // The area probe read the payload's own metadata, so the payload is
+            // present and the holding area is **positively** absent: no tree can
+            // live there, and this open holds the pool lock, so no eviction can
+            // be creating it right now. A recorded row is therefore finished,
+            // not unknown — a row that kept its charge because its directory
+            // vanished would otherwise be charged forever. (An absent removable
+            // volume never reaches here: the open that got this far already
+            // resolved the payload.)
+            if !self.ledger.holding.is_empty() {
+                self.ledger.holding.clear();
+                changed = true;
+            }
             if changed {
                 self.persist_revised()?;
             }
@@ -4989,17 +4991,29 @@ fn read_errno() -> i32 {
 /// at the batch bound, and the next pass lists the directory again, so a
 /// directory with a huge number of entries costs bounded memory.
 fn holding_names(dir: BorrowedFd<'_>, batch: usize) -> Result<Vec<std::ffi::CString>, LeaseError> {
-    // SAFETY: `dup` of a live descriptor; the stream owns the duplicate and is
-    // closed exactly once below.
-    let duplicate = unsafe { libc::dup(dir.as_raw_fd()) };
-    if duplicate < 0 {
+    // A fresh *open* of the same directory, never a `dup`: a duplicate shares
+    // this directory's file offset, so the next batch would resume at the end
+    // and report an empty directory while refused entries were still in it.
+    // `.` is opened without following a link like every other level.
+    let reopened = {
+        let dot = c".";
+        // SAFETY: `dir` and the C string are live for the call.
+        unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        }
+    };
+    if reopened < 0 {
         return Err(io_error(std::io::Error::last_os_error()));
     }
-    // SAFETY: `duplicate` is a freshly owned descriptor of a directory.
-    let stream = unsafe { libc::fdopendir(duplicate) };
+    // SAFETY: `reopened` is a freshly owned descriptor of a directory.
+    let stream = unsafe { libc::fdopendir(reopened) };
     if stream.is_null() {
         // SAFETY: `fdopendir` failed, so the descriptor is still ours.
-        unsafe { libc::close(duplicate) };
+        unsafe { libc::close(reopened) };
         return Err(io_error(std::io::Error::last_os_error()));
     }
     let mut names = Vec::new();
@@ -5161,6 +5175,21 @@ fn delete_holding_children(
     }
 }
 
+/// Test-only seam: run the traversal on one root with an injected device, so
+/// the "another device" refusal can be proved without a second mounted volume.
+/// Nothing else is injected: the same bounded traversal, the same refusals and
+/// the same device comparison run.
+#[cfg(test)]
+pub(super) fn delete_holding_children_for_test(
+    dir: BorrowedFd<'_>,
+    device: u64,
+) -> Result<(bool, HoldingDrain), LeaseError> {
+    let mut stats = HoldingDrain::default();
+    let deadline = Instant::now() + Duration::from_millis(HOLDING_DELETE_MAX_ELAPSED_MS);
+    let emptied = delete_holding_children(dir, device, 0, deadline, &mut stats)?;
+    Ok((emptied, stats))
+}
+
 /// What one claim attempt produced.
 enum ClaimOutcome {
     /// This pass has custody of the entry and must delete it.
@@ -5259,12 +5288,10 @@ fn claim_holding(pool: &Path, prefer: Option<&str>) -> Result<ClaimOutcome, Leas
         && facts.is_directory();
     Ok(ClaimOutcome::Claimed(Box::new(HoldingClaim {
         name: record.name,
-        slot: record.slot,
         tree,
         area,
         identity,
         trusted,
-        recorded_bytes: record.bytes,
     })))
 }
 
@@ -5282,6 +5309,18 @@ fn drain_claimed(pool: &Path, claim: &HoldingClaim) -> Result<HoldingDrain, Leas
         return Ok(drain);
     }
     let deadline = Instant::now() + Duration::from_millis(HOLDING_DELETE_MAX_ELAPSED_MS);
+    // The tree is being deleted, so no mode needs putting back: an owned slot
+    // root the owner left read-only or without its write bit (a test or build
+    // scratch tree) gains its owner access through the descriptor this claim
+    // already holds, addressed by no path and never through a link. Without it
+    // the root's own children cannot be unlinked and the entry would stay
+    // charged forever.
+    if crate::owned_delete::restore_owner_access(claim.tree.as_fd()).is_err() {
+        drain
+            .refused
+            .push(format!("{} (unwritable tree)", claim.name));
+        return Ok(drain);
+    }
     let emptied = delete_holding_children(
         claim.tree.as_fd(),
         claim.identity.0,

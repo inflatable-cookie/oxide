@@ -2871,8 +2871,6 @@ fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     let first_id: u64 = first.slot_id.parse().expect("slot id");
     let second_id: u64 = second.slot_id.parse().expect("slot id");
     let first_path = pool.join("payload/slots").join(&first.slot_id);
-    let second_path = pool.join("payload/slots").join(&second.slot_id);
-
     // Slot A: an unclassifiable journal, so reconciliation blocks and keeps it.
     super::pool::mark_evicting_for_test(&pool, first_id).expect("recorded deletion");
     fs::remove_dir_all(&first_path).expect("the recorded root is absent");
@@ -4862,21 +4860,6 @@ impl crate::owned_delete::RootCaptureJournal for RecordingJournal<'_> {
     }
 }
 
-/// End the real deletion at one root-capture stage the way a crash does: no
-/// put-back, no journal write and no ledger write runs after the panic.
-fn crash_eviction(pool: &Path, slot_id: u64, stage: crate::test_fs::RootCaptureCrash) {
-    let slot_id = slot_id.to_string();
-    let armed = crate::test_fs::root_capture_crash(stage);
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        evict_idle_slot_injected(pool, &slot_id)
-    }));
-    drop(armed);
-    assert!(
-        outcome.is_err(),
-        "the armed crash at {stage:?} did not fire"
-    );
-}
-
 /// A crash after the rename but before its phase is recorded: the record names
 /// the planned private name and the original name is free. Recovery finds the
 /// captured root under the recorded private name, puts it back and finishes.
@@ -6091,6 +6074,105 @@ fn an_owned_read_only_tree_is_deleted_whole() {
     let pass = managed::drain_holding(&pool, None).expect("drain");
     assert!(pass.gone, "the read-only tree is deleted: {pass:?}");
     assert!(holding_rows(&pool).is_empty());
+}
+
+/// The claimed tree's **own root** may be owner-no-write: the drain restores
+/// the owner's access through the descriptor it already holds, so a slot tree
+/// the owner left read-only is still deleted whole instead of staying charged
+/// forever.
+#[test]
+fn a_claimed_root_the_owner_left_read_only_is_still_drained() {
+    let fixture = Fixture::new("holding-readonly-root");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "holding-readonly-root");
+    let nested = slot_path.join("build/out");
+    fs::create_dir_all(&nested).expect("nested dir");
+    fs::write(nested.join("object"), b"x").expect("nested object");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).pop().expect("a holding row");
+    let held = holding_area(&pool).join(&row.name);
+    // The tree the claim will open: its root loses the owner's write bit, and so
+    // does one nested directory, so both the root's children and the nested
+    // level need the owner's access restored.
+    fs::set_permissions(held.join("build/out"), fs::Permissions::from_mode(0o500))
+        .expect("nested read-only");
+    fs::set_permissions(&held, fs::Permissions::from_mode(0o500)).expect("root read-only");
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the read-only root is deleted whole: {pass:?}");
+    assert!(pass.refused.is_empty(), "nothing is refused: {pass:?}");
+    assert!(!held.exists(), "the held tree is gone");
+    assert!(holding_rows(&pool).is_empty(), "the row is finished");
+}
+
+/// The traversal never enters a directory on another device: the same tree is
+/// proved both ways, so only the injected device differs. A regular file is
+/// still removed (no device rule applies to it), the child directory is refused
+/// by name and kept, and the real device then empties the tree — the branch is
+/// reachable and falsifiable, not merely unreachable code.
+#[test]
+fn a_child_directory_on_another_device_is_refused_and_kept() {
+    let fixture = Fixture::new("holding-device");
+    let root = fixture.dir("tree");
+    let child = root.join("child");
+    fs::create_dir(&child).expect("child dir");
+    fs::write(child.join("kept"), b"kept").expect("kept file");
+    fs::write(root.join("leaf"), b"leaf").expect("leaf file");
+    let held = File::open(&root).expect("open the tree");
+    let device = fs::symlink_metadata(&root).expect("root metadata").dev();
+
+    let (emptied, stats) =
+        super::pool::delete_holding_children_for_test(held.as_fd(), device.wrapping_add(1))
+            .expect("traversal");
+    assert!(
+        !emptied,
+        "a tree with a foreign-device child completed: {stats:?}"
+    );
+    assert!(
+        stats
+            .refused
+            .iter()
+            .any(|item| item.contains("another device")),
+        "the refusal names the device boundary: {stats:?}"
+    );
+    assert_eq!(
+        fs::read(child.join("kept")).expect("the foreign subtree survives"),
+        b"kept"
+    );
+    assert!(
+        !root.join("leaf").exists(),
+        "an ordinary file is still removed: {stats:?}"
+    );
+
+    let (emptied, stats) =
+        super::pool::delete_holding_children_for_test(held.as_fd(), device).expect("traversal");
+    assert!(
+        emptied,
+        "the same tree with its real device is empty: {stats:?}"
+    );
+    assert!(stats.refused.is_empty(), "nothing is refused: {stats:?}");
+}
+
+/// A recorded row whose holding area is positively absent is finished, not
+/// charged forever: the open that reads the payload sees no area, and no tree
+/// can live in an area that does not exist. Nothing is deleted here — the rows
+/// simply stop being charged.
+#[test]
+fn a_recorded_row_is_finished_when_the_holding_area_is_gone() {
+    let fixture = Fixture::new("holding-area-gone");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "holding-area-gone");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    assert_eq!(holding_rows(&pool).len(), 1, "the eviction recorded a row");
+
+    // The area and the tree vanish outside Oxide's control (a manual cleanup, an
+    // external tool, a lost directory): the row must not stay charged forever.
+    fs::remove_dir_all(holding_area(&pool)).expect("remove the holding area");
+
+    let pass = managed::drain_holding(&pool, None).expect("a locked open");
+    assert!(!pass.gone, "no entry was deleted: {pass:?}");
+    assert!(
+        holding_rows(&pool).is_empty(),
+        "the row is finished once its area is positively absent"
+    );
 }
 
 /// An unrecorded entry in the holding area is never adopted and never deleted:
