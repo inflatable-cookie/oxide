@@ -1345,11 +1345,94 @@ def self_check() -> int:
     expect_true(mode_from_args(["--self-check"]) == "self-check", "self-check mode")
     for refused in (["--bogus"], ["--diagnostic", "--plan"], ["--self-check", "--self-check"], ["run"]):
         expect_true(mode_from_args(refused) is None, f"{refused} selected a mode")
+    # The receipt-finishing path: a diagnostic that ran to completion cannot
+    # report success without its receipt, a run that is already failing keeps
+    # its own error (the receipt failure is printed, never masking it), and a
+    # counted run writes no receipt at all.
+    writes = []
+
+    def good_writer(outcome):
+        writes.append("write")
+        return "/fixture/front-door.diagnostic.json"
+
+    def bad_writer(outcome):
+        writes.append("fail")
+        raise RuntimeError("receipt directory is gone")
+
+    outcome = diagnostic_outcome()
+    expect_true(finish_run(0, True, outcome, good_writer) == 0,
+                "a written receipt did not return the run's code")
+    expect_true(writes == ["write"], f"receipt writer calls {writes}")
+    writes.clear()
+    try:
+        finish_run(0, True, outcome, bad_writer)
+    except RuntimeError as error:
+        expect_true("receipt directory is gone" in str(error), str(error))
+    else:
+        fail("a successful diagnostic returned without writing its receipt")
+    writes.clear()
+    expect_true(finish_run(0, True, outcome, bad_writer, failed=True) == 0,
+                "a failing diagnostic did not keep its own error")
+    expect_true(writes == ["fail"], f"failing-run writer calls {writes}")
+    writes.clear()
+    expect_true(finish_run(0, False, outcome, bad_writer) == 0, "a counted run failed on a receipt")
+    expect_true(writes == [], f"a counted run called the receipt writer: {writes}")
+    # `main` finishes through that one path, so no future edit can call the
+    # writer directly and suppress its failure again.
+    source = inspect.getsource(main)
+    expect_true("finish_run(" in source, "main does not finish through finish_run")
+    expect_true("diagnostic_receipt(" not in source,
+                "main calls diagnostic_receipt directly, outside finish_run")
+    handler = source[source.index("except BaseException as failure:"):]
+    expect_true(
+        "record_abort(" in handler
+        and "finish_run(0, True, outcome, failed=True)" in handler
+        and handler.index("finish_run(") < handler.index("raise"),
+        f"main's failure path does not record, write best-effort and re-raise: {handler}",
+    )
+    # The same path end to end through `main` with the run itself stubbed: a
+    # successful diagnostic whose receipt cannot be written raises instead of
+    # returning 0, and a failing diagnostic keeps its own error.
+    holder = dict(os.environ)
+    saved_argv = sys.argv
+    saved_run = globals()["run_proof"]
+    evidence_root = tempfile.mkdtemp(prefix="fd-receipt-path.")
+    try:
+        blocker = os.path.join(evidence_root, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("")
+        os.environ["OXIDE_PROOF_EVIDENCE"] = blocker
+        globals()["run_proof"] = lambda diagnostic, outcome: 0
+        sys.argv = ["test-front-door-accounting.py", "--diagnostic"]
+        try:
+            main()
+        except RuntimeError as error:
+            expect_true("evidence" in str(error), f"unexpected receipt error {error!r}")
+        else:
+            fail("the diagnostic reported success without writing its receipt")
+
+        def failing_run(diagnostic, outcome):
+            raise RuntimeError("the collection failed")
+
+        globals()["run_proof"] = failing_run
+        try:
+            main()
+        except RuntimeError as error:
+            expect_true(str(error) == "the collection failed", f"the receipt path masked {error!r}")
+        else:
+            fail("a failing diagnostic did not propagate its own error")
+    finally:
+        sys.argv = saved_argv
+        globals()["run_proof"] = saved_run
+        os.environ.clear()
+        os.environ.update(holder)
+        shutil.rmtree(evidence_root, ignore_errors=True)
     print("front-door self-check ok: walk/scope root mapping, exact ordered walk oracles, "
           "summary and provenance parsing, measure line, readiness needle, "
           "premise checklist and fixture/staging environments (private home, rustup, flags, temp, "
           "isolation, drop of every inherited CARGO_/SCCACHE_ value), timeout classification, "
-          "case map, keep-going/skip/abort driver, bounded unqualified receipt, dispatch")
+          "case map, keep-going/skip/abort driver, bounded unqualified receipt, "
+          "successful-run/failed-receipt and failing-run/failed-receipt paths, dispatch")
     return 0
 
 
@@ -1429,6 +1512,32 @@ def run_proof(diagnostic: bool, outcome: dict) -> int:
     return 0
 
 
+def finish_run(code: int, diagnostic: bool, outcome: dict, writer=None, failed: bool = False) -> int:
+    """The one place a diagnostic's receipt is written.
+
+    A diagnostic that ran to completion cannot report success without its
+    receipt: `writer` raising on the success path propagates, so `main` never
+    returns 0 for a run whose receipt could not be written. A run that is
+    already failing keeps its own error and only prints the receipt failure, so
+    the receipt path never masks the fault that ended the collection. A counted
+    run writes no receipt at all.
+    """
+    if not diagnostic:
+        return code
+    writer = diagnostic_receipt if writer is None else writer
+
+    def write(best_effort: bool) -> None:
+        try:
+            print(f"front-door diagnostic receipt {writer(outcome)}")
+        except BaseException as error:
+            print(f"front-door diagnostic receipt not written: {error!r}", file=sys.stderr)
+            if not best_effort:
+                raise
+
+    write(best_effort=failed)
+    return code
+
+
 def main() -> int:
     arguments = list(sys.argv[1:])
     mode = mode_from_args(arguments)
@@ -1442,23 +1551,13 @@ def main() -> int:
     diagnostic = mode == "diagnostic"
     outcome = diagnostic_outcome()
     try:
-        return run_proof(diagnostic, outcome)
+        code = run_proof(diagnostic, outcome)
     except BaseException as failure:
         if diagnostic:
             record_abort(outcome, "run", failure)
+            finish_run(0, True, outcome, failed=True)
         raise
-    finally:
-        if diagnostic:
-            # ONE bounded, unqualified receipt in every outcome, including a
-            # failure before the first case ran. A receipt that cannot be
-            # written ends the diagnostic instead of reporting success.
-            try:
-                path = diagnostic_receipt(outcome)
-                print(f"front-door diagnostic receipt {path}")
-            except BaseException as error:
-                print(f"front-door diagnostic receipt not written: {error!r}", file=sys.stderr)
-                if sys.exc_info()[0] is None:
-                    raise
+    return finish_run(code, diagnostic, outcome)
 
 
 if __name__ == "__main__":
