@@ -492,8 +492,9 @@ checklist](workflow.md#proof-authoring-premise-checklist) in `PREMISE_CHECKLIST`
 and `--plan` prints them: private `HOME` and rustup (the invoking `RUSTUP_HOME`,
 or the invoking `HOME/.rustup` when unset, is read before any private `HOME`
 exists and passed to staging and every fixture with `RUSTUP_TOOLCHAIN` pinned and
-`RUSTUP_AUTO_INSTALL=0`; staging is `--locked --offline` and each fixture crate
-ships its own lock); the account-home control (`OXIDE_TEST_HOME_FROM_ENV=1`
+`RUSTUP_AUTO_INSTALL=0`; staging is the only `--locked` call, against this
+repository's committed lock, while the fixture crate is dependency-free and no
+fixture invocation passes `--locked`); the account-home control (`OXIDE_TEST_HOME_FROM_ENV=1`
 beside the private `HOME`); environment isolation (the staging sweep drops every
 `CARGO_TARGET_`/`CARGO_BUILD_`/`CARGO_ENCODED_`/`SCCACHE_`/`OXIDE_`/`XDG_` key and
 every compiler override, and the fixture environment is built from a fixed
@@ -507,8 +508,13 @@ internal fixture pool, with per-tree `TMPDIR`/`TMP`/`TEMP`); and macOS `mktemp`
 `tempfile.mkdtemp`, which honours the supervisor's `TMPDIR`, and are removed).
 The pure self-check binds the map to the source it names — all nine items in
 order, every inapplicable item carrying its reason, every applicable disposition
-naming a helper the script really defines — so a disposition cannot drift into a
-claim no case body supports. Recording them activates nothing: the uncounted
+naming a helper the script really defines — and it binds item 1's lock claim to
+the two places it can drift: `create_project` must write a manifest with no
+`[dependencies]` table and no lock of its own, and the only `--locked` Cargo
+invocation in the script's effectful region must be staging's. A counterfactual
+manifest that declares a dependency, and a second `--locked` call, each fail that
+check, so a disposition cannot drift into a claim no case body supports.
+Recording them activates nothing: the uncounted
 diagnostic, the counted author native and the reviewer native remain separately
 owner-gated, and none has run at this head.
 

@@ -148,9 +148,12 @@ PREMISE_CHECKLIST = {
         "invoking_rustup_home() (explicit RUSTUP_HOME, else the invoking HOME/.rustup, "
         "read before any private HOME exists) is passed to stage_subject() and "
         "fixture_env() with RUSTUP_TOOLCHAIN pinned to " + BUILDER + " and "
-        "RUSTUP_AUTO_INSTALL=0; staging is `cargo build --locked --offline`, and the "
-        "fixture crates are written with their own Cargo.lock by the fixture builder, "
-        "so no toolchain is installed or downloaded"
+        "RUSTUP_AUTO_INSTALL=0. The only `--locked` call is staging, which builds "
+        "this repository against its committed Cargo.lock; the fixture crate "
+        "create_project() writes is dependency-free and no fixture invocation passes "
+        "`--locked` (they use `--offline` and the fixture's own Cargo-generated lock "
+        "inside the fixture tree), so no mode needs a pre-seeded lock and no toolchain "
+        "is installed or downloaded"
     ),
     "2_account_home_control": (
         "fixture_env() sets OXIDE_TEST_HOME_FROM_ENV=1 beside the private HOME, so the "
@@ -732,6 +735,31 @@ def self_check() -> None:
         plan["premise_checklist"]["items"] == PREMISE_CHECKLIST
         and plan["premise_checklist"]["not_applicable"] == list(NA_PREMISES),
         "the plan must print the recorded premise dispositions",
+    )
+    # Item 1's lock claim, bound to the two places it can drift: the fixture
+    # manifest (dependency-free, so Cargo can generate its own lock offline) and
+    # the one `--locked` call (staging, against this repository's committed lock).
+    # Each region is located by a line-anchored definition, so this block's own
+    # text can never satisfy the check it states.
+    def body_of(name: str) -> str:
+        match = re.search(rf"^def {name}\(", source, re.MULTILINE)
+        expect(match is not None, f"the script must define {name}")
+        return re.split(r"^def ", source[match.end():], maxsplit=1, flags=re.MULTILINE)[0]
+
+    fixture_body = body_of("create_project")
+    expect(
+        "[dependencies]" not in fixture_body and "Cargo.lock" not in fixture_body,
+        "the fixture manifest must stay dependency-free and ship no lock of its own, "
+        "or premise item 1's disposition is false",
+    )
+    staging_body = body_of("stage_subject")
+    marker = re.search(r"^# The proof\. Everything below has effects", source, re.MULTILINE)
+    expect(marker is not None, "the effectful region marker is missing")
+    effectful = source[marker.start():]
+    expect(
+        effectful.count('"--locked"') == 1 and '"--locked"' in staging_body,
+        "the only --locked Cargo call must be staging against the committed lock, "
+        "which is what premise item 1 records",
     )
     expect(POOL_CAP == "8MiB", "the fixture pool budget changed")
     expect(SLOT_ENTRIES == 20_000, "the fixture entry count changed")
