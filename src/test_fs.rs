@@ -545,6 +545,49 @@ pub(crate) fn run_before_walk_capture() {
 }
 
 thread_local! {
+    static BEFORE_HOLDING_RENAME: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside a holding rename, immediately after the
+/// source root's descriptor identity was verified and strictly before the
+/// `renameat`. This is how a unit test swaps the observed source name so the
+/// rename moves an object that is not the verified one — the containment path
+/// (oxide#190).
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct BeforeHoldingRenameGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn before_holding_rename(action: impl FnOnce() + 'static) -> BeforeHoldingRenameGuard {
+    BEFORE_HOLDING_RENAME.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping before-holding-rename injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    BeforeHoldingRenameGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for BeforeHoldingRenameGuard {
+    fn drop(&mut self) {
+        BEFORE_HOLDING_RENAME.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed before-holding-rename action, if any.
+pub(crate) fn run_before_holding_rename() {
+    let action = BEFORE_HOLDING_RENAME.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+thread_local! {
     static FORCED_INVALID_NAME: Cell<bool> = const { Cell::new(false) };
 }
 

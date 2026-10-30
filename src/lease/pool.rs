@@ -376,6 +376,33 @@ struct SlotRecord {
     /// the observed object. Only an `Evicting` record may carry one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     capture: Option<DeletionJournal>,
+    /// The verified rename a legacy pending deletion is about to perform
+    /// (oxide#190): the holding entry name and the root identity the
+    /// completeness preflight itself verified. Only an `Evicting` record may
+    /// carry one, and it is durable **before** the rename, so a recovery pass
+    /// can bind an interrupted migration's entry to the root the preflight
+    /// verified instead of adopting a directory that merely has the right name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hold_intent: Option<HoldingIntent>,
+}
+
+/// One durable rename intent for a legacy pending deletion (oxide#190). It is
+/// the identity binding the legacy migration needs: the hot idle-eviction path
+/// keeps its single durable write after the rename (the brief's rule), while
+/// this rare one-time path can afford one write before it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HoldingIntent {
+    /// The holding entry name the rename uses, exactly as derived.
+    name: String,
+    device: u64,
+    inode: u64,
+}
+
+impl HoldingIntent {
+    fn is_valid(&self) -> bool {
+        holding_name_is_bounded(&self.name) && self.device != 0 && self.inode != 0
+    }
 }
 
 /// One closed size observation. It is a measurement at a closing transition,
@@ -1172,6 +1199,36 @@ pub(super) fn holding_name_for_slot_injected(pool: &Path, slot_id: u64) -> Optio
         slot.incarnation,
         &slot.last_lease_id,
     )
+}
+
+/// Test-only: record the durable hold intent of one legacy pending deletion
+/// straight into the ledger, so a test can model the migration's
+/// rename-before-row interruption without opening (and reconciling) the pool.
+#[cfg(test)]
+pub(super) fn write_hold_intent_injected(
+    pool: &Path,
+    slot_id: u64,
+    device: u64,
+    inode: u64,
+) -> Result<(), LeaseError> {
+    let mut ledger = read_ledger(pool)?;
+    let store_id = ledger.store_id.clone();
+    let slot = ledger
+        .slots
+        .iter_mut()
+        .find(|slot| slot.id == slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if slot.state != SlotPersistState::Evicting {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let name = derived_holding_name(&store_id, slot.id, slot.incarnation, &slot.last_lease_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    slot.hold_intent = Some(HoldingIntent {
+        name,
+        device,
+        inode,
+    });
+    write_ledger(pool, &ledger)
 }
 
 /// Test-only: move one slot tree into the holding area with an explicit
@@ -2146,6 +2203,7 @@ impl Pool {
             rank: 0,
             recorded: None,
             capture: None,
+            hold_intent: None,
         });
         self.ledger.next_slot = slot_id.checked_add(1).ok_or(LeaseError::LedgerExhausted)?;
         self.stamp_rank(slot_id)?;
@@ -3159,7 +3217,19 @@ impl Pool {
                 self.reconciliation_blocked = true;
                 continue;
             }
-            let held = self.hold_slot_tree(id, &path, expected);
+            // The identity this deletion is about to move is durable **before**
+            // the rename, so a recovery pass can bind an interrupted migration
+            // to the root the preflight verified instead of adopting whatever
+            // directory happens to carry the derived name.
+            let Some(identity) = expected else {
+                self.reconciliation_blocked = true;
+                continue;
+            };
+            if self.record_hold_intent(id, identity).is_err() {
+                self.reconciliation_blocked = true;
+                continue;
+            }
+            let held = self.hold_slot_tree(id, &path, Some(identity));
             drop(ready);
             let row = match held {
                 Ok(row) => row,
@@ -4528,6 +4598,8 @@ impl Pool {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(error)),
         }
+        #[cfg(test)]
+        crate::test_fs::run_before_holding_rename();
         // One rename moves the whole tree; nothing is read, copied or
         // journaled, and the name is the only path the deleter needs.
         // SAFETY: both descriptors and both C strings are live for the call.
@@ -4543,11 +4615,25 @@ impl Pool {
             return Err(io_error(std::io::Error::last_os_error()));
         }
         // The moved entry must be the very object whose descriptor was
-        // verified: a swap in the rename window is detected here and is never
-        // recorded as a held tree.
+        // verified. A swap in the rename window is detected here, and the
+        // foreign tree that took its place is **contained**: it is moved to a
+        // name no generation can ever derive, so no later recovery pass can
+        // adopt it, charge it as a slot's tree or delete it. The payload walk
+        // keeps charging those bytes, and this command refuses.
         let moved =
             crate::owned_delete::observe_entry(holding.as_fd(), &target).map_err(io_error)?;
         if (moved.device, moved.inode) != identity {
+            let contained = std::ffi::CString::new(unverified_holding_name(&name))
+                .map_err(|_| LeaseError::UnknownAccounting)?;
+            // SAFETY: both names are inside the held holding-area descriptor.
+            unsafe {
+                libc::renameat(
+                    holding.as_raw_fd(),
+                    target.as_ptr(),
+                    holding.as_raw_fd(),
+                    contained.as_ptr(),
+                );
+            }
             return Err(LeaseError::UnsafePath(
                 "the held tree is not the slot that was verified",
             ));
@@ -4561,6 +4647,45 @@ impl Pool {
             bytes,
             at_ms: now_ms(),
         })
+    }
+
+    /// Bind a legacy pending deletion's rename durably **before** it happens:
+    /// the holding entry name and the root identity the completeness preflight
+    /// verified. Recovery then adopts an interrupted migration's entry only when
+    /// the entry is that exact object, so a directory that merely carries the
+    /// right name is never adopted and never deleted.
+    fn record_hold_intent(&mut self, id: u64, expected: (u64, u64)) -> Result<(), LeaseError> {
+        let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+        if slot.state != SlotPersistState::Evicting {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let name = self
+            .holding_name_for(slot.id, slot.incarnation, &slot.last_lease_id)
+            .ok_or(LeaseError::UnknownAccounting)?;
+        let intent = HoldingIntent {
+            name,
+            device: expected.0,
+            inode: expected.1,
+        };
+        let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
+        if slot.hold_intent.as_ref() == Some(&intent) {
+            return Ok(());
+        }
+        slot.hold_intent = Some(intent);
+        self.persist_revised()
+    }
+
+    /// The holding entry name a legacy pending deletion already bound durably,
+    /// when it matches this generation's own derivation.
+    fn recorded_hold_intent<'a>(&self, slot: &'a SlotRecord) -> Option<&'a HoldingIntent> {
+        let intent = slot.hold_intent.as_ref()?;
+        let derived = derived_holding_name(
+            &self.ledger.store_id,
+            slot.id,
+            slot.incarnation,
+            &slot.last_lease_id,
+        )?;
+        (intent.name == derived && intent.is_valid()).then_some(intent)
     }
 
     /// Adopt a holding entry a crash left before its row was durable, and
@@ -4608,10 +4733,7 @@ impl Pool {
             // eviction and a legacy pending deletion's migration. A held row's
             // tree is this command's live build directory; it is never moved
             // into the holding area, so a name that happens to match its
-            // generation must not be adopted as one.
-            if slot.state == SlotPersistState::Held {
-                continue;
-            }
+            // generation must not be adopted as one (see the match below).
             let path = self.slot_path_in(slot.id, slot.dir.as_deref())?;
             match holding_presence(&path) {
                 // The root is still there: nothing was renamed for this
@@ -4626,6 +4748,22 @@ impl Pool {
             if self.ledger.holding.iter().any(|row| row.name == name) {
                 continue;
             }
+            // A legacy pending deletion is adopted only against the identity its
+            // own durable intent recorded before the rename. Without that bind
+            // nothing is adopted: a directory that merely carries the derived
+            // name is kept, charged by the payload walk and left to a replay,
+            // never deleted on a name alone.
+            let bound = match slot.state {
+                SlotPersistState::Evicting => match self.recorded_hold_intent(slot) {
+                    Some(intent) => Some((intent.device, intent.inode)),
+                    None => continue,
+                },
+                // The idle path's rename is the brief's one-sync window: it is
+                // the same generation's own derived name, and any mismatch the
+                // writer itself detects is contained before it can be adopted.
+                SlotPersistState::Idle => None,
+                SlotPersistState::Held => continue,
+            };
             let Ok(target) = std::ffi::CString::new(name.as_bytes()) else {
                 continue;
             };
@@ -4636,6 +4774,7 @@ impl Pool {
                 || observed.uid != current_uid()
                 || observed.mode_bits() & 0o077 != 0
                 || observed.device != self.holding_device()
+                || bound.is_some_and(|bound| bound != (observed.device, observed.inode))
             {
                 continue;
             }
@@ -4705,6 +4844,14 @@ fn derived_holding_name(
         .collect();
     let name = format!("{store_id}-{id}-{incarnation}-{nonce}");
     holding_name_is_bounded(&name).then_some(name)
+}
+
+/// The containment name for a rename whose moved object is not the verified
+/// root. It starts with `.`, which `holding_name_is_bounded` refuses for a
+/// derived name, so no recovery pass can ever derive it. Nothing ever adopts or
+/// deletes a name that is not a recorded row.
+fn unverified_holding_name(name: &str) -> String {
+    format!(".unverified-{name}")
 }
 
 /// Whether one path is positively present. `Some(true)` is an observed entry,
@@ -5640,6 +5787,17 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         {
             return Err(LeaseError::UnknownAccounting);
         }
+        // A hold intent belongs to a recorded deletion as well: it names the
+        // rename that deletion is about to perform and the identity it verified.
+        if slot.hold_intent.is_some()
+            && (slot.state != SlotPersistState::Evicting
+                || !slot
+                    .hold_intent
+                    .as_ref()
+                    .is_some_and(HoldingIntent::is_valid))
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
     }
     Ok(())
 }
@@ -5922,6 +6080,7 @@ pub(super) fn add_idle_slot_for_test(
             at_ms: 1,
         }),
         capture: None,
+        hold_intent: None,
     });
     pool.ledger.next_slot = id + 1;
     pool.ledger.next_rank = Some(rank + 1);
@@ -6727,6 +6886,7 @@ mod recorded_ledger_tests {
                 rank,
                 recorded: recorded.then(|| record("v1.a.1.1.1").expect("record")),
                 capture: None,
+                hold_intent: None,
             }],
         }
     }

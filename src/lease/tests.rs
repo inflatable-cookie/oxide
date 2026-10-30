@@ -6161,6 +6161,14 @@ fn an_interrupted_legacy_migration_is_adopted_by_the_next_open() {
     mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
     prepare_holding_area(&pool);
     let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    // The migration binds the verified identity durably before its rename, so
+    // the interrupted state carries that intent as well.
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1)
+        .expect("durable hold intent");
     fs::rename(&slot_path, holding_area(&pool).join(&name)).expect("modelled migration rename");
     assert!(!slot_path.exists(), "the root left its recorded name");
 
@@ -6188,11 +6196,10 @@ fn an_interrupted_legacy_migration_is_adopted_by_the_next_open() {
 }
 
 /// The rename boundary is not satisfied by a name alone: the identity the
-/// caller verified is compared with the held descriptor *before* the rename and
-/// with the moved entry afterwards. A root replaced in that window refuses, and
-/// the replacement is neither held nor ever deleted.
+/// caller verified is compared with the held descriptor *before* the rename, so
+/// a root replaced in that window refuses and nothing is moved at all.
 #[test]
-fn a_replaced_root_refuses_at_the_rename_boundary() {
+fn a_replaced_root_refuses_before_the_rename() {
     let fixture = Fixture::new("replaced-root");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "replaced-root");
     let verified = {
@@ -6214,6 +6221,10 @@ fn a_replaced_root_refuses_at_the_rename_boundary() {
         "a replaced root was moved: {refused:?}"
     );
     assert!(slot_path.is_dir(), "the replacement is still where it was");
+    assert_eq!(
+        fs::read(slot_path.join("replacement")).expect("replacement payload"),
+        b"not the slot"
+    );
     assert!(
         holding_rows(&pool).is_empty(),
         "the replacement was recorded as a held tree"
@@ -6227,21 +6238,150 @@ fn a_replaced_root_refuses_at_the_rename_boundary() {
             "the holding area is unreadable: {error}"
         ),
         Ok(entries) => assert!(
-            !entries.flatten().next().is_some(),
+            entries.flatten().next().is_none(),
             "the replacement was moved into the holding area"
         ),
     }
+    assert!(aside.is_dir(), "the verified root is untouched");
+}
 
-    // The same call with the identity the caller now really verified succeeds,
-    // so the guard refused the mismatch rather than the operation.
-    let replacement = {
-        let metadata = fs::symlink_metadata(&slot_path).expect("replacement metadata");
+/// The undetectable-by-name half of the same race: the source name is swapped
+/// after the descriptor identity was verified and exactly before the rename, so
+/// the rename moves an object that is not the verified one. That object is
+/// **contained** under a name no generation can derive, so no recovery pass can
+/// adopt, charge or delete it; the command refuses and the pool keeps the
+/// generation's row.
+#[test]
+fn a_swap_at_the_rename_is_contained_and_never_adopted() {
+    let fixture = Fixture::new("rename-swap");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "rename-swap");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
         (metadata.dev(), metadata.ino())
     };
-    let name = super::pool::hold_expecting_injected(&pool, slot_id, Some(replacement))
-        .expect("the verified replacement moves");
+    let aside = slot_path.with_extension("race-aside");
+    let slot_for_race = slot_path.clone();
+    let aside_for_race = aside.clone();
+    // Swap the source name after the identity check and before the rename.
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&slot_for_race, &aside_for_race).expect("move the verified root aside");
+        fs::create_dir(&slot_for_race).expect("replacement root");
+        fs::set_permissions(&slot_for_race, fs::Permissions::from_mode(0o700))
+            .expect("replacement mode");
+        fs::write(slot_for_race.join("replacement"), b"not the slot").expect("replacement payload");
+    });
+    let refused = super::pool::hold_expecting_injected(&pool, slot_id, Some(verified));
+    drop(guard);
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "a swapped rename was recorded: {refused:?}"
+    );
+
+    // Containment: the foreign tree is not at the adoptable derived name.
+    let area = holding_area(&pool);
+    let derived = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived");
+    assert!(
+        !area.join(&derived).exists(),
+        "the swapped tree stayed at the adoptable derived name"
+    );
+    let contained: Vec<PathBuf> = fs::read_dir(&area)
+        .expect("holding area")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".unverified-"))
+        })
+        .collect();
+    assert_eq!(
+        contained.len(),
+        1,
+        "the swapped tree is contained: {contained:?}"
+    );
+    assert_eq!(
+        fs::read(contained[0].join("replacement")).expect("contained payload"),
+        b"not the slot"
+    );
+    // A later open neither adopts nor deletes it, and the generation's row is
+    // still recorded, so its slot is never silently freed.
+    let view = managed::ledger_view(&pool).expect("the next open");
+    assert!(
+        view.holding.is_empty(),
+        "a contained tree was adopted: {:#?}",
+        view.holding
+    );
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == slot_id.to_string()),
+        "the generation's row survived the refused rename"
+    );
+    assert!(
+        contained[0].is_dir(),
+        "the contained tree was deleted: {contained:?}"
+    );
+    assert!(aside.is_dir(), "the verified root is untouched");
+    // The containment is charged, not free: the payload walk still counts it.
+    let status = status_injected(&pool).expect("status");
+    assert!(
+        status.payload_unique_allocated_bytes.unwrap_or(0) > 0,
+        "the contained bytes were counted as free: {status:?}"
+    );
+}
+
+/// A legacy pending deletion is adopted only against the identity its own
+/// durable intent recorded before the rename. Without an intent, or with one
+/// that names a different object, the derived-name directory is never adopted:
+/// the record and its charge stay, the pool stays blocked, and the tree is left
+/// alone for a replay to decide.
+#[test]
+fn a_legacy_entry_is_adopted_only_against_its_recorded_intent() {
+    let fixture = Fixture::new("legacy-intent");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "legacy-intent");
+    mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
+    prepare_holding_area(&pool);
+    let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    fs::rename(&slot_path, holding_area(&pool).join(&name)).expect("modelled rename");
+
+    // No intent: nothing may be adopted on a name alone.
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(
+        view.holding.is_empty(),
+        "a derived name without an intent was adopted: {:#?}",
+        view.holding
+    );
+    assert!(view
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == slot_id.to_string()));
+    assert!(
+        holding_area(&pool).join(&name).is_dir(),
+        "the tree was touched"
+    );
+
+    // An intent for a different object: still nothing is adopted.
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1 + 1)
+        .expect("a mismatched intent");
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(
+        view.holding.is_empty(),
+        "a mismatched intent was adopted: {:#?}",
+        view.holding
+    );
     assert!(holding_area(&pool).join(&name).is_dir());
-    assert!(!slot_path.exists());
+
+    // The intent the preflight really verified: the migration is recoverable.
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1)
+        .expect("the verified intent");
+    let view = managed::ledger_view(&pool).expect("open adopts it");
+    assert_eq!(view.holding.len(), 1, "the bound migration is adopted");
+    assert!(view.slots.is_empty());
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
 }
 
 /// Only a positively classified miss concludes that a held tree is gone. An

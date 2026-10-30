@@ -308,6 +308,32 @@ left blocked behind a root its own rename moved. A tree still at its recorded
 root adopts nothing, so an unreplayed legacy journal keeps its own record until
 the replay decides it.
 
+**A rename that moved the wrong object is contained, never adopted.** The
+source root's descriptor identity is compared with the caller's verified
+identity before the rename and with the moved entry afterwards. If a swap
+happened inside that window, the foreign tree is **contained** under
+`.unverified-<derived name>`: `holding_name_is_bounded` refuses a leading `.`, so
+no recovery pass can ever derive that name, and no recorded row names it. It is
+never adopted, never charged to a slot and never deleted; the command refuses,
+the payload walk keeps charging its bytes, and the generation's own row stays
+recorded (its root is wherever the racer moved it), so the slot is never silently
+freed. The hot idle path keeps the brief's single durable write after the rename,
+which is why it relies on this containment plus the derivation rather than a
+recorded pre-rename identity; the residual it accepts is a crash inside the
+microsecond window between the verified open and the `renameat` of an *identical*
+generation's own tree, which the brief's "crash before the record leaves the slot
+record in place" rule covers.
+
+**A legacy migration binds its rename durably before it happens.** The rare,
+one-time legacy path can afford one extra write, so before the rename it records
+a bounded `hold_intent` (the derived name and the identity the #155 completeness
+preflight verified) on the `Evicting` row. Recovery therefore adopts an
+interrupted migration only against that recorded intent: a directory that merely
+carries the derived name, or one whose identity differs from the bound root, is
+never adopted — the record, its charge and any journal stay, the pool keeps its
+refusal, and only a replay decides. An `Evicting` row with no intent adopts
+nothing at all.
+
 **Only a positively classified miss is absence.** A recorded holding row is
 dropped when its entry is gone with `NotFound`. Any other `lstat` failure
 (`EACCES`, `EIO`, an over-bound name) is **unknown**, never absence: the row and
@@ -395,6 +421,16 @@ and `effigy proof:holding-delete:test` its self-check (one private temporary
 directory, removed before it returns; no child, pool or staging). Every native
 run needs its own owner activation, and the counted run and the independent
 reviewer native of the Elevated gate are separate.
+
+Its concurrency case first takes two entry-count samples of the held tree while
+only the deleter runs and requires them to strictly decrease: measured progress
+under the deleter's own non-blocking custody, which no other pass can claim while
+it holds the flock. Only then does the competitor start, and its admission must
+complete with the deleter still alive and that tree still non-empty, inside the
+in-lock control bound. Its diagnostic mode also runs every fixture command in its
+own session and confirms each group closed (`killpg` then `killpg(pid, 0)`) before
+it continues: a case may not leave a descendant behind, and an unconfirmed group
+ends the run rather than continuing with unknown custody.
 
 The proof's lock figure is the **whole eviction transaction under the pool
 lock** — victim and rank checks, the identity-verified rename and the one durable

@@ -55,6 +55,7 @@ import re
 import os
 import shutil
 import stat
+import signal
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,10 @@ INLOCK_CONTROL_SLACK_S = 2.0
 # How long the deleter keeps custody before the competitor arrives, so the
 # deletion is measurably in progress when the competitor takes the pool lock.
 CONCURRENT_CUSTODY_S = 0.5
+# The interval between two entry-count samples of the held tree. A strictly
+# decreasing count between them is measured progress under the deleter's
+# custody: nobody else can claim the entry while it holds the flock.
+PROGRESS_INTERVAL_S = 0.3
 MAX_RECEIPT_BYTES = 64 * 1024
 SELECTOR = "rust:holding-delete"
 COMMAND = [
@@ -178,6 +183,14 @@ def unexecuted(names: tuple[str, ...] | list[str]) -> None:
         for entry in CASES:
             if entry["name"] == name and entry["result"] == "unexecuted":
                 entry["result"] = "unexecuted"
+
+
+def close_children() -> bool:
+    """Close every fixture group this process still tracks; report closure."""
+    closed = True
+    for label, handle in list(CHILDREN):
+        closed = discard(handle, label) and closed
+    return closed and not CHILDREN
 
 
 def child_faults() -> str | None:
@@ -317,10 +330,12 @@ def plan_document() -> dict:
             },
             {
                 "name": "concurrent-admission",
-                "oracle": "a new-slot admission (observed by the pool's own "
-                "ledger row appearing) completes while the deleter is alive and "
-                "the held tree is provably still being deleted, and that "
-                "admission stays inside "
+                "oracle": "two entry-count samples of the held tree taken while "
+                "only the deleter runs strictly decrease (measured progress under "
+                "its non-blocking custody), then a new-slot admission (observed by "
+                "the pool's own ledger row appearing) completes with the deleter "
+                "still alive and that tree still non-empty, and that admission "
+                "stays inside "
                 f"{INLOCK_CONTROL_FACTOR}x the same admission measured on a "
                 f"pressure-free pool plus {INLOCK_CONTROL_SLACK_S}s. An in-lock "
                 "deletion would delay it by the whole deletion and fail the "
@@ -365,6 +380,7 @@ def plan_document() -> dict:
             "inlock_control_factor": INLOCK_CONTROL_FACTOR,
             "inlock_control_slack_s": INLOCK_CONTROL_SLACK_S,
             "concurrent_custody_s": CONCURRENT_CUSTODY_S,
+            "progress_interval_s": PROGRESS_INTERVAL_S,
         },
         "observations": {
             "lock_held": "the product's debug-only OXIDE_TEST_HOLDING_LOCK_LOG "
@@ -502,6 +518,10 @@ def self_check() -> None:
     expect(
         plan["limits"]["concurrent_custody_s"] == 0.5,
         "the concurrent custody lead changed",
+    )
+    expect(
+        plan["limits"]["progress_interval_s"] == 0.3,
+        "the progress sampling interval changed",
     )
     expect(len(plan["cases"]) == 4, "the plan case count changed")
     expect(plan["disk"]["fixture_roots"] == 4, "the plan fixture count changed")
@@ -711,6 +731,11 @@ def start_check(subject: str, workspace: str, env: dict, label: str) -> subproce
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        # One session per fixture command: the child and every descendant it
+        # starts (Oxide's own Cargo group) are this proof's own process tree, so
+        # a discard can close the whole group and confirm it rather than leaving
+        # a Cargo behind.
+        start_new_session=True,
     )
     CHILDREN.append((label, handle))
     say(f"{label}: started (pid {handle.pid})")
@@ -718,29 +743,52 @@ def start_check(subject: str, workspace: str, env: dict, label: str) -> subproce
 
 
 def finish(handle: subprocess.Popen, label: str) -> tuple[int, str]:
+    """Collect one fixture child, keeping custody if it does not close.
+
+    A child still running at the bounded wait stays **tracked**: dropping it
+    would lose its custody, so the timeout propagates to the collector, which
+    closes the whole group and can then report what happened.
+    """
     work_left()
-    try:
-        output, _ = handle.communicate(timeout=work_left())
-    finally:
-        CHILDREN[:] = [entry for entry in CHILDREN if entry[1] is not handle]
+    output, _ = handle.communicate(timeout=work_left())
+    CHILDREN[:] = [entry for entry in CHILDREN if entry[1] is not handle]
     say(f"{label}: exit {handle.returncode}")
     return handle.returncode, output
 
 
-def discard(handle: subprocess.Popen, label: str) -> None:
-    """Wait for a child this process started; a stuck one is killed by PID.
+def group_closed(pgid: int) -> bool:
+    """Whether a session this process created has no member left."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
-    Only PIDs this process started are ever signalled, and only after a bounded
-    wait, so an unknown custody outcome is recorded rather than leaked.
+
+def discard(handle: subprocess.Popen, label: str) -> bool:
+    """Close one fixture command's whole group and confirm it is gone.
+
+    Only a group this process created (`start_new_session=True`) is signalled,
+    and only after a bounded wait. Returns whether every member is confirmed
+    gone; `False` is unknown custody and must end a diagnostic run.
     """
     try:
-        handle.communicate(timeout=10)
+        handle.communicate(timeout=5)
     except subprocess.TimeoutExpired:
-        handle.kill()
-        handle.wait(timeout=30)
-    finally:
-        CHILDREN[:] = [entry for entry in CHILDREN if entry[1] is not handle]
-    say(f"{label}: discarded (exit {handle.returncode})")
+        try:
+            os.killpg(handle.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            handle.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+    CHILDREN[:] = [entry for entry in CHILDREN if entry[1] is not handle]
+    closed = group_closed(handle.pid) and handle.returncode is not None
+    say(f"{label}: discarded (exit {handle.returncode}, group closed {closed})")
+    return closed
 
 
 def wait_for_holding_row(pool: str, timeout: float = 20.0) -> dict | None:
@@ -962,12 +1010,18 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         deleter.poll() is None,
         "the deleter finished before the competitor started; the case is vacuous",
     )
-    remaining_before = entry_count(held)
+    first_sample = (time.perf_counter(), entry_count(held))
+    time.sleep(PROGRESS_INTERVAL_S)
+    second_sample = (time.perf_counter(), entry_count(held))
     expect(
-        0 < remaining_before < planted_total,
-        f"the deletion made no measurable progress before the control "
-        f"({remaining_before} of {planted_total} entries left)",
+        0 < second_sample[1] < first_sample[1] < planted_total,
+        f"the deletion made no measurable progress while the deleter held "
+        f"custody ({first_sample[1]} then {second_sample[1]} of {planted_total} "
+        "entries left)",
     )
+    remaining_before = second_sample[1]
+    progressed = first_sample[1] - second_sample[1]
+    progress_rate = progressed / max(second_sample[0] - first_sample[0], 0.001)
     slots_before = {str(entry["id"]) for entry in slot_rows(pool)}
     competitor = start_check(subject, competitor_workspace, env, "competitor")
     admission_started = time.perf_counter()
@@ -1019,6 +1073,9 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         "control_admission_s": round(control_elapsed, 3),
         "inlock_bound_s": round(bound, 3),
         "admission_during_deletion_s": round(admission_elapsed, 3),
+        "progress_samples": [first_sample[1], second_sample[1]],
+        "progress_entries": progressed,
+        "progress_entries_per_s": round(progress_rate, 1),
         "remaining_before": remaining_before,
         "remaining_at_admission": remaining_at_admission,
         "deleter_alive_at_admission": deleter_alive,
@@ -1037,10 +1094,15 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     deleter = start_check(subject, killer_workspace, env, "killed-deleter")
     row = wait_for_holding_row(pool)
     expect(row is not None, "the deleter never recorded a holding row")
-    # Kill only the child this proof started.
-    deleter.kill()
-    deleter.wait(timeout=30)
-    say(f"killed the deleter (exit {deleter.returncode})")
+    # Kill only the session this proof started, and confirm its whole group is
+    # gone before trusting what it left behind.
+    try:
+        os.killpg(deleter.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    closed = discard(deleter, "killed-deleter")
+    expect(closed, "the killed deleter's group could not be confirmed closed")
+    say("killed the deleter")
     work_left()
     rows = holding_rows(pool)
     expect(len(rows) == 1, f"the killed deleter left no recorded row: {rows}")
@@ -1133,8 +1195,11 @@ def run_cases() -> None:
         except AssertionError as error:
             record_fault(name, str(error))
             mark(name, "failed", error=str(error)[:400])
-            for label, handle in list(CHILDREN):
-                discard(handle, label)
+            if not close_children():
+                # A group this case started could not be confirmed closed, so
+                # its custody is unknown: keep-going is no longer safe.
+                unexecuted([other for other, _ in cases[index + 1 :]])
+                raise
             if not DIAGNOSTIC:
                 unexecuted([other for other, _ in cases[index + 1 :]])
                 raise
@@ -1142,8 +1207,7 @@ def run_cases() -> None:
             fault = f"{name}: unclassified outcome {type(error).__name__}: {error}"
             record_fault(name, fault)
             mark(name, "aborted", error=fault[:400])
-            for label, handle in list(CHILDREN):
-                discard(handle, label)
+            close_children()
             unexecuted([other for other, _ in cases[index + 1 :]])
             raise
     FACTS.update(facts)
@@ -1211,8 +1275,10 @@ def main(argv: list[str]) -> int:
         fault = f"unclassified outcome {type(error).__name__}: {error}"
         record_fault("proof", fault)
     finally:
-        for label, handle in list(CHILDREN):
-            discard(handle, label)
+        custody_closed = close_children()
+        if not custody_closed and fault is None:
+            fault = "a fixture group could not be confirmed closed"
+            record_fault("proof", fault)
     # Every case the run did not reach stays `unexecuted`, and a case that
     # reached an unclassified outcome is `aborted`: neither is a pass.
     if fault is not None:
@@ -1229,9 +1295,16 @@ def main(argv: list[str]) -> int:
         "selector": SELECTOR + (":diagnostic" if DIAGNOSTIC else ""),
         "qualified": bool(not DIAGNOSTIC and fault is None),
         "mode": "diagnostic" if DIAGNOSTIC else "counted",
-        "activation": "Uncounted diagnostic collection. The counted author "
-        "native and the independent reviewer native are owner-gated activations "
-        "and are not run by this mode; this receipt is never their evidence.",
+        "activation": (
+            "Uncounted diagnostic collection: it is never the counted evidence, "
+            "and no native activation is claimed by it. The counted author "
+            "native and the independent reviewer native are separate "
+            "owner-gated activations."
+            if DIAGNOSTIC
+            else "Counted author native run under its own owner activation. The "
+            "independent reviewer native is a separate activation and is not "
+            "evidence here."
+        ),
         "supervisor": {
             "path": "scripts/bounded-test.py",
             "sha256": runner_sha,
@@ -1252,6 +1325,14 @@ def main(argv: list[str]) -> int:
             "explicitly with RUSTUP_TOOLCHAIN pinned",
         },
         "case_tally": tally,
+        "custody": {
+            "fixture_children": "each fixture command runs in its own session "
+            "(start_new_session), so its descendants are this proof's own group",
+            "closure": "every group is waited for, or KILLed by its own group id "
+            "and reaped, and then confirmed gone with killpg(pid, 0) before the "
+            "run continues; an unconfirmed group ends a diagnostic run",
+            "unreaped": [label for label, _ in CHILDREN],
+        },
         "source_commit": commit,
         "source_tree": tree,
         "binary_sha256": sha256_file(SUBJECT) if SUBJECT and os.path.isfile(SUBJECT) else None,
