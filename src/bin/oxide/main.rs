@@ -642,22 +642,27 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     );
     let lease = match lease {
         Ok(inner) => Ok(inner),
-        Err(error) => {
+        Err(mut error) => {
             // A capacity refusal can be caused by holding bytes this command is
-            // able to free. The failed attempt's own evictions are not reported
-            // to it, so this pass takes one entry by rotation, outside the pool
-            // lock, and the admission is retried **once** — but only when the
-            // pass positively removed a tree, because that is the only thing
-            // that changed the pool's accounting. Nothing is retried on a pass
-            // that claimed nothing.
+            // able to free. The eviction decision takes **one** bounded victim
+            // per attempt, so this command publishes one pending tree outside
+            // the pool lock, retries, and re-evaluates from the resulting
+            // figure: each round deletes one tree and the admission decides
+            // again, so no warm slot is retired ahead of the decision that needs
+            // it. The loop is bounded; a pass that removes nothing, or the
+            // bound, leaves the last refusal standing.
             holding_sweep.finish();
-            let mut reclaim = HoldingSweep::start(store.pool.clone(), None);
-            let removed = reclaim.finish().is_some_and(|pass| pass.gone);
-            if removed {
+            let mut last: Result<Result<(store::Lease, Gate, Vec<String>), Stop>, String> =
+                Err(error);
+            for _ in 0..HOLDING_RECLAIM_ROUNDS {
+                let mut pass = HoldingSweep::start(store.pool.clone(), None);
+                if !pass.finish().is_some_and(|drain| drain.gone) {
+                    break;
+                }
                 eprintln!(
-                    "oxide: deleted a held slot tree in the holding area; retrying the admission once"
+                    "oxide: deleted a held slot tree in the holding area; re-evaluating the admission"
                 );
-                lease_with_gate(
+                last = lease_with_gate(
                     &store,
                     &key,
                     invocation.profile,
@@ -666,10 +671,15 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
                     label.as_deref(),
                     &mut waits,
                     &mut grants,
-                )
-            } else {
-                Err(error)
+                );
+                // A success, a stop or an execution failure ends the loop; a
+                // capacity refusal is re-evaluated after the next published
+                // tree, until one pass removes nothing or the bound is reached.
+                if last.is_ok() {
+                    break;
+                }
             }
+            last
         }
     };
     let (mut held, mut gate, mut pending) = match lease? {
@@ -1769,6 +1779,11 @@ impl StatusMode {
 /// product (it runs beside the build and is resumed by the next command); this
 /// is only the wait at exit, so one huge tree never holds a command open.
 const HOLDING_SWEEP_WAIT: Duration = Duration::from_secs(60);
+/// How many publish-and-re-evaluate rounds one command makes after a capacity
+/// refusal. Each round deletes exactly one pending tree outside the pool lock
+/// and then lets the admission decide again: the deletion is what changes the
+/// figure, so nothing is evicted ahead of the decision that needs it.
+const HOLDING_RECLAIM_ROUNDS: usize = 4;
 /// How often the bounded exit wait reports its progress.
 const HOLDING_SWEEP_REPORT: Duration = Duration::from_secs(2);
 

@@ -98,14 +98,20 @@ fn lease_after_publishing(
     match managed::lease(request.clone()) {
         Ok(grant) => Ok(grant),
         Err(error @ (LeaseError::Full | LeaseError::CapacityCharged { .. })) => {
-            let removed = managed::drain_holding(pool, None)
-                .map(|pass| pass.gone)
-                .unwrap_or(false);
-            if removed {
-                managed::lease(request)
-            } else {
-                Err(error)
+            let mut last = Err(error);
+            for _ in 0..4 {
+                let removed = managed::drain_holding(pool, None)
+                    .map(|pass| pass.gone)
+                    .unwrap_or(false);
+                if !removed {
+                    break;
+                }
+                last = managed::lease(request.clone());
+                if last.is_ok() {
+                    break;
+                }
             }
+            last
         }
         Err(other) => Err(other),
     }
@@ -126,16 +132,22 @@ fn lease_publishing(
     match lease_injected(request.clone()) {
         Ok(grant) => (Ok(grant), None),
         Err(error @ (LeaseError::Full | LeaseError::CapacityCharged { .. })) => {
-            // Deleting one pending tree is what changes the figure; a pass that
-            // removes nothing leaves the refusal to stand.
-            let removed = managed::drain_holding(pool, None)
-                .map(|pass| pass.gone)
-                .unwrap_or(false);
-            if removed {
-                (lease_injected(request), Some(error))
-            } else {
-                (Err(error.clone()), Some(error))
+            // The product publishes one tree outside the lock and re-evaluates,
+            // up to a small bound; a pass that removes nothing ends it.
+            let mut last = Err(error.clone());
+            for _ in 0..4 {
+                let removed = managed::drain_holding(pool, None)
+                    .map(|pass| pass.gone)
+                    .unwrap_or(false);
+                if !removed {
+                    break;
+                }
+                last = lease_injected(request.clone());
+                if last.is_ok() {
+                    break;
+                }
             }
+            (last, Some(error))
         }
         Err(other) => (Err(other.clone()), Some(other)),
     }
@@ -6740,6 +6752,38 @@ fn an_admission_reports_each_holding_entry_it_created() {
     assert_eq!(
         left[0].name, second[0],
         "the named entry was not the one deleted"
+    );
+}
+
+/// A private capture name inside a held tree is #155 journal state, and with the
+/// journal retired no record names it: the outside-lock deletion keeps it as
+/// uncertain instead of unlinking it as ordinary content, and the tree stays
+/// held, charged and reported.
+#[test]
+fn an_unrecorded_private_capture_in_a_held_tree_is_quarantined() {
+    let fixture = Fixture::new("capture-quarantine");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "capture-quarantine");
+    let capture = slot_path.join("build/.oxide-capture-fedcba9876543210");
+    fs::write(&capture, b"uncertain journal state").expect("a private capture name");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).remove(0);
+    let held = holding_area(&pool).join(&row.name);
+    let pass = managed::drain_holding(&pool, None).expect("the pass");
+    assert!(!pass.gone, "a private capture name was deleted: {pass:?}");
+    assert!(
+        pass.refused
+            .iter()
+            .any(|item| item.contains("unrecorded private capture")),
+        "the quarantine is not reported: {pass:?}"
+    );
+    assert!(
+        held.join("build/.oxide-capture-fedcba9876543210").exists(),
+        "the uncertain capture name was removed"
+    );
+    assert_eq!(
+        holding_rows(&pool).len(),
+        1,
+        "the tree stays held and charged"
     );
 }
 

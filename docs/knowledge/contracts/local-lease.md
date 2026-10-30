@@ -342,6 +342,14 @@ charge and any journal stay, the pool keeps its refusal, and only a replay (for 
 legacy row) or the operator decides. An `Evicting` row with no intent adopts
 nothing at all, and a held row is never a rename source.
 
+**A private capture name is never ordinary content.** The recursive #155
+inventory preflight that once refused such a tree ran under the pool lock and is
+gone; the same rule now lives in the outside-lock deletion. A name matching the
+private capture prefix (`.oxide-capture-…`) inside a held tree is #155 journal
+state that no record names any more, so it is **kept as uncertain**: the entry
+stays in place, the tree stays held and charged, and the pass reports it. It is
+never unlinked as ordinary content, and no locked walk is needed to notice it.
+
 **A rename that moved the wrong object is contained as well.** The source root's
 descriptor identity is compared with the caller's verified identity before the
 rename and with the moved entry afterwards. If a swap happened inside that
@@ -387,6 +395,15 @@ otherwise one starting from a rotating index derived from the pool's monotonic
 rank sequence, so a permanently refused entry never keeps another entry from
 being deleted by a later command. A deleted entry's descriptor is closed with
 its last name gone, so a later pass can never re-acquire it.
+
+**One bounded victim per decision.** Because a held tree keeps its bytes charged,
+the figure cannot fall inside one locked attempt. Byte pressure therefore selects
+**one** victim, releases the lock, and the command publishes that tree and
+re-evaluates from the new figure — up to a small fixed number of rounds, each
+removing exactly one tree. Nothing evicts a warm idle slot ahead of the decision
+that needs it, and a pool that cannot converge refuses with a bounded capacity
+result. The count ceilings (slot and project) still evict only as many whole idle
+slots as they need.
 
 **Accounting.** A holding row is charged its recorded bytes (the generation's
 closed observation, else the largest recorded slot, at least one byte) in the

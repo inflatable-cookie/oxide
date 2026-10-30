@@ -2192,7 +2192,16 @@ impl Pool {
                     if self.unmeasured_charge_exhausts_budget() {
                         return Err(self.capacity_refusal(used));
                     }
-                    self.evict_idle_until_under_cap(plan)?;
+                    // **One** bounded victim per attempt. A held tree keeps its
+                    // bytes charged until it is positively removed, so the
+                    // figure cannot fall inside this locked attempt: looping
+                    // here would retire every eligible idle slot, including warm
+                    // ones that the next decision may not need. The caller
+                    // publishes that one tree outside the lock, and the next
+                    // attempt re-evaluates from scratch.
+                    if !self.evict_one_idle_with(plan)? {
+                        return Err(self.capacity_refusal(used));
+                    }
                     let used = self.pressure()?;
                     if used >= self.budget {
                         return Err(self.capacity_refusal(used));
@@ -3071,29 +3080,6 @@ impl Pool {
         };
         let facts = binding.verify().map_err(|_| LeaseError::BackingMismatch)?;
         Ok(facts.available_bytes)
-    }
-
-    fn evict_idle_until_under_cap(&mut self, plan: &VictimPlan) -> Result<(), LeaseError> {
-        let mut remaining = self.ledger.slots.len();
-        loop {
-            // Byte pressure remeasures the recorded figure after each deletion
-            // and stops when it is under budget or no safe idle whole slot
-            // remains.
-            if self.pressure()? < self.budget {
-                return Ok(());
-            }
-            if remaining == 0 {
-                return Ok(());
-            }
-            let before = self.ledger.slots.len();
-            if !self.evict_one_idle_with(plan)? {
-                return Ok(());
-            }
-            if self.ledger.slots.len() >= before {
-                return Err(LeaseError::UnknownAccounting);
-            }
-            remaining -= 1;
-        }
     }
 
     /// One eligible idle victim for this admission's policy (design §6.7),
@@ -5051,6 +5037,16 @@ fn delete_holding_children(
                     continue;
                 }
             };
+            // A private capture name is #155 journal state, never ordinary
+            // content: the retirement of the journal means no record names one
+            // any more, so an unrecorded one is *uncertain* and is kept exactly
+            // where it is. The tree stays held and charged; the old recursive,
+            // in-lock preflight used to refuse the migration for the same
+            // reason, and this is the same rule applied outside the lock.
+            if crate::owned_delete::is_capture_name(std::ffi::OsStr::from_bytes(name.to_bytes())) {
+                holding_refuse(stats, &name, "an unrecorded private capture");
+                continue;
+            }
             match facts.file_type() {
                 libc::S_IFDIR => {
                     if facts.device != device {
@@ -6519,8 +6515,12 @@ mod removable_pool_path_tests {
             assert!(used < CAP, "pool figure {used} is not below the cap");
             // The frozen rule: the cap comparison never sees the volume total.
             // Restoring `max(recorded, volume_used)` would make this evict.
-            pool.evict_idle_until_under_cap(&VictimPlan::any())
-                .expect("no pressure");
+            // Below the cap the byte-pressure branch takes no victim at all:
+            // the decision is the comparison, and nothing below it runs.
+            assert!(
+                used < pool.budget,
+                "foreign volume bytes were charged into the pool figure"
+            );
             assert!(
                 pool.slot(1).is_some(),
                 "a pool below its cap evicted an idle slot for foreign volume bytes"
@@ -6853,7 +6853,9 @@ mod removable_pool_path_tests {
         // The same incomplete figure must not authorise a byte-pressure
         // deletion on the known-usage path.
         with_accounting_limits(1, 64, 60_000, || {
-            let outcome = pool.evict_idle_until_under_cap(&VictimPlan::any());
+            // The byte-pressure figure is unknown, so no victim may be chosen
+            // from it: the one-victim decision refuses with the incomplete scan.
+            let outcome = pool.pressure();
             assert!(
                 matches!(outcome, Err(LeaseError::AccountingIncomplete(_))),
                 "byte pressure on an unknown removable figure must refuse: {outcome:?}"

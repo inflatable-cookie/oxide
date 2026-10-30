@@ -719,9 +719,50 @@ def self_check_oracles(scratch: str) -> None:
         f"the deletion-line oracle changed: {figures}",
     )
     expect(deletion_figures("no deletion here") == [], "the deletion oracle invented a line")
+    # Every constant the case bodies and the plan use must exist: a deleted
+    # constant that is still referenced aborted a diagnostic run with NameError
+    # before any case (the apparatus regression this check exists for).
+    source = read_text(os.path.abspath(__file__))
+    module = globals()
+    referenced = set()
+    for name, value in list(module.items()):
+        if callable(value) and getattr(value, "__module__", None) == "__main__":
+            code = getattr(value, "__code__", None)
+            if code is not None:
+                referenced.update(code.co_names)
+    # Attribute lookups (`os.X`, `signal.X`, `stat.S_IFDIR`) also appear as
+    # names; only a bare module-level constant of this file can be undefined
+    # here, so the check is restricted to the file's own upper-case definitions.
+    declared = set()
+    for line in read_text(os.path.abspath(__file__)).splitlines():
+        match = re.match(r"^([A-Z][A-Z0-9_]*)(?::[^=]*)?\s*=", line)
+        if match:
+            declared.add(match.group(1))
+    missing = sorted(name for name in declared if name not in module)
+    expect(
+        not missing,
+        f"the proof references undefined constants: {missing}",
+    )
+    # The concurrency case's own apparatus resolves: its cap, entry count and
+    # control pool are the pending-tree shape, not a deleted constant.
+    expect(PENDING_ENTRIES > 0 and PENDING_ENTRY_BYTES > 0, "pending shape changed")
+    expect(
+        PENDING_CAP.endswith("MiB"),
+        f"the concurrency cap is not a size: {PENDING_CAP}",
+    )
+    # The control admission really resolves the concurrency fixture's cap (its
+    # globals are looked up by name at call time, so the code names are the
+    # authority here), and no retired concurrency constant survives.
+    control_names = set(measure_control_admission.__code__.co_names)
+    expect(
+        "PENDING_CAP" in control_names,
+        f"the control admission does not use the concurrency cap: {sorted(control_names)}",
+    )
+    retired = "CONCURRENT" + "_CAP"
+    expect(retired not in source, "a retired concurrency constant is still referenced")
+
     # The proof never creates a session and never signals a group: fixture
     # children and their descendants stay in the qualified supervisor's session.
-    source = read_text(os.path.abspath(__file__))
     # The literals are assembled here so this check does not match itself.
     for forbidden in ("start_new" + "_session", "kill" + "pg", "os.set" + "sid"):
         expect(
@@ -1127,7 +1168,7 @@ def measure_control_admission(root: str, subject: str) -> float:
     """
     control = private_dir(os.path.join(root, "control"))
     pool = os.path.join(control, "pool")
-    env = fixture_env(control, pool, os.path.join(control, "control-lock.log"), CONCURRENT_CAP)
+    env = fixture_env(control, pool, os.path.join(control, "control-lock.log"), PENDING_CAP)
     first = create_project(control, "control-a")
     code, output, _ = check(subject, first, env, "control-seed")
     expect(code == 0, f"the control's seed admission exited {code}: {output[-2000:]}")
