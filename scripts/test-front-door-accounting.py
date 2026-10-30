@@ -1427,6 +1427,112 @@ def self_check() -> int:
         os.environ.clear()
         os.environ.update(holder)
         shutil.rmtree(evidence_root, ignore_errors=True)
+    # The front-door source gate is fail-closed, exactly like the removal
+    # proof's: both git calls must exit 0, their answers must be an exact
+    # 40-hex identity and an empty tracked status, and a failed/empty answer
+    # aborts with the fault recorded and every case unexecuted before any
+    # scratch, staging or child exists.
+    def canned(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(["git"], returncode, stdout=stdout, stderr=stderr)
+
+    original_git = globals()["run_git"]
+    gate_root = tempfile.mkdtemp(prefix="fd-source-gate.")
+    holder = dict(os.environ)
+    try:
+        for label, head, status, needle in (
+            (
+                "status nonzero with empty stdout",
+                canned(0, "a" * 40 + "\n"),
+                canned(1, "", "fatal: not a git repository"),
+                "worktree status exited 1",
+            ),
+            (
+                "rev-parse nonzero",
+                canned(128, "", "fatal: not a git repository"),
+                canned(0, ""),
+                "source lookup exited 128",
+            ),
+            ("rev-parse empty", canned(0, "\n"), canned(0, ""), "no exact source identity"),
+            ("non-exact identity", canned(0, "deadbeef\n"), canned(0, ""), "no exact source identity"),
+            (
+                "dirty tracked worktree",
+                canned(0, "a" * 40 + "\n"),
+                canned(0, " M scripts/test-front-door-accounting.py\n"),
+                "tracked worktree is not clean",
+            ),
+        ):
+            answers = [head, status]
+            calls = []
+
+            def respond(arguments, answers=answers, calls=calls):
+                calls.append(list(arguments))
+                return answers[len(calls) - 1]
+
+            globals()["run_git"] = respond
+            try:
+                resolve_source()
+            except UnknownOutcome as error:
+                expect_true(needle in str(error), f"{label}: {error}")
+            else:
+                fail(f"{label}: the source gate accepted it")
+            expect_true(
+                calls == [["rev-parse", "HEAD"], ["status", "--porcelain", "--untracked-files=no"]],
+                f"{label}: gate calls {calls}",
+            )
+
+        def clean(arguments):
+            return canned(0, "a" * 40 + "\n") if arguments[0] == "rev-parse" else canned(0, "")
+
+        globals()["run_git"] = clean
+        expect_true(resolve_source() == "a" * 40, "the clean source gate did not return its identity")
+
+        # End to end through `run_proof`: a failed status is recorded on the
+        # outcome with the fault, no completed/failed case, every case
+        # unexecuted, and no scratch or staging effect at all.
+        if sys.platform == "darwin":
+            canonical = os.path.realpath(gate_root)
+            os.environ.update(
+                {
+                    "OXIDE_TASK_SCRATCH_ROOT": canonical,
+                    "OXIDE_PROOF_EVIDENCE": os.path.join(canonical, "evidence"),
+                    "TMPDIR": canonical,
+                    "TMP": canonical,
+                    "TEMP": canonical,
+                    "OXIDE_PROOF_DEADLINE_NS": str(
+                        time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 300 * 10**9
+                    ),
+                }
+            )
+            os.makedirs(os.environ["OXIDE_PROOF_EVIDENCE"], mode=0o700, exist_ok=True)
+            globals()["run_git"] = lambda arguments: (
+                canned(0, "a" * 40 + "\n") if arguments[0] == "rev-parse"
+                else canned(1, "", "fatal: not a git repository")
+            )
+            outcome = diagnostic_outcome()
+            try:
+                run_proof(True, outcome)
+            except UnknownOutcome as error:
+                expect_true("worktree status exited 1" in str(error), f"unexpected abort {error}")
+            else:
+                fail("a failed status did not abort the run")
+            expect_true(outcome["aborted"] is not None and "worktree status exited 1" in outcome["aborted"],
+                        f"outcome abort {outcome.get('aborted')!r}")
+            expect_true(outcome["first_fault"] == outcome["aborted"],
+                        f"outcome fault {outcome.get('first_fault')!r}")
+            expect_true(outcome["completed"] == [] and outcome["failed"] == [],
+                        f"outcome cases {outcome['completed']} / {outcome['failed']}")
+            expect_true(outcome["unexecuted"] == [case for case, _, _ in CASES],
+                        f"outcome unexecuted {outcome.get('unexecuted')}")
+            expect_true(outcome["source"] is None and outcome["root"] is None,
+                        f"a refused source recorded {outcome.get('source')!r} / {outcome.get('root')!r}")
+            expect_true(os.listdir(gate_root) == ["evidence"],
+                        f"the refused source left an effect: {os.listdir(gate_root)}")
+    finally:
+        globals()["run_git"] = original_git
+        os.environ.clear()
+        os.environ.update(holder)
+        shutil.rmtree(gate_root, ignore_errors=True)
+
     # A setup failure (before the first case) is recorded as an abort with the
     # fault and every case unexecuted, in a real receipt — never an empty,
     # fault-less document.
@@ -1496,6 +1602,50 @@ def mode_from_args(arguments: list) -> str | None:
     return None
 
 
+def run_git(arguments: list) -> subprocess.CompletedProcess:
+    """One bounded git call for the source gate."""
+    return subprocess.run(
+        ["git", *arguments], cwd=REPO, capture_output=True, text=True, timeout=30
+    )
+
+
+def resolve_source() -> str:
+    """The exact source identity this run binds to, or an abort.
+
+    Checked before any scratch, staging or child. Both git calls must exit 0,
+    their answers must be an exact 40-hex commit id and an empty tracked status,
+    and an empty stdout from a failed call is never a clean worktree or an
+    identity. A failing or interrupted call, a nonzero exit, an empty or
+    non-exact identity and a dirty tracked worktree are outcomes this proof
+    cannot classify: they raise [`UnknownOutcome`] and the caller records the
+    fault with every planned case unexecuted, before any effect.
+    """
+    try:
+        head = run_git(["rev-parse", "HEAD"])
+        status = run_git(["status", "--porcelain", "--untracked-files=no"])
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as failure:
+        need(f"source lookup failed: {failure!r}")
+    if head.returncode != 0:
+        need(
+            f"the source lookup exited {head.returncode}: "
+            f"{(head.stderr or '').strip()[-400:]!r}"
+        )
+    if status.returncode != 0:
+        need(
+            f"the worktree status exited {status.returncode} (its output is not a clean "
+            f"worktree): {(status.stderr or '').strip()[-400:]!r}"
+        )
+    source = (head.stdout or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", source):
+        need(f"no exact source identity: {source!r}")
+    dirty = (status.stdout or "").strip()
+    if dirty:
+        need(f"the tracked worktree is not clean: {dirty.splitlines()[:4]}")
+    return source
+
+
 def run_proof(diagnostic: bool, outcome: dict) -> int:
     """The one counted or diagnostic run. Mutates `outcome` so the caller can
     write one truthful receipt whatever path ends this run."""
@@ -1510,15 +1660,22 @@ def run_proof(diagnostic: bool, outcome: dict) -> int:
     if not (os.path.isdir(os.environ.get("OXIDE_PROOF_EVIDENCE", "")) and "OXIDE_PROOF_DEADLINE_NS" in os.environ):
         need("not under the qualified shared guard")
     work_deadline()
-    if subprocess.run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True,
-                      text=True, timeout=30).stdout.strip():
-        need("the checkout is not clean, so HEAD does not name its source")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
-                          text=True, timeout=30).stdout.strip()
+    try:
+        head = resolve_source()
+    except (KeyboardInterrupt, SystemExit):
+        record_abort(outcome, "source", "interrupted")
+        raise
+    except BaseException as failure:
+        # Fail closed before any scratch, staging or child: no effects at all,
+        # and the fault and every planned case are recorded for the receipt.
+        record_abort(outcome, "source", failure)
+        print(f"source: ABORTED {failure}", file=sys.stderr)
+        raise
+    outcome["source"] = head
     reserve(scratch, "admission")
     parent = os.path.realpath(tempfile.mkdtemp(prefix="front-door.", dir=scratch))
     os.chmod(parent, 0o700)
-    outcome.update(source=head, root=parent)
+    outcome["root"] = parent
     say(f"source {head}, scratch {parent} inside the guard's known shared root")
     try:
         oxide = stage(parent, staging_environment())
