@@ -486,6 +486,32 @@ estimator is shown to fail where the corrected one is discriminating. Every nati
 run needs its own owner activation, and the counted run and the independent
 reviewer native of the Elevated gate are separate.
 
+**Premise checklist, recorded before any activation.** The script carries the
+nine items of the [proof-authoring premise
+checklist](workflow.md#proof-authoring-premise-checklist) in `PREMISE_CHECKLIST`,
+and `--plan` prints them: private `HOME` and rustup (the invoking `RUSTUP_HOME`,
+or the invoking `HOME/.rustup` when unset, is read before any private `HOME`
+exists and passed to staging and every fixture with `RUSTUP_TOOLCHAIN` pinned and
+`RUSTUP_AUTO_INSTALL=0`; staging is `--locked --offline` and each fixture crate
+ships its own lock); the account-home control (`OXIDE_TEST_HOME_FROM_ENV=1`
+beside the private `HOME`); environment isolation (the staging sweep drops every
+`CARGO_TARGET_`/`CARGO_BUILD_`/`CARGO_ENCODED_`/`SCCACHE_`/`OXIDE_`/`XDG_` key and
+every compiler override, and the fixture environment is built from a fixed
+allow-list); automatic adoption, Cargo's external-subcommand argv and owned
+images (all three inapplicable, because no case uses permanent outputs, invokes
+an external subcommand or touches an image); compiler flags (`RUSTFLAGS` frozen
+with the encoded forms dropped); temporary storage (the documented
+`--root-parent /private/tmp` internal-placement exception for the genuine
+internal fixture pool, with per-tree `TMPDIR`/`TMP`/`TEMP`); and macOS `mktemp`
+(no shell `mktemp` anywhere; the self-check's two temporary directories come from
+`tempfile.mkdtemp`, which honours the supervisor's `TMPDIR`, and are removed).
+The pure self-check binds the map to the source it names — all nine items in
+order, every inapplicable item carrying its reason, every applicable disposition
+naming a helper the script really defines — so a disposition cannot drift into a
+claim no case body supports. Recording them activates nothing: the uncounted
+diagnostic, the counted author native and the reviewer native remain separately
+owner-gated, and none has run at this head.
+
 Its concurrency fixture is asymmetrical: a 70,000-entry victim tree (above the
 brief's 20,000-entry floor, sized so its deletion outlasts the bound's two-second
 slack even at a conservative 15,000-unlinks/s floor) beside an 8,000-entry

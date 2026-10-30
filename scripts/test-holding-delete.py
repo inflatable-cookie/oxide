@@ -137,6 +137,65 @@ PROGRESS_BUDGET_S = 60.0
 PROGRESS_MIN_BUCKETS = 3
 MAX_RECEIPT_BYTES = 64 * 1024
 SELECTOR = "rust:holding-delete"
+# The nine items of the fixed proof-authoring premise checklist
+# (docs/knowledge/contracts/workflow.md#proof-authoring-premise-checklist), each
+# with the executable source location that satisfies it or the concrete reason it
+# does not apply. The pure self-check binds this map to the source it names, so a
+# disposition cannot drift into a claim no case body supports, and `--plan`
+# prints it before any activation.
+PREMISE_CHECKLIST = {
+    "1_private_home_and_rustup": (
+        "invoking_rustup_home() (explicit RUSTUP_HOME, else the invoking HOME/.rustup, "
+        "read before any private HOME exists) is passed to stage_subject() and "
+        "fixture_env() with RUSTUP_TOOLCHAIN pinned to " + BUILDER + " and "
+        "RUSTUP_AUTO_INSTALL=0; staging is `cargo build --locked --offline`, and the "
+        "fixture crates are written with their own Cargo.lock by the fixture builder, "
+        "so no toolchain is installed or downloaded"
+    ),
+    "2_account_home_control": (
+        "fixture_env() sets OXIDE_TEST_HOME_FROM_ENV=1 beside the private HOME, so the "
+        "product honours that HOME instead of the account home"
+    ),
+    "3_environment_isolation": (
+        "stage_subject() drops every CARGO_TARGET_/CARGO_BUILD_/CARGO_ENCODED_/SCCACHE_/"
+        "OXIDE_/XDG_ key plus CARGO/RUSTC/RUSTFLAGS/RUSTDOCFLAGS/RUSTC_WRAPPER/"
+        "RUSTC_WORKSPACE_WRAPPER, and fixture_env() builds the child environment from a "
+        "fixed allow-list (private HOME, CARGO_HOME, OXIDE_POOL, OXIDE_POOL_CAP, "
+        "TMPDIR/TMP/TEMP, the toolchain home, the bounded test controls) so no host "
+        "pool, config or account provenance is inherited"
+    ),
+    "4_automatic_adoption": (
+        "not applicable: every fixture is a leased command on a private "
+        "directory-budget pool and none places or reads permanent outputs, so no "
+        "checkout can be automatically adopted and no case needs one created"
+    ),
+    "5_cargo_external_argv": (
+        "not applicable: no case invokes an external Cargo subcommand; the fixtures "
+        "run `oxide run`/`oxide test` and the staged candidate's own commands only"
+    ),
+    "6_owned_images": (
+        "not applicable: the fixture is an internal directory-budget pool, with no "
+        "sparse image, attach, mount or removable device anywhere in the script"
+    ),
+    "7_compiler_flags": (
+        "stage_subject() freezes RUSTFLAGS=-C strip=symbols with assertion-on, "
+        "debug-free profile settings and drops every encoded CARGO_ENCODED_* form, so "
+        "an inherited encoded value cannot override the staged candidate"
+    ),
+    "8_temporary_storage": (
+        "the selector's fixed COMMAND runs the qualified shared supervisor with "
+        "--root-parent /private/tmp (the owner-accepted internal-placement exception "
+        "bd357a4c, which the fixture's genuine internal directory-budget pool needs), "
+        "every case root comes from an explicit path under that parent, and "
+        "fixture_env() gives each fixture tree its own TMPDIR/TMP/TEMP inside it"
+    ),
+    "9_macos_mktemp": (
+        "the script never runs a shell `mktemp`; self_check() creates its two "
+        "temporary directories with `tempfile.mkdtemp(prefix=...)`, which honours the "
+        "supervisor's TMPDIR, and removes both before it returns"
+    ),
+}
+NA_PREMISES = ("4_automatic_adoption", "5_cargo_external_argv", "6_owned_images")
 COMMAND = [
     "python3",
     "scripts/bounded-test.py",
@@ -490,6 +549,14 @@ def plan_document() -> dict:
             "entries/s, about 16.7 ms per entry, under the pool lock) is a "
             "labelled historical reference, not a live comparison",
         },
+        "premise_checklist": {
+            "source": "docs/knowledge/contracts/workflow.md#proof-authoring-premise-checklist",
+            "items": PREMISE_CHECKLIST,
+            "not_applicable": list(NA_PREMISES),
+            "note": "recorded before any activation; the required uncounted "
+            "diagnostic, the counted author native and the reviewer native remain "
+            "separately owner-gated activations, so this plan claims none of them",
+        },
         "live_pool": False,
         "mounted_volume": False,
         "timing": "unmeasured; this plan claims no wall-clock figure",
@@ -629,6 +696,42 @@ def self_check() -> None:
     expect(
         "not a live comparison" in plan["observations"]["legacy_reference"],
         "the historical reference must be labelled, not claimed as live",
+    )
+    expect(
+        list(PREMISE_CHECKLIST) == [
+            "1_private_home_and_rustup",
+            "2_account_home_control",
+            "3_environment_isolation",
+            "4_automatic_adoption",
+            "5_cargo_external_argv",
+            "6_owned_images",
+            "7_compiler_flags",
+            "8_temporary_storage",
+            "9_macos_mktemp",
+        ],
+        "the premise checklist must record all nine items in order",
+    )
+    source = read_text(os.path.abspath(__file__))
+    for item, disposition in PREMISE_CHECKLIST.items():
+        expect(bool(disposition.strip()), f"premise {item} has no disposition")
+        if item in NA_PREMISES:
+            expect(
+                disposition.startswith("not applicable:"),
+                f"premise {item} is declared inapplicable without a reason",
+            )
+        else:
+            # Every applicable disposition names a helper the script really defines.
+            named = re.findall(r"\b([a-z_][a-z0-9_]*)\(\)", disposition)
+            expect(bool(named), f"premise {item} names no executable location")
+            for helper in named:
+                expect(
+                    f"def {helper}(" in source,
+                    f"premise {item} names {helper}(), which this script does not define",
+                )
+    expect(
+        plan["premise_checklist"]["items"] == PREMISE_CHECKLIST
+        and plan["premise_checklist"]["not_applicable"] == list(NA_PREMISES),
+        "the plan must print the recorded premise dispositions",
     )
     expect(POOL_CAP == "8MiB", "the fixture pool budget changed")
     expect(SLOT_ENTRIES == 20_000, "the fixture entry count changed")
