@@ -576,7 +576,20 @@ This is the interval decision `e0f63aa4` refuses to waive ("the under-one-second
 lock interval is not waived"): the figure the counted native must show under a
 second includes the accounting walks the eviction decision makes, not only the
 rename. A command that evicts more than once under one lock records a figure
-that also covers the evictions before it. Its concurrency oracle is positive
+that also covers the evictions before it. Its killed-deleter case runs the
+later command as a **warm reuse of the fixture's own idle slot**, not a new
+project: the fixture is over its cap on purpose (the victim's recorded charge
+plus the reusable slot exceeds the cap), so a new admission would legitimately
+retire an idle whole slot — the very tree that case's oracle requires to survive
+— and the case would prove the fixture's arithmetic rather than the takeover. A
+reuse takes no capacity decision, so the command's only effect on a slot is
+finishing the abandoned holding entry; the case asserts that the killed command
+was reaped, that the row and its partly deleted tree survived, that the later
+command reported and finished it, that no holding row remained, that the takeover
+added no slot, that its own slot came back idle, and that slot's tree still
+exists — and in the same run it confirms a reuse completes while a charged
+holding row sits above the pool's byte figure, which is what case 3's concurrent
+admission measures. Its concurrency oracle is positive
 and falsifiable: the competitor's admission is observed by the pool's own new
 ledger row appearing while the deleting process is alive and the held tree is
 provably still being deleted (a measured, decreasing, non-zero entry count under

@@ -39,7 +39,11 @@ Cases:
   tree, another project's command completes normally — the deletion holds no
   pool lock, so admission is not held behind it.
 - `killed-deleter-takeover`: a deleter killed with SIGKILL leaves its entry
-  recorded and charged; the next command claims it and finishes it.
+  recorded and charged; the next command's pre-admission pass claims it and
+  finishes it. That command is a warm reuse of the fixture's own idle slot, so
+  its own capacity decision cannot retire the tree the oracle requires to
+  survive (the fixture is over its cap on purpose), and the case also proves the
+  pool's slot membership is unchanged by the takeover.
 
 Throughput is reported as the observed entries/second and MiB/second of the
 outside-lock traversal plus the measured lock-held figure. The retired
@@ -485,7 +489,11 @@ def plan_document() -> dict:
             {
                 "name": "killed-deleter-takeover",
                 "oracle": "a SIGKILLed deleter leaves its row recorded and "
-                "charged, and the next command finishes that entry",
+                "charged; the killed command is confirmed reaped and its partly "
+                "deleted tree survives; the next command, a warm reuse of the "
+                "fixture's own idle slot (no capacity decision), reports and "
+                "finishes that entry, leaves no holding row, keeps the pool's "
+                "slot membership unchanged and preserves that slot's tree",
             },
         ],
         "phases": [
@@ -787,6 +795,27 @@ def self_check() -> None:
         effectful.count('"--locked"') == 1 and '"--locked"' in staging_body,
         "the only --locked Cargo call must be staging against the committed lock, "
         "which is what premise item 1 records",
+    )
+    # The killed-deleter case's later command must stay a warm reuse of the
+    # fixture's own idle slot: the fixture is over its cap on purpose, so a new
+    # admission would legitimately evict the tree that case's oracle requires to
+    # survive, and the case would then prove the fixture's arithmetic instead of
+    # the takeover. Bound to the case body text so the correction cannot regress.
+    killed_body = body_of("prove_killed_deleter_takeover")
+    expect(
+        'check(subject, reusable_ws, env, "takeover")' in killed_body,
+        "the killed-deleter case must run its takeover as a warm reuse of the "
+        "fixture's own idle slot",
+    )
+    expect(
+        "killed-takeover" not in killed_body,
+        "the killed-deleter case must not create a new project for the takeover: "
+        "a new admission takes a capacity decision the fixture's cap forces onto "
+        "the tree the oracle requires to survive",
+    )
+    expect(
+        "len(members_after) <= len(members_before)" in killed_body,
+        "the killed-deleter case must prove the takeover added no slot",
     )
     expect(POOL_CAP == "8MiB", "the fixture pool budget changed")
     expect(SLOT_ENTRIES == 20_000, "the fixture entry count changed")
@@ -1982,7 +2011,7 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
 def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     name = "killed-deleter-takeover"
     case(name)
-    pool, env, victim, reusable, _victim_ws, _competitor_ws = seed_eviction_fixture(
+    pool, env, victim, reusable, _victim_ws, reusable_ws = seed_eviction_fixture(
         root, subject, "killed"
     )
     # The evicting admission retires the older idle tree, and its own publish pass
@@ -2008,9 +2037,30 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     remaining_after_kill = planted_buckets(held)
     expect(remaining_after_kill > 0, "the held tree was already empty")
     # A later command resumes it: its own pre-admission pass claims the row
-    # outside the pool lock and finishes the deletion.
-    taker = create_project(root, "killed-takeover")
-    code, output, _ = check(subject, taker, env, "takeover")
+    # outside the pool lock and finishes the deletion, before any capacity
+    # decision of its own.
+    #
+    # The command is a **warm reuse** of the fixture's own idle slot, not a new
+    # project. The fixture is over its cap on purpose (the victim's recorded
+    # charge plus the reusable slot exceeds `PENDING_CAP`), so a *new* admission
+    # would legitimately retire an idle whole slot — the reusable one — and the
+    # "other tree survives" half of this oracle would be testing the fixture's
+    # own arithmetic instead of the takeover. A reuse takes no capacity decision,
+    # so the only thing this command can do to a slot is finish the abandoned
+    # holding entry.
+    # Membership is compared by count and by this slot's own identity rather
+    # than as an exact list: the killed command's held slot may be recovered by
+    # the same opens that drain the entry, and recovery keeps a slot's identity
+    # whatever state it settles in. What must not happen is a *new* slot (which a
+    # capacity decision would have to make room for) or a lost reusable slot.
+    members_before = [(row["id"], row["incarnation"]) for row in slot_rows(pool)]
+    expect(
+        (reusable["id"], reusable["incarnation"]) in members_before,
+        f"the fixture's reusable slot is not in the pool: {members_before}",
+    )
+    reusable_tree = slot_path(pool, reusable)
+    expect(tree_present(reusable_tree), "the fixture's other tree is missing before the takeover")
+    code, output, _ = check(subject, reusable_ws, env, "takeover")
     expect(code == 0, f"the takeover command exited {code}: {output[-3000:]}")
     expect(
         "deleted the held slot tree" in output,
@@ -2018,8 +2068,24 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     )
     expect(not holding_rows(pool), f"the row survived the takeover: {holding_rows(pool)}")
     expect(not tree_present(held), "the held tree survived the takeover")
+    # The reuse re-took the very slot it already owned: no new slot, no eviction
+    # of the tree this oracle requires, and the command returned it to idle.
+    members_after = [(row["id"], row["incarnation"]) for row in slot_rows(pool)]
     expect(
-        tree_present(slot_path(pool, reusable)),
+        (reusable["id"], reusable["incarnation"]) in members_after,
+        f"the reuse lost its own slot: {members_after}",
+    )
+    expect(
+        len(members_after) <= len(members_before),
+        f"the takeover added a slot, so it took a capacity decision: "
+        f"{members_before} -> {members_after}",
+    )
+    expect(
+        slot_state(pool, str(reusable["id"])) == "idle",
+        "the takeover did not return the reused slot to idle",
+    )
+    expect(
+        tree_present(reusable_tree),
         "the fixture's other tree was deleted by the takeover",
     )
     killed_facts = {
@@ -2027,6 +2093,9 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
         "pending_row_bytes": row["bytes"],
         "remaining_after_kill": remaining_after_kill,
         "next_command_finished_it": True,
+        "takeover_reused_its_own_slot": True,
+        "slot_count_before_takeover": len(members_before),
+        "slot_count_after_takeover": len(members_after),
     }
     passed(name, **killed_facts)
     return killed_facts
