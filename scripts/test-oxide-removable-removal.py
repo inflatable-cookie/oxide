@@ -203,6 +203,17 @@ class Proof(layout.Proof):
         print(f"----- {label}: exit {child.returncode} -----\n{stdout}{stderr}", flush=True)
         return child.returncode, stdout, stderr
 
+    def reap(self, child: subprocess.Popen) -> None:
+        """Kill (if needed) and positively reap this proof's own child, so a
+        failure path never leaves the guard's census unclosed."""
+        if child.poll() is None:
+            child.kill()
+        try:
+            child.wait(timeout=10)
+        except BaseException:
+            return
+        self.unclosed.discard(child.pid)
+
     def oxide(self, args: list, label: str, cwd: str, env: dict | None = None) -> tuple:
         """One `oxide` child; `env` names the child's own environment (the
         boot-session mode runs some children with a debug-only override)."""
@@ -266,8 +277,27 @@ class Volume:
         self.device = None
         self.uuid = None
 
+    def attachment_entries(self) -> list:
+        """Every `hdiutil info` entry whose image path is this proof's own
+        image. A forced detach can leave a stale *detached* entry behind, so
+        only entries that still carry a mounted entity are custody."""
+        info = plistlib.loads(self.proof.run(["/usr/bin/hdiutil", "info", "-plist"], timeout=30).stdout)
+        return [
+            image
+            for image in info.get("images", [])
+            if os.path.realpath(image.get("image-path", "")) == os.path.realpath(self.image)
+        ]
+
+    @staticmethod
+    def mounted_entities(entry: dict) -> list:
+        return [entity for entity in entry.get("system-entities", []) if entity.get("mount-point")]
+
+    def live_entries(self) -> list:
+        return [entry for entry in self.attachment_entries() if self.mounted_entities(entry)]
+
     def attach(self) -> None:
         expect(not os.path.lexists(self.mount), f"{self.mount} exists before attach")
+        expect(not self.live_entries(), f"{self.image} is still mounted before attach")
         attached = self.proof.run(["/usr/bin/hdiutil", "attach", *attach_options(), "-nobrowse", "-noverify", "-plist", self.image], timeout=60)
         expect(attached.returncode == 0, f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}")
         entities = plistlib.loads(attached.stdout)["system-entities"]
@@ -287,11 +317,12 @@ class Volume:
         print(f"attached {self.image} as {self.device} at {self.mount}, volume {self.uuid}")
 
     def bound(self) -> None:
-        """Positive identity immediately before a forced detach: this image
-        path owns this device and this mount, and the mount is this UUID."""
-        info = plistlib.loads(self.proof.run(["/usr/bin/hdiutil", "info", "-plist"], timeout=30).stdout)
-        own = [image for image in info.get("images", []) if os.path.realpath(image.get("image-path", "")) == os.path.realpath(self.image)]
-        expect(len(own) == 1, f"image {self.image} attached {len(own)} times")
+        """Positive identity immediately before a forced detach: this image is
+        mounted exactly once, that mount is this device and this mount point,
+        and it is this UUID. A stale detached entry is not custody and cannot
+        satisfy or fail the claim; a second *mount* still refuses."""
+        own = self.live_entries()
+        expect(len(own) == 1, f"image {self.image} is mounted {len(own)} times")
         devices = {entity.get("dev-entry") for entity in own[0]["system-entities"]}
         mounts = {entity.get("mount-point") for entity in own[0]["system-entities"]} - {None}
         expect(self.device in devices and mounts == {self.mount}, f"device {self.device} / mount {self.mount} not this image's: {devices} {mounts}")
@@ -590,9 +621,7 @@ class Removal:
             self.volume.no_spill("after fallback run/test")
             state["out_dir"] = out_dir
         finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
+            proof.reap(child)
 
     def case_held_delete(self) -> None:
         proof, state = self.proof, self.state
@@ -658,9 +687,7 @@ class Removal:
             )
             state.update(kept_id=kept_id, kept_slot=kept_slot, kept_present=kept_present)
         finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
+            proof.reap(child)
 
 
 def collect(session: Removal, diagnostic: bool, outcome: dict, bodies: dict | None = None) -> dict:
@@ -734,7 +761,7 @@ def run(proof: Proof, repo: str, diagnostic: bool) -> dict:
         if diagnostic:
             outcome["unclosed"] = sorted(proof.unclosed)
             outcome["mount"] = proof.mount
-            path = diagnostic_receipt(outcome)
+            path = diagnostic_receipt(outcome, "removal.diagnostic")
             print(f"removal diagnostic receipt {path}")
     return outcome
 
@@ -815,7 +842,7 @@ def git_fixture(proof: Proof, path: str, files: dict) -> str:
     return root
 
 
-def diagnostic_receipt(outcome: dict) -> str:
+def diagnostic_receipt(outcome: dict, prefix: str = DIAGNOSTIC_RECEIPT) -> str:
     """Write ONE bounded, uniquely named, explicitly unqualified receipt."""
     recorded = {
         **outcome,
@@ -833,7 +860,7 @@ def diagnostic_receipt(outcome: dict) -> str:
             "failed_cases": [case for case, _ in recorded["failed"]],
         }
         body = json.dumps(recorded, indent=1) + "\n"
-    name = f"{DIAGNOSTIC_RECEIPT}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.json"
+    name = f"{prefix}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.json"
     path = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], name)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(body)
@@ -1503,6 +1530,89 @@ def self_check() -> int:
             print(f"owners observation refused {why}: {error}")
         else:
             expect(False, f"the owners observation accepted {why}")
+    # A forced detach can leave a stale *detached* hdiutil entry behind. Only
+    # entries that still carry a mounted entity are custody: the stale entry
+    # can neither satisfy nor fail the identity claim, while a real second
+    # mount and a mismatched device still refuse.
+    class Attachments:
+        def __init__(self, images: list, uuid: str = "UUID"):
+            self.images = images
+            self.uuid = uuid
+
+        def run(self, argv, cwd=None, env=None, timeout=None):
+            if os.path.basename(argv[0]) == "hdiutil":
+                body = plistlib.dumps(
+                    {
+                        "images": [
+                            {"image-path": "/fixture/volume.sparseimage", "system-entities": entities}
+                            for entities in self.images
+                        ]
+                    }
+                )
+            else:
+                body = plistlib.dumps({"VolumeUUID": self.uuid})
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+    whole = {"dev-entry": "/dev/disk4"}
+    mounted = {"dev-entry": "/dev/disk4s1", "mount-point": "/Volumes/OxSelf"}
+    detached = Volume(
+        Attachments([[whole]]), "/fixture/volume.sparseimage", "/Volumes/OxSelf"
+    )
+    expect(detached.live_entries() == [], "a stale detached entry counted as custody")
+    one = Volume(Attachments([[whole, mounted]]), "/fixture/volume.sparseimage", "/Volumes/OxSelf")
+    expect(len(one.live_entries()) == 1, "a mounted entry was not custody")
+    one.device, one.uuid = "/dev/disk4", "UUID"
+    one.bound()
+    twice = Volume(
+        Attachments([[whole, mounted], [{"dev-entry": "/dev/disk6"}, {"dev-entry": "/dev/disk6s1", "mount-point": "/Volumes/OxOther"}]]),
+        "/fixture/volume.sparseimage",
+        "/Volumes/OxSelf",
+    )
+    twice.device, twice.uuid = "/dev/disk4", "UUID"
+    try:
+        twice.bound()
+    except RuntimeError as error:
+        expect("mounted 2 times" in str(error), f"second-mount refusal: {error}")
+    else:
+        expect(False, "a second mount was accepted as one attachment")
+    wrong = Volume(Attachments([[whole, mounted]]), "/fixture/volume.sparseimage", "/Volumes/OxSelf")
+    wrong.device, wrong.uuid = "/dev/disk9", "UUID"
+    try:
+        wrong.bound()
+    except RuntimeError as error:
+        expect("not this image's" in str(error), f"device refusal: {error}")
+    else:
+        expect(False, "a mismatched device was accepted")
+
+    # A failure path reaps its own child positively, so the guard's census
+    # never stays unclosed for a child this script already waited for.
+    class FakeChild:
+        def __init__(self, pid: int):
+            self.pid = pid
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    census = Proof(root)
+    killer = FakeChild(4242)
+    census.unclosed.add(4242)
+    census.reap(killer)
+    expect(census.unclosed == set(), f"a killed and reaped child stayed unclosed: {census.unclosed}")
+    exited = FakeChild(4243)
+    census.unclosed.add(4243)
+    exited.returncode = 0
+    census.reap(exited)
+    expect(census.unclosed == set(), "a child that exited on its own stayed unclosed")
+
     # The main mode's case map: every case has a body and a purpose, and every
     # dependency names an earlier case, so a diagnostic can skip only
     # dependents of what did not complete.
