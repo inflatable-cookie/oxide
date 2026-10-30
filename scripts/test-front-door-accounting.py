@@ -69,12 +69,16 @@ not gates. Bounds: 300 s and 512 MiB monitored scratch under
 completed, failed, dependent-skipped and unexecuted cases and the latched
 first fault in a bounded `qualified: false` receipt beside the guard's,
 continues only into dependency-independent cases, and aborts on an outcome it
-cannot classify. A child that does not finish in its bound is such an outcome:
+cannot classify. Writer closure is never something this script can conclude:
 `communicate_bounded`/`wait_child`/`wait_for`/`wait_text`/`stage` signal and
-reap what they can and then raise `UnknownOutcome` (`uncertain_child`), never a
-recoverable `OracleFailure`, because this script cannot conclude a descendant
-group's closure — only the guard's census can. The receipt is written in every
-outcome, including a failure before the first case ran. It is never a counted PASS. `--plan` prints the case table, the
+reap what they can and then raise `UnknownOutcome` (`uncertain_child`), and
+once *any* `oxide` child has been launched (`LAUNCHES`) every later failure —
+in any case, including `hardlink` — is an `UnknownOutcome` too, because reaping
+a direct leader and draining its pipes proves nothing about its Cargo
+descendants. Only a failure before the first launch may be a recoverable
+oracle failure. An abort leaves the scratch in place for the guard's later
+certain census. The receipt is written in every outcome, including a failure
+before the first case ran. It is never a counted PASS. `--plan` prints the case table, the
 allocation and the nine premise dispositions without any effect.
 `--self-check` is the pure apparatus check: no child, pool, image or scratch.
 Not a benchmark and not full QA. Scratch is removed only after positive
@@ -608,6 +612,7 @@ class Proof:
 
     def start(self, cwd: str, args: list, extra: dict | None = None, stderr=subprocess.PIPE):
         log = self.log_path()
+        note_child_launch()
         process = subprocess.Popen([self.oxide, *args], cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
                                    text=True, env={**self.env, "OXIDE_TEST_WALK_LOG": log,
                                                    "OXIDE_TEST_SCOPE_LOG": log + ".scope", **(extra or {})})
@@ -1097,6 +1102,23 @@ def diagnostic_outcome() -> dict:
     }
 
 
+# Every `oxide` child this proof launches can leave a Cargo descendant
+# writing after its direct leader is reaped: `communicate_bounded` reaps the
+# leader and drains its pipes, which proves nothing about the group. So any
+# failure after the first launch is an unknown writer outcome — the collection
+# aborts and the scratch is retained for the guard's later certain census.
+# Only a failure before the first launch can be a recoverable oracle failure.
+LAUNCHES = {"count": 0}
+
+
+def note_child_launch() -> None:
+    LAUNCHES["count"] += 1
+
+
+def launched_children() -> int:
+    return LAUNCHES["count"]
+
+
 def record_abort(outcome: dict, case: str, failure) -> None:
     """Record one abort truthfully: the fault, the aborted case and everything
     that never ran. Undecided cases stay unexecuted, never skipped."""
@@ -1121,11 +1143,24 @@ def run_cases(diagnostic: bool, proof: Proof, checkouts: dict, state: dict, outc
         try:
             bodies[case](proof, checkouts, state)
         except OracleFailure as failure:
-            outcome["failed"].append([case, str(failure)[:DIAGNOSTIC_RECEIPT_EXCERPT]])
-            outcome["first_fault"] = outcome["first_fault"] or f"{case}: {failure}"
-            print(f"front-door {case}: FAILED {failure}", file=sys.stderr, flush=True)
             if not diagnostic:
                 raise
+            if launched_children():
+                # A child (and therefore a Cargo group) was already started:
+                # neither the direct leader's reap nor its drained pipes prove
+                # that no descendant is still writing. This is an unknown
+                # writer outcome, not a recoverable one — abort and keep the
+                # scratch for the guard's census.
+                record_abort(outcome, case, failure)
+                print(f"front-door {case}: ABORTED {failure} (a child was already launched: "
+                      f"{launched_children()})", file=sys.stderr, flush=True)
+                raise UnknownOutcome(
+                    f"{case} failed after a child launch, so writer closure is unknown: {failure}"
+                ) from failure
+            outcome["failed"].append([case, str(failure)[:DIAGNOSTIC_RECEIPT_EXCERPT]])
+            outcome["first_fault"] = outcome["first_fault"] or f"{case}: {failure}"
+            print(f"front-door {case}: FAILED {failure} (no child launched yet)", file=sys.stderr,
+                  flush=True)
             continue
         except UnknownOutcome as failure:
             record_abort(outcome, case, failure)
@@ -1202,6 +1237,7 @@ def plan() -> int:
 
 def self_check() -> int:
     """Pure apparatus check: no child, pool, image, scratch or supervisor."""
+    LAUNCHES["count"] = 0
     root = tempfile.mkdtemp(prefix="front-door-self-check.")
     try:
         proof = Proof.__new__(Proof)
@@ -1593,7 +1629,7 @@ def self_check() -> int:
 
             def aborting_cases(diagnostic, proof, checkouts, state, outcome):
                 raise UnknownOutcome(
-                    "the recovery case cannot be concluded while its fixture group may still be writing"
+                    "status failed after a child launch, so writer closure is unknown"
                 )
 
             globals()["resolve_source"] = lambda: "a" * 40
@@ -1605,7 +1641,7 @@ def self_check() -> int:
                 try:
                     run_proof(True, outcome)
                 except UnknownOutcome as error:
-                    expect_true("may still be writing" in str(error), str(error))
+                    expect_true("writer closure is unknown" in str(error), str(error))
                 else:
                     fail("an aborted collection did not fail the run")
                 roots = [name for name in os.listdir(canonical) if name.startswith("front-door.")]
@@ -1666,6 +1702,10 @@ def self_check() -> int:
             f"skipped {outcome['skipped']}",
         )
         expect_true("fail" in calls, f"the failed case did not run: {calls}")
+        # A recoverable failure is only allowed before any child has launched:
+        # here no stub launched one, which is the demonstrably safe case.
+        expect_true(launched_children() == 0,
+                    f"a child was launched before the recoverable-continuation case: {LAUNCHES}")
         # An independent case still runs after another case's recoverable
         # failure, and the first fault is latched.
         calls.clear()
@@ -1675,6 +1715,55 @@ def self_check() -> int:
                     f"completed {outcome['completed']}")
         expect_true([case for case, _ in outcome["failed"]] == ["status"], f"failed {outcome['failed']}")
         expect_true(outcome["first_fault"] == "status: stub failure", f"first fault {outcome['first_fault']}")
+        # The same oracle failure after a child launch is NOT recoverable:
+        # the direct leader's reap and drained pipes prove nothing about its
+        # Cargo descendants, so the collection aborts, the independent
+        # hard-link case never runs, and the receipt keeps the fault and every
+        # unexecuted case.
+        LAUNCHES["count"] = 0
+        outcome = diagnostic_outcome()
+        ran = []
+
+        def launching_failure(proof, checkouts, state):
+            note_child_launch()
+            fail("the build exited 1 after a child launch")
+
+        bodies = {case: stub_noop for case, _, _ in CASES}
+        bodies["status"] = launching_failure
+        bodies["hardlink"] = lambda *args: ran.append("hardlink")
+        try:
+            run_cases(True, None, {}, {}, outcome, bodies)
+        except UnknownOutcome as error:
+            expect_true("writer closure is unknown" in str(error), str(error))
+        except OracleFailure:
+            fail("a post-launch oracle failure was left recoverable")
+        else:
+            fail("a post-launch oracle failure did not abort the collection")
+        expect_true(ran == [], f"the independent hard-link case ran after an unclosed writer: {ran}")
+        expect_true(outcome["failed"] == [],
+                    f"a post-launch failure was recorded as recoverable: {outcome['failed']}")
+        expect_true(outcome["aborted"] is not None and "status" in outcome["aborted"],
+                    f"aborted {outcome.get('aborted')!r}")
+        expect_true("hardlink" in outcome["unexecuted"] and "hardlink" not in outcome["completed"],
+                    f"the independent hard-link case followed an unclosed writer: {outcome['completed']}")
+        expect_true(outcome["completed"] == ["slots"],
+                    f"completed {outcome['completed']}")
+        holder = dict(os.environ)
+        evidence = tempfile.mkdtemp(prefix="fd-post-launch-abort.")
+        os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
+        try:
+            with open(diagnostic_receipt(outcome), encoding="utf-8") as handle:
+                receipt = json.load(handle)
+        finally:
+            os.environ.clear()
+            os.environ.update(holder)
+            shutil.rmtree(evidence, ignore_errors=True)
+        expect_true(receipt["qualified"] is False and receipt["aborted"] == outcome["aborted"],
+                    f"receipt abort {receipt.get('aborted')!r}")
+        expect_true(receipt["failed"] == [] and receipt["unexecuted"] == outcome["unexecuted"],
+                    f"receipt state {receipt.get('failed')} / {receipt.get('unexecuted')}")
+        LAUNCHES["count"] = 0
+
         # An unknown outcome aborts and leaves the rest unexecuted.
         outcome = diagnostic_outcome()
         try:
