@@ -1427,6 +1427,49 @@ def self_check() -> int:
         os.environ.clear()
         os.environ.update(holder)
         shutil.rmtree(evidence_root, ignore_errors=True)
+    # A setup failure (before the first case) is recorded as an abort with the
+    # fault and every case unexecuted, in a real receipt — never an empty,
+    # fault-less document.
+    holder = dict(os.environ)
+    saved_argv = sys.argv
+    saved_run = globals()["run_proof"]
+    setup_root = tempfile.mkdtemp(prefix="fd-setup-abort.")
+    try:
+        os.environ["OXIDE_PROOF_EVIDENCE"] = setup_root
+
+        def failing_setup(diagnostic, outcome):
+            outcome["root"] = "/fixture/guard-root"
+            raise KeyError("OXIDE_PROOF_DEADLINE_NS")
+
+        globals()["run_proof"] = failing_setup
+        sys.argv = ["test-front-door-accounting.py", "--diagnostic"]
+        try:
+            main()
+        except KeyError:
+            pass
+        else:
+            fail("a setup failure did not fail the diagnostic")
+        receipts = [name for name in os.listdir(setup_root) if name.startswith(DIAGNOSTIC_RECEIPT)]
+        expect_true(len(receipts) == 1, f"setup wrote {len(receipts)} receipts")
+        with open(os.path.join(setup_root, receipts[0]), encoding="utf-8") as handle:
+            receipt = json.load(handle)
+        expect_true(receipt["qualified"] is False, "a setup receipt claimed qualification")
+        expect_true(receipt["aborted"] is not None
+                    and "OXIDE_PROOF_DEADLINE_NS" in receipt["aborted"],
+                    f"setup receipt abort {receipt.get('aborted')!r}")
+        expect_true(receipt["first_fault"] == receipt["aborted"],
+                    f"setup receipt fault {receipt.get('first_fault')!r}")
+        expect_true(receipt["completed"] == [] and receipt["failed"] == [],
+                    f"setup receipt cases {receipt['completed']} / {receipt['failed']}")
+        expect_true(receipt["unexecuted"] == [case for case, _, _ in CASES],
+                    f"setup receipt unexecuted {receipt.get('unexecuted')}")
+        expect_true(receipt["root"] == "/fixture/guard-root", f"setup receipt root {receipt.get('root')!r}")
+    finally:
+        sys.argv = saved_argv
+        globals()["run_proof"] = saved_run
+        os.environ.clear()
+        os.environ.update(holder)
+        shutil.rmtree(setup_root, ignore_errors=True)
     print("front-door self-check ok: walk/scope root mapping, exact ordered walk oracles, "
           "summary and provenance parsing, measure line, readiness needle, "
           "premise checklist and fixture/staging environments (private home, rustup, flags, temp, "

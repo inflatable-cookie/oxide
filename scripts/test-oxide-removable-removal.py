@@ -384,21 +384,34 @@ def late_writes(out_dir: str, label: str) -> None:
         print(f"{label}: late directory creation refused: {error}")
 
 
+# The guard's own control variables. They are not fixture configuration: the
+# shared `layout.stage_at` -> `Proof.run` -> `work_left()` path reads
+# OXIDE_PROOF_DEADLINE_NS for every bounded child, and OXIDE_PROOF_EVIDENCE is
+# the same guard layout's evidence directory. The staging scrub preserves them
+# verbatim (re-set explicitly after the scrub, so the prefix list cannot ever
+# take them away) while removing every fixture-facing inherited value.
+GUARD_CONTROLS = ("OXIDE_PROOF_DEADLINE_NS", "OXIDE_PROOF_EVIDENCE")
+
+
 @contextlib.contextmanager
 def staging_environment_scrubbed():
     """The shared `layout.stage_at` helper builds from this process's
-    environment. Staging runs with every inherited OXIDE_/XDG_/CARGO_/
-    SCCACHE_/RUSTC* key removed and only the invoking Cargo home restored, set
-    explicitly, so this repository's committed lock resolves its offline
-    registry cache there and no unknown CARGO_* value reaches the candidate.
+    environment. Staging runs with every fixture-facing inherited OXIDE_/XDG_/
+    CARGO_/SCCACHE_/RUSTC* key removed and only the invoking Cargo home
+    restored, set explicitly, so this repository's committed lock resolves its
+    offline registry cache there and no unknown CARGO_* value reaches the
+    candidate. The guard's own OXIDE_PROOF_DEADLINE_NS and OXIDE_PROOF_EVIDENCE
+    stay visible for the helper, which needs them to bound every staged child.
     Everything is restored on exit, including on failure."""
     saved = dict(os.environ)
+    guard = {name: saved[name] for name in GUARD_CONTROLS if name in saved}
     invoking_cargo_home = saved.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
     try:
         for key in list(os.environ):
             if key.startswith(("OXIDE_", "XDG_", "CARGO_", "SCCACHE_", "RUSTC")):
                 os.environ.pop(key, None)
         os.environ["CARGO_HOME"] = invoking_cargo_home
+        os.environ.update(guard)
         yield
     finally:
         os.environ.clear()
@@ -535,12 +548,14 @@ class Removal:
         ),
     )
 
-    def __init__(self, proof: Proof, repo: str):
+    def __init__(self, proof: Proof, repo: str, source: str | None = None):
         self.proof = proof
         self.state = {}
         name = "OxRm" + secrets.token_hex(4)
         self.mount = f"/Volumes/{name}"
-        self.source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+        self.source = source or proof.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, timeout=30
+        ).stdout.decode().strip()
         print(f"removal proof {os.getpid()} source {self.source} ({layout.source_facts(repo)}) volume {name}")
         need(not os.path.lexists(self.mount), f"{self.mount} already exists; never touched")
         proof.phase("start")
@@ -800,10 +815,18 @@ def run(proof: Proof, repo: str, diagnostic: bool) -> dict:
     """The main (ephemeral, surprise-removal) mode. Returns its outcome
     document; the diagnostic receipt is written here, in every outcome."""
     outcome = diagnostic_outcome()
+    outcome["root"] = proof.root
+    source = ""
+    try:
+        source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+        outcome["source"] = source
+    except BaseException as failure:
+        # The abort below records why; a missing source is never invented.
+        print(f"source {failure!r} unresolved", file=sys.stderr)
     session = None
     try:
         try:
-            session = Removal(proof, repo)
+            session = Removal(proof, repo, source)
         except OracleFailure as failure:
             outcome["failed"].append(["setup", str(failure)[:RECEIPT_EXCERPT]])
             outcome["first_fault"] = outcome["first_fault"] or f"setup: {failure}"
@@ -812,9 +835,18 @@ def run(proof: Proof, repo: str, diagnostic: bool) -> dict:
                 print(f"setup: FAILED {failure}", file=sys.stderr)
                 return outcome
             raise
+        except (KeyboardInterrupt, SystemExit):
+            record_abort(outcome, "setup", "interrupted")
+            raise
+        except BaseException as failure:
+            # An unexpected setup exception is an outcome this collection
+            # cannot classify: record the fault, abort and leave every case
+            # unexecuted, then fail the run. An empty, fault-less receipt is
+            # never a truthful outcome.
+            record_abort(outcome, "setup", failure)
+            print(f"setup: ABORTED unexpected {failure!r}", file=sys.stderr)
+            raise
         outcome.update(
-            source=session.source,
-            root=proof.root,
             mount=session.mount,
             device=session.volume.device,
             volume_uuid=session.volume.uuid,
@@ -1292,10 +1324,12 @@ PREMISE_CHECKLIST = (
         "private HOME and rustup",
         "applicable: `private_environment` keeps the invoking RUSTUP_HOME, gives every child a "
         "private HOME and CARGO_HOME, pins RUSTUP_TOOLCHAIN=1.97.1 and RUSTUP_AUTO_INSTALL=0; staging "
-        "runs inside `staging_environment_scrubbed`, which removes every inherited "
-        "OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key and restores only the invoking CARGO_HOME (set "
+        "runs inside `staging_environment_scrubbed`, which removes every fixture-facing inherited "
+        "OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* value, restores only the invoking CARGO_HOME (set "
         "explicitly, because this repository's committed lock resolves its offline registry cache "
-        "there); `layout.stage_at` is the only --locked call, and the dependency-free fixtures make "
+        "there), and keeps the guard's own OXIDE_PROOF_DEADLINE_NS and OXIDE_PROOF_EVIDENCE visible "
+        "because the shared `layout.stage_at` -> `work_left()` path bounds every staged child with "
+        "them; `layout.stage_at` is the only --locked call, and the dependency-free fixtures make "
         "their own lock offline",
     ),
     (
@@ -1307,8 +1341,9 @@ PREMISE_CHECKLIST = (
         "environment isolation",
         "applicable: `private_environment` drops every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key "
         "(including all CARGO_* configuration and SCCACHE_* values) and re-adds only this fixture's "
-        "controls; `staging_environment_scrubbed` does the same for staging and restores only the "
-        "invoking CARGO_HOME",
+        "controls; `staging_environment_scrubbed` does the same for staging, restores only the "
+        "invoking CARGO_HOME and preserves only the guard's two OXIDE_PROOF_* control variables "
+        "(`GUARD_CONTROLS`), which are not fixture configuration",
     ),
     (
         "automatic adoption",
@@ -1330,8 +1365,9 @@ PREMISE_CHECKLIST = (
     (
         "compiler flags",
         "applicable: main() refuses an inherited RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS and staging "
-        "runs in the scrubbed environment, so neither reaches it; every fixture child gets "
-        "RUSTFLAGS=FROZEN_RUSTFLAGS with no encoded value",
+        "runs in the scrubbed environment (which keeps only the guard's OXIDE_PROOF_* controls), so "
+        "neither reaches it; every fixture child gets RUSTFLAGS=FROZEN_RUSTFLAGS with no encoded "
+        "value",
     ),
     (
         "temporary storage",
@@ -1822,6 +1858,67 @@ def self_check() -> int:
            f"receipt abort {receipt.get('aborted')!r}")
     expect(receipt["unexecuted"] == outcome["unexecuted"], f"receipt unexecuted {receipt.get('unexecuted')}")
     expect(receipt["failed"] == [], f"receipt failures {receipt.get('failed')}")
+
+    # A setup exception must record the real fault, the abort and all four
+    # cases unexecuted, never an empty fault-less receipt. `run` is driven with
+    # a stubbed `Removal` (an unexpected exception and a marker-style oracle
+    # failure) and a stubbed proof, each with its own real evidence directory.
+    class FakeProof:
+        root = "/fixture/guard-root"
+
+        def __init__(self):
+            self.unclosed = set()
+            self.mount = None
+
+        def run(self, command, *, cwd=None, env=None, timeout=None):
+            return subprocess.CompletedProcess(command, 0, stdout=b"deadbeef\n", stderr=b"")
+
+    for failure, expect_aborted in (
+        (KeyError("OXIDE_PROOF_DEADLINE_NS"), True),
+        (OracleFailure("candidate binary lacks the marker"), False),
+    ):
+        evidence = tempfile.mkdtemp(prefix="removal-setup-check.")
+        os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
+
+        def explode(proof, repo, source=None, failure=failure):
+            raise failure
+
+        original = globals()["Removal"]
+        # The stub keeps the real case table so `run`/`record_abort`/
+        # `diagnostic_outcome` name the same four cases.
+        explode.CASES = original.CASES
+        globals()["Removal"] = explode
+        try:
+            try:
+                run(FakeProof(), "/fixture/repo", True)
+            except BaseException as raised:
+                expect(raised is failure, f"setup re-raised {raised!r}")
+            receipts = [name for name in os.listdir(evidence) if name.startswith("removal.diagnostic")]
+            expect(len(receipts) == 1, f"setup wrote {len(receipts)} receipts")
+            with open(os.path.join(evidence, receipts[0]), encoding="utf-8") as handle:
+                receipt = json.load(handle)
+        finally:
+            globals()["Removal"] = original
+            os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+            shutil.rmtree(evidence, ignore_errors=True)
+        expect(receipt["qualified"] is False, "a setup receipt claimed qualification")
+        expect(receipt["source"] == "deadbeef", f"receipt source {receipt.get('source')!r}")
+        expect(receipt["root"] == "/fixture/guard-root", f"receipt root {receipt.get('root')!r}")
+        expect(
+            receipt["unexecuted"] == ["idle", "held", "held-delete", "quarantine"],
+            f"setup receipt unexecuted {receipt.get('unexecuted')}",
+        )
+        expect(receipt["completed"] == [], f"setup receipt completed {receipt.get('completed')}")
+        if expect_aborted:
+            expect(receipt["aborted"] is not None, f"a setup exception left no aborted fault: {receipt}")
+            expect(receipt["failed"] == [], f"a setup abort was recorded as a failure: {receipt['failed']}")
+        else:
+            expect(
+                [case for case, _ in receipt["failed"]] == ["setup"],
+                f"a setup oracle failure was not recorded: {receipt['failed']}",
+            )
+            expect(receipt["aborted"] is None, f"a setup oracle failure recorded an abort: {receipt.get('aborted')}")
+
     # The premise checklist is complete, and its environment claims are
     # checked against `private_environment` with hostile inherited values.
     expect(len(PREMISE_CHECKLIST) == 9, f"premise checklist has {len(PREMISE_CHECKLIST)} items")
@@ -1886,6 +1983,8 @@ def self_check() -> int:
         os.makedirs(os.path.join(staging_root, "home"), mode=0o700, exist_ok=True)
         hostile = {
             "OXIDE_POOL": "/fixture/host-pool",
+            "OXIDE_CONFIG": "/fixture/host-config",
+            "OXIDE_TEST_HOME_FROM_ENV": "0",
             "XDG_CONFIG_HOME": "/fixture/xdg",
             "CARGO_UNSTABLE_ALLOW_FEATURES": "fixture",
             "CARGO_REGISTRIES_FIXTURE_INDEX": "/fixture/index",
@@ -1895,16 +1994,35 @@ def self_check() -> int:
         }
         os.environ.update(hostile)
         os.environ["CARGO_HOME"] = "/fixture/invoking-cargo-home"
+        # The guard's own control variables are not fixture configuration: the
+        # shared staging helper bounds every child with the deadline and writes
+        # under the evidence directory, so the scrub must keep them visible.
+        os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(
+            time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 300 * 10**9
+        )
+        os.environ["OXIDE_PROOF_EVIDENCE"] = os.path.join(root, "fixture-evidence")
+        os.makedirs(os.environ["OXIDE_PROOF_EVIDENCE"], mode=0o700, exist_ok=True)
         before = dict(os.environ)
         seen = {}
+        left = 0.0
         with staging_environment_scrubbed():
             seen = dict(os.environ)
-            raise_after = 1
+            # A real exercise of the path that broke: the shared helper's own
+            # bounded-deadline call must not raise inside the scrub.
+            left = layout.work_left()
+        expect(left > 0, f"layout.work_left() inside the scrub returned {left}")
+        expect(
+            seen.get("OXIDE_PROOF_DEADLINE_NS") == before["OXIDE_PROOF_DEADLINE_NS"]
+            and seen.get("OXIDE_PROOF_EVIDENCE") == before["OXIDE_PROOF_EVIDENCE"],
+            f"the staging scrub hid the guard controls: {sorted(set(GUARD_CONTROLS) - set(seen))}",
+        )
         expect(os.environ == before, "the staging scrub did not restore the process environment")
         expect(seen.get("CARGO_HOME") == "/fixture/invoking-cargo-home",
                "staging did not restore the invoking Cargo home explicitly")
         for name in (
             "OXIDE_POOL",
+            "OXIDE_CONFIG",
+            "OXIDE_TEST_HOME_FROM_ENV",
             "XDG_CONFIG_HOME",
             "CARGO_UNSTABLE_ALLOW_FEATURES",
             "CARGO_REGISTRIES_FIXTURE_INDEX",
