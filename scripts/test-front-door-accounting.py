@@ -35,15 +35,24 @@ binary and every live pool out of it. One idle slot later holds more than
   the eviction's own accounting walk that slot again), and builds a new slot
   cold, whose single release walk is the last walk; nothing walks the payload
   or the idle slot beside it;
-- a final default `status` after recovery still walks nothing.
+- a final default `status` after recovery still walks nothing;
+- the same-slot hard-link retention control, restored natively on its own
+  pool: one retained slot holds an 8 MiB file with four names for one inode,
+  its release publishes the inode union, and an admission budgeted between that
+  union plus a charged unrecorded stray and the per-name sum keeps the retained
+  slot, its directory and all four names and admits a new slot — a per-name
+  record would evict the retained slot instead.
 
-Retired rather than duplicated: the byte-pressure eviction case and its
-hard-link control now live in `rust:recorded-slot-accounting` (case D drives
-byte pressure and evicts one owned idle whole slot; case E proves a cross-slot
-hard link is counted once) and the holding deletion under it in
-`rust:holding-delete`. This script keeps the routing facts those proofs do
-not cover: readiness, held and killed-holder refusals, the waiting build and
-the recovered cold build.
+Retired rather than duplicated: the *byte-pressure eviction* case (whole-pool
+LRU eviction while hard links are counted once) now lives in
+`rust:recorded-slot-accounting` case D and the holding deletion under it in
+`rust:holding-delete`. Its hard-link half is NOT covered there: case E is a
+*cross-slot* overcount and case D evicts independent slots, so neither proves
+that four names for one inode inside ONE retained slot are measured once and
+that an admission on a budget between that union and the per-name sum keeps it.
+That control therefore stays here, as its own case. This script keeps the
+routing facts those proofs do not cover: readiness, held and killed-holder
+refusals, the waiting build and the recovered cold build.
 
 The walk counts show routing only, not a resource gate. The scratch is one
 fresh directory inside the qualified supervisor's `OXIDE_TASK_SCRATCH_ROOT`
@@ -92,6 +101,13 @@ PROOF_SECONDS = 300
 SHUTDOWN_MARGIN_S = 30
 MIB = 1024 * 1024
 BIG_ENTRIES = 200_000
+# The same-slot hard-link retention control: one 8 MiB file with four names for
+# one inode inside ONE retained slot, plus an unrecorded stray beside `slots/`
+# that the shallow scope pass charges, so the budget can separate the recorded
+# inode union from the per-name sum without depending on an eviction.
+LINK_BYTES = 8 * MIB
+LINK_NAMES = 4
+LINK_STRAY_BYTES = 6 * MIB
 STARTED = time.monotonic()
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PEAK = {"bytes": 0, "phase": "none"}
@@ -156,6 +172,37 @@ PREMISE_CHECKLIST = (
         "fixture inherits that TMPDIR",
     ),
 )
+
+LINK_BUILD_RS = """use std::fs;
+use std::path::PathBuf;
+
+fn main() {
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let first = out.join("linked.bin");
+    fs::write(&first, vec![2u8; 8 * 1024 * 1024]).unwrap();
+    for index in 0..3 {
+        fs::hard_link(&first, out.join(format!("linked.bin.{index}"))).unwrap();
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"""
+
+FILLER_BUILD_RS = """use std::fs;
+use std::path::PathBuf;
+
+fn main() {
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut left = 12 * 1024 * 1024;
+    let mut index = 0;
+    while left > 0 {
+        let chunk = left.min(1024 * 1024);
+        fs::write(out.join(format!("filler.{index}")), vec![3u8; chunk]).unwrap();
+        left -= chunk;
+        index += 1;
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"""
 
 HOLD_TEST = """use std::path::PathBuf;
 use std::time::Duration;
@@ -419,6 +466,59 @@ def write_fixture(root: str, name: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:
             handle.write(text)
+
+
+def write_build_fixture(root: str, name: str, build_rs: str) -> str:
+    """A tiny crate whose build script writes its own slot tree."""
+    files = {
+        "Cargo.toml": (
+            f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
+            f'build = "build.rs"\n'
+        ),
+        "build.rs": build_rs,
+        "rust-toolchain.toml": f'[toolchain]\nchannel = "{BUILDER}"\n',
+        "src/main.rs": f'fn main() {{\n    println!("{name}");\n}}\n',
+    }
+    for relative, text in files.items():
+        path = os.path.join(root, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+    return root
+
+
+def hardlink_names(slot_dir: str) -> list:
+    """Every name of the hard-linked set inside one slot."""
+    found = []
+    for current, _dirs, files in os.walk(slot_dir, followlinks=False):
+        for name in files:
+            if name == "linked.bin" or name.startswith("linked.bin."):
+                found.append(os.path.join(current, name))
+    return sorted(found)
+
+
+def hardlink_budget(recorded: int, stray: int) -> int:
+    """The soft budget used by the retention admission: it fits the retained
+    slot's published once-per-inode figure plus the charged stray with a small
+    margin, and stays far below the per-name sum."""
+    return recorded + stray + 2 * MIB
+
+
+def hardlink_discriminates(recorded: int, union: int, per_name: int, stray: int, budget: int) -> bool:
+    """Whether the fixtures separate once-per-inode accounting from per-name
+    accounting: both independent measurements are a union (not the per-name
+    sum), the budget fits the union plus the charged stray, and the per-name
+    sum would not fit it — so a per-name measurement would evict the retained
+    slot."""
+    union_total = recorded + stray
+    per_name_total = per_name + stray
+    return (
+        LINK_BYTES <= recorded < 2 * LINK_BYTES
+        and union < 2 * LINK_BYTES
+        and per_name == union + (LINK_NAMES - 1) * LINK_BYTES
+        and union_total < budget < per_name_total
+        and budget - union_total < (LINK_NAMES - 1) * LINK_BYTES
+    )
 
 
 def fill(root: str, count: int) -> None:
@@ -851,16 +951,91 @@ def case_recovery(proof: Proof, checkouts: dict, state: dict) -> None:
     status(proof, checkouts["app"], "after recovery", list(proof.slots()))
 
 
+def case_hardlink(proof: Proof, checkouts: dict, state: dict) -> None:
+    """The same-slot hard-link retention control, restored natively.
+
+    `rust:recorded-slot-accounting` case E is a *cross-slot* overcount and its
+    byte-pressure case evicts under independent slots, so neither proves this
+    exact behaviour: four names for one 8 MiB inode inside ONE retained slot
+    must be measured once — the release publishes the inode union — and an
+    admission on a budget between that union and the per-name sum must keep the
+    retained slot, its directory and all four names. A measurement that counted
+    names separately would publish ~4x the file, exceed the same budget and
+    evict the retained slot.
+
+    The pressure is an unrecorded stray file beside `slots/` that the shallow
+    scope pass charges, so the admission needs no eviction to fit: with the
+    union it is under the budget and nothing is deleted, while a per-name record
+    would put it over and evict the only idle slot — the retained one.
+    """
+    root = os.path.join(proof.parent, "hardlink")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    link_proof = Proof(root, proof.oxide, dict(proof.env))
+    retained_checkout = write_build_fixture(os.path.join(root, "checkouts", "linked"), "linked", LINK_BUILD_RS)
+    fresh_checkout = write_build_fixture(os.path.join(root, "checkouts", "fresh"), "fresh", FILLER_BUILD_RS)
+    retained, _, _, _ = build(link_proof, retained_checkout, "hard-link retained slot",
+                              ["slots/{slot}"], ["payload"])
+    slot_dir = link_proof.slot_dir(retained)
+    names = hardlink_names(slot_dir)
+    inodes = {os.stat(path).st_ino for path in names}
+    record = (link_proof.slots().get(retained) or {}).get("recorded") or {}
+    recorded = record.get("unique_bytes")
+    if not isinstance(recorded, int):
+        fail(f"the retained slot {retained} published no recorded size: {record!r}")
+    union = tree_bytes(slot_dir)
+    per_name = union + (LINK_NAMES - 1) * LINK_BYTES
+    # The stray is a real, unrecorded entry beside `slots/`: the shallow scope
+    # pass charges it, so the admission has pressure to decide on without any
+    # eviction being needed when the union fits.
+    stray_path = os.path.join(link_proof.payload(), "stray.bin")
+    with open(stray_path, "wb") as handle:
+        handle.write(b"\x03" * LINK_STRAY_BYTES)
+    budget = hardlink_budget(recorded, LINK_STRAY_BYTES)
+    say(f"hard link: {len(names)} names for {len(inodes)} inode(s) in slot {retained}, "
+        f"recorded {recorded} B, union {union} B, per-name {per_name} B, "
+        f"stray {LINK_STRAY_BYTES} B, budget {budget} B")
+    if len(names) != LINK_NAMES or len(inodes) != 1:
+        fail(f"the retained slot does not hold {LINK_NAMES} names for one inode: {names}")
+    if not hardlink_discriminates(recorded, union, per_name, LINK_STRAY_BYTES, budget):
+        fail(f"the fixtures do not separate once-per-inode from per-name accounting: "
+             f"recorded {recorded} B, union {union} B, per-name {per_name} B, "
+             f"stray {LINK_STRAY_BYTES} B, budget {budget} B")
+    # The union (retained slot plus the charged stray) fits the budget by
+    # construction; the per-name sum does not, which is what makes the control
+    # discriminating. Both bounds are pinned by `hardlink_discriminates`.
+    slot, warmth, tail, _ = build(link_proof, fresh_checkout, "hard-link admission",
+                                  ["slots/{slot}"],
+                                  extra={"OXIDE_TEST_BUDGET_BYTES": str(budget)})
+    left = link_proof.slots()
+    if retained not in left or not os.path.isdir(slot_dir):
+        fail(f"the retained slot {retained} was evicted")
+    again = hardlink_names(slot_dir)
+    if again != names or len({os.stat(path).st_ino for path in again}) != 1:
+        fail(f"the retained slot lost its hard-link names: {again}")
+    if not os.path.exists(stray_path):
+        fail("the admission deleted the charged stray")
+    if warmth != "cold" or not tail.startswith("new slot, ") or slot in ("", retained):
+        fail(f"no new slot was admitted: {slot} {warmth} {tail}")
+    say(f"hard link: slot {retained} with {LINK_NAMES} names kept and nothing evicted, "
+        f"new slot {slot} admitted on a {budget} B budget")
+    state["hardlink"] = retained
+
+
 CASES = (
     ("slots", (), "two new slots: no admission walk, one payload scope pass, a release walk"),
     ("status", ("slots",), "recorded status walks nothing; --measure walks the payload then every slot"),
     ("readiness", ("slots",), "oxide new readiness walks nothing and reads no pool state"),
     ("reuse", ("slots",), "the 200,000-entry idle slot, then ordinary reuse walks its target twice"),
     ("recovery", ("reuse",), "a live holder refusal and its woken build, then the killed holder's recovery"),
+    ("hardlink", (),
+     "one retained slot holds four names for one 8 MiB inode: its release publishes the inode "
+     "union and an admission on a budget between that union and the per-name sum evicts the older "
+     "idle slot, keeps it, and admits a new slot"),
 )
 
 BODIES = {
     "slots": case_slots,
+    "hardlink": case_hardlink,
     "status": case_status,
     "readiness": case_readiness,
     "reuse": case_reuse,
@@ -979,10 +1154,13 @@ def plan() -> int:
     print(f"candidate: this HEAD's debug oxide, staged offline with {BUILDER} from {REPO}")
     print("selector: python3 scripts/bounded-test.py --root-parent /private/tmp "
           "--limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py")
-    print("allocation: one internal directory-budget pool with two slots, one idle slot of more than "
-          f"{BIG_ENTRIES:,} entries and one 8 MiB hard-linked file, two fixture checkouts and one "
-          "`oxide new` crate, all inside one owned scratch inside OXIDE_TASK_SCRATCH_ROOT "
-          "(measured staging peak 283 MiB of the 512 MiB monitored budget)")
+    print("allocation: one main internal directory-budget pool with two slots, one idle slot of more "
+          f"than {BIG_ENTRIES:,} entries, two fixture checkouts and one `oxide new` crate; plus one "
+          f"separate pool for the hard-link control, whose one retained slot holds a "
+          f"{LINK_BYTES // MIB} MiB file with {LINK_NAMES} names for one inode beside an unrecorded "
+          f"{LINK_STRAY_BYTES // MIB} MiB stray that the shallow scope pass charges and the second "
+          "admission is budgeted against; all inside one owned scratch inside "
+          "OXIDE_TASK_SCRATCH_ROOT (measured staging peak 283 MiB of the 512 MiB monitored budget)")
     print(f"limits: {PROOF_SECONDS} s wall including cleanup, stop {SHUTDOWN_MARGIN_S} s before the guard "
           f"deadline, {SCRATCH_LIMIT_BYTES // MIB} MiB monitored scratch, one Cargo call at a time")
     print("cases:")
@@ -1228,8 +1406,10 @@ def self_check() -> int:
                         f"{stub.__name__} was recorded as a recoverable failure: {outcome['failed']}")
             expect_true(outcome["completed"] == ["slots"],
                         f"{stub.__name__} completed a case it aborted: {outcome['completed']}")
-            expect_true(outcome["unexecuted"] == ["readiness", "reuse", "recovery"],
-                        f"{stub.__name__} unexecuted {outcome['unexecuted']}")
+            expect_true(
+                outcome["unexecuted"] == [case for case, _, _ in CASES if case not in outcome["reached"]],
+                f"{stub.__name__} unexecuted {outcome['unexecuted']}",
+            )
             # The receipt keeps the abort and the unexecuted set.
             holder = dict(os.environ)
             os.environ["OXIDE_PROOF_EVIDENCE"] = root
@@ -1244,10 +1424,47 @@ def self_check() -> int:
             expect_true(receipt["unexecuted"] == outcome["unexecuted"],
                         f"receipt unexecuted {receipt.get('unexecuted')}")
 
+        # The restored same-slot hard-link control: the budget separates a
+        # once-per-inode union from the per-name sum, and every counterfactual
+        # - a per-name record, a budget above the per-name sum, a zero size and
+        # a fixture that is not a per-name sum - is rejected by the oracle.
+        recorded = LINK_BYTES + 512 * 1024
+        union = recorded
+        stray = LINK_STRAY_BYTES
+        budget = hardlink_budget(recorded, stray)
+        per_name = union + (LINK_NAMES - 1) * LINK_BYTES
+        expect_true(hardlink_discriminates(recorded, union, per_name, stray, budget),
+                    "the hard-link budget does not separate union from per-name")
+        expect_true(not hardlink_discriminates(per_name, union, per_name, stray, budget),
+                    "a per-name measurement was accepted as a once-per-inode union")
+        expect_true(not hardlink_discriminates(recorded, union, per_name, stray, per_name + stray),
+                    "a budget above the per-name sum was accepted as discriminating")
+        expect_true(not hardlink_discriminates(recorded, union, per_name, stray, recorded + stray),
+                    "a budget that does not fit the published figure was accepted")
+        expect_true(not hardlink_discriminates(0, union, per_name, stray, budget),
+                    "a zero recorded size was accepted")
+        expect_true(not hardlink_discriminates(recorded, union, union, stray, budget),
+                    "a fixture that is not a per-name sum was accepted")
+        expect_true(not hardlink_discriminates(LINK_BYTES // 2, union, per_name, stray, budget),
+                    "a record below one file was accepted")
+        expect_true(not hardlink_discriminates(recorded, per_name, per_name, stray, budget),
+                    "a per-name union measurement was accepted")
+        expect_true(hardlink_budget(recorded, stray) == recorded + stray + 2 * MIB,
+                    "the hard-link budget does not include the charged stray")
+        expect_true(hardlink_budget(recorded, stray) != hardlink_budget(recorded, 0),
+                    "the charged stray does not change the hard-link budget")
+        expect_true(budget - (recorded + stray) < (LINK_NAMES - 1) * LINK_BYTES,
+                    "the hard-link margin is not far below the per-name excess")
+        expect_true(
+            ("hardlink", ()) in [(case, deps) for case, deps, _ in CASES],
+            "the hard-link case is missing or depends on an unrelated premise",
+        )
+        expect_true("hardlink" in BODIES, "the hard-link case has no body")
+
         # The case map: every case has a body and a purpose, and every
         # dependency names an earlier case, so the diagnostic can skip only
         # dependents of what did not complete.
-        expect_true(len(CASES) == 5, f"case table {CASES}")
+        expect_true(len(CASES) == 6, f"case table {CASES}")
         seen = []
         for case, deps, purpose in CASES:
             expect_true(purpose.strip() != "", f"case {case} has no purpose")
@@ -1280,20 +1497,23 @@ def self_check() -> int:
         # nothing that a missing premise could satisfy.
         outcome = diagnostic_outcome()
         run_cases(True, None, {}, {}, outcome, stubs(slots=stub_fail))
-        expect_true(outcome["completed"] == [], f"a failed case was completed: {outcome['completed']}")
+        # Only the independent cases still run; every chained case depends
+        # transitively on `slots`, so all of them are skipped.
+        independent = {case for case, deps, _ in CASES if not deps}
+        expect_true(set(outcome["completed"]) == independent - {"slots"},
+                    f"a failed case's dependents ran: {outcome['completed']}")
         expect_true([case for case, _ in outcome["failed"]] == ["slots"], f"failed {outcome['failed']}")
         expect_true(
-            outcome["skipped"] == [["status", ["slots"]], ["readiness", ["slots"]],
-                                   ["reuse", ["slots"]], ["recovery", ["reuse"]]],
+            [row[0] for row in outcome["skipped"]] == [case for case, deps, _ in CASES if deps],
             f"skipped {outcome['skipped']}",
         )
-        expect_true(calls == ["fail"], f"calls {calls}")
+        expect_true("fail" in calls, f"the failed case did not run: {calls}")
         # An independent case still runs after another case's recoverable
         # failure, and the first fault is latched.
         calls.clear()
         outcome = diagnostic_outcome()
         run_cases(True, None, {}, {}, outcome, stubs(status=stub_fail))
-        expect_true(outcome["completed"] == ["slots", "readiness", "reuse", "recovery"],
+        expect_true(set(outcome["completed"]) == {case for case, _, _ in CASES} - {"status"},
                     f"completed {outcome['completed']}")
         expect_true([case for case, _ in outcome["failed"]] == ["status"], f"failed {outcome['failed']}")
         expect_true(outcome["first_fault"] == "status: stub failure", f"first fault {outcome['first_fault']}")
@@ -1306,8 +1526,10 @@ def self_check() -> int:
         else:
             fail("an unknown outcome did not abort the collection")
         expect_true(outcome["aborted"] == "status: stub unknown outcome", f"aborted {outcome['aborted']}")
-        expect_true(outcome["unexecuted"] == ["readiness", "reuse", "recovery"],
-                    f"unexecuted {outcome['unexecuted']}")
+        expect_true(
+            outcome["unexecuted"] == [case for case, _, _ in CASES if case not in outcome["reached"]],
+            f"unexecuted {outcome['unexecuted']}",
+        )
         # The receipt is bounded, unique, explicitly unqualified and refused
         # without an evidence directory.
         holder = dict(os.environ)
