@@ -869,6 +869,72 @@ def self_check_oracles(scratch: str) -> None:
         "planted_buckets" in set(observe_progress.__code__.co_names),
         "the progress sampler does not use the cheap bucket counter",
     )
+    # The estimator itself, on synthetic timestamped windows.
+    #
+    # 1. A one-tick window (one bucket in one 20 ms interval) is not an estimate:
+    #    it is rejected outright, so it can never satisfy a caller.
+    one_tick = [(0.0, 40), (PROGRESS_SAMPLE_S, 39)]
+    expect(
+        estimate_progress(one_tick) is None,
+        "a one-tick window was accepted as a rate estimate",
+    )
+    # 2. Two buckets removed is still below the minimum.
+    two_buckets = [(0.0, 40), (0.20, 39), (0.40, 38)]
+    expect(
+        estimate_progress(two_buckets) is None,
+        f"a two-bucket window was accepted ({estimate_progress(two_buckets)!r})",
+    )
+    # 3. A sustained multi-bucket window gives the average rate over the whole
+    #    window and the remaining time that rate implies.
+    sustained = [(0.0, 40), (0.20, 38), (0.40, 36), (0.60, 34)]
+    estimate = estimate_progress(sustained)
+    expect(estimate is not None, "a sustained multi-bucket window was rejected")
+    expect(
+        estimate["progressed_buckets"] == 6
+        and abs(estimate["span_s"] - 0.60) < 1e-9
+        and abs(estimate["rate_per_s"] - 10.0) < 1e-9,
+        f"the sustained window's progress, span or rate is wrong: {estimate}",
+    )
+    expect(
+        abs(estimate["remaining_s"] - 3.4) < 1e-9,
+        f"the remaining time is not remaining/rate: {estimate}",
+    )
+    # 4. The counterfactual: the old last-two-sample estimator divides one bucket
+    #    by one 20 ms interval and so *falsely* concludes that too little deletion
+    #    remained to distinguish an in-lock deletion; the corrected estimate, over
+    #    the same tree state, is above the bound the real case enforces.
+    bound = 2.27
+    old_rate = (39.0 - 40.0) / -PROGRESS_SAMPLE_S
+    expect(
+        abs(old_rate - 50.0) < 1e-9,
+        f"the counterfactual's old rate changed: {old_rate}",
+    )
+    old_remaining_s = 39.0 / old_rate
+    expect(
+        old_remaining_s < bound,
+        f"the old estimator would not have failed on this tree: {old_remaining_s}",
+    )
+    expect(
+        estimate["remaining_s"] > bound,
+        f"the corrected estimate is not discriminating: {estimate}",
+    )
+    expect(
+        estimate["remaining_s"] > 3.0 * old_remaining_s,
+        f"the corrected estimate is not materially larger than the old one: "
+        f"{estimate['remaining_s']} vs {old_remaining_s}",
+    )
+    # Both cases must use the estimator, and neither may derive a rate from the
+    # last two samples itself.
+    for fn in (prove_concurrent_admission, prove_killed_deleter_takeover):
+        names = set(fn.__code__.co_names)
+        expect(
+            "observe_progress" in names,
+            f"{fn.__name__} does not measure progress by bounded sampling",
+        )
+        expect(
+            "PROGRESS_MIN_BUCKETS" in names or "estimate_progress" in names,
+            f"{fn.__name__} does not require a sound multi-bucket estimate",
+        )
     for evidence in ("holding_rows", "slot_state"):
         expect(
             evidence in concurrency_names,

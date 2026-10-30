@@ -479,7 +479,10 @@ native proof (one fixed script under the qualified shared supervisor,
 `--root-parent /private/tmp` for its genuine internal fixture pool, 300 s,
 512 MiB), `effigy rust:holding-delete:diagnostic` its uncounted keep-going twin,
 and `effigy proof:holding-delete:test` its self-check (one private temporary
-directory, removed before it returns; no child, pool or staging). Every native
+directory, removed before it returns; no child, pool or staging), which includes the
+progress-estimator counterfactual: a one-tick and a two-bucket window are rejected,
+a sustained multi-bucket window yields its average rate, and the old one-tick
+estimator is shown to fail where the corrected one is discriminating. Every native
 run needs its own owner activation, and the counted run and the independent
 reviewer native of the Elevated gate are separate.
 
