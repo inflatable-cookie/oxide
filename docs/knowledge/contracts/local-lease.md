@@ -546,18 +546,19 @@ has run a child, reaping the leader proves nothing about its descendants, whose
 closure belongs to the supervisor's census, so the run aborts and every case not
 reached stays `unexecuted`.
 
-The proof's lock figure is the **eviction's rename transaction under the pool
-lock** — the rank policy and victim re-checks, the intent write, the
-identity-verified rename and the row write — timed from the start of
-`retire_idle_slot` by a debug-only observation armed only inside the
-supervisor's scratch layout, so an inner fragment cannot pass as the whole
-interval. It is deliberately **not** the whole lock hold: the byte-pressure
-decision (`pressure` and the recorded-total walks that feed it, oxide#177/#186)
-and the victim selection run earlier in the same lock hold, belong to the
-accounting path rather than to this change, and are outside the timer. The
-contract therefore claims the under-one-second interval for the rename
-transaction only; how long those preceding walks take is unmeasured here and is
-not part of this subject. Its concurrency oracle is positive
+The proof's lock figure is the **whole eviction-deciding pool-lock interval**:
+from the evicting command's pool-lock acquisition to that eviction's row write,
+so it covers the fence, the ledger read, reconciliation, admission bookkeeping,
+the byte-pressure decision and the recorded-total walks that feed it
+(oxide#177/#186), the victim selection, and then the intent write, the
+identity-verified rename and the row write. It is measured by a debug-only
+observation armed only inside the supervisor's scratch layout, so an inner
+fragment — and the rename transaction alone — cannot pass as the whole interval.
+This is the interval decision `e0f63aa4` refuses to waive ("the under-one-second
+lock interval is not waived"): the figure the counted native must show under a
+second includes the accounting walks the eviction decision makes, not only the
+rename. A command that evicts more than once under one lock records a figure
+that also covers the evictions before it. Its concurrency oracle is positive
 and falsifiable: the competitor's admission is observed by the pool's own new
 ledger row appearing while the deleting process is alive and the held tree is
 provably still being deleted (a measured, decreasing, non-zero entry count under

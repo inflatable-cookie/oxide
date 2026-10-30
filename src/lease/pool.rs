@@ -699,6 +699,17 @@ pub(super) struct Pool {
     /// (oxide#190). Reported to the caller so the command publishes exactly the
     /// trees it evicted instead of selecting one by rotation.
     created_holding: Vec<String>,
+    /// Debug proof observation (oxide#190): the instant this mutating open took
+    /// the pool lock. An eviction's recorded figure is the elapsed interval from
+    /// here to its row write, so it measures the **whole eviction-deciding
+    /// pool-lock interval** — fence, ledger read, reconciliation, admission
+    /// bookkeeping, the byte-pressure decision and the recorded-total walks that
+    /// feed it, victim selection, the intent write, the identity-verified rename
+    /// and the row write — and not only the rename transaction. A command that
+    /// evicts more than once under one lock records a figure that also covers
+    /// the evictions before it. Absent from release builds.
+    #[cfg(debug_assertions)]
+    lock_taken: Option<Instant>,
 }
 
 /// Entry points for the `oxide` front door. They open a budget-only
@@ -1376,6 +1387,11 @@ impl Pool {
         } else {
             lock_pool(&root)?
         };
+        // Debug proof observation (oxide#190): an eviction's reported interval
+        // starts at this lock acquisition, so it covers every decision this lock
+        // hold makes instead of only the rename transaction.
+        #[cfg(debug_assertions)]
+        let lock_taken = Some(Instant::now());
         // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
@@ -1418,6 +1434,8 @@ impl Pool {
             unmeasured: BTreeMap::new(),
             reserve: None,
             created_holding: Vec::new(),
+            #[cfg(debug_assertions)]
+            lock_taken,
         };
         // Holding rows and the trees they name are reconciled first, in the
         // same locked open: an entry a crash left before its row is adopted
@@ -1476,6 +1494,8 @@ impl Pool {
             unmeasured: BTreeMap::new(),
             reserve: None,
             created_holding: Vec::new(),
+            #[cfg(debug_assertions)]
+            lock_taken: None,
         })
     }
 
@@ -3144,20 +3164,19 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
-        // Debug proof observation (oxide#190): this whole function runs while
-        // the pool lock is held, so its own elapsed time is the pool-lock-held
-        // part of one eviction's **rename transaction** — the rank policy and
-        // victim re-checks, the intent write, the identity-verified rename and
-        // the row write. It starts at this function's entry, so the figure is
-        // that whole interval and not an inner fragment. It is deliberately not
-        // the whole lock hold: the byte-pressure decision (`pressure` and its
-        // recorded-total walks, oxide#177/#186) and the victim selection run
-        // earlier in the same lock hold and belong to the accounting path, so a
-        // proof reading this figure claims nothing about them. Absent from
+        // Debug proof observation (oxide#190): the figure an eviction reports is
+        // the **whole eviction-deciding pool-lock interval** — measured from this
+        // open's lock acquisition (`lock_taken`) to this function's row write, so
+        // it covers the byte-pressure decision and the recorded-total walks that
+        // feed it, the victim selection, and then the rank policy and victim
+        // re-checks, the intent write, the identity-verified rename and the row
+        // write. It is not an inner fragment, and not only the rename
+        // transaction; a command that evicts more than once under one lock
+        // records a figure that also covers the evictions before it. Absent from
         // release builds and armed only inside the supervisor's own scratch
         // layout.
         #[cfg(debug_assertions)]
-        let transaction = Instant::now();
+        let lock_started = self.lock_taken.unwrap_or_else(Instant::now);
         // A legacy #155 journal must still be resolved before anything moves
         // (oxide#177). Since oxide#190 no path starts a journal, so this guard is
         // about legacy input an older writer left: it covers every entry point,
@@ -3199,7 +3218,7 @@ impl Pool {
         self.ledger.holding.push(row);
         self.persist_revised()?;
         #[cfg(debug_assertions)]
-        record_eviction_lock_ms(&self.root, id, transaction.elapsed().as_millis());
+        record_eviction_lock_ms(&self.root, id, lock_started.elapsed().as_millis());
         Ok(())
     }
 
@@ -4904,10 +4923,12 @@ fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
     }
 }
 
-/// Debug-only: append one eviction's pool-lock-held duration to
-/// `OXIDE_TEST_HOLDING_LOCK_LOG` (oxide#190). The duration covers the rename
-/// transaction from victim validation to the row write, not the byte-pressure
-/// decision or the victim selection that precede it in the same lock hold.
+/// Debug-only: append one eviction's pool-lock interval to
+/// `OXIDE_TEST_HOLDING_LOCK_LOG` (oxide#190). The duration is measured from the
+/// open's lock acquisition to the eviction's row write, so it covers the whole
+/// eviction-deciding lock hold — admission bookkeeping, the byte-pressure
+/// decision and its walks, victim selection, the intent write, the rename and
+/// the row write — rather than only the rename transaction.
 /// Armed only when the path is inside the supervisor's own
 /// `OXIDE_TASK_SCRATCH_ROOT`, so a release binary
 /// has no such control and an ordinary developer run writes nothing.
@@ -6078,6 +6099,8 @@ pub(super) fn volume_pool_for_test(
         unmeasured: BTreeMap::new(),
         reserve,
         created_holding: Vec::new(),
+        #[cfg(debug_assertions)]
+        lock_taken: None,
     })
 }
 
