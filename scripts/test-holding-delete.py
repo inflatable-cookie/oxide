@@ -115,6 +115,10 @@ CONCURRENT_CUSTODY_S = 0.5
 # is still there, which is also the point at which the competitor starts.
 PROGRESS_SAMPLE_S = 0.02
 PROGRESS_BUDGET_S = 60.0
+# Buckets that must be gone before a rate is estimated at all: with one bucket per
+# 20 ms tick a single-tick window overstates the rate roughly fivefold, and three
+# buckets make the window span several real bucket intervals.
+PROGRESS_MIN_BUCKETS = 3
 MAX_RECEIPT_BYTES = 64 * 1024
 SELECTOR = "rust:holding-delete"
 COMMAND = [
@@ -440,10 +444,12 @@ def plan_document() -> dict:
         "reuse); both halves are asserted in the pure self-check",
         "progress_observation": f"bounded sampling every {PROGRESS_SAMPLE_S}s "
         "of one cheap `listdir` count of the held tree's planted bucket "
-        "directories (never a full 20,000-entry walk), until two consecutive "
-        "samples strictly decrease, so the competitor starts while most buckets "
-        "remain; the case also requires the estimated remaining deletion time to "
-        "exceed the in-lock bound it enforces, which is what makes that control "
+        "directories (never a full 20,000-entry walk), estimated only once at "
+        f"least {PROGRESS_MIN_BUCKETS} buckets are gone and then as the average "
+        "rate over the whole first-to-last window, so one 20 ms tick cannot "
+        "satisfy the rate; the competitor starts while most buckets remain, and "
+        "the case also requires the estimated remaining deletion time to exceed "
+        "the in-lock bound it enforces, which is what makes that control "
         "falsifying",
         "boundaries": "the competitor's admission window is recorded as exact "
         "offsets, with the held bucket count and the recorded holding row read at "
@@ -1280,34 +1286,63 @@ def prove_refused_entry_kept(root: str, subject: str) -> dict:
     return held_facts
 
 
+def estimate_progress(
+    samples: list[tuple[float, int]],
+    min_progress: int = PROGRESS_MIN_BUCKETS,
+) -> dict | None:
+    """The rate and remaining time a timestamped bucket window supports.
+
+    The bucket counter is **quantized**: a bucket disappears only when its last
+    entry is unlinked, so two samples one 20 ms interval apart can only ever show
+    one bucket and dividing that by the interval overstates the rate by the ratio
+    of the interval to a bucket's real duration. The estimate is therefore taken
+    over the whole window — first to last sample — and only once at least
+    `min_progress` buckets have been removed, which makes the window span several
+    bucket intervals. Fewer than that is not an estimate at all (`None`), so a
+    one-tick reading can never satisfy a caller.
+    """
+    if len(samples) < 2:
+        return None
+    initial = samples[0][1]
+    remaining = samples[-1][1]
+    progressed = initial - remaining
+    span = samples[-1][0] - samples[0][0]
+    if progressed < min_progress or span <= 0.0:
+        return None
+    rate = progressed / span
+    return {
+        "initial_buckets": initial,
+        "remaining_buckets": remaining,
+        "progressed_buckets": progressed,
+        "span_s": span,
+        "rate_per_s": rate,
+        "remaining_s": (remaining / rate) if rate > 0.0 else float("inf"),
+    }
+
+
 def observe_progress(
     held: str, budget_s: float = PROGRESS_BUDGET_S
-) -> tuple[list[tuple[float, int]], float]:
-    """Measure a deletion's progress by bounded sampling.
+) -> tuple[list[tuple[float, int]], dict | None]:
+    """Sample the cheap bucket counter until a sound rate estimate exists.
 
-    Returns as soon as two consecutive samples show a **strict** decrease, with the
-    samples taken so far and the observed entries/second. Sampling every
-    `PROGRESS_SAMPLE_S` (not one long sleep) is what makes this fit a tree that can
-    vanish quickly on a fast volume: the caller learns about the decrease while
-    most of the tree is still there. A tree that is already gone returns a final
-    zero sample and rate `0.0`, which the caller must treat as a failed premise; a
-    budget always ends the wait.
+    One `listdir` per sample, never a 20,000-entry walk. Sampling stops as soon as
+    `estimate_progress` accepts the window (several buckets removed, average rate
+    over the whole window), when the tree is empty, or at the budget. The caller
+    must treat `None` as a failed premise, never as progress.
     """
     deadline = time.perf_counter() + budget_s
     samples: list[tuple[float, int]] = []
     while time.perf_counter() < deadline:
         work_left()
         count = planted_buckets(held) if tree_present(held) else 0
-        now = time.perf_counter()
-        samples.append((now, count))
+        samples.append((time.perf_counter(), count))
         if count == 0:
-            return samples, 0.0
-        if len(samples) >= 2 and samples[-1][1] < samples[-2][1]:
-            span = samples[-1][0] - samples[-2][0]
-            rate = (samples[-2][1] - samples[-1][1]) / max(span, 0.001)
-            return samples, rate
+            return samples, None
+        estimate = estimate_progress(samples)
+        if estimate is not None:
+            return samples, estimate
         time.sleep(PROGRESS_SAMPLE_S)
-    return samples, 0.0
+    return samples, estimate_progress(samples)
 
 
 def planted_buckets(held: str) -> int:
@@ -1492,17 +1527,22 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
     )
     # Progress under the evicting command's own non-blocking custody, measured with
     # the cheap bucket counter (one `listdir` per sample, never a 20,000-entry
-    # walk). It stops at the first strict decrease, while most buckets remain.
-    samples, progress_rate = observe_progress(held)
+    # walk) and estimated over a multi-bucket window, so a single 20 ms tick can
+    # never satisfy the rate.
+    samples, estimate = observe_progress(held)
     expect(
-        progress_rate > 0.0 and len(samples) >= 2,
-        f"the deletion made no measurable progress before it ended: {samples[-6:]}",
+        estimate is not None,
+        f"the deletion's bucket samples do not support a sound rate estimate "
+        f"(fewer than {PROGRESS_MIN_BUCKETS} buckets removed): {samples[-8:]}",
     )
-    initial_buckets = samples[0][1]
-    remaining_before = samples[-1][1]
+    initial_buckets = estimate["initial_buckets"]
+    remaining_before = estimate["remaining_buckets"]
+    progressed = estimate["progressed_buckets"]
+    observed_span = estimate["span_s"]
+    progress_rate = estimate["rate_per_s"]
     expect(
         0 < remaining_before < initial_buckets,
-        f"the deletion's bucket samples are not a strict decrease: {samples[-6:]}",
+        f"the deletion's bucket samples are not a strict decrease: {samples[-8:]}",
     )
     expect(
         remaining_before * 2 >= initial_buckets,
@@ -1510,8 +1550,6 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         f"{initial_buckets} buckets in before the first sample: the window is too "
         "short for the in-lock control to be discriminating",
     )
-    progressed = initial_buckets - remaining_before
-    observed_span = samples[-1][0] - samples[0][0]
     expect(
         evictor.poll() is None,
         "the evicting command finished before the competitor started; the case is vacuous",
@@ -1523,7 +1561,7 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
     bound = max(
         INLOCK_CONTROL_FACTOR * control_elapsed, control_elapsed + INLOCK_CONTROL_SLACK_S
     )
-    expected_remaining_s = remaining_before / progress_rate
+    expected_remaining_s = estimate["remaining_s"]
     expect(
         expected_remaining_s > bound,
         f"only {expected_remaining_s:.2f}s of deletion remained against a "
@@ -1635,10 +1673,11 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     # partly deleted tree survive, which is exactly the state a later command
     # resumes.
     evictor, row, held = start_eviction(root, subject, pool, env, victim, "killed")
-    samples, rate = observe_progress(held)
+    samples, estimate = observe_progress(held)
     expect(
-        rate > 0.0 and len(samples) >= 2,
-        f"the evicting command's deletion never made measurable progress: {samples[-6:]}",
+        estimate is not None,
+        f"the evicting command's deletion has no sound rate estimate "
+        f"(fewer than {PROGRESS_MIN_BUCKETS} buckets removed): {samples[-8:]}",
     )
     evictor.kill()
     reaped = discard(evictor, "killed-evictor")

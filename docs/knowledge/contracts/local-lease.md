@@ -483,12 +483,17 @@ directory, removed before it returns; no child, pool or staging). Every native
 run needs its own owner activation, and the counted run and the independent
 reviewer native of the Elevated gate are separate.
 
-Its concurrency case first takes two entry-count samples of the held tree while
-only the deleter runs and requires them to strictly decrease: measured progress
-under the deleter's own non-blocking custody, which no other pass can claim while
-it holds the flock. Only then does the competitor start, and its admission must
-complete with the deleter still alive and that tree still non-empty, inside the
-in-lock control bound. Its diagnostic mode leaves every fixture command — and
+Its concurrency case measures progress under the deleter's own non-blocking
+custody with one cheap `listdir` count of the held tree's planted bucket
+directories — never a full 20,000-entry walk per sample — and estimates the rate
+only once at least three buckets are gone, as the average over the whole
+first-to-last window, so a single 20 ms tick cannot satisfy it (the counter is
+quantized: a bucket disappears only when its last entry is unlinked). The
+competitor then starts while most buckets remain, and its warm-reuse admission
+must complete with the evicting command alive, its holding row still recorded and
+the held tree still non-empty (all read at the completion instant), inside the
+in-lock control bound, with the estimated remaining deletion time required to
+exceed that bound. Its diagnostic mode leaves every fixture command — and
 therefore its descendants — in the qualified shared supervisor's own session and
 process group: the script creates no session and never signals a group, because
 session closure and the census that decides it belong to that supervisor. Each
