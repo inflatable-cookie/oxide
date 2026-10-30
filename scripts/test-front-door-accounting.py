@@ -23,13 +23,16 @@ binary and every live pool out of it. One idle slot later holds more than
   oxide#182 it reads no pool state at all ("use not measured");
 - ordinary reuse walks exactly its target slot at admission and again at
   release, and prints the provenance label "slot N was X MiB when leased";
-- a live holder's `pool recover-interrupted` refuses with no walk, and so
-  does the same after its oxide is killed: the refusal names automatic
-  recovery, a build in the same checkout waits with no walk, then recovers
-  once the Cargo group is empty, walks the slot it is about to reuse, has
-  the freshness gate refuse it, evicts the untrusted slot through the
-  oxide#190 holding deletion, and builds a new slot cold, whose release walk
-  is the last walk of the command;
+- a live holder: `pool recover-interrupted` refuses with no walk, and a build
+  that must wait for that holder's slot (one host-wide slot, so it cannot
+  take a second) waits with no walk or scope pass, then takes the released
+  slot warm (one admission walk and one release walk);
+- a killed holder: `pool recover-interrupted` refuses again, naming automatic
+  recovery, with no walk, and the next build — started only once the
+  fixture's own Cargo group is positively empty — recovers the slot, walks it
+  once as a re-lease, has the freshness gate refuse it, evicts the untrusted
+  slot through the oxide#190 holding deletion, and builds a new slot cold,
+  whose release walk is the second and last walk;
 - a final default `status` after recovery still walks nothing.
 
 Retired rather than duplicated: the byte-pressure eviction case and its
@@ -423,7 +426,38 @@ def wait_text(path: str, text: str, process, label: str, seconds: float = 60) ->
         time.sleep(0.1)
 
 
+def holder_group(proof: Proof, checkout: str) -> int:
+    """The recorded Cargo group of this checkout's one active record, read from
+    the pool control state (never guessed from a pid)."""
+    path = os.path.join(proof.pool, "oxide-managed", "state.json")
+    with open(path) as handle:
+        state = json.load(handle)
+    for record in state.get("records", []):
+        if record.get("checkout") == checkout and record.get("process_group"):
+            return int(record["process_group"])
+    fail(f"no active record with a Cargo group for {checkout}")
+
+
+def await_group_empty(group: int, label: str, seconds: float = 60) -> None:
+    """Positive observation that the fixture's own Cargo group has no member
+    left: `killpg(group, 0)` delivers no signal and fails only when the group
+    is gone. The product makes the same closure decision before it recovers."""
+    deadline = time.monotonic() + min(seconds, remaining())
+    while True:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            say(f"{label}: Cargo group {group} is empty")
+            return
+        except PermissionError:
+            pass
+        if time.monotonic() > deadline:
+            fail(f"{label}: Cargo group {group} still has a member")
+        time.sleep(0.1)
+
+
 def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
+    """A live holder, the wait it forces, then a killed holder's recovery."""
     pidfile = os.path.join(proof.parent, "hold.pid")
     release = os.path.join(proof.parent, "hold.release")
     holder_err = open(os.path.join(proof.parent, "holder.err"), "w")
@@ -435,49 +469,41 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
         if record["state"] != "held":
             fail(f"slot {app_slot} is not held: {record}")
         code, _, stderr, walks, scopes, _ = proof.call(proof.parent, ["pool", "recover-interrupted", app_slot])
-        say(f"live holder: recover-interrupted exit {code}, walks {walks}, scopes {scopes}: {stderr.strip()[-200:]}")
+        say(f"live holder: recover-interrupted exit {code}, walks {walks}, scopes {scopes}: {stderr.strip()[-200:]}".replace("\n", " "))
         if code == 0 or "a live oxide command holds slot" not in stderr or walks or scopes:
             fail("recover-interrupted did not refuse a live holder without walking")
-        holder.send_signal(signal.SIGKILL)
-        holder.wait(timeout=30)
-        code, _, stderr, walks, scopes, _ = proof.call(proof.parent, ["pool", "recover-interrupted", app_slot])
-        say(f"killed holder: recover-interrupted exit {code}, walks {walks}, scopes {scopes}: {stderr.strip()[-200:]}")
-        if code == 0 or "recovered automatically by the next command" not in stderr or walks or scopes:
-            fail("recover-interrupted did not defer to automatic recovery without walking")
-        if proof.slots()[app_slot] != record:
-            fail("a refused recovery changed the ledger")
+        # A command that must wait for the holder's slot polls without walking
+        # (the #110 defect). One host-wide slot keeps the live holder's slot
+        # from being duplicated by a second slot, so the waiter really waits.
         waiter_path = os.path.join(proof.parent, "waiter.err")
         waiter_err = open(waiter_path, "w")
-        waiter, waiter_log = proof.start(app, ["build"], stderr=waiter_err)
-        wait_text(waiter_path, "waiting for another oxide command in this checkout", waiter, "waiter")
+        waiter, waiter_log = proof.start(app, ["build"], {"OXIDE_MAX_ACTIVE": "1"}, stderr=waiter_err)
+        wait_text(waiter_path, "waiting for a build slot", waiter, "waiter")
         time.sleep(1.0)
         waited = proof.walks(waiter_log)
         waited_scopes = proof.scopes(waiter_log)
         say(f"waiting build: walks while waiting {waited}, scopes {waited_scopes}")
         if waited or waited_scopes:
             fail(f"a waiting build walked {waited} or scoped {waited_scopes}")
+        # The holder finishes cleanly; the waiter then takes its released slot
+        # warm: one walk at admission and one at release, nothing else.
         with open(release, "w"):
             pass
         code = waiter.wait(timeout=min(120, remaining()))
         waiter_err.close()
         with open(waiter_path) as handle:
             stderr = handle.read()
-        walks = proof.walks(waiter_log)
-        slot, warmth, tail = summary(stderr, "recovered build")
-        say(f"recovered build: exit {code}, slot {slot} {warmth}, walks {walks}, summary tail: {tail}")
-        if code or not re.search(rf"recovered slot {app_slot} after oxide pid {holder.pid} died \(Cargo group \d+ empty\)", stderr):
-            fail(f"the build did not recover slot {app_slot}: {stderr[-2000:]}")
-        if f"cannot vouch for slot {app_slot}" not in stderr or warmth != "cold" or not tail.startswith("new slot, "):
-            fail(f"the untrusted recovered slot was not evicted for a cold build: {stderr[-2000:]}")
-        # The command re-leases the recovered slot (its own reuse walk), the
-        # freshness gate refuses it, and the new slot's release is the last
-        # walk. Nothing walks the payload or the idle slot beside it.
-        expect_roots("recovered build", "walks", walks, [f"slots/{app_slot}", f"slots/{slot}"])
-        if app_slot in proof.slots() or slot in ("", app_slot):
-            fail(f"recovered build ledger {sorted(proof.slots())}, slot {slot}")
-        if proof.walks(holder_log) != [f"slots/{app_slot}"]:
-            fail(f"the holder's lease walked {proof.walks(holder_log)}")
-        return slot
+        slot, warmth, tail = summary(stderr, "woken build")
+        say(f"woken build: exit {code}, slot {slot} {warmth}, walks {proof.walks(waiter_log)}, summary tail: {tail}")
+        if code or slot != app_slot or warmth != "warm":
+            fail(f"the woken build did not take slot {app_slot} warm: {code} {stderr[-2000:]}")
+        expect_roots("woken build", "walks", proof.walks(waiter_log),
+                     [f"slots/{app_slot}", f"slots/{app_slot}"])
+        if holder.wait(timeout=min(60, remaining())):
+            fail(f"the clean holder exited {holder.returncode}")
+        expect_roots("holder", "walks", proof.walks(holder_log),
+                     [f"slots/{app_slot}", f"slots/{app_slot}"])
+        holder_err.close()
     finally:
         with open(release, "w"):
             pass
@@ -486,6 +512,51 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
             if process is not None and process.poll() is None:
                 process.kill()
                 process.wait()
+
+    # A killed holder: the refused explicit recovery, then the next command's
+    # own recovery, eviction and cold build.
+    killed_pid = os.path.join(proof.parent, "killed.pid")
+    killed_release = os.path.join(proof.parent, "killed.release")
+    killed_err = open(os.path.join(proof.parent, "killed.err"), "w")
+    killed, killed_log = proof.start(app, ["test"], {"OXIDE_FIXTURE_HOLD": killed_pid}, stderr=killed_err)
+    try:
+        wait_for(killed_pid, killed, "killed holder start")
+        held = proof.slots()[app_slot]
+        if held["state"] != "held":
+            fail(f"slot {app_slot} is not held by the killed holder: {held}")
+        group = holder_group(proof, app)
+        killed.send_signal(signal.SIGKILL)
+        killed.wait(timeout=30)
+        with open(killed_release, "w"):
+            pass
+        # The product only recovers on a positively empty Cargo group; observe
+        # that the fixture's own group is empty before the next command.
+        await_group_empty(group, "killed holder")
+        code, _, stderr, walks, scopes, _ = proof.call(proof.parent, ["pool", "recover-interrupted", app_slot])
+        say(f"killed holder: recover-interrupted exit {code}, walks {walks}, scopes {scopes}: {stderr.strip()[-200:]}".replace("\n", " "))
+        if code == 0 or "recovered automatically by the next command" not in stderr or walks or scopes:
+            fail("recover-interrupted did not defer to automatic recovery without walking")
+        if proof.slots()[app_slot] != held:
+            fail("a refused recovery changed the ledger")
+        # One walk re-leases the recovered slot, which the freshness gate
+        # refuses; the new cold slot's release is the second and last walk.
+        new_slot, warmth, tail, stderr = build(proof, app, "recovered build",
+                                               [f"slots/{app_slot}", "slots/{slot}"])
+        if not re.search(rf"recovered slot {app_slot} after oxide pid {killed.pid} died \(Cargo group \d+ empty\)", stderr):
+            fail(f"the build did not recover slot {app_slot}: {stderr[-2000:]}")
+        if f"cannot vouch for slot {app_slot}" not in stderr or warmth != "cold" or not tail.startswith("new slot, "):
+            fail(f"the untrusted recovered slot was not evicted for a cold build: {stderr[-2000:]}")
+        if app_slot in proof.slots() or new_slot in ("", app_slot):
+            fail(f"recovered build ledger {sorted(proof.slots())}, slot {new_slot}")
+        expect_roots("killed holder", "walks", proof.walks(killed_log), [f"slots/{app_slot}"])
+        return new_slot
+    finally:
+        with open(killed_release, "w"):
+            pass
+        killed_err.close()
+        if killed.poll() is None:
+            killed.kill()
+            killed.wait()
 
 
 def self_check() -> int:
