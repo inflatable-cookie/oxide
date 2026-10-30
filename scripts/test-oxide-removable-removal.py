@@ -466,7 +466,15 @@ def run(proof: Proof, repo: str) -> None:
     volume.no_spill("after held build")
     expect(not os.path.lexists(out_dir), "the slot's OUT_DIR exists after removal")
     code, stdout, _ = proof.oxide(["status"], "status, volume gone", app)
-    expect(code == 0 and "slot 2 (" + held + "): lost with the removable volume; deleted whole when the volume returns" in stdout, "status does not show the lost slot")
+    expect(
+        code == 0
+        and re.search(
+            r"slot 2 retired and held, never reused \(lost with the removable volume; deleted whole when the volume returns\)",
+            stdout,
+        )
+        is not None,
+        "status does not show the lost slot",
+    )
     proof.phase("after held removal")
 
     # The next commands fall back; run and test use checkout-local outputs.
