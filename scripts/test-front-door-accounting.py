@@ -16,7 +16,9 @@ binary and every live pool out of it. One idle slot later holds more than
 - default `oxide status` walks nothing and makes no scope pass (recorded
   facts only);
 - `oxide status --measure` walks the payload first and then every slot, with
-  complete accounting on this small pool;
+  complete accounting; it also measures the checkout's `target` and the
+  Cargo home, which are not pool roots and are excluded from the pool walk
+  oracle;
 - `oxide new` readiness walks nothing and makes no scope pass: since
   oxide#182 it reads no pool state at all ("use not measured");
 - ordinary reuse walks exactly its target slot at admission and again at
@@ -228,6 +230,13 @@ def expect_roots(label: str, kind: str, roots: list, expected: list) -> None:
         fail(f"{label}: {kind} {roots}, expected {expected}")
 
 
+def pool_roots(walks: list) -> list:
+    """The pool's own walk roots from a command's log, in order. A measurement
+    also walks the checkout's `target` and the Cargo home, which are absolute
+    roots outside the payload and are never pool routing."""
+    return [root for root in walks if not root.startswith("/")]
+
+
 class Proof:
     def __init__(self, parent: str, oxide: str, env: dict):
         self.parent = parent
@@ -338,7 +347,7 @@ def status(proof: Proof, cwd: str, label: str, slots: list) -> str:
     say(f"{label} status --measure in {elapsed:.1f} s: {line.strip()}; walks {walks}, scopes {scopes}")
     if not counted or "accounting walk: partial" in stdout or "accounting walk: unknown" in stdout:
         fail(f"{label}: status --measure accounting is not complete:\n{stdout}")
-    expect_roots(label, "walks", walks, ["payload", *[f"slots/{slot}" for slot in slots]])
+    expect_roots(label, "pool walks", pool_roots(walks), ["payload", *[f"slots/{slot}" for slot in slots]])
     return stdout
 
 
@@ -503,6 +512,15 @@ def self_check() -> int:
                      ["payload", "slots/1", "slots/3", os.path.realpath(os.path.join(root, "outside"))])
         expect_roots("self-check", "scopes", proof.scopes(log), ["payload"])
         expect_roots("self-check", "absent logs", proof.walks(os.path.join(root, "missing")), [])
+        # A measurement also walks the checkout target and the Cargo home; the
+        # pool oracle excludes those absolute roots and keeps the payload-relative
+        # ones in order.
+        expect_roots(
+            "self-check",
+            "pool walks",
+            pool_roots(["payload", "/fixture/checkout/target", "slots/1", "/fixture/cargo-home"]),
+            ["payload", "slots/1"],
+        )
         # The oracle compares exact ordered lists. A passing list must pass,
         # and each wrong shape - the pre-#146 whole-payload admission walk, a
         # missing release walk, a reordered list, a dropped duplicate - must
@@ -630,6 +648,7 @@ def main() -> int:
         owned(parent, "after recovery")
         reserve(parent, "after recovery")
         recorded_status(proof, checkouts["app"], "after recovery")
+        status(proof, checkouts["app"], "after recovery", list(proof.slots()))
         reserve(parent, "after recovery status")
     except Exception:
         print(f"front-door accounting proof retained its owned scratch at {parent}", file=sys.stderr)
