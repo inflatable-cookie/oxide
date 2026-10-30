@@ -439,10 +439,15 @@ def plan_document() -> dict:
         "fits under it (its charged row leaves room for the competitor's warm "
         "reuse); both halves are asserted in the pure self-check",
         "progress_observation": f"bounded sampling every {PROGRESS_SAMPLE_S}s "
-        "until two consecutive samples strictly decrease, so the competitor starts "
-        "while most of the tree is still there; the case also requires the "
-        "estimated remaining deletion time to exceed the in-lock bound it "
-        "enforces, which is what makes that control falsifying",
+        "of one cheap `listdir` count of the held tree's planted bucket "
+        "directories (never a full 20,000-entry walk), until two consecutive "
+        "samples strictly decrease, so the competitor starts while most buckets "
+        "remain; the case also requires the estimated remaining deletion time to "
+        "exceed the in-lock bound it enforces, which is what makes that control "
+        "falsifying",
+        "boundaries": "the competitor's admission window is recorded as exact "
+        "offsets, with the held bucket count and the recorded holding row read at "
+        "both the start and the completion instant",
         "observations": {
             "lock_held": "the product's debug-only OXIDE_TEST_HOLDING_LOCK_LOG "
             "line per eviction, armed only inside the supervisor's scratch root. "
@@ -845,6 +850,31 @@ def self_check_oracles(scratch: str) -> None:
         "max" in concurrency_names and "INLOCK_CONTROL_FACTOR" in concurrency_names,
         "the concurrency case does not build the in-lock bound it enforces",
     )
+    # The oracle observes progress with one cheap `listdir` of planted buckets,
+    # never by walking the whole tree per sample, and it reads the deletion state
+    # at both ends of the admission window rather than inferring activity.
+    expect(
+        "planted_buckets" in concurrency_names
+        and "entry_count" not in concurrency_names,
+        f"the concurrency case does not use the cheap bucket counter: "
+        f"{sorted(concurrency_names)}",
+    )
+    expect(
+        "planted_buckets" in set(observe_progress.__code__.co_names),
+        "the progress sampler does not use the cheap bucket counter",
+    )
+    for evidence in ("holding_rows", "slot_state"):
+        expect(
+            evidence in concurrency_names,
+            f"the concurrency oracle does not read {evidence} at the boundaries",
+        )
+    for key in (
+        "buckets_at_admission_start",
+        "buckets_" + "at_admission_completion",
+        "admission_" + "started_offset_s",
+        "admission_" + "completed_offset_s",
+    ):
+        expect(key in source, f"the receipt does not record the boundary {key}")
     premise = "expected_" + "remaining_s"
     expect(
         premise in source,
@@ -1267,7 +1297,7 @@ def observe_progress(
     samples: list[tuple[float, int]] = []
     while time.perf_counter() < deadline:
         work_left()
-        count = entry_count(held) if tree_present(held) else 0
+        count = planted_buckets(held) if tree_present(held) else 0
         now = time.perf_counter()
         samples.append((now, count))
         if count == 0:
@@ -1278,6 +1308,23 @@ def observe_progress(
             return samples, rate
         time.sleep(PROGRESS_SAMPLE_S)
     return samples, 0.0
+
+
+def planted_buckets(held: str) -> int:
+    """A cheap monotone progress counter for a held tree.
+
+    The fixture writes its entries in `b0000`..`b0039` buckets of 500 files, and
+    the deletion empties those buckets one at a time, so the number of bucket
+    directories still present is a faithful progress signal that costs one
+    `listdir` of at most a few dozen names. Walking all 20,000 entries per sample
+    (as `entry_count` does) costs on the order of the deletion itself and makes any
+    sampling window meaningless.
+    """
+    planted = os.path.join(held, "build", "planted")
+    try:
+        return len(os.listdir(planted))
+    except OSError:
+        return 0
 
 
 def parse_size(text: str) -> int:
@@ -1443,27 +1490,27 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         str(row["slot"]) == str(victim["id"]),
         "the oldest idle tree was not the victim",
     )
-    # Progress under the evicting command's own non-blocking custody, measured by
-    # bounded sampling: it stops at the first proven decrease, while most of the
-    # tree is still there.
+    # Progress under the evicting command's own non-blocking custody, measured with
+    # the cheap bucket counter (one `listdir` per sample, never a 20,000-entry
+    # walk). It stops at the first strict decrease, while most buckets remain.
     samples, progress_rate = observe_progress(held)
     expect(
         progress_rate > 0.0 and len(samples) >= 2,
         f"the deletion made no measurable progress before it ended: {samples[-6:]}",
     )
-    initial_entries = samples[0][1]
+    initial_buckets = samples[0][1]
     remaining_before = samples[-1][1]
     expect(
-        0 < remaining_before < initial_entries,
-        f"the deletion's progress samples are not a strict decrease: {samples[-6:]}",
+        0 < remaining_before < initial_buckets,
+        f"the deletion's bucket samples are not a strict decrease: {samples[-6:]}",
     )
     expect(
-        remaining_before * 2 >= initial_entries,
-        f"the deletion was already {initial_entries - remaining_before} of "
-        f"{initial_entries} entries in before the first sample: the window is too "
+        remaining_before * 2 >= initial_buckets,
+        f"the deletion was already {initial_buckets - remaining_before} of "
+        f"{initial_buckets} buckets in before the first sample: the window is too "
         "short for the in-lock control to be discriminating",
     )
-    progressed = initial_entries - remaining_before
+    progressed = initial_buckets - remaining_before
     observed_span = samples[-1][0] - samples[0][0]
     expect(
         evictor.poll() is None,
@@ -1471,7 +1518,8 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
     )
     # The falsifying premise of the in-lock control: enough deletion work must
     # remain that an admission serialised behind the pool lock would exceed the
-    # bound we are about to enforce.
+    # bound this case enforces. Buckets are removed one at a time, so the
+    # remaining bucket count over the observed bucket rate is that time.
     bound = max(
         INLOCK_CONTROL_FACTOR * control_elapsed, control_elapsed + INLOCK_CONTROL_SLACK_S
     )
@@ -1482,10 +1530,16 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         f"{bound:.2f}s bound, so an in-lock deletion could not be distinguished",
     )
     # The competitor's admission, observed through the pool's own slot row: its
-    # idle slot becomes held while the held tree is still being deleted.
+    # idle slot becomes held. Boundaries are recorded exactly: the admission
+    # starts here and completes at the ledger transition below.
     expect(
         slot_state(pool, reusable_slot) == "idle",
         "the competitor's slot was not idle before its admission",
+    )
+    buckets_at_admission_start = planted_buckets(held)
+    expect(
+        buckets_at_admission_start > 0,
+        "the deletion was already over when the competitor's admission started",
     )
     competitor = start_check(subject, competitor_ws, env, "competitor")
     admission_started = time.perf_counter()
@@ -1499,24 +1553,31 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
             fail("the competitor exited without taking its slot")
         if time.perf_counter() - admission_started > 120:
             fail("the competitor's admission did not complete inside its window")
-        time.sleep(0.005)
-    # The oracle: this admission completed while the held tree was positively
-    # still being deleted, which an in-lock deletion could not allow.
+        time.sleep(0.002)
+    # The oracle, read at the completion instant: the competitor's admission ended
+    # while the evicting command was still alive, its holding row was still
+    # recorded and the held tree still had buckets to delete. All three are read
+    # immediately, so none of them is inferred from a process lifetime.
     evictor_alive = evictor.poll() is None
-    remaining_at_admission = entry_count(held) if tree_present(held) else 0
+    row_still_recorded = any(entry["name"] == row["name"] for entry in holding_rows(pool))
+    buckets_at_completion = planted_buckets(held)
     admission_elapsed = admission_completed - admission_started
     expect(
         evictor_alive,
         "the deleting command had already exited when the competitor admitted",
     )
     expect(
-        remaining_at_admission > 0 and tree_present(held),
-        f"the held tree was already gone at the competitor's admission "
-        f"({remaining_at_admission} entries left)",
+        row_still_recorded,
+        "the held row was already concluded at the competitor's admission",
     )
     expect(
-        remaining_at_admission <= remaining_before,
-        "the sampled progress is not monotonic",
+        buckets_at_completion > 0 and tree_present(held),
+        f"the held tree was already empty at the competitor's admission "
+        f"({buckets_at_completion} buckets left)",
+    )
+    expect(
+        buckets_at_completion <= buckets_at_admission_start,
+        "the bucket counter is not monotonic across the admission",
     )
     expect(
         admission_elapsed <= bound,
@@ -1541,16 +1602,22 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         "pending_row_bytes": row["bytes"],
         "control_admission_s": round(control_elapsed, 3),
         "inlock_bound_s": round(bound, 3),
+        # Exact boundaries: the admission window, and the deletion state read at
+        # both ends of it.
+        "admission_started_offset_s": round(admission_started - samples[0][0], 3),
+        "admission_completed_offset_s": round(admission_completed - samples[0][0], 3),
         "admission_during_deletion_s": round(admission_elapsed, 3),
         "deletion_remaining_estimate_s": round(expected_remaining_s, 3),
         "progress_samples": [count for _, count in samples],
         "progress_sample_span_s": round(observed_span, 3),
-        "progress_entries": progressed,
-        "progress_entries_per_s": round(progress_rate, 1),
-        "initial_entries": initial_entries,
-        "remaining_before": remaining_before,
-        "remaining_at_admission": remaining_at_admission,
+        "progress_buckets": progressed,
+        "progress_buckets_per_s": round(progress_rate, 3),
+        "initial_buckets": initial_buckets,
+        "buckets_remaining_before": remaining_before,
+        "buckets_at_admission_start": buckets_at_admission_start,
+        "buckets_at_admission_completion": buckets_at_completion,
         "evictor_alive_at_admission": evictor_alive,
+        "holding_row_recorded_at_admission": row_still_recorded,
         "competitor_slot_held_at_admission": True,
     }
     passed(name, **concurrent_facts)
@@ -1582,7 +1649,7 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     expect(rows[0]["name"] == row["name"], "the recorded row changed")
     expect(rows[0]["bytes"] > 0, "the surviving row carries no charge")
     expect(tree_present(held), "the held tree is gone")
-    remaining_after_kill = entry_count(held)
+    remaining_after_kill = planted_buckets(held)
     expect(remaining_after_kill > 0, "the held tree was already empty")
     # A later command resumes it: its own pre-admission pass claims the row
     # outside the pool lock and finishes the deletion.
