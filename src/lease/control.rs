@@ -45,11 +45,16 @@ pub const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Version 4 (the profile-member owned-outputs fence, oxide#133), version 3
 /// (the whole-target registry transaction, oxide#129) and version 2
 /// (oxide#128) remain readable until a forward fence upgrades them.
-pub const STATE_VERSION: u32 = 8;
+pub const STATE_VERSION: u32 = super::CONTROL_FENCE_VERSION;
+/// Version 9 is the whole-tree holding fence (oxide#190): a slot tree is
+/// renamed whole into the payload's private holding area under the pool lock
+/// and deleted outside it, so a ledger can carry a `holding` row instead of a
+/// per-entry deletion journal.
+pub const HOLDING_STATE_VERSION: u32 = super::CONTROL_FENCE_VERSION;
 /// Version 7 is the eviction-accounting fence (oxide#175).
 pub const EVICTION_ACCOUNTING_STATE_VERSION: u32 = 7;
 /// Version 8 is the raised-ceiling fence (oxide#177).
-pub const SLOT_CEILING_STATE_VERSION: u32 = super::CONTROL_FENCE_VERSION;
+pub const SLOT_CEILING_STATE_VERSION: u32 = 8;
 /// Version 6 carries the one-use fence. A version-7 or version-8 document may
 /// also carry it, so presence requires at least this version and version 6
 /// requires the fence itself.
@@ -78,10 +83,14 @@ pub const ONE_USE_FENCE: &str = super::CONTROL_ONE_USE_FENCE;
 /// later, and a version-7 or version-8 document always carries it.
 pub const EVICTION_ACCOUNTING_FENCE: &str = super::CONTROL_EVICTION_ACCOUNTING_FENCE;
 /// The raised-ceiling fence value (oxide#177); see
-/// [`State::slot_ceiling`]. A document carrying it is always at version 8,
-/// and a version-8 document always carries it. The library's fence writer and
-/// this store use one value.
+/// [`State::slot_ceiling`]. A document carrying it is at version 8 or later,
+/// and version 8 requires it. The library's fence writer and this store use
+/// one value.
 pub const SLOT_CEILING_FENCE: &str = super::CONTROL_SLOT_CEILING_FENCE;
+/// The whole-tree holding fence value (oxide#190); see [`State::holding`]. A
+/// document carrying it is always at version 9, and a version-9 document
+/// always carries it.
+pub const HOLDING_FENCE: &str = super::CONTROL_HOLDING_FENCE;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
 pub const MAX_IDENTITY_BYTES: usize = 64;
@@ -385,6 +394,12 @@ pub struct State {
     /// refusing a pool this one just raised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_ceiling: Option<String>,
+    /// Forward-only whole-tree holding fence (oxide#190), set durably by the
+    /// admission gate before the first ledger write that records a holding row
+    /// and never cleared. An older binary hands off at version 9 instead of
+    /// reading a pool whose eviction route it does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<String>,
 }
 
 /// The durable initialization record shared by both pools of a pair.
@@ -429,6 +444,7 @@ impl Default for State {
             one_use_workspaces: None,
             eviction_accounting: None,
             slot_ceiling: None,
+            holding: None,
         }
     }
 }
@@ -555,6 +571,7 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
             | ONE_USE_STATE_VERSION
             | EVICTION_ACCOUNTING_STATE_VERSION
             | SLOT_CEILING_STATE_VERSION
+            | HOLDING_STATE_VERSION
     ) {
         return Err("Oxide state has an unsupported version".to_owned());
     }
@@ -628,6 +645,23 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
         }
         Some(fence) if fence == SLOT_CEILING_FENCE => {
             if state.version < SLOT_CEILING_STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
+        Some(_) => {
+            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
+        }
+    }
+    // The whole-tree holding fence and version 9 are equivalent (oxide#190): a
+    // version-9 document always carries it, and a smaller pool never does.
+    match state.holding.as_deref() {
+        None => {
+            if state.version >= HOLDING_STATE_VERSION {
+                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+            }
+        }
+        Some(fence) if fence == HOLDING_FENCE => {
+            if state.version < HOLDING_STATE_VERSION {
                 return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
             }
         }
@@ -852,6 +886,8 @@ fn reject_non_string_fences(bytes: &[u8]) -> Result<(), String> {
         #[serde(default)]
         slot_ceiling: RawFence,
         #[serde(default)]
+        holding: RawFence,
+        #[serde(default)]
         owned_outputs: RawFence,
     }
     let Ok(document) = serde_json::from_slice::<RawDocument>(bytes) else {
@@ -862,6 +898,7 @@ fn reject_non_string_fences(bytes: &[u8]) -> Result<(), String> {
         ("one_use_workspaces", document.one_use_workspaces),
         ("eviction_accounting", document.eviction_accounting),
         ("slot_ceiling", document.slot_ceiling),
+        ("holding", document.holding),
         ("owned_outputs", document.owned_outputs),
     ] {
         if field.present && !field.string {
@@ -894,7 +931,8 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
         | RECORDED_ACCOUNTING_STATE_VERSION
         | ONE_USE_STATE_VERSION
         | EVICTION_ACCOUNTING_STATE_VERSION
-        | SLOT_CEILING_STATE_VERSION => false,
+        | SLOT_CEILING_STATE_VERSION
+        | HOLDING_STATE_VERSION => false,
         _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
     };
     if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
@@ -922,6 +960,9 @@ pub fn fenced_state(mut state: State) -> Result<State, String> {
     }
     if state.slot_ceiling.is_none() {
         state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+    }
+    if state.holding.is_none() {
+        state.holding = Some(HOLDING_FENCE.to_owned());
     }
     state.version = STATE_VERSION;
     validate_state(&state, false)?;

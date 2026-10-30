@@ -624,7 +624,13 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     let mut grants = LeaseGrants::new();
     let resolution = cli::resolution(&invocation.cargo_args);
     let label = exec_label(&invocation.tool);
-    let (mut held, mut gate) = match lease_with_gate(
+    // The sweep runs before the admission as well as beside the writer
+    // (oxide#190): a pool over its budget because of a pending holding row
+    // refuses the very admission that could delete it, so this command's pass
+    // takes that entry (at most one, under a brief lock, deleted outside it)
+    // and its own evicted tree is deleted the same way once the lease is held.
+    let mut holding_sweep = HoldingSweep::start(store.pool.clone());
+    let lease = lease_with_gate(
         &store,
         &key,
         invocation.profile,
@@ -633,12 +639,44 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         label.as_deref(),
         &mut waits,
         &mut grants,
-    )? {
+    );
+    let lease = match lease {
+        Ok(inner) => Ok(inner),
+        Err(error) => {
+            // One retry, only when this command's own pass finished a pending
+            // entry: the pool's accounting changed under it, so the refusal it
+            // just received may no longer hold. A pass that claimed nothing
+            // leaves the original refusal untouched.
+            let reclaimed = holding_sweep.finish();
+            if reclaimed.is_some() {
+                eprintln!(
+                    "oxide: finished a pending slot deletion in the holding area; retrying the admission once"
+                );
+                lease_with_gate(
+                    &store,
+                    &key,
+                    invocation.profile,
+                    admission,
+                    &resolution,
+                    label.as_deref(),
+                    &mut waits,
+                    &mut grants,
+                )
+            } else {
+                Err(error)
+            }
+        }
+    };
+    let (mut held, mut gate) = match lease? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
         Err(Stop::Cargo(code)) => return Ok(code),
         Err(Stop::Admission) => return Ok(stop_for_admission()),
     };
+    // The admission just taken may itself have evicted an idle slot, whose tree
+    // is already renamed into the holding area and recorded. This command owns
+    // its deletion from here, beside its own writer (oxide#190).
+    let mut holding_sweep = HoldingSweep::start(store.pool.clone());
     if budget::admission_expired() {
         let origin = held.prior.unchanged();
         store.release(held, origin)?;
@@ -971,6 +1009,10 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     }) {
         eprintln!("oxide: {note}");
     }
+    // The command's own deletion finishes before the summary, inside its
+    // bounded wait, so the pool is not left holding a tree this command could
+    // have removed (oxide#190).
+    holding_sweep.finish();
     let mut notes = [gate.describe(), wrapper_note, output_note]
         .into_iter()
         .flatten()
@@ -1707,6 +1749,127 @@ impl StatusMode {
     }
 }
 
+/// How long a command waits for its own holding deletion before it reports the
+/// tree as left for a later command. The deletion itself is unbounded in the
+/// product (it runs beside the build and is resumed by the next command); this
+/// is only the wait at exit, so one huge tree never holds a command open.
+const HOLDING_SWEEP_WAIT: Duration = Duration::from_secs(60);
+/// How often the bounded exit wait reports its progress.
+const HOLDING_SWEEP_REPORT: Duration = Duration::from_secs(2);
+
+/// The asynchronous deletion of one held slot tree, owned by the command that
+/// evicted it (oxide#190).
+///
+/// The worker claims at most one recorded holding entry under a brief pool
+/// lock, then deletes that tree outside the lock while this command's own
+/// writer runs. It never waits for another deleter: the per-entry custody lock
+/// is taken without blocking, so a command that loses the race simply leaves
+/// the entry to the process that holds it.
+///
+/// The guard joins the worker before this command exits, with a bounded wait
+/// whose progress is printed. A worker that is still running at the bound is
+/// detached: the entry stays recorded and charged, and a later command's own
+/// pass resumes it from whatever is left.
+struct HoldingSweep {
+    worker: Option<std::thread::JoinHandle<Option<oxide_storage::lease::HoldingDrain>>>,
+}
+
+impl HoldingSweep {
+    /// Start the pass for this command's pool. A pool with nothing pending
+    /// costs one short locked open that finds no entry.
+    fn start(pool: PathBuf) -> Self {
+        let worker = std::thread::Builder::new()
+            .name("oxide-holding".to_owned())
+            .spawn(move || report_holding_pass(&pool))
+            .ok();
+        Self { worker }
+    }
+
+    /// Wait for the pass with a bounded wait, printing its progress. Returns
+    /// the pass's own result when it finished inside the bound: `Some` means
+    /// this command claimed and worked on one holding entry, which is the
+    /// evidence a caller uses to retry an admission the pending charge refused.
+    fn finish(&mut self) -> Option<oxide_storage::lease::HoldingDrain> {
+        let started = Instant::now();
+        let mut next_report = HOLDING_SWEEP_REPORT;
+        loop {
+            let finished = self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished());
+            if finished {
+                return self
+                    .worker
+                    .take()
+                    .and_then(|worker| worker.join().ok().flatten());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= HOLDING_SWEEP_WAIT {
+                // Detach the worker: the process is about to exit, and the
+                // entry keeps its record and charge for the next command.
+                self.worker = None;
+                eprintln!(
+                    "oxide: a held slot tree is still being deleted after {}s; it stays recorded in the holding area, and the next oxide command resumes it",
+                    elapsed.as_secs()
+                );
+                return None;
+            }
+            if elapsed >= next_report {
+                eprintln!(
+                    "oxide: still deleting a held slot tree outside the pool lock ({}s; the build and every other command are not held)",
+                    elapsed.as_secs()
+                );
+                next_report += HOLDING_SWEEP_REPORT;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for HoldingSweep {
+    /// Every return path of a command joins its own deletion, never only the
+    /// happy one.
+    fn drop(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        let _ = self.finish();
+    }
+}
+
+/// One pass: claim a pending holding entry and delete it outside the pool
+/// lock. Progress goes to stderr, bounded to one line per pass.
+fn report_holding_pass(pool: &Path) -> Option<oxide_storage::lease::HoldingDrain> {
+    let started = Instant::now();
+    match oxide_storage::lease::managed::drain_holding(pool, None) {
+        Ok(pass) => {
+            let Some(name) = pass.claimed.clone() else {
+                return None;
+            };
+            if pass.gone {
+                eprintln!(
+                    "oxide: deleted the held slot tree {name} outside the pool lock ({} entries, {} in {:.2}s)",
+                    pass.entries,
+                    cargo_home::size(pass.bytes),
+                    started.elapsed().as_secs_f64()
+                );
+            } else if !pass.refused.is_empty() {
+                eprintln!(
+                    "oxide: kept part of the held slot tree {name} ({}); it stays recorded and charged, and a later command reports it again",
+                    pass.refused.join(", ")
+                );
+            }
+            Some(pass)
+        }
+        // A deletion that cannot continue is reported, never fatal: the tree
+        // stays recorded, charged and visible in `oxide status`.
+        Err(error) => {
+            eprintln!("oxide: the held slot deletion could not continue: {error}");
+            None
+        }
+    }
+}
+
 /// One cumulative budget for every walk a measured status makes (payload,
 /// slots, checkout, Cargo home), so no combination of walks runs unbounded.
 struct MeasureBudget {
@@ -2195,6 +2358,23 @@ fn print_pool(
         println!(
             "  recorded deletions pending reconciliation: {} (left in place; status never reconciles or deletes)",
             pending.join(", ")
+        );
+    }
+    // Held trees are deleted outside the pool lock by the command that evicted
+    // them or by a later one (oxide#190). This reports the recorded facts and
+    // one presence check each, never a walk; it starts no deletion.
+    for held in &report.holding {
+        let age = process::now_ms().saturating_sub(held.at_ms) / 1000;
+        println!(
+            "  slot {} held for deletion: {} recorded, {}s old, {}",
+            held.slot_id,
+            crate::cargo_home::size(held.recorded_bytes),
+            age,
+            match held.present {
+                Some(true) => "tree still present, deletion pending outside the pool lock",
+                Some(false) => "tree gone, record pending its next locked open",
+                None => "presence not probed",
+            }
         );
     }
     if let Some(error) = &report.state_error {

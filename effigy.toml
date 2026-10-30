@@ -48,6 +48,34 @@ minimum_effigy_version = "0.14.0"
   "git diff --check HEAD",
 ]
 
+# Whole-tree holding deletion (oxide#190): one fixed script and the whole
+# command of the qualified shared supervisor. A slot tree is renamed whole into
+# the payload's private holding area under the pool lock and deleted outside it,
+# with one durable row per held tree and a non-blocking per-entry custody lock.
+# `--root-parent /private/tmp` is the owner-accepted internal-placement
+# exception (decision bd357a4c): the fixture's own OXIDE_POOL is a genuine
+# internal `directory-budget-v1` pool, which the product correctly refuses on an
+# external volume. The cases are a 20,000-entry eviction with the product's own
+# recorded lock-held figure, a refused unknown entry type that keeps its row and
+# charge, a concurrent admission while a held tree is deleted, and a killed
+# deleter whose entry the next command finishes. 300 s, 512 MiB monitored
+# scratch. `--diagnostic` is the same guard, root and limits in keep-going mode
+# with a bounded `qualified: false` receipt; it is never a counted pass.
+# `proof:holding-delete:test` runs only the script's pure self-check (argument
+# boundary, plan, oracles, constants) with no child, Cargo, pool or scratch.
+# Every native run needs its own owner activation. Not a benchmark, a real-pool
+# rate claim or an alias for full QA.
+[tasks."proof:holding-delete:test"]
+run = "python3 scripts/test-holding-delete.py --self-check"
+
+[tasks."rust:holding-delete"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py"
+
+[tasks."rust:holding-delete:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py --diagnostic"
+
 [test.suites.rust]
 run = "python3 scripts/bounded-test.py oxide test --workspace --all-targets --locked"
 default = false

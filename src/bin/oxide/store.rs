@@ -937,6 +937,10 @@ pub struct Report {
     /// Idle slots with no current ledger record: they make `recorded_total` a
     /// stated lower bound.
     pub unrecorded_slots: usize,
+    /// Slot trees already renamed into the payload's holding area and pending
+    /// deletion outside the pool lock (oxide#190). Recorded facts only: this
+    /// view performs no walk and starts no deletion.
+    pub holding: Vec<oxide_storage::lease::HoldingEntry>,
     /// The bounded class facts of this pool's ledger (design §5.5, §5.6).
     pub class: ClassMembership,
 }
@@ -3688,6 +3692,7 @@ impl Store {
             recorded_total: snapshot.recorded_total,
             recorded_slots: snapshot.recorded_slots,
             unrecorded_slots: snapshot.unrecorded_slots,
+            holding: snapshot.holding,
             class,
         })
     }
@@ -4838,7 +4843,7 @@ impl Store {
         Ok(())
     }
 
-    /// Make the version-8 control fences durable when they are not already
+    /// Make the current control fences durable when they are not already
     /// there. Returns without writing for an already-fenced control.
     fn fence_admission_state(&self) -> Result<(), String> {
         let mut state = self.load()?;
@@ -4854,10 +4859,23 @@ impl Store {
         if Self::mark_slot_ceiling(&mut state) {
             changed = true;
         }
+        if Self::mark_holding(&mut state) {
+            changed = true;
+        }
         if !changed {
             return Ok(());
         }
         self.save(&state)
+    }
+
+    /// Mark the caller's in-memory state with the whole-tree holding fence
+    /// (oxide#190). Returns whether it changed, so a caller saves once.
+    fn mark_holding(state: &mut State) -> bool {
+        if state.holding.as_deref() == Some(HOLDING_FENCE) {
+            return false;
+        }
+        state.holding = Some(HOLDING_FENCE.to_owned());
+        true
     }
 
     /// Mark the caller's in-memory state with the raised-ceiling fence.
@@ -4919,10 +4937,16 @@ impl Store {
         let recorded = fenced.recorded_accounting.is_some();
         let one_use = fenced.one_use_workspaces.is_some();
         let slot_ceiling = fenced.slot_ceiling.is_some();
+        let holding = fenced.holding.is_some();
         let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
-        fenced.version = if slot_ceiling {
+        fenced.version = if holding {
+            // Version 9 is the whole-tree holding fence (oxide#190) and the
+            // hand-off trigger that must precede any ledger write recording a
+            // holding row.
+            HOLDING_STATE_VERSION
+        } else if slot_ceiling {
             // Version 8 is the raised-ceiling fence (oxide#177) and the
             // hand-off trigger that must precede the ledger's policy-4 write.
             SLOT_CEILING_STATE_VERSION
@@ -9787,7 +9811,12 @@ pub(crate) mod tests {
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         state["version"] = serde_json::json!(RECORDED_ACCOUNTING_STATE_VERSION);
         state["recorded_accounting"] = serde_json::json!(RECORDED_ACCOUNTING_FENCE);
-        for field in ["slot_ceiling", "eviction_accounting", "one_use_workspaces"] {
+        for field in [
+            "slot_ceiling",
+            "eviction_accounting",
+            "one_use_workspaces",
+            "holding",
+        ] {
             state.as_object_mut().expect("object").remove(field);
         }
         write_raw_state(store, &serde_json::to_vec(&state).unwrap());
@@ -10018,7 +10047,7 @@ pub(crate) mod tests {
         assert!(
             STATE_VERSION > EVICTION_ACCOUNTING_STATE_VERSION
                 && STATE_VERSION > ONE_USE_STATE_VERSION,
-            "a predecessor that knows version 7 or 6 must see version 8 as newer"
+            "a predecessor that knows version 7 or 6 must see the current version as newer"
         );
         let (root, store, _key) = class_fixture("v7-predecessor");
         store.admission().unwrap();
@@ -10029,6 +10058,7 @@ pub(crate) mod tests {
             document["slot_ceiling"],
             serde_json::json!(SLOT_CEILING_FENCE)
         );
+        assert_eq!(document["holding"], serde_json::json!(HOLDING_FENCE));
 
         // A predecessor knows at most version 7, so it refuses this real
         // version-8 document before reading the ledger. The model is local
@@ -10036,7 +10066,7 @@ pub(crate) mod tests {
         // such a reader applies (oxide#122).
         assert!(
             predecessor_accepts_control(&bytes).is_err(),
-            "a predecessor accepted the version-8 control"
+            "a predecessor accepted a current-version control"
         );
         // This binary applies the same rule to a version it does not know.
         let mut newer = document;
@@ -10137,6 +10167,9 @@ pub(crate) mod tests {
     /// document without the fence are states no writer produces. Version 8
     /// carries the eviction-accounting fence too and may carry the one-use
     /// fence, so a one-use pool at the raised ceiling keeps all three.
+    /// Version 9 adds the whole-tree holding fence (oxide#190) on the same
+    /// terms: a version-9 document always carries it, and a smaller pool never
+    /// does, so an older binary hands off before it reads a holding row.
     #[test]
     fn the_raised_slot_ceiling_fence_and_version_are_equivalent() {
         let mut state = State::default();
@@ -10146,14 +10179,45 @@ pub(crate) mod tests {
         state.version = STATE_VERSION;
         assert!(
             validate_state(&state, false).is_err(),
-            "version 8 without the raised fence was accepted"
+            "the current version without the raised fence was accepted"
         );
         state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        assert!(
+            validate_state(&state, false).is_err(),
+            "the current version without the holding fence was accepted"
+        );
+        state.holding = Some(HOLDING_FENCE.to_owned());
         assert!(validate_state(&state, false).is_ok());
+
+        // Version 8 is still exactly the raised-ceiling shape: it carries that
+        // fence and neither the holding fence nor a holding row.
+        state.version = SLOT_CEILING_STATE_VERSION;
+        state.holding = None;
+        assert!(validate_state(&state, false).is_ok());
+        assert!(
+            validate_state(
+                &State {
+                    holding: Some(HOLDING_FENCE.to_owned()),
+                    ..state.clone()
+                },
+                false
+            )
+            .is_err(),
+            "the holding fence at version 8 was accepted"
+        );
+        state.holding = Some(HOLDING_FENCE.to_owned());
+        state.version = STATE_VERSION;
+        state.slot_ceiling = None;
+        assert!(
+            validate_state(&state, false).is_err(),
+            "the holding version without the raised fence was accepted"
+        );
+        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
 
         // Version 7 is the eviction-accounting shape without the raised fence.
         state.version = EVICTION_ACCOUNTING_STATE_VERSION;
         state.slot_ceiling = None;
+        state.holding = None;
         assert!(validate_state(&state, false).is_ok());
         assert!(
             validate_state(
@@ -10192,6 +10256,7 @@ pub(crate) mod tests {
         );
 
         state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
+        state.holding = Some(HOLDING_FENCE.to_owned());
         state.one_use_workspaces = Some(ONE_USE_FENCE.to_owned());
         assert!(
             validate_state(&state, false).is_ok(),
@@ -10230,8 +10295,8 @@ pub(crate) mod tests {
         assert!(!text.contains("\"class\""), "{text}");
         assert!(!text.contains("class_reason"), "{text}");
         assert!(
-            text.contains("\"version\":8"),
-            "a normal admission did not carry the raised-ceiling version: {text}"
+            text.contains(&format!("\"version\":{STATE_VERSION}")),
+            "a normal admission did not carry the current fenced version: {text}"
         );
         assert_eq!(
             store.load().unwrap().one_use_workspaces,
@@ -10240,7 +10305,7 @@ pub(crate) mod tests {
         );
         assert!(
             serde_json::from_slice::<v5::State>(&bytes).is_err(),
-            "a version-5 reader accepted a version-8 document"
+            "a version-5 reader accepted a current-version document"
         );
 
         // A one-use record carries the class, its reason and the fence; the
