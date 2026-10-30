@@ -30,9 +30,11 @@ binary and every live pool out of it. One idle slot later holds more than
 - a killed holder: `pool recover-interrupted` refuses again, naming automatic
   recovery, with no walk, and the next build — started only once the
   fixture's own Cargo group is positively empty — recovers the slot, walks it
-  once as a re-lease, has the freshness gate refuse it, evicts the untrusted
-  slot through the oxide#190 holding deletion, and builds a new slot cold,
-  whose release walk is the second and last walk;
+  as it re-leases it, has the freshness gate refuse it, evicts the untrusted
+  slot through the oxide#190 holding deletion (its release measurement and
+  the eviction's own accounting walk that slot again), and builds a new slot
+  cold, whose single release walk is the last walk; nothing walks the payload
+  or the idle slot beside it;
 - a final default `status` after recovery still walks nothing.
 
 Retired rather than duplicated: the byte-pressure eviction case and its
@@ -248,6 +250,7 @@ class Proof:
         self.env = {**env, "OXIDE_POOL": self.pool, "OXIDE_POOL_CREATE": "1"}
         self.logs = 0
         self.dirs = {}
+        self.last_log = ""
 
     def payload(self) -> str:
         return os.path.realpath(os.path.join(self.pool, "payload"))
@@ -290,6 +293,7 @@ class Proof:
             fail(f"oxide {args} did not finish")
         if "walk log" in stderr and "not written" in stderr:
             fail(f"oxide {args} could not write its walk log: {stderr[-800:]}")
+        self.last_log = log
         return (process.returncode, stdout, stderr, self.walks(log), self.scopes(log),
                 time.monotonic() - started)
 
@@ -308,16 +312,16 @@ def summary(stderr: str, label: str) -> tuple:
     return match.group(1), match.group(2), match.group(3)
 
 
-def build(proof: Proof, cwd: str, label: str, expected_walks: list,
+def build(proof: Proof, cwd: str, label: str, expected_walks: list | None,
           expected_scopes: list | None = None, extra: dict | None = None) -> tuple:
     code, _, stderr, walks, scopes, elapsed = proof.call(cwd, ["build"], extra)
     if code:
         fail(f"{label}: exit {code}: {stderr[-2000:]}")
     slot, warmth, tail = summary(stderr, label)
-    expected = [walk.format(slot=slot) for walk in expected_walks]
     say(f"{label}: slot {slot} {warmth} in {elapsed:.1f} s, walks {walks}, scopes {scopes}, "
         f"summary tail: {tail}")
-    expect_roots(label, "walks", walks, expected)
+    if expected_walks is not None:
+        expect_roots(label, "walks", walks, [walk.format(slot=slot) for walk in expected_walks])
     if expected_scopes is not None:
         expect_roots(label, "scopes", scopes, [scope.format(slot=slot) for scope in expected_scopes])
     if "pool total: see oxide status" not in tail or "allocated of" in tail:
@@ -539,9 +543,19 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
         if proof.slots()[app_slot] != held:
             fail("a refused recovery changed the ledger")
         # One walk re-leases the recovered slot, which the freshness gate
-        # refuses; the new cold slot's release is the second and last walk.
-        new_slot, warmth, tail, stderr = build(proof, app, "recovered build",
-                                               [f"slots/{app_slot}", "slots/{slot}"])
+        # refuses; the new cold slot's release is the last walk. The untrusted
+        # slot is walked more than once by design (the re-lease, then its
+        # release measurement inside the discard, then the eviction's own
+        # accounting), so its count is observed and printed, never gated. What
+        # is gated is routing: no walk of the payload, the idle slot beside it,
+        # or anything else, and exactly one walk of the new slot, last.
+        new_slot, warmth, tail, stderr = build(proof, app, "recovered build", None)
+        recovered, fresh = f"slots/{app_slot}", f"slots/{new_slot}"
+        walks = proof.walks(proof.last_log)
+        if set(walks) != {recovered, fresh} or walks[-1] != fresh or walks.count(fresh) != 1:
+            fail(f"recovered build walks {walks}, expected only {recovered} and one {fresh} last")
+        say(f"recovered build walks the untrusted slot {walks.count(recovered)} times, "
+            f"then its new slot once")
         if not re.search(rf"recovered slot {app_slot} after oxide pid {killed.pid} died \(Cargo group \d+ empty\)", stderr):
             fail(f"the build did not recover slot {app_slot}: {stderr[-2000:]}")
         if f"cannot vouch for slot {app_slot}" not in stderr or warmth != "cold" or not tail.startswith("new slot, "):
