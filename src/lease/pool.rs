@@ -1231,6 +1231,36 @@ pub(super) fn write_hold_intent_injected(
     write_ledger(pool, &ledger)
 }
 
+/// Test-only: record the durable rename intent of one idle slot straight into
+/// the ledger, so a test can model the interruption windows around an eviction's
+/// rename without opening (and reconciling) the pool.
+#[cfg(test)]
+pub(super) fn hold_intent_for_test(
+    pool: &Path,
+    slot_id: u64,
+    device: u64,
+    inode: u64,
+) -> Result<(), LeaseError> {
+    let mut ledger = read_ledger(pool)?;
+    let store_id = ledger.store_id.clone();
+    let slot = ledger
+        .slots
+        .iter_mut()
+        .find(|slot| slot.id == slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if slot.state != SlotPersistState::Idle {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let name = derived_holding_name(&store_id, slot.id, slot.incarnation, &slot.last_lease_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    slot.hold_intent = Some(HoldingIntent {
+        name,
+        device,
+        inode,
+    });
+    write_ledger(pool, &ledger)
+}
+
 /// Test-only: move one slot tree into the holding area with an explicit
 /// expected root identity, without reconciliation, so a test can prove the
 /// rename boundary refuses a replaced root. Writes nothing durable beyond the
@@ -2072,8 +2102,10 @@ impl Pool {
             slot.holder = request.holder.clone();
             slot.lease_id = Some(lease_id.clone());
             slot.last_lease_id = lease_id;
-            // A held slot never borrows or keeps an idle observation.
+            // A held slot never borrows or keeps an idle observation, and it
+            // never keeps a rename intent from its idle generation.
             slot.recorded = None;
+            slot.hold_intent = None;
         }
         self.stamp_rank(slot_id)?;
         self.persist_revised()?;
@@ -4707,11 +4739,36 @@ impl Pool {
     /// not absence: the row and its charge are kept, so a tree that is still
     /// there is never reported as deleted and never stops being accounted.
     fn reconcile_holding(&mut self) -> Result<(), LeaseError> {
+        let mut changed = false;
+        // An intent whose root is still at its recorded path names a rename that
+        // never happened (the command refused or crashed before it). It is
+        // stale: the generation is an ordinary slot again, so the intent is
+        // cleared before anything else, and this needs no holding area.
+        let stale: Vec<u64> = self
+            .ledger
+            .slots
+            .iter()
+            .filter(|slot| slot.hold_intent.is_some())
+            .filter(|slot| {
+                self.slot_path_in(slot.id, slot.dir.as_deref())
+                    .ok()
+                    .is_some_and(|path| holding_presence(&path) == Some(true))
+            })
+            .map(|slot| slot.id)
+            .collect();
+        for id in stale {
+            if let Some(slot) = self.slot_mut(id) {
+                slot.hold_intent = None;
+                changed = true;
+            }
+        }
         let Some(holding) = self.open_holding_area(false)? else {
+            if changed {
+                self.persist_revised()?;
+            }
             return Ok(());
         };
         let root = self.holding_root();
-        let mut changed = false;
         let mut gone: Vec<String> = Vec::new();
         for row in &self.ledger.holding {
             match holding_presence(&root.join(&row.name)) {
@@ -4748,20 +4805,20 @@ impl Pool {
             if self.ledger.holding.iter().any(|row| row.name == name) {
                 continue;
             }
-            // A legacy pending deletion is adopted only against the identity its
-            // own durable intent recorded before the rename. Without that bind
+            // A generation is adopted only against the root identity its own
+            // durable intent recorded before the rename. Without that bind
             // nothing is adopted: a directory that merely carries the derived
-            // name is kept, charged by the payload walk and left to a replay,
-            // never deleted on a name alone.
+            // name — a swapped root whose containment failed, an entry an
+            // observation error could not classify, or a stranger — is kept,
+            // charged by the payload walk and left to a replay, never deleted on
+            // a name alone.
             let bound = match slot.state {
-                SlotPersistState::Evicting => match self.recorded_hold_intent(slot) {
-                    Some(intent) => Some((intent.device, intent.inode)),
-                    None => continue,
-                },
-                // The idle path's rename is the brief's one-sync window: it is
-                // the same generation's own derived name, and any mismatch the
-                // writer itself detects is contained before it can be adopted.
-                SlotPersistState::Idle => None,
+                SlotPersistState::Idle | SlotPersistState::Evicting => {
+                    match self.recorded_hold_intent(slot) {
+                        Some(intent) => (intent.device, intent.inode),
+                        None => continue,
+                    }
+                }
                 SlotPersistState::Held => continue,
             };
             let Ok(target) = std::ffi::CString::new(name.as_bytes()) else {
@@ -4774,7 +4831,7 @@ impl Pool {
                 || observed.uid != current_uid()
                 || observed.mode_bits() & 0o077 != 0
                 || observed.device != self.holding_device()
-                || bound.is_some_and(|bound| bound != (observed.device, observed.inode))
+                || bound != (observed.device, observed.inode)
             {
                 continue;
             }
@@ -5787,14 +5844,18 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
         {
             return Err(LeaseError::UnknownAccounting);
         }
-        // A hold intent belongs to a recorded deletion as well: it names the
-        // rename that deletion is about to perform and the identity it verified.
+        // A hold intent names a rename a deletion is about to perform and the
+        // root identity it verified. Only the two states that can be a rename
+        // source may carry one: an idle slot waiting for its eviction's write,
+        // and a recorded legacy deletion. A held row can never carry it.
         if slot.hold_intent.is_some()
-            && (slot.state != SlotPersistState::Evicting
-                || !slot
-                    .hold_intent
-                    .as_ref()
-                    .is_some_and(HoldingIntent::is_valid))
+            && (!matches!(
+                slot.state,
+                SlotPersistState::Idle | SlotPersistState::Evicting
+            ) || !slot
+                .hold_intent
+                .as_ref()
+                .is_some_and(HoldingIntent::is_valid))
         {
             return Err(LeaseError::UnknownAccounting);
         }

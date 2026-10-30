@@ -5850,16 +5850,22 @@ fn an_eviction_moves_the_whole_tree_into_the_holding_area() {
     );
 }
 
-/// The open a crash between the rename and its single durable write leaves:
-/// the slot row is still recorded, its root is gone, and the tree sits under
-/// the name that generation derives. The next locked open adopts it as a
-/// holding row instead of charging an absent slot or deleting blindly.
+/// The open a crash between the rename and its durable row leaves: the slot row
+/// is still recorded with the identity its own intent bound, its root is gone,
+/// and the tree sits under the name that generation derives. The next locked
+/// open adopts it as a holding row instead of charging an absent slot or
+/// deleting blindly.
 #[test]
 fn a_tree_renamed_before_its_row_is_adopted_by_the_next_open() {
     let fixture = Fixture::new("holding-adopt");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "holding-adopt");
     prepare_holding_area(&pool);
     let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::hold_intent_for_test(&pool, slot_id, verified.0, verified.1).expect("intent");
     fs::rename(&slot_path, holding_area(&pool).join(&name)).expect("modelled rename");
     assert!(!slot_path.exists());
 
@@ -6245,12 +6251,12 @@ fn a_replaced_root_refuses_before_the_rename() {
     assert!(aside.is_dir(), "the verified root is untouched");
 }
 
-/// The undetectable-by-name half of the same race: the source name is swapped
-/// after the descriptor identity was verified and exactly before the rename, so
-/// the rename moves an object that is not the verified one. That object is
-/// **contained** under a name no generation can derive, so no recovery pass can
-/// adopt, charge or delete it; the command refuses and the pool keeps the
-/// generation's row.
+/// The half a name cannot catch: the source name is swapped after the descriptor
+/// identity was verified and exactly before the rename, so the rename moves an
+/// object that is not the verified one. The eviction has already bound that
+/// identity durably, so no recovery pass may adopt the entry; the foreign tree
+/// is additionally contained under a name no generation can derive. Nothing
+/// foreign is ever deleted and the generation's row keeps its charge.
 #[test]
 fn a_swap_at_the_rename_is_contained_and_never_adopted() {
     let fixture = Fixture::new("rename-swap");
@@ -6270,7 +6276,7 @@ fn a_swap_at_the_rename_is_contained_and_never_adopted() {
             .expect("replacement mode");
         fs::write(slot_for_race.join("replacement"), b"not the slot").expect("replacement payload");
     });
-    let refused = super::pool::hold_expecting_injected(&pool, slot_id, Some(verified));
+    let refused = evict_idle_slot_injected(&pool, &slot_id.to_string());
     drop(guard);
     assert!(
         matches!(refused, Err(LeaseError::UnsafePath(_))),
@@ -6327,6 +6333,91 @@ fn a_swap_at_the_rename_is_contained_and_never_adopted() {
         status.payload_unique_allocated_bytes.unwrap_or(0) > 0,
         "the contained bytes were counted as free: {status:?}"
     );
+    let _ = verified;
+}
+
+/// An idle rename interrupted after the durable intent and after the rename (the
+/// crash window the brief accepts) is adopted by the next open **because** the
+/// intent names the very object now in the holding area — never merely because
+/// the entry carries the derived name. A stranger at that name with the real
+/// root elsewhere is kept and charged instead.
+#[test]
+fn an_idle_rename_interruption_is_adopted_only_by_its_intent() {
+    let fixture = Fixture::new("idle-interrupt");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "idle-interrupt");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    prepare_holding_area(&pool);
+    let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    // The durable intent an interrupted eviction leaves behind.
+    super::pool::hold_intent_for_test(&pool, slot_id, verified.0, verified.1)
+        .expect("durable intent");
+    // A stranger appears at the derived name and the verified root is where a
+    // failed containment would have left it (out of its recorded path).
+    let aside = slot_path.with_extension("race-aside");
+    fs::rename(&slot_path, &aside).expect("the verified root left its path");
+    let stranger = holding_area(&pool).join(&name);
+    fs::create_dir(&stranger).expect("stranger");
+    fs::write(stranger.join("replacement"), b"not the slot").expect("stranger payload");
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(
+        view.holding.is_empty(),
+        "a stranger at the derived name was adopted: {:#?}",
+        view.holding
+    );
+    assert!(view
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == slot_id.to_string()));
+    assert!(
+        stranger.join("replacement").exists(),
+        "the stranger was touched"
+    );
+
+    // Now the verified root itself is the entry under that name: the intent
+    // binds it and the adoption completes.
+    fs::remove_dir_all(&stranger).expect("clear the stranger");
+    fs::rename(&aside, holding_area(&pool).join(&name)).expect("modelled rename");
+    let view = managed::ledger_view(&pool).expect("open adopts it");
+    assert_eq!(
+        view.holding.len(),
+        1,
+        "the bound idle interruption is adopted"
+    );
+    assert!(view.slots.is_empty());
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
+}
+
+/// An intent whose root is still at its recorded path names a rename that never
+/// happened (the command refused or crashed before it). The next open clears it
+/// and treats the generation as an ordinary idle slot again: nothing is moved,
+/// adopted or deleted.
+#[test]
+fn a_stale_intent_is_cleared_and_its_slot_stays_an_ordinary_idle_slot() {
+    let fixture = Fixture::new("stale-intent");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "stale-intent");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::hold_intent_for_test(&pool, slot_id, verified.0, verified.1).expect("intent");
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(view.holding.is_empty(), "a stale intent adopted something");
+    assert!(slot_path.is_dir(), "the root was moved");
+    let ledger = fs::read(pool.join("ledger.json")).expect("ledger bytes");
+    let text = String::from_utf8_lossy(&ledger);
+    assert!(
+        !text.contains("hold_intent"),
+        "the stale intent survived the open: {text}"
+    );
+    // The slot is a normal idle slot again: a fresh project cannot reuse it, but
+    // an explicit eviction still retires it whole.
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("the slot is still evictable");
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
 }
 
 /// A legacy pending deletion is adopted only against the identity its own

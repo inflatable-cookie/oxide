@@ -277,26 +277,33 @@ owner-only directory, so per-entry journaling was unnecessary.
 (an idle, positively writer-closed, verified slot; unknown or partial slots stay
 ineligible). The slot root is verified as the real owner-only directory the
 ledger records, on the slots root's own device; the descriptor of that root is
-opened without following a link and the identity it reports is **carried to the
-rename boundary**, so a root a racer replaced after the check refuses
-(`UnsafePath`) instead of being held and later deleted. `renameat` then moves the
-tree **whole** into a private holding area on the same device:
+opened without following a link and the identity it reports is bound durably and
+**carried to the rename boundary**, so a root a racer replaced after the check
+refuses (`UnsafePath`) instead of being held and later deleted. `renameat` then
+moves the tree **whole** into a private holding area on the same device:
 `<payload>/.oxide-holding/<store>-<slot>-<incarnation>-<nonce>`. The area is
 created owner-only (`0700`) and verified (real directory, caller's own, payload
-device). One durable revised ledger write records one holding row — name, slot,
-incarnation, the directory identity the rename observed, the recorded bytes and
-when it was recorded — and drops the slot row. That single write is the whole
-durable record of the pending deletion: there is no per-entry journal, because
-the tree is a private directory that becomes unreachable from every slot path
-the moment it is renamed.
+device). One durable revised ledger write then records one holding row — name,
+slot, incarnation, the directory identity the rename moved, the recorded bytes
+and when it was recorded — and drops the slot row.
+
+Two synced ledger writes in total, both O(1): one **rename intent** before the
+rename (the derived name and the verified identity) and the row swap after it.
+Nothing is written per entry — the tree is a private directory that becomes
+unreachable from every slot path the moment it is renamed, which is what made
+per-entry journaling unnecessary.
 
 The nonce is the generation's own recorded `last_lease_id`, not a fresh random
-token. Every part of the entry name is therefore durable ledger state, so a
-crash **between the rename and the row** leaves the slot row in place with its
-root gone and the tree under a name the next open derives again. That open
-adopts it: the row is added and the slot row dropped in one write. A crash
-**after** the row leaves a charged, isolated row that a later command finishes.
-Nothing in either crash window is guessed from an absent name.
+token. Every part of the entry name is durable ledger state, and the intent is
+what makes each window recoverable **by identity rather than by name**: a crash
+before the intent leaves an untouched idle slot that is still a candidate; a
+crash between the intent and the rename leaves a stale intent that the next open
+clears (nothing moved, nothing adopted); a crash between the rename and the row
+swap leaves the idle row, its intent and the tree under the derived name, which
+the next open adopts only because the entry's identity is the one the intent
+bound; a crash after the row leaves a charged, isolated row a later command
+finishes. Nothing in any window is concluded from an absent name or from a name
+alone.
 
 **Recovery order and the legacy migration window.** `Pool::open` reconciles the
 holding area **before** it replays a recorded deletion. Adoption therefore
@@ -308,31 +315,28 @@ left blocked behind a root its own rename moved. A tree still at its recorded
 root adopts nothing, so an unreplayed legacy journal keeps its own record until
 the replay decides it.
 
-**A rename that moved the wrong object is contained, never adopted.** The
-source root's descriptor identity is compared with the caller's verified
-identity before the rename and with the moved entry afterwards. If a swap
-happened inside that window, the foreign tree is **contained** under
-`.unverified-<derived name>`: `holding_name_is_bounded` refuses a leading `.`, so
-no recovery pass can ever derive that name, and no recorded row names it. It is
-never adopted, never charged to a slot and never deleted; the command refuses,
-the payload walk keeps charging its bytes, and the generation's own row stays
-recorded (its root is wherever the racer moved it), so the slot is never silently
-freed. The hot idle path keeps the brief's single durable write after the rename,
-which is why it relies on this containment plus the derivation rather than a
-recorded pre-rename identity; the residual it accepts is a crash inside the
-microsecond window between the verified open and the `renameat` of an *identical*
-generation's own tree, which the brief's "crash before the record leaves the slot
-record in place" rule covers.
+**Adoption is always identity-bound; a name alone adopts nothing.** Every
+generation that can be a rename source — an idle slot and a recorded legacy
+deletion — carries a durable `hold_intent` naming the derived entry and the root
+identity the writer verified before the rename. Recovery adopts an interrupted
+rename only when the entry's own `(device, inode)` **is** that bound identity.
+A stranger at the derived name, an entry whose identity differs, and an entry an
+observation error could not classify are all never adopted: their record, its
+charge and any journal stay, the pool keeps its refusal, and only a replay (for a
+legacy row) or the operator decides. An `Evicting` row with no intent adopts
+nothing at all, and a held row is never a rename source.
 
-**A legacy migration binds its rename durably before it happens.** The rare,
-one-time legacy path can afford one extra write, so before the rename it records
-a bounded `hold_intent` (the derived name and the identity the #155 completeness
-preflight verified) on the `Evicting` row. Recovery therefore adopts an
-interrupted migration only against that recorded intent: a directory that merely
-carries the derived name, or one whose identity differs from the bound root, is
-never adopted — the record, its charge and any journal stay, the pool keeps its
-refusal, and only a replay decides. An `Evicting` row with no intent adopts
-nothing at all.
+**A rename that moved the wrong object is contained as well.** The source root's
+descriptor identity is compared with the caller's verified identity before the
+rename and with the moved entry afterwards. If a swap happened inside that
+window, the foreign tree is moved to `.unverified-<derived name>`:
+`holding_name_is_bounded` refuses a leading `.`, so no generation can derive that
+name and no recorded row names it. Whether or not that containment rename
+succeeds, the identity binding above already makes the entry unadoptable; the
+containment additionally keeps a foreign tree out of the reachable name space and
+the command refuses. The payload walk keeps charging those bytes, and the
+generation's own row stays recorded (its root is wherever the racer put it), so
+the slot is never silently freed and no foreign bytes are ever deleted.
 
 **Only a positively classified miss is absence.** A recorded holding row is
 dropped when its entry is gone with `NotFound`. Any other `lstat` failure
@@ -388,14 +392,15 @@ above).
 **Mixed versions.** The fence comes first (#177's rule): control state version
 9 always carries the forward-only `oxide.holding/1` fence, and the admission
 gate makes it durable before any locked pool open or ledger write that can
-record a holding row. An older binary hands off to a receipt-matching successor
+record a holding row or a rename intent. An older binary hands off to a receipt-matching successor
 (at its own `control_state_version` capability) or refuses; it never meets a
 holding row with a schema it cannot represent. The library ledger's `holding`
 row is omitted while empty, so a pool that never evicted keeps the exact bytes
 an older binary wrote.
 
 **Legacy migration.** A `#155` per-entry journal can still exist in a ledger
-written by an older binary. The first locked open resolves it exactly as #155's
+written by an older binary; its row carries the same durable `hold_intent` the
+idle path uses, written before its rename, and adoption is bound by it. The first locked open resolves it exactly as #155's
 replay rules allow (`reconcile_root_capture`, deepest-first rollback of recorded
 captures, recorded mode restoration, `RootCaptureState::Absent`/`Uncertain` and
 any recorded foreign capture staying pending) and then, instead of starting
@@ -427,14 +432,18 @@ only the deleter runs and requires them to strictly decrease: measured progress
 under the deleter's own non-blocking custody, which no other pass can claim while
 it holds the flock. Only then does the competitor start, and its admission must
 complete with the deleter still alive and that tree still non-empty, inside the
-in-lock control bound. Its diagnostic mode also runs every fixture command in its
-own session and confirms each group closed (`killpg` then `killpg(pid, 0)`) before
-it continues: a case may not leave a descendant behind, and an unconfirmed group
-ends the run rather than continuing with unknown custody.
+in-lock control bound. Its diagnostic mode leaves every fixture command — and
+therefore its descendants — in the qualified shared supervisor's own session and
+process group: the script creates no session and never signals a group, because
+session closure and the census that decides it belong to that supervisor. Each
+child it starts is waited for, or killed by its own PID and reaped, and only a
+positive reap counts as closure; an unreaped child stays tracked and ends the run
+rather than continuing with unknown custody, and no closure of a descendant is
+ever claimed.
 
 The proof's lock figure is the **whole eviction transaction under the pool
-lock** — victim and rank checks, the identity-verified rename and the one durable
-ledger write — timed from the start of that transaction by a debug-only
+lock** — victim and rank checks, the intent write, the identity-verified rename
+and the row write — timed from the start of that transaction by a debug-only
 observation armed only inside the supervisor's scratch layout, so an inner
 fragment cannot pass as the whole interval. Its concurrency oracle is positive
 and falsifiable: the competitor's admission is observed by the pool's own new

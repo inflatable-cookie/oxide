@@ -55,7 +55,6 @@ import re
 import os
 import shutil
 import stat
-import signal
 import subprocess
 import sys
 import tempfile
@@ -371,6 +370,9 @@ def plan_document() -> dict:
             "concurrent admission in `concurrent-admission`",
             "stage_cargo_jobs": STAGE_JOBS,
             "fixture_cargo_jobs": FIXTURE_JOBS,
+            "sessions": "none created: every fixture child and its descendants "
+            "stay in the qualified shared supervisor's own session, which owns "
+            "session closure and the census that decides it",
         },
         "limits": {
             "wall_limit_s": WALL_LIMIT_S,
@@ -580,6 +582,15 @@ def self_check_oracles(scratch: str) -> None:
         f"the deletion-line oracle changed: {figures}",
     )
     expect(deletion_figures("no deletion here") == [], "the deletion oracle invented a line")
+    # The proof never creates a session and never signals a group: fixture
+    # children and their descendants stay in the qualified supervisor's session.
+    source = read_text(os.path.abspath(__file__))
+    # The literals are assembled here so this check does not match itself.
+    for forbidden in ("start_new" + "_session", "kill" + "pg", "os.set" + "sid"):
+        expect(
+            forbidden not in source,
+            f"the proof must leave session custody to the supervisor ({forbidden})",
+        )
     log = os.path.join(scratch, "lock.log")
     write_private(log, "/p/payload/slots/7 3\nnot a reading\n/p/x 12\n")
     readings = lock_observations(log)
@@ -731,11 +742,11 @@ def start_check(subject: str, workspace: str, env: dict, label: str) -> subproce
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        # One session per fixture command: the child and every descendant it
-        # starts (Oxide's own Cargo group) are this proof's own process tree, so
-        # a discard can close the whole group and confirm it rather than leaving
-        # a Cargo behind.
-        start_new_session=True,
+        # The child stays in the qualified supervisor's own session and process
+        # group. This proof never creates a session and never signals a group:
+        # session closure and the census that decides it belong to the shared
+        # supervisor, and an escape it did not create would be its finding, not
+        # this script's.
     )
     CHILDREN.append((label, handle))
     say(f"{label}: started (pid {handle.pid})")
@@ -756,39 +767,31 @@ def finish(handle: subprocess.Popen, label: str) -> tuple[int, str]:
     return handle.returncode, output
 
 
-def group_closed(pgid: int) -> bool:
-    """Whether a session this process created has no member left."""
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    return False
-
-
 def discard(handle: subprocess.Popen, label: str) -> bool:
-    """Close one fixture command's whole group and confirm it is gone.
+    """Kill and reap one fixture child by its own PID, then confirm it is gone.
 
-    Only a group this process created (`start_new_session=True`) is signalled,
-    and only after a bounded wait. Returns whether every member is confirmed
-    gone; `False` is unknown custody and must end a diagnostic run.
+    Only the child this proof started is signalled — never a process group, and
+    never a pattern — because the child and its descendants live in the shared
+    supervisor's session, whose closure the supervisor decides. Returns whether
+    the child was positively reaped; an unreaped child is unknown custody and
+    must end a diagnostic run. The handle stays tracked until it is reaped, so a
+    timeout can never drop custody silently.
     """
     try:
         handle.communicate(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(handle.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        handle.kill()
         try:
             handle.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             pass
+    if handle.returncode is None:
+        # Still not reaped: keep it tracked and report unknown custody.
+        say(f"{label}: still running after the discard wait (unknown custody)")
+        return False
     CHILDREN[:] = [entry for entry in CHILDREN if entry[1] is not handle]
-    closed = group_closed(handle.pid) and handle.returncode is not None
-    say(f"{label}: discarded (exit {handle.returncode}, group closed {closed})")
-    return closed
+    say(f"{label}: discarded (exit {handle.returncode}, reaped)")
+    return True
 
 
 def wait_for_holding_row(pool: str, timeout: float = 20.0) -> dict | None:
@@ -1094,15 +1097,13 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     deleter = start_check(subject, killer_workspace, env, "killed-deleter")
     row = wait_for_holding_row(pool)
     expect(row is not None, "the deleter never recorded a holding row")
-    # Kill only the session this proof started, and confirm its whole group is
-    # gone before trusting what it left behind.
-    try:
-        os.killpg(deleter.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    closed = discard(deleter, "killed-deleter")
-    expect(closed, "the killed deleter's group could not be confirmed closed")
-    say("killed the deleter")
+    # Kill only the child this proof started, and confirm it was reaped before
+    # trusting what it left behind. Its descendants stay in the shared
+    # supervisor's session, which this proof never signals.
+    deleter.kill()
+    reaped = discard(deleter, "killed-deleter")
+    expect(reaped, "the killed deleter could not be confirmed reaped")
+    say(f"killed the deleter (exit {deleter.returncode})")
     work_left()
     rows = holding_rows(pool)
     expect(len(rows) == 1, f"the killed deleter left no recorded row: {rows}")
@@ -1326,11 +1327,16 @@ def main(argv: list[str]) -> int:
         },
         "case_tally": tally,
         "custody": {
-            "fixture_children": "each fixture command runs in its own session "
-            "(start_new_session), so its descendants are this proof's own group",
-            "closure": "every group is waited for, or KILLed by its own group id "
-            "and reaped, and then confirmed gone with killpg(pid, 0) before the "
-            "run continues; an unconfirmed group ends a diagnostic run",
+            "fixture_children": "every fixture command stays in the qualified "
+            "shared supervisor's own session and process group; this proof "
+            "creates no session and never signals a group",
+            "reaping": "each child is waited for, or killed by its own PID and "
+            "reaped, and only a positive reap is closure; an unreaped child is "
+            "unknown custody and ends a diagnostic run, and it stays tracked",
+            "descendants": "descendants of a fixture command (Oxide's own Cargo "
+            "group) are outside this proof's signalling authority; their closure "
+            "is the shared supervisor's census, and no closure of theirs is "
+            "claimed here",
             "unreaped": [label for label, _ in CHILDREN],
         },
         "source_commit": commit,

@@ -961,11 +961,12 @@ pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
 pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
 pub const CONTROL_ONE_USE_FENCE: &str = "oxide.one-use/1";
-/// The whole-tree holding fence (oxide#190). A ledger carrying a `holding`
-/// row, and a pool whose eviction route renames a slot tree into the payload's
-/// private holding area, is written only after this front-door fence is
-/// durable. An older binary meets version 9 first and hands off to a
-/// receipt-matching successor instead of reading a state it cannot represent.
+/// The whole-tree holding fence (oxide#190). A ledger carrying a `holding` row
+/// or a `hold_intent` (the verified identity a rename is bound to), and a pool
+/// whose eviction route renames a slot tree into the payload's private holding
+/// area, is written only after this front-door fence is durable. An older binary
+/// meets version 9 first and hands off to a receipt-matching successor instead
+/// of reading a state it cannot represent.
 pub const CONTROL_HOLDING_FENCE: &str = "oxide.holding/1";
 /// The control version that must carry [`CONTROL_ONE_USE_FENCE`].
 const CONTROL_ONE_USE_VERSION: u64 = 6;
