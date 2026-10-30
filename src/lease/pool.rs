@@ -3153,13 +3153,13 @@ impl Pool {
         // the supervisor's own scratch layout.
         #[cfg(debug_assertions)]
         let transaction = Instant::now();
-        // One durable deletion journal at a time (oxide#177). An eviction is
-        // the only path that starts a journal, and this check covers every
-        // entry point, including the explicit `evict_idle_slot` that does not
-        // pass through `lease()`'s blocked-reconciliation refusal: a second
-        // deletion would interleave two journals and grow the ledger past its
-        // derived bound. The pending record and its journal are kept, and a
-        // later open retries reconciliation.
+        // A legacy #155 journal must still be resolved before anything moves
+        // (oxide#177). Since oxide#190 no path starts a journal, so this guard is
+        // about legacy input an older writer left: it covers every entry point,
+        // including the explicit `evict_idle_slot` that does not pass through
+        // `lease()`'s blocked-reconciliation refusal, so a holding move never
+        // races a journal the replay still has to resolve. The pending record and
+        // its journal are kept, and a later open retries reconciliation.
         if self.reconciliation_blocked
             || self.ledger.slots.iter().any(|slot| slot.capture.is_some())
         {

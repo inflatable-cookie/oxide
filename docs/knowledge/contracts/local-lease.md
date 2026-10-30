@@ -941,31 +941,41 @@ a larger ledger, so every accepted ledger is at most 8 MiB.
 The measured state the current writer can reach from an empty ledger is
 serialized at every bounded maximum: the all-idle 256-slot ledger (numeric
 fields at their full 20-digit width including `cap_bytes`, every string at its
-cap including the widest accepted `lease_id`) measures 4,213,726 bytes, and
-with **one** maximal `DeletionJournal` (96 capture records and 32 mismatched
-captures, chains of 64 capture private names, name fields at `PATH_MAX` 1024
-bytes in `NAME_MAX` 255-byte components, `expected_mode` at the unrestricted
-u32 maximum, maximal sixfold escapes) it measures 5,625,456 bytes on an
-`Evicting` record that retains its closed observation. The writer
-refuses an over-bound journal object per object and puts it back without
-deleting it; the reader refuses a ledger that carries one. Ordinary evictions go
-through `retire_idle_slot`, which refuses while reconciliation is blocked or any
-journal is outstanding (so the guard covers `evict_idle_slot` too), and every
-open reconciles all `Evicting` records before admitting anything.
+cap including the widest accepted `lease_id`) measures 4,213,726 bytes. That is
+the figure this writer's ordinary eviction path reaches: since oxide#190 it
+writes one holding row and two O(1) synced writes per eviction and starts no
+journal at all. A `DeletionJournal` is now only **legacy input**: a ledger an
+older writer left can still carry one — with **one** maximal journal (96 capture
+records and 32 mismatched captures, chains of 64 capture private names, name
+fields at `PATH_MAX` 1024 bytes in `NAME_MAX` 255-byte components,
+`expected_mode` at the unrestricted u32 maximum, maximal sixfold escapes) it
+measures 5,625,456 bytes on an `Evicting` record that retains its closed
+observation, and the reader and the replay both accept it. The writer refuses
+an over-bound journal object per object and puts it back without deleting it;
+the reader refuses a ledger that carries one. Ordinary evictions go through
+`retire_idle_slot`, which refuses while reconciliation is blocked or a legacy
+journal is still outstanding (so the guard covers `evict_idle_slot` too), and
+every open reconciles the holding area and then all `Evicting` records before
+admitting anything.
 
-**Recovery is a second journal path, not a preserve-only path.** Every
-`Pool::open` runs `reconcile_evicting`. For an `Evicting` record with no
-journal, `reconcile_slot_capture` returns `Resume` and `remove_owned_slot`
-creates and persists a fresh `SlotCaptureJournal` through `begin`, without the
-`retire_idle_slot` guard; a recoverable inherited journal is rolled back,
-cleared and restarted the same way. The journal is started only after
-`pending_root_ready` completes its bounded preflight, so a blocked or
-partially inventoried tree keeps its record and starts no journal; a failed
-deletion that did start one keeps it and is retried on the next open. The front
-door's admission gate and the library's own locked open make the version-8
-control fence durable before any reconciliation (see the fence paragraph), so
-recovery, journal starts and ledger writes are all preceded by the hand-off
-fence.
+**Recovery moves trees; it never starts a journal.** Every `Pool::open`
+reconciles the holding area first (`reconcile_holding`: adoption only against a
+recorded intent-verified identity, rows dropped only when positively absent) and
+then the `Evicting` records. For a legacy `Evicting` record,
+`reconcile_slot_capture` resolves the #155 journal by #155's own rules —
+`Concluded` drops the record, `Resume` continues only after the recorded root is
+restored at its recorded name, `Blocked` keeps the record and starts nothing. A
+`Resume` then verifies the restored root in O(1) with `pending_root_verified`
+and moves it whole into the holding area, exactly as an ordinary eviction does.
+No path in this binary creates or persists a `SlotCaptureJournal`: the
+per-entry capture, journal start and in-lock per-entry removal, and the
+recovery functions that started a journal (`remove_owned_slot`, `begin`,
+`pending_root_ready`), no longer exist, and a blocked or unclassifiable pending
+root keeps its record instead of starting one. The front door's admission gate
+and the library's own locked open make the version-9 control fence (which
+carries `oxide.holding/1`) durable before any reconciliation (see the fence
+paragraph), so recovery, holding moves and ledger writes are all preceded by
+the hand-off fence.
 
 **Worst-valid byte bound (oxide#177; Supervisor ruling 49081d79).**
 `MAX_LEDGER_BYTES` *is* the worst-valid byte bound: the read and write paths
@@ -1014,17 +1024,19 @@ stays at or below 128 slots never carries `4`, so its ledger stays readable by
 an older binary. The ledger alone cannot order that switch against the
 [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122), which reads
 control state rather than the ledger, so the mutating-command admission gate
-makes a forward-only **version-8** control fence durable as the command's
+makes a forward-only **version-9** control fence durable as the command's
 first write (the oxide#177 `oxide.slots/256` fence, beside the oxide#175
-eviction-accounting and oxide#146 recorded-accounting fences; Oxide Supervisor
+eviction-accounting, oxide#146 recorded-accounting and oxide#190
+`oxide.holding/1` fences; Oxide Supervisor
 ruling 4c9984a1, fence first). The gate runs under the admission lock and
-before any locked `Pool::open` (which reconciles recorded deletions, can start
-a recovery journal and writes the ledger), so every such effect — ordinary
-eviction, recovery, journal start and ledger write — is preceded by the
+before any locked `Pool::open` (which reconciles the holding area and recorded
+deletions and writes the ledger), so every such effect — ordinary eviction,
+recovery, a holding move and ledger write — is preceded by the
 durable fence. A locked `Pool::open` also raises the same fence itself, under
 the pool lock, before its first reconciliation: pre-Store entries
 (`Store::open_at`, `Store::open_removable` and `recover-interrupted`'s ledger
-read) and a direct library open therefore cannot start a journal before it.
+read) and a direct library open therefore cannot write to a holding-era pool
+before it.
 That library path writes only the version and the three fence fields, taking
 the admission lock non-blocking and refusing rather than reconciling under
 contention; an absent control state (a library fixture) and passive
@@ -1116,9 +1128,10 @@ its own, so the runner owns closure on any fault. With every slot's record
 current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The maximal
-writer-reachable ledger serialization — the measured one-journal `Evicting`
-state, 5,625,456 bytes with 2,763,152 bytes headroom under the 8 MiB
-worst-valid byte bound — escaped round-trip and oversized-field refusals are
+accepted ledger serialization — the legacy one-journal `Evicting` state,
+5,625,456 bytes with 2,763,152 bytes headroom under the 8 MiB
+worst-valid byte bound, which since oxide#190 is only input an older writer
+left (this writer starts no journal) — escaped round-trip and oversized-field refusals are
 unit tests in `effigy test rust`, as is a
 fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
 trip with a journal (bounded read via the passive snapshot, ranked ordering,
@@ -1516,7 +1529,8 @@ The raised-ceiling fence (oxide#177) repeats that ordering for `capacity_policy:
 4`: the admission gate writes control version 8 (with the `oxide.slots/256`
 fence) as the command's first write, before the locked open and before that
 same admission can record the 129th slot, and a later ordinary save keeps
-version 8 because the fences are part of the document. A
+version 8 because the fences are part of the document (oxide#190 later raises
+the same document to version 9, which also carries `oxide.holding/1`). A
 crash between the two writes leaves control 5 with a v1 ledger, which is a
 normal state for the new binary and a hand-off for the older one; the reverse
 order would strand it. The old binary's own refusal remains the honest
@@ -1590,9 +1604,9 @@ decision mocks where a real path exists:
    `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
 8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2`, `3` and
    `4` ledgers; held IDs preserved; the admission gate writes control version
-   8 (recorded, eviction-accounting and raised-ceiling fences) as every
+   9 (recorded, eviction-accounting, raised-ceiling and holding fences) as every
    mutating command's first write, and a locked `Pool::open` raises it before
-   its recovery, journal start or ledger write, so a pool this binary mutates
+   its reconciliation, holding move or ledger write, so a pool this binary mutates
    never feeds a predecessor a ledger it cannot represent or a control version
    it cannot read; an
    owned-outputs-only state derives version 4 (proved on `save` directly, not
@@ -1897,9 +1911,11 @@ may return exit 5 without touching any new holder. Do not treat an unknown
 or mistyped ID as evidence that the intended writer ended. A held compatible
 project/profile returns busy rather than allowing a concurrent writer.
 
-A recorded deletion also journals every capture it makes (oxide#155). The slot's
-ledger record carries the root plan — the planned private name, the root's
-`(device, inode)`, the verified parent's `(device, inode)` and the root's full
+A recorded deletion also journals every capture it makes (oxide#155). This is the
+retired shape: since oxide#190 no deletion starts a journal — a legacy record
+like this one is still read and resolved by the replay below, and a resumed
+deletion moves its verified root whole into the holding area. The slot's
+ledger record carries the root plan — the planned private name, the root's`(device, inode)`, the verified parent's `(device, inode)` and the root's full
 `st_mode`, written before the exclusive rename, then the captured phase after it
 and a `removed` phase only once the root's own removal completed — beside a
 record for every nested capture: its private and observed names, its verified

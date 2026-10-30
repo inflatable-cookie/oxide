@@ -2737,16 +2737,15 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
     })
 }
 
-/// The maximal ledger this writer reaches on its **ordinary eviction path**
-/// (oxide#177): the raised-ceiling representation at 256 slots with every field
-/// at its cap, where the one slot a pool can durably leave `Evicting` carries a
-/// maximal deletion journal. `retire_idle_slot` refuses a second deletion while
-/// a journal is outstanding, so an admission starts one. `MAX_LEDGER_BYTES` is
+/// The maximal accepted ledger carrying a legacy journal (oxide#177): the
+/// raised-ceiling representation at 256 slots with every field at its cap, where
+/// one slot carries a maximal deletion journal. Since oxide#190 no path in this
+/// binary starts a journal, so this is a **read-side** bound — an older writer
+/// left the journal, `retire_idle_slot` and the reader both still honour it, and
+/// the replay rewrites or drops it. `MAX_LEDGER_BYTES` is
 /// the *worst-valid byte bound* — a larger ledger is corrupt and refused, and
-/// the reader accepts any otherwise-valid ledger at or below it. Recovery can
-/// leave more journals (see
-/// `recovery_creates_a_journal_for_a_second_pending_deletion`), so this figure
-/// is the maximal ordinary-path state, not a bound on recovery.
+/// the reader accepts any otherwise-valid ledger at or below it, including one
+/// an older writer left with more than one journal.
 #[test]
 fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-journal-ledger");
@@ -2845,14 +2844,17 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(snapshot.evicting_slot_ids.len(), 1);
 }
 
-/// Recovery is a second journal path (oxide#177): `Pool::open` reconciles
-/// every `Evicting` record, and `remove_owned_slot` creates and persists a fresh
-/// `SlotCaptureJournal` for one that has none (or after a recoverable journal is
-/// rolled back and cleared), without `retire_idle_slot`'s single-journal guard;
-/// the loop continues past a blocked record and a failed deletion keeps its
-/// journal. One open can therefore leave a journal per failing pending
-/// deletion. The admission gate and the library's locked open make the
-/// version-8 control fence durable before the open, so this recovery path is
+/// Recovery moves a legacy pending root whole and never starts a journal
+/// (oxide#190): `Pool::open` reconciles the holding area and then every
+/// `Evicting` record, `reconcile_slot_capture` resolves a legacy #155 journal by
+/// #155's own rules (`Concluded` drops the record, `Resume` continues only after
+/// the root is restored, `Blocked` keeps it and starts nothing), and a resumed
+/// deletion verifies its root in O(1) and moves it into the holding area.
+/// Because the per-entry journal start is retired, no open can leave a new
+/// journal behind: this test proves the legacy shape stays readable and is
+/// adopted, and that a blocked record keeps its journal without starting
+/// another. The admission gate and the library's locked open make the
+/// version-9 control fence durable before the open, so this path is
 /// preceded by the hand-off fence (oxide#177, fence first).
 #[test]
 fn recovery_keeps_a_second_pending_deletion_without_a_journal() {

@@ -202,6 +202,8 @@ NA_PREMISES = ("4_automatic_adoption", "5_cargo_external_argv", "6_owned_images"
 COMMAND = [
     "python3",
     "scripts/bounded-test.py",
+    "--root-parent",
+    "/private/tmp",
     "--limit",
     str(WALL_LIMIT_S),
     "--scratch-budget-mib",
@@ -210,6 +212,11 @@ COMMAND = [
     "python3",
     "scripts/test-holding-delete.py",
 ]
+# The root the fixture's genuine internal directory-budget pool needs (the
+# owner-accepted internal-placement exception bd357a4c). The fixed command, the
+# plan, the receipt and `effigy.toml`'s selector all carry it, and the pure
+# self-check binds the three records together.
+ROOT_PARENT = "/private/tmp"
 USAGE = """usage: test-holding-delete.py [--plan | --self-check | --diagnostic | --help]
 
 Without an argument this runs the counted proof under the qualified shared
@@ -715,6 +722,7 @@ def self_check() -> None:
         "the premise checklist must record all nine items in order",
     )
     source = read_text(os.path.abspath(__file__))
+    selector_source = read_text(os.path.join(REPO, "effigy.toml"))
     for item, disposition in PREMISE_CHECKLIST.items():
         expect(bool(disposition.strip()), f"premise {item} has no disposition")
         if item in NA_PREMISES:
@@ -768,6 +776,34 @@ def self_check() -> None:
         and "--limit" in COMMAND
         and "--scratch-budget-mib" in COMMAND,
         "the fixed command changed",
+    )
+    expect(
+        "--root-parent" in COMMAND
+        and COMMAND[COMMAND.index("--root-parent") + 1] == ROOT_PARENT,
+        "the fixed command must carry the internal-placement root its fixture pool "
+        "needs, which is what premise item 8 records",
+    )
+
+    def selector_command(name: str) -> str:
+        block = re.search(
+            rf'^\[tasks\."{re.escape(name)}"\]\n((?:[^\[].*\n)*)',
+            selector_source,
+            re.MULTILINE,
+        )
+        expect(block is not None, f"effigy.toml must define {name}")
+        run = re.search(r'^run = "(.*)"$', block.group(1), re.MULTILINE)
+        expect(run is not None, f"{name} must declare a run command")
+        return run.group(1)
+
+    expect(
+        selector_command("rust:holding-delete") == " ".join(COMMAND),
+        "the counted selector must run exactly the fixed command the plan and "
+        "receipt name, or the receipt records a command nobody runs",
+    )
+    expect(
+        selector_command("rust:holding-delete:diagnostic")
+        == " ".join(COMMAND) + " --diagnostic",
+        "the diagnostic selector must be the same command with --diagnostic appended",
     )
     expect(
         sha256_file(os.path.abspath(__file__)) != "",

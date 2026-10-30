@@ -59,28 +59,25 @@ pub const LEGACY_MAX_SLOTS: usize = 128;
 /// journal count. No count rule is added and the cap does not grow for
 /// multi-journal states.
 ///
-/// The measured states this writer reaches on its **ordinary eviction path**
-/// from a fresh pool are reported separately: the raised-ceiling
+/// The measured states are reported separately: the raised-ceiling
 /// representation at `MAX_SLOTS` with every bounded field and numeric field at
-/// its maximum is 4,213,726 bytes all-idle, and 5,625,456 bytes with this
-/// writer's maximal single `DeletionJournal` on an `Evicting` record that also
-/// keeps its closed observation — 2,763,152 bytes below the cap.
-/// Ordinary evictions go through `retire_idle_slot`, which refuses while
-/// reconciliation is blocked or any journal is outstanding, so an admission
-/// starts at most one journal. **Recovery is a second journal path**: every
-/// `Pool::open` runs `reconcile_evicting`, and `remove_owned_slot` creates and
-/// persists a `SlotCaptureJournal` for an `Evicting` record that has none —
-/// but only after the bounded `pending_root_ready` preflight completes, so a
-/// blocked or partially inventoried tree keeps the record and starts no
-/// journal. A journaled deletion whose own removal fails keeps its journal and
-/// is retried on the next open. An earlier write can still have left more than
+/// its maximum is 4,213,726 bytes all-idle — the figure this writer's ordinary
+/// eviction path reaches, because since oxide#190 an eviction writes one
+/// holding row in two O(1) synced writes and starts no journal — and
+/// 5,625,456 bytes with a maximal single `DeletionJournal` on an `Evicting`
+/// record that also keeps its closed observation, 2,763,152 bytes below the
+/// cap. A journal is now only **legacy input**: an older writer left it, the
+/// reader accepts it, and `Pool::open`'s replay rewrites or drops it. No path
+/// in this binary creates a `SlotCaptureJournal`, so the journaled figure
+/// bounds what an accepted legacy ledger may carry rather than what this
+/// writer produces. An earlier write can still have left more than
 /// one such journal in a pool, and the reader accepts any otherwise-valid
 /// ledger below this cap. A write above the cap is refused, so a durable
-/// ledger never exceeds it; the 5,625,456-byte state is what this writer
-/// reaches on its ordinary path. The front door's admission gate, and the
-/// library's own locked open before reconciliation, make the version-8 control
-/// fence durable (oxide#177, fence first), so recovery, journal starts and
-/// ledger writes are all preceded by the hand-off fence. A maximal journal
+/// ledger never exceeds it. The front door's admission gate, and the
+/// library's own locked open before reconciliation, make the version-9 control
+/// fence (which carries `oxide.holding/1`) durable (oxide#177, fence first), so
+/// recovery, holding moves and ledger writes are all preceded by the hand-off
+/// fence. A legacy journal
 /// is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture records and
 /// `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a chain of at
 /// most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the enforced
