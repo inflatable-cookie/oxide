@@ -400,11 +400,14 @@ path for entries a command did not create. A claim takes an exclusive
 **non-blocking** `flock` on the holding entry's own directory descriptor, under a
 brief pool lock, and holds it for the whole deletion. A second command that finds it held claims nothing and deletes
 nothing: a live custodian is never waited for, and nothing infers custody from a
-PID, an age or a timeout. Each pass claims at most one entry, its own first and
-otherwise one starting from a rotating index derived from the pool's monotonic
-rank sequence, so a permanently refused entry never keeps another entry from
-being deleted by a later command. A deleted entry's descriptor is closed with
-its last name gone, so a later pass can never re-acquire it.
+PID, an age or a timeout. Each pass claims at most one entry: the name its own
+command published first, otherwise the **least-recently-attempted** recorded row
+(with the oldest row breaking a tie), so a permanently refused entry never keeps
+another entry from being deleted by a later command. That order is independent of
+grants and releases: a pass that concludes with a row still in place records the
+attempt in one O(1) write, so the rotation advances even while every admission is
+capacity-blocked. A deleted entry's descriptor is closed with its last name gone,
+so a later pass can never re-acquire it.
 
 **One bounded victim per decision.** Because a held tree keeps its bytes charged,
 the figure cannot fall inside one locked attempt. Byte pressure therefore selects
@@ -425,9 +428,12 @@ walk isolates the recorded entries so nothing is counted twice. An **unrecorded*
 entry in the holding area is never adopted and never deleted; it stays counted by
 the payload walk (so its bytes are charged rather than free) and is reported. A
 command whose admission is refused because of such bytes finishes a pending
-deletion outside the pool lock and retries exactly once — only when that pass
-positively removed a tree, because that is the only thing that changes the
-figure; it never assumes the bytes are free. An undeletable tree therefore keeps
+deletion outside the pool lock and **re-evaluates**: a positive removal — not a
+pass — is the trigger, so the admission is retried for a removal the
+pre-admission pass made after the refusal as well, and each later round publishes
+one more tree and re-evaluates again, up to a small fixed bound of four rounds. A
+round that removes nothing keeps the last refusal. It never assumes the bytes are
+free. An undeletable tree therefore keeps
 its charge and its admission refuses with a bounded capacity result rather than
 exceeding the budget. `oxide status` lists each held entry with its recorded
 bytes, its age and one presence check — no walk, no custody, no deletion.
@@ -436,8 +442,8 @@ bytes, its age and one presence check — no walk, no custody, no deletion.
 `EBUSY`, another owner, another device, a depth beyond the bound, an unknown
 entry type) stays in the holding area, still recorded and still charged, and is
 reported by name in the pass's bounded diagnostics. It never blocks admission
-that has capacity and never blocks another holding entry (see the rotation
-above).
+that has capacity and never blocks another holding entry: the attempt marker moves
+it behind the others in the takeover order above.
 
 **Mixed versions.** The fence comes first (#177's rule): control state version
 9 always carries the forward-only `oxide.holding/1` fence, and the admission
