@@ -133,6 +133,10 @@ RESULTS: list[dict] = []
 PHASE_STARTED = time.perf_counter()
 DIAGNOSTIC = False
 FIRST_FAULT: str | None = None
+# Every fault this run recorded, in order, bounded. The first one is latched
+# separately for the receipt's headline; this list shows that a case fault was
+# followed by a custody fault, or that only one happened.
+FAULTS: list[str] = []
 # Fixture children this process started and has not yet reaped. A case may not
 # return while one is still running: its custody would be unknown.
 CHILDREN: list[tuple[str, subprocess.Popen]] = []
@@ -150,11 +154,13 @@ def fail(message: str) -> None:
 
 
 def record_fault(name: str, message: str) -> None:
-    """Keep the first fault of a keep-going diagnostic run."""
+    """Record a fault: the first one is latched, all of them are kept (bounded)."""
     global FIRST_FAULT
     print(f"holding-delete case {name} failed: {message}", file=sys.stderr)
     if FIRST_FAULT is None:
         FIRST_FAULT = f"{name}: {message}"
+    if len(FAULTS) < 8:
+        FAULTS.append(f"{name}: {message}")
 
 
 def expect(condition: bool, message: str) -> None:
@@ -164,6 +170,13 @@ def expect(condition: bool, message: str) -> None:
 
 def say(message: str) -> None:
     print(f"[{time.perf_counter() - PHASE_STARTED:7.1f}s] {message}", flush=True)
+
+
+def declare(names: tuple[str, ...] | list[str]) -> list[dict]:
+    """Install a fresh case table; the collector and its regression share it."""
+    global CASES
+    CASES = [{"name": name, "result": "unexecuted"} for name in names]
+    return CASES
 
 
 def case(name: str) -> None:
@@ -564,9 +577,112 @@ def self_check() -> None:
     scratch = tempfile.mkdtemp(prefix="holding-delete-self-check.")
     try:
         self_check_oracles(scratch)
+        collector = tempfile.mkdtemp(prefix="holding-delete-collector.")
+        try:
+            self_check_collector(collector)
+        finally:
+            shutil.rmtree(collector, ignore_errors=True)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     print("self-check: ok (pure argument, plan, oracle and constant checks; not evidence)")
+
+
+def self_check_collector(scratch: str) -> None:
+    """The collector's own branch: keep-going only while closure is provable.
+
+    Fake case bodies, no child, no pool: the interesting thing is exactly which
+    cases the collector records and whether it aborts, and that it treats a
+    synchronously launched fixture command the same as an asynchronous one.
+    """
+    global DIAGNOSTIC, FIRST_FAULT
+
+    def no_child(_root: str, _subject: str) -> dict:
+        raise AssertionError("a case that launched nothing failed")
+
+    def launched_then_failed(_root: str, _subject: str) -> dict:
+        # Exactly what every fixture launcher does, before the launch.
+        mark_fixture_child()
+        raise AssertionError("a case that launched a command failed")
+
+    def passing(_root: str, _subject: str) -> dict:
+        return {"ok": True}
+
+    def drive(keep_going: bool, bodies: list) -> tuple[dict, str | None, bool]:
+        declare([name for name, _ in bodies])
+        FIRST_FAULT = None
+        del FAULTS[:]
+        DIAGNOSTIC = keep_going
+        try:
+            facts = collect(bodies, scratch, keep_going)
+            return facts, None, True
+        except AssertionError as error:
+            return {}, str(error), False
+        finally:
+            DIAGNOSTIC = False
+
+    results = [
+        ("no-child-failure", no_child),
+        ("after-it", passing),
+    ]
+    _, _, completed = drive(True, results)
+    expect(completed, "a diagnostic case with no child must still continue")
+    expect(
+        [entry["result"] for entry in CASES] == ["failed", "passed"],
+        f"keep-going accounting changed: {CASES}",
+    )
+    expect(
+        FIRST_FAULT is not None and "launched nothing" in FIRST_FAULT,
+        f"the first fault was not latched: {FIRST_FAULT}",
+    )
+
+    launched = [
+        ("launched-failure", launched_then_failed),
+        ("after-it", passing),
+    ]
+    _, fault, completed = drive(True, launched)
+    expect(
+        not completed,
+        "a diagnostic continued after a case that launched a fixture command",
+    )
+    expect(
+        [entry["result"] for entry in CASES] == ["failed", "unexecuted"],
+        f"abort accounting changed: {CASES}",
+    )
+    expect(
+        any("descendant closure belongs" in fault for fault in FAULTS),
+        f"the custody fault was not recorded: {FAULTS}",
+    )
+
+    counted = [
+        ("launched-failure", launched_then_failed),
+        ("after-it", passing),
+    ]
+    _, _, completed = drive(False, counted)
+    expect(not completed, "counted mode did not stop at the first failure")
+    expect(
+        [entry["result"] for entry in CASES] == ["failed", "unexecuted"],
+        f"counted accounting changed: {CASES}",
+    )
+
+    # Every fixture launch marks the case first: the wrapper and each direct
+    # synchronous site are checked in the source, because that ordering is what
+    # the collector branch above relies on.
+    source = read_text(os.path.abspath(__file__))
+    for helper in ("def check(", "def start_check(", "def run_fixture(", "def spawn_fixture("):
+        start = source.index(helper)
+        body = source[start : source.index("\ndef ", start + 1)]
+        expect(
+            "mark_fixture_child()" in body
+            or "run_fixture(" in body
+            or "spawn_fixture(" in body,
+            f"{helper} does not mark its fixture launch",
+        )
+    status_site = source.index("[subject, \"status\"]")
+    expect(
+        "run_fixture(" in source[max(0, status_site - 400) : status_site],
+        "the synchronous status command does not mark its launch",
+    )
+    declare(DECLARED_CASES)
 
 
 def self_check_oracles(scratch: str) -> None:
@@ -730,10 +846,34 @@ def create_project(root: str, label: str) -> str:
     return path
 
 
+def mark_fixture_child() -> None:
+    """Record that the running case launched a fixture command.
+
+    Called **before** every fixture launch, synchronous or asynchronous, so the
+    collector never concludes that a failing case ran no command when it did —
+    a command's descendants are outside this proof's signalling authority and
+    their closure is the shared supervisor's census.
+    """
+    global CASE_STARTED_CHILD
+    CASE_STARTED_CHILD = True
+
+
+def run_fixture(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run one fixture command synchronously, after marking the launch."""
+    mark_fixture_child()
+    return subprocess.run(argv, **kwargs)
+
+
+def spawn_fixture(argv: list[str], **kwargs) -> subprocess.Popen:
+    """Start one fixture command asynchronously, after marking the launch."""
+    mark_fixture_child()
+    return subprocess.Popen(argv, **kwargs)
+
+
 def check(subject: str, workspace: str, env: dict, label: str) -> tuple[int, str, float]:
     work_left()
     started = time.perf_counter()
-    result = subprocess.run(
+    result = run_fixture(
         [subject, "check", "--offline", "-j", str(FIXTURE_JOBS)],
         cwd=workspace,
         env=env,
@@ -749,7 +889,7 @@ def check(subject: str, workspace: str, env: dict, label: str) -> tuple[int, str
 
 def start_check(subject: str, workspace: str, env: dict, label: str) -> subprocess.Popen:
     work_left()
-    handle = subprocess.Popen(
+    handle = spawn_fixture(
         [subject, "check", "--offline", "-j", str(FIXTURE_JOBS)],
         cwd=workspace,
         env=env,
@@ -762,8 +902,6 @@ def start_check(subject: str, workspace: str, env: dict, label: str) -> subproce
         # supervisor, and an escape it did not create would be its finding, not
         # this script's.
     )
-    global CASE_STARTED_CHILD
-    CASE_STARTED_CHILD = True
     CHILDREN.append((label, handle))
     say(f"{label}: started (pid {handle.pid})")
     return handle
@@ -924,9 +1062,10 @@ def prove_refused_entry_kept(root: str, subject: str) -> dict:
         stat.S_ISFIFO(os.lstat(os.path.join(held, "build", "planted", "pipe")).st_mode),
         "the refused item is not the planted FIFO",
     )
-    # Recorded status reports it without a walk or a deletion.
+    # Recorded status reports it without a walk or a deletion. It is a fixture
+    # command like any other, so its launch is marked before it starts.
     work_left()
-    result = subprocess.run(
+    result = run_fixture(
         [subject, "status"], env=env, capture_output=True, text=True, timeout=work_left()
     )
     expect(result.returncode == 0, f"status exited {result.returncode}")
@@ -1177,32 +1316,29 @@ def run_proof(scratch: str, commit: str, tree: str, runner_sha: str, subject: st
     run_cases()
 
 
-def run_cases() -> None:
-    """Run the declared cases under the reported collection rules.
+def collect(
+    cases: list[tuple[str, object]],
+    root_parent: str,
+    keep_going: bool,
+) -> dict:
+    """Run one case table under the reported collection rules.
 
-    Counted mode is fail-fast: the first failed oracle ends the run. Diagnostic
-    mode is keep-going and keeps its own accounting — a recoverable oracle
-    failure is recorded, that case is marked `failed`, and the cases after it
-    that do not depend on it still run. Each case builds its own pool and
-    checkout, so no case depends on another's state. An unclassified outcome
-    (an unexpected exception, an unreaped child, an exhausted deadline) marks
-    the case and the rest `aborted`/`unexecuted` and stops: the receipt then
-    says exactly how far the run got, and a case that never ran is never a
-    pass.
+    Counted mode (`keep_going` false) is fail-fast. Diagnostic mode keeps going
+    only while descendant writer closure stays provable: a recoverable oracle
+    failure in a case that launched **no** fixture command may continue, because
+    nothing of that case is running. A case that launched one — synchronously or
+    asynchronously, marked before the launch — aborts the run even after its
+    leader is reaped: a command's descendants are outside this proof's signalling
+    authority, so their closure is the qualified shared supervisor's census and
+    this script cannot conclude it. An unclassified outcome always aborts. Every
+    case not reached stays `unexecuted`; a case that reached an unclassified
+    outcome is `aborted`; neither is ever a pass.
     """
-    cases = [
-        ("evict-under-lock", prove_evict_under_lock),
-        ("refused-entry-kept", prove_refused_entry_kept),
-        ("concurrent-admission", prove_concurrent_admission),
-        ("killed-deleter-takeover", prove_killed_deleter_takeover),
-    ]
     global CASE_STARTED_CHILD
     facts: dict = {}
     started = time.perf_counter()
     for index, (name, prove) in enumerate(cases):
-        root = private_dir(
-            os.path.join(os.environ["OXIDE_TASK_SCRATCH_ROOT"], "case", f"{index}-{name}")
-        )
+        root = private_dir(os.path.join(root_parent, "case", f"{index}-{name}"))
         CASE_STARTED_CHILD = False
         case(name)
         try:
@@ -1216,19 +1352,13 @@ def run_cases() -> None:
             mark(name, "failed", error=str(error)[:400])
             started_child = CASE_STARTED_CHILD
             reaped = close_children()
-            if not DIAGNOSTIC:
+            if not keep_going:
                 unexecuted([other for other, _ in cases[index + 1 :]])
                 raise
             if started_child or not reaped:
-                # A fixture command ran, so descendants of it live outside this
-                # proof's signalling authority; their closure is the shared
-                # supervisor's census. Reaping the leader proves nothing about
-                # them, so keep-going would continue with unknown descendant
-                # custody. The run aborts and every case not reached stays
-                # `unexecuted`.
                 record_fault(
                     "custody",
-                    "a case that started a fixture child failed: descendant "
+                    "a case that launched a fixture command failed: descendant "
                     "closure belongs to the shared supervisor's census, so this "
                     "diagnostic does not continue",
                 )
@@ -1241,8 +1371,22 @@ def run_cases() -> None:
             close_children()
             unexecuted([other for other, _ in cases[index + 1 :]])
             raise
-    FACTS.update(facts)
-    FACTS["elapsed_s"] = round(time.perf_counter() - started, 3)
+    facts["elapsed_s"] = round(time.perf_counter() - started, 3)
+    return facts
+
+
+def run_cases() -> None:
+    """Run the declared proof cases."""
+    declare(DECLARED_CASES)
+    cases = [
+        ("evict-under-lock", prove_evict_under_lock),
+        ("refused-entry-kept", prove_refused_entry_kept),
+        ("concurrent-admission", prove_concurrent_admission),
+        ("killed-deleter-takeover", prove_killed_deleter_takeover),
+    ]
+    FACTS.update(
+        collect(cases, os.environ["OXIDE_TASK_SCRATCH_ROOT"], DIAGNOSTIC)
+    )
 
 
 SUBJECT = ""
@@ -1386,6 +1530,7 @@ def main(argv: list[str]) -> int:
         "cases": CASES,
         "facts": FACTS,
         "first_fault": fault or FIRST_FAULT,
+        "faults": FAULTS,
         "deadline_left_s": deadline_remaining(),
         "elapsed_s": round(time.perf_counter() - started, 3),
         "lock_metric": "the whole eviction transaction under the pool lock "

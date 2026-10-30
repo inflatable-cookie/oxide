@@ -291,7 +291,12 @@ Two synced ledger writes in total, both O(1): one **rename intent** before the
 rename (the derived name and the verified identity) and the row swap after it.
 Nothing is written per entry — the tree is a private directory that becomes
 unreachable from every slot path the moment it is renamed, which is what made
-per-entry journaling unnecessary.
+per-entry journaling unnecessary. The brief asked for one sync; the Oxide
+Supervisor accepted two on 2026-10-30 (decision `1e522ecc`) because the intent is
+what makes a crash between the rename and the row recoverable **by identity**
+rather than by a name, and both writes are O(1) rather than per entry. Any figure
+quoted for the lock-held interval therefore covers the intent write, the rename
+and the row write together.
 
 The nonce is the generation's own recorded `last_lease_id`, not a fresh random
 token. Every part of the entry name is durable ledger state, and the intent is
